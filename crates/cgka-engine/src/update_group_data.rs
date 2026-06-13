@@ -111,6 +111,13 @@ impl<S: StorageProvider> Engine<S> {
                         crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
                     let after = crate::app_components::decode_admin_policy(&update.data)
                         .unwrap_or_default();
+                    // Refuse to create a commit whose admin-policy lists an admin
+                    // with no member leaf (admin-policy-v1.md). UpdateAppComponents
+                    // does not change membership, so the resulting members are the
+                    // current members.
+                    crate::app_components::reject_admins_without_member_leaf(
+                        &mls_group, &group_id, &after,
+                    )?;
                     for change in crate::group_state_changes::admin_changes(&before, &after) {
                         staged_changes.push(crate::engine::PendingGroupStateChange {
                             actor: self_actor.clone(),

@@ -10,7 +10,6 @@ wraps / peels Marmot group MLS bytes for Nostr kind `445`.
 
 - Maps kind `445` events with an `h` tag into group `TransportMessage`s.
 - Maps kind `1059` events with a `p` tag into welcome `TransportMessage`s.
-- Preserves causal `e` tags as `TransportMessage::causal_deps`.
 - Encrypts and decrypts kind `445` group envelopes with ChaCha20Poly1305 (`content = base64(nonce || ciphertext)`,
   empty AAD) using the engine exporter snapshot.
 - Carries no source-epoch hint in the kind `445` envelope: an undecryptable message returns `DecryptFailed`, and the

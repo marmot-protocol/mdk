@@ -733,6 +733,25 @@ pub(crate) fn decode_received_event(
         );
         return None;
     }
+    // The inner app event MUST NOT carry transport routing tags. For the Nostr
+    // binding these are h (group routing id), p (recipient), relays (relay hints),
+    // and expiration (NIP-40); they belong on the outer envelope only. See
+    // spec/protocol-core/group-messaging.md ("App payloads") and
+    // spec/foundation/application-messages.md ("Encoding"). Application-content
+    // tags (e, imeta, system, stream-*) are not routing tags and are allowed.
+    if event.tags.iter().any(|tag| {
+        matches!(
+            tag.first().map(String::as_str),
+            Some("h" | "p" | "relays" | "expiration")
+        )
+    }) {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "rejecting MLS application message: inner app event carries a transport routing tag",
+        );
+        return None;
+    }
     if event.kind == MARMOT_APP_EVENT_KIND_CHAT
         && event
             .tags
@@ -1124,5 +1143,43 @@ mod confirmation_state_tests {
             record.via_welcome_message_id_hex.as_deref(),
             Some("welcome-2")
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_tag_tests {
+    use super::*;
+
+    fn decode_with_tags(tags: Vec<Vec<String>>) -> Option<ReceivedMessage> {
+        let pubkey = "aa".repeat(32);
+        let event =
+            MarmotInnerEvent::new(pubkey.clone(), 1, MARMOT_APP_EVENT_KIND_CHAT, tags, "hi");
+        let payload = event.encode().unwrap();
+        decode_received_event(
+            &payload,
+            &pubkey,
+            None,
+            &GroupId::new(vec![0x01; 32]),
+            1,
+            &"00".repeat(32),
+            0,
+            false,
+        )
+    }
+
+    #[test]
+    fn inner_event_with_transport_routing_tag_is_rejected() {
+        for name in ["h", "p", "relays", "expiration"] {
+            assert!(
+                decode_with_tags(vec![vec![name.to_string(), "x".to_string()]]).is_none(),
+                "inner transport routing tag {name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn inner_event_with_application_tag_is_accepted() {
+        // `e` (reply/edit target) is application content, not a routing tag.
+        assert!(decode_with_tags(vec![vec!["e".to_string(), "ab".repeat(32)]]).is_some());
     }
 }

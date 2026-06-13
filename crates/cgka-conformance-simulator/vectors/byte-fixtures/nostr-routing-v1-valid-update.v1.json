@@ -1,5 +1,5 @@
 {
-  "fixture_name": "marmot.transport.nostr.routing.v1/update-valid-two-relays/v1",
+  "fixture_name": "marmot.transport.nostr.routing.v1/update-valid-full-replacement/v1",
   "fixture_version": "1",
   "vector_type": "app_component_update",
   "component": {
@@ -8,28 +8,27 @@
     "document": "spec/app-components/nostr-routing-v1.md"
   },
   "encoding": {
-    "format": "TLS presentation language",
+    "format": "Marmot canonical encoding",
     "notes": [
       "bytes.hex is the MarmotNostrRoutingUpdateV1 payload, not the AppDataUpdate proposal wrapper.",
-      "The update payload contains only relays<V>.",
-      "MarmotNostrRelayV1.url<1..512> is encoded with a two-byte vector length.",
-      "relays<V> is encoded with a four-byte vector length."
+      "The update payload is a full replacement state (MarmotNostrRoutingUpdateV1 = MarmotNostrRoutingV1): it carries the 32-byte nostr_group_id followed by the new relays<V>, in the Marmot canonical encoding.",
+      "This example changes the relay list to a single relay while keeping nostr_group_id; an update MAY also change nostr_group_id (a routing rotation)."
     ]
   },
   "bytes": {
-    "hex": "0000002e00157773733a2f2f72656c61792d612e6578616d706c6500157773733a2f2f72656c61792d622e6578616d706c65"
+    "hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f16157773733a2f2f72656c61792d632e6578616d706c65"
   },
   "expected": {
     "valid": true,
     "fields": {
+      "nostr_group_id_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
       "relays": [
-        "wss://relay-a.example",
-        "wss://relay-b.example"
+        "wss://relay-c.example"
       ]
     },
     "errors": []
   },
   "notes": [
-    "There is no v1 update that changes nostr_group_id."
+    "The update is a full replacement state and begins with nostr_group_id[32]; it is decoded by the same codec as the state vector."
   ]
 }

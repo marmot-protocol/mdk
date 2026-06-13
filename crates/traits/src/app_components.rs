@@ -514,9 +514,7 @@ pub fn decode_group_avatar_url_v1(bytes: &[u8]) -> Result<GroupAvatarUrlV1, Stri
         return Err("group avatar component has trailing bytes".into());
     }
     let url = String::from_utf8(url).map_err(|e| format!("group avatar URL is not UTF-8: {e}"))?;
-    let dim = String::from_utf8(dim).map_err(|e| format!("group avatar dim is not UTF-8: {e}"))?;
-    let thumbhash = String::from_utf8(thumbhash)
-        .map_err(|e| format!("group avatar thumbhash is not UTF-8: {e}"))?;
+    // Presence is decided on the raw bytes: an absent state carries no hints.
     if url.is_empty() && (!dim.is_empty() || !thumbhash.is_empty()) {
         return Err("group avatar absent state must not include hints".into());
     }
@@ -527,10 +525,24 @@ pub fn decode_group_avatar_url_v1(bytes: &[u8]) -> Result<GroupAvatarUrlV1, Stri
             return Err("group avatar URL is not normalized".into());
         }
     }
+    // `dim` and `thumbhash` are opaque length-bounded hints: a decoder validates
+    // only their length (done above by decode_var_bytes) and interprets the bytes
+    // as UTF-8 only for rendering. A non-UTF-8 hint is treated as ABSENT and MUST
+    // NOT invalidate otherwise-valid state (spec/app-components/group-avatar-url-v1.md
+    // and spec/foundation/canonical-encoding.md, "opaque hints"). Rejecting it
+    // here would make the same commit accepted by some clients and not others.
     Ok(GroupAvatarUrlV1 {
         url,
-        dim: (!dim.is_empty()).then_some(dim),
-        thumbhash: (!thumbhash.is_empty()).then_some(thumbhash),
+        dim: if dim.is_empty() {
+            None
+        } else {
+            String::from_utf8(dim).ok()
+        },
+        thumbhash: if thumbhash.is_empty() {
+            None
+        } else {
+            String::from_utf8(thumbhash).ok()
+        },
     })
 }
 
@@ -706,14 +718,24 @@ fn is_loopback_host(host: Host<&str>) -> bool {
 }
 
 fn reject_non_routable_ipv4(addr: Ipv4Addr) -> Result<(), String> {
-    if addr.is_loopback()
+    let o = addr.octets();
+    // Canonical unsafe-host set (spec/foundation/host-safety.md). std classifies
+    // some ranges; the rest are matched explicitly so this validator stays in
+    // lockstep with the media-locator validator in marmot-app and with the spec.
+    let unsafe_host = addr.is_loopback()
         || addr.is_private()
         || addr.is_link_local()
         || addr.is_broadcast()
         || addr.is_documentation()
         || addr.is_unspecified()
         || addr.is_multicast()
-    {
+        || o[0] == 0 // this host 0.0.0.0/8
+        || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64.0.0/10
+        || matches!(o, [192, 0, 0, _]) // IETF protocol assignments 192.0.0.0/24
+        || matches!(o, [192, 88, 99, _]) // 6to4 relay anycast 192.88.99.0/24
+        || (o[0] == 198 && (18..=19).contains(&o[1])) // benchmarking 198.18.0.0/15
+        || o[0] >= 240; // reserved 240.0.0.0/4 (incl. 255.255.255.255 broadcast)
+    if unsafe_host {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
     Ok(())
@@ -726,17 +748,25 @@ fn reject_non_routable_ipv6(addr: Ipv6Addr) -> Result<(), String> {
     if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
-    // Reject ranges the stable std API does not yet classify, mirroring the IPv4
-    // branch's `is_documentation()` and the spec's "documentation" MUST-reject:
-    //   - unique-local      fc00::/7   (first & 0xfe00 == 0xfc00)
-    //   - link-local        fe80::/10  (first & 0xffc0 == 0xfe80)
-    //   - documentation     2001:db8::/32 (segments[0] == 0x2001 && [1] == 0x0db8)
-    //   - documentation     3fff::/20  (first & 0xfff0 == 0x3ff0), per RFC 9637
+    // Ranges the stable std API does not classify, per the canonical unsafe-host
+    // set (spec/foundation/host-safety.md), kept in lockstep with the media-locator
+    // validator in marmot-app:
+    //   - unique-local  fc00::/7       (first & 0xfe00 == 0xfc00)
+    //   - link-local    fe80::/10      (first & 0xffc0 == 0xfe80)
+    //   - 6to4          2002::/16      (first == 0x2002)              transition prefix
+    //   - Teredo        2001:0000::/32 (first == 0x2001 && second == 0)  transition prefix
+    //   - documentation 2001:db8::/32  (first == 0x2001 && second == 0x0db8)
+    //   - documentation 3fff::/20      (first & 0xfff0 == 0x3ff0), per RFC 9637
     let [first, second, ..] = addr.segments();
     if (first & 0xfe00) == 0xfc00
         || (first & 0xffc0) == 0xfe80
+        || first == 0x2002
+        || (first == 0x2001 && second == 0x0000)
         || (first == 0x2001 && second == 0x0db8)
         || (first & 0xfff0) == 0x3ff0
+        // Only global unicast 2000::/3 is routable today; reject anything else
+        // not already caught above (loopback/unspecified/multicast handled earlier).
+        || (first & 0xe000) != 0x2000
     {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
@@ -1278,11 +1308,22 @@ mod tests {
             "https://192.168.1.2/a.png",
             "https://172.16.0.1/a.png",
             "https://169.254.1.1/a.png",
+            // Ranges aligned with the canonical unsafe-host set / media validator.
+            "https://0.0.0.1/a.png",     // 0.0.0.0/8 this-host
+            "https://100.64.0.1/a.png",  // CGNAT 100.64.0.0/10
+            "https://192.0.0.1/a.png",   // IETF protocol assignments 192.0.0.0/24
+            "https://192.88.99.1/a.png", // 6to4 relay anycast 192.88.99.0/24
+            "https://198.18.0.1/a.png",  // benchmarking 198.18.0.0/15
+            "https://240.0.0.1/a.png",   // reserved 240.0.0.0/4
             "https://[::1]/a.png",
             "https://[::ffff:127.0.0.1]/a.png",
             "https://[::ffff:10.0.0.1]/a.png",
             "https://[fc00::1]/a.png",
             "https://[fe80::1]/a.png",
+            "https://[2002::1]/a.png", // 6to4 transition prefix
+            "https://[2001::1]/a.png", // Teredo 2001:0000::/32
+            "https://[3fff::1]/a.png", // documentation 3fff::/20 (RFC 9637)
+            "https://[4000::1]/a.png", // outside global unicast 2000::/3
         ] {
             assert!(
                 validate_and_normalize_group_avatar_url(raw).is_err(),
@@ -1347,6 +1388,32 @@ mod tests {
         let mut bytes = encode_group_avatar_url_v1(&avatar).unwrap();
         bytes.push(0);
         assert!(decode_group_avatar_url_v1(&bytes).is_err());
+    }
+
+    #[test]
+    fn group_avatar_url_decode_treats_non_utf8_hint_as_absent() {
+        // dim/thumbhash are opaque length-bounded hints: a non-UTF-8 hint MUST NOT
+        // invalidate the component (else the same commit forks accept/reject across
+        // clients). It is interpreted as absent.
+        let url = validate_and_normalize_group_avatar_url("https://cdn.example.com/a.png").unwrap();
+        let mut bytes = Vec::new();
+        encode_var_bytes(url.as_bytes(), &mut bytes);
+        encode_var_bytes(&[0xff, 0xfe], &mut bytes); // non-UTF-8 dim
+        encode_var_bytes(&[0x80, 0x81, 0x82], &mut bytes); // non-UTF-8 thumbhash
+
+        let decoded = decode_group_avatar_url_v1(&bytes)
+            .expect("non-UTF-8 opaque hints must not invalidate the avatar component");
+        assert_eq!(decoded.url, url);
+        assert_eq!(decoded.dim, None);
+        assert_eq!(decoded.thumbhash, None);
+
+        // A within-bounds UTF-8 hint is still surfaced for rendering.
+        let mut bytes = Vec::new();
+        encode_var_bytes(url.as_bytes(), &mut bytes);
+        encode_var_bytes(b"512x512", &mut bytes);
+        encode_var_bytes(b"", &mut bytes);
+        let decoded = decode_group_avatar_url_v1(&bytes).unwrap();
+        assert_eq!(decoded.dim.as_deref(), Some("512x512"));
     }
 
     #[test]

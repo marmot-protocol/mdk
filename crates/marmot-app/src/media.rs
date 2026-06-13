@@ -472,6 +472,19 @@ pub(crate) fn media_attachment_from_imeta_tag(
     let mut file_name = None;
     let mut dim = None;
     let mut thumbhash = None;
+    // Single-occurrence fields MUST appear at most once. m, filename, and
+    // plaintext_sha256 feed file_key derivation and the AEAD AAD, so a first-wins
+    // vs last-wins decoder would derive different keys for the same tag. Reject a
+    // duplicate rather than overwriting (spec/features/encrypted-media.md).
+    let set_once = |slot: &mut Option<String>, value: &str, label: &str| -> Result<(), AppError> {
+        if slot.is_some() {
+            return Err(AppError::InvalidAppMessagePayload(format!(
+                "media tag must contain exactly one {label}"
+            )));
+        }
+        *slot = Some(value.to_owned());
+        Ok(())
+    };
     for field in tag.iter().skip(1) {
         if field.starts_with("blurhash ") {
             return Err(AppError::InvalidAppMessagePayload(
@@ -500,20 +513,15 @@ pub(crate) fn media_attachment_from_imeta_tag(
                         "media version must be {ENCRYPTED_MEDIA_VERSION}"
                     )));
                 }
-                if version.is_some() {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "media tag must contain exactly one version".into(),
-                    ));
-                }
-                version = Some(value.to_owned());
+                set_once(&mut version, value, "version")?;
             }
-            "ciphertext_sha256" => ciphertext_sha256 = Some(value.to_owned()),
-            "plaintext_sha256" => plaintext_sha256 = Some(value.to_owned()),
-            "nonce" => nonce_hex = Some(value.to_owned()),
-            "m" => media_type = Some(value.to_owned()),
-            "filename" => file_name = Some(value.to_owned()),
-            "dim" => dim = Some(value.to_owned()),
-            "thumbhash" => thumbhash = Some(value.to_owned()),
+            "ciphertext_sha256" => set_once(&mut ciphertext_sha256, value, "ciphertext_sha256")?,
+            "plaintext_sha256" => set_once(&mut plaintext_sha256, value, "plaintext_sha256")?,
+            "nonce" => set_once(&mut nonce_hex, value, "nonce")?,
+            "m" => set_once(&mut media_type, value, "m")?,
+            "filename" => set_once(&mut file_name, value, "filename")?,
+            "dim" => set_once(&mut dim, value, "dim")?,
+            "thumbhash" => set_once(&mut thumbhash, value, "thumbhash")?,
             _ => {}
         }
     }
@@ -859,6 +867,13 @@ fn is_public_ipv6(addr: Ipv6Addr) -> bool {
         return false;
     }
     if first == 0x2001 && second == 0x0db8 {
+        return false;
+    }
+    // Documentation 3fff::/20 (RFC 9637). It falls inside global-unicast 2000::/3,
+    // so the terminal rule below would otherwise accept it. Reject to match the
+    // canonical unsafe-host set (spec/foundation/host-safety.md) and the avatar/
+    // endpoint validator in cgka_traits, which already rejects 3fff::/20.
+    if (first & 0xfff0) == 0x3ff0 {
         return false;
     }
     (first & 0xe000) == 0x2000
@@ -1228,6 +1243,35 @@ mod tests {
         tag
     }
 
+    #[test]
+    fn imeta_parser_rejects_duplicate_single_occurrence_field() {
+        // Baseline valid tag parses.
+        assert!(media_attachment_from_imeta_tag(&valid_imeta_tag(), None, false).is_ok());
+        // A duplicate of a single-occurrence field MUST be rejected, especially the
+        // key/AAD-determining ones (m, filename, plaintext_sha256).
+        for dup in [
+            "m image/jpeg".to_owned(),
+            "filename evil.png".to_owned(),
+            format!("plaintext_sha256 {}", "44".repeat(32)),
+            format!("ciphertext_sha256 {}", "55".repeat(32)),
+            "nonce 444444444444444444444444".to_owned(),
+        ] {
+            let mut tag = valid_imeta_tag();
+            tag.push(dup.clone());
+            assert!(
+                media_attachment_from_imeta_tag(&tag, None, false).is_err(),
+                "duplicate field {dup:?} must be rejected"
+            );
+        }
+        // A repeated `locator` is allowed (locator is one-or-more).
+        let mut multi = valid_imeta_tag();
+        multi.push(format!(
+            "locator blossom-v1 https://media2.example/{}.bin",
+            "11".repeat(32)
+        ));
+        assert!(media_attachment_from_imeta_tag(&multi, None, false).is_ok());
+    }
+
     fn spawn_http_response(response: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("test server addr");
@@ -1553,6 +1597,17 @@ mod tests {
             assert!(err.to_string().contains("non-public"));
             assert!(!media_imeta_tags_are_valid(&[tag], false));
         }
+    }
+
+    #[test]
+    fn imeta_parser_rejects_ipv6_documentation_3fff_media_locator() {
+        // 3fff::/20 (RFC 9637) is documentation space that sits inside global-unicast
+        // 2000::/3, so it must be rejected explicitly (canonical unsafe-host set).
+        let tag = tag_with_locator(format!("https://[3fff::1]/{}.bin", valid_hash()));
+        let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+        assert!(err.to_string().contains("non-public"));
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 
     #[test]

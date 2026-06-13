@@ -4972,6 +4972,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen",
  "rustls",
+ "rustls-platform-verifier",
  "sha2",
  "thiserror 2.0.18",
  "tokio",

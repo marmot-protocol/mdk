@@ -5571,8 +5571,15 @@ fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> M
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
     // installs leave it unset.
-    let config = MarmotAppConfig::default()
+    let mut config = MarmotAppConfig::default()
         .with_allow_loopback_blob_endpoints(dm_allow_loopback_blob_endpoints());
+    // Dev/test only: DM_DEV_SETTLEMENT_QUIESCENCE_MS overrides the pinned
+    // convergence settlement window (e.g. `0` for instant settlement in
+    // integration tests). Production installs leave it unset and use the pinned
+    // default.
+    if let Some(ms) = dm_dev_settlement_quiescence_ms() {
+        config = config.with_dev_settlement_quiescence_ms(ms);
+    }
     MarmotApp::with_relays_and_account_home_and_config(
         home,
         relay.into_iter().collect(),
@@ -5586,6 +5593,12 @@ fn dm_allow_loopback_blob_endpoints() -> bool {
         std::env::var("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+fn dm_dev_settlement_quiescence_ms() -> Option<u64> {
+    std::env::var("DM_DEV_SETTLEMENT_QUIESCENCE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
 }
 
 fn open_account_home(

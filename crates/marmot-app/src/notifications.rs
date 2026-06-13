@@ -68,9 +68,13 @@ impl PushPlatform {
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Result<Self, AppError> {
+        // Lowercase-only per spec/features/push-notifications.md ("platform is the
+        // string apns or fcm") and the no-case-fold canonical-decoding rule. Do NOT
+        // accept "Apns"/"APNS"/"Fcm"/"FCM": a case-folding decoder would store and
+        // match push-token state differently from a strict peer.
         match value {
-            "apns" | "Apns" | "APNS" => Ok(Self::Apns),
-            "fcm" | "Fcm" | "FCM" => Ok(Self::Fcm),
+            "apns" => Ok(Self::Apns),
+            "fcm" => Ok(Self::Fcm),
             _ => Err(AppError::InvalidPushToken(
                 "unsupported push platform".into(),
             )),
@@ -1209,5 +1213,24 @@ mod tests {
             fingerprint,
             push_token_fingerprint(PushPlatform::Fcm, token)
         );
+    }
+
+    #[test]
+    fn push_platform_from_str_is_lowercase_only() {
+        assert!(matches!(
+            PushPlatform::from_str("apns"),
+            Ok(PushPlatform::Apns)
+        ));
+        assert!(matches!(
+            PushPlatform::from_str("fcm"),
+            Ok(PushPlatform::Fcm)
+        ));
+        // Case variants MUST be rejected (lowercase-only per spec + no case-fold).
+        for bad in ["Apns", "APNS", "Fcm", "FCM", "aPns", " apns", "apns "] {
+            assert!(
+                PushPlatform::from_str(bad).is_err(),
+                "case/whitespace variant {bad:?} must be rejected"
+            );
+        }
     }
 }

@@ -250,6 +250,9 @@ fn dm(home: &std::path::Path) -> Command {
     // CLI tests exercise encrypted media against a loopback Blossom server,
     // which is the dev/test scenario the loopback-HTTP gate is for.
     command.env("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1");
+    // Instant convergence settlement so multi-client tests do not wait on the
+    // pinned 1000 ms quiescence window (dev/test only).
+    command.env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
     command
 }
 
@@ -2934,6 +2937,9 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3044,6 +3050,9 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3193,6 +3202,9 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3375,6 +3387,9 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3934,6 +3949,9 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3997,6 +4015,9 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Instant convergence settlement (dev/test) so the daemon surfaces
+        // synced state without waiting on the pinned quiescence window.
+        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

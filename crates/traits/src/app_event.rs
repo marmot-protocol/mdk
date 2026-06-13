@@ -71,7 +71,17 @@ pub const STREAM_CHUNKS_TAG: &str = "stream-chunks";
 
 /// An unsigned Nostr event carried as the plaintext of an MLS application
 /// message. Same fields as a Nostr event except `sig`.
+///
+/// `deny_unknown_fields` enforces the foundation decoder rule
+/// (spec/foundation/application-messages.md, "Encoding"): a payload is exactly
+/// the six members below, so a decoder MUST reject a `sig` member or any other
+/// unknown top-level member. serde additionally rejects a duplicate of any of
+/// these known fields, and `deny_unknown_fields` rejects a duplicate unknown
+/// key, covering the "duplicate object keys" rule. Without this, serde silently
+/// drops a forbidden `sig` / unknown members and keeps the last of duplicate
+/// unknown keys, so a spec-conformant peer would reject what this client accepts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MarmotAppEvent {
     pub id: String,
     pub pubkey: String,
@@ -330,5 +340,27 @@ mod tests {
         let decoded = MarmotAppEvent::decode(&event.encode().unwrap()).unwrap();
         assert_eq!(decoded.first_tag_value(STREAM_TAG), Some("abc123"));
         assert_eq!(decoded.first_tag_value(STREAM_START_TAG), Some("deadbeef"));
+    }
+
+    #[test]
+    fn decode_rejects_sig_unknown_and_duplicate_members() {
+        let event =
+            MarmotAppEvent::new("aa".repeat(32), 1, MARMOT_APP_EVENT_KIND_CHAT, vec![], "hi");
+        let valid = String::from_utf8(event.encode().unwrap()).unwrap();
+        assert!(valid.starts_with('{'));
+        // Baseline valid event decodes.
+        assert!(MarmotAppEvent::decode(valid.as_bytes()).is_ok());
+
+        // A forbidden inner `sig` member MUST be rejected (not silently dropped).
+        let with_sig = valid.replacen('{', "{\"sig\":\"deadbeef\",", 1);
+        assert!(MarmotAppEvent::decode(with_sig.as_bytes()).is_err());
+
+        // An unknown top-level member MUST be rejected.
+        let with_unknown = valid.replacen('{', "{\"evil\":1,", 1);
+        assert!(MarmotAppEvent::decode(with_unknown.as_bytes()).is_err());
+
+        // A duplicate object key MUST be rejected (here a second `content`).
+        let with_dup = valid.replacen('{', "{\"content\":\"x\",", 1);
+        assert!(MarmotAppEvent::decode(with_dup.as_bytes()).is_err());
     }
 }

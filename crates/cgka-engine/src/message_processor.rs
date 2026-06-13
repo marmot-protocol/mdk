@@ -632,6 +632,17 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(err);
                     }
+                    // Reject (pre-merge) a commit whose resulting epoch would list an
+                    // admin key with no member leaf — e.g. removing an account's last
+                    // leaf without dropping it from `admins`. admin-policy-v1.md.
+                    if let Err(err) =
+                        crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+                            &mls_group, &group_id, &staged,
+                        )
+                    {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(err);
+                    }
                     let Some(commit_committer) = sender_id.clone() else {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(EngineError::Backend(

@@ -8,18 +8,17 @@
     "document": "spec/app-components/nostr-routing-v1.md"
   },
   "encoding": {
-    "format": "TLS presentation language",
+    "format": "Marmot canonical encoding",
     "notes": [
-      "bytes.hex is the component state bytes stored in AppDataDictionary.component_data.data.",
-      "bytes.component_data_hex is ComponentData with component_id 0x8004 and an opaque data<V> wrapper.",
-      "opaque nostr_group_id<32..32> is encoded with a one-byte vector length.",
-      "MarmotNostrRelayV1.url<1..512> is encoded with a two-byte vector length.",
-      "relays<V> and data<V> are encoded with four-byte vector lengths."
+      "bytes.hex is the component state bytes stored in AppDataDictionary.component_data.data, in the Marmot canonical encoding (spec/foundation/canonical-encoding.md): QUIC variable-length length prefixes.",
+      "opaque nostr_group_id[32] is exactly 32 bytes with NO length prefix.",
+      "relays<V> is a QUIC-varint byte length, then each MarmotNostrRelayV1.url<1..512> is a QUIC-varint length prefix followed by the URL bytes.",
+      "bytes.component_data_hex is the OpenMLS ComponentData entry: component_id (uint16 0x8004) then the data as a variable-length byte vector wrapping bytes.hex."
     ]
   },
   "bytes": {
-    "hex": "20000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000002e00157773733a2f2f72656c61792d612e6578616d706c6500157773733a2f2f72656c61792d622e6578616d706c65",
-    "component_data_hex": "80040000005320000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000002e00157773733a2f2f72656c61792d612e6578616d706c6500157773733a2f2f72656c61792d622e6578616d706c65"
+    "hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2c157773733a2f2f72656c61792d612e6578616d706c65157773733a2f2f72656c61792d622e6578616d706c65",
+    "component_data_hex": "8004404d000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2c157773733a2f2f72656c61792d612e6578616d706c65157773733a2f2f72656c61792d622e6578616d706c65"
   },
   "expected": {
     "valid": true,
@@ -33,7 +32,7 @@
     "errors": []
   },
   "notes": [
-    "Relay order is byte-lexicographic and duplicate-free.",
+    "Relay order is byte-lexicographic over the URL content bytes and duplicate-free.",
     "This fixture does not include an AppDataUpdate wrapper."
   ]
 }

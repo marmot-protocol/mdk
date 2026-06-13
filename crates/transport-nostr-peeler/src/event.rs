@@ -10,8 +10,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CAUSAL_DEP_TAG: &str = "e";
-
 /// Nostr event shape consumed and produced at the peeler boundary.
 ///
 /// This is intentionally a small DTO instead of a relay client type. A Nostr
@@ -33,13 +31,6 @@ impl NostrTransportEvent {
     /// Convert a Nostr event into the raw transport message the engine ingests.
     pub fn to_transport_message(&self) -> Result<TransportMessage, NostrPeelerError> {
         let id = MessageId::new(decode_hex_exact("event id", &self.id, 32)?);
-        let causal_deps = self
-            .tags
-            .iter()
-            .filter(|tag| tag.first().is_some_and(|name| name == CAUSAL_DEP_TAG))
-            .filter_map(|tag| tag.get(1))
-            .map(|value| decode_hex_exact("causal dependency id", value, 32).map(MessageId::new))
-            .collect::<Result<Vec<_>, _>>()?;
         let envelope = match self.kind {
             KIND_MARMOT_GROUP_MESSAGE => {
                 let group_id = self.single_tag_value(GROUP_TAG)?;
@@ -63,7 +54,10 @@ impl NostrTransportEvent {
             payload: serde_json::to_vec(self)
                 .map_err(|e| NostrPeelerError::Malformed(e.to_string()))?,
             timestamp: Timestamp(self.created_at),
-            causal_deps,
+            // Kind 445 MUST NOT carry any tag other than h/expiration
+            // (transports/nostr.md). The peeler no longer extracts `e` causal
+            // dependencies — the feature was unused — so this is always empty.
+            causal_deps: Vec::new(),
             source: TransportSource(NOSTR_SOURCE.into()),
             envelope,
         })
@@ -223,10 +217,7 @@ mod tests {
             pubkey: "22".repeat(32),
             created_at: 1_700_000_000,
             kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![
-                vec!["h".into(), "aa55".into()],
-                vec!["e".into(), "99".repeat(32)],
-            ],
+            tags: vec![vec!["h".into(), "aa55".into()]],
             content: "encrypted body".into(),
             sig: None,
         };
@@ -236,7 +227,9 @@ mod tests {
         assert_eq!(msg.id.as_slice(), vec![0x11; 32].as_slice());
         assert_eq!(msg.timestamp.0, 1_700_000_000);
         assert_eq!(msg.source.0, NOSTR_SOURCE);
-        assert_eq!(msg.causal_deps[0].as_slice(), vec![0x99; 32].as_slice());
+        // The peeler does not extract `e` causal-dependency tags (kind 445 carries
+        // none per transports/nostr.md).
+        assert!(msg.causal_deps.is_empty());
         assert_eq!(
             msg.envelope,
             TransportEnvelope::GroupMessage {

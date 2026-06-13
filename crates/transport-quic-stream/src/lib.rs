@@ -19,15 +19,23 @@ use cgka_traits::{
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
-use quinn::crypto::rustls::QuicClientConfig;
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rand::{RngCore, rngs::OsRng};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep, timeout};
 
 const FRAME_LEN_BYTES: usize = 4;
 const LOCAL_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+/// Direct-path QUIC ALPN, pinned by spec/transports/quic.md. Both peers MUST
+/// negotiate exactly this protocol; it is the direct-path counterpart to the
+/// broker path's `marmot.quic_broker.v1` and the direct path's versioning hook.
+pub const QUIC_STREAM_PROTOCOL_V1: &str = "marmot.quic_stream.v1";
+/// `QUIC_STREAM_PROTOCOL_V1` as ALPN bytes.
+pub const QUIC_STREAM_ALPN_V1: &[u8] = QUIC_STREAM_PROTOCOL_V1.as_bytes();
 /// Spec-pinned reader allowance on top of the plaintext frame policy cap: a
 /// reader rejects a frame whose `frame_len` exceeds the group's
 /// `max_plaintext_frame_len` policy value plus exactly 1024 bytes of header
@@ -616,8 +624,21 @@ fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStreamError> {
         .map_err(|err| QuicTextStreamError::Certificate(err.to_string()))?;
     let cert_der = CertificateDer::from(certified_key.cert);
     let key_der = PrivatePkcs8KeyDer::from(certified_key.signing_key.serialize_der());
-    let server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], key_der.into())
+    // Build the rustls config directly (not via the quinn convenience
+    // constructor) so the direct-path ALPN `marmot.quic_stream.v1` is negotiated
+    // during the TLS handshake, per spec/transports/quic.md.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| QuicTextStreamError::Certificate(err.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der.into())
         .map_err(|err| QuicTextStreamError::Certificate(err.to_string()))?;
+    crypto.alpn_protocols = vec![QUIC_STREAM_ALPN_V1.to_vec()];
+    let server_config = ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(crypto)
+            .map_err(|err| QuicTextStreamError::Certificate(err.to_string()))?,
+    ));
     Ok((server_config, cert_der.as_ref().to_vec()))
 }
 
@@ -625,13 +646,24 @@ fn client_endpoint(
     trust: ServerTrust,
     server_addr: SocketAddr,
 ) -> Result<Endpoint, QuicTextStreamError> {
-    let client_config = match trust {
-        ServerTrust::Platform => ClientConfig::try_with_platform_verifier()?,
+    // Every direct-path client config negotiates the spec-mandated ALPN
+    // `marmot.quic_stream.v1`, so the rustls config is built here rather than via
+    // the quinn convenience constructors (which set no ALPN).
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?;
+    let mut crypto = match trust {
+        ServerTrust::Platform => builder
+            .with_platform_verifier()
+            .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?
+            .with_no_client_auth(),
         ServerTrust::CertificateDer(cert_der) => {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(CertificateDer::from(cert_der))?;
-            ClientConfig::with_root_certificates(Arc::new(roots))
-                .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?
+            builder
+                .with_root_certificates(Arc::new(roots))
+                .with_no_client_auth()
         }
         ServerTrust::InsecureLocal => {
             if !server_addr.ip().is_loopback() {
@@ -639,26 +671,20 @@ fn client_endpoint(
                     server_addr,
                 ));
             }
-            ClientConfig::new(Arc::new(
-                QuicClientConfig::try_from(insecure_client_crypto()?)
-                    .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?,
-            ))
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(SkipServerVerification::new(provider))
+                .with_no_client_auth()
         }
     };
+    crypto.alpn_protocols = vec![QUIC_STREAM_ALPN_V1.to_vec()];
+    let client_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto)
+            .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?,
+    ));
     let mut endpoint = Endpoint::client(LOCAL_BIND)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
-}
-
-fn insecure_client_crypto() -> Result<rustls::ClientConfig, QuicTextStreamError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    Ok(
-        rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()?
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new(provider))
-            .with_no_client_auth(),
-    )
 }
 
 async fn write_record(
@@ -824,6 +850,13 @@ pub enum QuicTextStreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_path_alpn_is_the_pinned_wire_value() {
+        // Wire-visible interop id; both peers must offer exactly this (quic.md).
+        assert_eq!(QUIC_STREAM_PROTOCOL_V1, "marmot.quic_stream.v1");
+        assert_eq!(QUIC_STREAM_ALPN_V1, b"marmot.quic_stream.v1");
+    }
 
     #[test]
     fn text_delta_splitter_preserves_utf8_boundaries() {

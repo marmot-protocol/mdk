@@ -22,6 +22,12 @@ pub struct MarmotAppConfig {
     /// requests to the local host. This does not affect component validity
     /// (decode still accepts loopback endpoints).
     pub allow_loopback_blob_endpoints: bool,
+    /// Dev/test override for the convergence settlement quiescence window, in
+    /// milliseconds. `None` (the default) uses the protocol-pinned value
+    /// (`settlement_quiescence_ms = 1000`); a client MUST NOT ship a non-default
+    /// value (spec/implementation-model.md, "Convergence Policy Overrides").
+    /// Test harnesses set `Some(0)` for deterministic, instant settlement.
+    pub dev_settlement_quiescence_ms: Option<u64>,
 }
 
 /// Compiled or app-level default service URLs for production telemetry export
@@ -45,6 +51,7 @@ impl Default for MarmotAppConfig {
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             service_endpoints: MarmotServiceEndpoints::compiled(),
             allow_loopback_blob_endpoints: false,
+            dev_settlement_quiescence_ms: None,
         }
     }
 }
@@ -64,6 +71,14 @@ impl MarmotAppConfig {
     /// default; production builds must leave this unset.
     pub fn with_allow_loopback_blob_endpoints(mut self, allow: bool) -> Self {
         self.allow_loopback_blob_endpoints = allow;
+        self
+    }
+
+    /// Dev/test override for the convergence settlement quiescence window (ms).
+    /// Off by default (the protocol-pinned `1000` ms is used); production builds
+    /// must leave this unset. Test harnesses set `0` for instant settlement.
+    pub fn with_dev_settlement_quiescence_ms(mut self, ms: u64) -> Self {
+        self.dev_settlement_quiescence_ms = Some(ms);
         self
     }
 }

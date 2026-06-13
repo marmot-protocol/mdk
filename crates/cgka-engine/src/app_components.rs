@@ -198,6 +198,112 @@ pub(crate) fn require_admin_for_staged_commit(
     require_admin(mls_group, group_id, sender)
 }
 
+fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
+    let basic = BasicCredential::try_from(cred).ok()?;
+    <[u8; 32]>::try_from(basic.identity()).ok()
+}
+
+/// Enforce the admin-policy resulting-epoch invariant
+/// (spec/app-components/admin-policy-v1.md): in the resulting epoch every admin
+/// key MUST correspond to an account with at least one member leaf. A commit
+/// that removes an account's last member leaf without dropping that account from
+/// `admins` (or otherwise leaves an admin with no leaf) is invalid.
+///
+/// Validated PRE-merge from the staged commit's resulting GroupContext and its
+/// membership changes: no transaction wraps `merge_staged_commit`, so a
+/// post-merge rejection could not be rolled back.
+pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    staged: &StagedCommit,
+) -> Result<(), EngineError> {
+    // Resulting admins come from the staged (provisional) app_data_dictionary, so
+    // an admin-policy update in this same commit is already reflected.
+    let Some(dict) = staged.group_context().extensions().app_data_dictionary() else {
+        return Ok(());
+    };
+    let Some(admin_bytes) = dict.dictionary().get(&GROUP_ADMIN_POLICY_COMPONENT_ID) else {
+        return Ok(());
+    };
+    let resulting_admins = decode_admin_policy(admin_bytes)?;
+    if resulting_admins.is_empty() {
+        return Ok(());
+    }
+
+    // Leaves this commit removes: by-reference Remove proposals plus SelfRemove.
+    let mut removed_leaves: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for remove in staged.remove_proposals() {
+        removed_leaves.insert(remove.remove_proposal().removed().u32());
+    }
+    for queued in staged.queued_proposals() {
+        if matches!(queued.proposal(), Proposal::SelfRemove)
+            && let Sender::Member(leaf) = queued.sender()
+        {
+            removed_leaves.insert(leaf.u32());
+        }
+    }
+
+    // Resulting member accounts: an account remains a member if ANY of its leaves
+    // survives (multi-device), so collect surviving current leaves plus added
+    // leaves by account.
+    let mut accounts: BTreeSet<[u8; 32]> = BTreeSet::new();
+    for member in mls_group.members() {
+        if removed_leaves.contains(&member.index.u32()) {
+            continue;
+        }
+        if let Some(pk) = credential_account_pubkey(member.credential) {
+            accounts.insert(pk);
+        }
+    }
+    for add in staged.add_proposals() {
+        if let Some(pk) = credential_account_pubkey(
+            add.add_proposal()
+                .key_package()
+                .leaf_node()
+                .credential()
+                .clone(),
+        ) {
+            accounts.insert(pk);
+        }
+    }
+
+    if resulting_admins
+        .iter()
+        .any(|admin| !accounts.contains(admin))
+    {
+        return Err(EngineError::Other(format!(
+            "admin-policy update is invalid: an admin key has no member leaf in the resulting epoch (group {group_id:?})"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an admin set that lists an admin with no member leaf in the CURRENT
+/// epoch (admin-policy-v1.md). Used on the outbound `UpdateAppComponents` path,
+/// where the commit changes only component bytes and not membership, so the
+/// resulting member set equals the current one.
+pub(crate) fn reject_admins_without_member_leaf(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    admins: &[[u8; 32]],
+) -> Result<(), EngineError> {
+    if admins.is_empty() {
+        return Ok(());
+    }
+    let mut accounts: BTreeSet<[u8; 32]> = BTreeSet::new();
+    for member in mls_group.members() {
+        if let Some(pk) = credential_account_pubkey(member.credential) {
+            accounts.insert(pk);
+        }
+    }
+    if admins.iter().any(|admin| !accounts.contains(admin)) {
+        return Err(EngineError::Other(format!(
+            "admin-policy update is invalid: an admin key has no member leaf (group {group_id:?})"
+        )));
+    }
+    Ok(())
+}
+
 fn reject_admin_self_remove_proposals(
     mls_group: &MlsGroup,
     group_id: &GroupId,

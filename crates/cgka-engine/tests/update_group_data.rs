@@ -603,6 +603,29 @@ async fn invalid_admin_policy_component_is_rejected() {
     assert!(matches!(err, EngineError::Serialize(_)));
 }
 
+#[tokio::test]
+async fn admin_policy_update_listing_non_member_is_rejected() {
+    // admin-policy-v1.md: every admin key must correspond to an account with a
+    // member leaf in the resulting epoch. Alice stays an admin (so this is not a
+    // last-admin removal), but `carol` is not a member, so the update is invalid.
+    let (mut alice, _bob, gid) = create_pair().await;
+    let alice_id = pad32(b"alice");
+    let carol_non_member = pad32(b"carol");
+
+    let err = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid,
+            updates: vec![AppComponentData {
+                component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+                data: encode_admin_policy_for_test(&[alice_id, carol_non_member]),
+            }],
+        })
+        .await
+        .expect_err("admin-policy listing a non-member must be rejected");
+
+    assert!(matches!(err, EngineError::Other(_)), "got {err:?}");
+}
+
 // ── Partial update ──────────────────────────────────────────────────────────
 
 #[tokio::test]

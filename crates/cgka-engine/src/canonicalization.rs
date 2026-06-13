@@ -229,12 +229,7 @@ fn canonicalize_internal(
 
     let mut materialized_graph =
         materialize_candidate_graph(&input, &unique_messages, materialized_candidates);
-    attach_app_witnesses(
-        &mut materialized_graph,
-        &unique_messages,
-        &input.state,
-        &input.policy,
-    );
+    attach_app_witnesses(&mut materialized_graph, &unique_messages, &input.policy);
     let selected_branch = select_canonical_branch(
         input.state.current_tip_epoch,
         &materialized_graph.candidates,
@@ -594,7 +589,6 @@ fn source_epoch_matches_parent(
 fn attach_app_witnesses(
     graph: &mut MaterializedGraph,
     unique_messages: &[&PeeledMessage],
-    state: &CanonicalizationState,
     policy: &CanonicalizationPolicy,
 ) {
     for message in unique_messages {
@@ -606,15 +600,21 @@ fn attach_app_witnesses(
         else {
             continue;
         };
-        if app_message_expired(state, policy, *epoch) {
-            continue;
-        }
         for branch_id in decrypts_on_branches {
             if let Some(candidate) = graph
                 .candidates
                 .iter_mut()
                 .find(|candidate| candidate.id == *branch_id)
             {
+                // Witness counting evaluates the retained app-payload window with
+                // the CANDIDATE's tip_epoch as the reference tip, not the global
+                // canonical tip (retained-history.md "App-payload retention" and
+                // convergence.md "App-payload witnesses"). Using current_tip_epoch
+                // here would count a different witness set than a spec-faithful
+                // client and select a different branch -> fork.
+                if app_message_expired(candidate.tip_epoch, policy, *epoch) {
+                    continue;
+                }
                 candidate.app_witnesses.push(AppWitness {
                     epoch: *epoch,
                     sender: message.sender.clone(),
@@ -698,7 +698,10 @@ fn handle_app_message(
             InvalidatedAppMessageReason::BeyondAnchor,
             decrypted_payload_ref,
         ));
-    } else if app_message_expired(&input.state, &input.policy, epoch) {
+    } else if app_message_expired(input.state.current_tip_epoch, &input.policy, epoch) {
+        // Delivery decisions use the canonical tip as the reference tip
+        // (retained-history.md). Witness counting uses the candidate tip instead;
+        // see attach_app_witnesses.
         result.invalidated_app_messages.push(invalidated_app(
             message,
             epoch,
@@ -819,11 +822,11 @@ fn has_blocking_convergence_error(result: &CanonicalizationResult) -> bool {
 }
 
 fn app_message_expired(
-    state: &CanonicalizationState,
+    reference_tip_epoch: u64,
     policy: &CanonicalizationPolicy,
     epoch: u64,
 ) -> bool {
-    state.current_tip_epoch.saturating_sub(epoch) > policy.app_message_past_epoch_limit
+    reference_tip_epoch.saturating_sub(epoch) > policy.app_message_past_epoch_limit
 }
 
 fn dropped(message: &PeeledMessage, reason: DroppedMessageReason) -> DroppedMessage {
@@ -858,5 +861,31 @@ impl CanonicalizationResult {
         self.queued_outbound_intents.sort();
         self.publishable_outbound_messages.sort();
         self.errors.sort();
+    }
+}
+
+#[cfg(test)]
+mod witness_window_tests {
+    use super::*;
+
+    #[test]
+    fn app_message_expired_is_relative_to_the_passed_reference_tip() {
+        // app_message_expired must gate on the reference tip it is GIVEN, so the
+        // witness path can pass the candidate's tip_epoch (not the global canonical
+        // tip). limit = app_message_past_epoch_limit (pinned 5 by default).
+        let policy = CanonicalizationPolicy::default();
+        let limit = policy.app_message_past_epoch_limit;
+        let epoch = 10;
+        // Within the window for a near reference tip.
+        assert!(!app_message_expired(epoch + limit, &policy, epoch));
+        // Just outside the window for a farther reference tip.
+        assert!(app_message_expired(epoch + limit + 1, &policy, epoch));
+        // A nearer (candidate) reference tip can keep a message in-window even when
+        // a farther (global) tip would expire it — the exact distinction this fix
+        // restores for witness counting.
+        let global_tip = epoch + limit + 5;
+        let candidate_tip = epoch + 1;
+        assert!(app_message_expired(global_tip, &policy, epoch));
+        assert!(!app_message_expired(candidate_tip, &policy, epoch));
     }
 }
