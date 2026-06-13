@@ -61,6 +61,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Added a scrollable TUI messages panel: Tab to the Messages focus and use Up/Down or `j`/`k` to scroll, plus
   PageUp/PageDown and Home/End from any focus. New messages stay pinned to the bottom unless you have scrolled up.
 
+### Fixed
+
+- The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
+  finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
+  status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
+
 ### Security
 
 - Hardened `dmd` IPC by making daemon-owned socket directories `0700`, daemon sockets `0600`, requiring same-UID
