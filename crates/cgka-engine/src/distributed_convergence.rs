@@ -428,6 +428,14 @@ impl<S: StorageProvider> Engine<S> {
         result: &CanonicalizationResult,
     ) -> Result<(), OpenMlsProjectionError> {
         for invalidated in &result.invalidated_app_messages {
+            // `UndecryptableInCanonicalState` is retryable: the message
+            // targets a future epoch we cannot peel yet and will be re-fed on
+            // a later canonicalize pass. Emitting `AppMessageInvalidated` here
+            // would tell the app the message is permanently gone (the client
+            // invalidates the timeline source row), so skip it for that reason.
+            if invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState {
+                continue;
+            }
             self.events_buf
                 .push_back(GroupEvent::AppMessageInvalidated {
                     group_id: group_id.clone(),
@@ -462,6 +470,13 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         for invalidated in &result.invalidated_app_messages {
+            // Skip the retryable reason: a future-epoch app message must stay
+            // eligible for a later canonicalize pass. Marking it seen would
+            // make canonicalization treat it as `AlreadySeen` and drop it
+            // before the awaited commit advances the epoch.
+            if invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState {
+                continue;
+            }
             if let Ok(bytes) = hex::decode(&invalidated.message_id) {
                 self.seen_message_ids
                     .insert(cgka_traits::types::MessageId::new(bytes));

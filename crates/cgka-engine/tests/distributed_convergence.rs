@@ -1482,6 +1482,151 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
     );
 }
 
+/// Regression for darkmatter#144: a future-epoch app message that is
+/// canonicalized as `UndecryptableInCanonicalState` (the retryable case — the
+/// commit advancing the group to the message's epoch has not been selected
+/// yet) must NOT be persisted as the terminal `EpochInvalidated`, and must not
+/// emit `AppMessageInvalidated`. Otherwise the buffered message can never
+/// re-enter convergence and is silently dropped once that commit arrives.
+///
+/// To reach the stored-convergence persistence path the pass must settle on a
+/// tip: here convergence selects the epoch-2 commit while the app message
+/// lives at epoch 3 (its commit withheld), so the message is classified
+/// `UndecryptableInCanonicalState` and persisted alongside the applied branch.
+///
+/// Note the retryable mapping is scoped to messages whose epoch is *beyond* the
+/// settled tip (here msg epoch 3 > tip 2). An `UndecryptableInCanonicalState`
+/// message at or below the settled tip is instead stranded — the awaited commit
+/// already passed on a branch it does not belong to — and stays terminal
+/// `EpochInvalidated`; mapping that case to `Retryable` would wedge convergence
+/// (it never clears, so the group reports perpetually unsettled and all later
+/// sends stall). That at/below-tip path is covered end-to-end by the CLI test
+/// `three_user_message_lifecycle_covers_invite_remove_and_later_delivery`.
+#[tokio::test]
+async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-future-epoch-retryable".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Alice advances the group epoch 1 -> 2 (invite david).
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite_david = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch2, pending) = evolution(invite_david);
+    alice.confirm_published(pending).await.unwrap();
+
+    // Alice advances the group epoch 2 -> 3 (invite eve), then sends an app
+    // message at epoch 3.
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let invite_eve = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch3, pending) = evolution(invite_eve);
+    alice.confirm_published(pending).await.unwrap();
+    let app_msg = send_app(&mut alice, &group_id, b"future epoch payload".to_vec()).await;
+
+    // Carol buffers the epoch-2 commit and the epoch-3 app message, but NOT
+    // the epoch-3 commit. Convergence settles on epoch 2; the app message has
+    // no candidate branch that decrypts it (it targets epoch 3), so it is
+    // classified UndecryptableInCanonicalState — the retryable case.
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit_to_epoch2, &group_id), 1_000)
+        .expect("epoch-2 commit buffered");
+    carol
+        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .expect("future app message buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence settles on the epoch-2 commit");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.invalidated_app_messages.iter().any(|invalidated| {
+            invalidated.message_id == hex::encode(app_msg.id.as_slice())
+                && invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState
+        }),
+        "future-epoch app message should be UndecryptableInCanonicalState, got {:?}",
+        result.invalidated_app_messages
+    );
+    // The fix: retryable, not terminal. Pre-fix this was EpochInvalidated and
+    // the message could never re-enter convergence.
+    assert_message_state(&carol_storage, &app_msg, MessageState::Retryable);
+
+    // The app must NOT have been told the message is permanently invalidated.
+    let events = carol.drain_events();
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated { message_id, .. } if *message_id == app_msg.id
+        )),
+        "retryable future-epoch app message must not emit AppMessageInvalidated, got {events:?}"
+    );
+
+    // Now the awaited epoch-3 commit arrives. Convergence must re-feed the
+    // buffered app message (it was kept Retryable and not marked seen) and
+    // apply it on the canonical branch.
+    carol
+        .buffer_openmls_convergence_message(&group_id, route(commit_to_epoch3, &group_id), 2_000)
+        .expect("epoch-3 commit buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .expect("convergence applies the re-fed app message after the commit lands");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        result.accepted_app_messages,
+        vec![hex::encode(app_msg.id.as_slice())]
+    );
+    assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
+
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                GroupEvent::MessageReceived { group_id: event_group, payload, .. }
+                    if *event_group == group_id && app_content(payload) == b"future epoch payload"
+            )
+        }),
+        "expected the previously-buffered app message to be delivered after the commit, got {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
