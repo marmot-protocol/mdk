@@ -1021,7 +1021,7 @@ impl TuiApp {
         }
 
         match key.code {
-            KeyCode::Char('?') if self.focus != Focus::Composer || self.input.is_empty() => {
+            KeyCode::Char('?') if self.focus != Focus::Composer => {
                 self.show_help = !self.show_help;
             }
             KeyCode::Char('q') if self.focus != Focus::Composer && self.input.is_empty() => {
@@ -5392,6 +5392,44 @@ mod tests {
         assert_eq!(messages_scroll_offsets(40, 10, 12), (12, 18));
         // Scrollback past the top clamps to the first line.
         assert_eq!(messages_scroll_offsets(40, 10, u16::MAX), (30, 0));
+    }
+
+    fn char_key(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn leading_question_mark_inserts_into_empty_composer() {
+        // Regression for darkmatter#200: a leading '?' in an empty composer
+        // used to toggle help and was swallowed instead of being inserted.
+        let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
+        app.focus = Focus::Composer;
+        assert!(app.input.is_empty());
+        assert!(!app.show_help);
+
+        app.handle_key(char_key('?')).expect("handle '?'");
+
+        assert_eq!(app.input, "?");
+        assert!(!app.show_help, "'?' in composer must not toggle help");
+
+        app.handle_key(char_key('h')).expect("handle 'h'");
+        app.handle_key(char_key('i')).expect("handle 'i'");
+        assert_eq!(app.input, "?hi");
+    }
+
+    #[test]
+    fn question_mark_toggles_help_outside_composer() {
+        // '?' still toggles help when the composer is not focused.
+        let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
+        app.focus = Focus::Chats;
+        assert!(!app.show_help);
+
+        app.handle_key(char_key('?')).expect("handle '?'");
+        assert!(app.show_help, "'?' outside composer toggles help on");
+        assert!(app.input.is_empty());
+
+        app.handle_key(char_key('?')).expect("handle '?'");
+        assert!(!app.show_help, "'?' outside composer toggles help off");
     }
 
     fn line_text(line: &Line<'_>) -> String {

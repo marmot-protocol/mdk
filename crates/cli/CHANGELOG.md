@@ -63,6 +63,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- The TUI composer now accepts a leading `?` instead of swallowing it to toggle help. Previously, typing or pasting a
+  message that started with `?` into an empty composer toggled the help panel and dropped the character, making it
+  impossible to compose such messages. The `?` help shortcut now applies only when the composer is not focused; the
+  `/help` and `/?` slash spellings remain available.
 - The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
   finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
   status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
