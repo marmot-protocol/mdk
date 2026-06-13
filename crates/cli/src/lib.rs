@@ -1174,6 +1174,13 @@ pub(crate) enum DmError {
         account_id: String,
         source_relays: Vec<String>,
     },
+    #[error("message pagination requires {timestamp_flag} and {message_id_flag} together")]
+    MessagePaginationCursorMismatch {
+        timestamp_flag: &'static str,
+        message_id_flag: &'static str,
+    },
+    #[error("message pagination cannot use before and after cursors together")]
+    MessagePaginationConflictingCursors,
 }
 
 pub async fn run_from<I, T>(args: I) -> CliOutput
@@ -3015,6 +3022,12 @@ pub(crate) async fn message_command_with_runtime(
             after_message_id,
             limit,
         } => {
+            validate_message_list_cursors(
+                before,
+                before_message_id.as_deref(),
+                after,
+                after_message_id.as_deref(),
+            )?;
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
@@ -4917,6 +4930,30 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Vec<Value> {
         .collect()
 }
 
+fn validate_message_list_cursors(
+    before: Option<u64>,
+    before_message_id: Option<&str>,
+    after: Option<u64>,
+    after_message_id: Option<&str>,
+) -> Result<(), DmError> {
+    if before.is_some() != before_message_id.is_some() {
+        return Err(DmError::MessagePaginationCursorMismatch {
+            timestamp_flag: "--before",
+            message_id_flag: "--before-message-id",
+        });
+    }
+    if after.is_some() != after_message_id.is_some() {
+        return Err(DmError::MessagePaginationCursorMismatch {
+            timestamp_flag: "--after",
+            message_id_flag: "--after-message-id",
+        });
+    }
+    if before.is_some() && after.is_some() {
+        return Err(DmError::MessagePaginationConflictingCursors);
+    }
+    Ok(())
+}
+
 fn apply_message_cursors(
     mut messages: Vec<AppMessageRecord>,
     before: Option<u64>,
@@ -5692,6 +5729,22 @@ fn dm_error_json(err: &DmError) -> Value {
                 "retry_with_relay": "--relay <relay-that-has-the-current-list>",
             },
         }),
+        DmError::MessagePaginationCursorMismatch {
+            timestamp_flag,
+            message_id_flag,
+        } => json!({
+            "code": "message_pagination_cursor_mismatch",
+            "message": err.to_string(),
+            "timestamp_flag": timestamp_flag,
+            "message_id_flag": message_id_flag,
+            "repair": {
+                "supply_both": format!("pass {timestamp_flag} and {message_id_flag} together"),
+            },
+        }),
+        DmError::MessagePaginationConflictingCursors => json!({
+            "code": "message_pagination_conflicting_cursors",
+            "message": err.to_string(),
+        }),
         DmError::AccountHome(err) => account_home_error_json(err),
         DmError::App(err) => app_error_json(err),
         DmError::QuicStream(err) => json!({
@@ -6059,7 +6112,7 @@ mod tests {
         AppMessageRecord, DmError, GlobalRelayDefaults, apply_global_relay_defaults,
         apply_message_cursors, default_home_from_env, first_quic_candidate_is_loopback,
         parse_quic_candidate, quic_candidate_host, relay_endpoints, relay_stats_output,
-        relay_stats_plain, resolve_relay,
+        relay_stats_plain, resolve_relay, validate_message_list_cursors,
     };
     use marmot_app::{
         DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -6329,5 +6382,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    #[test]
+    fn message_list_cursors_accept_valid_compound_and_no_cursor() {
+        assert!(validate_message_list_cursors(None, None, None, None).is_ok());
+        assert!(validate_message_list_cursors(Some(101), Some("d"), None, None).is_ok());
+        assert!(validate_message_list_cursors(None, None, Some(100), Some("a")).is_ok());
+    }
+
+    #[test]
+    fn message_list_cursors_reject_lone_before_message_id() {
+        let err = validate_message_list_cursors(None, Some("d"), None, None)
+            .expect_err("lone --before-message-id must be rejected");
+        assert!(matches!(
+            err,
+            DmError::MessagePaginationCursorMismatch {
+                timestamp_flag: "--before",
+                message_id_flag: "--before-message-id",
+            }
+        ));
+    }
+
+    #[test]
+    fn message_list_cursors_reject_lone_after_message_id() {
+        let err = validate_message_list_cursors(None, None, None, Some("a"))
+            .expect_err("lone --after-message-id must be rejected");
+        assert!(matches!(
+            err,
+            DmError::MessagePaginationCursorMismatch {
+                timestamp_flag: "--after",
+                message_id_flag: "--after-message-id",
+            }
+        ));
+    }
+
+    #[test]
+    fn message_list_cursors_reject_lone_before_timestamp() {
+        let err = validate_message_list_cursors(Some(101), None, None, None)
+            .expect_err("lone --before timestamp must be rejected");
+        assert!(matches!(
+            err,
+            DmError::MessagePaginationCursorMismatch {
+                timestamp_flag: "--before",
+                message_id_flag: "--before-message-id",
+            }
+        ));
+    }
+
+    #[test]
+    fn message_list_cursors_reject_before_and_after_together() {
+        let err = validate_message_list_cursors(Some(101), Some("d"), Some(100), Some("a"))
+            .expect_err("before and after cursors cannot be combined");
+        assert!(matches!(err, DmError::MessagePaginationConflictingCursors));
     }
 }

@@ -63,6 +63,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `dm messages list` now validates its pagination cursor flags instead of silently mishandling them. Previously,
+  `--before-message-id`/`--after-message-id` were ignored unless the matching `--before`/`--after` timestamp was also
+  supplied, and any lone cursor flag combined with `--limit` returned the oldest N messages instead of the newest.
+  Supplying a message-id cursor without its timestamp (or vice versa), or combining `--before*` with `--after*`, now
+  returns a clear error (`message_pagination_cursor_mismatch` / `message_pagination_conflicting_cursors`), matching the
+  `dm messages timeline list` behavior.
 - The TUI composer now accepts a leading `?` instead of swallowing it to toggle help. Previously, typing or pasting a
   message that started with `?` into an empty composer toggled the help panel and dropped the character, making it
   impossible to compose such messages. The `?` help shortcut now applies only when the composer is not focused; the
