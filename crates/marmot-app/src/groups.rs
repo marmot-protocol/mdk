@@ -266,7 +266,17 @@ impl AppGroupRecord {
                 via_welcome_message_id_hex,
                 welcomer_account_id_hex,
             } => {
-                if !self.pending_confirmation && self.via_welcome_message_id_hex.is_some() {
+                // Short-circuit only on a true replay: an already-resolved
+                // group (accepted or declined, so `pending_confirmation` is
+                // false) whose recorded welcome id matches the incoming one.
+                // A genuine re-invite carries a *different* `via_welcome` id and
+                // must re-surface as pending even though MLS auto-joined, so the
+                // pending-invite projection stays visible until accepted
+                // (see darkmatter#184).
+                if !self.pending_confirmation
+                    && self.via_welcome_message_id_hex.as_deref()
+                        == Some(via_welcome_message_id_hex.as_str())
+                {
                     return;
                 }
                 self.pending_confirmation = true;
@@ -992,5 +1002,126 @@ mod avatar_url_tests {
             AppGroupAvatarUrlComponent::new("http://cdn.example.com/a.png".to_owned(), None, None)
                 .unwrap_err();
         assert!(matches!(err, AppError::InvalidGroupAvatarUrl(_)));
+    }
+}
+
+#[cfg(test)]
+mod confirmation_state_tests {
+    use super::*;
+
+    fn test_record() -> AppGroupRecord {
+        let routing = AppGroupNostrRoutingComponent::new(NostrRoutingV1 {
+            nostr_group_id: [0u8; 32],
+            relays: vec!["wss://relay.example.com".to_owned()],
+        })
+        .expect("routing component");
+        AppGroupRecord::new(
+            hex::encode([1u8; 32]),
+            routing,
+            "group".to_owned(),
+            "desc".to_owned(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )
+    }
+
+    fn pending(via_welcome: &str, welcomer: Option<&str>) -> GroupConfirmationProjection {
+        GroupConfirmationProjection::Pending {
+            via_welcome_message_id_hex: via_welcome.to_owned(),
+            welcomer_account_id_hex: welcomer.map(str::to_owned),
+        }
+    }
+
+    // A genuine re-invite (a new GroupJoined carrying a *different* welcome id)
+    // after the user accepted must re-surface the group as pending and record
+    // the new welcome/welcomer. Regression test for darkmatter#184.
+    #[test]
+    fn reinvite_after_accept_resurfaces_as_pending() {
+        let mut record = test_record();
+
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        assert!(record.pending_confirmation);
+
+        // User accepts: pending cleared, welcome id retained.
+        record.apply_confirmation_state(GroupConfirmationProjection::Accepted);
+        assert!(!record.pending_confirmation);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-1")
+        );
+
+        // Genuine re-invite: a different welcome id must re-mark pending and
+        // update the recorded welcome/welcomer fields.
+        record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
+        assert!(record.pending_confirmation);
+        assert!(!record.archived);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-2")
+        );
+        assert_eq!(
+            record.welcomer_account_id_hex.as_deref(),
+            Some("welcomer-2")
+        );
+    }
+
+    // A re-invite after the user declined (pending=false, archived=true) must
+    // also re-surface the group as a fresh pending invite.
+    #[test]
+    fn reinvite_after_decline_resurfaces_as_pending() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("welcome-1", None));
+
+        // Simulate decline: leave + archive, pending cleared, welcome retained.
+        record.pending_confirmation = false;
+        record.archived = true;
+
+        record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
+        assert!(record.pending_confirmation);
+        assert!(!record.archived);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-2")
+        );
+        assert_eq!(
+            record.welcomer_account_id_hex.as_deref(),
+            Some("welcomer-2")
+        );
+    }
+
+    // A true replay (same welcome id on an already-resolved group) must NOT
+    // re-mark pending — otherwise an accepted/declined group would bounce back
+    // to the invite list on every redelivered GroupJoined.
+    #[test]
+    fn replay_same_welcome_id_does_not_resurface() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        record.apply_confirmation_state(GroupConfirmationProjection::Accepted);
+        assert!(!record.pending_confirmation);
+
+        // Redelivery of the same welcome id is a replay: stay resolved.
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        assert!(!record.pending_confirmation);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-1")
+        );
+    }
+
+    // While a group is still pending, a redelivered welcome (same or different
+    // id) keeps it pending and refreshes the welcome metadata.
+    #[test]
+    fn pending_record_keeps_pending_on_redelivery() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        assert!(record.pending_confirmation);
+
+        record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
+        assert!(record.pending_confirmation);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-2")
+        );
     }
 }
