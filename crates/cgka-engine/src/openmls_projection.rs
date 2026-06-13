@@ -144,6 +144,7 @@ struct StoredOpenMlsCandidatePathResult {
 enum CandidatePathProbeResult {
     Materialized(Option<OpenMlsMaterializedCandidate>),
     UnauthorizedCommit { message_id: String },
+    InvalidCommit { message_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +203,7 @@ pub enum OpenMlsProjectionError {
     Snapshot(String),
     Replay(String),
     UnauthorizedCommit { message_id: String },
+    InvalidCommit { message_id: String, reason: String },
     Serialize(String),
     Storage(String),
     InvalidPolicy(String),
@@ -225,6 +227,9 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::Replay(e) => write!(f, "OpenMLS replay failed: {e}"),
             OpenMlsProjectionError::UnauthorizedCommit { message_id } => {
                 write!(f, "unauthorized admin-gated commit: {message_id}")
+            }
+            OpenMlsProjectionError::InvalidCommit { message_id, reason } => {
+                write!(f, "invalid commit {message_id}: {reason}")
             }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
             OpenMlsProjectionError::Storage(e) => write!(f, "storage failed: {e}"),
@@ -687,6 +692,14 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                         });
                         continue;
                     }
+                    CandidatePathProbeResult::InvalidCommit { message_id, .. } => {
+                        invalid_commit_drops.push(DroppedMessage {
+                            message_id,
+                            kind: MessageKind::Commit,
+                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                        });
+                        continue;
+                    }
                 };
 
                 extended = true;
@@ -746,6 +759,10 @@ fn probe_candidate_path<S: StorageProvider>(
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
             Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
         }
+        Err(OpenMlsProjectionError::InvalidCommit {
+            message_id,
+            reason: _,
+        }) => Ok(CandidatePathProbeResult::InvalidCommit { message_id }),
         Err(OpenMlsProjectionError::Replay(_)) => Ok(CandidatePathProbeResult::Materialized(None)),
         Err(err) => Err(err),
     }
@@ -1355,9 +1372,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             Err(e) => return Err(replay_error("process_message", e)),
         };
-        let sender = sender_identity(processed.sender(), &mls_group);
-        let sender_id = sender.clone().map(MemberId::new);
-        let sender = sender.unwrap_or_default();
+        let sender_id = sender_member_id(processed.sender(), &mls_group);
+        let sender = sender_id
+            .as_ref()
+            .map(|id| id.as_slice().to_vec())
+            .unwrap_or_default();
 
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
@@ -1397,23 +1416,25 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
                 let committer = sender.clone();
                 // foundation/identity.md: deferred commits replayed during
-                // convergence are an inbound credential ingress too. Reject a
-                // commit that would add a member with an invalid x-only
-                // secp256k1 credential identity before merging it.
-                for add in staged.add_proposals() {
-                    let leaf = add.add_proposal().key_package().leaf_node();
-                    let validation =
-                        crate::identity::validated_member_id_of_leaf(leaf).and_then(|_| {
-                            crate::account_identity_proof::validate_leaf_account_identity_proof(
-                                leaf,
-                                crate::DEFAULT_CIPHERSUITE,
-                            )
-                        });
-                    if let Err(err) = validation {
-                        return Err(OpenMlsProjectionError::Replay(format!(
-                            "invalid added credential identity or account proof: {err}"
-                        )));
-                    }
+                // convergence are an inbound credential ingress too. Reject
+                // commits that introduce or mutate a member LeafNode whose
+                // credential identity is invalid, lacks a valid account proof,
+                // or no longer matches the member identity being updated.
+                // Replay only needs the validation result; the returned added
+                // member ids are used by the live apply path to emit state
+                // changes before merge.
+                if let Err(err) =
+                    crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                        &staged,
+                        &mls_group,
+                        &sender_id.clone().expect("checked above"),
+                        mls_group.ciphersuite(),
+                    )
+                {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: format!("invalid credential identity or account proof: {err}"),
+                    });
                 }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged
@@ -1582,13 +1603,12 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
     )
 }
 
-fn sender_identity(sender: &Sender, group: &MlsGroup) -> Option<Vec<u8>> {
+fn sender_member_id(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
     let Sender::Member(leaf_idx) = sender else {
         return None;
     };
     let member = group.member_at(*leaf_idx)?;
-    let basic = BasicCredential::try_from(member.credential).ok()?;
-    Some(basic.identity().to_vec())
+    crate::identity::validated_member_id(&member.credential).ok()
 }
 
 fn message_digest(bytes: &[u8]) -> [u8; 32] {

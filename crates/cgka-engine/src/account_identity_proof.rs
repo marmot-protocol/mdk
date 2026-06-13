@@ -6,7 +6,9 @@
 //! as admin authorization, can safely trust the credential identity.
 
 use cgka_traits::error::EngineError;
+use cgka_traits::types::MemberId;
 use openmls::extensions::{Extension, ExtensionType, UnknownExtension};
+use openmls::group::{MlsGroup, StagedCommit};
 use openmls::prelude::{BasicCredential, LeafNode, SignatureScheme};
 use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
@@ -168,6 +170,63 @@ pub(crate) fn validate_leaf_account_identity_proof(
             "proof signature does not verify for credential identity".into(),
         )
     })
+}
+
+pub(crate) fn validate_leaf_account_identity_proof_for_member(
+    leaf: &LeafNode,
+    ciphersuite: Ciphersuite,
+    expected_member_id: &MemberId,
+    context: &str,
+) -> Result<(), EngineError> {
+    let actual_member_id = crate::identity::validated_member_id_of_leaf(leaf)?;
+    validate_leaf_account_identity_proof(leaf, ciphersuite)?;
+    if actual_member_id != *expected_member_id {
+        return Err(EngineError::InvalidAccountIdentityProof(format!(
+            "{context} credential identity does not match existing member identity"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_staged_commit_account_identity_proofs(
+    staged: &StagedCommit,
+    group: &MlsGroup,
+    committer: &MemberId,
+    ciphersuite: Ciphersuite,
+) -> Result<Vec<MemberId>, EngineError> {
+    let mut added = Vec::new();
+
+    for add in staged.add_proposals() {
+        let leaf = add.add_proposal().key_package().leaf_node();
+        validate_leaf_account_identity_proof(leaf, ciphersuite)?;
+        added.push(crate::identity::validated_member_id_of_leaf(leaf)?);
+    }
+
+    for update in staged.update_proposals() {
+        let expected =
+            crate::identity::member_id_of_sender(update.sender(), group).ok_or_else(|| {
+                EngineError::InvalidAccountIdentityProof(
+                    "Update proposal has no authenticated member sender".into(),
+                )
+            })?;
+        validate_leaf_account_identity_proof_for_member(
+            update.update_proposal().leaf_node(),
+            ciphersuite,
+            &expected,
+            "Update proposal",
+        )?;
+    }
+
+    if let Some(update_path_leaf) = staged.update_path_leaf_node() {
+        validate_leaf_account_identity_proof_for_member(
+            update_path_leaf,
+            ciphersuite,
+            committer,
+            "commit update path",
+        )?;
+    }
+
+    Ok(added)
 }
 
 pub(crate) fn account_identity_proof_capability() -> ExtensionType {

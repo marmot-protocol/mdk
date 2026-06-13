@@ -10,7 +10,11 @@ use cgka_traits::storage::{
 };
 use cgka_traits::types::MemberId;
 use openmls::extensions::Extension;
-use openmls::prelude::{BasicCredential, Credential, CredentialWithKey, LeafNode, SignatureScheme};
+use openmls::group::MlsGroup;
+use openmls::prelude::{
+    BasicCredential, Credential, CredentialWithKey, LeafNode, LeafNodeIndex, Sender,
+    SignatureScheme,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
 
@@ -147,6 +151,18 @@ pub(crate) fn validated_member_id(credential: &Credential) -> Result<MemberId, E
 /// in-tree leaf). Returns the validated `MemberId`.
 pub(crate) fn validated_member_id_of_leaf(leaf: &LeafNode) -> Result<MemberId, EngineError> {
     validated_member_id(leaf.credential())
+}
+
+pub(crate) fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
+    match sender {
+        Sender::Member(leaf_idx) => member_id_at_leaf(group, *leaf_idx),
+        _ => None,
+    }
+}
+
+pub(crate) fn member_id_at_leaf(group: &MlsGroup, leaf_idx: LeafNodeIndex) -> Option<MemberId> {
+    let member = group.member_at(leaf_idx)?;
+    validated_member_id(&member.credential).ok()
 }
 
 #[cfg(test)]

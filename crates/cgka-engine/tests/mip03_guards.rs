@@ -8,6 +8,7 @@
 
 use async_trait::async_trait;
 use cgka_engine::app_components::staged_commit_requires_admin;
+use cgka_engine::canonicalization::DroppedMessageReason;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
@@ -24,11 +25,13 @@ use cgka_traits::transport::{
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{PreSharedKeyProposal, Proposal};
+use openmls::prelude::{BasicCredential, CredentialWithKey, LeafNodeParameters};
 use openmls::schedule::PreSharedKeyId;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
 use storage_sqlite::SqliteAccountStorage;
+use tls_codec::Serialize as _;
 
 mod support;
 use support::proof_signer;
@@ -63,6 +66,13 @@ fn hash_id(b: &[u8]) -> MessageId {
     let mut h = DefaultHasher::new();
     b.hash(&mut h);
     MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+fn canonicalization_message_id(msg: &TransportMessage) -> String {
+    // Stored OpenMLS canonicalization keys commit candidates by MLS payload
+    // digest, not by the transport envelope id used by the live ingest path.
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(&msg.payload))
 }
 
 #[async_trait]
@@ -217,6 +227,266 @@ fn requires_admin_for_proposals(
         .clear_pending_commit(provider.storage())
         .expect("clear pending commit");
     requires_admin
+}
+
+fn spoofed_self_update_commit(
+    storage: &SqliteAccountStorage,
+    crypto: &RustCrypto,
+    attacker: &MemberId,
+    victim: &MemberId,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(crypto, storage.mls_storage());
+    let (mut mls_group, signer) = load_group_and_signer(storage, crypto, attacker, group_id);
+    let spoofed_credential = CredentialWithKey {
+        credential: BasicCredential::new(victim.as_slice().to_vec()).into(),
+        signature_key: signer.public().into(),
+    };
+    let leaf_node_parameters = LeafNodeParameters::builder()
+        .with_credential_with_key(spoofed_credential)
+        .build();
+    let commit_bundle = mls_group
+        .self_update(&provider, &signer, leaf_node_parameters)
+        .expect("attacker can build spoofed self-update at OpenMLS layer");
+    let (commit_out, _welcome_opt, _group_info) = commit_bundle.into_contents();
+    let commit_bytes = commit_out
+        .tls_serialize_detached()
+        .expect("serialize spoofed self-update commit");
+
+    TransportMessage {
+        id: hash_id(&commit_bytes),
+        payload: commit_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+fn spoofed_update_proposal(
+    storage: &SqliteAccountStorage,
+    crypto: &RustCrypto,
+    attacker: &MemberId,
+    victim: &MemberId,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(crypto, storage.mls_storage());
+    let (mut mls_group, signer) = load_group_and_signer(storage, crypto, attacker, group_id);
+    let spoofed_credential = CredentialWithKey {
+        credential: BasicCredential::new(victim.as_slice().to_vec()).into(),
+        signature_key: signer.public().into(),
+    };
+    let leaf_node_parameters = LeafNodeParameters::builder()
+        .with_credential_with_key(spoofed_credential)
+        .build();
+    let (proposal_out, _proposal_ref) = mls_group
+        .propose_self_update(&provider, &signer, leaf_node_parameters)
+        .expect("attacker can build spoofed update proposal at OpenMLS layer");
+    let proposal_bytes = proposal_out
+        .tls_serialize_detached()
+        .expect("serialize spoofed update proposal");
+
+    TransportMessage {
+        id: hash_id(&proposal_bytes),
+        payload: proposal_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("malicious-openmls-proposal".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+fn commit_pending_proposals(
+    storage: &SqliteAccountStorage,
+    crypto: &RustCrypto,
+    committer: &MemberId,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(crypto, storage.mls_storage());
+    let (mut mls_group, signer) = load_group_and_signer(storage, crypto, committer, group_id);
+    let (commit_out, _welcome_opt, _group_info) = mls_group
+        .commit_to_pending_proposals(&provider, &signer)
+        .expect("committer can build by-reference update commit");
+    let commit_bytes = commit_out
+        .tls_serialize_detached()
+        .expect("serialize by-reference update commit");
+
+    TransportMessage {
+        id: hash_id(&commit_bytes),
+        payload: commit_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-commit".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn inbound_self_update_rejects_account_identity_spoofing() {
+    // A non-admin self-update is an allowed commit shape, but the new update
+    // path leaf must still prove and preserve the committer's account identity.
+    // Without Marmot's per-update validation, OpenMLS accepts a self-update that
+    // keeps Bob's MLS signature key while changing the credential identity to
+    // Alice's admin account pubkey.
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "spoofed-self-update".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let before_epoch = alice.epoch(&group_id).expect("alice has group");
+    let crypto = RustCrypto::default();
+    let spoofed = spoofed_self_update_commit(
+        &bob_storage,
+        &crypto,
+        &bob.self_id(),
+        &alice.self_id(),
+        &group_id,
+    );
+
+    let spoofed_id = canonicalization_message_id(&spoofed);
+
+    let outcome = alice.ingest(spoofed).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::PeelFailed
+            }
+        ),
+        "terminally invalid same-epoch commits should not remain buffered, got {outcome:?}"
+    );
+    let result = alice
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence should classify spoofed update");
+    assert!(
+        result.accepted_commits.is_empty(),
+        "spoofed self-update must not be accepted, got {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == spoofed_id
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        }),
+        "spoofed self-update must be terminally invalidated, got {result:?}"
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), before_epoch);
+}
+
+#[tokio::test]
+async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
+    // Lock the `staged.update_proposals()` arm independently from the direct
+    // update-path test above: Bob first queues a spoofed Update proposal, then
+    // Alice commits it by reference. Recipients must validate Bob's proposed new
+    // leaf against Bob's pre-merge account identity before applying the commit.
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let (mut carol, _carol_storage) = build_with_storage(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "spoofed-by-reference-update".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    let crypto = RustCrypto::default();
+    let spoofed_proposal = spoofed_update_proposal(
+        &bob_storage,
+        &crypto,
+        &bob.self_id(),
+        &alice.self_id(),
+        &group_id,
+    );
+
+    assert!(matches!(
+        alice.ingest(spoofed_proposal.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert!(matches!(
+        carol.ingest(spoofed_proposal).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+
+    let before_epoch = carol.epoch(&group_id).expect("carol has group");
+    let by_reference_commit =
+        commit_pending_proposals(&alice_storage, &crypto, &alice.self_id(), &group_id);
+    let commit_id = canonicalization_message_id(&by_reference_commit);
+
+    let outcome = carol.ingest(by_reference_commit).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::PeelFailed
+            }
+        ),
+        "terminally invalid by-reference Update commits should not remain buffered, got {outcome:?}"
+    );
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence should classify spoofed by-reference update");
+    assert!(
+        result.accepted_commits.is_empty(),
+        "spoofed by-reference Update must not be accepted, got {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == commit_id
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        }),
+        "spoofed by-reference Update must be terminally invalidated, got {result:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), before_epoch);
 }
 
 #[tokio::test]

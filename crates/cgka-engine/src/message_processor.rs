@@ -11,6 +11,7 @@
 use crate::engine::Engine;
 use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
+use crate::identity::{member_id_at_leaf, member_id_of_sender};
 use crate::openmls_projection::{
     OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
@@ -33,7 +34,7 @@ use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::messages::proposals::{AppDataUpdateOperation, ProposalOrRef};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProcessedMessage,
-    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, Sender, ValidationError,
+    ProcessedMessageContent, Proposal, ProtocolMessage, ProtocolVersion, ValidationError,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -619,27 +620,22 @@ impl<S: StorageProvider> Engine<S> {
                     };
                     let commit_priority =
                         crate::app_components::commit_ordering_priority_for_staged(&staged);
-                    // foundation/identity.md: reject an inbound commit that
-                    // would add a member whose credential identity is not a
-                    // valid x-only secp256k1 public key, before it mutates
-                    // canonical state.
-                    let mut added = Vec::new();
-                    for add in staged.add_proposals() {
-                        let leaf = add.add_proposal().key_package().leaf_node();
-                        match crate::identity::validated_member_id_of_leaf(leaf).and_then(|id| {
-                            crate::account_identity_proof::validate_leaf_account_identity_proof(
-                                leaf,
-                                self.ciphersuite,
-                            )?;
-                            Ok(id)
-                        }) {
-                            Ok(id) => added.push(id),
-                            Err(err) => {
-                                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                                return Err(err);
-                            }
+                    // foundation/identity.md: reject inbound commits that
+                    // introduce or mutate a member LeafNode whose credential
+                    // identity is invalid, lacks a valid account proof, or no
+                    // longer matches the member identity being updated.
+                    let added = match crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                        &staged,
+                        &mls_group,
+                        &commit_committer,
+                        self.ciphersuite,
+                    ) {
+                        Ok(added) => added,
+                        Err(err) => {
+                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                            return Err(err);
                         }
-                    }
+                    };
                     // Classify departures before the merge consumes the staged
                     // commit and the leaving leaves disappear: a SelfRemove is a
                     // member leaving (attributed to themselves); a Remove is an
@@ -1908,22 +1904,6 @@ pub(crate) fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>
         snapshot(cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID),
         snapshot(cgka_traits::app_components::GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
     ]
-}
-
-fn member_id_of_sender(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
-    match sender {
-        Sender::Member(leaf_idx) => member_id_at_leaf(group, *leaf_idx),
-        _ => None,
-    }
-}
-
-fn member_id_at_leaf(
-    group: &MlsGroup,
-    leaf_idx: openmls::prelude::LeafNodeIndex,
-) -> Option<MemberId> {
-    let member = group.member_at(leaf_idx)?;
-    let basic = BasicCredential::try_from(member.credential).ok()?;
-    Some(MemberId::new(basic.identity().to_vec()))
 }
 
 fn record_group_id(msg: &TransportMessage) -> GroupId {
