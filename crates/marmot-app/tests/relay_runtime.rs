@@ -3036,7 +3036,7 @@ async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
 }
 
 #[tokio::test]
-async fn relay_list_fetch_only_uses_requested_bootstrap_relays() {
+async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -3045,12 +3045,14 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays() {
     let _relays = (seed_a, seed_b);
     let app = MarmotApp::with_relay(dir.path(), seed_a_url.clone());
 
-    app.publish_account_relay_lists(
+    publish_account_relay_lists_at(
+        &home,
         "alice",
-        AccountRelayListBootstrap::new(vec![endpoint(&seed_a_url)], vec![endpoint(&seed_a_url)]),
+        &seed_a_url,
+        &seed_a_url,
+        test_unix_now_seconds(),
     )
-    .await
-    .unwrap();
+    .await;
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let missing_from_seed_b = app
@@ -3061,6 +3063,41 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays() {
     assert!(!missing_from_seed_b.complete);
     assert_eq!(missing_from_seed_b.missing, vec!["nip65", "inbox"]);
     assert_eq!(missing_from_seed_b.bootstrap_relays, vec![seed_b_url]);
+}
+
+#[tokio::test]
+async fn relay_list_empty_fetch_keeps_cached_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let (seed_a, seed_a_url) = mock_relay().await;
+    let (seed_b, seed_b_url) = mock_relay().await;
+    let _relays = (seed_a, seed_b);
+    let app = MarmotApp::with_relay(dir.path(), seed_a_url.clone());
+
+    let cached = app
+        .publish_account_relay_lists(
+            "alice",
+            AccountRelayListBootstrap::new(
+                vec![endpoint(&seed_a_url)],
+                vec![endpoint(&seed_a_url)],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let account_id = home.account("alice").unwrap().account_id_hex;
+    let fetched = app
+        .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_b_url)])
+        .await
+        .unwrap();
+
+    assert_eq!(fetched, cached);
+    let directory_entry = app
+        .directory_entry_for_account_id(&account_id)
+        .unwrap()
+        .expect("cached directory entry");
+    assert_eq!(directory_entry.relay_lists, cached);
 }
 
 #[tokio::test]

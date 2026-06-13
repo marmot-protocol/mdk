@@ -1771,13 +1771,15 @@ impl MarmotApp {
             .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
         let mut status = selection.value;
-        if selection.rejected_future {
+        if selection.rejected_future || !relay_lists_have_any_relays(&status) {
             let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
             if relay_lists_have_any_relays(&cached) {
                 if !relay_lists_have_any_relays(&status) {
                     return Ok(cached);
                 }
-                fill_missing_relay_lists_from_cached(&mut status, &cached);
+                if selection.rejected_future {
+                    fill_missing_relay_lists_from_cached(&mut status, &cached);
+                }
             }
         }
         if status.bootstrap_relays.is_empty() {
