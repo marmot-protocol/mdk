@@ -1709,10 +1709,7 @@ async fn future_epoch_app_message_stays_retryable_until_commit_arrives() {
         .expect("convergence applies the re-fed app message after the commit lands");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert_eq!(
-        result.accepted_app_messages,
-        vec![content_hex(&app_msg)]
-    );
+    assert_eq!(result.accepted_app_messages, vec![content_hex(&app_msg)]);
     assert_message_state(&carol_storage, &app_msg, MessageState::Processed);
 
     let events = carol.drain_events();
