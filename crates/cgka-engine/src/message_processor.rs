@@ -1899,7 +1899,7 @@ fn process_commit_with_app_data_updates<S: StorageProvider>(
 /// "absent" encoding both collapse to `None`, so this inbound diff matches the
 /// own-commit diff in `update_group_data` and a "clear an already-absent
 /// avatar" commit converges to no row on every client.
-fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
+pub(crate) fn avatar_component_snapshot(mls_group: &MlsGroup) -> [Option<Vec<u8>>; 2] {
     let snapshot = |component_id| {
         crate::app_components::app_component_data_of_group(mls_group, component_id)
             .filter(|bytes| crate::app_components::avatar_component_present(component_id, bytes))

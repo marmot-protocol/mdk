@@ -18,6 +18,10 @@ use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 
+/// Admin pubkeys + avatar component bytes snapshotted on either side of a
+/// convergence apply, for the unattributed group-state-change diffs.
+type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2]);
+
 impl<S: StorageProvider> Engine<S> {
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
         self.convergence_policy = policy;
@@ -167,6 +171,12 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        // Pre-apply admin/avatar component snapshot, mirroring the direct
+        // inbound seam's before-state capture so the reorg path can emit the
+        // same profile/admin state-change events. Best-effort: a group whose
+        // MLS state isn't loadable just skips those diffs.
+        let previous_components = self.reorg_component_snapshot(group_id);
+        let previous_name = previous_group.name.clone();
         let previous_tip = self
             .epoch_manager
             .epoch(group_id)
@@ -270,6 +280,8 @@ impl<S: StorageProvider> Engine<S> {
             self.emit_convergence_events(
                 group_id,
                 previous_group.members,
+                &previous_name,
+                previous_components,
                 previous_tip,
                 selected_tip,
             )?;
@@ -281,10 +293,37 @@ impl<S: StorageProvider> Engine<S> {
         Ok(result)
     }
 
+    /// Best-effort load of the live MlsGroup's admin set + avatar component
+    /// bytes for before/after diffing around a convergence apply. `None` when
+    /// the MLS state isn't materialized; the caller skips those diffs rather
+    /// than failing convergence over a missing caption.
+    fn reorg_component_snapshot(&self, group_id: &GroupId) -> Option<ReorgComponentSnapshot> {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = openmls::group::MlsGroup::load(
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                &provider,
+            ),
+            &mls_gid,
+        )
+        .ok()
+        .flatten()?;
+        let admins = crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
+        Some((
+            admins,
+            crate::message_processor::avatar_component_snapshot(&mls_group),
+        ))
+    }
+
     fn emit_convergence_events(
         &mut self,
         group_id: &GroupId,
         previous_members: Vec<cgka_traits::group::Member>,
+        previous_name: &str,
+        previous_components: Option<ReorgComponentSnapshot>,
         previous_tip: EpochId,
         selected_tip: EpochId,
     ) -> Result<(), OpenMlsProjectionError> {
@@ -300,6 +339,27 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        // Same unattributed treatment as the membership deltas below: the
+        // committer that effected each admin/profile change is not cheaply
+        // available on the replay path. The previous-tip → selected-tip diff
+        // is net of commits the direct seam already applied (their effects
+        // are part of the "previous" snapshot), so changes already emitted
+        // attributed there do not re-emit here as duplicates.
+        if let (Some((before_admins, before_avatar)), Some((after_admins, after_avatar))) =
+            (previous_components, self.reorg_component_snapshot(group_id))
+        {
+            for change in crate::group_state_changes::admin_changes(&before_admins, &after_admins) {
+                self.push_group_state_change(group_id, selected_tip, None, change);
+            }
+            for change in crate::group_state_changes::profile_changes(
+                Some(previous_name),
+                Some(current_group.name.as_str()),
+                &before_avatar,
+                &after_avatar,
+            ) {
+                self.push_group_state_change(group_id, selected_tip, None, change);
+            }
+        }
         let previous_ids: HashSet<MemberId> = previous_members
             .iter()
             .map(|member| member.id.clone())

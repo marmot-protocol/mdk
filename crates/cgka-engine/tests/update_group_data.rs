@@ -757,6 +757,74 @@ async fn convergence_refreshes_recipient_marmot_record_name_and_description() {
     );
 }
 
+#[tokio::test]
+async fn convergence_emits_unattributed_profile_change_events() {
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, _bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original-name".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (alice_pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let res = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("new-renamed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, alice_pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(alice_pending).await.unwrap();
+
+    // Bob applies the rename via the convergence path, not the direct seam.
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    bob.ingest(routed).await.unwrap();
+    bob.drain_events();
+    converge_buffered_commit(&mut bob, &gid);
+
+    // The reorg seam must surface the same profile diff the direct seam
+    // emits, unattributed — otherwise the rename never becomes a kind-1210
+    // row for members that applied the commit through convergence.
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::GroupRenamed { name },
+                ..
+            } if name == "new-renamed"
+        )),
+        "convergence apply must emit an unattributed GroupRenamed, got: {events:?}",
+    );
+}
+
 // ── State guard ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
