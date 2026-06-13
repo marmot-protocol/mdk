@@ -15,6 +15,7 @@ use crate::capabilities::{
     required_capabilities_extension_for_features,
 };
 use crate::engine::Engine;
+use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::wire_format::{PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
 use cgka_traits::TransportEndpoint;
@@ -175,25 +176,27 @@ impl<S: StorageProvider> Engine<S> {
             self.identity.credential_with_key.clone(),
         )
         .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
+        let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
         // 3. Add members to produce a staged commit + welcome (skipped for
         //    solo creation). Publish-before-apply keeps the staged commit
         //    attached to `mls_group`; merge happens in `do_confirm_published`.
         //    Welcome bytes are independently serializable from the OpenMLS
         //    return value; they do not require a merged group.
+        let mut pending_commit_guard = None;
         let welcome_bytes: Option<Vec<u8>> = if parsed_kps.is_empty() {
             None
         } else {
             let (_commit_out, welcome_out, _group_info) = mls_group
                 .add_members(&provider, &self.identity.signer, &parsed_kps)
                 .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+            pending_commit_guard =
+                Some(PendingCommitCleanupGuard::arm(&provider, group_id.clone()));
             let bytes = welcome_out
                 .tls_serialize_detached()
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
             Some(bytes)
         };
-
-        let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
         // 4. Persist Marmot-side group record with the PROJECTED
         //    post-merge member set before recording outbound welcomes.
@@ -293,6 +296,10 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::CreateGroup,
             self.current_audit_context.clone(),
         )?;
+
+        if let Some(guard) = pending_commit_guard {
+            guard.disarm();
+        }
 
         let _ = ctx;
 

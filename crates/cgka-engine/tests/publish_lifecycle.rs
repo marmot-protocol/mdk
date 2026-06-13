@@ -26,6 +26,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -62,6 +63,20 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 }
 
 struct MockPeeler;
+
+struct FailFirstGroupWrapPeeler {
+    inner: MockPeeler,
+    remaining_failures: AtomicUsize,
+}
+
+impl FailFirstGroupWrapPeeler {
+    fn new() -> Self {
+        Self {
+            inner: MockPeeler,
+            remaining_failures: AtomicUsize::new(1),
+        }
+    }
+}
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
@@ -128,6 +143,48 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
+#[async_trait]
+impl TransportPeeler for FailFirstGroupWrapPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.inner.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        self.inner.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        if self
+            .remaining_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(PeelerError::WrapFailed(
+                "injected group-wrap failure".into(),
+            ));
+        }
+        self.inner.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_welcome(payload, recipient).await
+    }
+}
+
 fn registry_with_reactions() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
     r.register(
@@ -150,11 +207,15 @@ fn registry_with_reactions() -> FeatureRegistry {
 }
 
 fn build(id: &[u8]) -> impl CgkaEngine {
+    build_with_peeler(id, Box::new(MockPeeler))
+}
+
+fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEngine {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())
-        .peeler(Box::new(MockPeeler))
+        .peeler(peeler)
         .build()
         .unwrap()
 }
@@ -225,6 +286,64 @@ async fn invite_publish_failed_rolls_back_projected_member_set() {
         })
         .await
         .expect("post-rollback invite must succeed");
+    let retry_pending = match retry {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => panic!("expected GroupEvolution"),
+    };
+    alice.confirm_published(retry_pending).await.unwrap();
+    assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+    assert_eq!(alice.members(&gid).unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn invite_wrap_failure_clears_staged_pending_commit_before_retry() {
+    let mut alice = build_with_peeler(b"alice", Box::new(FailFirstGroupWrapPeeler::new()));
+    let mut bob = build(b"bob");
+    let mut carol = build(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+    assert_eq!(alice.members(&gid).unwrap().len(), 2);
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let err = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .expect_err("first invite should fail at transport wrapping");
+    assert!(
+        matches!(err, EngineError::Peeler(PeelerError::WrapFailed(_))),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+    assert_eq!(alice.members(&gid).unwrap().len(), 2);
+
+    let carol_kp2 = carol.fresh_key_package().await.unwrap();
+    let retry = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp2],
+        })
+        .await
+        .expect("retry after wrap failure must not hit orphaned OpenMLS PendingCommit");
     let retry_pending = match retry {
         SendResult::GroupEvolution { pending, .. } => pending,
         _ => panic!("expected GroupEvolution"),

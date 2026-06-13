@@ -15,6 +15,7 @@ use crate::identity::{member_id_at_leaf, member_id_of_sender};
 use crate::openmls_projection::{
     OpenMlsContentKind, project_mls_message, retained_anchor_epoch_from_snapshot_name,
 };
+use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::SnapshotRollbackGuard;
 use cgka_traits::app_components::AppComponentData;
@@ -869,6 +870,8 @@ impl<S: StorageProvider> Engine<S> {
                         let (commit_out, _welcome_opt, _gi) = mls_group
                             .commit_to_pending_proposals(&provider, &self.identity.signer)
                             .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
+                        let pending_commit_guard =
+                            PendingCommitCleanupGuard::arm(&provider, group_id.clone());
                         let commit_bytes = commit_out
                             .tls_serialize_detached()
                             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -892,6 +895,26 @@ impl<S: StorageProvider> Engine<S> {
                         )?;
 
                         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
+
+                        // Match the explicit send paths' projected Marmot
+                        // state before entering PendingPublish. If this storage
+                        // write fails, the guard clears the OpenMLS commit and
+                        // the EpochManager remains Stable.
+                        if let Ok(mut g) = self.storage.get_group(&group_id) {
+                            g.epoch = new_epoch;
+                            g.members
+                                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
+                            self.storage.put_group(&g)?;
+                        }
+
+                        let commit_priority = mls_group
+                            .pending_commit()
+                            .map(crate::app_components::commit_ordering_priority_for_staged)
+                            .ok_or_else(|| {
+                                EngineError::Backend(
+                                    "auto-commit produced no pending commit".into(),
+                                )
+                            })?;
                         let pending_ref = self.epoch_manager.next_pending_ref();
                         let staged = cgka_traits::engine_state::StagedCommitHandle::from_bytes(
                             group_id.as_slice().to_vec(),
@@ -905,14 +928,6 @@ impl<S: StorageProvider> Engine<S> {
                             crate::epoch_manager::PendingKind::GroupEvolution,
                             self.current_audit_context.clone(),
                         )?;
-                        let commit_priority = mls_group
-                            .pending_commit()
-                            .map(crate::app_components::commit_ordering_priority_for_staged)
-                            .ok_or_else(|| {
-                                EngineError::Backend(
-                                    "auto-commit produced no pending commit".into(),
-                                )
-                            })?;
                         self.track_pending_commit_for_recovery(
                             pending_ref,
                             group_id.clone(),
@@ -951,17 +966,7 @@ impl<S: StorageProvider> Engine<S> {
                             msg: wrapped,
                             pending: pending_ref,
                         });
-
-                        // Match the explicit send paths' projected Marmot
-                        // state: callers can see the pending member set, while
-                        // the OpenMLS commit itself is not merged until
-                        // confirm_published.
-                        if let Ok(mut g) = self.storage.get_group(&group_id) {
-                            g.epoch = new_epoch;
-                            g.members
-                                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
-                            self.storage.put_group(&g)?;
-                        }
+                        pending_commit_guard.disarm();
                     }
                     Ok(IngestOutcome::Processed)
                 }
@@ -1393,6 +1398,7 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, welcome_out, _gi) = mls_group
             .add_members(&provider, &self.identity.signer, &parsed_kps)
             .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -1472,6 +1478,10 @@ impl<S: StorageProvider> Engine<S> {
         // post-merge epoch is +1.
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
@@ -1484,10 +1494,6 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
@@ -1513,6 +1519,7 @@ impl<S: StorageProvider> Engine<S> {
             .collect();
         self.pending_state_changes
             .insert(pending_ref, added_changes);
+        pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
             msg: commit_msg,
@@ -1623,6 +1630,7 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, _welcome_opt, _gi) = mls_group
             .remove_members(&provider, &self.identity.signer, &leaf_indices)
             .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -1654,6 +1662,10 @@ impl<S: StorageProvider> Engine<S> {
 
         let prior_epoch = EpochId(mls_group.epoch().as_u64());
         let new_epoch = EpochId(prior_epoch.0.saturating_add(1));
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
@@ -1666,10 +1678,6 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
@@ -1693,6 +1701,7 @@ impl<S: StorageProvider> Engine<S> {
             .collect();
         self.pending_state_changes
             .insert(pending_ref, removed_changes);
+        pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
             msg: commit_msg,

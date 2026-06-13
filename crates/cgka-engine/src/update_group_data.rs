@@ -2,6 +2,7 @@
 //! `marmot.group.profile.v1`.
 
 use crate::engine::Engine;
+use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
@@ -222,6 +223,7 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("app_data_update build: {e:?}")))?
             .stage_commit(&provider)
             .map_err(|e| EngineError::Backend(format!("app_data_update stage: {e:?}")))?;
+        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
         let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -269,6 +271,12 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| {
+                EngineError::Backend("group-data update produced no pending commit".into())
+            })?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.epoch_manager.begin_pending(
@@ -280,12 +288,6 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| {
-                EngineError::Backend("group-data update produced no pending commit".into())
-            })?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
@@ -303,6 +305,7 @@ impl<S: StorageProvider> Engine<S> {
             self.pending_state_changes
                 .insert(pending_ref, staged_changes);
         }
+        pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
             msg: wrapped,

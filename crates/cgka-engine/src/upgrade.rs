@@ -7,6 +7,7 @@
 //! updates to `do_confirm_published`.
 
 use crate::engine::Engine;
+use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -198,6 +199,7 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("upgrade build: {e:?}")))?
             .stage_commit(&provider)
             .map_err(|e| EngineError::Backend(format!("upgrade stage: {e:?}")))?;
+        let pending_commit_guard = PendingCommitCleanupGuard::arm(&provider, group_id.clone());
         let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -232,6 +234,10 @@ impl<S: StorageProvider> Engine<S> {
 
         // State: PendingPublish at the projected post-merge epoch (+1).
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
+        let commit_priority = mls_group
+            .pending_commit()
+            .map(crate::app_components::commit_ordering_priority_for_staged)
+            .ok_or_else(|| EngineError::Backend("upgrade produced no pending commit".into()))?;
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged = StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
         self.epoch_manager.begin_pending(
@@ -243,10 +249,6 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("upgrade produced no pending commit".into()))?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),
@@ -260,6 +262,7 @@ impl<S: StorageProvider> Engine<S> {
             ),
             recovery_snapshot,
         );
+        pending_commit_guard.disarm();
 
         let _ = upgradeable;
         Ok(SendResult::GroupEvolution {

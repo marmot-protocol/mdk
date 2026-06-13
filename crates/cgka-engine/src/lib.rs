@@ -54,6 +54,7 @@ pub mod identity;
 pub mod key_package;
 pub mod message_processor;
 pub mod openmls_projection;
+pub mod pending_commit_guard;
 pub mod provider;
 pub mod publish;
 pub mod snapshot_guard;
