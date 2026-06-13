@@ -401,10 +401,23 @@ impl<S: StorageProvider> Engine<S> {
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
             let msg_content_type = proto.content_type();
-            if pending_recovery.is_none()
-                && msg_content_type == ContentType::Commit
-                && msg_epoch >= current_epoch
-            {
+            let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
+                if msg_epoch >= current_epoch {
+                    true
+                } else {
+                    let policy = self.convergence_policy_for_group(&group_id).map_err(|e| {
+                        EngineError::Backend(format!("load convergence policy: {e}"))
+                    })?;
+                    let within_rewind_horizon = current_epoch.0.saturating_sub(msg_epoch.0)
+                        <= policy.convergence.max_rewind_commits;
+                    within_rewind_horizon
+                        && !self.epoch_manager.we_committed_from(&group_id, msg_epoch)
+                        && self.has_retained_anchor_snapshot(&group_id, msg_epoch)?
+                }
+            } else {
+                false
+            };
+            if pending_recovery.is_none() && commit_should_enter_convergence {
                 let now_ms = self.convergence_now_ms();
                 self.buffer_openmls_convergence_message(&group_id, openmls_msg.clone(), now_ms)
                     .map_err(|e| EngineError::Backend(format!("buffer convergence: {e}")))?;
@@ -2192,6 +2205,19 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(None)
+    }
+
+    fn has_retained_anchor_snapshot(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<bool, EngineError> {
+        for snapshot_name in self.storage.list_group_snapshots(group_id)? {
+            if retained_anchor_epoch_from_snapshot_name(&snapshot_name) == Some(epoch.0) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn available_past_peel_snapshots(

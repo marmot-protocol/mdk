@@ -697,6 +697,107 @@ async fn engine_replays_late_same_epoch_commit_from_retained_anchor() {
 }
 
 #[tokio::test]
+async fn engine_ingest_buffers_late_same_epoch_commit_within_rewind_horizon() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-inline-late-commit".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    });
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_invite);
+    let alice_commit = route(alice_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .expect("alice commit buffered");
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("alice branch applies via convergence");
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    let bob_commit = route(bob_commit, &group_id);
+    let bob_wins = committer_wins(&bob.self_id(), &alice.self_id());
+
+    let outcome = carol.ingest(bob_commit.clone()).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "past-epoch competing commit inside the rewind horizon must enter convergence, got {outcome:?}"
+    );
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .expect("late same-epoch commit ingested through the inline path converges");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    if bob_wins {
+        assert_eq!(result.accepted_commits, vec![content_hex(&bob_commit)]);
+        assert_message_state(&carol_storage, &bob_commit, MessageState::Processed);
+    } else {
+        assert_eq!(result.accepted_commits, vec![content_hex(&alice_commit)]);
+        assert_message_state(&carol_storage, &bob_commit, MessageState::EpochInvalidated);
+    }
+    let members = carol.members(&group_id).unwrap();
+    assert_eq!(
+        members.iter().any(|member| member.id == eve.self_id()),
+        bob_wins
+    );
+    assert_eq!(
+        members.iter().any(|member| member.id == david.self_id()),
+        !bob_wins
+    );
+}
+
+#[tokio::test]
 async fn engine_metrics_count_post_settle_reorg_from_late_same_epoch_commit() {
     // End-to-end check that the diagnostic reorg telemetry
     // (`docs/marmot-architecture/relay-delivery-telemetry.md` §"Validation:
