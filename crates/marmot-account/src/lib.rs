@@ -1066,6 +1066,10 @@ where
         Ok(self.session.members(group_id)?)
     }
 
+    pub fn own_leaf_index(&self, group_id: &GroupId) -> AccountResult<u32> {
+        Ok(self.session.own_leaf_index(group_id)?)
+    }
+
     pub async fn ingest_delivery(
         &mut self,
         delivery: TransportDelivery,

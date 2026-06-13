@@ -236,12 +236,14 @@ async fn session_reopens_encrypted_sqlite_group_state() {
     );
     assert_eq!(alice.epoch(&created.group_id).unwrap(), EpochId(1));
     assert_eq!(alice.members(&created.group_id).unwrap().len(), 2);
+    assert_eq!(alice.own_leaf_index(&created.group_id).unwrap(), 0);
 
     drop(alice);
 
     let reopened = AccountDeviceSession::open(config(&alice_path, &key, b"alice")).unwrap();
     assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
     assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
+    assert_eq!(reopened.own_leaf_index(&created.group_id).unwrap(), 0);
 }
 
 #[tokio::test]

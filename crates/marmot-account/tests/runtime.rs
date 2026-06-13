@@ -383,6 +383,7 @@ async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
         }]
     );
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
+    assert_eq!(runtime.own_leaf_index(&group_id).unwrap(), 0);
     let publishes = adapter.publishes();
     assert_eq!(publishes.len(), 1);
     assert_eq!(

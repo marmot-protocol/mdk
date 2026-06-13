@@ -600,6 +600,85 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
 }
 
 #[tokio::test]
+async fn own_leaf_index_reports_mls_index_after_blank_leaf() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "own leaf index".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    assert_eq!(alice.own_leaf_index(&group_id).unwrap(), 0);
+    assert_eq!(bob.own_leaf_index(&group_id).unwrap(), 1);
+    assert_eq!(carol.own_leaf_index(&group_id).unwrap(), 2);
+
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match remove {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = carol.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut carol, &group_id);
+
+    let carol_roster_index = carol
+        .members(&group_id)
+        .unwrap()
+        .into_iter()
+        .position(|member| member.id == carol.self_id())
+        .unwrap() as u32;
+    assert_eq!(
+        carol_roster_index, 1,
+        "bob's blanked leaf is skipped by roster enumeration"
+    );
+    assert_eq!(carol.own_leaf_index(&group_id).unwrap(), 2);
+}
+
+#[tokio::test]
 async fn non_admin_cannot_remove_members() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");

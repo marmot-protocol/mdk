@@ -570,6 +570,13 @@ pub trait CgkaEngine: Send + Sync {
         component_id: AppComponentId,
     ) -> Result<Option<Vec<u8>>, EngineError>;
 
+    /// Local client's current MLS leaf index in this group.
+    ///
+    /// This is the MLS tree leaf index, not the current roster enumeration
+    /// index. Roster order can diverge from MLS leaf positions after removals
+    /// blank leaves in the tree.
+    fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError>;
+
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError>;
 
     fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError>;

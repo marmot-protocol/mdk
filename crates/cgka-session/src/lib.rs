@@ -498,6 +498,10 @@ impl AccountDeviceSession {
         self.engine.members(group_id)
     }
 
+    pub fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {
+        self.engine.own_leaf_index(group_id)
+    }
+
     pub fn self_id(&self) -> MemberId {
         self.engine.self_id()
     }

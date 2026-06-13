@@ -1001,6 +1001,10 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         ))
     }
 
+    fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {
+        self.do_own_leaf_index(group_id)
+    }
+
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
         self.do_members(group_id)
     }
