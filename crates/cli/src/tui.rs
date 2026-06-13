@@ -568,6 +568,7 @@ struct TuiApp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StreamComposer {
     stream_id: String,
+    group_id: String,
     pending_text: String,
     last_flush: Instant,
 }
@@ -1305,6 +1306,7 @@ impl TuiApp {
         let stream_id = value_string(&result, "stream_id").unwrap_or_else(|| "unknown".to_owned());
         self.streaming = Some(StreamComposer {
             stream_id: stream_id.clone(),
+            group_id: preview_group_id.clone(),
             pending_text: String::new(),
             last_flush: Instant::now(),
         });
@@ -1331,7 +1333,11 @@ impl TuiApp {
     }
 
     fn upsert_active_stream_preview(&mut self, stream_id: &str) {
-        let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
+        let Some(group_id) = self
+            .streaming
+            .as_ref()
+            .map(|streaming| streaming.group_id.clone())
+        else {
             return;
         };
         upsert_live_stream_preview(
@@ -1440,10 +1446,9 @@ impl TuiApp {
             }
         };
         self.input.clear();
-        let group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
         remove_live_stream_preview(
             &mut self.live_stream_previews,
-            group_id.as_deref(),
+            Some(streaming.group_id.as_str()),
             &streaming.stream_id,
         );
         self.refresh_messages()?;
@@ -1472,10 +1477,9 @@ impl TuiApp {
         ];
         let _ = self.client.run_json(Some(&account_id), &args);
         self.input.clear();
-        let group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
         remove_live_stream_preview(
             &mut self.live_stream_previews,
-            group_id.as_deref(),
+            Some(streaming.group_id.as_str()),
             &streaming.stream_id,
         );
         self.status = format!("cancelled stream {}", shorten(&streaming.stream_id, 18));
@@ -4605,6 +4609,55 @@ mod tests {
         assert_eq!(rendered_preview, "stream: daemon live text");
         assert_eq!(preview_lines.len(), 2);
         assert!(stream_preview_lines(&daemon, &[], Some("different-group")).is_empty());
+    }
+
+    #[test]
+    fn active_stream_preview_pins_to_open_time_group_after_selection_shift() {
+        // Regression for issue #198: the stream composer must key its live
+        // preview upsert/cleanup on the group selected when the stream was
+        // opened, not on the chat that happens to be selected now. A
+        // background chat-subscription tick can shift selected_chat while
+        // streaming (e.g. the streamed-into chat is archived/removed by
+        // another member/device). Before the fix, keystrokes upserted the
+        // streamed text under the wrong group and finish/cancel left a ghost
+        // row under the original group.
+        let stream_group = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other_group = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let account_id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        // compose-cancel response; cancel_stream_composer ignores the value.
+        let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{}}"#);
+        let mut app = test_tui_app(client, account_id);
+        app.chats = vec![ChatRow {
+            group_id: other_group.to_owned(),
+            name: "other".to_owned(),
+            archived: false,
+        }];
+        // Selection now points at a DIFFERENT group than the streamed-into one.
+        app.selected_chat = 0;
+        app.streaming = Some(StreamComposer {
+            stream_id: stream_id.to_owned(),
+            group_id: stream_group.to_owned(),
+            pending_text: String::new(),
+            last_flush: Instant::now(),
+        });
+        app.input = "hello".to_owned();
+
+        // A keystroke-driven preview upsert must land under the pinned group.
+        app.upsert_active_stream_preview(stream_id);
+        assert_eq!(app.live_stream_previews.len(), 1);
+        let preview = &app.live_stream_previews[0];
+        assert_eq!(preview.group_id, stream_group);
+        assert_eq!(preview.stream_id, stream_id);
+        assert_eq!(preview.text, "hello");
+
+        // Cancel must remove the preview from the pinned group, not the
+        // currently-selected one, so no ghost streaming row is left behind.
+        app.cancel_stream_composer()
+            .expect("cancel stream composer");
+        assert!(app.live_stream_previews.is_empty());
+        assert!(app.streaming.is_none());
     }
 
     #[test]
