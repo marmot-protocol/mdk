@@ -924,6 +924,7 @@ mod tests {
             tags: Vec::new(),
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 
@@ -940,6 +941,7 @@ mod tests {
             tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 

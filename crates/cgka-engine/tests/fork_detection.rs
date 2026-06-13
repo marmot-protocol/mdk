@@ -491,6 +491,7 @@ fn extract_fork_recovered<'a>(
             recovered_epoch,
             winner,
             invalidated,
+            ..
         } if event_group == group_id => {
             Some((*source_epoch, *recovered_epoch, winner, invalidated))
         }

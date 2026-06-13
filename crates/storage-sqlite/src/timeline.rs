@@ -29,6 +29,11 @@ pub struct StoredAppEvent {
     pub tags: Vec<Vec<String>>,
     pub recorded_at: u64,
     pub received_at: u64,
+    /// Transport id of the commit that produced this row, when it is a
+    /// locally-synthesized group system row (kind 1210). Non-unique: one commit
+    /// can produce many rows. Enables `invalidate_app_events_by_origin_commit`
+    /// when that commit loses a fork. `None` for all other event kinds.
+    pub origin_commit_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -229,9 +234,9 @@ impl SqliteAccountStorage {
         tx.execute(
             "INSERT INTO app_events (
                 group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
-                plaintext, kind, tags_json, recorded_at, received_at
+                plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
                 source_message_id_hex = excluded.source_message_id_hex,
                 source_epoch = excluded.source_epoch,
@@ -242,6 +247,7 @@ impl SqliteAccountStorage {
                 tags_json = excluded.tags_json,
                 recorded_at = excluded.recorded_at,
                 received_at = excluded.received_at,
+                origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
                 invalidated = 0,
                 invalidation_reason = NULL",
             params![
@@ -256,6 +262,7 @@ impl SqliteAccountStorage {
                 tags_json(&event.tags)?,
                 u64_to_i64(event.recorded_at)?,
                 u64_to_i64(event.received_at)?,
+                &event.origin_commit_id,
             ],
         )
         .storage()?;
@@ -303,6 +310,96 @@ impl SqliteAccountStorage {
             message_id_hex,
             reason,
         )
+    }
+
+    /// Invalidate every app event whose `origin_commit_id` matches the given
+    /// commit. This is the **1:N** invalidation path used when fork recovery
+    /// rolls a commit back: a single commit can have synthesized several
+    /// kind-1210 group system rows, all of which must be invalidated together so
+    /// a losing branch's rows do not persist as stale timeline history. Returns
+    /// `None` when no rows reference the commit (e.g. the commit produced no
+    /// system rows). Rows are kept (marked `invalidated`), matching the
+    /// keep-invalidated-records storage invariant; `project_group_events`
+    /// renders them as tombstones, and the emitted `TimelineMessageChange`s let
+    /// live subscribers update.
+    pub fn invalidate_app_events_by_origin_commit(
+        &self,
+        origin_commit_id: &str,
+        reason: &str,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        // Fetch all rows the commit synthesized. They all share one group (a
+        // commit belongs to a single group), so one rebuild + change set covers
+        // them. `origin_commit_id` is non-unique by design (multi-row-per-commit).
+        let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT group_id_hex, message_id_hex, kind, tags_json
+                     FROM app_events
+                     WHERE origin_commit_id = ?1",
+                )
+                .storage()?;
+            stmt.query_map(params![origin_commit_id], |row| {
+                let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })?;
+                Ok((row.get(0)?, row.get(1)?, kind, tags))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?
+        };
+        let Some(group_id_hex) = rows.first().map(|(group_id_hex, ..)| group_id_hex.clone()) else {
+            return Ok(None);
+        };
+        // Collect the set of timeline message ids affected across all matched
+        // rows so we can diff before/after for the change set.
+        let mut affected_message_ids = BTreeSet::new();
+        for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
+            affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
+                &tx,
+                row_group_id_hex,
+                message_id_hex,
+                *kind,
+                tags,
+            )?);
+        }
+        let before = timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
+        tx.execute(
+            "UPDATE app_events
+             SET invalidated = 1, invalidation_reason = ?2
+             WHERE origin_commit_id = ?1",
+            params![origin_commit_id, reason],
+        )
+        .storage()?;
+        rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
+        let messages =
+            timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
+        // One change set covers all invalidated rows. Each invalidated row's own
+        // message id anchors its change; pass each in turn and merge.
+        let mut changes = Vec::new();
+        for (_, message_id_hex, kind, tags) in &rows {
+            changes.extend(timeline_changes_for_invalidation(
+                message_id_hex,
+                *kind,
+                tags,
+                &before,
+                &messages,
+            ));
+        }
+        dedup_timeline_changes(&mut changes);
+        tx.commit().storage()?;
+        Ok(Some(TimelineProjectionUpdate {
+            group_id_hex,
+            messages,
+            changes,
+        }))
     }
 
     fn invalidate_app_event(
@@ -628,6 +725,23 @@ fn timeline_changes_for_invalidation(
             }),
     );
     changes
+}
+
+/// Deduplicate a merged change set produced by invalidating several rows that
+/// share one origin commit. Because each invalidated row contributes a change
+/// set computed against the same before/after timeline snapshots, the per-row
+/// sets can overlap (e.g. a shared reply-preview target). Keep the first change
+/// seen per `(message_id, variant)` so live subscribers receive one update per
+/// affected message.
+fn dedup_timeline_changes(changes: &mut Vec<TimelineMessageChange>) {
+    let mut seen = HashSet::new();
+    changes.retain(|change| {
+        let key = match change {
+            TimelineMessageChange::Upsert { message, .. } => (0u8, message.message_id_hex.clone()),
+            TimelineMessageChange::Remove { message_id_hex, .. } => (1u8, message_id_hex.clone()),
+        };
+        seen.insert(key)
+    });
 }
 
 fn timeline_trigger_for_invalidation_row(
@@ -1427,6 +1541,7 @@ mod tests {
             tags: Vec::new(),
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 
@@ -1443,6 +1558,7 @@ mod tests {
             tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 
@@ -1460,6 +1576,7 @@ mod tests {
             tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 
@@ -1479,6 +1596,7 @@ mod tests {
             ],
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 
@@ -1495,6 +1613,7 @@ mod tests {
             tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 
@@ -1513,6 +1632,7 @@ mod tests {
             tags: vec![vec!["system".to_owned(), system_type.to_owned()]],
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 
@@ -1524,6 +1644,147 @@ mod tests {
             })
             .unwrap()
             .messages
+    }
+
+    fn group_system_from_commit(
+        id: &str,
+        system_type: &str,
+        at: u64,
+        origin_commit_id: &str,
+    ) -> StoredAppEvent {
+        let mut event = group_system(id, system_type, at);
+        event.origin_commit_id = Some(origin_commit_id.to_owned());
+        event
+    }
+
+    #[test]
+    fn invalidate_by_origin_commit_tombstones_all_rows_from_one_commit() {
+        // A single rolled-back commit can have synthesized several kind-1210
+        // system rows (e.g. it added two members). Invalidating by origin commit
+        // must tombstone every one of them while leaving rows from other commits
+        // (and from the winning branch) untouched.
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&group_system_from_commit(
+                "losing-added",
+                "member_added",
+                10,
+                "commit-losing",
+            ))
+            .unwrap();
+        store
+            .record_app_event(&group_system_from_commit(
+                "losing-admin",
+                "admin_added",
+                11,
+                "commit-losing",
+            ))
+            .unwrap();
+        store
+            .record_app_event(&group_system_from_commit(
+                "winning-added",
+                "member_added",
+                12,
+                "commit-winning",
+            ))
+            .unwrap();
+
+        let update = store
+            .invalidate_app_events_by_origin_commit("commit-losing", "LosingBranch")
+            .unwrap()
+            .expect("matched rows should produce an update");
+        // Both losing-branch rows are reported as changed; the winning row is not.
+        let changed_ids: Vec<&str> = update
+            .changes
+            .iter()
+            .map(|change| match change {
+                TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.as_str(),
+                TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
+            })
+            .collect();
+        assert!(changed_ids.contains(&"losing-added"));
+        assert!(changed_ids.contains(&"losing-admin"));
+        assert!(!changed_ids.contains(&"winning-added"));
+
+        // Rows are kept (tombstoned), not deleted; both losing rows carry the
+        // invalidation status while the winning row stays live.
+        let rows = list(&store);
+        let status = |id: &str| {
+            rows.iter()
+                .find(|row| row.message_id_hex == id)
+                .map(|row| row.invalidation_status.clone())
+        };
+        assert_eq!(
+            status("losing-added"),
+            Some(Some("LosingBranch".to_owned()))
+        );
+        assert_eq!(
+            status("losing-admin"),
+            Some(Some("LosingBranch".to_owned()))
+        );
+        assert_eq!(status("winning-added"), Some(None));
+    }
+
+    #[test]
+    fn invalidate_by_origin_commit_returns_none_when_no_rows_match() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&group_system_from_commit(
+                "row",
+                "member_added",
+                10,
+                "commit-a",
+            ))
+            .unwrap();
+        assert!(
+            store
+                .invalidate_app_events_by_origin_commit("commit-unknown", "LosingBranch")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reupsert_with_none_origin_preserves_existing_commit_link() {
+        // A deterministic kind-1210 row can be written first from direct ingest
+        // with Some(origin_commit_id) and later re-derived through an
+        // unattributed convergence path that passes None. The re-upsert must not
+        // clear the stored commit link, otherwise a later fork recovery can no
+        // longer find/tombstone the row by origin commit.
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .record_app_event(&group_system_from_commit(
+                "row",
+                "member_added",
+                10,
+                "commit-losing",
+            ))
+            .unwrap();
+        // Re-upsert the same (group_id, message_id) with no attribution.
+        store
+            .record_app_event(&group_system("row", "member_added", 10))
+            .unwrap();
+
+        // The row must still be discoverable and tombstoned by its origin commit.
+        let update = store
+            .invalidate_app_events_by_origin_commit("commit-losing", "LosingBranch")
+            .unwrap()
+            .expect("origin commit link must survive the None re-upsert");
+        let changed_ids: Vec<&str> = update
+            .changes
+            .iter()
+            .map(|change| match change {
+                TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.as_str(),
+                TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.as_str(),
+            })
+            .collect();
+        assert!(changed_ids.contains(&"row"));
+        let rows = list(&store);
+        let status = rows
+            .iter()
+            .find(|row| row.message_id_hex == "row")
+            .map(|row| row.invalidation_status.clone());
+        assert_eq!(status, Some(Some("LosingBranch".to_owned())));
     }
 
     #[test]
@@ -1847,6 +2108,7 @@ mod tests {
             tags: vec![vec![STREAM_TAG.to_owned(), "aa".repeat(32)]],
             recorded_at: 1,
             received_at: 1,
+            origin_commit_id: None,
         };
         let final_event = StoredAppEvent {
             group_id_hex: "11".repeat(32),
@@ -1863,6 +2125,7 @@ mod tests {
             ],
             recorded_at: 2,
             received_at: 2,
+            origin_commit_id: None,
         };
 
         store.record_app_event(&start).unwrap();

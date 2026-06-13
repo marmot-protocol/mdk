@@ -14,7 +14,7 @@ use cgka_traits::capabilities::{
 };
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    GroupEvent, KeyPackage, SendIntent, SendResult,
+    GroupEvent, GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -485,6 +485,16 @@ fn snapshot_group_events() {
         }
     );
     insta::assert_json_snapshot!(
+        "event_group_state_changed",
+        GroupEvent::GroupStateChanged {
+            group_id: gid(),
+            epoch: EpochId(2),
+            actor: Some(mem_id()),
+            change: GroupStateChange::MemberAdded { member: mem_id() },
+            origin_commit_id: Some(mid()),
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_fork_recovered",
         GroupEvent::ForkRecovered {
             group_id: gid(),
@@ -502,6 +512,14 @@ fn snapshot_group_events() {
                 committer: MemberId::new(b"bob".to_vec()),
                 commit_digest: [0xBB; 32],
             },
+            invalidated_commit_id: mid(),
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_commit_rolled_back",
+        GroupEvent::CommitRolledBack {
+            group_id: gid(),
+            invalidated_commit_id: mid(),
         }
     );
     insta::assert_json_snapshot!(

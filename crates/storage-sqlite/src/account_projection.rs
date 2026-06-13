@@ -1036,6 +1036,7 @@ mod tests {
             tags: Vec::new(),
             recorded_at: at,
             received_at: at,
+            origin_commit_id: None,
         }
     }
 

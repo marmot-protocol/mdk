@@ -114,9 +114,13 @@ impl<S: StorageProvider> Engine<S> {
                 crate::audit_helpers::pending_kind_str(kind),
             ),
         );
-        if let Some(message_id) = self.promote_pending_commit_for_recovery(pending) {
+        // The transport id of the commit we just confirmed. It identifies the
+        // rows the upcoming `GroupStateChanged` events synthesize, so they can be
+        // invalidated by origin commit if this commit later loses a fork.
+        let origin_commit_id = self.promote_pending_commit_for_recovery(pending);
+        if let Some(message_id) = origin_commit_id.as_ref() {
             self.storage
-                .update_message_state(&message_id, MessageState::Processed)?;
+                .update_message_state(message_id, MessageState::Processed)?;
             self.audit_with_context(
                 Some(&group_id),
                 audit_context.clone(),
@@ -149,6 +153,7 @@ impl<S: StorageProvider> Engine<S> {
                     new_epoch,
                     pending_change.actor,
                     pending_change.change,
+                    origin_commit_id.clone(),
                 );
             }
         }

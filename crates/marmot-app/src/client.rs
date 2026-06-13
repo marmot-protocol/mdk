@@ -949,6 +949,9 @@ impl AppClient {
             tags: event.tags.clone(),
             source_epoch,
             recorded_at: Some(event.created_at),
+            // Only synthesized kind-1210 system rows carry an origin commit;
+            // ordinary sent app events do not.
+            origin_commit_id: None,
         };
         let update = self
             .app
@@ -1921,6 +1924,8 @@ impl AppClient {
                     tags: message.tags.clone(),
                     source_epoch: Some(message.source_epoch),
                     recorded_at: Some(source_recorded_at),
+                    // Received app messages are not synthesized system rows.
+                    origin_commit_id: None,
                 };
                 let projection_update = self
                     .app
@@ -1943,6 +1948,41 @@ impl AppClient {
                     &self.state.label,
                     &hex::encode(message_id.as_slice()),
                     &format!("{reason:?}"),
+                )?
+            {
+                summary.projection_updates.push(projection_update);
+            }
+            // A rolled-back commit on a losing branch invalidates any kind-1210
+            // group system rows it synthesized (one commit → many rows). The
+            // winning branch's fresh rows are synthesized below from this
+            // delivery's `GroupStateChanged` events, so the timeline converges
+            // to the canonical branch without stale losing-branch rows.
+            if let cgka_traits::engine::GroupEvent::ForkRecovered {
+                invalidated_commit_id,
+                ..
+            } = event
+                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
+                    &self.state.label,
+                    &hex::encode(invalidated_commit_id.as_slice()),
+                    "LosingBranch",
+                )?
+            {
+                summary.projection_updates.push(projection_update);
+            }
+            // Convergence-path analog of `ForkRecovered`: a commit first applied
+            // through stored convergence (so its synthesized kind-1210 rows carry
+            // `origin_commit_id`) later lost a same-epoch fork and was rolled
+            // back. `ForkRecovered` only fires on the direct staged-commit seam,
+            // so without this the convergence-born losing rows would survive.
+            // Invalidate every row whose origin commit matches.
+            if let cgka_traits::engine::GroupEvent::CommitRolledBack {
+                invalidated_commit_id,
+                ..
+            } = event
+                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
+                    &self.state.label,
+                    &hex::encode(invalidated_commit_id.as_slice()),
+                    "LosingBranch",
                 )?
             {
                 summary.projection_updates.push(projection_update);
@@ -2610,6 +2650,7 @@ impl AppClient {
                 epoch,
                 actor,
                 change,
+                origin_commit_id,
             } = event
             {
                 let projection = match build_group_system_projection(
@@ -2618,6 +2659,9 @@ impl AppClient {
                     actor.as_ref(),
                     change,
                     recorded_at,
+                    origin_commit_id
+                        .as_ref()
+                        .map(|id| hex::encode(id.as_slice())),
                 ) {
                     Ok(projection) => projection,
                     Err(_err) => {
@@ -2669,15 +2713,18 @@ impl AppClient {
 /// authenticated [`GroupStateChange`]. The row is synthesized locally
 /// (Approach A) — no kind-1210 message is sent on the wire. The message id is
 /// deterministic over (actor, epoch, system_type, content) so re-processing the
-/// same change upserts instead of duplicating; the `source_message_id_hex` link
-/// lets a commit that is later invalidated on a losing branch invalidate this
-/// row through the same path as any other app event.
+/// same change upserts instead of duplicating. The row carries a null
+/// `source_message_id_hex` (one commit can synthesize several rows, which would
+/// collide on the partial unique source index); instead `origin_commit_id`
+/// links the row back to the commit that produced it, so losing-branch fork
+/// recovery can invalidate every row derived from a rolled-back commit (1:N).
 fn build_group_system_projection(
     group_id: &cgka_traits::types::GroupId,
     epoch: u64,
     actor: Option<&cgka_traits::types::MemberId>,
     change: &cgka_traits::engine::GroupStateChange,
     recorded_at: u64,
+    origin_commit_id: Option<String>,
 ) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
     use cgka_traits::app_event::{
         GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
@@ -2791,6 +2838,9 @@ fn build_group_system_projection(
         tags,
         source_epoch: Some(epoch),
         recorded_at: Some(recorded_at),
+        // Non-unique link to the origin commit so a losing-branch rollback can
+        // invalidate every row this commit synthesized (1:N).
+        origin_commit_id,
     })
 }
 

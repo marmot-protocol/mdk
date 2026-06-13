@@ -685,6 +685,10 @@ struct AppMessageProjection {
     tags: Vec<Vec<String>>,
     source_epoch: Option<u64>,
     recorded_at: Option<u64>,
+    /// Transport id of the originating commit for a synthesized kind-1210 group
+    /// system row, so the row can be invalidated by origin commit if that commit
+    /// loses a fork. `None` for all other projections.
+    origin_commit_id: Option<String>,
 }
 
 fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
@@ -892,6 +896,7 @@ fn stored_app_event_from_projection(
         source_epoch: message.source_epoch,
         recorded_at: message.recorded_at.unwrap_or(received_at),
         received_at,
+        origin_commit_id: message.origin_commit_id.clone(),
     }
 }
 
@@ -908,6 +913,7 @@ fn stored_app_event_from_message_record(record: &AppMessageRecord) -> StoredAppE
         source_epoch: record.source_epoch,
         recorded_at: record.recorded_at,
         received_at: record.received_at,
+        origin_commit_id: None,
     }
 }
 
@@ -3667,6 +3673,23 @@ impl MarmotApp {
         let update = self
             .account_storage(label)?
             .invalidate_app_event_by_message_id(message_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Invalidate every synthesized group system row produced by a commit that
+    /// fork recovery rolled back. One commit can have synthesized several rows
+    /// (1:N), so this is a multi-row invalidation keyed on `origin_commit_id`.
+    pub(crate) fn invalidate_timeline_origin_commit(
+        &self,
+        label: &str,
+        origin_commit_id_hex: &str,
+        reason: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .invalidate_app_events_by_origin_commit(origin_commit_id_hex, reason)?;
         update
             .map(|update| self.app_projection_update(label, update))
             .transpose()
@@ -6788,6 +6811,7 @@ mod tests {
                 tags: Vec::new(),
                 source_epoch: None,
                 recorded_at: Some(1_700_000_101),
+                origin_commit_id: None,
             })
             .unwrap();
         legacy
@@ -6846,6 +6870,7 @@ mod tests {
                 tags: Vec::new(),
                 source_epoch: None,
                 recorded_at: Some(1_700_000_102),
+                origin_commit_id: None,
             })
             .unwrap();
         assert_eq!(app.messages("alice").unwrap().len(), 1);

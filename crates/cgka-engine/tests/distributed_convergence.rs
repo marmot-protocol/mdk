@@ -305,6 +305,176 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
 }
 
+/// darkmatter#286: a commit applied through STORED CONVERGENCE that later loses
+/// a same-epoch fork must (a) attribute its winning-branch group-system rows to
+/// the accepted commit via `origin_commit_id`, and (b) emit
+/// `GroupEvent::CommitRolledBack` for the losing commit so the app can tombstone
+/// the kind-1210 rows that losing commit synthesized.
+///
+/// Unlike the direct staged-commit seam (which fires `ForkRecovered`), this path
+/// routes commits into convergence (`msg_epoch >= current_epoch`), so before
+/// this fix the losing branch's synthesized rows had `origin_commit_id = NULL`
+/// and no event ever targeted them — leaving stale contradictory history.
+#[tokio::test]
+async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-rollback".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    // Two same-epoch invite commits fork the epoch: Alice invites David, Bob
+    // invites Eve. Only one wins branch selection on Carol's convergence pass.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, bob_pending) = evolution(bob_invite);
+    let commit_messages = [
+        route(alice_commit.clone(), &group_id),
+        route(bob_commit.clone(), &group_id),
+    ];
+
+    // Use an app-message witness to deterministically pick which branch wins,
+    // independent of the authenticated committer tie-break.
+    let app_branch_index = 1 - commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
+    let quiet_branch_index = 1 - app_branch_index;
+
+    let app_msg = if app_branch_index == 0 {
+        alice.confirm_published(alice_pending).await.unwrap();
+        send_app(
+            &mut alice,
+            &group_id,
+            b"rollback witness from alice".to_vec(),
+        )
+        .await
+    } else {
+        bob.confirm_published(bob_pending).await.unwrap();
+        send_app(&mut bob, &group_id, b"rollback witness from bob".to_vec()).await
+    };
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_messages[0].clone(), 1_000)
+        .expect("first commit buffered");
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit_messages[1].clone(), 1_000)
+        .expect("second commit buffered");
+    carol
+        .buffer_openmls_convergence_message(&group_id, app_msg.clone(), 1_000)
+        .expect("app witness buffered");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    // Exactly one commit was accepted; the sibling is dropped as a losing
+    // branch (`InvalidAgainstCandidateState`).
+    assert_eq!(
+        result.accepted_commits,
+        vec![content_hex(&commit_messages[app_branch_index])]
+    );
+    let losing_commit = &commit_messages[quiet_branch_index];
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.kind == MessageKind::Commit
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.message_id == content_hex(losing_commit)
+        }),
+        "expected losing commit dropped as InvalidAgainstCandidateState, got {:?}",
+        result.dropped_messages
+    );
+    assert_message_state(
+        &carol_storage,
+        losing_commit,
+        MessageState::EpochInvalidated,
+    );
+
+    let winning_commit_id = content_id(&commit_messages[app_branch_index]);
+    let losing_commit_id = content_id(losing_commit);
+    let events = carol.drain_events();
+
+    // (b) The losing commit emits CommitRolledBack so the app can tombstone the
+    // kind-1210 rows it synthesized — there is no ForkRecovered on this path.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::CommitRolledBack { group_id: g, invalidated_commit_id }
+                if g == &group_id && *invalidated_commit_id == losing_commit_id
+        )),
+        "expected CommitRolledBack for the losing commit, got {events:?}"
+    );
+    // No ForkRecovered fires here: this is the convergence path, not the direct
+    // staged-commit seam.
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::ForkRecovered { .. })),
+        "convergence path must not emit ForkRecovered, got {events:?}"
+    );
+
+    // (a) The winning branch's MemberAdded row is attributed to the accepted
+    // commit, so a later rollback of *that* commit could tombstone it too.
+    let selected_invitee = if app_branch_index == 0 {
+        MemberId::new(pad32(b"david"))
+    } else {
+        MemberId::new(pad32(b"eve"))
+    };
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateChanged {
+                group_id: g,
+                change: cgka_traits::engine::GroupStateChange::MemberAdded { member },
+                origin_commit_id: Some(origin),
+                ..
+            } if g == &group_id
+                && *member == selected_invitee
+                && *origin == winning_commit_id
+        )),
+        "expected MemberAdded row attributed to the winning commit, got {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn engine_does_not_apply_stored_branch_before_stability_gate() {
     let (mut alice, _alice_storage) = build_client(b"alice");

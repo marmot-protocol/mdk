@@ -284,10 +284,12 @@ impl<S: StorageProvider> Engine<S> {
                 previous_components,
                 previous_tip,
                 selected_tip,
+                single_accepted_commit_id(&result),
             )?;
         }
         self.emit_application_replay_events(group_id, &observations);
         self.emit_invalidated_app_events(group_id, &result)?;
+        self.emit_rolled_back_commits(group_id, &result)?;
 
         self.remember_canonicalization_result_messages(&result);
         Ok(result)
@@ -318,6 +320,7 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_convergence_events(
         &mut self,
         group_id: &GroupId,
@@ -326,6 +329,7 @@ impl<S: StorageProvider> Engine<S> {
         previous_components: Option<ReorgComponentSnapshot>,
         previous_tip: EpochId,
         selected_tip: EpochId,
+        origin_commit_id: Option<MessageId>,
     ) -> Result<(), OpenMlsProjectionError> {
         if previous_tip != selected_tip {
             self.events_buf.push_back(GroupEvent::EpochChanged {
@@ -339,17 +343,27 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // Same unattributed treatment as the membership deltas below: the
-        // committer that effected each admin/profile change is not cheaply
-        // available on the replay path. The previous-tip → selected-tip diff
-        // is net of commits the direct seam already applied (their effects
-        // are part of the "previous" snapshot), so changes already emitted
-        // attributed there do not re-emit here as duplicates.
+        // `origin_commit_id` is `Some` only when this convergence pass applied a
+        // single accepted commit, so the entire previous-tip → selected-tip diff
+        // is attributable to it; the rows it synthesizes carry that commit id so
+        // they can be tombstoned together if it later loses a fork (see
+        // `single_accepted_commit_id` + `emit_rolled_back_commits`). When several
+        // commits were applied in one pass the delta cannot be split per-commit,
+        // so we fall back to `None` (unattributed) as before. The previous-tip →
+        // selected-tip diff is net of commits the direct seam already applied
+        // (their effects are part of the "previous" snapshot), so changes already
+        // emitted attributed there do not re-emit here as duplicates.
         if let (Some((before_admins, before_avatar)), Some((after_admins, after_avatar))) =
             (previous_components, self.reorg_component_snapshot(group_id))
         {
             for change in crate::group_state_changes::admin_changes(&before_admins, &after_admins) {
-                self.push_group_state_change(group_id, selected_tip, None, change);
+                self.push_group_state_change(
+                    group_id,
+                    selected_tip,
+                    None,
+                    change,
+                    origin_commit_id.clone(),
+                );
             }
             for change in crate::group_state_changes::profile_changes(
                 Some(previous_name),
@@ -357,7 +371,13 @@ impl<S: StorageProvider> Engine<S> {
                 &before_avatar,
                 &after_avatar,
             ) {
-                self.push_group_state_change(group_id, selected_tip, None, change);
+                self.push_group_state_change(
+                    group_id,
+                    selected_tip,
+                    None,
+                    change,
+                    origin_commit_id.clone(),
+                );
             }
         }
         let previous_ids: HashSet<MemberId> = previous_members
@@ -373,7 +393,10 @@ impl<S: StorageProvider> Engine<S> {
         // Convergence reorg: we reach the canonical branch by replaying stored
         // commits, so the committer that effected each membership delta is not
         // resolved cheaply here. Emit the change unattributed (`actor: None`);
-        // the row still renders ("X was added") without a "by Y".
+        // the row still renders ("X was added") without a "by Y". The
+        // `origin_commit_id` link (when a single commit drove this pass) is
+        // independent of `actor` — it ties the row to its origin commit for
+        // fork-recovery tombstoning, not to a renderable committer.
         for member in current_group.members {
             if !previous_ids.contains(&member.id) {
                 self.push_group_state_change(
@@ -381,6 +404,7 @@ impl<S: StorageProvider> Engine<S> {
                     selected_tip,
                     None,
                     GroupStateChange::MemberAdded { member: member.id },
+                    origin_commit_id.clone(),
                 );
             }
         }
@@ -392,6 +416,7 @@ impl<S: StorageProvider> Engine<S> {
                 GroupStateChange::MemberRemoved {
                     member: member_id.clone(),
                 },
+                origin_commit_id.clone(),
             );
         }
 
@@ -448,6 +473,43 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Emit a [`GroupEvent::CommitRolledBack`] for every commit that this
+    /// convergence pass dropped because it lost branch selection
+    /// (`InvalidAgainstCandidateState`). This is the convergence-path analog of
+    /// the direct seam's [`GroupEvent::ForkRecovered`] commit attribution: a
+    /// commit that was previously applied through stored convergence (and so
+    /// synthesized kind-1210 group system rows stamped with its `origin_commit_id`)
+    /// can later lose a same-epoch fork during a reorg. The app uses
+    /// `invalidated_commit_id` to tombstone those origin-linked rows so a losing
+    /// branch's "Alice added Bob"-style history does not survive.
+    ///
+    /// Only `InvalidAgainstCandidateState` drops are reported: malformed /
+    /// unsupported-policy commits never produced authenticated state changes,
+    /// and the app-side tombstone is a no-op when no row carries the commit id,
+    /// so emitting here is idempotent and safe even for commits this client
+    /// never applied.
+    fn emit_rolled_back_commits(
+        &mut self,
+        group_id: &GroupId,
+        result: &CanonicalizationResult,
+    ) -> Result<(), OpenMlsProjectionError> {
+        for dropped in &result.dropped_messages {
+            if dropped.kind != crate::canonicalization::MessageKind::Commit {
+                continue;
+            }
+            if dropped.reason
+                != crate::canonicalization::DroppedMessageReason::InvalidAgainstCandidateState
+            {
+                continue;
+            }
+            self.events_buf.push_back(GroupEvent::CommitRolledBack {
+                group_id: group_id.clone(),
+                invalidated_commit_id: message_id_from_hex(&dropped.message_id)?,
+            });
+        }
+        Ok(())
+    }
+
     fn remember_canonicalization_result_messages(&mut self, result: &CanonicalizationResult) {
         for message_id in result
             .accepted_commits
@@ -483,6 +545,23 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
     }
+}
+
+/// The single commit id this convergence pass applied, hex-decoded to a
+/// [`MessageId`], or `None` when the pass applied zero or several commits.
+///
+/// Convergence-synthesized group-state-change rows can only be attributed to a
+/// concrete origin commit when exactly one commit was accepted this pass — then
+/// the entire previous-tip → selected-tip diff is that commit's effect. With
+/// multiple accepted commits the per-commit attribution is ambiguous (the diff
+/// is their combined effect), so the rows stay unattributed (`None`) and are
+/// re-synthesized fresh from the winning branch on a later convergence pass,
+/// matching the pre-existing behavior.
+fn single_accepted_commit_id(result: &CanonicalizationResult) -> Option<MessageId> {
+    let [only_commit] = result.accepted_commits.as_slice() else {
+        return None;
+    };
+    hex::decode(only_commit).ok().map(MessageId::new)
 }
 
 /// Result returned for a group already in `Unrecoverable`: no canonical

@@ -1335,6 +1335,7 @@ mod tests {
                 tags: Vec::new(),
                 source_epoch: None,
                 recorded_at: Some(recorded_at),
+                origin_commit_id: None,
             })
             .unwrap();
         }

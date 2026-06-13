@@ -141,7 +141,12 @@ impl<S: StorageProvider> Engine<S> {
         transport_group_id: Vec<u8>,
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
-        let mut pending_recovery: Option<(EpochId, CommitOrderingKey, CommitOrderingKey)> = None;
+        let mut pending_recovery: Option<(
+            EpochId,
+            CommitOrderingKey,
+            CommitOrderingKey,
+            MessageId,
+        )> = None;
 
         loop {
             // Load MlsGroup from storage.
@@ -519,9 +524,10 @@ impl<S: StorageProvider> Engine<S> {
                             ForkResolution::CandidateWins {
                                 winner,
                                 invalidated,
-                                invalidated_storage_id: _,
+                                invalidated_storage_id,
                             } => {
-                                pending_recovery = Some((msg_epoch, winner, invalidated));
+                                pending_recovery =
+                                    Some((msg_epoch, winner, invalidated, invalidated_storage_id));
                                 continue;
                             }
                             ForkResolution::IncumbentWins => {
@@ -740,13 +746,16 @@ impl<S: StorageProvider> Engine<S> {
                         self.ciphersuite,
                     )?;
 
-                    if let Some((source_epoch, winner, invalidated)) = pending_recovery.take() {
+                    if let Some((source_epoch, winner, invalidated, invalidated_commit_id)) =
+                        pending_recovery.take()
+                    {
                         self.events_buf.push_back(GroupEvent::ForkRecovered {
                             group_id: group_id.clone(),
                             source_epoch,
                             recovered_epoch: after,
                             winner,
                             invalidated,
+                            invalidated_commit_id,
                         });
                     }
                     self.events_buf.push_back(GroupEvent::EpochChanged {
@@ -757,12 +766,17 @@ impl<S: StorageProvider> Engine<S> {
                     // Synthesize attributed state-change events, ordered:
                     // additions, departures, admin grants/revocations, then
                     // profile changes. The app turns each into a kind-1210 row.
+                    // All rows from this commit carry its transport id so they
+                    // can be invalidated together if the commit later loses a
+                    // fork and is rolled back.
+                    let origin_commit_id = Some(msg.id.clone());
                     for member in added {
                         self.push_group_state_change(
                             &group_id,
                             after,
                             sender_id.clone(),
                             GroupStateChange::MemberAdded { member },
+                            origin_commit_id.clone(),
                         );
                     }
                     for member in removed {
@@ -781,12 +795,24 @@ impl<S: StorageProvider> Engine<S> {
                                 sender_id.clone(),
                             )
                         };
-                        self.push_group_state_change(&group_id, after, actor, change);
+                        self.push_group_state_change(
+                            &group_id,
+                            after,
+                            actor,
+                            change,
+                            origin_commit_id.clone(),
+                        );
                     }
                     for change in
                         crate::group_state_changes::admin_changes(&before_admins, &after_admins)
                     {
-                        self.push_group_state_change(&group_id, after, sender_id.clone(), change);
+                        self.push_group_state_change(
+                            &group_id,
+                            after,
+                            sender_id.clone(),
+                            change,
+                            origin_commit_id.clone(),
+                        );
                     }
                     for change in crate::group_state_changes::profile_changes(
                         before_profile.as_ref().map(|(name, _)| name.as_str()),
@@ -794,7 +820,13 @@ impl<S: StorageProvider> Engine<S> {
                         &before_avatar,
                         &after_avatar,
                     ) {
-                        self.push_group_state_change(&group_id, after, sender_id.clone(), change);
+                        self.push_group_state_change(
+                            &group_id,
+                            after,
+                            sender_id.clone(),
+                            change,
+                            origin_commit_id.clone(),
+                        );
                     }
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     // In-memory fast path mirrors the durable record, keyed on
@@ -1308,19 +1340,25 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Queue a `GroupStateChanged` event for the application to synthesize into
-    /// a durable kind-1210 group system row.
+    /// a durable kind-1210 group system row. `origin_commit_id` carries the
+    /// transport id of the commit that produced this change (when attributable),
+    /// so the row can be invalidated by origin commit if that commit later loses
+    /// a fork. Reorg-driven re-derivations that cannot resolve a single commit
+    /// pass `None`.
     pub(crate) fn push_group_state_change(
         &mut self,
         group_id: &GroupId,
         epoch: EpochId,
         actor: Option<MemberId>,
         change: GroupStateChange,
+        origin_commit_id: Option<MessageId>,
     ) {
         self.events_buf.push_back(GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch,
             actor,
             change,
+            origin_commit_id,
         });
     }
 
