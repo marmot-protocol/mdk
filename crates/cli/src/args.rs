@@ -447,6 +447,18 @@ pub(crate) enum GroupCommand {
         #[arg(long)]
         description: Option<String>,
     },
+    #[command(name = "set-avatar-url")]
+    SetAvatarUrl {
+        group: String,
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+        url: Option<String>,
+        #[arg(long, requires = "url")]
+        dim: Option<String>,
+        #[arg(long, requires = "url")]
+        thumbhash: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -515,6 +527,27 @@ pub(crate) enum GroupsCommand {
         group_id: String,
         #[arg(help = "New group name")]
         name: String,
+    },
+    #[command(
+        name = "set-avatar-url",
+        about = "Set, update, or clear the group URL avatar"
+    )]
+    SetAvatarUrl {
+        #[arg(help = "Group id to update")]
+        group_id: String,
+        #[arg(
+            long,
+            conflicts_with = "clear",
+            required_unless_present = "clear",
+            help = "HTTPS avatar URL"
+        )]
+        url: Option<String>,
+        #[arg(long, requires = "url", help = "Optional avatar dimensions as WxH")]
+        dim: Option<String>,
+        #[arg(long, requires = "url", help = "Optional thumbhash hex")]
+        thumbhash: Option<String>,
+        #[arg(long, help = "Clear the group URL avatar")]
+        clear: bool,
     },
     #[command(hide = true)]
     Invites,

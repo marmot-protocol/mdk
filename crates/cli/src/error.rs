@@ -496,6 +496,11 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "reason": reason,
         }),
+        AppError::InvalidGroupAvatarUrl(reason) => json!({
+            "code": "invalid_group_avatar_url",
+            "message": err.to_string(),
+            "reason": reason,
+        }),
         AppError::Hex(err) => json!({
             "code": "invalid_hex",
             "message": err.to_string(),

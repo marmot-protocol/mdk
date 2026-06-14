@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Added `dm groups set-avatar-url <group> --url <https-url> [--dim WxH] [--thumbhash <hex>]` (and `--clear`) to set,
+  update, and clear the group URL avatar (`marmot.group.avatar-url.v1`) over the existing app runtime path; a parallel
+  legacy `dm group set-avatar-url` form is also available. `dm groups show` / `dm chats show` now surface the
+  `avatar_url` component in both human and `--json` output, and an invalid (non-HTTPS / disallowed-host) URL returns
+  the stable `invalid_group_avatar_url` JSON error. `set-avatar-url` now requires exactly one of `--url` / `--clear`
+  (`--dim` / `--thumbhash` only accompany `--url`), and an explicit empty `--url ""` is rejected as
+  `invalid_group_avatar_url` rather than silently clearing the avatar. Human `show` output also surfaces
+  `avatar_dim` / `avatar_thumbhash` render hints when present.
+
 - The TUI now renders kind-1210 group system rows as friendly lines (e.g. "alice added bob", "bob left",
   "alice renamed the group") instead of raw JSON. These durable rows are synthesized locally from authenticated group
   state changes (member added/removed/left, admin granted/revoked, group renamed, avatar changed) and appear inline in

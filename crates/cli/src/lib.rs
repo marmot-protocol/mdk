@@ -768,10 +768,20 @@ pub(crate) fn group_list_plain(groups: &[AppGroupRecord]) -> String {
 }
 
 fn group_plain(group: &AppGroupRecord) -> String {
-    format!(
+    let mut line = format!(
         "{} name={} endpoint={}",
         group.group_id_hex, group.profile.name, group.endpoint
-    )
+    );
+    if group.avatar_url.present {
+        line.push_str(&format!(" avatar_url={}", group.avatar_url.url));
+        if let Some(dim) = &group.avatar_url.dim {
+            line.push_str(&format!(" avatar_dim={dim}"));
+        }
+        if let Some(thumbhash) = &group.avatar_url.thumbhash {
+            line.push_str(&format!(" avatar_thumbhash={thumbhash}"));
+        }
+    }
+    line
 }
 
 pub(crate) fn group_json(group: AppGroupRecord) -> Value {
@@ -780,6 +790,7 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
         "endpoint": group.endpoint,
         "profile": group.profile,
         "image": group.image,
+        "avatar_url": group.avatar_url,
         "admin_policy": group.admin_policy,
         "nostr_routing": group.nostr_routing,
         "agent_text_stream": group.agent_text_stream,

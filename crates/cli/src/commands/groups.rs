@@ -154,6 +154,63 @@ pub(crate) async fn group_command_with_runtime(
                 }),
             })
         }
+        GroupCommand::SetAvatarUrl {
+            group,
+            url,
+            dim,
+            thumbhash,
+            clear,
+        } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
+            // clap guarantees exactly one of `--url` / `--clear` is present, and
+            // that `--dim` / `--thumbhash` only accompany `--url`. An explicit
+            // empty `--url ""` is a malformed URL, not a clear — surface it as the
+            // typed `invalid_group_avatar_url` error rather than silently clearing.
+            // Validation/normalization (https-only, length bound, reject
+            // localhost/private hosts) is enforced in the codec; the CLI passes
+            // the URL through.
+            let url = if clear {
+                None
+            } else {
+                match url {
+                    Some(url) if url.is_empty() => {
+                        return Err(AppError::InvalidGroupAvatarUrl(
+                            "group avatar URL must not be empty".to_owned(),
+                        )
+                        .into());
+                    }
+                    other => other,
+                }
+            };
+            let summary = runtime
+                .update_group_avatar_url(&account.label, &group_id, url, dim, thumbhash)
+                .await?;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let group = app
+                .group(&account.label, &group_id_hex)?
+                .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
+            let action = if group.avatar_url.present {
+                "set"
+            } else {
+                "cleared"
+            };
+            Ok(CommandOutput {
+                plain: format!(
+                    "{action} avatar-url for group {group_id_hex} published={}",
+                    summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "group": group_json(group),
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                }),
+            })
+        }
     }
 }
 
@@ -339,6 +396,28 @@ pub(crate) async fn groups_command_with_runtime(
                     group: group_id,
                     name: Some(name),
                     description: None,
+                },
+                account_flag,
+            )
+            .await
+        }
+        GroupsCommand::SetAvatarUrl {
+            group_id,
+            url,
+            dim,
+            thumbhash,
+            clear,
+        } => {
+            group_command_with_runtime(
+                account_home,
+                app,
+                runtime,
+                GroupCommand::SetAvatarUrl {
+                    group: group_id,
+                    url,
+                    dim,
+                    thumbhash,
+                    clear,
                 },
                 account_flag,
             )

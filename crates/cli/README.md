@@ -179,6 +179,8 @@ dm --account <npub-or-hex> groups admins <group-hex>
 dm --account <npub-or-hex> groups relays <group-hex>
 dm --account <npub-or-hex> groups leave <group-hex>
 dm --account <npub-or-hex> groups rename <group-hex> <name>
+dm --account <npub-or-hex> groups set-avatar-url <group-hex> --url <https-url> [--dim <WxH>] [--thumbhash <hex>]
+dm --account <npub-or-hex> groups set-avatar-url <group-hex> --clear
 dm --account <npub-or-hex> groups promote <group-hex> <member-npub-or-hex>
 dm --account <npub-or-hex> groups demote <group-hex> <member-npub-or-hex>
 dm --account <npub-or-hex> groups self-demote <group-hex>
@@ -190,6 +192,8 @@ dm --account <npub-or-hex> group invite <group-hex> <member-npub-or-hex> [...]
 dm --account <npub-or-hex> group remove <group-hex> <member-npub-or-hex> [...]
 dm --account <npub-or-hex> group update <group-hex> --name <name>
 dm --account <npub-or-hex> group update <group-hex> --description <description>
+dm --account <npub-or-hex> group set-avatar-url <group-hex> --url <https-url> [--dim <WxH>] [--thumbhash <hex>]
+dm --account <npub-or-hex> group set-avatar-url <group-hex> --clear
 ```
 
 Message commands:

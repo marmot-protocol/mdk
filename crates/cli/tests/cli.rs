@@ -5032,6 +5032,161 @@ fn group_update_publishes_profile_component_changes() {
 }
 
 #[test]
+fn groups_set_avatar_url_round_trips_through_sync_and_show() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    run_json(home.path(), &["--account", &bob, "sync"]);
+
+    // Set the URL avatar on alice.
+    let set = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-avatar-url",
+            group_id,
+            "--url",
+            "https://cdn.example.com/a.png",
+            "--dim",
+            "512x512",
+        ],
+    );
+    assert_eq!(set["group"]["avatar_url"]["present"], true);
+    assert_eq!(
+        set["group"]["avatar_url"]["url"],
+        "https://cdn.example.com/a.png"
+    );
+    assert_eq!(set["group"]["avatar_url"]["dim"], "512x512");
+    assert_eq!(set["published"], 1);
+
+    // alice's own show renders it (human + JSON).
+    let alice_show = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "show", group_id],
+    );
+    assert_eq!(
+        alice_show["group"]["avatar_url"]["url"],
+        "https://cdn.example.com/a.png"
+    );
+
+    // bob syncs and sees the avatar in the projection.
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_group = run_json(home.path(), &["--account", &bob, "chats", "show", group_id]);
+    assert_eq!(bob_group["group"]["avatar_url"]["present"], true);
+    assert_eq!(
+        bob_group["group"]["avatar_url"]["url"],
+        "https://cdn.example.com/a.png"
+    );
+
+    // Updating to a new URL replaces the previous one.
+    let updated = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-avatar-url",
+            group_id,
+            "--url",
+            "https://cdn.example.com/b.png",
+        ],
+    );
+    assert_eq!(
+        updated["group"]["avatar_url"]["url"],
+        "https://cdn.example.com/b.png"
+    );
+
+    // Clearing removes the avatar.
+    let cleared = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-avatar-url",
+            group_id,
+            "--clear",
+        ],
+    );
+    assert_eq!(cleared["group"]["avatar_url"]["present"], false);
+
+    run_json(home.path(), &["--account", &bob, "sync"]);
+    let bob_cleared = run_json(home.path(), &["--account", &bob, "chats", "show", group_id]);
+    assert_eq!(bob_cleared["group"]["avatar_url"]["present"], false);
+
+    // A non-HTTPS URL surfaces the stable typed error code.
+    let err = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-avatar-url",
+            group_id,
+            "--url",
+            "http://cdn.example.com/a.png",
+        ],
+    );
+    assert_eq!(err["code"], "invalid_group_avatar_url");
+
+    // An explicitly empty `--url ""` is rejected as a malformed URL rather than
+    // silently clearing the avatar.
+    let empty_err = run_json_error(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "groups",
+            "set-avatar-url",
+            group_id,
+            "--url",
+            "",
+        ],
+    );
+    assert_eq!(empty_err["code"], "invalid_group_avatar_url");
+
+    // Omitting both --url and --clear is a usage error (no silent clear).
+    assert!(
+        !dm(home.path())
+            .args(["--account", &alice, "groups", "set-avatar-url", group_id])
+            .output()
+            .expect("dm command should start")
+            .status
+            .success(),
+        "set-avatar-url without --url/--clear should fail"
+    );
+
+    // --dim without --url is a usage error.
+    assert!(
+        !dm(home.path())
+            .args([
+                "--account",
+                &alice,
+                "groups",
+                "set-avatar-url",
+                group_id,
+                "--dim",
+                "512x512",
+            ])
+            .output()
+            .expect("dm command should start")
+            .status
+            .success(),
+        "set-avatar-url --dim without --url should fail"
+    );
+}
+
+#[test]
 fn non_admin_group_mutations_return_admin_policy_errors() {
     let home = tempfile::tempdir().expect("tempdir");
 
