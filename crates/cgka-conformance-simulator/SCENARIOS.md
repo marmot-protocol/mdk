@@ -179,9 +179,13 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### `convergence-chaos/v1`
 
-- Generator: `generate_convergence_chaos_family`
+- Generator: `generate_convergence_chaos_family` (generator version `2`).
 - Setup: the family rotates through the case classes below.
 - Expected: each case carries semantic expectations for convergence, rollback, payload delivery, or recovery.
+- Seed behavior: the rollback (`2`) and storm shapes (`6`, `7`, `8`, `9`) draw their delivery schedule from the seed,
+  so distinct seeds exercise distinct adversarial orderings. Convergence, rollback, and payload-set expectations are
+  invariant under delivery schedule, so they stay fixed while coverage grows with the seed. The remaining shapes are
+  pure functions of the case index.
 
 #### Chaos Class `0`: Invite Fork
 
@@ -197,9 +201,11 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 #### Chaos Class `2`: Rollback Queue Faults
 
-- Setup: Alice rolls back a group-data update. Bob sends after the rollback.
-- Pressure: duplicate and delayed app delivery after rollback.
-- Expected: Alice remains at epoch 1 and receives Bob's post-rollback payload once.
+- Setup: Alice rolls back a group-data update. Bob sends several app messages after the rollback.
+- Pressure: a seed-driven delivery reorder of the post-rollback messages, plus a duplicated and delayed copy of the
+  rolled-back commit redelivered across the rollback.
+- Expected: Alice remains at epoch 1 and receives Bob's post-rollback payloads once each, in the seed-driven delivery
+  order (the redelivered commit is deduped).
 
 #### Chaos Class `3`: Partition Leave
 
@@ -222,25 +228,25 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 #### Chaos Class `6`: Large Message Storm
 
 - Setup: Alice creates a 21-member group. Every other member sends.
-- Pressure: large group plus reversed app-message delivery.
+- Pressure: large group plus a seed-driven app-message delivery reorder.
 - Expected: Alice observes all expected payloads and stays at epoch 1 with 21 members.
 
 #### Chaos Class `7`: Large Partitioned Storm
 
 - Setup: Alice creates a 25-member group. Other members send while only Alice is allowed by the partition.
-- Pressure: large group with partitioned delivery.
+- Pressure: large group with partitioned delivery and a seed-driven reorder.
 - Expected: Alice observes the expected payloads and keeps 25 members.
 
 #### Chaos Class `8`: Large Commit Storm
 
 - Setup: Alice creates a 21-member group. Eight members race group-data commits.
-- Pressure: multi-committer same-epoch commit storm plus duplicate and reorder.
+- Pressure: multi-committer same-epoch commit storm plus a seed-driven duplicate and reorder.
 - Expected: the committers converge at epoch 2 with 21 members.
 
 #### Chaos Class `9`: Mixed Large Storm
 
 - Setup: Alice creates a 21-member group. Members send app messages, then eight members race group-data commits.
-- Pressure: large app-message load followed by a commit storm.
+- Pressure: large app-message load (seed-driven reorder) followed by a commit storm with a seed-driven duplicate and reorder.
 - Expected: the committers converge at epoch 2 with 21 members.
 
 #### Chaos Class `10`: Restart Delivery Faults

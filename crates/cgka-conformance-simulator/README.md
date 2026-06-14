@@ -198,12 +198,14 @@ Alice's deeper branch at epoch 3 depending on which messages are available befor
 trace includes exactly the selected branch application payload.
 
 `generate_convergence_chaos_family(seed, cases)` produces deterministic adversarial convergence cases with built-in
-semantic expectations. The first generator version rotates through invite forks, group-data forks, publish rollback plus
+semantic expectations. The generator rotates through invite forks, group-data forks, publish rollback plus
 delayed duplicates, partition/heal/leave, delayed past-epoch app delivery, stable duplicate/delay/reorder queue faults,
 20+ client message storms, partitioned large-group delivery storms, multi-committer group-data storms, mixed large
-message/commit storms, and restart plus duplicate delivery faults. These cases are ordinary `ScenarioSpec`s, so the same
-runner and report path can turn selected generated cases into fixed vectors when that makes the conformance contract
-clearer.
+message/commit storms, and restart plus duplicate delivery faults. Generator version `2` draws the delivery schedule of
+the rollback and storm shapes from the seed, so distinct seeds exercise distinct adversarial orderings while the
+schedule-invariant convergence, rollback, and payload-set expectations stay fixed. These cases are ordinary
+`ScenarioSpec`s, so the same runner and report path can turn selected generated cases into fixed vectors when that makes
+the conformance contract clearer.
 
 ## Report artifacts
 

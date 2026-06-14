@@ -112,7 +112,10 @@ group-data fork recovery, rollback plus delayed duplicate delivery, partition/he
 delivery, stable duplicate/delay/reorder queue faults, 20+ client message storms, partitioned large-group delivery
 storms, multi-committer group-data storms, mixed large message/commit storms, and restart plus duplicate delivery
 faults. These cases carry semantic `expected_outcomes`, so report failures point at the broken convergence invariant
-instead of only writing an observation dump.
+instead of only writing an observation dump. Generator version `2` draws the delivery schedule of the rollback and storm
+shapes (arms 2, 6, 7, 8, 9) from the seed, so distinct seeds exercise distinct adversarial orderings; the
+schedule-invariant convergence, rollback, and payload-set expectations stay fixed, so coverage grows with the seed
+without re-pinning vectors.
 
 ## How to add a new scripted scenario
 

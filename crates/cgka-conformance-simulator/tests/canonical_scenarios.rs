@@ -763,7 +763,7 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-chaos/v1");
-        assert_eq!(case.generator_version, "1");
+        assert_eq!(case.generator_version, "2");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
 
@@ -779,6 +779,67 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
         );
         assert!(report.invariant_failures.is_empty());
         assert_eq!(report.scenario, case.scenario);
+    }
+}
+
+#[tokio::test]
+async fn convergence_chaos_family_seed_changes_scenarios() {
+    // Regression for darkmatter#166: distinct seeds must produce distinct
+    // chaos scenarios. Before the fix, every shape except the rollback case was
+    // a pure function of case_index, so seeded batches silently re-ran the same
+    // fixed scenarios and coverage did not grow with seeds.
+    let seed_a = generate_convergence_chaos_family(1, 11);
+    let seed_b = generate_convergence_chaos_family(2, 11);
+    assert_eq!(seed_a.len(), 11);
+    assert_eq!(seed_b.len(), 11);
+
+    // The two queue-fault/storm shapes that consume the rng must differ between
+    // seeds (rollback delivery schedule, message storm, partitioned storm,
+    // commit storm, mixed storm). Check the seed-driven shapes specifically.
+    let seed_driven_arms = [2usize, 6, 7, 8, 9];
+    for arm in seed_driven_arms {
+        assert_ne!(
+            seed_a[arm].scenario, seed_b[arm].scenario,
+            "chaos arm {arm} should differ across seeds",
+        );
+    }
+
+    // Arm 2 (rollback queue faults) must vary a real behavioral dimension, not
+    // just the app payload string: the seed-driven delivery schedule (the
+    // ReorderQueued permutation) must differ across seeds. This is the
+    // regression guard for darkmatter#166's blocking review finding — before
+    // the fix, arm 2's only rng use was a random u16 appended to a payload, so
+    // normalizing the payload made both seeds' scenarios identical.
+    let reorder_order = |case: &GeneratedScenarioCase| -> Vec<usize> {
+        case.scenario
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                ScenarioStep::ReorderQueued { order } => Some(order.clone()),
+                _ => None,
+            })
+            .expect("rollback arm should carry a seed-driven ReorderQueued step")
+    };
+    assert_ne!(
+        reorder_order(&seed_a[2]),
+        reorder_order(&seed_b[2]),
+        "arm 2 rollback delivery schedule must vary with the seed, not just the payload string",
+    );
+
+    // Every seed-driven scenario must still satisfy its pinned expectations,
+    // so the divergence reflects real behavior variation, not breakage.
+    for case in seed_a.iter().chain(seed_b.iter()) {
+        let report = run_generated_case_report(case, None)
+            .await
+            .expect("seeded chaos case reports");
+        assert!(
+            report.expectation_failures.is_empty(),
+            "case {} (seed {}) failed expectations: {:?}",
+            case.case_index,
+            case.seed,
+            report.expectation_failures
+        );
+        assert!(report.invariant_failures.is_empty());
     }
 }
 
