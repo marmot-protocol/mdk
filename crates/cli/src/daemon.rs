@@ -29,9 +29,54 @@ use crate::{
 };
 
 const DAEMON_EVENT_REPLAY_LIMIT: usize = 256;
+const MESSAGE_SUBSCRIPTION_DEDUP_LIMIT: usize = DAEMON_EVENT_REPLAY_LIMIT;
 const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
+
+#[derive(Debug)]
+struct BoundedMessageSubscriptionIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+    limit: usize,
+}
+
+impl BoundedMessageSubscriptionIds {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            limit,
+        }
+    }
+
+    fn insert(&mut self, id: String) -> bool {
+        if id.is_empty() {
+            return true;
+        }
+        if !self.ids.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.ids.len() > self.limit {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.ids.remove(&oldest);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonClientError {
@@ -1036,8 +1081,10 @@ async fn handle_messages_subscription(
             return Ok(());
         }
     };
-    let mut seen_messages = HashSet::new();
-    let mut seen_stream_previews = HashSet::new();
+    let mut seen_messages =
+        BoundedMessageSubscriptionIds::with_limit(MESSAGE_SUBSCRIPTION_DEDUP_LIMIT);
+    let mut seen_stream_previews =
+        BoundedMessageSubscriptionIds::with_limit(MESSAGE_SUBSCRIPTION_DEDUP_LIMIT);
     let mut event_rx = events.subscribe_messages();
     let mut stream_rx = stream_manager.subscribe();
     if !write_stream_response(
@@ -1368,8 +1415,8 @@ async fn write_message_subscription_event(
     response: DaemonStreamResponse,
     group_id: Option<&str>,
     account_id: &str,
-    seen_messages: &mut HashSet<String>,
-    seen_stream_previews: &mut HashSet<String>,
+    seen_messages: &mut BoundedMessageSubscriptionIds,
+    seen_stream_previews: &mut BoundedMessageSubscriptionIds,
 ) -> bool {
     if !stream_response_matches_subscription(&response, group_id, account_id) {
         return true;
@@ -1864,8 +1911,8 @@ fn value_matches_group_and_account(
 
 fn mark_stream_response_seen(
     response: &DaemonStreamResponse,
-    seen_messages: &mut HashSet<String>,
-    seen_stream_previews: &mut HashSet<String>,
+    seen_messages: &mut BoundedMessageSubscriptionIds,
+    seen_stream_previews: &mut BoundedMessageSubscriptionIds,
 ) -> bool {
     let Some(result) = &response.result else {
         return true;
@@ -4476,6 +4523,68 @@ mod tests {
             None,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
+    }
+
+    #[test]
+    fn message_subscription_seen_message_ids_are_bounded_to_recent_ids() {
+        let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
+        let mut seen_stream_previews = BoundedMessageSubscriptionIds::with_limit(3);
+
+        for index in 0..5 {
+            let response = DaemonStreamResponse::ok(serde_json::json!({
+                "type": "message",
+                "message": { "message_id": format!("message-{index}") }
+            }));
+            assert!(mark_stream_response_seen(
+                &response,
+                &mut seen_messages,
+                &mut seen_stream_previews
+            ));
+        }
+
+        assert_eq!(seen_messages.len(), 3);
+        assert!(!seen_messages.contains("message-0"));
+        assert!(!seen_messages.contains("message-1"));
+        assert!(seen_messages.contains("message-2"));
+        assert!(seen_messages.contains("message-4"));
+
+        let duplicate = DaemonStreamResponse::ok(serde_json::json!({
+            "type": "message",
+            "message": { "message_id": "message-2" }
+        }));
+        assert!(!mark_stream_response_seen(
+            &duplicate,
+            &mut seen_messages,
+            &mut seen_stream_previews
+        ));
+    }
+
+    #[test]
+    fn message_subscription_seen_stream_previews_are_bounded_to_recent_ids() {
+        let mut seen_messages = BoundedMessageSubscriptionIds::with_limit(3);
+        let mut seen_stream_previews = BoundedMessageSubscriptionIds::with_limit(3);
+
+        for index in 0..5 {
+            let response = DaemonStreamResponse::ok(serde_json::json!({
+                "type": "stream_preview",
+                "stream_preview": {
+                    "watch_id": format!("watch-{index}"),
+                    "status": "running",
+                    "text": format!("chunk-{index}")
+                }
+            }));
+            assert!(mark_stream_response_seen(
+                &response,
+                &mut seen_messages,
+                &mut seen_stream_previews
+            ));
+        }
+
+        assert_eq!(seen_stream_previews.len(), 3);
+        assert!(!seen_stream_previews.contains("watch-0:running:chunk-0::"));
+        assert!(!seen_stream_previews.contains("watch-1:running:chunk-1::"));
+        assert!(seen_stream_previews.contains("watch-2:running:chunk-2::"));
+        assert!(seen_stream_previews.contains("watch-4:running:chunk-4::"));
     }
 
     #[test]

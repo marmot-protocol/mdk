@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -47,10 +47,10 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
-    NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
+    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp,
+    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
+    NotificationUpdate, NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
     RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
     SyncSummary, TimelineMessageChange, TimelineMessageQuery, TimelinePage, TimelineUpdateTrigger,
     UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
@@ -83,6 +83,60 @@ pub struct RuntimeSharedServices {
     audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
+}
+
+const MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT: usize = MAX_SEEN_EVENT_IDS;
+
+#[derive(Debug)]
+struct MessageSubscriptionSeenIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+    limit: usize,
+}
+
+impl MessageSubscriptionSeenIds {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            limit,
+        }
+    }
+
+    fn from_ids(ids: impl IntoIterator<Item = String>, limit: usize) -> Self {
+        let mut seen = Self::with_limit(limit);
+        for id in ids {
+            seen.insert(id);
+        }
+        seen
+    }
+
+    fn insert(&mut self, id: String) -> bool {
+        if id.is_empty() {
+            return true;
+        }
+        if !self.ids.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.ids.len() > self.limit {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.ids.remove(&oldest);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
 }
 
 impl Default for RuntimeSharedServices {
@@ -1259,16 +1313,12 @@ impl MarmotAppRuntime {
         let mut events = self.events.subscribe();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot = self.messages_with_query(&account.account_id_hex, query)?;
-        let mut seen_message_ids = snapshot
-            .iter()
-            .filter_map(|message| {
-                if message.message_id_hex.is_empty() {
-                    None
-                } else {
-                    Some(message.message_id_hex.clone())
-                }
-            })
-            .collect::<HashSet<_>>();
+        let mut seen_message_ids = MessageSubscriptionSeenIds::from_ids(
+            snapshot
+                .iter()
+                .map(|message| message.message_id_hex.clone()),
+            MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT,
+        );
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -1293,9 +1343,7 @@ impl MarmotAppRuntime {
                 {
                     continue;
                 }
-                if !message.message_id_hex.is_empty()
-                    && !seen_message_ids.insert(message.message_id_hex.clone())
-                {
+                if !seen_message_ids.insert(message.message_id_hex.clone()) {
                     continue;
                 }
                 if updates_tx.send(update).await.is_err() {
@@ -5946,6 +5994,33 @@ fn stamp_published_profile_created_at(profile: &mut UserProfileMetadata, now: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_subscription_seen_ids_are_bounded_to_recent_ids() {
+        let mut seen =
+            MessageSubscriptionSeenIds::from_ids((0..5).map(|index| format!("message-{index}")), 3);
+
+        assert_eq!(seen.len(), 3);
+        assert!(!seen.contains("message-0"));
+        assert!(!seen.contains("message-1"));
+        assert!(seen.contains("message-2"));
+        assert!(seen.contains("message-4"));
+        assert!(!seen.insert("message-2".to_owned()));
+        assert!(seen.insert("message-5".to_owned()));
+        assert_eq!(seen.len(), 3);
+        assert!(!seen.contains("message-2"));
+        assert!(seen.contains("message-3"));
+        assert!(seen.contains("message-5"));
+    }
+
+    #[test]
+    fn message_subscription_seen_ids_do_not_store_empty_ids() {
+        let mut seen = MessageSubscriptionSeenIds::with_limit(1);
+
+        assert!(seen.insert(String::new()));
+        assert!(seen.insert(String::new()));
+        assert_eq!(seen.len(), 0);
+    }
 
     #[test]
     fn parse_quic_candidate_ignores_path_query_and_fragment_after_authority() {
