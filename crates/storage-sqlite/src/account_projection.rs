@@ -373,17 +373,17 @@ impl SqliteAccountStorage {
                            plaintext, kind, tags_json, source_epoch, recorded_at, received_at
                     FROM app_events
                     WHERE group_id_hex = ?1
-                    ORDER BY recorded_at DESC, received_at DESC, insert_order DESC
+                    ORDER BY recorded_at DESC, message_id_hex DESC, insert_order DESC
                     LIMIT ?2
                  )
-                 ORDER BY recorded_at, received_at, insert_order"
+                 ORDER BY recorded_at, message_id_hex, insert_order"
             }
             (Some(_), None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
                         kind, tags_json, source_epoch, recorded_at, received_at
                  FROM app_events
                  WHERE group_id_hex = ?1
-                 ORDER BY recorded_at, received_at, insert_order"
+                 ORDER BY recorded_at, message_id_hex, insert_order"
             }
             (None, Some(_)) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
@@ -392,16 +392,16 @@ impl SqliteAccountStorage {
                     SELECT insert_order, message_id_hex, direction, group_id_hex, sender,
                            plaintext, kind, tags_json, source_epoch, recorded_at, received_at
                     FROM app_events
-                    ORDER BY recorded_at DESC, received_at DESC, insert_order DESC
+                    ORDER BY recorded_at DESC, message_id_hex DESC, insert_order DESC
                     LIMIT ?1
                  )
-                 ORDER BY recorded_at, received_at, insert_order"
+                 ORDER BY recorded_at, message_id_hex, insert_order"
             }
             (None, None) => {
                 "SELECT message_id_hex, direction, group_id_hex, sender, plaintext,
                         kind, tags_json, source_epoch, recorded_at, received_at
                  FROM app_events
-                 ORDER BY recorded_at, received_at, insert_order"
+                 ORDER BY recorded_at, message_id_hex, insert_order"
             }
         };
         let conn = self.lock()?;

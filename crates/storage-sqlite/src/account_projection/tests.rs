@@ -199,6 +199,47 @@ fn app_messages_list_raw_events_and_prune_rebuilds_timeline() {
 }
 
 #[test]
+fn app_messages_tie_break_on_message_id_matches_cursor_order() {
+    // Same `recorded_at`, but `message_id_hex` lexical order differs from both
+    // insertion order and `received_at` order. `dm messages list` filters
+    // cursor ties on `(recorded_at, message_id_hex)`, so the projection must
+    // return same-timestamp rows in `message_id_hex` order or pagination skips
+    // or duplicates rows. Regression test for issue #390.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let recorded_at = 100;
+    // Insert so that received_at order (and insert order) is the REVERSE of
+    // message_id_hex lexical order: "aaa" received last, "ccc" received first.
+    // Under the buggy (recorded_at, received_at, insert_order) ordering the
+    // projection would return ccc, bbb, aaa; the cursor tie-breaker expects
+    // message_id_hex order aaa, bbb, ccc.
+    for (id, received_at) in [("ccc", 10u64), ("bbb", 20u64), ("aaa", 30u64)] {
+        let mut event = app_event(id, "gg", recorded_at);
+        event.received_at = received_at;
+        store.record_app_event(&event).unwrap();
+    }
+
+    let ordered_ids = |limit: Option<usize>| {
+        store
+            .app_messages(StoredAppMessageQuery {
+                group_id_hex: Some("gg".to_owned()),
+                limit,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|message| message.message_id_hex)
+            .collect::<Vec<_>>()
+    };
+
+    // Ascending display order must be by message_id_hex, matching the cursor
+    // tie-breaker used by `apply_message_cursors`.
+    assert_eq!(ordered_ids(None), vec!["aaa", "bbb", "ccc"]);
+
+    // The newest-N limited path takes the lexically-greatest ids, then returns
+    // them in ascending message_id_hex order. With limit 2 that is bbb, ccc.
+    assert_eq!(ordered_ids(Some(2)), vec!["bbb", "ccc"]);
+}
+
+#[test]
 fn push_registration_preserves_created_at_when_token_rotates() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let registration = AccountPushRegistration {
