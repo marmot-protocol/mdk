@@ -1251,6 +1251,14 @@ where
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         match daemon::send_execute(&socket, cli.clone()).await {
             Ok(output) => return output,
+            // An oversized request is a client-side limit violation, not a
+            // daemon-unavailable condition: the encoder rejects it before it
+            // ever reaches `dmd`. Surface it as a terminal error even on the
+            // implicit-socket path, otherwise the request silently falls
+            // through to `run_cli_local` and masks the size cap (see #190).
+            Err(err @ daemon::DaemonClientError::RequestTooLarge { .. }) => {
+                return daemon_client_error(cli.json, err);
+            }
             Err(err) if cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some() => {
                 return daemon_client_error(cli.json, err);
             }
@@ -6448,5 +6456,51 @@ mod tests {
         let err = validate_message_list_cursors(Some(101), Some("d"), Some(100), Some("a"))
             .expect_err("before and after cursors cannot be combined");
         assert!(matches!(err, DmError::MessagePaginationConflictingCursors));
+    }
+
+    // Regression for #190: an oversized request on the *implicit* daemon socket
+    // path (default socket merely exists, no `--socket`/`DM_SOCKET`) must surface
+    // the client-side size-limit error instead of silently falling through to
+    // local execution. Without the terminal `RequestTooLarge` arm in `run_from`,
+    // the encoder rejects the request and the request silently runs locally,
+    // masking the cap.
+    #[tokio::test]
+    async fn run_from_oversized_request_on_implicit_socket_fails_locally() {
+        // DM_SOCKET would force the explicit-socket branch and invalidate the
+        // implicit-path assertion; only run the check when it is unset.
+        if std::env::var_os("DM_SOCKET").is_some() {
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("temp home");
+        // Materialize the default socket path so `daemon_socket_for_client`
+        // takes the implicit-socket branch without us passing `--socket`.
+        let socket = crate::daemon::default_socket_path(home.path());
+        std::fs::create_dir_all(socket.parent().expect("socket parent"))
+            .expect("create socket dir");
+        std::fs::File::create(&socket).expect("create placeholder socket file");
+
+        // A message body over the 1 MiB request cap; the encoder rejects this
+        // before any connection attempt.
+        let huge_text = "a".repeat(2 * 1024 * 1024);
+        let args: Vec<OsString> = vec![
+            OsString::from("dm"),
+            OsString::from("--json"),
+            OsString::from("--home"),
+            home.path().as_os_str().to_owned(),
+            OsString::from("messages"),
+            OsString::from("send"),
+            OsString::from("group-1"),
+            OsString::from(huge_text),
+        ];
+
+        let output = super::run_from(args).await;
+
+        assert_eq!(output.code, 1, "oversized request must fail");
+        assert!(
+            output.stdout.contains("byte limit"),
+            "expected a client-side size-limit error, got stdout: {}",
+            output.stdout
+        );
     }
 }

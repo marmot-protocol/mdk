@@ -76,6 +76,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 - The TUI no longer exits the whole session when an error occurs while a stream composer is active. Failures from
   finishing or cancelling a stream (daemon gone, broker/QUIC error, relay publish rejection) are now caught into the
   status line — mirroring the non-streaming Enter path — so the composer stays open and the user can retry Enter/Esc.
+- `dmd` no longer exits when a single client connection is abrupt, empty, oversized, malformed, or stalled.
+  Per-connection read failures (a client that closes before sending, a mid-write interrupt, a request over the 1 MiB
+  cap, or invalid JSON) are now reported to that client and skipped like authorization failures, instead of propagating
+  out of the accept loop and killing the daemon (which left a stale socket and pid file). The accept loop also bounds
+  how long it waits for a client to send its request frame, so a same-UID client that connects but never sends data can
+  no longer wedge the loop and starve other clients. `dm` rejects oversized requests client-side before sending — even
+  on the default implicit daemon socket — so e.g. `dm messages send` with a body over the limit fails locally with a
+  clear size-limit error instead of silently falling back to local execution or reaching the daemon.
 
 ### Security
 
