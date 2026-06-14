@@ -1585,11 +1585,42 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
 }
 
 fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
+    if let Command::Stream { command } = &cli.command
+        && client_hosted_stream_command(command).is_some()
+    {
+        return None;
+    }
+
     let socket = daemon_socket_path_for_client(cli, home);
     if cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some() || socket.exists() {
         Some(socket)
     } else {
         None
+    }
+}
+
+pub(crate) fn client_hosted_stream_command(
+    command: &StreamCommand,
+) -> Option<(&'static str, &'static str)> {
+    match command {
+        StreamCommand::Receive { .. } => Some((
+            "stream receive",
+            "it waits for incoming stream traffic; run dm stream receive directly without --socket",
+        )),
+        StreamCommand::Send {
+            start_event_id: None,
+            ..
+        } => Some((
+            "stream send",
+            "it opens a client-hosted stream; anchor the send to an existing stream or run it directly without --socket",
+        )),
+        StreamCommand::Watch {
+            background: false, ..
+        } => Some((
+            "stream watch",
+            "foreground stream watches run until the stream ends; use --background or run directly without --socket",
+        )),
+        _ => None,
     }
 }
 
@@ -6191,13 +6222,15 @@ fn engine_error_json(err: &EngineError) -> Value {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::Path;
     use std::path::PathBuf;
 
     use super::{
-        AppMessageRecord, DmError, GlobalRelayDefaults, apply_global_relay_defaults,
-        apply_message_cursors, default_home_from_env, first_quic_candidate_is_loopback,
-        parse_quic_candidate, quic_candidate_host, relay_endpoints, relay_stats_output,
-        relay_stats_plain, resolve_relay, validate_message_list_cursors,
+        AppMessageRecord, Cli, Command, DmError, GlobalRelayDefaults, StreamCommand,
+        apply_global_relay_defaults, apply_message_cursors, daemon_socket_for_client,
+        default_home_from_env, first_quic_candidate_is_loopback, parse_quic_candidate,
+        quic_candidate_host, relay_endpoints, relay_stats_output, relay_stats_plain, resolve_relay,
+        validate_message_list_cursors,
     };
     use marmot_app::{
         DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -6257,6 +6290,101 @@ mod tests {
                 connection_successes: 1,
                 ..RelayPlaneHealth::default()
             },
+        }
+    }
+
+    fn test_cli(command: Command) -> Cli {
+        Cli {
+            home: None,
+            socket: Some(PathBuf::from("/tmp/dmd.sock")),
+            relay: None,
+            daemon_discovery_relays: Vec::new(),
+            daemon_default_account_relays: Vec::new(),
+            secret_store: None,
+            keychain_service: None,
+            account: None,
+            json: true,
+            command,
+        }
+    }
+
+    fn loopback_stream_addr() -> std::net::SocketAddr {
+        "127.0.0.1:4450".parse().expect("loopback address")
+    }
+
+    #[test]
+    fn daemon_execute_socket_skips_stream_commands_that_must_run_in_client() {
+        let home = Path::new("/tmp/dm-home");
+        let commands = [
+            StreamCommand::Receive {
+                bind: loopback_stream_addr(),
+                start_event_id: None,
+            },
+            StreamCommand::Send {
+                broker: false,
+                connect: loopback_stream_addr(),
+                server_name: "localhost".to_owned(),
+                server_cert_der_hex: None,
+                insecure_local: true,
+                stream_id: None,
+                start_event_id: None,
+                chunk_bytes: 1024,
+                chunk_delay_ms: 0,
+                text: vec!["hello".to_owned()],
+            },
+            StreamCommand::Watch {
+                group: "aa".repeat(32),
+                stream_id: None,
+                server_cert_der_hex: None,
+                insecure_local: true,
+                background: false,
+            },
+        ];
+
+        for command in commands {
+            let cli = test_cli(Command::Stream { command });
+            assert_eq!(daemon_socket_for_client(&cli, home), None);
+        }
+    }
+
+    #[test]
+    fn daemon_execute_socket_keeps_finite_stream_commands() {
+        let home = Path::new("/tmp/dm-home");
+        let socket = Path::new("/tmp/dmd.sock");
+        let commands = [
+            StreamCommand::Start {
+                group: "aa".repeat(32),
+                stream_id: None,
+                quic_candidates: vec!["quic://127.0.0.1:4450".to_owned()],
+            },
+            StreamCommand::Send {
+                broker: false,
+                connect: loopback_stream_addr(),
+                server_name: "localhost".to_owned(),
+                server_cert_der_hex: None,
+                insecure_local: true,
+                stream_id: None,
+                start_event_id: Some("bb".repeat(32)),
+                chunk_bytes: 1024,
+                chunk_delay_ms: 0,
+                text: vec!["hello".to_owned()],
+            },
+            StreamCommand::Finish {
+                group: "aa".repeat(32),
+                stream_id: "cc".repeat(32),
+                start_event_id: "bb".repeat(32),
+                transcript_hash: "dd".repeat(32),
+                chunk_count: 1,
+                text: vec!["hello".to_owned()],
+            },
+        ];
+
+        for command in commands {
+            let cli = test_cli(Command::Stream { command });
+            assert_eq!(
+                daemon_socket_for_client(&cli, home).as_deref(),
+                Some(socket)
+            );
         }
     }
 

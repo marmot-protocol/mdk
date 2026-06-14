@@ -63,6 +63,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `dm stream receive`, unanchored `dm stream send`, and foreground `dm stream watch` now stay client-hosted when a
+  daemon socket is configured, and direct daemon Execute requests for those long-running stream commands return
+  `daemon_forbidden` instead of blocking `dmd`'s accept loop.
 - `dm messages list` now validates its pagination cursor flags instead of silently mishandling them. Previously,
   `--before-message-id`/`--after-message-id` were ignored unless the matching `--before`/`--after` timestamp was also
   supplied, and any lone cursor flag combined with `--limit` returned the oldest N messages instead of the newest.

@@ -1017,6 +1017,7 @@ fn blocked_daemon_execute_command(
             "logout",
             "it removes a local account; run dm logout directly without --socket",
         )),
+        crate::Command::Stream { command } => crate::client_hosted_stream_command(command),
         _ => None,
     }
 }
@@ -4409,6 +4410,61 @@ mod tests {
         assert_eq!(logout.code, 1);
         assert_eq!(logout_json["error"]["code"], "daemon_forbidden");
         assert_eq!(logout_json["error"]["command"], "logout");
+    }
+
+    #[test]
+    fn long_running_stream_execute_commands_are_refused_over_daemon() {
+        let receive = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
+            command: crate::StreamCommand::Receive {
+                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
+                start_event_id: None,
+            },
+        }))
+        .expect("stream receive should be blocked");
+        let receive_json: serde_json::Value =
+            serde_json::from_str(receive.stdout.trim()).expect("receive error JSON");
+        assert_eq!(receive.code, 1);
+        assert_eq!(receive_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(receive_json["error"]["command"], "stream receive");
+
+        let unanchored_send =
+            blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
+                command: crate::StreamCommand::Send {
+                    broker: false,
+                    connect: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
+                    server_name: "localhost".to_owned(),
+                    server_cert_der_hex: None,
+                    insecure_local: true,
+                    stream_id: None,
+                    start_event_id: None,
+                    chunk_bytes: 1024,
+                    chunk_delay_ms: 0,
+                    text: vec!["hello".to_owned()],
+                },
+            }))
+            .expect("unanchored stream send should be blocked");
+        let unanchored_send_json: serde_json::Value =
+            serde_json::from_str(unanchored_send.stdout.trim()).expect("send error JSON");
+        assert_eq!(unanchored_send.code, 1);
+        assert_eq!(unanchored_send_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(unanchored_send_json["error"]["command"], "stream send");
+
+        let foreground_watch =
+            blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Stream {
+                command: crate::StreamCommand::Watch {
+                    group: "aa".repeat(32),
+                    stream_id: None,
+                    server_cert_der_hex: None,
+                    insecure_local: true,
+                    background: false,
+                },
+            }))
+            .expect("foreground stream watch should be blocked");
+        let foreground_watch_json: serde_json::Value =
+            serde_json::from_str(foreground_watch.stdout.trim()).expect("watch error JSON");
+        assert_eq!(foreground_watch.code, 1);
+        assert_eq!(foreground_watch_json["error"]["code"], "daemon_forbidden");
+        assert_eq!(foreground_watch_json["error"]["command"], "stream watch");
     }
 
     #[tokio::test]
