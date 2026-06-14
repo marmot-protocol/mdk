@@ -69,9 +69,14 @@ pub(crate) fn app_data_dictionary_extension_for_group(
         );
     }
     if required.contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) {
+        // The spec's "absent image" encoding is five empty var-bytes fields
+        // (group-blossom-image-v1.md), not zero bytes. `encode_component_vectors(&[])`
+        // yields an empty Vec, which `validate_group_image` rejects (its first
+        // `decode_var_bytes` fails on an empty cursor). Write the canonical
+        // five-empty-fields absent state so the created GroupContext validates.
         dict.insert(
             GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-            encode_component_vectors(&[]),
+            encode_component_vectors(&[&[], &[], &[], &[], &[]]),
         );
     }
     if required.contains(GROUP_ADMIN_POLICY_COMPONENT_ID) {
@@ -681,4 +686,74 @@ fn decode_var_bytes(
     let bytes = cursor[prefix_len..end].to_vec();
     *cursor = &cursor[end..];
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the group-creation `app_data_dictionary` for `required` with no
+    /// initial component bytes, then assert that every entry the engine writes
+    /// passes the engine's own `validate_app_component_update`. Regression for
+    /// darkmatter#174: the engine wrote zero bytes for a required blossom-image
+    /// at creation, which its own `validate_group_image` rejects.
+    fn assert_creation_state_self_validates(required: AppComponentSet) {
+        let initial = InitialComponentState {
+            name: "name".to_string(),
+            description: "desc".to_string(),
+            admins: vec![[7u8; 32]],
+            app_components: Vec::new(),
+        };
+        let ext = app_data_dictionary_extension_for_group(&required, &initial)
+            .expect("creation dictionary should build");
+        let Extension::AppDataDictionary(ext) = ext else {
+            panic!("expected an AppDataDictionary extension");
+        };
+        for entry in ext.dictionary().entries() {
+            // `app_components` itself is the negotiated id list, validated via
+            // the update path's APP_COMPONENTS_COMPONENT_ID arm — include it.
+            let component = AppComponentData {
+                component_id: entry.id(),
+                data: entry.data().to_vec(),
+            };
+            let component_id = component.component_id;
+            validate_app_component_update(&component).unwrap_or_else(|e| {
+                panic!(
+                    "engine wrote component {component_id:#06x} at creation that its own \
+                     validator rejects: {e:?}"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn group_creation_blossom_image_state_self_validates() {
+        let mut ids = BTreeSet::new();
+        ids.insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        assert_creation_state_self_validates(AppComponentSet::from(ids));
+    }
+
+    #[test]
+    fn group_creation_full_required_set_self_validates() {
+        let ids: BTreeSet<AppComponentId> = [
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+        ]
+        .into_iter()
+        .collect();
+        assert_creation_state_self_validates(AppComponentSet::from(ids));
+    }
+
+    #[test]
+    fn absent_blossom_image_is_five_empty_fields() {
+        // The canonical absent encoding is five zero-length var-bytes fields:
+        // 5 bytes of 0x00, not an empty Vec.
+        let absent = encode_component_vectors(&[&[], &[], &[], &[], &[]]);
+        assert_eq!(absent, vec![0u8; 5]);
+        // It must round-trip through the image validator as "absent".
+        validate_group_image(&absent).expect("five-empty-fields is the absent state");
+        // The previous (buggy) zero-byte encoding must NOT validate.
+        assert!(validate_group_image(&[]).is_err());
+    }
 }
