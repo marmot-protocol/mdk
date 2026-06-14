@@ -2238,13 +2238,12 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
-                    let selected_group_id =
-                        self.selected_chat_row().map(|chat| chat.group_id.clone());
+                    let loaded_group_id = self.messages_group_id.clone();
                     if let Some(status) = apply_tui_subscription_result(
                         &mut self.messages,
                         &mut self.live_stream_previews,
                         &mut self.unread_counts,
-                        selected_group_id.as_deref(),
+                        loaded_group_id.as_deref(),
                         &result,
                     ) {
                         self.status = status;
@@ -5071,6 +5070,71 @@ mod tests {
         assert_eq!(status, None);
         assert!(messages.is_empty());
         assert!(unread_counts.is_empty());
+    }
+
+    #[test]
+    fn message_subscription_gates_on_loaded_chat_not_highlighted_chat() {
+        let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let loaded_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let highlighted_group_id =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let mut app = test_tui_app(test_unused_client(), account_id);
+        app.chats = vec![
+            ChatRow {
+                group_id: loaded_group_id.to_owned(),
+                name: "loaded".to_owned(),
+                archived: false,
+            },
+            ChatRow {
+                group_id: highlighted_group_id.to_owned(),
+                name: "highlighted".to_owned(),
+                archived: false,
+            },
+        ];
+        app.selected_chat = 1;
+        app.messages_group_id = Some(loaded_group_id.to_owned());
+        let (tx, rx) = mpsc::channel();
+        app.message_subscription = Some(MessageSubscription {
+            account_id: account_id.to_owned(),
+            child: test_sleep_child(),
+            rx,
+        });
+
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "trigger": "MessageReceived",
+            "type": "message",
+            "message": {
+                "message_id": "highlighted",
+                "direction": "received",
+                "group_id": highlighted_group_id,
+                "from": "alice",
+                "plaintext": "hello highlighted"
+            }
+        })))
+        .expect("send highlighted message event");
+
+        assert!(app.drain_message_subscription());
+        assert!(app.messages.is_empty());
+        assert_eq!(app.unread_counts.get(highlighted_group_id), Some(&1));
+
+        tx.send(SubscriptionEvent::Result(serde_json::json!({
+            "trigger": "MessageReceived",
+            "type": "message",
+            "message": {
+                "message_id": "loaded",
+                "direction": "received",
+                "group_id": loaded_group_id,
+                "from": "bob",
+                "plaintext": "hello loaded"
+            }
+        })))
+        .expect("send loaded message event");
+
+        assert!(app.drain_message_subscription());
+        assert_eq!(app.unread_counts.get(loaded_group_id), None);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].message_id, "loaded");
+        assert_eq!(app.messages[0].display_text, "hello loaded");
     }
 
     #[test]

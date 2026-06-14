@@ -69,6 +69,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   Supplying a message-id cursor without its timestamp (or vice versa), or combining `--before*` with `--after*`, now
   returns a clear error (`message_pagination_cursor_mismatch` / `message_pagination_conflicting_cursors`), matching the
   `dm messages timeline list` behavior.
+- Fixed TUI live message subscription gating so highlighted-chat navigation cannot append another chat's incoming
+  messages into the loaded conversation or count the visible chat as unread.
 - The TUI composer now accepts a leading `?` instead of swallowing it to toggle help. Previously, typing or pasting a
   message that started with `?` into an empty composer toggled the help panel and dropped the character, making it
   impossible to compose such messages. The `?` help shortcut now applies only when the composer is not focused; the
