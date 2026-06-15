@@ -17,9 +17,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrTransportEvent;
 
+use cgka_traits::app_event::{
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+};
+
 use crate::{
     AppError, AppGroupRecord, MarmotApp, MarmotAppEvent, ReceivedMessage, RuntimeMessageReceived,
+    tag_value,
 };
+use storage_sqlite::TimelineMessageTarget;
 
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE: u64 = 447;
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST: u64 = 448;
@@ -164,6 +170,15 @@ pub struct NotificationUpdate {
     pub sender: NotificationUser,
     pub receiver: NotificationUser,
     pub preview_text: Option<String>,
+    /// Reaction emoji (Nostr kind 7 content); `None` for non-reactions. Additive
+    /// at the DTO level (no `trigger`/`preview_text` change), but it changes the
+    /// generated UniFFI record: consumers must regenerate bindings and ship the
+    /// matching native library to receive it.
+    pub reaction_emoji: Option<String>,
+    /// Preview of the reacted-to message (resolved via the `e` tag against the
+    /// timeline). `None` for non-reactions, an unresolvable target, or a
+    /// deleted/invalidated one — removed text must never reach the preview.
+    pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
     pub is_from_self: bool,
 }
@@ -608,9 +623,7 @@ pub(crate) fn notification_update_from_event(
     event: &MarmotAppEvent,
 ) -> Result<Option<NotificationUpdate>, AppError> {
     match event {
-        MarmotAppEvent::MessageReceived(message) => {
-            notification_update_from_message(app, message).map(Some)
-        }
+        MarmotAppEvent::MessageReceived(message) => notification_update_from_message(app, message),
         MarmotAppEvent::GroupJoined {
             account_id_hex,
             account_label,
@@ -625,20 +638,59 @@ pub(crate) fn notification_update_from_event(
     }
 }
 
+/// Whether a received app-event kind should ever surface as a notification.
+/// Only chat messages and reactions alert; deletes, edits, agent-stream control
+/// events, and group-system rows are state changes, not new user messages.
+fn is_notifiable_message_kind(kind: u64) -> bool {
+    kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION
+}
+
 fn notification_update_from_message(
     app: &MarmotApp,
     event: &RuntimeMessageReceived,
-) -> Result<NotificationUpdate, AppError> {
+) -> Result<Option<NotificationUpdate>, AppError> {
     let settings = app.notification_settings(&event.account_label)?;
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
+    }
+    // Only chat messages and reactions alert. Deletes, edits, agent-stream
+    // control events, and group-system rows are not new user-facing messages,
+    // so they never produce a notification (e.g. deleting a message must not
+    // push a "Deleted a message" alert).
+    if !is_notifiable_message_kind(event.message.kind) {
+        return Ok(None);
     }
     let group_id_hex = hex::encode(event.message.group_id.as_slice());
     let group = app.group(&event.account_label, &group_id_hex)?;
     let receiver = notification_user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;
-    Ok(NotificationUpdate {
+    // Resolve the reacted-to row from the materialized timeline by id (not raw
+    // app_events): the timeline reflects deletion/invalidation and never carries
+    // removed text, so a reaction can't leak it into a preview. Notify only the
+    // target's author; if this account didn't author it, or the target is gone
+    // (authorship unverifiable), emit nothing.
+    let reaction_target = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
+        match tag_value(&event.message.tags, EVENT_REF_TAG) {
+            Some(target_id) => {
+                app.reaction_target(&event.account_label, &group_id_hex, target_id)?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION
+        && reaction_target
+            .as_ref()
+            .map(|target| target.sender.as_str())
+            != Some(event.account_id_hex.as_str())
+    {
+        return Ok(None);
+    }
+    let (reaction_emoji, reacted_to_preview) =
+        reaction_notification_fields(&event.message, reaction_target.as_ref());
+    Ok(Some(NotificationUpdate {
         notification_key: format!(
             "message:{}:{}",
             event.account_id_hex, event.message.message_id_hex
@@ -654,9 +706,11 @@ fn notification_update_from_message(
         sender,
         receiver,
         preview_text: preview_text_for_message(&event.message),
+        reaction_emoji,
+        reacted_to_preview,
         timestamp_ms: unix_now_ms(),
         is_from_self,
-    })
+    }))
 }
 
 fn notification_update_from_group_join(
@@ -694,6 +748,8 @@ fn notification_update_from_group_join(
         sender,
         receiver,
         preview_text: None,
+        reaction_emoji: None,
+        reacted_to_preview: None,
         timestamp_ms: unix_now_ms(),
         is_from_self: sender_id == account_id_hex,
     })
@@ -706,11 +762,46 @@ fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {
 }
 
 fn preview_text_for_message(message: &ReceivedMessage) -> Option<String> {
-    if is_push_gossip_kind(message.kind) || message.plaintext.trim().is_empty() {
+    preview_text_for_kind(message.kind, &message.plaintext)
+}
+
+/// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
+/// kinds and blank text never produce a preview.
+fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
+    if is_push_gossip_kind(kind) || plaintext.trim().is_empty() {
         None
     } else {
-        Some(message.plaintext.clone())
+        Some(plaintext.to_owned())
     }
+}
+
+/// Shape the (emoji, preview) pair for a reaction from its already-resolved
+/// timeline target. Emoji is the trimmed event content. Preview is `None` for a
+/// `deleted`/`invalidated` target so removed text never reaches a preview;
+/// otherwise the normal preview rule applies. Pure; returns display text only.
+fn reaction_notification_fields(
+    message: &ReceivedMessage,
+    target: Option<&TimelineMessageTarget>,
+) -> (Option<String>, Option<String>) {
+    if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
+        return (None, None);
+    }
+    let reaction_emoji = {
+        let trimmed = message.plaintext.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    };
+    let reacted_to_preview = target.and_then(|target| {
+        if target.deleted || target.invalidated {
+            None
+        } else {
+            preview_text_for_kind(target.kind, &target.plaintext)
+        }
+    });
+    (reaction_emoji, reacted_to_preview)
 }
 
 fn notification_user_from_message(

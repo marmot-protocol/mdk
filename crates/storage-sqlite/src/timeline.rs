@@ -123,6 +123,22 @@ pub struct TimelinePage {
     pub has_more_after: bool,
 }
 
+/// A single materialized-timeline row resolved by id, carrying only the fields a
+/// reaction-notification preview needs. Read from `message_timeline` (the
+/// user-visible truth) rather than raw `app_events`, so deleted/invalidated
+/// targets are reflected and their original plaintext is never leaked into a
+/// preview by callers that honor `deleted`/`invalidated`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineMessageTarget {
+    pub sender: String,
+    pub plaintext: String,
+    pub kind: u64,
+    pub deleted: bool,
+    /// True when `invalidation_status IS NOT NULL`, i.e. convergence invalidated
+    /// the message (losing branch / beyond anchor) and it is kept as a tombstone.
+    pub invalidated: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineProjectionUpdate {
     pub group_id_hex: String,
@@ -534,6 +550,38 @@ impl SqliteAccountStorage {
             has_more_before,
             has_more_after,
         })
+    }
+
+    /// Resolve a single materialized-timeline row by `(group_id_hex,
+    /// message_id_hex)` without scanning the timeline. Returns the small
+    /// [`TimelineMessageTarget`] view (sender, plaintext, kind, deleted,
+    /// invalidated) or `None` when the id is absent in that group. Used by the
+    /// reaction-notification path to resolve the reacted-to message from the
+    /// user-visible truth instead of raw `app_events`.
+    pub fn timeline_message_target(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<Option<TimelineMessageTarget>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT sender, plaintext, kind, deleted, invalidation_status
+             FROM message_timeline
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2
+             LIMIT 1",
+            params![group_id_hex, message_id_hex],
+            |row| {
+                Ok(TimelineMessageTarget {
+                    sender: row.get(0)?,
+                    plaintext: row.get(1)?,
+                    kind: row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
+                    deleted: row.get::<_, i64>(3)? != 0,
+                    invalidated: row.get::<_, Option<String>>(4)?.is_some(),
+                })
+            },
+        )
+        .optional()
+        .storage()
     }
 }
 

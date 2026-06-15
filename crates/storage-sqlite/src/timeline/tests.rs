@@ -980,3 +980,80 @@ fn no_op_delete_invalidation_does_not_emit_unchanged_target() {
 
     assert!(update.changes.is_empty());
 }
+
+#[test]
+fn timeline_message_target_resolves_single_row_and_reflects_state() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+
+    // A present, delivered row returns its sender/plaintext/kind and is neither
+    // deleted nor invalidated.
+    let found = store
+        .timeline_message_target(&"11".repeat(32), "target")
+        .unwrap()
+        .expect("target row");
+    assert_eq!(found.sender, "alice");
+    assert_eq!(found.plaintext, "hello");
+    assert_eq!(found.kind, MARMOT_APP_EVENT_KIND_CHAT);
+    assert!(!found.deleted);
+    assert!(!found.invalidated);
+
+    // Absent id in the same group → None.
+    assert!(
+        store
+            .timeline_message_target(&"11".repeat(32), "missing")
+            .unwrap()
+            .is_none()
+    );
+
+    // Scoped to the group: the same id in another group is not visible.
+    assert!(
+        store
+            .timeline_message_target(&"22".repeat(32), "target")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn timeline_message_target_reflects_deleted_row() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "secret body"))
+        .unwrap();
+    // The author deletes their own message; the timeline row is kept but marked
+    // deleted with its plaintext cleared.
+    store
+        .record_app_event(&delete("delete-1", "alice", "target", 2))
+        .unwrap();
+
+    let found = store
+        .timeline_message_target(&"11".repeat(32), "target")
+        .unwrap()
+        .expect("deleted target row still present");
+    assert!(found.deleted);
+    assert!(!found.invalidated);
+    // The materialized row clears plaintext on delete; nothing to leak.
+    assert_eq!(found.plaintext, "");
+}
+
+#[test]
+fn timeline_message_target_reflects_invalidated_row() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .invalidate_app_event_by_source("source-target", "LosingBranch")
+        .unwrap()
+        .expect("projection update");
+
+    let found = store
+        .timeline_message_target(&"11".repeat(32), "target")
+        .unwrap()
+        .expect("invalidated target row still present");
+    assert!(found.invalidated);
+    assert!(!found.deleted);
+}

@@ -35,9 +35,9 @@ pub use shared::{
 };
 pub use timeline::{
     MAX_TIMELINE_LIMIT, StoredAppEvent, TimelineMessageChange, TimelineMessageQuery,
-    TimelineMessageRecord, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    TimelineMessageRecord, TimelineMessageTarget, TimelinePage, TimelinePagination,
+    TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
+    TimelineUpdateTrigger, TimelineUserReaction,
 };
 
 pub(crate) use codec::{
