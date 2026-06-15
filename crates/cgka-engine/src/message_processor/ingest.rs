@@ -644,9 +644,15 @@ impl<S: StorageProvider> Engine<S> {
                         &staged,
                         self.ciphersuite,
                     )?;
-                    mls_group
-                        .merge_staged_commit(&provider, *staged)
-                        .map_err(|e| EngineError::Backend(format!("merge_staged_commit: {e:?}")))?;
+                    self.storage.with_transaction(|storage| {
+                        let tx_provider =
+                            EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                        mls_group
+                            .merge_staged_commit(&tx_provider, *staged)
+                            .map_err(|e| {
+                                EngineError::Backend(format!("merge_staged_commit: {e:?}"))
+                            })
+                    })?;
                     let after = EpochId(mls_group.epoch().as_u64());
                     let after_members = group_lifecycle::marmot_members(&mls_group);
                     let after_admins =

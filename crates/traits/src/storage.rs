@@ -197,5 +197,18 @@ pub trait StorageProvider:
     /// `OpenMlsProvider`-shaped objects for MLS operations.
     fn mls_storage(&self) -> &Self::Mls;
 
+    /// Run a storage operation inside one backend transaction when the backend
+    /// supports it. Backends without transactional support use the closure
+    /// directly; SQLite overrides this so multi-write OpenMLS transitions are
+    /// committed or rolled back as one unit.
+    fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        Self: Sized,
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        f(self)
+    }
+
     fn backend(&self) -> Backend;
 }

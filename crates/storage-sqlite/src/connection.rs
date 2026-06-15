@@ -4,11 +4,231 @@ use cgka_traits::storage::{StorageError, StorageProvider, StorageResult};
 use cgka_traits::types::Backend;
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::ThreadId;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-pub(crate) type SharedConnection = Arc<Mutex<rusqlite::Connection>>;
+#[derive(Clone)]
+pub(crate) struct SharedConnection {
+    inner: Arc<SharedConnectionInner>,
+}
+
+struct SharedConnectionInner {
+    connection: Mutex<rusqlite::Connection>,
+    transaction_owner: Mutex<Option<ThreadId>>,
+    transaction_unusable: Mutex<Option<String>>,
+    transaction_released: Condvar,
+}
+
+impl fmt::Debug for SharedConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedConnection").finish_non_exhaustive()
+    }
+}
+
+impl SharedConnection {
+    fn new(connection: rusqlite::Connection) -> Self {
+        Self {
+            inner: Arc::new(SharedConnectionInner {
+                connection: Mutex::new(connection),
+                transaction_owner: Mutex::new(None),
+                transaction_unusable: Mutex::new(None),
+                transaction_released: Condvar::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> StorageResult<MutexGuard<'_, rusqlite::Connection>> {
+        let current = std::thread::current().id();
+        loop {
+            self.wait_for_transaction_slot(current)?;
+            let connection = self
+                .inner
+                .connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let owner = self
+                .inner
+                .transaction_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(err) = self.transaction_unusable_error() {
+                return Err(err);
+            }
+            if !owner.as_ref().is_some_and(|owner| owner != &current) {
+                drop(owner);
+                return Ok(connection);
+            }
+            drop(owner);
+            drop(connection);
+        }
+    }
+
+    pub(crate) fn is_current_thread_transaction_owner(&self) -> bool {
+        let current = std::thread::current().id();
+        let owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owner.as_ref().is_some_and(|owner| owner == &current)
+    }
+
+    pub(crate) fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        let current = std::thread::current().id();
+        let mut owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while owner.as_ref().is_some_and(|owner| owner != &current) {
+            if let Some(err) = self.transaction_unusable_error() {
+                return Err(E::from(err));
+            }
+            owner = self
+                .inner
+                .transaction_released
+                .wait(owner)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        if let Some(err) = self.transaction_unusable_error() {
+            return Err(E::from(err));
+        }
+
+        // Nested transaction on the same thread: the outer SQL transaction is
+        // already active and owns rollback/commit.
+        if owner.as_ref().is_some_and(|owner| owner == &current) {
+            drop(owner);
+            return f();
+        }
+
+        *owner = Some(current);
+        drop(owner);
+
+        if let Err(err) = self.execute_transaction_boundary("BEGIN IMMEDIATE") {
+            self.clear_transaction_owner();
+            return Err(E::from(err));
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match result {
+            Ok(Ok(value)) => match self.execute_transaction_boundary("COMMIT") {
+                Ok(()) => {
+                    self.clear_transaction_owner();
+                    Ok(value)
+                }
+                Err(commit_err) => match self.execute_transaction_boundary("ROLLBACK") {
+                    Ok(()) => {
+                        self.clear_transaction_owner();
+                        Err(E::from(commit_err))
+                    }
+                    Err(rollback_err) => Err(E::from(self.mark_transaction_unusable(format!(
+                        "sqlite transaction COMMIT failed ({commit_err}); ROLLBACK after failed COMMIT also failed ({rollback_err}); connection marked unusable",
+                    )))),
+                },
+            },
+            Ok(Err(err)) => match self.execute_transaction_boundary("ROLLBACK") {
+                Ok(()) => {
+                    self.clear_transaction_owner();
+                    Err(err)
+                }
+                Err(rollback_err) => Err(E::from(self.mark_transaction_unusable(format!(
+                    "sqlite transaction ROLLBACK failed after callback error ({rollback_err}); connection marked unusable",
+                )))),
+            },
+            Err(payload) => match self.execute_transaction_boundary("ROLLBACK") {
+                Ok(()) => {
+                    self.clear_transaction_owner();
+                    std::panic::resume_unwind(payload);
+                }
+                Err(rollback_err) => {
+                    let _ = self.mark_transaction_unusable(format!(
+                        "sqlite transaction ROLLBACK failed during panic cleanup ({rollback_err}); connection marked unusable",
+                    ));
+                    std::panic::resume_unwind(payload);
+                }
+            },
+        }
+    }
+
+    fn wait_for_transaction_slot(&self, current: ThreadId) -> StorageResult<()> {
+        let mut owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(err) = self.transaction_unusable_error() {
+                return Err(err);
+            }
+            if !owner.as_ref().is_some_and(|owner| owner != &current) {
+                return Ok(());
+            }
+            owner = self
+                .inner
+                .transaction_released
+                .wait(owner)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn execute_transaction_boundary(&self, sql: &str) -> StorageResult<()> {
+        let conn = self
+            .inner
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute_batch(sql)
+            .map_err(|e| StorageError::Backend(format!("sqlite transaction {sql}: {e}")))
+    }
+
+    fn transaction_unusable_error(&self) -> Option<StorageError> {
+        let unusable = self
+            .inner
+            .transaction_unusable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unusable
+            .as_ref()
+            .map(|reason| StorageError::Backend(reason.clone()))
+    }
+
+    fn clear_transaction_owner(&self) {
+        let mut owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *owner = None;
+        self.inner.transaction_released.notify_all();
+    }
+
+    fn mark_transaction_unusable(&self, reason: String) -> StorageError {
+        let mut owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut unusable = self
+            .inner
+            .transaction_unusable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if unusable.is_none() {
+            *unusable = Some(reason.clone());
+        }
+        *owner = None;
+        drop(unusable);
+        drop(owner);
+        self.inner.transaction_released.notify_all();
+        StorageError::Backend(reason)
+    }
+}
 
 pub struct SqlCipherKey(Zeroizing<String>);
 
@@ -142,7 +362,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Self> {
         apply_operational_pragmas(&connection, &options)?;
         migrations::run_all(&mut connection)?;
-        let connection = Arc::new(Mutex::new(connection));
+        let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());
         Ok(Self {
             connection,
@@ -151,10 +371,7 @@ impl SqliteAccountStorage {
     }
 
     pub(crate) fn lock(&self) -> StorageResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-        Ok(self
-            .connection
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+        self.connection.lock()
     }
 }
 
@@ -314,6 +531,14 @@ impl StorageProvider for SqliteAccountStorage {
         &self.openmls
     }
 
+    fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        self.connection.with_transaction(|| f(self))
+    }
+
     fn backend(&self) -> Backend {
         Backend::Sqlite
     }
@@ -322,7 +547,7 @@ impl StorageProvider for SqliteAccountStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, mpsc};
 
     static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TRACED_SQLCIPHER_SETUP: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
@@ -375,6 +600,137 @@ mod tests {
         let conn = store.lock().unwrap();
 
         assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
+    }
+
+    #[test]
+    fn transaction_rolls_back_openmls_writes_on_error() {
+        use crate::storage::test_support::TestGroupState;
+        use cgka_traits::storage::StorageError;
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = openmls::group::GroupId::from_slice(b"transaction-rollback");
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage
+                .mls_storage()
+                .write_group_state(&group_id, &TestGroupState(b"partial".to_vec()))
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+
+        assert!(result.is_err());
+        let persisted: Option<TestGroupState> = store.mls_storage().group_state(&group_id).unwrap();
+        assert_eq!(persisted, None);
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct TestLeafNode(Vec<u8>);
+
+    impl openmls_traits::storage::Entity<{ openmls_traits::storage::CURRENT_VERSION }>
+        for TestLeafNode
+    {
+    }
+    impl openmls_traits::storage::traits::LeafNode<{ openmls_traits::storage::CURRENT_VERSION }>
+        for TestLeafNode
+    {
+    }
+
+    #[test]
+    fn transaction_allows_openmls_list_mutations_inside_outer_transaction() {
+        use cgka_traits::storage::StorageError;
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = openmls::group::GroupId::from_slice(b"transaction-list-mutation");
+
+        store
+            .with_transaction(|storage| {
+                storage
+                    .mls_storage()
+                    .append_own_leaf_node(&group_id, &TestLeafNode(b"leaf".to_vec()))
+                    .map_err(|e| StorageError::Backend(e.to_string()))
+            })
+            .unwrap();
+
+        let leaves: Vec<TestLeafNode> = store.mls_storage().own_leaf_nodes(&group_id).unwrap();
+        assert_eq!(leaves, vec![TestLeafNode(b"leaf".to_vec())]);
+    }
+
+    #[test]
+    fn connection_lock_rechecks_transaction_owner_after_acquiring_connection() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let shared = store.connection.clone();
+        let connection_guard = shared
+            .inner
+            .connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (lock_returned_tx, lock_returned_rx) = mpsc::channel();
+        let worker_connection = shared.clone();
+        let worker = std::thread::spawn(move || {
+            let _guard = worker_connection.lock().unwrap();
+            lock_returned_tx.send(()).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let mut owner = shared
+                .inner
+                .transaction_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *owner = Some(std::thread::current().id());
+        }
+        drop(connection_guard);
+
+        assert!(
+            lock_returned_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "non-owner connection lock entered another thread's transaction",
+        );
+
+        shared.clear_transaction_owner();
+        lock_returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("connection lock should proceed after the transaction owner clears");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn transaction_rolls_back_after_failed_commit_before_releasing_owner() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE deferred_parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE deferred_child (
+                     parent_id INTEGER NOT NULL REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED
+                 );",
+            )
+            .storage()
+            .unwrap();
+        }
+
+        let result: StorageResult<()> = store.with_transaction(|storage| {
+            let conn = storage.lock()?;
+            conn.execute("INSERT INTO deferred_child (parent_id) VALUES (7)", [])
+                .storage()?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        let conn = store.lock().unwrap();
+        assert!(
+            conn.is_autocommit(),
+            "failed COMMIT must not leave the connection inside a transaction",
+        );
+        let child_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deferred_child", [], |row| row.get(0))
+            .storage()
+            .unwrap();
+        assert_eq!(child_count, 0);
     }
 
     #[test]

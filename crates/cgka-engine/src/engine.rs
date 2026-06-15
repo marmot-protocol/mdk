@@ -454,11 +454,17 @@ impl<S: StorageProvider> Engine<S> {
                 })
             });
             if mls_group.pending_commit().is_some() && !staged_removes_member {
-                mls_group
-                    .clear_pending_commit(
-                        <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-                    )
-                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                self.storage.with_transaction(|storage| {
+                    let tx_provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                        &self.crypto,
+                        storage.mls_storage(),
+                    );
+                    mls_group
+                        .clear_pending_commit(
+                            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider),
+                        )
+                        .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
+                })?;
                 let recovered_epoch = EpochId(mls_group.epoch().as_u64());
                 if let Ok(mut g) = self.storage.get_group(&group_id) {
                     g.epoch = recovered_epoch;

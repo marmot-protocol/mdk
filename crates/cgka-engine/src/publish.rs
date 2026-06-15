@@ -69,9 +69,13 @@ impl<S: StorageProvider> Engine<S> {
                 staged,
                 self.ciphersuite,
             )?;
-            mls_group
-                .merge_pending_commit(&provider)
-                .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
+            self.storage.with_transaction(|storage| {
+                let tx_provider =
+                    EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                mls_group
+                    .merge_pending_commit(&tx_provider)
+                    .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))
+            })?;
         }
 
         // Now the MLS group is at the new epoch. Mirror the Marmot record
@@ -179,9 +183,13 @@ impl<S: StorageProvider> Engine<S> {
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
         if mls_group.pending_commit().is_some() {
-            mls_group
-                .clear_pending_commit(provider.storage())
-                .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+            self.storage.with_transaction(|storage| {
+                let tx_provider =
+                    EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                mls_group
+                    .clear_pending_commit(tx_provider.storage())
+                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
+            })?;
         }
 
         // Roll back the Marmot record's projected fields. The send paths

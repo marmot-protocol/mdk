@@ -215,8 +215,8 @@ fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 
 /// `admins` (or otherwise leaves an admin with no leaf) is invalid.
 ///
 /// Validated PRE-merge from the staged commit's resulting GroupContext and its
-/// membership changes: no transaction wraps `merge_staged_commit`, so a
-/// post-merge rejection could not be rolled back.
+/// membership changes: a post-merge rejection would be too late even though the
+/// storage provider now wraps `merge_staged_commit` in a backend transaction.
 pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     mls_group: &MlsGroup,
     group_id: &GroupId,

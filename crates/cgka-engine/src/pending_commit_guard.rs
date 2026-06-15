@@ -116,7 +116,13 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
                 if mls_group.pending_commit().is_none() {
                     true
                 } else {
-                    match mls_group.clear_pending_commit(mls_storage) {
+                    let clear_result: Result<(), StorageError> =
+                        storage.with_transaction(|storage| {
+                            mls_group
+                                .clear_pending_commit(storage.mls_storage())
+                                .map_err(|e| StorageError::Backend(format!("clear_pending: {e:?}")))
+                        });
+                    match clear_result {
                         Ok(()) => true,
                         Err(_e) => {
                             tracing::warn!(

@@ -60,32 +60,13 @@ impl SqliteOpenMlsStorage {
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let storage_key = build_key(label, key);
         let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let mut list: Vec<Vec<u8>> = tx
-            .query_row(
-                "SELECT value FROM openmls_values
-                 WHERE provider_version = ?1 AND storage_key = ?2",
-                params![CURRENT_VERSION, storage_key],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|value| serde_json::from_slice(&value))
-            .transpose()?
-            .unwrap_or_default();
-        list.push(serde_json::to_vec(value)?);
-        tx.execute(
-            "INSERT OR REPLACE INTO openmls_values
-                (provider_version, label, storage_key, group_key, value)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                CURRENT_VERSION,
-                label,
-                storage_key,
-                group_key.as_deref(),
-                serde_json::to_vec(&list)?
-            ],
-        )?;
-        tx.commit()?;
+        if self.connection.is_current_thread_transaction_owner() {
+            append_entity_on_connection(&conn, label, storage_key, group_key.as_deref(), value)?;
+        } else {
+            let tx = conn.transaction()?;
+            append_entity_on_connection(&tx, label, storage_key, group_key.as_deref(), value)?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -99,34 +80,25 @@ impl SqliteOpenMlsStorage {
         let encoded = serde_json::to_vec(value)?;
         let storage_key = build_key(label, key);
         let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let mut list: Vec<Vec<u8>> = tx
-            .query_row(
-                "SELECT value FROM openmls_values
-                 WHERE provider_version = ?1 AND storage_key = ?2",
-                params![CURRENT_VERSION, storage_key],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|value| serde_json::from_slice(&value))
-            .transpose()?
-            .unwrap_or_default();
-        if let Some(pos) = list.iter().position(|stored| stored == &encoded) {
-            list.remove(pos);
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO openmls_values
-                (provider_version, label, storage_key, group_key, value)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                CURRENT_VERSION,
+        if self.connection.is_current_thread_transaction_owner() {
+            remove_entity_on_connection(
+                &conn,
                 label,
                 storage_key,
                 group_key.as_deref(),
-                serde_json::to_vec(&list)?
-            ],
-        )?;
-        tx.commit()?;
+                encoded.as_slice(),
+            )?;
+        } else {
+            let tx = conn.transaction()?;
+            remove_entity_on_connection(
+                &tx,
+                label,
+                storage_key,
+                group_key.as_deref(),
+                encoded.as_slice(),
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -235,18 +207,98 @@ impl SqliteOpenMlsStorage {
         // PROPOSAL_QUEUE_REFS_LABEL together; a crash (SIGKILL/OOM/power loss)
         // between two separate autocommit deletes could otherwise leave queue
         // refs whose entities are gone, which bricks MlsGroup::load for that
-        // group with no self-healing path (issue #148).
-        let tx = conn.transaction()?;
-        for label in labels {
-            tx.execute(
-                "DELETE FROM openmls_values
-                 WHERE provider_version = ?1 AND group_key = ?2 AND label = ?3",
-                params![CURRENT_VERSION, group_key, *label],
-            )?;
+        // group with no self-healing path (issue #148). If the engine already
+        // owns a broader OpenMLS transaction, execute directly inside it instead
+        // of starting a nested SQLite transaction.
+        if self.connection.is_current_thread_transaction_owner() {
+            delete_group_labels_on_connection(&conn, group_key.as_slice(), labels)?;
+        } else {
+            let tx = conn.transaction()?;
+            delete_group_labels_on_connection(&tx, group_key.as_slice(), labels)?;
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(())
     }
+}
+
+fn list_values_on_connection(
+    conn: &rusqlite::Connection,
+    storage_key: &[u8],
+) -> Result<Vec<Vec<u8>>, SqliteOpenMlsStorageError> {
+    conn.query_row(
+        "SELECT value FROM openmls_values
+         WHERE provider_version = ?1 AND storage_key = ?2",
+        params![CURRENT_VERSION, storage_key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()?
+    .map(|value| serde_json::from_slice(&value))
+    .transpose()
+    .map(|value| value.unwrap_or_default())
+    .map_err(Into::into)
+}
+
+fn write_list_on_connection(
+    conn: &rusqlite::Connection,
+    label: &[u8],
+    storage_key: &[u8],
+    group_key: Option<&[u8]>,
+    list: &[Vec<u8>],
+) -> Result<(), SqliteOpenMlsStorageError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO openmls_values
+            (provider_version, label, storage_key, group_key, value)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            CURRENT_VERSION,
+            label,
+            storage_key,
+            group_key,
+            serde_json::to_vec(list)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_entity_on_connection<T: Entity<CURRENT_VERSION>>(
+    conn: &rusqlite::Connection,
+    label: &[u8],
+    storage_key: Vec<u8>,
+    group_key: Option<&[u8]>,
+    value: &T,
+) -> Result<(), SqliteOpenMlsStorageError> {
+    let mut list = list_values_on_connection(conn, storage_key.as_slice())?;
+    list.push(serde_json::to_vec(value)?);
+    write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)
+}
+
+fn remove_entity_on_connection(
+    conn: &rusqlite::Connection,
+    label: &[u8],
+    storage_key: Vec<u8>,
+    group_key: Option<&[u8]>,
+    encoded: &[u8],
+) -> Result<(), SqliteOpenMlsStorageError> {
+    let mut list = list_values_on_connection(conn, storage_key.as_slice())?;
+    if let Some(pos) = list.iter().position(|stored| stored == encoded) {
+        list.remove(pos);
+    }
+    write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)
+}
+
+fn delete_group_labels_on_connection(
+    conn: &rusqlite::Connection,
+    group_key: &[u8],
+    labels: &[&[u8]],
+) -> Result<(), SqliteOpenMlsStorageError> {
+    for label in labels {
+        conn.execute(
+            "DELETE FROM openmls_values
+             WHERE provider_version = ?1 AND group_key = ?2 AND label = ?3",
+            params![CURRENT_VERSION, group_key, *label],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -286,6 +338,9 @@ mod tests {
             .expect("delete_group_labels body");
         let body = body
             .split("\n    fn ")
+            .next()
+            .unwrap_or(body)
+            .split("\nfn ")
             .next()
             .unwrap_or(body)
             .split("\n#[cfg(test)]")

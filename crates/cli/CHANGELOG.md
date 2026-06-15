@@ -72,6 +72,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- OpenMLS group state transitions are now persisted atomically. The multi-write commit-merge path (engine state,
+  pending-commit cleanup, and OpenMLS value-store updates) is wrapped in a single SQLite transaction, so a crash or
+  interruption mid-merge can no longer leave torn group state on disk; the device either advances to the new epoch
+  fully or rolls back to the prior consistent state on next load.
 - `dmd` now moves peer authorization and request-frame reads onto per-connection tasks immediately after accept, so a
   client that writes a partial frame and stalls can only stall itself; other clients can still reach Ping, Status, and
   Shutdown without waiting for the stalled request timeout.
