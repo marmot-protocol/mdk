@@ -176,168 +176,23 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .await;
     }
     let mut worker_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let shutdown_result = loop {
         worker_tasks.retain(|task| !task.is_finished());
-        let (mut stream, _) = listener.accept().await?;
-        if let Err(err) = authorize_daemon_peer(&stream) {
-            write_daemon_output(
-                &mut stream,
-                &CliOutput {
-                    code: 1,
-                    stdout: String::new(),
-                    stderr: format!("error: {err}\n"),
-                },
-            )
-            .await;
-            continue;
-        }
-        let request =
-            match read_daemon_request_within(&mut stream, DAEMON_REQUEST_READ_TIMEOUT).await {
-                Ok(request) => request,
-                Err(err) => {
-                    // A single bad/abrupt/oversized/malformed/stalled connection
-                    // must not take down the whole daemon or wedge the accept loop.
-                    // Mirror the authz-failure path above: report the error to this
-                    // client and keep serving. The bounded read timeout also stops
-                    // a same-UID client that connects but never sends a request
-                    // frame from blocking every other client indefinitely.
-                    write_daemon_output(
-                        &mut stream,
-                        &CliOutput {
-                            code: 1,
-                            stdout: String::new(),
-                            stderr: format!("error: {err}\n"),
-                        },
-                    )
-                    .await;
-                    continue;
-                }
-            };
-        match request {
-            DaemonRequest::Status => {
-                let output = daemon_status_output(&defaults, state.clone(), workers.clone()).await;
-                write_daemon_output(&mut stream, &output).await;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let defaults = defaults.clone();
+                let state = state.clone();
+                let events = events.clone();
+                let workers = workers.clone();
+                let shutdown_tx = shutdown_tx.clone();
+                worker_tasks.push(tokio::spawn(async move {
+                    handle_daemon_connection(stream, defaults, state, events, workers, shutdown_tx).await;
+                }));
             }
-            DaemonRequest::Ping => {
-                write_daemon_output(
-                    &mut stream,
-                    &CliOutput {
-                        code: 0,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                    },
-                )
-                .await;
-            }
-            DaemonRequest::Shutdown => {
-                write_daemon_output(
-                    &mut stream,
-                    &CliOutput {
-                        code: 0,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                    },
-                )
-                .await;
+            _ = shutdown_rx.recv() => {
                 break Ok(());
-            }
-            DaemonRequest::MessagesSubscribe { mut cli } => {
-                apply_defaults(&mut cli, &defaults);
-                let defaults = defaults.clone();
-                let state = state.clone();
-                let events = events.clone();
-                let workers = workers.clone();
-                worker_tasks.push(tokio::spawn(async move {
-                    let runtime = {
-                        let mut workers_guard = workers.lock().await;
-                        reconcile_app_runtime(
-                            &defaults,
-                            state.clone(),
-                            events.clone(),
-                            &mut workers_guard.runtime,
-                        )
-                        .await;
-                        workers_guard.runtime.runtime.clone()
-                    };
-                    let _ = handle_messages_subscription(
-                        &mut stream,
-                        &defaults,
-                        state,
-                        events,
-                        runtime,
-                        *cli,
-                    )
-                    .await;
-                }));
-            }
-            DaemonRequest::ChatsSubscribe { mut cli } => {
-                apply_defaults(&mut cli, &defaults);
-                let defaults = defaults.clone();
-                let state = state.clone();
-                let events = events.clone();
-                let workers = workers.clone();
-                worker_tasks.push(tokio::spawn(async move {
-                    let runtime = {
-                        let mut workers_guard = workers.lock().await;
-                        reconcile_app_runtime(&defaults, state, events, &mut workers_guard.runtime)
-                            .await;
-                        workers_guard.runtime.runtime.clone()
-                    };
-                    let _ = handle_chats_subscription(&mut stream, &defaults, runtime, *cli).await;
-                }));
-            }
-            DaemonRequest::GroupStateSubscribe { mut cli } => {
-                apply_defaults(&mut cli, &defaults);
-                let defaults = defaults.clone();
-                let state = state.clone();
-                let events = events.clone();
-                let workers = workers.clone();
-                worker_tasks.push(tokio::spawn(async move {
-                    let runtime = {
-                        let mut workers_guard = workers.lock().await;
-                        reconcile_app_runtime(&defaults, state, events, &mut workers_guard.runtime)
-                            .await;
-                        workers_guard.runtime.runtime.clone()
-                    };
-                    let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli)
-                        .await;
-                }));
-            }
-            DaemonRequest::StreamWatch { cli } => {
-                let defaults = defaults.clone();
-                let state = state.clone();
-                let events = events.clone();
-                let workers = workers.clone();
-                worker_tasks.push(tokio::spawn(async move {
-                    let mut workers_guard = workers.lock().await;
-                    let _ = handle_stream_watch_connection(
-                        cli,
-                        &mut stream,
-                        &defaults,
-                        state,
-                        events,
-                        &mut workers_guard,
-                    )
-                    .await;
-                }));
-            }
-            DaemonRequest::Execute { cli } => {
-                let defaults = defaults.clone();
-                let state = state.clone();
-                let events = events.clone();
-                let workers = workers.clone();
-                worker_tasks.push(tokio::spawn(async move {
-                    let mut workers_guard = workers.lock().await;
-                    let _ = handle_execute_connection(
-                        cli,
-                        &mut stream,
-                        &defaults,
-                        state,
-                        events,
-                        &mut workers_guard,
-                    )
-                    .await;
-                }));
             }
         }
     };
@@ -351,6 +206,149 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(&pid_path);
     shutdown_result
+}
+
+async fn handle_daemon_connection(
+    mut stream: UnixStream,
+    defaults: DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    workers: SharedDaemonWorkers,
+    shutdown_tx: mpsc::UnboundedSender<()>,
+) {
+    if let Err(err) = authorize_daemon_peer(&stream) {
+        write_daemon_output(
+            &mut stream,
+            &CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("error: {err}\n"),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let request = match read_daemon_request_within(&mut stream, DAEMON_REQUEST_READ_TIMEOUT).await {
+        Ok(request) => request,
+        Err(err) => {
+            // A single bad/abrupt/oversized/malformed/stalled connection must
+            // not take down the daemon or wedge the accept loop. Each accepted
+            // connection owns its bounded read in a worker task, so a slow-loris
+            // client can only stall itself while the listener keeps accepting.
+            write_daemon_output(
+                &mut stream,
+                &CliOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: format!("error: {err}\n"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    match request {
+        DaemonRequest::Status => {
+            let output = daemon_status_output(&defaults, state, workers).await;
+            write_daemon_output(&mut stream, &output).await;
+        }
+        DaemonRequest::Ping => {
+            write_daemon_output(
+                &mut stream,
+                &CliOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .await;
+        }
+        DaemonRequest::Shutdown => {
+            write_daemon_output(
+                &mut stream,
+                &CliOutput {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            )
+            .await;
+            let _ = shutdown_tx.send(());
+        }
+        DaemonRequest::MessagesSubscribe { mut cli } => {
+            apply_defaults(&mut cli, &defaults);
+            let runtime = {
+                let mut workers_guard = workers.lock().await;
+                reconcile_app_runtime(
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers_guard.runtime,
+                )
+                .await;
+                workers_guard.runtime.runtime.clone()
+            };
+            let _ =
+                handle_messages_subscription(&mut stream, &defaults, state, events, runtime, *cli)
+                    .await;
+        }
+        DaemonRequest::ChatsSubscribe { mut cli } => {
+            apply_defaults(&mut cli, &defaults);
+            let runtime = {
+                let mut workers_guard = workers.lock().await;
+                reconcile_app_runtime(
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers_guard.runtime,
+                )
+                .await;
+                workers_guard.runtime.runtime.clone()
+            };
+            let _ = handle_chats_subscription(&mut stream, &defaults, runtime, *cli).await;
+        }
+        DaemonRequest::GroupStateSubscribe { mut cli } => {
+            apply_defaults(&mut cli, &defaults);
+            let runtime = {
+                let mut workers_guard = workers.lock().await;
+                reconcile_app_runtime(
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers_guard.runtime,
+                )
+                .await;
+                workers_guard.runtime.runtime.clone()
+            };
+            let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli).await;
+        }
+        DaemonRequest::StreamWatch { cli } => {
+            let mut workers_guard = workers.lock().await;
+            let _ = handle_stream_watch_connection(
+                cli,
+                &mut stream,
+                &defaults,
+                state,
+                events,
+                &mut workers_guard,
+            )
+            .await;
+        }
+        DaemonRequest::Execute { cli } => {
+            let mut workers_guard = workers.lock().await;
+            let _ = handle_execute_connection(
+                cli,
+                &mut stream,
+                &defaults,
+                state,
+                events,
+                &mut workers_guard,
+            )
+            .await;
+        }
+    }
 }
 
 async fn daemon_status_output(

@@ -72,6 +72,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `dmd` now moves peer authorization and request-frame reads onto per-connection tasks immediately after accept, so a
+  client that writes a partial frame and stalls can only stall itself; other clients can still reach Ping, Status, and
+  Shutdown without waiting for the stalled request timeout.
 - `dmd` now handles daemon-forwarded Execute and subscription setup work on spawned connection tasks instead of awaiting
   worker-mutating requests in the single accept loop. `dm daemon status` and `dm daemon stop` remain responsive while a
   long Execute owns daemon worker state; status falls back to a best-effort worker snapshot when that state is busy.

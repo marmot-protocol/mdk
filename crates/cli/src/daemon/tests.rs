@@ -4,6 +4,7 @@ use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
 };
+use nostr_relay_builder::MockRelay;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -472,6 +473,71 @@ async fn daemon_request_reader_times_out_on_stalled_client() {
     );
     // `_client` is held open for the duration: the timeout fires precisely
     // because the peer is connected but silent.
+}
+
+#[tokio::test]
+async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
+    // Regression for #191: accepting one same-UID client that writes a partial
+    // frame and then stalls must not keep the accept loop from serving another
+    // client's Ping/Status/Shutdown request.
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let relay = MockRelay::run().await.expect("start mock relay");
+    let relay_url = relay.url().await.to_string();
+    let args = DaemonArgs {
+        home: Some(home.path().to_path_buf()),
+        data_dir: None,
+        logs_dir: None,
+        socket: Some(socket.clone()),
+        relay: Some(relay_url),
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("dm-test-keychain".to_owned()),
+    };
+    let server = tokio::spawn(run_server(args));
+    for _ in 0..50 {
+        if socket.try_exists().expect("socket existence check") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.try_exists().expect("socket existence check"));
+
+    let mut stalled = UnixStream::connect(&socket)
+        .await
+        .expect("connect stalled client");
+    stalled
+        .write_all(b"{\"Ping\"")
+        .await
+        .expect("write partial request");
+
+    let ping = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_request(&socket, &DaemonRequest::Ping),
+    )
+    .await;
+    drop(stalled);
+
+    let shutdown_output = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_request(&socket, &DaemonRequest::Shutdown),
+    )
+    .await
+    .expect("shutdown request should not time out")
+    .expect("shutdown request should succeed");
+    assert_eq!(shutdown_output.code, 0);
+
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server task should not time out")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    let output = ping
+        .expect("ping should not wait behind stalled request reader")
+        .expect("ping request should succeed");
+    assert_eq!(output.code, 0);
 }
 
 #[tokio::test]
