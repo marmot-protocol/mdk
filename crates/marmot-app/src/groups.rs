@@ -927,20 +927,70 @@ pub(crate) fn add_group(
     state.groups.push(group);
 }
 
+/// Decide whether per-endpoint publish failures should abort an app-layer
+/// operation, gated on how the underlying MLS pending state resolved.
+///
+/// A `PublishFailure` lands in `effects.failures` whenever an outbound message
+/// fails to reach the required acknowledgement count. On its own that is *not*
+/// enough to know whether the operation succeeded: the runtime confirms a
+/// create/commit once it is durably live (e.g. a create whose commit is at
+/// epoch 1 with at least one welcome exposed), even if some welcomes or relays
+/// were unreached. Dropping the local app projection in that case strands the
+/// creator with a confirmed MLS group its own UI never recorded, while invitees
+/// who did receive a welcome see a real group (darkmatter#428).
+///
+/// Resolution semantics:
+/// - no failures: success.
+/// - any pending `RolledBack`: the commit/create was reverted at the MLS layer,
+///   so the publish failure is a genuine hard error the caller must see.
+/// - any pending `Confirmed` (and none rolled back): confirmed-but-partial. The
+///   operation is live at its new epoch; unreached endpoints are recoverable
+///   "ghost member" conditions. Keep the local projection (caller still runs
+///   `add_group` / `save_state`) and surface a soft warning only.
+/// - failures with no pending resolution at all (e.g. a plain application
+///   message or proposal publish that never landed): hard error, as before.
 pub(crate) fn fail_if_publish_failed(
-    failures: &[marmot_account::PublishFailure],
+    effects: &marmot_account::AccountDeviceEffects,
 ) -> Result<(), AppError> {
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::Publish(
-            failures
-                .iter()
-                .map(|failure| failure.reason.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
-        ))
+    if effects.failures.is_empty() {
+        return Ok(());
     }
+
+    let mut any_confirmed = false;
+    let mut any_rolled_back = false;
+    for resolution in &effects.pending {
+        match resolution {
+            marmot_account::PendingResolution::Confirmed { .. } => any_confirmed = true,
+            marmot_account::PendingResolution::RolledBack { .. } => any_rolled_back = true,
+        }
+    }
+
+    if any_rolled_back {
+        return Err(publish_failure_error(&effects.failures));
+    }
+
+    if any_confirmed {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "fail_if_publish_failed",
+            failures = effects.failures.len(),
+            "publish reached insufficient endpoints but pending state confirmed; \
+             treating unreached endpoints as recoverable and keeping local projection"
+        );
+        return Ok(());
+    }
+
+    Err(publish_failure_error(&effects.failures))
+}
+
+fn publish_failure_error(failures: &[marmot_account::PublishFailure]) -> AppError {
+    AppError::Publish(
+        failures
+            .iter()
+            .map(|failure| failure.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 pub(crate) fn send_summary_from_effects(
@@ -1181,5 +1231,103 @@ mod routing_tag_tests {
     fn inner_event_with_application_tag_is_accepted() {
         // `e` (reply/edit target) is application content, not a routing tag.
         assert!(decode_with_tags(vec![vec!["e".to_string(), "ab".repeat(32)]]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod fail_if_publish_failed_tests {
+    use super::*;
+    use cgka_traits::MessageId;
+    use cgka_traits::engine_state::PendingStateRef;
+    use marmot_account::{AccountDeviceEffects, PendingResolution, PublishFailure};
+
+    fn failure(reason: &str) -> PublishFailure {
+        PublishFailure {
+            message_id: MessageId::new(vec![0xab; 32]),
+            reason: reason.to_owned(),
+        }
+    }
+
+    fn pending_ref() -> PendingStateRef {
+        PendingStateRef::new(7)
+    }
+
+    #[test]
+    fn no_failures_is_ok() {
+        let effects = AccountDeviceEffects::default();
+        assert!(fail_if_publish_failed(&effects).is_ok());
+    }
+
+    // darkmatter#428: a confirmed-but-partial create/commit (pending Confirmed,
+    // welcomes/relays unreached) must NOT abort the app-layer projection. The
+    // group is live at its new epoch; unreached endpoints are recoverable.
+    #[test]
+    fn confirmed_partial_publish_is_soft_pass() {
+        let mut effects = AccountDeviceEffects::default();
+        effects
+            .failures
+            .push(failure("insufficient publish acknowledgements"));
+        effects.pending.push(PendingResolution::Confirmed {
+            pending: pending_ref(),
+        });
+        assert!(
+            fail_if_publish_failed(&effects).is_ok(),
+            "confirmed-but-partial create must keep the local projection (darkmatter#428)"
+        );
+    }
+
+    // A rolled-back pending means the commit/create was reverted at the MLS
+    // layer, so the publish failure is a genuine hard error.
+    #[test]
+    fn rolled_back_publish_is_hard_error() {
+        let mut effects = AccountDeviceEffects::default();
+        effects
+            .failures
+            .push(failure("insufficient publish acknowledgements"));
+        effects.pending.push(PendingResolution::RolledBack {
+            pending: pending_ref(),
+        });
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    // A plain application-message/proposal publish carries no pending
+    // resolution; a failure there means the message never landed, so it stays a
+    // hard error (preserves pre-#428 behavior).
+    #[test]
+    fn failure_without_pending_is_hard_error() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("relay rejected"));
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    // A mixed resolution where any pending rolled back must hard-fail even if
+    // another pending confirmed: a reverted commit is not recoverable.
+    #[test]
+    fn rolled_back_dominates_confirmed() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("insufficient acks"));
+        effects.pending.push(PendingResolution::Confirmed {
+            pending: PendingStateRef::new(1),
+        });
+        effects.pending.push(PendingResolution::RolledBack {
+            pending: PendingStateRef::new(2),
+        });
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    // The hard-error message joins all failure reasons, unchanged from the
+    // original contract.
+    #[test]
+    fn hard_error_joins_all_failure_reasons() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("reason-a"));
+        effects.failures.push(failure("reason-b"));
+        match fail_if_publish_failed(&effects).unwrap_err() {
+            AppError::Publish(msg) => assert_eq!(msg, "reason-a; reason-b"),
+            other => panic!("expected AppError::Publish, got {other:?}"),
+        }
     }
 }

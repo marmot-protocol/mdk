@@ -199,7 +199,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.add_group(&group_id)?;
@@ -300,7 +300,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -344,7 +344,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -382,7 +382,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;
@@ -485,7 +485,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -520,7 +520,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -575,7 +575,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -619,7 +619,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -744,7 +744,7 @@ impl AppClient {
                 }
                 None => self.runtime.send(send_intent).await?,
             };
-            fail_if_publish_failed(&effects.failures)?;
+            fail_if_publish_failed(&effects)?;
             Ok::<_, AppError>(effects)
         }
         .await
@@ -1070,7 +1070,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
@@ -1255,7 +1255,7 @@ impl AppClient {
 
         self.sync_runtime_groups().await?;
         let effects = self.runtime.advance_convergence(group_id).await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
@@ -1303,7 +1303,7 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        fail_if_publish_failed(&effects.failures)?;
+        fail_if_publish_failed(&effects)?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let message_ids = effects

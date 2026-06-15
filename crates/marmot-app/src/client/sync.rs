@@ -138,7 +138,7 @@ impl AppClient {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let source_recorded_at = delivery.message.timestamp.0;
         let effects = self.runtime.ingest_delivery(delivery).await?;
-        fail_if_publish_failed(&effects.effects.failures)?;
+        fail_if_publish_failed(&effects.effects)?;
         self.remember_transport_cursor(source_recorded_at);
         for event in &effects.effects.events {
             let before = self.state.groups.len();
