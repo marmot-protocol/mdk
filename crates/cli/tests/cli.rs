@@ -4407,6 +4407,49 @@ fn daemon_refuses_reset_over_socket() {
 }
 
 #[test]
+fn daemon_running_does_not_auto_forward_logout() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let account = create_local_account_id(home.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .spawn()
+        .expect("dmd should start");
+
+    wait_for_daemon(&socket);
+
+    let mut logout_command = dm_without_relay(home.path());
+    logout_command.env_remove("DM_SOCKET");
+    let logout = logout_command
+        .args(["logout", &account])
+        .output()
+        .expect("dm logout should start");
+
+    stop_daemon(&socket, &mut child);
+
+    assert!(
+        logout.status.success(),
+        "implicit logout should run locally while daemon is running\n{}",
+        command_output_summary(&logout)
+    );
+    let logout_json: Value = serde_json::from_slice(&logout.stdout).expect("logout stdout JSON");
+    assert_eq!(logout_json["result"]["logged_out"], true);
+    assert_eq!(logout_json["result"]["account_id"], account);
+
+    let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
+    assert_eq!(accounts.len(), 0);
+}
+
+#[test]
 fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("dmd.sock");

@@ -516,7 +516,11 @@ fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
     }
 
     let socket = daemon_socket_path_for_client(cli, home);
-    if cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some() || socket.exists() {
+    let explicit_daemon_socket = cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some();
+    if matches!(cli.command, Command::Logout { .. }) && !explicit_daemon_socket {
+        return None;
+    }
+    if explicit_daemon_socket || socket.exists() {
         Some(socket)
     } else {
         None
@@ -1204,6 +1208,43 @@ mod tests {
             let cli = test_cli(Command::Stream { command });
             assert_eq!(daemon_socket_for_client(&cli, home), None);
         }
+    }
+
+    #[test]
+    fn daemon_execute_socket_skips_implicit_logout() {
+        // DM_SOCKET makes the socket selection explicit; this regression covers
+        // the auto-discovered daemon socket path that previously forwarded
+        // `dm logout` even though the user did not pass `--socket`.
+        if std::env::var_os("DM_SOCKET").is_some() {
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("temp home");
+        let socket = daemon::default_socket_path(home.path());
+        std::fs::create_dir_all(socket.parent().expect("socket parent"))
+            .expect("create socket dir");
+        std::fs::File::create(&socket).expect("create placeholder socket file");
+
+        let mut cli = test_cli(Command::Logout {
+            pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        });
+        cli.socket = None;
+
+        assert_eq!(daemon_socket_for_client(&cli, home.path()), None);
+    }
+
+    #[test]
+    fn daemon_execute_socket_keeps_explicit_logout() {
+        let home = Path::new("/tmp/dm-home");
+        let socket = Path::new("/tmp/dmd.sock");
+        let cli = test_cli(Command::Logout {
+            pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        });
+
+        assert_eq!(
+            daemon_socket_for_client(&cli, home).as_deref(),
+            Some(socket)
+        );
     }
 
     #[test]

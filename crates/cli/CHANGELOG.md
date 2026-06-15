@@ -78,6 +78,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `dm stream receive`, unanchored `dm stream send`, and foreground `dm stream watch` now stay client-hosted when a
   daemon socket is configured, and direct daemon Execute requests for those long-running stream commands return
   `daemon_forbidden` instead of blocking `dmd`'s accept loop.
+- `dm logout` now stays client-hosted when `dmd` is only auto-discovered from the default socket, so signing out works
+  while the daemon is running; explicitly socket-targeted logout requests still fail instead of mutating account state
+  inside `dmd`.
 - Auto-discovered daemon command forwarding now falls back to local execution only when the client cannot connect to
   `dmd`. If the daemon accepts a command but closes or returns malformed/no output before responding, `dm --json` now
   reports `daemon_state_unknown` instead of silently re-running the command locally.
