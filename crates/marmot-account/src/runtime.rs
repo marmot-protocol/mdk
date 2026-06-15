@@ -28,6 +28,12 @@ use crate::routing::{
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PublishStatus {
+    met_required_acks: bool,
+    accepted_by_any_endpoint: bool,
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -269,7 +275,7 @@ where
                     self.publish_one(msg, &mut output, context.clone()).await?;
                 }
                 PublishWork::GroupCreated { welcomes, pending } => {
-                    self.publish_pending(
+                    self.publish_group_created(
                         welcomes,
                         pending,
                         &mut output,
@@ -319,10 +325,50 @@ where
     ) -> AccountResult<()> {
         let mut all_published = true;
         for message in messages {
-            all_published &= self.publish_one(message, output, context.clone()).await?;
+            all_published &= self
+                .publish_one(message, output, context.clone())
+                .await?
+                .met_required_acks;
         }
 
         if all_published {
+            let effects = self.session.confirm_published(pending).await?;
+            output
+                .pending
+                .push(PendingResolution::Confirmed { pending });
+            output.absorb_session_effects(effects, queue);
+        } else {
+            let effects = self.session.publish_failed(pending).await?;
+            output
+                .pending
+                .push(PendingResolution::RolledBack { pending });
+            output.absorb_session_effects(effects, queue);
+        }
+        Ok(())
+    }
+
+    async fn publish_group_created(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        pending: PendingStateRef,
+        output: &mut AccountDeviceEffects,
+        queue: &mut VecDeque<PublishWork>,
+        context: Option<AuditEventContext>,
+    ) -> AccountResult<()> {
+        let mut all_published = true;
+        let mut any_welcome_exposed = false;
+        for welcome in welcomes {
+            let status = self.publish_one(welcome, output, context.clone()).await?;
+            any_welcome_exposed |= status.accepted_by_any_endpoint;
+            if !status.met_required_acks {
+                all_published = false;
+                if !any_welcome_exposed {
+                    break;
+                }
+            }
+        }
+
+        if all_published || any_welcome_exposed {
             let effects = self.session.confirm_published(pending).await?;
             output
                 .pending
@@ -347,7 +393,11 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        if self.publish_one(commit, output, context.clone()).await? {
+        if self
+            .publish_one(commit, output, context.clone())
+            .await?
+            .met_required_acks
+        {
             let effects = self.session.confirm_published(pending).await?;
             output
                 .pending
@@ -372,7 +422,7 @@ where
         message: TransportMessage,
         output: &mut AccountDeviceEffects,
         context: Option<AuditEventContext>,
-    ) -> AccountResult<bool> {
+    ) -> AccountResult<PublishStatus> {
         let message_id = message.id.clone();
         let msg_id_hex = hex::encode(message_id.as_slice());
         let mut publish_context = context.unwrap_or_default();
@@ -395,7 +445,7 @@ where
                     message_id,
                     reason: e.to_string(),
                 });
-                return Ok(false);
+                return Ok(PublishStatus::default());
             }
         };
         let required_acks = self.routing.required_acks(&target);
@@ -439,10 +489,11 @@ where
                     message_id,
                     reason: e.to_string(),
                 });
-                return Ok(false);
+                return Ok(PublishStatus::default());
             }
         };
         let published = report.met_required_acks();
+        let accepted_by_any_endpoint = report.accepted_count() > 0;
         self.session.record_audit_event(
             target_group_id.as_ref(),
             Some(publish_context.clone()),
@@ -484,7 +535,10 @@ where
             });
         }
         output.reports.push(report);
-        Ok(published)
+        Ok(PublishStatus {
+            met_required_acks: published,
+            accepted_by_any_endpoint,
+        })
     }
 }
 

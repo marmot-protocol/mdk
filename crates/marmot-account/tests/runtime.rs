@@ -434,6 +434,120 @@ async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
 }
 
 #[tokio::test]
+async fn create_group_stops_welcome_publish_after_unexposed_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot create stop key").unwrap();
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let mut carol_session = session(dir.path().join("carol.sqlite"), &key, b"carol");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let carol_kp = carol_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+    let carol_id = carol_session.self_id();
+    let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_next(0);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            )
+            .with_inbox_route(
+                carol_id,
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let (group_id, effects) = runtime
+        .create_group(CreateGroupRequest {
+            name: "runtime unexposed failure".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(effects.pending.len(), 1);
+    assert!(matches!(
+        effects.pending[0],
+        PendingResolution::RolledBack { .. }
+    ));
+    assert_eq!(effects.failures.len(), 1);
+    assert_eq!(effects.reports.len(), 1);
+    assert_eq!(effects.reports[0].accepted_count(), 0);
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 0);
+    assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
+    assert_eq!(adapter.publishes().len(), 1);
+}
+
+#[tokio::test]
+async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot partial create key").unwrap();
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+    let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_next(1);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .required_acks(2)
+            .with_inbox_route(
+                bob_id,
+                vec![
+                    TransportEndpoint("wss://bob-inbox-a.example".into()),
+                    TransportEndpoint("wss://bob-inbox-b.example".into()),
+                ],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let (group_id, effects) = runtime
+        .create_group(CreateGroupRequest {
+            name: "runtime partial create".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(effects.pending.len(), 1);
+    assert!(matches!(
+        effects.pending[0],
+        PendingResolution::Confirmed { .. }
+    ));
+    assert_eq!(effects.failures.len(), 1);
+    assert_eq!(effects.reports.len(), 1);
+    assert_eq!(effects.reports[0].accepted_count(), 1);
+    assert!(!effects.reports[0].met_required_acks());
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
+    assert_eq!(runtime.session().members(&group_id).unwrap().len(), 2);
+
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 1);
+    assert!(matches!(
+        publishes[0].message.envelope,
+        TransportEnvelope::Welcome { .. }
+    ));
+}
+
+#[tokio::test]
 async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot evolution partial publish key").unwrap();
