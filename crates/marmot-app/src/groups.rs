@@ -891,8 +891,9 @@ pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
         | GroupEvent::EpochChanged { group_id, .. }
         | GroupEvent::ForkRecovered { group_id, .. }
         | GroupEvent::CommitRolledBack { group_id, .. }
-        | GroupEvent::GroupUnrecoverable { group_id }
-        | GroupEvent::PendingCommitRecovered { group_id, .. } => Some(group_id),
+        | GroupEvent::GroupUnrecoverable { group_id, .. }
+        | GroupEvent::PendingCommitRecovered { group_id, .. }
+        | GroupEvent::GroupHydrationQuarantined { group_id, .. } => Some(group_id),
     }
 }
 

@@ -1,0 +1,16 @@
+---
+source: crates/traits/tests/snapshots.rs
+assertion_line: 533
+expression: "GroupEvent::GroupHydrationQuarantined\n{\n    group_id: gid(), reason:\n    GroupHydrationQuarantineReason::OpenMlsGroupMissing,\n}"
+---
+{
+  "GroupHydrationQuarantined": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "reason": "OpenMlsGroupMissing"
+  }
+}

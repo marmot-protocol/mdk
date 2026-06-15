@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupStateChange, KeyPackage,
-    SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
+    GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
@@ -33,6 +33,7 @@ use marmot_forensics::{
 };
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,6 +41,25 @@ use std::time::Instant;
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+fn hydration_quarantine_reason_tag(reason: GroupHydrationQuarantineReason) -> &'static str {
+    match reason {
+        GroupHydrationQuarantineReason::OpenMlsLoadFailed => "openmls_load_failed",
+        GroupHydrationQuarantineReason::OpenMlsGroupMissing => "openmls_group_missing",
+        GroupHydrationQuarantineReason::MemberValidationFailed => "member_validation_failed",
+        GroupHydrationQuarantineReason::GroupRecordLoadFailed => "group_record_load_failed",
+        GroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
+            "pending_commit_recovery_failed"
+        }
+    }
+}
+
+fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-hydration-quarantine-group/v1");
+    hasher.update(group_id.as_slice());
+    hex::encode(hasher.finalize())
+}
 
 /// OpenMLS-backed CGKA engine. Construct via [`EngineBuilder`].
 /// A group-state change effected by a locally staged commit, buffered until
@@ -415,46 +435,66 @@ impl<S: StorageProvider> Engine<S> {
     /// the prior (pre-recovery) behaviour for removal-bearing commits.
     pub fn hydrate_stable_groups_from_storage(&mut self) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
-            let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-                &self.crypto,
-                self.storage.mls_storage(),
-            );
-            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-            let mut mls_group = openmls::group::MlsGroup::load(
-                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-                &mls_gid,
-            )
-            .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-            crate::group_lifecycle::validate_member_credentials_and_account_proofs(
-                &mls_group,
-                self.ciphersuite,
-            )?;
+            if let Err(reason) = self.hydrate_one_stored_group(&group_id) {
+                self.quarantine_stored_group_on_hydrate(&group_id, reason);
+            }
+        }
+        Ok(())
+    }
 
-            // A staged commit that survived process restart *may* mean the
-            // application crashed mid-publish. Clear it (treat as
-            // publish-failed) so the group is not permanently wedged, then
-            // re-derive the Marmot record from the post-clear MLS state.
-            //
-            // BUT a surviving pending commit is also the normal cross-process
-            // state of a deferred SelfRemove auto-commit, whose Marmot record
-            // is already projected forward past the leave. Rolling back a
-            // commit that removes a member would re-add the departed member and
-            // fork convergence, so we only recover commits that add no
-            // member-removal (no `Remove`, no `SelfRemove`). Removal-bearing
-            // staged commits are left exactly as they were before this recovery
-            // path existed.
-            let staged_removes_member = mls_group.pending_commit().is_some_and(|staged| {
-                staged.queued_proposals().any(|queued| {
-                    matches!(
-                        queued.proposal(),
-                        openmls::prelude::Proposal::Remove(_)
-                            | openmls::prelude::Proposal::SelfRemove
-                    )
-                })
-            });
-            if mls_group.pending_commit().is_some() && !staged_removes_member {
-                self.storage.with_transaction(|storage| {
+    fn hydrate_one_stored_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), GroupHydrationQuarantineReason> {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut mls_group = openmls::group::MlsGroup::load(
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &mls_gid,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
+        .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?;
+        crate::group_lifecycle::validate_member_credentials_and_account_proofs(
+            &mls_group,
+            self.ciphersuite,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
+
+        let mut group = self
+            .storage
+            .get_group(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
+        // A staged commit that survived process restart *may* mean the
+        // application crashed mid-publish. Clear it (treat as
+        // publish-failed) so the group is not permanently wedged, then
+        // re-derive the Marmot record from the post-clear MLS state.
+        //
+        // BUT a surviving pending commit is also the normal cross-process
+        // state of a deferred SelfRemove auto-commit, whose Marmot record
+        // is already projected forward past the leave. Rolling back a
+        // commit that removes a member would re-add the departed member and
+        // fork convergence, so we only recover commits that add no
+        // member-removal (no `Remove`, no `SelfRemove`). Removal-bearing
+        // staged commits are left exactly as they were before this recovery
+        // path existed.
+        let staged_removes_member = mls_group.pending_commit().is_some_and(|staged| {
+            staged.queued_proposals().any(|queued| {
+                matches!(
+                    queued.proposal(),
+                    openmls::prelude::Proposal::Remove(_) | openmls::prelude::Proposal::SelfRemove
+                )
+            })
+        });
+        if mls_group.pending_commit().is_some() && !staged_removes_member {
+            // Clear the staged commit transactionally (preserves the #421
+            // crash-safety fix): the MLS storage mutation must be atomic so a
+            // crash mid-clear cannot leave torn group state.
+            self.storage
+                .with_transaction(|storage| {
                     let tx_provider = crate::provider::EngineOpenMlsProvider::<S>::new(
                         &self.crypto,
                         storage.mls_storage(),
@@ -464,33 +504,56 @@ impl<S: StorageProvider> Engine<S> {
                             <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&tx_provider),
                         )
                         .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
-                })?;
-                let recovered_epoch = EpochId(mls_group.epoch().as_u64());
-                if let Ok(mut g) = self.storage.get_group(&group_id) {
-                    g.epoch = recovered_epoch;
-                    g.members = crate::group_lifecycle::marmot_members(&mls_group);
-                    g.required_capabilities =
-                        crate::capability_manager::required_capabilities_from_group(&mls_group);
-                    crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-                    self.storage.put_group(&g)?;
-                }
-                self.audit_group(
-                    &group_id,
-                    AuditEventKind::PendingCommitRecoveredOnOpen {
-                        recovered_epoch: recovered_epoch.0,
-                    },
-                );
-                self.events_buf
-                    .push_back(GroupEvent::PendingCommitRecovered {
-                        group_id: group_id.clone(),
-                        recovered_epoch,
-                    });
-            }
-
-            let group = self.storage.get_group(&group_id)?;
-            self.epoch_manager.set_stable(group_id, group.epoch);
+                })
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let recovered_epoch = EpochId(mls_group.epoch().as_u64());
+            group.epoch = recovered_epoch;
+            group.members = crate::group_lifecycle::marmot_members(&mls_group);
+            group.required_capabilities =
+                crate::capability_manager::required_capabilities_from_group(&mls_group);
+            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
+            self.storage
+                .put_group(&group)
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            self.audit_group(
+                group_id,
+                AuditEventKind::PendingCommitRecoveredOnOpen {
+                    recovered_epoch: recovered_epoch.0,
+                },
+            );
+            self.events_buf
+                .push_back(GroupEvent::PendingCommitRecovered {
+                    group_id: group_id.clone(),
+                    recovered_epoch,
+                });
         }
+
+        self.epoch_manager.set_stable(group_id.clone(), group.epoch);
         Ok(())
+    }
+
+    fn quarantine_stored_group_on_hydrate(
+        &mut self,
+        group_id: &GroupId,
+        reason: GroupHydrationQuarantineReason,
+    ) {
+        let reason_tag = hydration_quarantine_reason_tag(reason);
+        let group_digest = hydration_quarantine_group_digest(group_id);
+        tracing::warn!(
+            target: "cgka_engine::hydrate",
+            method = "quarantine_stored_group_on_hydrate",
+            reason = reason_tag,
+            "quarantined stored group during session-open hydration"
+        );
+        self.audit(AuditEventKind::GroupHydrationQuarantined {
+            group_digest,
+            reason: reason_tag.to_string(),
+        });
+        self.events_buf
+            .push_back(GroupEvent::GroupHydrationQuarantined {
+                group_id: group_id.clone(),
+                reason,
+            });
     }
 
     pub(crate) fn convergence_now_ms(&self) -> u64 {

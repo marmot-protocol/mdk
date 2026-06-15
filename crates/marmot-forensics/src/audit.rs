@@ -318,6 +318,13 @@ pub enum AuditEventKind {
     /// so the group is no longer wedged on `PendingCommit`. The group is
     /// usable at `recovered_epoch` and the application should resync.
     PendingCommitRecoveredOnOpen { recovered_epoch: u64 },
+    /// A single stored group failed session-open hydration and was skipped so
+    /// the rest of the account can open. `group_digest` is a SHA-256 digest of
+    /// the group id with a domain-separation prefix.
+    GroupHydrationQuarantined {
+        group_digest: DigestHex,
+        reason: String,
+    },
     /// Pre-commit snapshot created for fork recovery.
     SnapshotCreated {
         snapshot_name: String,
@@ -417,6 +424,7 @@ impl AuditEventKind {
             AuditEventKind::PendingCommitRecoveredOnOpen { .. } => {
                 "pending_commit_recovered_on_open"
             }
+            AuditEventKind::GroupHydrationQuarantined { .. } => "group_hydration_quarantined",
             AuditEventKind::SnapshotCreated { .. } => "snapshot_created",
             AuditEventKind::ForkResolution { .. } => "fork_resolution",
             AuditEventKind::ConvergenceDecision { .. } => "convergence_decision",

@@ -14,7 +14,8 @@ use cgka_traits::capabilities::{
 };
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    GroupEvent, GroupStateChange, KeyPackage, SendIntent, SendResult,
+    GroupEvent, GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent,
+    SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -527,6 +528,13 @@ fn snapshot_group_events() {
         GroupEvent::PendingCommitRecovered {
             group_id: gid(),
             recovered_epoch: EpochId(1),
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_group_hydration_quarantined",
+        GroupEvent::GroupHydrationQuarantined {
+            group_id: gid(),
+            reason: GroupHydrationQuarantineReason::OpenMlsGroupMissing,
         }
     );
 }

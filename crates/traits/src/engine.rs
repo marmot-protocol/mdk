@@ -287,6 +287,27 @@ pub enum GroupStateChange {
     GroupAvatarChanged,
 }
 
+/// Why a stored group was skipped during session-open hydration.
+///
+/// Hydration is best-effort per group: one corrupt, missing, or validation-
+/// failing group must not abort opening the whole account. The engine emits
+/// this reason with [`GroupEvent::GroupHydrationQuarantined`] so the app can
+/// surface per-group recovery while keeping healthy groups available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupHydrationQuarantineReason {
+    /// OpenMLS returned an error while loading the stored group state.
+    OpenMlsLoadFailed,
+    /// Marmot metadata referenced a group whose OpenMLS state was missing.
+    OpenMlsGroupMissing,
+    /// Member credentials, account-identity proofs, or ratchet-tree export
+    /// validation failed for the loaded MLS group.
+    MemberValidationFailed,
+    /// The Marmot group record could not be loaded or refreshed.
+    GroupRecordLoadFailed,
+    /// Hydrate found a stranded pending commit, but recovery itself failed.
+    PendingCommitRecoveryFailed,
+}
+
 /// Ordered, decrypted output the application should render / act on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupEvent {
@@ -334,6 +355,13 @@ pub enum GroupEvent {
         /// origin commit is not resolvable cheaply (e.g. a convergence reorg that
         /// re-derives state without replaying a single attributable commit).
         origin_commit_id: Option<MessageId>,
+    },
+    /// A persisted group was skipped during session-open hydration. Hydration
+    /// remains best-effort across groups; this event identifies the quarantined
+    /// group and a coarse recovery reason for application UX / telemetry.
+    GroupHydrationQuarantined {
+        group_id: GroupId,
+        reason: GroupHydrationQuarantineReason,
     },
     EpochChanged {
         group_id: GroupId,
