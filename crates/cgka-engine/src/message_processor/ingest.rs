@@ -821,6 +821,10 @@ impl<S: StorageProvider> Engine<S> {
                     // the leaver; a Remove is attributed to the proposer.
                     let auto_is_self_remove = matches!(queued.proposal(), Proposal::SelfRemove);
                     let auto_proposer = member_id_of_sender(queued.sender(), &mls_group);
+                    // Capture the proposal kind string before `queued` is
+                    // consumed below; the not-stable guard re-audits with it.
+                    let auto_proposal_kind =
+                        crate::audit_helpers::proposal_kind_str(queued.proposal()).to_string();
                     mls_group
                     .store_pending_proposal(
                         <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
@@ -833,6 +837,32 @@ impl<S: StorageProvider> Engine<S> {
                         decision_report.decision,
                         crate::auto_committer::AutoCommitDecision::Commit
                     ) {
+                        // Only stage an auto-commit from a Stable epoch. The
+                        // engine accepts ingest while Recovering (can_ingest is
+                        // true for Recovering), so this arm is reachable in a
+                        // non-Stable state — but EpochManager::begin_pending is
+                        // Stable-only and would reject the transition AFTER a
+                        // commit, snapshot, and sent-message record were already
+                        // staged, leaving a dangling commit. Guard up front:
+                        // leave the proposal queued (it was just stored) and
+                        // skip staging until the group returns to Stable
+                        // (darkmatter#146). A group with no recorded state is
+                        // treated as Stable, matching begin_pending's fallback.
+                        let is_stable = self
+                            .epoch_manager
+                            .state(&group_id)
+                            .is_none_or(|s| s.is_stable());
+                        if !is_stable {
+                            self.audit_group(
+                                &group_id,
+                                marmot_forensics::AuditEventKind::AutoCommitDecision {
+                                    proposal_kind: auto_proposal_kind,
+                                    decision: "observe".to_string(),
+                                    reason: Some("group_not_stable".to_string()),
+                                },
+                            );
+                            return Ok(IngestOutcome::Processed);
+                        }
                         // Fork-detection bookkeeping — we're committing FROM
                         // the current pre-commit epoch.
                         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());

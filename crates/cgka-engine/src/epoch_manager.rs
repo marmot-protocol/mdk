@@ -121,18 +121,26 @@ impl EpochManager {
         kind: PendingKind,
         audit_context: Option<AuditEventContext>,
     ) -> Result<(), EngineError> {
-        // Record the pre-commit epoch BEFORE the transition so fork
-        // detection works even if the transition fails.
+        // Atomic in the state map (mirrors the Sm1 fix applied to
+        // confirm_publish / rollback_publish): clone the prior state and run
+        // the fallible transition BEFORE mutating any of self.states /
+        // self.committed_from / self.pending. A failing inner transition (e.g.
+        // a non-Stable prev → InvalidTransition) must leave every map untouched
+        // so the group's EpochState entry is never orphaned. Previously the
+        // entry was removed before the transition and never re-inserted on
+        // error, dropping the group to UnknownGroup (darkmatter#146).
+        let prev = self
+            .states
+            .get(&group_id)
+            .cloned()
+            .unwrap_or_else(|| EpochState::stable(pre_commit_epoch));
+        let new_state = prev.begin_pending(new_epoch, pending, pending_ref)?;
+
+        // The transition succeeded — commit every mutation together.
         self.committed_from
             .entry(group_id.clone())
             .or_default()
             .insert(pre_commit_epoch);
-
-        let prev = self
-            .states
-            .remove(&group_id)
-            .unwrap_or_else(|| EpochState::stable(pre_commit_epoch));
-        let new_state = prev.begin_pending(new_epoch, pending, pending_ref)?;
         self.states.insert(group_id.clone(), new_state);
         self.pending.insert(
             pending_ref,
@@ -274,5 +282,90 @@ impl EpochManager {
         self.states
             .get(group_id)
             .is_some_and(|s| s.is_unrecoverable())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gid() -> GroupId {
+        GroupId::new(vec![0xAB; 4])
+    }
+
+    fn handle() -> StagedCommitHandle {
+        StagedCommitHandle::from_bytes(vec![0xCD; 4])
+    }
+
+    /// Regression for darkmatter#146: `begin_pending` from a non-Stable state
+    /// must be atomic. A failing inner transition (Recovering →
+    /// InvalidTransition) must leave `states`, `committed_from`, and `pending`
+    /// untouched so the group is never orphaned to UnknownGroup.
+    #[test]
+    fn begin_pending_failure_leaves_state_intact() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+
+        // Drive the group into Recovering — a state from which begin_pending is
+        // illegal but which still reports can_ingest() == true.
+        em.set_stable(group_id.clone(), EpochId(3));
+        em.detect_fork(&group_id, vec![]);
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Recovering"));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
+        assert!(em.can_ingest(&group_id));
+
+        let pending_ref = em.next_pending_ref();
+        let result = em.begin_pending(
+            group_id.clone(),
+            EpochId(3),
+            EpochId(4),
+            handle(),
+            pending_ref,
+            PendingKind::GroupEvolution,
+            None,
+        );
+
+        // The transition is rejected ...
+        assert!(result.is_err(), "begin_pending from Recovering must fail");
+        // ... and crucially the group's state map entry survives unchanged.
+        assert_eq!(
+            em.state(&group_id).map(|s| s.name()),
+            Some("Recovering"),
+            "state must not be orphaned on failed begin_pending"
+        );
+        assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
+        // The pending meta was never inserted, so the ref is unknown.
+        assert!(em.group_for_pending(pending_ref).is_none());
+        // committed_from was not advanced for a transition that did not happen.
+        assert!(!em.we_committed_from(&group_id, EpochId(3)));
+    }
+
+    /// The happy path still records committed_from + pending and enters
+    /// PendingPublish.
+    #[test]
+    fn begin_pending_success_records_all_bookkeeping() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(7));
+
+        let pending_ref = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            pending_ref,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("begin_pending from Stable succeeds");
+
+        assert_eq!(
+            em.state(&group_id).map(|s| s.name()),
+            Some("PendingPublish")
+        );
+        assert_eq!(em.epoch(&group_id), Some(EpochId(8)));
+        assert_eq!(em.group_for_pending(pending_ref), Some(group_id.clone()));
+        assert!(em.we_committed_from(&group_id, EpochId(7)));
     }
 }

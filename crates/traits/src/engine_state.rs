@@ -240,6 +240,15 @@ impl EpochState {
         matches!(self, EpochState::Unrecoverable(_))
     }
 
+    /// Whether this group is in the `Stable` state — the only state from which
+    /// a new pending publish (`begin_pending`) is legal. Callers that stage a
+    /// commit MUST confirm this first; staging from a non-`Stable` state (e.g.
+    /// `Recovering`, which still accepts ingest) hits `begin_pending`'s
+    /// Stable-only precondition.
+    pub fn is_stable(&self) -> bool {
+        matches!(self, EpochState::Stable { .. })
+    }
+
     /// Short name for logs / tests.
     pub fn name(&self) -> &'static str {
         match self {

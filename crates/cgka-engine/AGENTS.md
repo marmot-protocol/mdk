@@ -204,9 +204,15 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
   - **Test:** implicit (no event leak — covered by existing tests)
 
 - **Item:** **Sm1** Atomic state-machine transitions
-  - **What changed:** `EpochManager::confirm_publish` / `rollback_publish` clone the prior `EpochState` + `PendingMeta`
-    before transitioning. A failing inner transition no longer orphans the group's state map entry.
-  - **Test:** covered by existing publish-lifecycle tests
+  - **What changed:** `EpochManager::confirm_publish` / `rollback_publish` / `begin_pending` clone the prior
+    `EpochState` and run the fallible inner transition BEFORE mutating `states` / `committed_from` / `pending`. A
+    failing inner transition no longer orphans the group's state map entry. `begin_pending` got this treatment in
+    darkmatter#146 (it previously removed-before-transition, orphaning the group to `UnknownGroup` when staged from a
+    non-`Stable` state). The auto-commit ingest arm also now requires `Stable` (`EpochState::is_stable`) before staging,
+    so a `Recovering` group — which still accepts ingest — leaves the SelfRemove proposal queued instead of staging a
+    commit that `begin_pending` would reject.
+  - **Test:** `epoch_manager::tests::begin_pending_failure_leaves_state_intact` +
+    `begin_pending_success_records_all_bookkeeping`; existing publish-lifecycle tests
 
 - **Item:** **Sm2** Convergence ingest outcome classification
   - **What changed:** `message_processor::convergence_ingest_outcome` now reports `Stale` for terminal dispositions
