@@ -21,7 +21,7 @@ use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority};
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::MessageState;
-use cgka_traits::storage::{StorageError, StorageProvider};
+use cgka_traits::storage::{MessageStorage, StorageError, StorageProvider};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::{AuditEventKind, ForkWinner};
 use sha2::{Digest, Sha256};
@@ -80,7 +80,7 @@ impl ForkRecoveryManager {
         )
     }
 
-    pub(crate) fn create_snapshot<S: StorageProvider>(
+    pub(crate) fn create_snapshot<S: MessageStorage>(
         &mut self,
         storage: &S,
         group_id: &GroupId,
@@ -132,7 +132,7 @@ impl ForkRecoveryManager {
             .insert((record.group_id.clone(), record.source_epoch), record);
     }
 
-    fn resolve<S: StorageProvider>(
+    fn resolve<S: MessageStorage>(
         &mut self,
         storage: &S,
         group_id: &GroupId,
@@ -182,6 +182,38 @@ impl ForkRecoveryManager {
             .filter(|record| &record.group_id == group_id)
             .map(|record| (record.source_epoch, record.snapshot_name.clone()))
             .collect()
+    }
+
+    fn prune_before<S: MessageStorage>(
+        &mut self,
+        storage: &S,
+        group_id: &GroupId,
+        oldest_retained_epoch: EpochId,
+    ) {
+        let stale: Vec<_> = self
+            .incumbents
+            .iter()
+            .filter(|((record_group_id, source_epoch), _)| {
+                record_group_id == group_id && source_epoch.0 < oldest_retained_epoch.0
+            })
+            .map(|(key, record)| (key.clone(), record.snapshot_name.clone()))
+            .collect();
+
+        for (key, snapshot_name) in stale {
+            match storage.release_group_snapshot(group_id, &snapshot_name) {
+                Ok(()) | Err(StorageError::SnapshotMissing(_)) => {
+                    self.incumbents.remove(&key);
+                }
+                Err(_e) => {
+                    tracing::warn!(
+                        target: "cgka_engine::fork_recovery",
+                        method = "prune_before",
+                        source_epoch = key.1.0,
+                        "failed to release pruned fork recovery snapshot; retaining incumbent for retry"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -322,5 +354,119 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) fn retained_fork_snapshots(&self, group_id: &GroupId) -> Vec<(EpochId, String)> {
         self.fork_recovery.retained_snapshots(group_id)
+    }
+
+    pub(crate) fn prune_fork_recovery_for_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let current_epoch = self.storage.get_group(group_id)?.epoch;
+        let policy = self
+            .convergence_policy_for_group(group_id)
+            .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
+        let oldest_retained_epoch = EpochId(
+            current_epoch
+                .0
+                .saturating_sub(policy.convergence.max_rewind_commits),
+        );
+        self.fork_recovery
+            .prune_before(&self.storage, group_id, oldest_retained_epoch);
+        self.epoch_manager
+            .prune_committed_from_before(group_id, oldest_retained_epoch);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::message::{MessageRecord, MessageState};
+    use cgka_traits::storage::StorageResult;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct HardFailingReleaseStorage {
+        release_attempts: Mutex<Vec<String>>,
+    }
+
+    fn unused<T>() -> StorageResult<T> {
+        unreachable!("unused in prune_before release-failure test")
+    }
+
+    impl MessageStorage for HardFailingReleaseStorage {
+        fn put_message(&self, _record: &MessageRecord) -> StorageResult<()> {
+            unused()
+        }
+
+        fn get_message(&self, _id: &MessageId) -> StorageResult<MessageRecord> {
+            unused()
+        }
+
+        fn update_message_state(
+            &self,
+            _id: &MessageId,
+            _new_state: MessageState,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn list_messages(
+            &self,
+            _group_id: &GroupId,
+            _at_or_after_epoch: EpochId,
+        ) -> StorageResult<Vec<MessageRecord>> {
+            unused()
+        }
+
+        fn create_group_snapshot(&self, _group_id: &GroupId, _name: &str) -> StorageResult<()> {
+            unused()
+        }
+
+        fn list_group_snapshots(&self, _group_id: &GroupId) -> StorageResult<Vec<String>> {
+            unused()
+        }
+
+        fn rollback_group_to_snapshot(
+            &self,
+            _group_id: &GroupId,
+            _name: &str,
+        ) -> StorageResult<()> {
+            unused()
+        }
+
+        fn release_group_snapshot(&self, _group_id: &GroupId, name: &str) -> StorageResult<()> {
+            self.release_attempts.lock().unwrap().push(name.to_string());
+            Err(StorageError::Backend("release failed".into()))
+        }
+    }
+
+    #[test]
+    fn prune_before_keeps_incumbent_when_snapshot_release_hard_fails() {
+        let mut manager = ForkRecoveryManager::default();
+        let group_id = GroupId::new(b"group".to_vec());
+        manager.record_applied(CommitRecoveryRecord {
+            group_id: group_id.clone(),
+            source_epoch: EpochId(1),
+            ordering_key: CommitOrderingKey::from_commit_bytes(
+                EpochId(1),
+                CommitOrderingPriority::Ordinary,
+                MemberId::new(b"alice".to_vec()),
+                b"commit",
+            ),
+            storage_id: MessageId::new(b"message".to_vec()),
+            snapshot_name: "fork-1".to_string(),
+        });
+
+        let storage = HardFailingReleaseStorage::default();
+        manager.prune_before(&storage, &group_id, EpochId(2));
+
+        assert_eq!(
+            storage.release_attempts.lock().unwrap().as_slice(),
+            &[String::from("fork-1")]
+        );
+        assert_eq!(
+            manager.recovery_snapshot_name(&group_id, EpochId(1)),
+            Some("fork-1".to_string())
+        );
     }
 }

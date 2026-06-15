@@ -8,6 +8,8 @@
 //! - Apply the winning commit and return to Stable
 
 use async_trait::async_trait;
+use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
@@ -472,6 +474,122 @@ async fn convergence_privileged_remove_beats_grinding_ordinary_self_update() {
     assert!(
         !members.iter().any(|member| member.id == bob_id),
         "Bob remains removed; the grinding self-update cannot resurrect him"
+    );
+}
+
+#[tokio::test]
+async fn stale_commit_outside_rewind_horizon_is_not_treated_as_recoverable_fork() {
+    let mut labels: Vec<&'static [u8]> = vec![
+        &b"fork-retention-00"[..],
+        &b"fork-retention-01"[..],
+        &b"fork-retention-02"[..],
+        &b"fork-retention-03"[..],
+        &b"fork-retention-04"[..],
+        &b"fork-retention-05"[..],
+    ];
+    labels.sort_by_key(|label| pad32(label));
+    let late_committer = labels[0];
+    let local_committer = labels[labels.len() - 1];
+
+    let (mut alice, _alice_storage) = build_client_with_storage(local_committer);
+    let mut bob = build_client(late_committer);
+    let mut dave = build_client(b"late-dave");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "retention-horizon".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let bob_welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    let policy = CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    };
+    alice
+        .set_group_convergence_policy(&group_id, policy)
+        .unwrap();
+
+    // Bob produces a same-source-epoch commit from epoch 1, then Alice advances
+    // two epochs without seeing it. Once Alice is at epoch 3 and the policy
+    // keeps only one rewind commit, source epoch 1 is outside the recovery
+    // horizon and must be classified as a stale commit, not a recoverable fork.
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    let late_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![dave_kp],
+        })
+        .await
+        .unwrap();
+    let late_commit = match late_invite {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            bob.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected Bob invite GroupEvolution, got {other:?}"),
+    };
+
+    for i in 0..2 {
+        let update = alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(format!("retention-horizon-{i}")),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let pending = match update {
+            SendResult::GroupEvolution { pending, .. } => pending,
+            other => panic!("expected Alice update GroupEvolution, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+    }
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(3));
+
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..late_commit
+    };
+    let outcome = alice.ingest(routed).await.unwrap();
+    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadyAtEpoch {
+                current: EpochId(3),
+                msg_epoch: EpochId(1),
+            }
+        }
+    ));
+    let events = alice.drain_events();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
+        "late commits outside the rewind horizon must not trigger fork recovery"
     );
 }
 

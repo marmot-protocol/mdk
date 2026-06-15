@@ -695,6 +695,7 @@ impl<S: StorageProvider> Engine<S> {
                         self.identity.self_id(),
                         self.ciphersuite,
                     )?;
+                    self.prune_fork_recovery_for_group(&group_id)?;
 
                     if let Some((source_epoch, winner, invalidated, invalidated_commit_id)) =
                         pending_recovery.take()

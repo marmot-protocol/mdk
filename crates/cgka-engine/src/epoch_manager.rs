@@ -252,6 +252,23 @@ impl EpochManager {
             .insert(epoch);
     }
 
+    pub(crate) fn prune_committed_from_before(
+        &mut self,
+        group_id: &GroupId,
+        oldest_retained_epoch: EpochId,
+    ) {
+        let should_remove = if let Some(epochs) = self.committed_from.get_mut(group_id) {
+            let retained = epochs.split_off(&oldest_retained_epoch);
+            *epochs = retained;
+            epochs.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            self.committed_from.remove(group_id);
+        }
+    }
+
     /// Transition the named group into `Recovering` due to a detected fork.
     /// Always legal regardless of current state.
     pub(crate) fn detect_fork(&mut self, group_id: &GroupId, buffered: Vec<PeeledMessage>) {

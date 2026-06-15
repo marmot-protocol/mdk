@@ -14,6 +14,8 @@
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
+use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::EngineError;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -235,6 +237,33 @@ fn build_with_peeler_and_storage(
         .unwrap()
 }
 
+fn build_engine_with_storage(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+) -> cgka_engine::Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn fork_snapshot_names(
+    storage: &SqliteAccountStorage,
+    gid: &cgka_traits::types::GroupId,
+) -> Vec<String> {
+    let mut names = storage
+        .list_group_snapshots(gid)
+        .unwrap()
+        .into_iter()
+        .filter(|name| name.starts_with("fork-"))
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 // ── 1. Invite + publish_failed → projected member rolls back ───────────────
 
 #[tokio::test]
@@ -450,6 +479,72 @@ async fn invite_wrap_failure_releases_pre_commit_recovery_snapshot() {
     alice.confirm_published(retry_pending).await.unwrap();
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
     assert_eq!(alice.members(&gid).unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn confirmed_commits_prune_fork_recovery_snapshots_to_rewind_horizon() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let mut bob = build(b"bob");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let policy = CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    };
+    alice.set_group_convergence_policy(&gid, policy).unwrap();
+
+    for i in 0..3 {
+        let update = alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: gid.clone(),
+                name: Some(format!("g-{i}")),
+                description: None,
+            })
+            .await
+            .unwrap();
+        let pending = match update {
+            SendResult::GroupEvolution { pending, .. } => pending,
+            _ => panic!("expected GroupEvolution"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+
+        let snapshots = fork_snapshot_names(&storage, &gid);
+        assert!(
+            snapshots.len() <= 1,
+            "fork snapshots exceeded max_rewind_commits=1 after update {i}: {snapshots:?}"
+        );
+    }
+
+    assert_eq!(alice.epoch(&gid).unwrap().0, 4);
+    let snapshots = fork_snapshot_names(&storage, &gid);
+    assert!(
+        !snapshots.is_empty()
+            && snapshots
+                .iter()
+                .all(|snapshot| snapshot.starts_with("fork-3-")),
+        "only the current rewind horizon's source epoch should remain: {snapshots:?}"
+    );
 }
 
 // ── 2. Upgrade + publish_failed → required caps roll back ──────────────────

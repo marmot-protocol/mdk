@@ -131,6 +131,7 @@ impl<S: StorageProvider> Engine<S> {
                 ),
             );
         }
+        self.prune_fork_recovery_for_group(&group_id)?;
         let event = match kind {
             crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
             crate::epoch_manager::PendingKind::GroupEvolution => GroupEvent::EpochChanged {
