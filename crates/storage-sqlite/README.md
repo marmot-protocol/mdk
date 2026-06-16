@@ -18,8 +18,10 @@ The crate is split around storage concerns:
   trait.
 - `account_projection.rs`, `chat_list.rs`, and `timeline.rs` own the app-facing projections (account event projection,
   chat-list projection including avatar URLs, and the materialized message timeline).
-- `encrypted_media_secrets.rs` owns per-group encrypted-media secret storage; `shared.rs` and `codec.rs` own shared
-  row/codec helpers and SQLite error mapping.
+- `encrypted_media_secrets.rs` owns per-group encrypted-media secret storage; `codec.rs` owns shared JSON/codec helpers
+  and SQLite error mapping; `shared.rs` owns `SqliteSharedStorage`, a separate (non-account-scoped) database for
+  cross-identity state: the public-directory user cache, relay-telemetry settings, audit-log settings, and the telemetry
+  install id.
 - `migrations.rs` owns the migration runner and migration tests.
 
 ## Migrations

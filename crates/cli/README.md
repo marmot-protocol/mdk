@@ -150,8 +150,8 @@ dm --account <npub-or-hex> keys delete-all --confirm
 `keys publish` republishes the currently cached KeyPackage; `keys rotate` (alias `force-publish`) force-mints and
 publishes a fresh replacement KeyPackage.
 
-KeyPackage publish/fetch/check/list use the current relay-directory path. Relay deletion commands are present but return
-`unsupported_command` until Nostr deletion is wired through the app runtime.
+KeyPackage publish/fetch/check/list use the current relay-directory path. KeyPackage deletion commands (`keys delete`,
+`keys delete-all`) are present but return `unsupported_command` until Nostr deletion is wired through the app runtime.
 
 Chat projection commands:
 

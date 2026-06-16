@@ -41,6 +41,8 @@ several files in the same crate); methods shared across those files are `pub(cra
   `InboundCatchUpDriver`.
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
 - `src/bootstrap.rs` — `dm-agent bootstrap` flow.
+- `src/bin/dm-agent.rs` — the `dm-agent` binary entrypoint and clap CLI surface (`ServeArgs`, the `bootstrap`
+  subcommand and `BootstrapArgs`, octal socket-mode parsing, and terminal-QR rendering).
 - `src/tests.rs` — white-box test suite exercising the above `pub(crate)` internals.
 
 ## Verification

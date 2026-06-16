@@ -29,4 +29,8 @@ cargo run -p transport-quic-broker --bin marmot-quic-broker -- --bind 127.0.0.1:
 For local development the broker prints the SHA-256 fingerprint of its generated self-signed certificate. A stable
 certificate can be supplied with `--cert-pem <path> --key-pem <path>`.
 
+Other operator flags: `--per-subscriber-queue <n>` and `--max-backlog <n>` tune the bounded live queue and replay
+backlog depths, `--replay-ttl-secs <n>` sets the replay window (default `0`, hard cap 300), and `--json` emits
+structured startup/status logs.
+
 Docker and VM deployment notes live in [`../../docs/quic-broker-deployment.md`](../../docs/quic-broker-deployment.md).

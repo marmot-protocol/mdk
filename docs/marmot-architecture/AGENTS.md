@@ -49,6 +49,12 @@ Agent map for the Marmot architecture docs.
 - **Path:** `relay-observability.md`
   - **Role:** Export contract for client-side relay telemetry: privacy contract, metric catalogue, and observability.md amendment.
 
+- **Path:** `telemetry.md`
+  - **Role:** Current implementation inventory for telemetry, logging, and tracing: OTLP export, engine reorg metrics, and the collected/exported fields.
+
+- **Path:** `audit-logging.md`
+  - **Role:** Current implementation inventory for opt-in forensic JSONL logs: file identity, event kinds/metadata, and upload/tracker behavior.
+
 - **Path:** `hermes-agent-production-runbook.md`
   - **Role:** Draft operational runbook for the Hermes agent deployment. Check status and dates before relying on it.
 

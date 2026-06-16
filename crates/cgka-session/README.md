@@ -2,10 +2,11 @@
 
 Production-shaped account-device wrapper around `Engine<SqliteAccountStorage>`.
 
-This crate is where app integration starts to become concrete. Callers provide an identity, SQLCipher database key,
-database path, feature registry, and transport peeler. The session opens encrypted storage, builds the engine, hydrates
-stable group epochs from stored group records, and returns app events plus publishable transport work from each
-lifecycle method.
+This crate is where app integration starts to become concrete. `SessionConfig::new` takes an identity, SQLCipher
+database key, database path, and transport peeler; opening the session also requires an account identity-proof signer.
+A feature registry, supported app-component set, convergence policy, and an optional forensic recorder are set through
+builder methods on `SessionConfig`. The session opens encrypted storage, builds the engine, hydrates stable group epochs
+from stored group records, and returns app events plus publishable transport work from each lifecycle method.
 
 ## What this crate does
 

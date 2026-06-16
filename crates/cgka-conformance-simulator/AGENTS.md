@@ -85,10 +85,12 @@ cooperation; sending is `&mut self`, the engine is awaited inline.
 
 Delivery policies (`DeliveryPolicy`):
 
-- `ordered`: FIFO. Default for all canonical scenarios + the proptest.
+- `ordered`: FIFO (`Ordered { broadcast_welcomes }`). Default for all canonical scenarios + the proptest.
 - `reverse`: pop from the back. Useful for ingesting commits before their proposals.
 - `seeded_random`: deterministic shuffle from a fixed `u64` seed.
-- `partition`: drop messages whose recipient is in the partition set.
+
+Partitioning is orthogonal to the delivery policy, not a fourth policy: `set_partition(Some(allowed))` restricts
+delivery to the allowed client set (messages to clients outside it are dropped) and `set_partition(None)` heals.
 
 The bus knows about welcomes vs. group messages so welcomes can be routed to a specific recipient without requiring it
 to be a group member yet.

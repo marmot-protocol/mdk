@@ -52,5 +52,5 @@ available for repair and tests, but the daemon path is runtime-owned subscriptio
 
 The crate root now keeps app construction, shared state, storage/projector wiring, directory bootstrap, account relay
 list helpers, and public re-exports. Runtime orchestration lives in the `src/runtime/` module, app-client commands and queries
-live in `src/client.rs`, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media DTOs plus
-Blossom upload/download helpers live in `src/media.rs`.
+live in the `src/client/` module, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media
+DTOs plus Blossom upload/download helpers live in the `src/media/` module.

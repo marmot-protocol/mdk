@@ -4,6 +4,11 @@ Map for simulator tests.
 
 ## Files
 
+- **File:** `agent_text_stream_vectors.rs`
+  - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
+    encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the
+    `QuicBrokerControlEnvelopeV1` envelope.
+
 - **File:** `candidate_state_graph.rs`
   - **Owns:** Selector/candidate graph policy tests.
 

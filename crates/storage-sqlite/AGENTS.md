@@ -5,7 +5,9 @@ Agent-facing map for the SQLCipher-backed storage backend.
 ## Scope
 
 `SqliteAccountStorage` implements `cgka_traits::StorageProvider` with Marmot metadata and custom OpenMLS storage in one
-encrypted SQLite database. One database file belongs to one Marmot account-device identity.
+encrypted SQLite database. One database file belongs to one Marmot account-device identity. `shared.rs`'s
+`SqliteSharedStorage` is a deliberate exception: a separate, non-account-scoped database for cross-identity state — do
+not "fix" it into the per-account database.
 
 ## Key files
 
@@ -21,7 +23,7 @@ encrypted SQLite database. One database file belongs to one Marmot account-devic
 | `src/chat_list.rs` | Chat-list projection, including avatar URLs. |
 | `src/timeline.rs` | Materialized message-timeline aggregation. |
 | `src/encrypted_media_secrets.rs` | Per-group encrypted-media secret storage. |
-| `src/shared.rs` | Shared row helpers used across projections. |
+| `src/shared.rs` | `SqliteSharedStorage`: a separate non-account-scoped database for cross-identity state (public-directory cache, relay-telemetry/audit-log settings, telemetry install id). |
 
 ## Invariants
 

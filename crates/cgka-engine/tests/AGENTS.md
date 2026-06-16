@@ -57,6 +57,13 @@ backend on the same rail.
 - **File:** `publish_lifecycle.rs`
   - **Owns:** Explicit publish-before-apply lifecycle for local group evolution
 
+- **File:** `pending_commit_recovery.rs`
+  - **Owns:** Crash-during-publish recovery at session open — `hydrate_stable_groups_from_storage` detects a surviving
+    `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (darkmatter#150)
+
+- **File:** `hydration_quarantine.rs`
+  - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
+
 - **File:** `snapshot_privacy.rs`
   - **Owns:** Snapshot names do not expose plaintext group ids
 
@@ -110,6 +117,11 @@ cargo test -p cgka-engine
 - **File:** `vector_artifacts.rs`
   - **Owns:** Vector manifest and byte-fixture well-formedness checks
 
+- **File:** `agent_text_stream_vectors.rs`
+  - **Owns:** Byte-level conformance vectors for the agent text stream QUIC feature: `AgentTextStreamKeyContextV1`
+    encoding, HKDF-SHA256 record key / nonce derivation, record AEAD AAD, transcript hashes, and the
+    `QuicBrokerControlEnvelopeV1` envelope
+
 Quick CI run:
 
 ```sh
@@ -149,5 +161,7 @@ Run before checkpointing broad storage/engine changes; the exact count changes a
 
 Testing engine behavior requires an `Engine<S>` instance which requires a storage backend, so engine-behavior assertions
 go through `tests/*.rs` integration files, using `storage-sqlite` in-memory mode unless the test explicitly needs
-encrypted file-backed persistence. The exceptions are `src/identity.rs` and `src/engine_metrics.rs`, which carry small
-in-crate `#[cfg(test)]` modules for pure-data logic that needs no `Engine` instance.
+encrypted file-backed persistence. The exceptions are `src/identity.rs`, `src/engine_metrics.rs`, `src/epoch_manager.rs`,
+`src/fork_recovery.rs`, `src/app_components.rs`, `src/canonicalization.rs`, and `src/group_state_changes.rs`, which carry
+small in-crate `#[cfg(test)]` modules for pure-data logic (state transitions, diff helpers, policy ordering) that needs
+no `Engine` instance.

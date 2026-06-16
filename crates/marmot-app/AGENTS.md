@@ -26,7 +26,8 @@ App runtime bridge for the first real Marmot app surfaces.
   recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files are widened to
   `pub(crate)`; `pub` items keep stable `marmot_app::...` paths via the crate-root re-export.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
-- Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in `src/media.rs`.
+- Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
+  (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`).
 - Keep the mechanical `storage_sqlite` `Stored*` <-> app-DTO mapper free functions (account state, groups, components,
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
@@ -64,7 +65,8 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
-- Keep the relay-telemetry export path in `relay_plane.rs` (rollup) and `relay_telemetry_export.rs` (exporter). It is
+- Keep the relay-telemetry export path in the `src/relay_plane/` module (rollup in `relay_plane/telemetry.rs`) and
+  `relay_telemetry_export.rs` (exporter, including the `MarmotRelayPlane::telemetry_exporter` constructor). It is
   opt-in and off by default: `MarmotRelayPlane::telemetry_exporter` is the single construction gate, relay-identity
   resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default

@@ -29,6 +29,12 @@ OpenMLS appears only where the storage aggregate needs the OpenMLS storage trait
 | `src/engine.rs` | Public engine trait, send/create requests, outputs, group events. |
 | `src/storage.rs` | Storage trait aggregate and snapshot/rollback contract. |
 | `src/engine_state.rs` | Epoch and welcome state machines. |
+| `src/welcome.rs` | `PendingWelcome` pending-welcome persistence record. |
+| `src/error.rs` | `EngineError` and `PeelerError` — the engine/peeler error vocabulary. |
+| `src/types.rs` | Core id newtypes (`GroupId`/`MemberId`/`MessageId`), `EpochId`, and the `Backend` enum. |
+| `src/group.rs` | `Group` and `Member` storage records. |
+| `src/message.rs` | `MessageRecord`, `MessageState`, and the `StoredMessagePayload` envelope. |
+| `src/peeler.rs` | The `TransportPeeler` crypto-boundary trait. |
 | `src/transport.rs` | Transport-facing message envelope types. |
 | `src/transport_adapter.rs` | Account-aware adapter trait, publish targets, delivery metadata. |
 | `src/ingest.rs` | Peeled-message content and ingest outcomes. |
@@ -43,6 +49,7 @@ OpenMLS appears only where the storage aggregate needs the OpenMLS storage trait
 | `src/group_context.rs` | `GroupContextSnapshot` group-context view. |
 | `src/agent_text_stream.rs` | Agent text stream component policy, record framing, and transcript helpers. |
 | `tests/snapshots.rs` | JSON/debug shape checks for cross-boundary types. |
+| `tests/error_display.rs` | Asserts `EngineError`/`PeelerError` `Display` output leaks no group/member ids or pubkeys. |
 
 ## Verification
 

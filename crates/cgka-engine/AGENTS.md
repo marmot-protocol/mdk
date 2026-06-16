@@ -82,13 +82,18 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 - **Module:** `fork_recovery.rs`
   - **Owns:** deterministic same-epoch commit ordering, pre-commit snapshot metadata, rollback-to-winner recovery
 
+- **Module:** `group_state_changes.rs`
+  - **Owns:** pure, MLS-free before/after diff helpers that turn an applied commit's effect on canonical group state
+    (admin set, profile name, avatar bytes) into `GroupStateChange` values, later surfaced as
+    `GroupEvent::GroupStateChanged`
+
 - **Module:** `publish.rs`
   - **Owns:** `do_confirm_published` (merges staged commit + mirrors Marmot/cache post-merge) and `do_publish_failed`
     (`MlsGroup::clear_pending_commit` + Marmot re-derive). The publish-before-apply contract lives here.
 
 - **Module:** `auto_committer.rs`
-  - **Owns:** the free function `decide(mls_group, proposal) -> AutoCommitDecision` — lowest-index auto-commit policy
-    for SelfRemove proposals
+  - **Owns:** the free function `decide_with_reason(mls_group, proposal) -> AutoCommitDecisionReport` — lowest-index
+    auto-commit policy for SelfRemove proposals (the report wraps an `AutoCommitDecision` plus a stable `reason` string)
 
 - **Module:** `upgrade.rs`
   - **Owns:** `do_upgrade_group_capabilities` — promotes upgradeable MLS primitives through
@@ -105,6 +110,11 @@ realises. Read those rustdocs as the source of truth — this table is just an i
 - **Module:** `snapshot_guard.rs`
   - **Owns:** RAII guard that rolls back + releases a snapshot on Drop; used by snapshot-probing call sites so panics or
     async cancellation don't leave storage in mid-mutation state
+
+- **Module:** `pending_commit_guard.rs`
+  - **Owns:** `PendingCommitCleanupGuard` — RAII cleanup that clears an orphaned OpenMLS pending commit and releases the
+    fork-recovery snapshot if a commit-producing send path is dropped or returns early before handing off a
+    `PendingStateRef`
 
 - **Module:** `wire_format.rs`
   - **Owns:** `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + the `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker
@@ -246,7 +256,7 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
   - **Test:** covered by existing replay tests
 
 - **Item:** **Sm7** Auto-committer §150 fail-closed
-  - **What changed:** `auto_committer::decide` now refuses to auto-commit a SelfRemove if the leaver's
+  - **What changed:** `auto_committer::decide_with_reason` now refuses to auto-commit a SelfRemove if the leaver's
     credential is malformed (length ≠ 32) instead of treating that as "no admin to compare against."
   - **Test:** covered by existing MIP-03 guard tests
 
