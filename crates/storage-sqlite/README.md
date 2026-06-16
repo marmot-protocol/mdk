@@ -65,10 +65,13 @@ snapshots are pruned after successful stable canonicalization advances the tip. 
 audit/debug evidence and so applications can decide whether to surface invalidated messages.
 
 OpenMLS proposal queues are also treated as recoverable cached state. If `queued_proposals()` finds a
-`ProposalQueueRefs` entry whose `QueuedProposal` entity is missing, the backend clears the whole proposal queue for that
-group and returns an empty queue. It deliberately does not load a partial subset of still-present proposals: after
-corruption, a later commit must start from the current MLS group state and require proposals to be re-enqueued rather
-than silently committing a queue whose history is known incomplete.
+`ProposalQueueRefs` entry whose `QueuedProposal` entity is missing (a dangling ref) or present but undeserializable
+(a truncated/garbled blob from out-of-band corruption, a partial write, or a storage-format skew), the backend clears
+the whole proposal queue for that group and returns an empty queue. It deliberately does not load a partial subset of
+still-present proposals: after corruption, a later commit must start from the current MLS group state and require
+proposals to be re-enqueued rather than silently committing a queue whose history is known incomplete. Only deserialize
+failures are treated as recoverable corruption here; operational errors (SQLite/lock failures) still propagate so a
+transient backend fault is never mistaken for queue corruption.
 
 Run:
 

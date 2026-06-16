@@ -282,26 +282,38 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         let mut proposals = Vec::with_capacity(refs.len());
         for proposal_ref in refs {
             let key = serde_json::to_vec(&(group_id, &proposal_ref))?;
-            match self.read_entity(QUEUED_PROPOSAL_LABEL, key)? {
-                Some(proposal) => proposals.push((proposal_ref, proposal)),
-                None => {
-                    // A ref without its entity means the persisted queue is no longer
-                    // authoritative. Recover by clearing the entire queue instead of
-                    // loading a partial subset: commits after recovery start from the
-                    // current MLS group state and require proposals to be re-enqueued.
-                    // This keeps corrupted historical queue state from silently
-                    // influencing a future commit while still allowing group load.
-                    tracing::warn!(
-                        target: "marmot.storage_sqlite.openmls",
-                        method = "queued_proposals",
-                        "clearing corrupted OpenMLS proposal queue after dangling proposal reference"
-                    );
-                    self.delete_group_labels(
+            match self.read_entity(QUEUED_PROPOSAL_LABEL, key) {
+                Ok(Some(proposal)) => proposals.push((proposal_ref, proposal)),
+                Ok(None) => {
+                    // A ref without its entity (dangling reference) means the persisted
+                    // queue is no longer authoritative. Recover by clearing the entire
+                    // queue instead of loading a partial subset: commits after recovery
+                    // start from the current MLS group state and require proposals to be
+                    // re-enqueued. This keeps corrupted historical queue state from
+                    // silently influencing a future commit while still allowing group
+                    // load (issue #315).
+                    self.recover_corrupt_proposal_queue(
                         group_id,
-                        &[QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL],
+                        "clearing corrupted OpenMLS proposal queue after dangling proposal reference",
                     )?;
                     return Ok(Vec::new());
                 }
+                Err(SqliteOpenMlsStorageError::Serialization(_)) => {
+                    // The ref's entity row is present but its JSON blob fails to
+                    // deserialize (out-of-band corruption, a partial write, or a
+                    // storage-format skew). Treat undeserializable queue contents as the
+                    // same recoverable corruption as a dangling ref: a partial/garbled
+                    // queue must not silently influence a future commit, and permanently
+                    // bricking group load is the worse failure mode (issue #350). Only the
+                    // deserialize error is recovered here; Sqlite/Lock errors are
+                    // operational rather than corruption, so they still propagate.
+                    self.recover_corrupt_proposal_queue(
+                        group_id,
+                        "clearing corrupted OpenMLS proposal queue after undeserializable queued proposal",
+                    )?;
+                    return Ok(Vec::new());
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(proposals)
@@ -643,6 +655,34 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
     }
 }
 
+impl SqliteOpenMlsStorage {
+    /// Clear the entire OpenMLS proposal queue for `group_id` after detecting
+    /// recoverable corruption (a dangling ref or an undeserializable queued
+    /// proposal blob). Deletes `QUEUED_PROPOSAL_LABEL` and
+    /// `PROPOSAL_QUEUE_REFS_LABEL` atomically via `delete_group_labels` so the
+    /// queue cannot be left half-cleared, logs a privacy-safe warning, and lets
+    /// the caller return an empty queue. Dropping a pending local proposal is
+    /// safe; a later commit simply starts from the current MLS group state and
+    /// requires proposals to be re-enqueued. Permitting a partial/garbled queue
+    /// to load is not safe, so this trades unrecoverable group load failure for
+    /// a clean, re-enqueueable empty queue.
+    fn recover_corrupt_proposal_queue<GroupId: traits::GroupId<CURRENT_VERSION>>(
+        &self,
+        group_id: &GroupId,
+        warning: &'static str,
+    ) -> Result<(), SqliteOpenMlsStorageError> {
+        tracing::warn!(
+            target: "marmot.storage_sqlite.openmls",
+            method = "queued_proposals",
+            "{warning}"
+        );
+        self.delete_group_labels(
+            group_id,
+            &[QUEUED_PROPOSAL_LABEL, PROPOSAL_QUEUE_REFS_LABEL],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +733,43 @@ mod tests {
             mls.queued_proposals(&group_id).unwrap();
         assert_eq!(proposals, Vec::new());
 
+        let refs: Vec<TestProposalRef> = mls.queued_proposal_refs(&group_id).unwrap();
+        assert_eq!(refs, Vec::new());
+    }
+
+    #[test]
+    fn queued_proposals_recovers_from_undeserializable_blob_by_clearing_queue() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![9, 8, 7, 6]);
+        let corrupt_ref = TestProposalRef(vec![0xDD]);
+        let proposal = TestQueuedProposal(vec![0xEE]);
+
+        // Enqueue a normal proposal so both the ref list and the entity row exist.
+        mls.queue_proposal(&group_id, &corrupt_ref, &proposal)
+            .unwrap();
+
+        // Corrupt the QueuedProposal entity in place: overwrite its JSON blob with
+        // bytes that cannot deserialize into a TestQueuedProposal. The ref stays
+        // intact, so this is the "row present but undeserializable" case (#350),
+        // distinct from the dangling-ref ("row missing") case (#315).
+        let group_key = SqliteOpenMlsStorage::group_key(&group_id).unwrap();
+        let proposal_key = serde_json::to_vec(&(&group_id, &corrupt_ref)).unwrap();
+        mls.write_value(
+            QUEUED_PROPOSAL_LABEL,
+            proposal_key,
+            Some(group_key),
+            b"not valid json for this entity".to_vec(),
+        )
+        .unwrap();
+
+        // queued_proposals() must self-heal (clear the queue) instead of
+        // propagating the deserialize error, which would otherwise brick group load.
+        let proposals: Vec<(TestProposalRef, TestQueuedProposal)> =
+            mls.queued_proposals(&group_id).unwrap();
+        assert_eq!(proposals, Vec::new());
+
+        // Both labels are cleared, so a subsequent load starts from a clean queue.
         let refs: Vec<TestProposalRef> = mls.queued_proposal_refs(&group_id).unwrap();
         assert_eq!(refs, Vec::new());
     }
