@@ -1,6 +1,9 @@
 use super::*;
 use crate::StoredAppEvent;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_TAG,
+};
 
 fn group(id: &str, name: &str) -> StoredAccountGroup {
     StoredAccountGroup {
@@ -44,6 +47,88 @@ fn app_event(id: &str, group_id_hex: &str, at: u64) -> StoredAppEvent {
         plaintext: id.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+    }
+}
+
+fn agent_stream_start_event(
+    id: &str,
+    group_id_hex: &str,
+    stream_id_hex: &str,
+    at: u64,
+) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: group_id_hex.to_owned(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: None,
+        direction: "received".to_owned(),
+        sender: "agent".to_owned(),
+        plaintext: id.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+        tags: vec![vec![STREAM_TAG.to_owned(), stream_id_hex.to_owned()]],
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+    }
+}
+
+fn reply_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: group_id_hex.to_owned(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: None,
+        direction: "received".to_owned(),
+        sender: "sender".to_owned(),
+        plaintext: id.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        tags: vec![
+            vec![EVENT_REF_TAG.to_owned(), target.to_owned()],
+            vec![QUOTE_REF_TAG.to_owned(), target.to_owned()],
+        ],
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+    }
+}
+
+fn reaction_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: group_id_hex.to_owned(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: None,
+        direction: "received".to_owned(),
+        sender: "reactor".to_owned(),
+        plaintext: "+".to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_REACTION,
+        tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
+        recorded_at: at,
+        received_at: at,
+        origin_commit_id: None,
+    }
+}
+
+fn delete_event(
+    id: &str,
+    group_id_hex: &str,
+    sender: &str,
+    target: &str,
+    at: u64,
+) -> StoredAppEvent {
+    StoredAppEvent {
+        group_id_hex: group_id_hex.to_owned(),
+        message_id_hex: id.to_owned(),
+        source_message_id_hex: Some(format!("source-{id}")),
+        source_epoch: None,
+        direction: "received".to_owned(),
+        sender: sender.to_owned(),
+        plaintext: String::new(),
+        kind: MARMOT_APP_EVENT_KIND_DELETE,
+        tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
@@ -158,7 +243,7 @@ fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
 }
 
 #[test]
-fn app_messages_list_raw_events_and_prune_rebuilds_timeline() {
+fn app_messages_list_raw_events_and_prune_updates_timeline() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
         .record_app_event(&app_event("old-aa", "aa", 10))
@@ -196,6 +281,242 @@ fn app_messages_list_raw_events_and_prune_rebuilds_timeline() {
         .unwrap();
     assert_eq!(timeline.messages.len(), 1);
     assert_eq!(timeline.messages[0].message_id_hex, "new-aa");
+}
+
+#[test]
+fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&app_event("old-aa", "aa", 10))
+        .unwrap();
+    store
+        .record_app_event(&app_event("new-aa", "aa", 20))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_survivor_timeline_delete
+             BEFORE DELETE ON message_timeline
+             WHEN OLD.message_id_hex = 'new-aa'
+             BEGIN
+                SELECT RAISE(FAIL, 'unexpected survivor timeline delete');
+             END;",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+
+    let timeline = store
+        .message_timeline(crate::TimelineMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            ..crate::TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(timeline.messages.len(), 1);
+    assert_eq!(timeline.messages[0].message_id_hex, "new-aa");
+}
+
+#[test]
+fn prune_app_events_before_deletes_only_pruned_agent_stream_start_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&agent_stream_start_event(
+            "old-stream",
+            "aa",
+            "stream-old",
+            10,
+        ))
+        .unwrap();
+    store
+        .record_app_event(&agent_stream_start_event(
+            "new-stream",
+            "aa",
+            "stream-new",
+            20,
+        ))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_survivor_stream_start_delete
+             BEFORE DELETE ON agent_stream_starts
+             WHEN OLD.message_id_hex = 'new-stream'
+             BEGIN
+                SELECT RAISE(FAIL, 'unexpected survivor stream start delete');
+             END;",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+
+    let conn = store.lock().unwrap();
+    let stream_start_ids = conn
+        .prepare("SELECT message_id_hex FROM agent_stream_starts ORDER BY message_id_hex")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stream_start_ids, vec!["new-stream"]);
+}
+
+#[test]
+fn prune_app_events_before_chunks_projection_deletes_under_sqlite_variable_limit() {
+    const EVENT_COUNT: usize = 1_005;
+
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: The raw handle is only used to lower this test connection's
+        // bind-parameter limit before any concurrent use; rusqlite keeps owning
+        // the connection and no pointer is retained.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_VARIABLE_NUMBER,
+                1_000,
+            );
+        }
+    }
+    for index in 0..EVENT_COUNT {
+        store
+            .record_app_event(&app_event(&format!("old-{index:04}"), "aa", index as u64))
+            .unwrap();
+    }
+
+    assert_eq!(
+        store.prune_app_events_before("aa", 2_000).unwrap(),
+        EVENT_COUNT
+    );
+
+    let conn = store.lock().unwrap();
+    let timeline_rows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_timeline WHERE group_id_hex = 'aa'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(timeline_rows, 0);
+}
+
+#[test]
+fn prune_app_events_before_does_not_reproject_replies_when_parent_is_pruned() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&app_event("old-parent", "aa", 10))
+        .unwrap();
+    store
+        .record_app_event(&reply_event("reply", "aa", "old-parent", 20))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reply_timeline_update
+             BEFORE UPDATE ON message_timeline
+             WHEN OLD.message_id_hex = 'reply'
+             BEGIN
+                SELECT RAISE(FAIL, 'unexpected reply timeline reproject');
+             END;
+             CREATE TRIGGER fail_reply_timeline_delete
+             BEFORE DELETE ON message_timeline
+             WHEN OLD.message_id_hex = 'reply'
+             BEGIN
+                SELECT RAISE(FAIL, 'unexpected reply timeline delete');
+             END;",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+
+    let timeline = store
+        .message_timeline(crate::TimelineMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            ..crate::TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(timeline.messages.len(), 1);
+    let reply = &timeline.messages[0];
+    assert_eq!(reply.message_id_hex, "reply");
+    assert_eq!(reply.reply_to_message_id_hex.as_deref(), Some("old-parent"));
+    assert!(reply.reply_preview.is_none());
+}
+
+#[test]
+fn prune_app_events_before_reprojects_survivor_when_reaction_is_pruned() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&app_event("target", "aa", 20))
+        .unwrap();
+    store
+        .record_app_event(&reaction_event("old-reaction", "aa", "target", 10))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_target_timeline_delete
+             BEFORE DELETE ON message_timeline
+             WHEN OLD.message_id_hex = 'target'
+             BEGIN
+                SELECT RAISE(FAIL, 'unexpected survivor timeline delete');
+             END;",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+
+    let timeline = store
+        .message_timeline(crate::TimelineMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            ..crate::TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(timeline.messages.len(), 1);
+    let target = &timeline.messages[0];
+    assert_eq!(target.message_id_hex, "target");
+    assert!(target.reactions.user_reactions.is_empty());
+    assert!(target.reactions.by_emoji.is_empty());
+}
+
+#[test]
+fn prune_app_events_before_reprojects_survivor_when_delete_is_pruned() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&app_event("target", "aa", 20))
+        .unwrap();
+    store
+        .record_app_event(&delete_event("old-delete", "aa", "sender", "target", 10))
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_target_timeline_delete
+             BEFORE DELETE ON message_timeline
+             WHEN OLD.message_id_hex = 'target'
+             BEGIN
+                SELECT RAISE(FAIL, 'unexpected survivor timeline delete');
+             END;",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+
+    let timeline = store
+        .message_timeline(crate::TimelineMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            ..crate::TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(timeline.messages.len(), 1);
+    let target = &timeline.messages[0];
+    assert_eq!(target.message_id_hex, "target");
+    assert!(!target.deleted);
+    assert_eq!(target.plaintext, "target");
 }
 
 #[test]

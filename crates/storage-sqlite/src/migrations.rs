@@ -24,6 +24,8 @@ mod migration_0011_chat_list_avatar_url;
 mod migration_0012_app_event_origin_commit;
 #[path = "migrations/0013_app_event_kind_order_index.rs"]
 mod migration_0013_app_event_kind_order_index;
+#[path = "migrations/0014_message_timeline_reply_lookup_index.rs"]
+mod migration_0014_message_timeline_reply_lookup_index;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -100,6 +102,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         name: "0013_app_event_kind_order_index",
         apply: migration_0013_app_event_kind_order_index::apply,
+    },
+    Migration {
+        version: 14,
+        name: "0014_message_timeline_reply_lookup_index",
+        apply: migration_0014_message_timeline_reply_lookup_index::apply,
     },
 ];
 
@@ -304,6 +311,17 @@ mod tests {
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn message_timeline_reply_lookup_index_is_migrated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        assert!(connection_has_index(
+            &conn,
+            "message_timeline",
+            "idx_message_timeline_reply_lookup"
+        ));
     }
 
     #[test]
@@ -640,5 +658,14 @@ mod tests {
         stmt.query_map([], |row| row.get::<_, String>("name"))
             .unwrap()
             .any(|name| name.as_deref() == Ok(column))
+    }
+
+    fn connection_has_index(conn: &rusqlite::Connection, table: &str, index: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>("name"))
+            .unwrap()
+            .any(|name| name.as_deref() == Ok(index))
     }
 }

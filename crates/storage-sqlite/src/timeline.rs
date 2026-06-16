@@ -20,6 +20,7 @@ const DEFAULT_TIMELINE_LIMIT: usize = 50;
 /// materialized window kept above this cannot be re-fetched in one query, so
 /// window owners should not exceed it.
 pub const MAX_TIMELINE_LIMIT: usize = 200;
+const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
@@ -199,6 +200,13 @@ struct RawAppEvent {
     received_at: u64,
     invalidated: bool,
     invalidation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PrunedAppEvent {
+    message_id_hex: String,
+    kind: u64,
+    tags: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -610,6 +618,47 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     Ok(())
 }
 
+pub(crate) fn prune_app_events_before_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    cutoff_recorded_at: u64,
+) -> StorageResult<usize> {
+    let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+    if pruned_events.is_empty() {
+        return Ok(0);
+    }
+
+    let mut pruned_message_ids = BTreeSet::new();
+    let mut affected_message_ids = BTreeSet::new();
+    for event in &pruned_events {
+        pruned_message_ids.insert(event.message_id_hex.clone());
+        affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
+            tx,
+            group_id_hex,
+            &event.message_id_hex,
+            event.kind,
+            &event.tags,
+        )?);
+    }
+
+    let pruned = tx
+        .execute(
+            "DELETE FROM app_events
+             WHERE group_id_hex = ?1
+               AND recorded_at < ?2",
+            params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
+        )
+        .storage()?;
+
+    delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
+    for message_id in affected_message_ids {
+        upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
+    }
+
+    Ok(pruned)
+}
+
 fn can_project_record_app_event_incrementally(kind: u64) -> bool {
     matches!(
         kind,
@@ -964,6 +1013,77 @@ fn app_events_for_rebuild_tx(
         .storage()
 }
 
+fn app_events_before_cutoff_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    cutoff_recorded_at: u64,
+) -> StorageResult<Vec<PrunedAppEvent>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT message_id_hex, kind, tags_json
+             FROM app_events
+             WHERE group_id_hex = ?1
+               AND recorded_at < ?2
+             ORDER BY recorded_at, message_id_hex, insert_order",
+        )
+        .storage()?;
+    stmt.query_map(
+        params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
+        |row| {
+            let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok(PrunedAppEvent {
+                message_id_hex: row.get(0)?,
+                kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+                tags,
+            })
+        },
+    )
+    .storage()?
+    .collect::<Result<Vec<_>, _>>()
+    .storage()
+}
+
+fn delete_timeline_projection_rows_by_ids_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<()> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    for table in ["message_timeline", "agent_stream_starts"] {
+        for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+            values.extend(
+                chunk
+                    .iter()
+                    .map(|message_id| rusqlite::types::Value::Text((*message_id).clone())),
+            );
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table}
+                     WHERE group_id_hex = ?
+                       AND message_id_hex IN ({placeholders})"
+                ),
+                params_from_iter(values.iter()),
+            )
+            .storage()?;
+        }
+    }
+    Ok(())
+}
+
 fn affected_timeline_message_ids_tx(
     tx: &Transaction<'_>,
     event: &StoredAppEvent,
@@ -983,6 +1103,46 @@ fn affected_timeline_message_ids_for_parts_tx(
     message_id_hex: &str,
     kind: u64,
     tags: &[Vec<String>],
+) -> StorageResult<BTreeSet<String>> {
+    affected_timeline_message_ids_for_parts_with_options_tx(
+        tx,
+        group_id_hex,
+        message_id_hex,
+        kind,
+        tags,
+        true,
+    )
+}
+
+fn affected_timeline_message_ids_for_pruned_event_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+) -> StorageResult<BTreeSet<String>> {
+    // Pruning does not emit live timeline changes, and reply previews are
+    // hydrated from message_timeline at read time. Re-project direct survivors
+    // whose stored projection depended on the pruned row (reaction/delete/edit
+    // targets), but do not scan retained replies just because their preview
+    // target was pruned.
+    affected_timeline_message_ids_for_parts_with_options_tx(
+        tx,
+        group_id_hex,
+        message_id_hex,
+        kind,
+        tags,
+        false,
+    )
+}
+
+fn affected_timeline_message_ids_for_parts_with_options_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_id_hex: &str,
+    kind: u64,
+    tags: &[Vec<String>],
+    include_reply_preview_dependents: bool,
 ) -> StorageResult<BTreeSet<String>> {
     let mut ids = BTreeSet::new();
     let mut reply_preview_targets = BTreeSet::new();
@@ -1018,12 +1178,14 @@ fn affected_timeline_message_ids_for_parts_tx(
         }
         _ => {}
     }
-    let reply_targets = reply_preview_targets.into_iter().collect::<Vec<_>>();
-    ids.extend(reply_message_ids_for_targets_tx(
-        tx,
-        group_id_hex,
-        &reply_targets,
-    )?);
+    if include_reply_preview_dependents {
+        let reply_targets = reply_preview_targets.into_iter().collect::<Vec<_>>();
+        ids.extend(reply_message_ids_for_targets_tx(
+            tx,
+            group_id_hex,
+            &reply_targets,
+        )?);
+    }
     Ok(ids)
 }
 

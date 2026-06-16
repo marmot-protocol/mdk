@@ -1,5 +1,5 @@
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, bool_i64, tags_from_json, u64_to_i64, unix_now_ms,
+    SqliteAccountStorage, SqliteResultExt, bool_i64, tags_from_json, unix_now_ms,
     unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -441,15 +441,8 @@ impl SqliteAccountStorage {
     ) -> StorageResult<usize> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        let pruned = tx
-            .execute(
-                "DELETE FROM app_events
-                 WHERE group_id_hex = ?1
-                   AND recorded_at < ?2",
-                params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
-            )
-            .storage()?;
-        crate::timeline::rebuild_message_timeline_for_group_tx(&tx, group_id_hex)?;
+        let pruned =
+            crate::timeline::prune_app_events_before_tx(&tx, group_id_hex, cutoff_recorded_at)?;
         tx.commit().storage()?;
         Ok(pruned)
     }
