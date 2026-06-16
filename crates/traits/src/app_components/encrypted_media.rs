@@ -271,9 +271,12 @@ pub fn validate_and_normalize_blob_endpoint_url(
     if url.fragment().is_some() {
         return Err("encrypted media endpoint URL must not include a fragment".into());
     }
-    if url.query().is_some() {
-        return Err("encrypted media endpoint URL must not include a query".into());
-    }
+    // Per group-encrypted-media-v1.md the invalidity list is userinfo, fragments,
+    // missing hosts, and unsafe hosts only. Query strings are NOT invalid: WHATWG
+    // parse-and-serialize preserves a query, so a spec-conformant producer can emit
+    // `https://blossom.example/?x=1` as valid normalized state. Rejecting it here
+    // forked commit acceptance (issue #374). This also matches the sibling avatar
+    // validator, which has no query check.
     let host = url
         .host()
         .ok_or("encrypted media endpoint URL must include a host")?;

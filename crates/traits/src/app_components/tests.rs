@@ -150,6 +150,39 @@ fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
     );
 }
 
+/// Regression for #374: the spec's invalidity list (group-encrypted-media-v1.md)
+/// names only userinfo / fragments / missing-host / unsafe-host. A query string
+/// is NOT invalid, and WHATWG parse-and-serialize preserves it, so a query-bearing
+/// endpoint is valid normalized state and must be accepted on the decode/commit
+/// path. The sibling avatar validator behaves the same way.
+#[test]
+fn encrypted_media_endpoint_accepts_query_string() {
+    assert_eq!(
+        validate_and_normalize_blob_endpoint_url("https://blossom.example/?x=1", false),
+        Ok("https://blossom.example/?x=1".to_owned())
+    );
+    // The regression that forked commit acceptance was on the decode path, so
+    // exercise it explicitly: a query-bearing endpoint must survive the full
+    // encode -> decode_encrypted_media_policy_v1 round-trip (which dispatches
+    // through validate_blob_endpoint_url_is_canonical, the commit-acceptance
+    // check #374 names), not just producer-side construction.
+    let policy = EncryptedMediaPolicyV1::blossom_default(
+        vec!["https://blossom.example/?x=1".to_owned()],
+        false,
+    )
+    .expect("query-bearing endpoint is valid policy state");
+    let encoded = encode_encrypted_media_policy_v1(&policy).expect("query-bearing policy encodes");
+    let decoded = decode_encrypted_media_policy_v1(&encoded)
+        .expect("query-bearing endpoint is accepted on the decode/commit-acceptance path");
+    assert_eq!(
+        decoded.default_blob_endpoints,
+        vec![BlobStoreEndpointV1 {
+            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            base_url: "https://blossom.example/?x=1".to_owned(),
+        }]
+    );
+}
+
 /// Fixed encode→bytes vector pinning the corrected #171 layout: each
 /// `BlobStoreEndpointV1` is the concatenation `{locator_kind, base_url}` with
 /// NO per-item length wrapper, matching `allowed_locator_kinds` and the spec's
