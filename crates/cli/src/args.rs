@@ -998,6 +998,12 @@ pub(crate) enum DaemonCommand {
     Start {
         #[arg(
             long,
+            value_name = "PATH",
+            help = "Use this Darkmatter data directory (alias for --home)"
+        )]
+        data_dir: Option<PathBuf>,
+        #[arg(
+            long,
             value_name = "URLS",
             value_delimiter = ',',
             help = "Comma-separated discovery relays for profiles, relay lists, and KeyPackages"

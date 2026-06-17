@@ -79,11 +79,12 @@ pub fn default_log_path(home: &Path) -> PathBuf {
 pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliOutput {
     match command {
         DaemonCommand::Start {
+            data_dir,
             discovery_relays,
             default_account_relays,
             logs_dir,
         } => {
-            let home = resolve_home(cli.home.clone());
+            let home = resolve_home(cli.home.clone().or(data_dir));
             let socket = cli
                 .socket
                 .clone()

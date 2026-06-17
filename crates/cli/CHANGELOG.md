@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Added `--data-dir` to `dm daemon start` (an alias for `--home`), completing `wnd`/`dmd` setup-flag parity
+  alongside the existing `--logs-dir`, `--discovery-relays`, and `--default-account-relays`. The resolved home is
+  forwarded to the spawned `dmd` child as before; `--home` still takes precedence when both are given.
+
 - Added `dm groups set-avatar-url <group> --url <https-url> [--dim WxH] [--thumbhash <hex>]` (and `--clear`) to set,
   update, and clear the group URL avatar (`marmot.group.avatar-url.v1`) over the existing app runtime path; a parallel
   legacy `dm group set-avatar-url` form is also available. `dm groups show` / `dm chats show` now surface the

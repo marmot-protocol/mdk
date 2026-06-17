@@ -602,6 +602,7 @@ fn whitenoise_command_surface_names_are_present() {
         String::from_utf8_lossy(&daemon_start_help.stderr)
     );
     for flag in [
+        "--data-dir",
         "--discovery-relays",
         "--default-account-relays",
         "--logs-dir",
