@@ -499,7 +499,7 @@ jobs:
 
     - name: Configure RubyGems Trusted Publishing credentials
       if: startsWith(github.ref, 'refs/tags/v')
-      uses: rubygems/configure-rubygems-credentials@762a4b77c3300434bb57c7ce80b20e36231927aa # v2.0.0
+      uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
 
     - name: Build and publish gem to RubyGems.org
       if: startsWith(github.ref, 'refs/tags/v')
