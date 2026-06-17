@@ -69,7 +69,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
         with:
           tool: cargo-llvm-cov
 
