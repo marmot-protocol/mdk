@@ -1,6 +1,9 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
-use cgka_traits::app_components::{BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN};
+pub(crate) use cgka_traits::app_components::is_loopback_host;
+use cgka_traits::app_components::{
+    BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN, is_loopback_ip, is_public_ip,
+};
 use url::{Host, Url};
 
 use super::MediaLocator;
@@ -72,8 +75,7 @@ fn validate_public_or_allowed_loopback_host(
 ) -> Result<(), String> {
     match host {
         Host::Domain(domain) => {
-            let lowered = domain.to_ascii_lowercase();
-            if lowered == "localhost" || lowered.ends_with(".localhost") {
+            if is_loopback_host(Host::Domain(domain)) {
                 return if allow_loopback {
                     Ok(())
                 } else {
@@ -87,78 +89,11 @@ fn validate_public_or_allowed_loopback_host(
     }
 }
 
-pub(crate) fn is_loopback_host(host: Host<&str>) -> bool {
-    match host {
-        Host::Domain(domain) => {
-            let lowered = domain.to_ascii_lowercase();
-            lowered == "localhost" || lowered.ends_with(".localhost")
-        }
-        Host::Ipv4(addr) => addr.is_loopback(),
-        Host::Ipv6(addr) => addr.is_loopback(),
-    }
-}
-
 pub(crate) fn reject_non_public_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
-    match addr {
-        IpAddr::V4(addr) if allow_loopback && addr.is_loopback() => Ok(()),
-        IpAddr::V6(addr) if allow_loopback && addr.is_loopback() => Ok(()),
-        IpAddr::V4(addr) if is_public_ipv4(addr) => Ok(()),
-        IpAddr::V6(addr) if is_public_ipv6(addr) => Ok(()),
-        _ => Err("URL must not point at a non-public address".into()),
+    if (allow_loopback && is_loopback_ip(addr)) || is_public_ip(addr) {
+        return Ok(());
     }
-}
-
-fn is_public_ipv4(addr: Ipv4Addr) -> bool {
-    let [a, b, c, d] = addr.octets();
-    !matches!(
-        (a, b, c, d),
-        (0, _, _, _)
-            | (10, _, _, _)
-            | (100, 64..=127, _, _)
-            | (127, _, _, _)
-            | (169, 254, _, _)
-            | (172, 16..=31, _, _)
-            | (192, 0, 0, _)
-            | (192, 0, 2, _)
-            | (192, 88, 99, _)
-            | (192, 168, _, _)
-            | (198, 18..=19, _, _)
-            | (198, 51, 100, _)
-            | (203, 0, 113, _)
-            | (224..=255, _, _, _)
-    )
-}
-
-fn is_public_ipv6(addr: Ipv6Addr) -> bool {
-    if let Some(mapped) = addr.to_ipv4_mapped() {
-        return is_public_ipv4(mapped);
-    }
-    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
-        return false;
-    }
-    let segments = addr.segments();
-    let first = segments[0];
-    let second = segments[1];
-    if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
-        return false;
-    }
-    // Reject IPv6 transition mechanisms that can route to an embedded IPv4
-    // endpoint through host-local tunnel configuration, bypassing the IPv4
-    // non-public-address checks above.
-    if first == 0x2002 || (first == 0x2001 && second == 0x0000) {
-        return false;
-    }
-    if first == 0x2001 && second == 0x0db8 {
-        return false;
-    }
-    // Documentation 3fff::/20 (RFC 9637). It falls inside global-unicast 2000::/3,
-    // so the terminal rule below would otherwise accept it. Reject to match the
-    // canonical unsafe-host set (spec/foundation/host-safety.md) and the avatar/
-    // endpoint validator in cgka_traits, which already rejects 3fff::/20.
-    if (first & 0xfff0) == 0x3ff0 {
-        return false;
-    }
-    (first & 0xe000) == 0x2000
+    Err("URL must not point at a non-public address".into())
 }
 
 /// Whether `url` is a loopback-HTTP blob endpoint: scheme `http` (cleartext)
@@ -173,13 +108,5 @@ pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
     if parsed.scheme() != "http" {
         return false;
     }
-    match parsed.host() {
-        Some(url::Host::Domain(domain)) => {
-            let lowered = domain.to_ascii_lowercase();
-            lowered == "localhost" || lowered.ends_with(".localhost")
-        }
-        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
-        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
-        None => false,
-    }
+    parsed.host().is_some_and(is_loopback_host)
 }

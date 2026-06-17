@@ -40,6 +40,9 @@ pub use encrypted_media::{
     BlobStoreEndpointV1, EncryptedMediaPolicyV1, decode_encrypted_media_policy_v1,
     encode_encrypted_media_policy_v1, validate_and_normalize_blob_endpoint_url,
 };
+pub use host_safety::{
+    is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4, is_public_ipv6,
+};
 pub use routing::{NostrRoutingV1, decode_nostr_routing_v1, encode_nostr_routing_v1};
 
 /// MLS ComponentID.

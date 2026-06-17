@@ -1,14 +1,17 @@
-//! Public-IP / loopback host classifiers shared by the avatar-url and
-//! encrypted-media endpoint validators.
+//! Public-IP / loopback host classifiers shared by app-component validators and
+//! app fetch/upload code.
 //!
-//! These are reimplemented elsewhere (the media-locator validator in
-//! `marmot-app`); this copy is the engine-side, spec-aligned set per
-//! `spec/foundation/host-safety.md`.
+//! This module owns the canonical unsafe-host set from
+//! `spec/foundation/host-safety.md`. Callers keep their own URL/scheme policy and
+//! error wording, but share these low-level host and IP classifiers so SSRF
+//! hardening cannot drift across crates.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Host;
 
-pub(crate) fn is_loopback_host(host: Host<&str>) -> bool {
+/// Whether `host` is `localhost`, a subdomain of `.localhost`, or an IP
+/// loopback literal.
+pub fn is_loopback_host(host: Host<&str>) -> bool {
     match host {
         Host::Domain(domain) => {
             let lowered = domain.to_ascii_lowercase();
@@ -19,57 +22,89 @@ pub(crate) fn is_loopback_host(host: Host<&str>) -> bool {
     }
 }
 
+/// Whether `addr` is an IPv4 or IPv6 loopback address.
+pub fn is_loopback_ip(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => addr.is_loopback(),
+        IpAddr::V6(addr) => addr.is_loopback(),
+    }
+}
+
+/// Whether `addr` is public/global-routable under Marmot's canonical
+/// unsafe-host set.
+pub fn is_public_ip(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => is_public_ipv4(addr),
+        IpAddr::V6(addr) => is_public_ipv6(addr),
+    }
+}
+
+/// Whether an IPv4 address is public/global-routable under Marmot's canonical
+/// unsafe-host set.
+pub fn is_public_ipv4(addr: Ipv4Addr) -> bool {
+    let [a, b, c, d] = addr.octets();
+    !matches!(
+        (a, b, c, d),
+        (0, _, _, _)
+            | (10, _, _, _)
+            | (100, 64..=127, _, _)
+            | (127, _, _, _)
+            | (169, 254, _, _)
+            | (172, 16..=31, _, _)
+            | (192, 0, 0, _)
+            | (192, 0, 2, _)
+            | (192, 88, 99, _)
+            | (192, 168, _, _)
+            | (198, 18..=19, _, _)
+            | (198, 51, 100, _)
+            | (203, 0, 113, _)
+            | (224..=255, _, _, _)
+    )
+}
+
+/// Whether an IPv6 address is public/global-routable under Marmot's canonical
+/// unsafe-host set. IPv4-mapped IPv6 addresses are classified by their embedded
+/// IPv4 address.
+pub fn is_public_ipv6(addr: Ipv6Addr) -> bool {
+    if let Some(mapped) = addr.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
+        return false;
+    }
+    let segments = addr.segments();
+    let first = segments[0];
+    let second = segments[1];
+    if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
+        return false;
+    }
+    // Reject IPv6 transition mechanisms that can route to an embedded IPv4
+    // endpoint through host-local tunnel configuration, bypassing IPv4 checks.
+    if first == 0x2002 || (first == 0x2001 && second == 0x0000) {
+        return false;
+    }
+    if first == 0x2001 && second == 0x0db8 {
+        return false;
+    }
+    // Documentation 3fff::/20 (RFC 9637). It falls inside global-unicast
+    // 2000::/3, so the terminal rule below would otherwise accept it.
+    if (first & 0xfff0) == 0x3ff0 {
+        return false;
+    }
+    // Only global unicast 2000::/3 is routable today; reject anything else not
+    // already caught above.
+    (first & 0xe000) == 0x2000
+}
+
 pub(crate) fn reject_non_routable_ipv4(addr: Ipv4Addr) -> Result<(), String> {
-    let o = addr.octets();
-    // Canonical unsafe-host set (spec/foundation/host-safety.md). std classifies
-    // some ranges; the rest are matched explicitly so this validator stays in
-    // lockstep with the media-locator validator in marmot-app and with the spec.
-    let unsafe_host = addr.is_loopback()
-        || addr.is_private()
-        || addr.is_link_local()
-        || addr.is_broadcast()
-        || addr.is_documentation()
-        || addr.is_unspecified()
-        || addr.is_multicast()
-        || o[0] == 0 // this host 0.0.0.0/8
-        || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64.0.0/10
-        || matches!(o, [192, 0, 0, _]) // IETF protocol assignments 192.0.0.0/24
-        || matches!(o, [192, 88, 99, _]) // 6to4 relay anycast 192.88.99.0/24
-        || (o[0] == 198 && (18..=19).contains(&o[1])) // benchmarking 198.18.0.0/15
-        || o[0] >= 240; // reserved 240.0.0.0/4 (incl. 255.255.255.255 broadcast)
-    if unsafe_host {
+    if !is_public_ipv4(addr) {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
     Ok(())
 }
 
 pub(crate) fn reject_non_routable_ipv6(addr: Ipv6Addr) -> Result<(), String> {
-    if let Some(mapped) = addr.to_ipv4_mapped() {
-        return reject_non_routable_ipv4(mapped);
-    }
-    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
-        return Err("group avatar URL must not point at a non-routable address".into());
-    }
-    // Ranges the stable std API does not classify, per the canonical unsafe-host
-    // set (spec/foundation/host-safety.md), kept in lockstep with the media-locator
-    // validator in marmot-app:
-    //   - unique-local  fc00::/7       (first & 0xfe00 == 0xfc00)
-    //   - link-local    fe80::/10      (first & 0xffc0 == 0xfe80)
-    //   - 6to4          2002::/16      (first == 0x2002)              transition prefix
-    //   - Teredo        2001:0000::/32 (first == 0x2001 && second == 0)  transition prefix
-    //   - documentation 2001:db8::/32  (first == 0x2001 && second == 0x0db8)
-    //   - documentation 3fff::/20      (first & 0xfff0 == 0x3ff0), per RFC 9637
-    let [first, second, ..] = addr.segments();
-    if (first & 0xfe00) == 0xfc00
-        || (first & 0xffc0) == 0xfe80
-        || first == 0x2002
-        || (first == 0x2001 && second == 0x0000)
-        || (first == 0x2001 && second == 0x0db8)
-        || (first & 0xfff0) == 0x3ff0
-        // Only global unicast 2000::/3 is routable today; reject anything else
-        // not already caught above (loopback/unspecified/multicast handled earlier).
-        || (first & 0xe000) != 0x2000
-    {
+    if !is_public_ipv6(addr) {
         return Err("group avatar URL must not point at a non-routable address".into());
     }
     Ok(())

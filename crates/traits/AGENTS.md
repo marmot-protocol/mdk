@@ -40,7 +40,7 @@ OpenMLS appears only where the storage aggregate needs the OpenMLS storage trait
 | `src/ingest.rs` | Peeled-message content and ingest outcomes. |
 | `src/app_components/mod.rs` | Shared component ids, schema-name strings, length limits, `AppComponentData`, `AppComponentSet`; re-exports everything so `cgka_traits::app_components::*` paths are unchanged. |
 | `src/app_components/codec.rs` | QUIC-varint / var-bytes primitives and the `ComponentsList` encoder. |
-| `src/app_components/host_safety.rs` | Public-IP / loopback host classifiers (engine-side copy of the spec unsafe-host set). |
+| `src/app_components/host_safety.rs` | Canonical public-IP / loopback host classifiers shared by app-component URL policy and media SSRF guards. |
 | `src/app_components/routing.rs` | `NostrRoutingV1` state and codec. |
 | `src/app_components/encrypted_media.rs` | `EncryptedMediaPolicyV1` / `BlobStoreEndpointV1` state, codec, and endpoint-URL validation. |
 | `src/app_components/avatar_url.rs` | `GroupAvatarUrlV1` state, codec, and avatar-URL validation. |
