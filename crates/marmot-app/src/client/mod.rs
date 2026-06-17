@@ -788,6 +788,7 @@ impl AppClient {
                 if should_project_locally {
                     match self.app.invalidate_timeline_app_event(
                         &self.state.label,
+                        &group_id_hex,
                         &app_event_id,
                         "local_publish_failed",
                     ) {

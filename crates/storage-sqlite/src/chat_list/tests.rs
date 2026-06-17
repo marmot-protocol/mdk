@@ -377,7 +377,7 @@ fn invalidated_kind9_tombstones_do_not_count_as_unread() {
     // Convergence invalidates the losing-branch rows (kept as tombstones).
     for id in ["phantom1", "phantom2", "phantom3"] {
         store
-            .invalidate_app_event_by_message_id(id, "LosingBranch")
+            .invalidate_app_event_by_message_id(GROUP, id, "LosingBranch")
             .unwrap();
     }
 

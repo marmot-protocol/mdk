@@ -848,7 +848,11 @@ fn message_id_invalidation_keeps_message_as_tombstone() {
         .unwrap();
 
     let update = store
-        .invalidate_app_event_by_message_id("target", "UndecryptableInCanonicalState")
+        .invalidate_app_event_by_message_id(
+            &"11".repeat(32),
+            "target",
+            "UndecryptableInCanonicalState",
+        )
         .unwrap()
         .expect("projection update");
 
@@ -864,6 +868,66 @@ fn message_id_invalidation_keeps_message_as_tombstone() {
     assert_eq!(
         rows[0].invalidation_status.as_deref(),
         Some("UndecryptableInCanonicalState")
+    );
+}
+
+#[test]
+fn message_id_invalidation_is_group_scoped() {
+    // Inner app-event ids are NIP-01 hashes with no group binding, so the same
+    // account sending identical content to two groups in the same second
+    // produces the same message_id_hex in both. Invalidating one group's copy
+    // (e.g. reason "local_publish_failed" when one fan-out leg fails) must NOT
+    // touch the other group's delivered copy. Regression for darkmatter#156.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_a = "11".repeat(32);
+    let group_b = "22".repeat(32);
+
+    // Same message_id_hex ("dup") in both groups; the table's
+    // UNIQUE(group_id_hex, message_id_hex) lets both rows coexist. Distinct
+    // source ids keep the partial unique source index satisfied.
+    let mut event_a = chat("dup", "alice", 1, "hello");
+    event_a.group_id_hex = group_a.clone();
+    event_a.source_message_id_hex = Some("source-a".to_owned());
+    let mut event_b = chat("dup", "alice", 1, "hello");
+    event_b.group_id_hex = group_b.clone();
+    event_b.source_message_id_hex = Some("source-b".to_owned());
+    store.record_app_event(&event_a).unwrap();
+    store.record_app_event(&event_b).unwrap();
+
+    // Invalidate only group A's copy.
+    let update = store
+        .invalidate_app_event_by_message_id(&group_a, "dup", "local_publish_failed")
+        .unwrap()
+        .expect("projection update");
+    // The returned update must be for group A.
+    assert_eq!(update.group_id_hex, group_a);
+
+    let rows_a = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_a.clone()),
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap()
+        .messages;
+    assert_eq!(rows_a.len(), 1);
+    assert_eq!(
+        rows_a[0].invalidation_status.as_deref(),
+        Some("local_publish_failed"),
+        "group A's copy should be invalidated"
+    );
+
+    // Group B's copy must remain untouched (delivered, not a tombstone).
+    let rows_b = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_b.clone()),
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap()
+        .messages;
+    assert_eq!(rows_b.len(), 1);
+    assert_eq!(
+        rows_b[0].invalidation_status, None,
+        "group B's copy must NOT be invalidated by group A's failure"
     );
 }
 

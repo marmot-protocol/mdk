@@ -339,24 +339,35 @@ impl SqliteAccountStorage {
             "UPDATE app_events
              SET invalidated = 1, invalidation_reason = ?2
              WHERE source_message_id_hex = ?1",
-            source_message_id_hex,
+            &[&source_message_id_hex],
             reason,
         )
     }
 
+    /// Invalidate the app event addressed by `(group_id_hex, message_id_hex)`.
+    ///
+    /// The lookup MUST be group-scoped: inner app-event ids are NIP-01 hashes
+    /// over (pubkey, created_at, kind, tags, content) with no group binding, so
+    /// the same account sending identical content to two groups in the same
+    /// second produces the same `message_id_hex` in both (the table's
+    /// `UNIQUE(group_id_hex, message_id_hex)` constraint anticipates this). A
+    /// `message_id_hex`-only predicate would invalidate — and then fail to
+    /// rebuild — the unrelated group's copy. The composite predicate is also
+    /// served by the uniqueness index, so the call is no longer a full scan.
     pub fn invalidate_app_event_by_message_id(
         &self,
+        group_id_hex: &str,
         message_id_hex: &str,
         reason: &str,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.invalidate_app_event(
             "SELECT group_id_hex, message_id_hex, kind, tags_json
              FROM app_events
-             WHERE message_id_hex = ?1",
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             "UPDATE app_events
-             SET invalidated = 1, invalidation_reason = ?2
-             WHERE message_id_hex = ?1",
-            message_id_hex,
+             SET invalidated = 1, invalidation_reason = ?3
+             WHERE group_id_hex = ?1 AND message_id_hex = ?2",
+            &[&group_id_hex, &message_id_hex],
             reason,
         )
     }
@@ -451,21 +462,30 @@ impl SqliteAccountStorage {
         }))
     }
 
+    /// Invalidate the single app-event row addressed by `lookup_params`.
+    ///
+    /// Both the SELECT and the UPDATE bind `lookup_params` positionally
+    /// (`?1`, `?2`, ...); `reason` is bound as the trailing parameter, so the
+    /// UPDATE's `invalidation_reason = ?N` placeholder must use the index one
+    /// past the lookup params. Callers must pass a predicate that resolves to
+    /// at most one row: a non-null `source_message_id_hex` is unique (partial
+    /// index in 0004_app_timeline.rs), and `(group_id_hex, message_id_hex)` is
+    /// unique by table constraint. `message_id_hex` alone is NOT unique — the
+    /// same inner NIP-01 event id can appear in multiple groups — so the
+    /// message-id path is group-scoped to avoid invalidating a different
+    /// group's delivered copy and to let the lookup use the uniqueness index
+    /// instead of a full table scan.
     fn invalidate_app_event(
         &self,
         select_sql: &str,
         update_sql: &str,
-        lookup_id_hex: &str,
+        lookup_params: &[&dyn rusqlite::ToSql],
         reason: &str,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        // A non-null `source_message_id_hex` is unique (partial index in
-        // 0004_app_timeline.rs), and `message_id_hex` is unique per group, so a
-        // lookup resolves to at most one row. (Synthesized group system rows
-        // deliberately carry a null source for exactly this reason.)
         let row: Option<(String, String, u64, Vec<Vec<String>>)> = tx
-            .query_row(select_sql, params![lookup_id_hex], |row| {
+            .query_row(select_sql, lookup_params, |row| {
                 let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
                 let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -489,8 +509,10 @@ impl SqliteAccountStorage {
             &tags,
         )?;
         let before = timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
-        tx.execute(update_sql, params![lookup_id_hex, reason])
-            .storage()?;
+        // The UPDATE shares the lookup predicate and appends `reason` last.
+        let mut update_params: Vec<&dyn rusqlite::ToSql> = lookup_params.to_vec();
+        update_params.push(&reason);
+        tx.execute(update_sql, update_params.as_slice()).storage()?;
         rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
         let messages =
             timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
