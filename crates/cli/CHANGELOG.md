@@ -76,6 +76,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- The distributed-convergence canonicalization apply path now persists its multi-write merge atomically. The
+  `merge_staged_commit` replay, Marmot group-record refresh, and message-disposition writes that run when a stored
+  out-of-order commit is replayed are wrapped in a single SQLite transaction, closing the residual torn-write window
+  left after #157/#421 (which only covered the live state-transition paths). A crash mid-merge now rolls back to the
+  prior consistent epoch instead of stranding torn group state and an orphaned apply snapshot.
 - OpenMLS group state transitions are now persisted atomically. The multi-write commit-merge path (engine state,
   pending-commit cleanup, and OpenMLS value-store updates) is wrapped in a single SQLite transaction, so a crash or
   interruption mid-merge can no longer leave torn group state on disk; the device either advances to the new epoch

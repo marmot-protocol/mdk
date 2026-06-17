@@ -242,6 +242,12 @@ impl std::fmt::Display for OpenMlsProjectionError {
 
 impl std::error::Error for OpenMlsProjectionError {}
 
+impl From<StorageError> for OpenMlsProjectionError {
+    fn from(e: StorageError) -> Self {
+        OpenMlsProjectionError::Storage(format!("{e:?}"))
+    }
+}
+
 pub fn project_mls_message(
     bytes: &[u8],
 ) -> Result<OpenMlsMessageProjection, OpenMlsProjectionError> {
@@ -975,10 +981,24 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     result: &CanonicalizationResult,
     replay_messages: &[TransportMessage],
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
-    let output = process_openmls_messages_inner(storage, group_id, replay_messages)?;
-    update_group_record_from_replay(storage, group_id, &output)?;
-    persist_openmls_canonicalization_dispositions(storage, result)?;
-    Ok(output.observations)
+    // #157/#424: the convergence-apply multi-write durable sequence
+    // (merge_staged_commit's 7+ provider writes, the Marmot group-record
+    // refresh, and the disposition state writes) must commit or roll back as a
+    // single backend transaction. Without this, a process kill (SIGKILL/OOM/
+    // power loss) mid-merge leaves the persisted group torn (GroupContext/tree
+    // at epoch N+1 while group_epoch_secrets/message_secrets lag at epoch N).
+    //
+    // The surrounding durable group snapshot (create/rollback/release in
+    // `apply_openmls_canonicalization_result`) intentionally stays OUTSIDE this
+    // boundary: those ops drive their own SQLite transactions and cannot nest
+    // inside an open one. The snapshot guards in-process error returns; this
+    // transaction guards hard crashes mid-merge.
+    storage.with_transaction(|storage| {
+        let output = process_openmls_messages_inner(storage, group_id, replay_messages)?;
+        update_group_record_from_replay(storage, group_id, &output)?;
+        persist_openmls_canonicalization_dispositions(storage, result)?;
+        Ok(output.observations)
+    })
 }
 
 fn replay_messages_for_canonicalization_result<S: StorageProvider>(

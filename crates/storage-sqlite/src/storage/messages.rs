@@ -46,34 +46,20 @@ impl MessageStorage for SqliteAccountStorage {
     }
 
     fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
+        // #424: when this runs inside an engine `with_transaction` (convergence
+        // apply path), the outer SQL transaction is already open and owns
+        // commit/rollback, so we must not start a nested one. Mirror the
+        // openmls value-store pattern: operate directly on the locked
+        // connection when we're the transaction owner, otherwise wrap our own.
         let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let record_bytes: Vec<u8> = tx
-            .query_row(
-                "SELECT record FROM cgka_messages WHERE id = ?1",
-                params![id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()
-            .storage()?
-            .ok_or(StorageError::NotFound)?;
-        let mut record: MessageRecord = deserialize(&record_bytes)?;
-        record.state = new_state;
-        let changed = tx
-            .execute(
-                "UPDATE cgka_messages SET state = ?1, record = ?2 WHERE id = ?3",
-                params![
-                    message_state_to_i64(new_state),
-                    serialize(&record)?,
-                    id.as_slice()
-                ],
-            )
-            .storage()?;
-        if changed == 0 {
-            return Err(StorageError::NotFound);
+        if self.connection.is_current_thread_transaction_owner() {
+            update_message_state_on_connection(&conn, id, new_state)
+        } else {
+            let tx = conn.transaction().storage()?;
+            update_message_state_on_connection(&tx, id, new_state)?;
+            tx.commit().storage()?;
+            Ok(())
         }
-        tx.commit().storage()?;
-        Ok(())
     }
 
     fn list_messages(
@@ -115,6 +101,42 @@ impl MessageStorage for SqliteAccountStorage {
     fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         snapshots::release(self, group_id, name)
     }
+}
+
+/// Read-modify-write the stored state of a single message on an already-locked
+/// connection (which may be a bare `Connection` or a `Transaction` — both deref
+/// to `Connection`). Factored out so `update_message_state` can run it either
+/// inside the caller's open engine transaction or inside a fresh local one.
+fn update_message_state_on_connection(
+    conn: &rusqlite::Connection,
+    id: &MessageId,
+    new_state: MessageState,
+) -> StorageResult<()> {
+    let record_bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT record FROM cgka_messages WHERE id = ?1",
+            params![id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?
+        .ok_or(StorageError::NotFound)?;
+    let mut record: MessageRecord = deserialize(&record_bytes)?;
+    record.state = new_state;
+    let changed = conn
+        .execute(
+            "UPDATE cgka_messages SET state = ?1, record = ?2 WHERE id = ?3",
+            params![
+                message_state_to_i64(new_state),
+                serialize(&record)?,
+                id.as_slice()
+            ],
+        )
+        .storage()?;
+    if changed == 0 {
+        return Err(StorageError::NotFound);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,6 +185,54 @@ mod tests {
 
         assert!(body.contains("transaction()"));
         assert!(!body.contains("self.get_message(id)"));
+    }
+
+    #[test]
+    fn update_message_state_runs_inside_outer_engine_transaction() {
+        // #424 regression: when the convergence-apply path runs the disposition
+        // writes inside an engine `with_transaction`, `update_message_state`
+        // must reuse the open transaction instead of opening a nested one
+        // ("cannot start a transaction within a transaction").
+        use cgka_traits::storage::{StorageError, StorageProvider};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let message = sample_message(mid(1), gid(1), 0);
+        store.put_message(&message).unwrap();
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.update_message_state(&message.id, MessageState::Processed)?;
+            Ok(())
+        });
+        assert!(result.is_ok(), "nested update must succeed: {result:?}");
+        assert_eq!(
+            store.get_message(&message.id).unwrap().state,
+            MessageState::Processed
+        );
+    }
+
+    #[test]
+    fn update_message_state_rolls_back_with_outer_transaction() {
+        // #424 regression: a torn convergence apply must not leave a message
+        // state half-committed. When the outer transaction aborts, the state
+        // change made via `update_message_state` rolls back with it.
+        use cgka_traits::storage::{StorageError, StorageProvider};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let message = sample_message(mid(1), gid(1), 0);
+        store.put_message(&message).unwrap();
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.update_message_state(&message.id, MessageState::Processed)?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store.get_message(&message.id).unwrap().state,
+            MessageState::Created,
+            "message state must roll back with the aborted outer transaction",
+        );
     }
 
     #[test]
