@@ -342,6 +342,64 @@ fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
 }
 
 #[test]
+fn invalidated_kind9_tombstones_do_not_count_as_unread() {
+    // Repro for #418: a group exchanges chat plus a group-system commit; fork
+    // recovery later invalidates some received kind:9 rows (losing branch). The
+    // invalidated rows are kept as "did not reach the group" tombstones, not
+    // markable chat rows, so the read pointer can never advance past them. They
+    // must not keep `unread_count` pinned above zero.
+    let store = setup_store();
+    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+
+    // A visible received chat the client will actually read.
+    store
+        .record_app_event(&chat("visible", REMOTE, 10, "real message"))
+        .unwrap();
+    // Three received chats that will be invalidated as a losing branch. Their
+    // sender-claimed timeline_at sits after the visible message, so they sort
+    // after any read marker the client can set.
+    for id in ["phantom1", "phantom2", "phantom3"] {
+        store
+            .record_app_event(&chat(id, REMOTE, 11, "losing branch"))
+            .unwrap();
+    }
+
+    // Before invalidation: all four received chats are unread.
+    assert_eq!(
+        store
+            .refresh_chat_list_row(LOCAL, GROUP)
+            .unwrap()
+            .expect("chat row")
+            .unread_count,
+        4
+    );
+
+    // Convergence invalidates the losing-branch rows (kept as tombstones).
+    for id in ["phantom1", "phantom2", "phantom3"] {
+        store
+            .invalidate_app_event_by_message_id(id, "LosingBranch")
+            .unwrap();
+    }
+
+    // The client reads the only visible chat row.
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "visible")
+        .unwrap();
+
+    let row = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap()
+        .pop()
+        .expect("chat row");
+
+    // Invalidated tombstones are not markable chat rows; they must not pin the
+    // counter. Previously this stayed at 3.
+    assert_eq!(row.unread_count, 0);
+    assert_eq!(row.first_unread_message_id_hex, None);
+    assert_eq!(row.last_read_message_id_hex.as_deref(), Some("visible"));
+}
+
+#[test]
 fn own_kind9_send_clears_existing_unread_without_counting_as_unread() {
     let store = setup_store();
     store.initialize_chat_read_state(LOCAL, GROUP).unwrap();

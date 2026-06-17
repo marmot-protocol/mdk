@@ -526,6 +526,7 @@ fn unread_summary_tx(
          WHERE group_id_hex = ?1
            AND kind = ?2
            AND deleted = 0
+           AND invalidation_status IS NULL
            AND sender != ?3
            AND {where_sql}"
     );
@@ -549,6 +550,7 @@ fn unread_summary_tx(
          WHERE group_id_hex = ?1
            AND kind = ?2
            AND deleted = 0
+           AND invalidation_status IS NULL
            AND sender != ?3
            AND {where_sql}
          ORDER BY timeline_at ASC, message_id_hex ASC
