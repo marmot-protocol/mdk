@@ -21,8 +21,8 @@ use cgka_traits::{
     TransportPublishReport, TransportPublishRequest,
 };
 use marmot_account::{
-    AccountDeviceRuntime, KeyPackagePublication, KeyPackagePublishError, KeyPackagePublisher,
-    PendingResolution, StaticTransportRouting,
+    AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
+    KeyPackagePublisher, PendingResolution, StaticTransportRouting,
 };
 use storage_sqlite::SqlCipherKey;
 
@@ -279,6 +279,76 @@ impl RecordingKeyPackages {
     }
 }
 
+/// Publisher that fails the first `fail_first` publish attempts, then succeeds,
+/// recording every publication it is asked to send (including failed ones).
+#[derive(Clone)]
+struct FlakyKeyPackages {
+    publications: Arc<Mutex<Vec<KeyPackagePublication>>>,
+    remaining_failures: Arc<Mutex<usize>>,
+}
+
+impl FlakyKeyPackages {
+    fn new(fail_first: usize) -> Self {
+        Self {
+            publications: Arc::new(Mutex::new(Vec::new())),
+            remaining_failures: Arc::new(Mutex::new(fail_first)),
+        }
+    }
+
+    fn publications(&self) -> Vec<KeyPackagePublication> {
+        self.publications.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for FlakyKeyPackages {
+    async fn publish_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<(), KeyPackagePublishError> {
+        self.publications.lock().unwrap().push(publication);
+        let mut remaining = self.remaining_failures.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err(KeyPackagePublishError::unexposed(
+                "injected publish failure",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Publisher that simulates the production `AppKeyPackagePublisher` failure
+/// shape: it "publishes" to an external transport first and only then performs
+/// a local step that fails. The returned error is therefore `externally_exposed`
+/// — the KeyPackage may already be discoverable on a relay, so the runtime must
+/// NOT prune the private bundle (darkmatter#160 adversarial review).
+#[derive(Clone, Default)]
+struct ExposedThenFailsKeyPackages {
+    publications: Arc<Mutex<Vec<KeyPackagePublication>>>,
+}
+
+impl ExposedThenFailsKeyPackages {
+    fn publications(&self) -> Vec<KeyPackagePublication> {
+        self.publications.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for ExposedThenFailsKeyPackages {
+    async fn publish_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<(), KeyPackagePublishError> {
+        self.publications.lock().unwrap().push(publication);
+        // External publish succeeded; a subsequent local step (e.g. cache write)
+        // failed. The KeyPackage is already exposed.
+        Err(KeyPackagePublishError::exposed(
+            "injected post-exposure failure (e.g. local cache write)",
+        ))
+    }
+}
+
 #[tokio::test]
 async fn activate_transport_uses_session_identity_and_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -333,6 +403,147 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
     assert_eq!(
         publications[0].endpoints,
         vec![TransportEndpoint("wss://keys.example".into())]
+    );
+}
+
+#[tokio::test]
+async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() {
+    // darkmatter#160: when publication fails, publish_fresh_key_package must
+    // surface the publish error AND delete the orphaned private bundle that
+    // fresh_key_package persisted, so a failing-publisher retry loop does not
+    // accumulate unused private key material.
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp cleanup key").unwrap();
+    let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    // Fail the first attempt, succeed thereafter.
+    let publisher = FlakyKeyPackages::new(1);
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        RecordingAdapter::default(),
+        policy,
+        publisher.clone(),
+    );
+
+    // First attempt: publisher fails, error propagates.
+    let err = runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("publish failure must propagate");
+    assert!(matches!(err, AccountError::KeyPackage(_)), "got {err:?}");
+
+    // Retry: a brand-new bundle is generated and this time publication
+    // succeeds. The bundle from the failed attempt was pruned, so it is not
+    // left orphaned in storage.
+    let key_package = runtime
+        .publish_fresh_key_package()
+        .await
+        .expect("retry should publish successfully");
+    assert!(!key_package.bytes().is_empty());
+
+    let publications = publisher.publications();
+    // One failed attempt + one successful attempt were both sent to the
+    // publisher; they carry distinct freshly generated key packages.
+    assert_eq!(publications.len(), 2);
+    assert_ne!(publications[0].key_package, publications[1].key_package);
+    assert_eq!(publications[1].key_package, key_package);
+}
+
+#[tokio::test]
+async fn publish_fresh_key_package_retains_bundle_when_publish_fails_after_exposure() {
+    // darkmatter#160 adversarial review: the orphan-cleanup must NOT prune the
+    // private bundle when the publisher fails *after* the KeyPackage may already
+    // be externally exposed (e.g. the production AppKeyPackagePublisher publishes
+    // to a relay first, then fails on a local cache write). Pruning there would
+    // leave a remotely discoverable but unjoinable KeyPackage: an inviter could
+    // build a Welcome against the published event, but this account could never
+    // join because the matching private bundle was deleted.
+    //
+    // This test proves retention end-to-end: after an exposed publish failure,
+    // a peer builds a real group + Welcome against the just-generated KeyPackage,
+    // and the account successfully joins it — which is only possible if the
+    // private bundle survived in storage.
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp exposed retain key").unwrap();
+    let publisher = ExposedThenFailsKeyPackages::default();
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut alice_runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        policy,
+        publisher.clone(),
+    );
+
+    // Publication fails after exposure; the error propagates but the bundle is
+    // retained rather than pruned.
+    let err = alice_runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("exposed publish failure must propagate");
+    assert!(matches!(err, AccountError::KeyPackage(_)), "got {err:?}");
+
+    // Recover the exact KeyPackage that was generated (and exposed). The
+    // publisher recorded it on the failed attempt.
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 1);
+    let alice_kp = publications[0].key_package.clone();
+
+    // A peer builds a real group + Welcome against Alice's published KeyPackage.
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let created = bob_session
+        .create_group(CreateGroupRequest {
+            name: "retained-bundle group".into(),
+            description: "".into(),
+            members: vec![alice_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { welcomes, pending } => {
+            bob_session.confirm_published(*pending).await.unwrap();
+            welcomes
+                .iter()
+                .find(|msg| {
+                    matches!(
+                        &msg.envelope,
+                        TransportEnvelope::Welcome { recipient }
+                            if recipient == &alice_runtime.session().self_id()
+                    )
+                })
+                .cloned()
+                .expect("welcome addressed to alice")
+        }
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+
+    // Alice joins via the Welcome. This succeeds ONLY because the private bundle
+    // was retained: if the cleanup had pruned it, OpenMLS would find no matching
+    // KeyPackage for the Welcome's hash ref and the join would fail.
+    let joined = alice_runtime
+        .session_mut()
+        .ingest(welcome)
+        .await
+        .expect("join must succeed because the private bundle was retained");
+    assert!(
+        joined.effects.events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupJoined { group_id, .. } if group_id == &created.group_id
+        )),
+        "expected GroupJoined event, got {:?}",
+        joined.effects.events
+    );
+    assert_eq!(
+        alice_runtime
+            .session()
+            .members(&created.group_id)
+            .unwrap()
+            .len(),
+        2
     );
 }
 

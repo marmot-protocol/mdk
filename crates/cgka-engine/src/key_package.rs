@@ -110,6 +110,48 @@ impl<S: StorageProvider> Engine<S> {
         Ok(KeyPackage::new(bytes))
     }
 
+    /// Delete a previously generated (and persisted) KeyPackage bundle from
+    /// storage, identified by its wire bytes.
+    ///
+    /// `do_fresh_key_package` persists the bundle's private HPKE init key
+    /// material through the OpenMLS storage provider as a side effect of
+    /// `KeyPackageBuilder::build`. When the higher layer fails to publish that
+    /// KeyPackage it must call this to prune the orphaned private bundle;
+    /// otherwise retries against a failing publisher accumulate unused private
+    /// key material indefinitely (darkmatter#160). The KeyPackages produced
+    /// here carry the last-resort extension, so OpenMLS never deletes them on
+    /// the welcome path — cleanup is entirely the caller's responsibility.
+    ///
+    /// Deleting a KeyPackage that is not present in storage is a no-op (the
+    /// underlying `DELETE` matches zero rows), so this is safe to call
+    /// idempotently on a retry path.
+    pub(crate) fn do_delete_key_package(&mut self, kp: &KeyPackage) -> Result<(), EngineError> {
+        let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
+            .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
+        let kp_in = match msg.extract() {
+            MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+            _ => {
+                return Err(EngineError::Serialize(
+                    "MLS message did not carry a KeyPackage".into(),
+                ));
+            }
+        };
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let key_package = kp_in
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+        let hash_ref = key_package
+            .hash_ref(provider.crypto())
+            .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
+        // Bring the OpenMLS storage trait into scope so `delete_key_package` is
+        // callable on the MLS storage side. Aliased to avoid clashing with the
+        // crate's own `cgka_traits::storage::StorageProvider` bound on `S`.
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+        OpenMlsStorageProvider::delete_key_package(provider.storage(), &hash_ref)
+            .map_err(|e| EngineError::Backend(format!("key_package delete: {e:?}")))?;
+        Ok(())
+    }
+
     /// Parse a transported KeyPackage back into an OpenMLS
     /// [`MlsKeyPackage`], running the MLS 1.0 validation pass. Used by
     /// `create_group` and `invite`.

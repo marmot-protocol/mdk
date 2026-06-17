@@ -1197,4 +1197,8 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         self.do_fresh_key_package()
     }
+
+    async fn delete_key_package(&mut self, key_package: &KeyPackage) -> Result<(), EngineError> {
+        self.do_delete_key_package(key_package)
+    }
 }

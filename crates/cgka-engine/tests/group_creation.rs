@@ -553,6 +553,57 @@ async fn fresh_key_package_is_mls_last_resort() {
 }
 
 #[tokio::test]
+async fn delete_key_package_is_idempotent_noop_when_absent() {
+    // Deleting a KeyPackage that is not (or no longer) in storage must be a
+    // no-op rather than an error, so the publisher-failure cleanup path is safe
+    // to call idempotently across retries (darkmatter#160).
+    let mut alice = build_client(b"a", selfremove_registry());
+    let kp = alice.fresh_key_package().await.unwrap();
+
+    alice.delete_key_package(&kp).await.unwrap();
+    // Second delete: the bundle is already gone, but this still succeeds.
+    alice.delete_key_package(&kp).await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_key_package_removes_bundle_so_welcome_cannot_be_joined() {
+    // darkmatter#160: fresh_key_package persists the private bundle into
+    // storage. After delete_key_package prunes it, a Welcome built against that
+    // KeyPackage can no longer be joined because the private bundle is gone.
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let mut bob = build_client(b"bob", selfremove_registry());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    // Bob prunes the just-generated bundle (as the orphan-cleanup path does).
+    bob.delete_key_package(&bob_kp).await.unwrap();
+
+    let (_gid, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match result {
+        SendResult::GroupCreated { welcomes, pending } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.into_iter().next().unwrap()
+        }
+        _ => unreachable!(),
+    };
+
+    // The private bundle was deleted, so Bob cannot join: OpenMLS finds no
+    // matching KeyPackage in storage for the Welcome's referenced hash.
+    bob.join_welcome(welcome)
+        .await
+        .expect_err("join must fail after the key package bundle was deleted");
+}
+
+#[tokio::test]
 async fn join_welcome_called_twice_for_same_welcome_errors_on_second_call() {
     // Direct `CgkaEngine::join_welcome` callers skip the ingest-path
     // dedup. Without entry-level dedup, a re-call would re-stage a

@@ -225,6 +225,29 @@ impl AccountDeviceSession {
         Ok(key_package)
     }
 
+    /// Delete a previously generated KeyPackage bundle from storage.
+    ///
+    /// Used by the account orchestration layer to prune the private bundle
+    /// persisted by `fresh_key_package` when publication fails, so a retrying
+    /// app does not accumulate orphaned private key material (darkmatter#160).
+    pub async fn delete_key_package(
+        &mut self,
+        key_package: &KeyPackage,
+    ) -> Result<(), EngineError> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "delete_key_package",
+            "deleting key package bundle"
+        );
+        self.engine.delete_key_package(key_package).await?;
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "delete_key_package",
+            "key package bundle deleted"
+        );
+        Ok(())
+    }
+
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
         Ok(self.engine.group_record(group_id)?)
     }

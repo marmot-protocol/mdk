@@ -2601,11 +2601,11 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         publication: KeyPackagePublication,
     ) -> Result<(), KeyPackagePublishError> {
         let metadata = key_package_metadata(&publication.key_package)
-            .map_err(|e| KeyPackagePublishError(e.to_string()))?;
+            .map_err(|e| KeyPackagePublishError::unexposed(e.to_string()))?;
         let account_id_hex = hex::encode(publication.account_id.as_slice());
         if metadata.credential_identity_hex != account_id_hex {
-            return Err(KeyPackagePublishError(
-                "KeyPackage credential identity does not match publication account".into(),
+            return Err(KeyPackagePublishError::unexposed(
+                "KeyPackage credential identity does not match publication account",
             ));
         }
         let key_package_id = self
@@ -2635,17 +2635,27 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             app_components: self.app_components.clone(),
             publish_endpoints: publication.endpoints.clone(),
         };
+        // Relay publish happens first. A failure here means no relay accepted
+        // the event (`NostrKeyPackagePublisher` requires >=1 ack and returns
+        // `Err` only when the accept count falls short), so the KeyPackage was
+        // never externally exposed and the orphaned private bundle is safe to
+        // prune (darkmatter#160).
         let outcome = NostrKeyPackagePublisher::new(relay_client)
             .publish_key_package(&nostr_publication)
             .await
-            .map_err(|e| KeyPackagePublishError(e.to_string()))?;
+            .map_err(|e| KeyPackagePublishError::unexposed(e.to_string()))?;
         let key_package_event_id = outcome
             .message_id
             .map(|message_id| hex::encode(message_id.as_slice()))
             .unwrap_or_default();
 
+        // From here on the KeyPackage HAS been accepted by at least one relay,
+        // so it is externally discoverable. Any subsequent failure must NOT
+        // prune the private bundle, or an inviter could build a Welcome against
+        // the published event that this account can never join. Mark these
+        // errors `exposed` (darkmatter#160 adversarial review).
         let dir = self.app.key_package_cache_dir().join(KEY_PACKAGE_DIR);
-        fs::create_dir_all(&dir).map_err(|e| KeyPackagePublishError(e.to_string()))?;
+        fs::create_dir_all(&dir).map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
         write_json(
             dir.join(format!("{}.json", self.account_label)),
             &KeyPackageRecord {
@@ -2658,7 +2668,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 key_package_hex: hex::encode(publication.key_package.bytes()),
             },
         )
-        .map_err(|e| KeyPackagePublishError(e.to_string()))
+        .map_err(|e| KeyPackagePublishError::exposed(e.to_string()))
     }
 }
 

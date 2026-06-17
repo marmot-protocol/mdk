@@ -659,4 +659,14 @@ pub trait CgkaEngine: Send + Sync {
     /// Produce a fresh KeyPackage suitable for publishing to a KeyPackage
     /// directory. Expiry and refresh scheduling live above the engine.
     async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError>;
+
+    /// Delete a previously generated KeyPackage bundle from storage.
+    ///
+    /// `fresh_key_package` persists the bundle's private HPKE init key material
+    /// as a side effect of building it. Callers that fail to publish a
+    /// generated KeyPackage must call this to prune the orphaned private bundle,
+    /// otherwise retries against a failing publisher accumulate unused private
+    /// key material indefinitely (darkmatter#160). Deleting a KeyPackage that is
+    /// not present in storage is a no-op, so this is safe to call idempotently.
+    async fn delete_key_package(&mut self, key_package: &KeyPackage) -> Result<(), EngineError>;
 }
