@@ -464,9 +464,21 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         epoch: &EpochKey,
         leaf_index: u32,
     ) -> Result<Vec<HpkeKeyPair>, Self::Error> {
-        self.read_json(
+        // Prefer the unambiguous tuple key (#158). Fall back to the legacy
+        // concatenated key so rows written before the key format was
+        // disambiguated stay reachable after upgrade: the current epoch's HPKE
+        // private key material must remain readable until OpenMLS next re-stores
+        // it under the new key, otherwise an in-flight commit could fail to find
+        // the keys needed to process it.
+        if let Some(value) = self.read_json(
             EPOCH_KEY_PAIRS_LABEL,
             epoch_key_pairs_id(group_id, epoch, leaf_index)?,
+        )? {
+            return Ok(value);
+        }
+        self.read_json(
+            EPOCH_KEY_PAIRS_LABEL,
+            epoch_key_pairs_id_legacy(group_id, epoch, leaf_index)?,
         )
         .map(|value| value.unwrap_or_default())
     }
@@ -624,9 +636,15 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
         epoch: &EpochKey,
         leaf_index: u32,
     ) -> Result<(), Self::Error> {
+        // Delete both encodings so a delete cannot leave a stale legacy-key row
+        // behind that a later read would resurrect (see #158 read fallback).
         self.delete_value(
             EPOCH_KEY_PAIRS_LABEL,
             epoch_key_pairs_id(group_id, epoch, leaf_index)?,
+        )?;
+        self.delete_value(
+            EPOCH_KEY_PAIRS_LABEL,
+            epoch_key_pairs_id_legacy(group_id, epoch, leaf_index)?,
         )
     }
 
@@ -733,6 +751,126 @@ mod tests {
 
     impl Entity<CURRENT_VERSION> for TestQueuedProposal {}
     impl traits::QueuedProposal<CURRENT_VERSION> for TestQueuedProposal {}
+
+    // Serializes transparently to a bare JSON number, matching how the real
+    // GroupEpoch encodes. This is the property that made undelimited
+    // concatenation in epoch_key_pairs_id unsafe.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct TestEpochKey(u64);
+
+    impl Key<CURRENT_VERSION> for TestEpochKey {}
+    impl traits::EpochKey<CURRENT_VERSION> for TestEpochKey {}
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestHpkeKeyPair(Vec<u8>);
+
+    impl Entity<CURRENT_VERSION> for TestHpkeKeyPair {}
+    impl traits::HpkeKeyPair<CURRENT_VERSION> for TestHpkeKeyPair {}
+
+    // Regression test for #158: distinct (epoch, leaf_index) pairs whose
+    // decimal digits realign — (epoch=3, leaf=45) and (epoch=34, leaf=5) —
+    // must map to distinct storage keys. Under the old undelimited
+    // concatenation ("3"+"45" == "34"+"5") the second write silently
+    // clobbered the first via INSERT OR REPLACE, losing HPKE key material.
+    #[test]
+    fn epoch_key_pairs_no_collision_across_realigning_epoch_leaf_digits() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![1, 2, 3, 4]);
+
+        let pairs_a = vec![TestHpkeKeyPair(vec![0xAA])];
+        let pairs_b = vec![TestHpkeKeyPair(vec![0xBB])];
+
+        // (epoch=3, leaf_index=45)
+        mls.write_encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45, &pairs_a)
+            .unwrap();
+        // (epoch=34, leaf_index=5) — would collide under undelimited concat.
+        mls.write_encryption_epoch_key_pairs(&group_id, &TestEpochKey(34), 5, &pairs_b)
+            .unwrap();
+
+        // Both rows must survive independently.
+        let read_a: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45)
+            .unwrap();
+        let read_b: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(34), 5)
+            .unwrap();
+        assert_eq!(read_a, pairs_a, "(epoch=3, leaf=45) was overwritten");
+        assert_eq!(read_b, pairs_b, "(epoch=34, leaf=5) was not stored");
+
+        // Deleting one must not affect the other.
+        mls.delete_encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45)
+            .unwrap();
+        let after_delete_a: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(3), 45)
+            .unwrap();
+        let after_delete_b: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &TestEpochKey(34), 5)
+            .unwrap();
+        assert_eq!(after_delete_a, Vec::new(), "delete missed its own row");
+        assert_eq!(
+            after_delete_b, pairs_b,
+            "delete of (3, 45) wrongly removed (34, 5)"
+        );
+    }
+
+    // Upgrade-compatibility for #158: rows written before the key format was
+    // disambiguated live under the legacy concatenated key. After upgrade,
+    // encryption_epoch_key_pairs must still find them (read fallback) and
+    // delete_encryption_epoch_key_pairs must remove them (dual delete), so a
+    // group's current-epoch HPKE private key material is not stranded.
+    #[test]
+    fn epoch_key_pairs_reads_and_deletes_legacy_concatenated_key() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let group_id = TestGroupId(vec![5, 6, 7, 8]);
+        let epoch = TestEpochKey(7);
+        let leaf_index = 2u32;
+        let legacy_pairs = vec![TestHpkeKeyPair(vec![0xCC])];
+
+        // Seed a row under the pre-#158 legacy key, mimicking on-disk state from
+        // a build that predates the tuple-key fix.
+        let legacy_key = epoch_key_pairs_id_legacy(&group_id, &epoch, leaf_index).unwrap();
+        mls.write_value(
+            EPOCH_KEY_PAIRS_LABEL,
+            legacy_key,
+            Some(SqliteOpenMlsStorage::group_key(&group_id).unwrap()),
+            serde_json::to_vec(&legacy_pairs).unwrap(),
+        )
+        .unwrap();
+
+        // Read falls back to the legacy key when no tuple-key row exists.
+        let read_legacy: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &epoch, leaf_index)
+            .unwrap();
+        assert_eq!(read_legacy, legacy_pairs, "legacy row was not read back");
+
+        // A new tuple-key write takes precedence over the shadowed legacy row.
+        let new_pairs = vec![TestHpkeKeyPair(vec![0xDD])];
+        mls.write_encryption_epoch_key_pairs(&group_id, &epoch, leaf_index, &new_pairs)
+            .unwrap();
+        let read_after_write: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &epoch, leaf_index)
+            .unwrap();
+        assert_eq!(
+            read_after_write, new_pairs,
+            "tuple-key row must shadow the legacy row"
+        );
+
+        // Delete removes both encodings, so the shadowed legacy row cannot be
+        // resurrected after the tuple-key row is gone.
+        mls.delete_encryption_epoch_key_pairs(&group_id, &epoch, leaf_index)
+            .unwrap();
+        let read_after_delete: Vec<TestHpkeKeyPair> = mls
+            .encryption_epoch_key_pairs(&group_id, &epoch, leaf_index)
+            .unwrap();
+        assert_eq!(
+            read_after_delete,
+            Vec::new(),
+            "legacy row resurfaced after delete"
+        );
+    }
 
     #[test]
     fn queued_proposals_recovers_from_dangling_refs_by_clearing_queue() {
