@@ -286,8 +286,15 @@ impl TuiApp {
         {
             return Ok(false);
         }
-        self.flush_stream_append()?;
-        Ok(true)
+        match self.flush_stream_append() {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                if let Some(streaming) = self.streaming.as_mut() {
+                    streaming.last_flush = Instant::now();
+                }
+                Err(err)
+            }
+        }
     }
 
     pub(crate) fn flush_stream_append(&mut self) -> TuiResult<()> {

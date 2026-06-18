@@ -1741,6 +1741,44 @@ fn test_chat_subscription(account_id: &str, include_archived: bool) -> ChatSubsc
 }
 
 #[test]
+fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
+    // Regression for darkmatter#197: automatic stream-append retries come from
+    // tick(), which runs every UI event interval. A failing append must move the
+    // retry gate forward so a down daemon/broker does not spawn a blocking `dm`
+    // subprocess on every tick.
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_tempdir, client) =
+        test_json_client(r#"{"ok":false,"error":{"message":"broker offline"}}"#);
+    let mut app = test_tui_app(client, account_id);
+    let first_due = Instant::now();
+    let stale_flush = first_due - STREAM_APPEND_FLUSH_INTERVAL - Duration::from_millis(1);
+    app.streaming = Some(StreamComposer {
+        stream_id: "stream-197".to_owned(),
+        group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        pending_text: "queued".to_owned(),
+        last_flush: stale_flush,
+    });
+
+    let first = app.flush_stream_append_if_due(first_due);
+
+    assert!(
+        first.is_err(),
+        "first due flush should report the append failure"
+    );
+    let streaming = app.streaming.as_ref().expect("composer remains active");
+    assert_eq!(streaming.pending_text, "queued");
+    assert!(streaming.last_flush >= first_due);
+    let retry_gate = streaming.last_flush;
+
+    let second = app.flush_stream_append_if_due(retry_gate + UI_EVENT_WAIT);
+
+    assert!(!second.expect("retry gate should suppress immediate retry"));
+    let streaming = app.streaming.as_ref().expect("composer remains active");
+    assert_eq!(streaming.pending_text, "queued");
+    assert_eq!(streaming.last_flush, retry_gate);
+}
+
+#[test]
 fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
     // Regression for issue #194: a fallible streaming finish (daemon gone,
     // broker/QUIC error, relay publish ok=false) must not propagate out of
