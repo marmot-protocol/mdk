@@ -461,7 +461,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
 
     // Convergence invalidates the losing-branch row (kept as a tombstone).
     store
-        .invalidate_app_event_by_message_id("phantom", "LosingBranch")
+        .invalidate_app_event_by_message_id(GROUP, "phantom", "LosingBranch")
         .unwrap();
 
     // Preview and sort anchor must fall back to the visible delivered message,
@@ -510,7 +510,7 @@ fn chat_list_preview_is_empty_when_only_invalidated_kind9_exists() {
         .record_app_event(&chat("phantom", REMOTE, 11, "losing branch"))
         .unwrap();
     store
-        .invalidate_app_event_by_message_id("phantom", "LosingBranch")
+        .invalidate_app_event_by_message_id(GROUP, "phantom", "LosingBranch")
         .unwrap();
 
     let row = store
