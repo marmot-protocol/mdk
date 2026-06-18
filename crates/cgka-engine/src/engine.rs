@@ -467,11 +467,48 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
         .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?;
-        crate::group_lifecycle::validate_member_credentials_and_account_proofs(
-            &mls_group,
-            self.ciphersuite,
-        )
-        .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
+
+        // Member-credential + account-identity-proof validation runs one
+        // BIP-340 schnorr verification per leaf. All of this state was already
+        // validated at join/invite/commit ingress and read back from this
+        // device's own encrypted storage, so re-verifying every leaf of every
+        // group on every session open is pure repeated work (darkmatter#152:
+        // ~50 groups x ~50 members ≈ 2500 schnorr verifications per open, and
+        // marmot-app opens a fresh session per client() call).
+        //
+        // Gate the full walk behind a cheap, content-bound marker (a hash over
+        // the exported ratchet-tree bytes). If the stored marker matches the
+        // current tree, this exact tree already passed validation in a prior
+        // run and is byte-identical now, so the schnorr re-verification is
+        // skipped. Any membership/leaf/proof change (or a marker-version bump)
+        // yields a different marker and forces full re-validation, so
+        // correctness never depends on the marker — only performance. A marker
+        // computation/IO failure simply falls back to full validation.
+        let current_marker =
+            crate::group_lifecycle::compute_validated_tree_marker(&mls_group, self.ciphersuite)
+                .ok();
+        let already_validated = match (
+            &current_marker,
+            self.storage.validated_tree_marker(group_id),
+        ) {
+            (Some(current), Ok(Some(stored))) => stored == *current,
+            _ => false,
+        };
+        if !already_validated {
+            crate::group_lifecycle::validate_member_credentials_and_account_proofs(
+                &mls_group,
+                self.ciphersuite,
+            )
+            .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
+            // Validation passed for this tree state; persist the marker so the
+            // next open of an unchanged group skips the per-leaf schnorr work.
+            // A write failure is non-fatal: it only forfeits the optimization
+            // (the next open re-validates), so it must not quarantine a healthy
+            // group.
+            if let Some(marker) = &current_marker {
+                let _ = self.storage.put_validated_tree_marker(group_id, marker);
+            }
+        }
 
         let mut group = self
             .storage

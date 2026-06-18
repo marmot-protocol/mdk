@@ -37,6 +37,7 @@ pub(super) fn rollback(
     queued_outbound(&tx, group_id, &snapshot.queued_outbound)?;
     member_capabilities(&tx, group_id, &snapshot.member_caps)?;
     convergence_policy(&tx, group_id, snapshot.convergence_policy.as_deref())?;
+    validated_tree_marker(&tx, group_id, snapshot.validated_tree_marker.as_deref())?;
     openmls_values(&tx, &mls_group_key, &snapshot.openmls_values)?;
 
     tx.commit().storage()?;
@@ -157,6 +158,27 @@ fn convergence_policy(
             "INSERT INTO cgka_convergence_policies (group_id, policy)
              VALUES (?1, ?2)",
             params![group_id.as_slice(), policy],
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
+fn validated_tree_marker(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &GroupId,
+    marker: Option<&[u8]>,
+) -> StorageResult<()> {
+    tx.execute(
+        "DELETE FROM cgka_member_validation_cache WHERE group_id = ?1",
+        params![group_id.as_slice()],
+    )
+    .storage()?;
+    if let Some(marker) = marker {
+        tx.execute(
+            "INSERT INTO cgka_member_validation_cache (group_id, marker)
+             VALUES (?1, ?2)",
+            params![group_id.as_slice(), marker],
         )
         .storage()?;
     }

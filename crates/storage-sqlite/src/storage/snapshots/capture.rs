@@ -30,6 +30,7 @@ pub(super) fn create(
     let queued_outbound = queued_outbound(&tx, group_id)?;
     let member_caps = member_capabilities(&tx, group_id)?;
     let convergence_policy = convergence_policy(&tx, group_id)?;
+    let validated_tree_marker = validated_tree_marker(&tx, group_id)?;
     let openmls_values = openmls_values(&tx, &mls_group_key)?;
 
     let snapshot = Snapshot {
@@ -38,6 +39,7 @@ pub(super) fn create(
         queued_outbound,
         member_caps,
         convergence_policy,
+        validated_tree_marker,
         openmls_values,
     };
     tx.execute(
@@ -139,6 +141,19 @@ fn convergence_policy(
 ) -> StorageResult<Option<Vec<u8>>> {
     tx.query_row(
         "SELECT policy FROM cgka_convergence_policies WHERE group_id = ?1",
+        params![group_id.as_slice()],
+        |row| row.get(0),
+    )
+    .optional()
+    .storage()
+}
+
+fn validated_tree_marker(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &GroupId,
+) -> StorageResult<Option<Vec<u8>>> {
+    tx.query_row(
+        "SELECT marker FROM cgka_member_validation_cache WHERE group_id = ?1",
         params![group_id.as_slice()],
         |row| row.get(0),
     )

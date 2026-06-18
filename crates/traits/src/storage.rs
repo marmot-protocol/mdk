@@ -148,6 +148,23 @@ pub trait ConvergencePolicyStorage {
     fn convergence_policy(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>>;
 }
 
+// ── MemberValidationCacheStorage ────────────────────────────────────────────
+
+/// Durable per-group marker certifying that a specific ratchet-tree state
+/// already passed member-credential + account-identity-proof validation.
+///
+/// The engine keys the marker on the exact exported ratchet-tree bytes, so any
+/// change to membership, a leaf node, or an account-identity proof yields a
+/// different marker and forces full re-validation. Storage keeps opaque bytes;
+/// the engine owns marker derivation and versioning. The marker lives in the
+/// same encrypted, account-device-scoped database as the group state it
+/// certifies, so it never widens the trust boundary: an attacker who could
+/// forge a marker row could already tamper the group state it guards.
+pub trait MemberValidationCacheStorage {
+    fn put_validated_tree_marker(&self, group_id: &GroupId, marker: &[u8]) -> StorageResult<()>;
+    fn validated_tree_marker(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>>;
+}
+
 // ── AccountDeviceSignerStorage ─────────────────────────────────────────────
 
 /// Account-device-local binding from Marmot identity to MLS signer lookup key.
@@ -186,6 +203,7 @@ pub trait StorageProvider:
     + WelcomeStorage
     + CapabilityStorage
     + ConvergencePolicyStorage
+    + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
     + Send
     + Sync

@@ -2,6 +2,7 @@ mod account_device_signer;
 mod capabilities;
 mod convergence_policy;
 mod groups;
+mod member_validation_cache;
 mod messages;
 mod outbound;
 mod snapshots;

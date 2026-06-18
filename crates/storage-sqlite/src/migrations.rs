@@ -26,6 +26,8 @@ mod migration_0012_app_event_origin_commit;
 mod migration_0013_app_event_kind_order_index;
 #[path = "migrations/0014_message_timeline_reply_lookup_index.rs"]
 mod migration_0014_message_timeline_reply_lookup_index;
+#[path = "migrations/0015_member_validation_cache.rs"]
+mod migration_0015_member_validation_cache;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -107,6 +109,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 14,
         name: "0014_message_timeline_reply_lookup_index",
         apply: migration_0014_message_timeline_reply_lookup_index::apply,
+    },
+    Migration {
+        version: 15,
+        name: "0015_member_validation_cache",
+        apply: migration_0015_member_validation_cache::apply,
     },
 ];
 
@@ -471,6 +478,7 @@ mod tests {
             ("cgka_queued_outbound", "group_id"),
             ("cgka_member_capabilities", "group_id"),
             ("cgka_convergence_policies", "group_id"),
+            ("cgka_member_validation_cache", "group_id"),
             ("cgka_group_snapshots", "group_id"),
         ] {
             assert_eq!(
@@ -504,6 +512,11 @@ mod tests {
         ));
         assert_foreign_key_error(conn.execute(
             "INSERT INTO cgka_convergence_policies (group_id, policy)
+             VALUES (?1, ?2)",
+            params![orphan_group, vec![0xAA_u8]],
+        ));
+        assert_foreign_key_error(conn.execute(
+            "INSERT INTO cgka_member_validation_cache (group_id, marker)
              VALUES (?1, ?2)",
             params![orphan_group, vec![0xAA_u8]],
         ));

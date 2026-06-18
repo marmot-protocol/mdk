@@ -12,6 +12,7 @@ pub(super) struct Snapshot {
     pub(super) queued_outbound: Vec<OrderedQueuedOutbound>,
     pub(super) member_caps: Vec<MemberCapabilitiesSnapshot>,
     pub(super) convergence_policy: Option<Vec<u8>>,
+    pub(super) validated_tree_marker: Option<Vec<u8>>,
     pub(super) openmls_values: Vec<OpenMlsValueSnapshot>,
 }
 

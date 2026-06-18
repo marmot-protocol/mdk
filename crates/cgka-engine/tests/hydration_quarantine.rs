@@ -13,8 +13,9 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    ConvergencePolicyStorage, GroupStorage, MemberValidationCacheStorage, MessageStorage,
+    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -425,6 +426,15 @@ impl ConvergencePolicyStorage for FlakyGroupRecordStorage {
     }
 }
 
+impl MemberValidationCacheStorage for FlakyGroupRecordStorage {
+    fn put_validated_tree_marker(&self, group_id: &GroupId, marker: &[u8]) -> StorageResult<()> {
+        self.inner.put_validated_tree_marker(group_id, marker)
+    }
+    fn validated_tree_marker(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.validated_tree_marker(group_id)
+    }
+}
+
 impl AccountDeviceSignerStorage for FlakyGroupRecordStorage {
     fn put_account_device_signer(&self, binding: &AccountDeviceSignerBinding) -> StorageResult<()> {
         self.inner.put_account_device_signer(binding)
@@ -574,4 +584,84 @@ async fn retry_for_unknown_group_errors() {
         engine.retry_hydrate_quarantined_group(&unknown),
         Err(EngineError::UnknownGroup(id)) if id == unknown
     ));
+}
+
+// darkmatter#152: session open must not re-verify an unchanged group's
+// account-identity proofs on every open. After a successful hydration the
+// engine persists a content-bound validation marker; reopening an unchanged
+// group finds the marker already set so the per-leaf schnorr re-verification is
+// skipped, and the group still hydrates to the same epoch.
+#[tokio::test]
+async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group = create_confirmed_group(&mut initial).await;
+    let epoch = storage.get_group(&group).unwrap().epoch;
+    drop(initial);
+
+    // No marker before the first hydration.
+    assert_eq!(
+        storage.validated_tree_marker(&group).expect("read marker"),
+        None,
+        "marker should not exist before any hydration"
+    );
+
+    let mut first = build_engine(storage.clone());
+    first
+        .hydrate_stable_groups_from_storage()
+        .expect("first hydration");
+    assert_eq!(first.epoch(&group).unwrap(), epoch);
+
+    // First open validated the tree and persisted a marker.
+    let marker = storage
+        .validated_tree_marker(&group)
+        .expect("read marker")
+        .expect("marker should be persisted after a validating hydration");
+    drop(first);
+
+    // Reopening an unchanged group hydrates fine; the marker is unchanged
+    // because the tree bytes are identical.
+    let mut second = build_engine(storage.clone());
+    second
+        .hydrate_stable_groups_from_storage()
+        .expect("second hydration of unchanged group");
+    assert_eq!(second.epoch(&group).unwrap(), epoch);
+    assert_eq!(
+        storage.validated_tree_marker(&group).expect("read marker"),
+        Some(marker),
+        "marker for an unchanged group must be stable across opens"
+    );
+}
+
+// A stale/garbage marker must never let a tampered group through: marker
+// mismatch forces full validation. A healthy group with a mismatched marker
+// still hydrates (full validation passes) and the marker is refreshed.
+#[tokio::test]
+async fn stale_validation_marker_forces_revalidation_and_refresh() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group = create_confirmed_group(&mut initial).await;
+    let epoch = storage.get_group(&group).unwrap().epoch;
+    drop(initial);
+
+    // Plant a bogus marker that cannot match the real tree.
+    storage
+        .put_validated_tree_marker(&group, b"stale-marker-does-not-match")
+        .expect("plant stale marker");
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydration revalidates and accepts the healthy group");
+    assert_eq!(reopened.epoch(&group).unwrap(), epoch);
+
+    // Full validation ran and refreshed the marker to the real value.
+    let refreshed = storage
+        .validated_tree_marker(&group)
+        .expect("read marker")
+        .expect("marker should be refreshed after revalidation");
+    assert_ne!(
+        refreshed, b"stale-marker-does-not-match",
+        "stale marker must be overwritten with the real content-bound marker"
+    );
 }

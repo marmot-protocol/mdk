@@ -32,6 +32,7 @@ use openmls::group::{MlsGroup, MlsGroupCreateConfig, StagedWelcome};
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
 use openmls::treesync::Node;
 use openmls_traits::types::Ciphersuite;
+use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
 
 /// MLS exporter input for the Nostr kind-445 group-event encryption key:
@@ -647,6 +648,11 @@ pub(crate) fn validate_member_credentials(group: &MlsGroup) -> Result<(), Engine
 
 /// Validate every Marmot member identity and the account-key proof attached to
 /// each LeafNode in the exported MLS ratchet tree.
+///
+/// This is the cold-path full validation: it runs one BIP-340 schnorr
+/// verification per leaf. Session open ([`Engine::hydrate_one_stored_group`])
+/// gates it behind [`compute_validated_tree_marker`] so an unchanged group's
+/// already-validated tree is not re-verified on every open.
 pub(crate) fn validate_member_credentials_and_account_proofs(
     group: &MlsGroup,
     ciphersuite: Ciphersuite,
@@ -666,6 +672,41 @@ pub(crate) fn validate_member_credentials_and_account_proofs(
         }
     }
     Ok(())
+}
+
+/// Bumped whenever the member-credential / account-identity-proof validation
+/// logic changes. A bump makes every previously stored marker mismatch, so a
+/// group's tree is fully re-validated under the new rules on the next open.
+const VALIDATED_TREE_MARKER_VERSION: u8 = 1;
+
+/// Derive a cheap, content-bound marker certifying a specific ratchet-tree
+/// state passed [`validate_member_credentials_and_account_proofs`].
+///
+/// The marker is `SHA-256(version || ciphersuite || TLS(exported ratchet
+/// tree))`. It is bound to the exact bytes the validator reads, so any change
+/// to membership, a leaf node, or an account-identity-proof extension yields a
+/// different marker. This is deliberately *not* the OpenMLS `tree_hash` or
+/// `epoch_authenticator`: the former is `pub(crate)` and the latter is a
+/// derived secret that is not bound to the stored leaf bytes the proof
+/// validation actually inspects, so neither would detect tampering of the
+/// stored tree the way a hash over the exported bytes does.
+///
+/// Computing the marker is O(tree size) serialization + one hash — no schnorr
+/// verification — so doing it per group on every open is far cheaper than the
+/// per-leaf BIP-340 verification it lets unchanged groups skip.
+pub(crate) fn compute_validated_tree_marker(
+    group: &MlsGroup,
+    ciphersuite: Ciphersuite,
+) -> Result<Vec<u8>, EngineError> {
+    let tree = group.export_ratchet_tree();
+    let tree_bytes = tree
+        .tls_serialize_detached()
+        .map_err(|e| EngineError::Backend(format!("serialize ratchet tree: {e}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update([VALIDATED_TREE_MARKER_VERSION]);
+    hasher.update(u16::from(ciphersuite).to_be_bytes());
+    hasher.update(&tree_bytes);
+    Ok(hasher.finalize().to_vec())
 }
 
 pub(crate) fn marmot_members(group: &MlsGroup) -> Vec<Member> {
