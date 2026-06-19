@@ -99,8 +99,157 @@ fn http_ok_response(body: &[u8]) -> Vec<u8> {
     response
 }
 
+fn http_json_response(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes()
+}
+
+fn http_status_response(status: u16, reason: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .into_bytes()
+}
+
+fn blossom_endpoint(base_url: String) -> BlobStoreEndpointV1 {
+    BlobStoreEndpointV1 {
+        locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        base_url,
+    }
+}
+
+fn media_upload_request(blossom_server: Option<String>) -> MediaUploadRequest {
+    MediaUploadRequest {
+        attachments: vec![MediaUploadAttachmentRequest {
+            file_name: "diagram.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            plaintext: b"hello encrypted media".to_vec(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        blossom_server,
+    }
+}
+
+fn signing_keys() -> nostr::Keys {
+    nostr::Keys::generate()
+}
+
+fn media_secret() -> [u8; 32] {
+    [7_u8; 32]
+}
+
 fn http_not_found_response() -> Vec<u8> {
     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
+    let failing = spawn_http_response(http_status_response(500, "Internal Server Error"));
+    let succeeding = spawn_http_response(http_json_response("{}"));
+    let endpoints = [
+        blossom_endpoint(failing.clone()),
+        blossom_endpoint(succeeding.clone()),
+    ];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let result = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &allowed,
+        true,
+    )
+    .await
+    .expect("second Blossom endpoint should absorb first endpoint failure");
+
+    let locator = &result.attachments[0].reference.locators[0];
+    assert_eq!(locator.kind, BLOSSOM_LOCATOR_KIND_V1);
+    assert!(
+        locator.value.starts_with(&format!("{succeeding}/")),
+        "upload locator should come from fallback server, got {}",
+        locator.value
+    );
+    assert!(
+        !locator.value.starts_with(&failing),
+        "upload must not use the failed server locator"
+    );
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
+    let first = spawn_http_response(http_status_response(500, "Internal Server Error"));
+    let second = spawn_http_response(http_status_response(502, "Bad Gateway"));
+    let endpoints = [
+        blossom_endpoint(first.clone()),
+        blossom_endpoint(second.clone()),
+    ];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let err = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &[],
+        true,
+    )
+    .await
+    .expect_err("all failing endpoints should aggregate their failures");
+
+    let AppError::BlobStore(message) = err else {
+        panic!("expected aggregated BlobStore error");
+    };
+    assert!(
+        message.contains("upload failed for all Blossom servers"),
+        "unexpected error: {message}"
+    );
+    assert!(message.contains("server 1: upload returned HTTP 500"));
+    assert!(message.contains("server 2: upload returned HTTP 502"));
+    assert!(
+        !message.contains(&first) && !message.contains(&second),
+        "aggregated error must not embed Blossom server URLs: {message}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_blossom_server_override_skips_default_endpoint_failover() {
+    let override_server = spawn_http_response(http_status_response(500, "Internal Server Error"));
+    let default_server = spawn_http_response(http_json_response("{}"));
+    let endpoints = [blossom_endpoint(default_server.clone())];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let err = upload_encrypted_media(
+        media_upload_request(Some(override_server.clone())),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &[],
+        true,
+    )
+    .await
+    .expect_err("explicit override must remain a single-server bypass");
+
+    let AppError::BlobStore(message) = err else {
+        panic!("expected single override BlobStore error");
+    };
+    assert!(message.contains("server 1: upload returned HTTP 500"));
+    assert!(
+        !message.contains("server 2") && !message.contains(&default_server),
+        "override failure should not include default endpoint fallback: {message}"
+    );
 }
 
 #[test]

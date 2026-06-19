@@ -984,32 +984,46 @@ impl AppClient {
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         // `upload_encrypted_media` always performs Blossom upload semantics and
-        // emits a `blossom-v1` locator, so the chosen default endpoint MUST be a
-        // Blossom endpoint. A policy whose first endpoint serves a non-Blossom
-        // locator would otherwise receive Blossom bytes at the wrong backend.
-        // Skip loopback-HTTP policy endpoints unless this build is configured for
-        // dev/test: they are valid component state but a production client MUST
-        // NOT upload to the local host (a remote admin could point the policy at
-        // the victim's loopback services). An explicit per-request
-        // `blossom_server` override is an intentional dev escape hatch, so when
-        // one is present any Blossom policy endpoint serves as the (unused)
-        // default.
+        // emits a `blossom-v1` locator, so every default upload candidate MUST be
+        // a Blossom endpoint. Iterate all usable candidates in policy order so a
+        // single server outage does not fail the send. Skip loopback-HTTP policy
+        // endpoints unless this build is configured for dev/test: they are valid
+        // component state but a production client MUST NOT upload to the local
+        // host (a remote admin could point the policy at the victim's loopback
+        // services). An explicit per-request `blossom_server` override is an
+        // intentional single-server dev escape hatch: it bypasses endpoint
+        // failover, but the group policy must still allow `blossom-v1` locators.
         let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        let policy_allows_blossom = policy.allowed_locator_kinds.is_empty()
+            || policy
+                .allowed_locator_kinds
+                .iter()
+                .any(|kind| kind == BLOSSOM_LOCATOR_KIND_V1);
+        if !policy_allows_blossom {
+            return Err(AppError::InvalidEncryptedMedia(
+                "group policy has no usable Blossom endpoint for upload".into(),
+            ));
+        }
         let has_explicit_server = request.blossom_server.is_some();
-        let default_endpoint = policy
-            .default_blob_endpoints
-            .iter()
-            .find(|endpoint| {
-                endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1
-                    && (has_explicit_server
-                        || allow_loopback
-                        || !is_loopback_http_endpoint(&endpoint.base_url))
-            })
-            .ok_or_else(|| {
-                AppError::InvalidEncryptedMedia(
+        let default_endpoints = if has_explicit_server {
+            Vec::new()
+        } else {
+            let endpoints = policy
+                .default_blob_endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1
+                        && (allow_loopback || !is_loopback_http_endpoint(&endpoint.base_url))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if endpoints.is_empty() {
+                return Err(AppError::InvalidEncryptedMedia(
                     "group policy has no usable Blossom endpoint for upload".into(),
-                )
-            })?;
+                ));
+            }
+            endpoints
+        };
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let keys = self
             .app
@@ -1022,7 +1036,7 @@ impl AppClient {
             source_epoch,
             media_secret.as_ref(),
             &keys,
-            default_endpoint,
+            &default_endpoints,
             &policy.allowed_locator_kinds,
             allow_loopback,
         )

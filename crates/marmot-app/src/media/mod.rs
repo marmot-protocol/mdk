@@ -215,7 +215,7 @@ pub(crate) async fn upload_encrypted_media(
     source_epoch: u64,
     media_secret: &[u8],
     signing_keys: &nostr::Keys,
-    default_endpoint: &BlobStoreEndpointV1,
+    default_endpoints: &[BlobStoreEndpointV1],
     allowed_locator_kinds: &[String],
     allow_loopback_http: bool,
 ) -> Result<MediaUploadResult, AppError> {
@@ -224,10 +224,18 @@ pub(crate) async fn upload_encrypted_media(
             "media upload requires at least one attachment".into(),
         ));
     }
-    let server = request
-        .blossom_server
-        .as_deref()
-        .unwrap_or(default_endpoint.base_url.as_str());
+    let upload_servers = match request.blossom_server {
+        Some(server) => vec![server],
+        None => default_endpoints
+            .iter()
+            .map(|endpoint| endpoint.base_url.clone())
+            .collect::<Vec<_>>(),
+    };
+    if upload_servers.is_empty() {
+        return Err(AppError::InvalidEncryptedMedia(
+            "group policy has no usable Blossom endpoint for upload".into(),
+        ));
+    }
     let mut attachments = Vec::with_capacity(request.attachments.len());
     for attachment in request.attachments {
         attachments.push(
@@ -236,7 +244,7 @@ pub(crate) async fn upload_encrypted_media(
                 source_epoch,
                 media_secret,
                 signing_keys,
-                server,
+                &upload_servers,
                 allowed_locator_kinds,
                 allow_loopback_http,
             )
@@ -254,7 +262,7 @@ async fn upload_encrypted_media_attachment(
     source_epoch: u64,
     media_secret: &[u8],
     signing_keys: &nostr::Keys,
-    server: &str,
+    upload_servers: &[String],
     allowed_locator_kinds: &[String],
     allow_loopback_http: bool,
 ) -> Result<MediaUploadAttachmentResult, AppError> {
@@ -288,8 +296,8 @@ async fn upload_encrypted_media_attachment(
         )
         .map_err(|_| AppError::InvalidEncryptedMedia("media encryption failed".into()))?;
     let ciphertext_sha256 = hex::encode(Sha256::digest(&encrypted));
-    let url = upload_blossom_blob(
-        server,
+    let url = upload_blossom_blob_with_fallback(
+        upload_servers,
         &encrypted,
         &ciphertext_sha256,
         signing_keys,
@@ -320,6 +328,51 @@ async fn upload_encrypted_media_attachment(
         encrypted_size_bytes: encrypted.len() as u64,
         reference,
     })
+}
+
+async fn upload_blossom_blob_with_fallback(
+    servers: &[String],
+    encrypted: &[u8],
+    encrypted_hash_hex: &str,
+    signing_keys: &nostr::Keys,
+    allow_loopback_http: bool,
+) -> Result<String, AppError> {
+    let mut failures = Vec::new();
+    for (idx, server) in servers.iter().enumerate() {
+        match upload_blossom_blob(
+            server,
+            encrypted,
+            encrypted_hash_hex,
+            signing_keys,
+            allow_loopback_http,
+        )
+        .await
+        {
+            Ok(url) => return Ok(url),
+            Err(err) => failures.push(format!(
+                "server {}: {}",
+                idx + 1,
+                upload_error_summary(&err)
+            )),
+        }
+    }
+    Err(AppError::BlobStore(format!(
+        "upload failed for all Blossom servers: {}",
+        failures.join("; ")
+    )))
+}
+
+fn upload_error_summary(err: &AppError) -> String {
+    match err {
+        AppError::BlobStore(message)
+        | AppError::InvalidEncryptedMedia(message)
+        | AppError::InvalidAppMessagePayload(message) => message.clone(),
+        // `upload_blossom_blob` should currently surface upload failures through
+        // the privacy-scrubbed variants above. Keep this fallback as a defensive
+        // catch-all only; do not route URL-bearing transport errors here without
+        // first adding an explicit scrubbed summary arm.
+        other => other.to_string(),
+    }
 }
 
 pub(crate) async fn download_encrypted_media(
