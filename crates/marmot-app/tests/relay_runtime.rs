@@ -2022,6 +2022,7 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
                 limit: Some(10),
             },
         )
+        .await
         .unwrap();
     assert_eq!(subscription.snapshot.len(), 1);
     assert_eq!(subscription.snapshot[0].plaintext, "already projected");

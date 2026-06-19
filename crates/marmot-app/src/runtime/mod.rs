@@ -78,7 +78,7 @@ pub(crate) use subscriptions::{
     TIMELINE_WINDOW_LIMIT, TimelineQueryFn, TimelineSubscriptionSignal, TimelineWindow,
     TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
     merge_timeline_window, messages_recovery_query, received_message_update_from_record,
-    reconcile_chat_list_snapshot, send_chat_list_remove_update,
+    reconcile_chat_list_snapshot, recovery_row_is_pre_subscription, send_chat_list_remove_update,
 };
 // External items `runtime/tests.rs` reaches through `super::*` that the
 // orchestration core itself no longer references after the split.

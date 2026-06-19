@@ -720,7 +720,7 @@ impl Drop for RuntimeAgentStreamWatch {
 }
 
 impl MarmotAppRuntime {
-    pub fn subscribe_messages(
+    pub async fn subscribe_messages(
         &self,
         account_ref: &str,
         query: AppMessageQuery,
@@ -742,13 +742,40 @@ impl MarmotAppRuntime {
         // reload the full group history (keeping the group filter) and rely on
         // `seen_message_ids` to dedupe what was already delivered. See #180.
         let recovery_query = messages_recovery_query(&query);
-        let snapshot = self.messages_with_query(&account.account_id_hex, query)?;
+        let snapshot_query = query;
+        let app_for_snapshot = app.clone();
+        let account_label_for_snapshot = account_label.clone();
+        let snapshot = blocking_app_task(move || {
+            app_for_snapshot.messages_with_query(&account_label_for_snapshot, snapshot_query)
+        })
+        .await?;
         let mut seen_message_ids = MessageSubscriptionSeenIds::from_ids(
             snapshot
                 .iter()
                 .map(|message| message.message_id_hex.clone()),
             MESSAGE_SUBSCRIPTION_SEEN_ID_LIMIT,
         );
+        // Pre-subscription watermark for lag recovery. `seen_message_ids` is a
+        // BOUNDED LRU seeded only from the (possibly `limit`-capped) snapshot,
+        // so it cannot, on its own, distinguish "older pre-subscription history
+        // the caller never asked for" from "a genuinely new post-subscription
+        // message". Without a watermark, the first broadcast lag re-reads the
+        // full group history (recovery drops `limit`, see #180) and re-emits
+        // every older row that isn't in the limited seen-set — so a mobile
+        // caller using `limit: Some(25)` to avoid full-history replay gets the
+        // entire back-history dumped as "live" updates on first lag.
+        //
+        // The store returns rows ascending by `(recorded_at, message_id_hex)`,
+        // and a limited snapshot is the latest N of that order, so the snapshot's
+        // last row is the newest message that existed at subscription time. Any
+        // recovery row at or below this key is pre-existing history and must be
+        // suppressed; only strictly-newer rows are genuinely missed live
+        // messages worth re-emitting (still deduped via `seen_message_ids`).
+        // `None` (empty snapshot) means no pre-existing history, so recovery
+        // emits everything as before.
+        let recovery_watermark: Option<(u64, String)> = snapshot
+            .last()
+            .map(|message| (message.recorded_at, message.message_id_hex.clone()));
         let (updates_tx, updates_rx) = mpsc::channel(APP_RUNTIME_SUBSCRIPTION_BUFFER);
         tokio::spawn(async move {
             loop {
@@ -782,7 +809,22 @@ impl MarmotAppRuntime {
                             Err(_) => continue,
                         };
                         for update in updates {
-                            let message_id = update.message().message_id_hex.clone();
+                            let message = update.message();
+                            // Suppress pre-existing history at or below the
+                            // subscription watermark. Recovery reloads the full
+                            // group history (no `limit`), so without this a
+                            // limited subscriber would receive every older row
+                            // as a bogus "live" update on the first lag. Only
+                            // messages strictly newer than the watermark are
+                            // genuinely-missed live messages.
+                            if recovery_row_is_pre_subscription(
+                                recovery_watermark.as_ref(),
+                                message.recorded_at,
+                                &message.message_id_hex,
+                            ) {
+                                continue;
+                            }
+                            let message_id = message.message_id_hex.clone();
                             if !message_id.is_empty() && !seen_message_ids.insert(message_id) {
                                 continue;
                             }
@@ -1291,6 +1333,33 @@ pub(crate) fn messages_recovery_query(query: &AppMessageQuery) -> AppMessageQuer
     AppMessageQuery {
         group_id_hex: query.group_id_hex.clone(),
         limit: None,
+    }
+}
+
+/// True when a lag-recovery row is at or below the subscription's pre-existing
+/// watermark — i.e. it existed at subscription time and must NOT be re-emitted
+/// as a live update.
+///
+/// `watermark` is `(recorded_at, message_id_hex)` of the newest message that
+/// existed when the subscription was created (the last row of the ascending
+/// snapshot; `None` for an empty snapshot). Because lag recovery drops the
+/// caller's initial-replay `limit` and reloads the full group history (see
+/// #180), a limited subscriber would otherwise receive every older row as a
+/// bogus live update on the first lag. Comparing on the canonical
+/// `(recorded_at, message_id_hex)` key — the same order the store returns —
+/// suppresses pre-subscription history while still admitting genuinely-new
+/// messages (strictly greater than the watermark). An empty watermark means
+/// there was no pre-existing history, so nothing is suppressed.
+pub(crate) fn recovery_row_is_pre_subscription(
+    watermark: Option<&(u64, String)>,
+    recorded_at: u64,
+    message_id_hex: &str,
+) -> bool {
+    match watermark {
+        Some((watermark_at, watermark_id)) => {
+            (recorded_at, message_id_hex) <= (*watermark_at, watermark_id.as_str())
+        }
+        None => false,
     }
 }
 

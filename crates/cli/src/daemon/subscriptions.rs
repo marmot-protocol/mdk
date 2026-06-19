@@ -39,13 +39,16 @@ pub(crate) async fn handle_messages_subscription(
         return Ok(());
     };
     let stream_manager = runtime.shared_services().agent_streams();
-    let mut runtime_subscription = match runtime.subscribe_messages(
-        &account_ref,
-        marmot_app::AppMessageQuery {
-            group_id_hex: group_id.clone(),
-            limit,
-        },
-    ) {
+    let mut runtime_subscription = match runtime
+        .subscribe_messages(
+            &account_ref,
+            marmot_app::AppMessageQuery {
+                group_id_hex: group_id.clone(),
+                limit,
+            },
+        )
+        .await
+    {
         Ok(subscription) => subscription,
         Err(err) => {
             let _ =

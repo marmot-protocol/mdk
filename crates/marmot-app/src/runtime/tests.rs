@@ -1079,6 +1079,56 @@ fn messages_recovery_query_preserves_absent_group_filter() {
 }
 
 #[test]
+fn limited_subscription_recovery_suppresses_pre_subscription_history() {
+    // Regression for the limited-snapshot lag-replay bug: a caller using
+    // `limit: Some(N)` to avoid full-history replay must NOT receive the entire
+    // older history as live updates on the first broadcast lag. Recovery drops
+    // the limit and reloads the full group history, so the watermark
+    // (the newest row that existed at subscription time = the last row of the
+    // ascending limited snapshot) is what distinguishes pre-existing history
+    // (suppress) from genuinely-new post-subscription messages (emit).
+    //
+    // Scenario: full history is rows recorded_at 10,20,30,40,50; a `limit: 2`
+    // snapshot holds 40,50, so the watermark is (50, "id50"). On lag, recovery
+    // reloads ALL five rows. Rows 10-50 are at/below the watermark and must be
+    // suppressed; a genuinely-new row (60) arriving after subscription must be
+    // emitted.
+    let watermark = Some((50_u64, "id50".to_owned()));
+
+    // Every pre-subscription row (including the watermark row itself) is
+    // suppressed — even the ones the limited snapshot never contained (10/20/30).
+    for (at, id) in [
+        (10, "id10"),
+        (20, "id20"),
+        (30, "id30"),
+        (40, "id40"),
+        (50, "id50"),
+    ] {
+        assert!(
+            recovery_row_is_pre_subscription(watermark.as_ref(), at, id),
+            "row ({at}, {id}) existed at subscription time and must be suppressed on recovery"
+        );
+    }
+
+    // A genuinely-new post-subscription row is emitted.
+    assert!(
+        !recovery_row_is_pre_subscription(watermark.as_ref(), 60, "id60"),
+        "a message newer than the watermark is a real missed live update and must be emitted"
+    );
+
+    // Same-second tie-break: a row at the watermark timestamp but a larger
+    // message id sorts strictly after the watermark and must be emitted.
+    assert!(
+        !recovery_row_is_pre_subscription(watermark.as_ref(), 50, "id99"),
+        "same-timestamp row with a greater id sorts after the watermark and must be emitted"
+    );
+
+    // An empty snapshot has no watermark, so recovery suppresses nothing
+    // (unchanged behavior for unlimited / empty-history subscriptions).
+    assert!(!recovery_row_is_pre_subscription(None, 10, "id10"));
+}
+
+#[test]
 fn lifecycle_refuses_account_open_after_shutdown_begins() {
     let lifecycle = RuntimeLifecycle::new();
 

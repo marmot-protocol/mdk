@@ -723,7 +723,7 @@ async fn message_history_binding_methods_validate_group_hex() {
     assert!(format!("{invalid_group}").contains("invalid hex"));
 
     let invalid_subscribe = match kit
-        .subscribe_messages("missing".into(), Some("not-hex".into()))
+        .subscribe_messages("missing".into(), Some("not-hex".into()), Some(25))
         .await
     {
         Ok(_) => panic!("invalid group hex subscription should fail"),

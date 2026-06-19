@@ -67,18 +67,20 @@ impl Marmot {
     }
 
     /// Messages for a specific group (when `group_id_hex` is `Some`) or
-    /// every message across the account (when `None`). Async for the same
-    /// tokio-runtime reason as [`Marmot::subscribe_chats`].
+    /// every message across the account (when `None`). `limit` caps the initial
+    /// snapshot to the latest N rows; live updates continue after the snapshot.
+    /// Async for the same tokio-runtime reason as [`Marmot::subscribe_chats`].
     pub async fn subscribe_messages(
         &self,
         account_ref: String,
         group_id_hex: Option<String>,
+        limit: Option<u32>,
     ) -> Result<Arc<MessagesSubscription>, MarmotKitError> {
         let query = AppMessageQuery {
             group_id_hex: optional_group_id_hex(group_id_hex)?,
-            limit: None,
+            limit: limit.map(|n| n as usize),
         };
-        let inner = self.runtime.subscribe_messages(&account_ref, query)?;
+        let inner = self.runtime.subscribe_messages(&account_ref, query).await?;
         Ok(MessagesSubscription::new(inner))
     }
 
