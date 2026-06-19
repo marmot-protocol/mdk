@@ -83,7 +83,7 @@ pub fn generate_convergence_chaos_family(seed: u64, cases: usize) -> Vec<Generat
         let (scenario, expected_outcomes) = convergence_chaos_case(&mut rng, case_index as u64);
         out.push(GeneratedScenarioCase {
             family_name: "convergence-chaos/v1".into(),
-            generator_version: "2".into(),
+            generator_version: "3".into(),
             seed,
             case_index: case_index as u64,
             scenario,
@@ -351,11 +351,13 @@ fn convergence_chaos_rollback_queue_faults(
     }
     // Seed-driven delivery schedule for the post-rollback messages.
     steps.push(ScenarioStep::ReorderQueued { order });
-    // Duplicate the rolled-back commit at the queue head and delay the copy so
-    // the released duplicate is deduped across the rollback regardless of seed.
-    steps.push(ScenarioStep::DuplicateQueued { index: 0 });
+    // Duplicate the first post-rollback app message, not the rolled-back commit
+    // pinned at queue head. The original reaches alice in the first delivery
+    // pass; the delayed copy is released and ticked separately, so this shape
+    // exercises duplicate app-message handling under a rollback-tainted queue.
+    steps.push(ScenarioStep::DuplicateQueued { index: 1 });
     steps.push(ScenarioStep::DelayQueued {
-        index: 1,
+        index: 2,
         delayed: "duplicate-app".into(),
     });
     steps.push(ScenarioStep::DeliverAll);

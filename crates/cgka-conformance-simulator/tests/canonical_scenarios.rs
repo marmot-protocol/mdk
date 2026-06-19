@@ -766,7 +766,7 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
     for (case_index, case) in cases.iter().enumerate() {
         assert_eq!(case.family_name, "convergence-chaos/v1");
-        assert_eq!(case.generator_version, "2");
+        assert_eq!(case.generator_version, "3");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
 
@@ -844,6 +844,62 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
         );
         assert!(report.invariant_failures.is_empty());
     }
+}
+
+#[tokio::test]
+async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message() {
+    // Regression for darkmatter#163: the rollback arm must duplicate and delay
+    // a Bob app message that Alice actually ticks, not the rolled-back commit
+    // pinned at queue index 0 and addressed to Bob.
+    let cases = generate_convergence_chaos_family(123, 3);
+    let case = &cases[2];
+
+    let duplicate_index = case
+        .scenario
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ScenarioStep::DuplicateQueued { index } => Some(*index),
+            _ => None,
+        })
+        .expect("rollback arm should duplicate a queued message");
+    assert_eq!(
+        duplicate_index, 1,
+        "queue index 0 is Alice's rolled-back commit to Bob; duplicate the first post-rollback app message instead",
+    );
+
+    let delayed_copy = case
+        .scenario
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ScenarioStep::DelayQueued { index, delayed } => Some((*index, delayed.as_str())),
+            _ => None,
+        })
+        .expect("rollback arm should delay the duplicate copy");
+    assert_eq!(delayed_copy, (2, "duplicate-app"));
+
+    let report = run_generated_case_report(case, None)
+        .await
+        .expect("rollback duplicate-app case reports");
+    assert!(
+        report.expectation_failures.is_empty(),
+        "rollback duplicate-app expectations failed: {:?}",
+        report.expectation_failures
+    );
+    assert!(report.invariant_failures.is_empty());
+
+    let trace = report.observed_trace.as_ref().expect("trace");
+    let alice = trace
+        .observations
+        .iter()
+        .find(|observation| observation.client == "alice")
+        .expect("alice observation");
+    assert_eq!(
+        alice.received_payloads.len(),
+        6,
+        "Alice should receive the six unique post-rollback app payloads; the released duplicate must not emit a seventh",
+    );
 }
 
 #[tokio::test]

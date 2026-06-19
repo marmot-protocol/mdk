@@ -179,7 +179,7 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 
 ### `convergence-chaos/v1`
 
-- Generator: `generate_convergence_chaos_family` (generator version `2`).
+- Generator: `generate_convergence_chaos_family` (generator version `3`).
 - Setup: the family rotates through the case classes below.
 - Expected: each case carries semantic expectations for convergence, rollback, payload delivery, or recovery.
 - Seed behavior: the rollback (`2`) and storm shapes (`6`, `7`, `8`, `9`) draw their delivery schedule from the seed,
@@ -202,10 +202,10 @@ regression, covers a new semantic edge, or is the smallest readable example of a
 #### Chaos Class `2`: Rollback Queue Faults
 
 - Setup: Alice rolls back a group-data update. Bob sends several app messages after the rollback.
-- Pressure: a seed-driven delivery reorder of the post-rollback messages, plus a duplicated and delayed copy of the
-  rolled-back commit redelivered across the rollback.
+- Pressure: a seed-driven delivery reorder of the post-rollback messages, plus a duplicated and delayed copy of one app
+  message released after Alice has already processed the original.
 - Expected: Alice remains at epoch 1 and receives Bob's post-rollback payloads once each, in the seed-driven delivery
-  order (the redelivered commit is deduped).
+  order (the released app duplicate is deduped).
 
 #### Chaos Class `3`: Partition Leave
 
