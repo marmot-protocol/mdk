@@ -99,6 +99,16 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
     pub message_id_hex: String,
+    /// Delivery marker for own (`direction == "sent"`) messages. An own send
+    /// commits and projects locally *before* it publishes, so a message that
+    /// was committed but not yet delivered (e.g. sent offline / relay
+    /// unreachable) carries `None` here — render it as pending/failed. On
+    /// delivery/convergence the same row is upserted with `Some(..)` (the
+    /// published source event id), so flip the UI to delivered once this
+    /// becomes non-null. To re-drive delivery of a stuck pending message
+    /// without minting a duplicate, call `retry_group_convergence` rather than
+    /// re-sending the text. For received messages this is the originating event
+    /// id and is always `Some(..)`.
     pub source_message_id_hex: Option<String>,
     pub direction: String,
     pub group_id_hex: String,

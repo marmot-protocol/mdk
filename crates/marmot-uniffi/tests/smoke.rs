@@ -754,3 +754,31 @@ async fn message_history_binding_methods_validate_group_hex() {
         .expect_err("missing account should fail after hex validation");
     assert!(format!("{missing_account}").contains("missing"));
 }
+
+#[tokio::test]
+async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    // The convergence-retry binding (darkmatter#472) must reject invalid group
+    // hex with InvalidHex before any account/runtime work, matching every other
+    // group-scoped FFI method.
+    let invalid_group = kit
+        .retry_group_convergence("missing".into(), "not-hex".into())
+        .await
+        .expect_err("invalid group hex should fail before account lookup");
+    assert!(format!("{invalid_group}").contains("invalid hex"));
+
+    // Valid hex gets past validation and then fails on the missing account,
+    // proving the value was decoded rather than treated as an opaque string.
+    let missing_account = kit
+        .retry_group_convergence("missing".into(), "AB".repeat(32))
+        .await
+        .expect_err("missing account should fail after hex validation");
+    assert!(format!("{missing_account}").contains("missing"));
+}

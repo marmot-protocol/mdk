@@ -29,6 +29,31 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Re-attempt publishing a group's pending (committed-but-undelivered)
+    /// commit(s) without minting a new event.
+    ///
+    /// An own send commits and projects locally *before* it publishes, so a
+    /// message sent while offline (or when the relay was unreachable) lands in
+    /// the timeline with `source_message_id_hex == null` — committed, not yet
+    /// delivered. Re-sending the same text would mint a fresh commit and event
+    /// id, duplicating the bubble. This drives the existing pending commit to
+    /// the relays via convergence instead, so the original timeline row flips
+    /// to delivered (`source_message_id_hex == Some(..)`) on success and no new
+    /// event is created. Returns the delivery summary; `published == 0` means
+    /// nothing was pending or publishing is still failing.
+    pub async fn retry_group_convergence(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .retry_group_convergence(&account_ref, &group_id)
+            .await?;
+        Ok(summary.into())
+    }
+
     /// React to `target_message_id` with `emoji` (an "add" reaction).
     pub async fn react_to_message(
         &self,
