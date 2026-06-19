@@ -122,6 +122,19 @@ fn account_home_rejects_path_like_labels() {
 }
 
 #[test]
+fn account_home_rejects_windows_drive_relative_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let secret_hex = nostr::Keys::generate().secret_key().to_secret_hex();
+
+    assert!(matches!(
+        home.import_account("C:evil", &secret_hex),
+        Err(AccountHomeError::InvalidAccountLabel(label)) if label == "C:evil"
+    ));
+    assert!(!dir.path().join("accounts").join("C:evil").exists());
+}
+
+#[test]
 fn account_home_can_derive_identity_before_importing_secret() {
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 

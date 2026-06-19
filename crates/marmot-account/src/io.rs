@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -63,11 +63,14 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> AccountHomeResult<()> {
 }
 
 pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
-    if label.is_empty()
-        || label == "."
-        || label == ".."
+    let mut components = Path::new(label).components();
+    let is_single_normal_component =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+
+    if !is_single_normal_component
         || label.contains('/')
         || label.contains('\\')
+        || label.contains(':')
     {
         return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
     }
