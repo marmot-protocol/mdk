@@ -1753,11 +1753,19 @@ fn account_create_rejects_nsec_argv_and_accepts_stdin_secret() {
 
 #[test]
 fn whitenoise_identity_commands_create_login_and_show_accounts() {
+    // This test exercises the full create-identity + login + KeyPackage publish
+    // flow, which is publish-heavy. Use a DEDICATED relay rather than the shared
+    // process-wide `test_relay_url()` MockRelay: under parallel test load, many
+    // subprocesses connecting to one shared relay race, and the login publish
+    // intermittently fails with "publish failed: relay not connected". A private
+    // relay removes the cross-test connection contention without serializing the
+    // whole relay-backed suite. (Fixes flaky CI; see issue #463.)
     let home = tempfile::tempdir().expect("tempdir");
-    let relay = test_relay_url();
+    let dedicated_relay = TestRelay::new();
+    let relay = dedicated_relay.url();
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 
-    let created = run_json(home.path(), &["create-identity"]);
+    let created = run_json_with_relay(home.path(), relay, &["create-identity"]);
     assert_eq!(created["local_signing"], true);
     assert!(created["npub"].as_str().expect("npub").starts_with("npub1"));
     assert_eq!(created["key_package"]["published"], true);
@@ -1770,15 +1778,19 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
     assert_eq!(display_name, profile_name);
     assert_two_word_pseudonym(profile_name);
 
-    let shown_profile = run_json(home.path(), &["--account", created_id, "profile", "show"]);
+    let shown_profile = run_json_with_relay(
+        home.path(),
+        relay,
+        &["--account", created_id, "profile", "show"],
+    );
     assert_eq!(shown_profile["profile"], created["profile"]);
 
     let positional_error = run_json_error(home.path(), &["login", nsec, "--relay", relay]);
     assert_eq!(positional_error["code"], "secret_argument_rejected");
     assert!(!positional_error.to_string().contains(nsec));
 
-    let logged_in = run_json_with_stdin(
-        home.path(),
+    let logged_in = run_json_with_stdin_command(
+        dm_with_relay(home.path(), relay),
         &["login", "--nsec-stdin", "--relay", relay],
         &format!("{nsec}\n"),
     );
@@ -1787,7 +1799,7 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
     assert_eq!(logged_in["key_package"]["published"], true);
     assert!(logged_in["key_package"]["bytes"].as_u64().expect("bytes") > 0);
 
-    let whoami = run_json(home.path(), &["whoami"]);
+    let whoami = run_json_with_relay(home.path(), relay, &["whoami"]);
     let accounts = whoami["accounts"].as_array().expect("accounts");
     assert_eq!(accounts.len(), 2);
     assert!(
@@ -1796,7 +1808,7 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
             .all(|account| account["local_signing"] == true)
     );
 
-    let accounts_list = run_json(home.path(), &["accounts", "list"]);
+    let accounts_list = run_json_with_relay(home.path(), relay, &["accounts", "list"]);
     assert_eq!(
         accounts_list["accounts"]
             .as_array()

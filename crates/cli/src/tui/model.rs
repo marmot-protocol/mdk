@@ -1172,7 +1172,24 @@ pub(crate) fn group_component_diagnostics(group: &Value) -> Vec<GroupComponentDi
 }
 
 pub(crate) fn terminal_safe_text(value: &str) -> String {
-    value.chars().filter(|ch| !ch.is_control()).collect()
+    value
+        .chars()
+        .filter(|ch| !ch.is_control() && !is_terminal_spoofing_format_control(*ch))
+        .collect()
+}
+
+fn is_terminal_spoofing_format_control(ch: char) -> bool {
+    // Deny invisible bidi and zero-width format controls that can spoof
+    // untrusted terminal-rendered labels/messages without being Unicode Cc.
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 pub(crate) fn shorten(value: &str, max_len: usize) -> String {

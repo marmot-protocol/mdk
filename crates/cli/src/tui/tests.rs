@@ -599,6 +599,16 @@ fn message_lines_keep_chronological_order_and_summarize_stream_markers() {
 }
 
 #[test]
+fn terminal_safe_text_strips_bidi_and_zero_width_format_characters() {
+    assert_eq!(
+        terminal_safe_text(
+            "safe\u{202a}name\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{feff}done",
+        ),
+        "safenamedone"
+    );
+}
+
+#[test]
 fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
     let messages = vec![MessageRow {
         message_id: "01".to_owned(),
