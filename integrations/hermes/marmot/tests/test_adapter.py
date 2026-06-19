@@ -421,20 +421,65 @@ class TranscriptTests(unittest.TestCase):
     def setUp(self):
         self.adapter = load_adapter_module()
 
+    def test_quic_varint_encoder_matches_rfc9000_boundaries(self):
+        cases = {
+            0: "00",
+            32: "20",
+            63: "3f",
+            64: "4040",
+            16383: "7fff",
+            16384: "80004000",
+            1073741823: "bfffffff",
+            1073741824: "c000000040000000",
+            4611686018427387903: "ffffffffffffffff",
+        }
+
+        for value, expected_hex in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(self.adapter._encode_quic_varint(value).hex(), expected_hex)
+
+        with self.assertRaises(ValueError):
+            self.adapter._encode_quic_varint(-1)
+        with self.assertRaises(ValueError):
+            self.adapter._encode_quic_varint(4611686018427387904)
+
     def test_transcript_matches_rust_status_hash_fixture(self):
+        # Mirrors crates/cgka-conformance-simulator/tests/agent_text_stream_vectors.rs:
+        # fixed stream_id 0x40..0x5f, fixed start_event_id 0xc0..0xdf,
+        # record type 1 text_delta "hello", then record type 3 status "thinking".
         transcript = self.adapter.AgentTextStreamTranscript(
-            stream_id_hex="11" * 32,
-            start_message_id_hex="22" * 32,
+            stream_id_hex=bytes(range(0x40, 0x60)).hex(),
+            start_message_id_hex=bytes(range(0xC0, 0xE0)).hex(),
             chunk_bytes=1024,
         )
 
+        self.assertEqual(
+            transcript.hash_hex,
+            "e4ef961892a7425c1c279f747920ac18d55810732f2aa6b20b330f2666714c78",
+        )
         transcript.append_text("hello")
         transcript.append_status("thinking")
 
         self.assertEqual(transcript.chunk_count, 2)
         self.assertEqual(
             transcript.hash_hex,
-            "455be8152d19c352ee9f982274cf5d9b6b7d929a4f198be4ef05f75328921b32",
+            "c0bc23a83a5607f29babfd40464c454306674b82b4653c88fd6f8dbb77e1415c",
+        )
+
+    def test_default_stream_chunking_matches_connector_compose_default(self):
+        self.assertEqual(self.adapter.DEFAULT_STREAM_CHUNK_BYTES, 1024)
+
+        transcript = self.adapter.AgentTextStreamTranscript(
+            stream_id_hex="11" * 32,
+            start_message_id_hex="22" * 32,
+            chunk_bytes=self.adapter.DEFAULT_STREAM_CHUNK_BYTES,
+        )
+        transcript.append_text("a" * (self.adapter.DEFAULT_STREAM_CHUNK_BYTES + 1))
+
+        self.assertEqual(transcript.chunk_count, 2)
+        self.assertEqual(
+            [len(chunk) for chunk in self.adapter.split_text_deltas("a" * 1025, 1024)],
+            [1024, 1],
         )
 
     def test_append_only_delta_rejects_replacements(self):

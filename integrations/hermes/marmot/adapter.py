@@ -1543,8 +1543,23 @@ def _optional_hex(value: Any, field: str = "hex") -> Optional[str]:
     return _normalize_hex(value, field)
 
 
+def _encode_quic_varint(value: int) -> bytes:
+    value = int(value)
+    if value < 0:
+        raise ValueError("QUIC varint value must be non-negative")
+    if value < 0x40:
+        return value.to_bytes(1, "big")
+    if value < 0x4000:
+        return (value | 0x4000).to_bytes(2, "big")
+    if value < 0x40000000:
+        return (value | 0x80000000).to_bytes(4, "big")
+    if value < 0x4000000000000000:
+        return (value | 0xC000000000000000).to_bytes(8, "big")
+    raise ValueError("QUIC varint value exceeds 2^62-1")
+
+
 def _hash_len_prefixed(hasher: Any, data: bytes) -> None:
-    hasher.update(len(data).to_bytes(8, "big"))
+    hasher.update(_encode_quic_varint(len(data)))
     hasher.update(data)
 
 
