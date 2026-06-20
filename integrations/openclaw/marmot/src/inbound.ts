@@ -24,6 +24,7 @@ export interface MarmotGroupInvite {
 export interface MarmotInboundBridgeOptions {
   accountIdHex?: string | null;
   groupIdHex?: string | null;
+  onReady?: () => void | Promise<void>;
   onMessage: (message: MarmotInboundMessage) => void | Promise<void>;
   /** The agent joined a group via a welcome (used to greet/onboard on join). */
   onGroupInvite?: (invite: MarmotGroupInvite) => void | Promise<void>;
@@ -94,6 +95,7 @@ export class MarmotInboundBridge {
             groupIdHex: this.options.groupIdHex ?? null,
           },
           signal,
+          { onReady: () => void this.options.onReady?.() },
         )) {
           if (signal.aborted) {
             return;

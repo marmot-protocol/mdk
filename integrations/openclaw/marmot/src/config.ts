@@ -30,6 +30,7 @@ export interface MarmotChannelAccountConfig {
   groupIdHex?: string;
   quicCandidates?: string[] | string;
   streaming?: MarmotStreamingConfig | boolean;
+  blockStreaming?: boolean;
   profileNameOnboarding?: boolean;
   dm?: {
     enabled?: boolean;
@@ -47,6 +48,7 @@ export interface ResolvedMarmotAccount {
   groupIdHex?: string;
   quicCandidates: string[];
   streamMode: StreamMode;
+  blockStreaming: boolean;
   profileNameOnboarding: boolean;
   profileOnboardingStatePath: string;
   dmPolicy?: string;
@@ -79,6 +81,11 @@ const MARMOT_ACCOUNT_PROPERTIES = {
     type: ["object", "boolean"],
     description:
       "Live QUIC preview streaming: { mode: off|partial|block|progress }. 'block' is the default; 'partial'/'progress' are handled best-effort with transcript-backed final recovery. Boolean accepted for legacy on/off.",
+  },
+  blockStreaming: {
+    type: "boolean",
+    description:
+      "Enable OpenClaw completed-block delivery into Marmot's live preview sink. Defaults on when QUIC candidates are configured and Marmot streaming is not off.",
   },
   profileNameOnboarding: { type: "boolean" },
   dm: {
@@ -187,6 +194,25 @@ function resolveStreamMode(
   return "block";
 }
 
+function resolveBlockStreaming(
+  cfg: MarmotChannelAccountConfig,
+  env: Record<string, string | undefined>,
+  streamMode: StreamMode,
+  quicCandidates: string[],
+): boolean {
+  const fromEnv = parseBoolEnv(env.MARMOT_BLOCK_STREAMING);
+  if (fromEnv !== undefined) {
+    return fromEnv;
+  }
+  if (typeof cfg.blockStreaming === "boolean") {
+    return cfg.blockStreaming;
+  }
+  if (typeof cfg.streaming === "object" && typeof cfg.streaming.block?.enabled === "boolean") {
+    return cfg.streaming.block.enabled;
+  }
+  return streamMode !== "off" && quicCandidates.length > 0;
+}
+
 /**
  * Resolve the dm-agent connection + policy for an OpenClaw account, layering
  * channel config over MARMOT_* environment variables (config wins).
@@ -228,6 +254,9 @@ export function resolveMarmotAccount(
     home,
   );
 
+  const streamMode = resolveStreamMode(cfg.streaming, env.MARMOT_STREAM_MODE);
+  const blockStreaming = resolveBlockStreaming(cfg, env, streamMode, quicCandidates);
+
   return {
     accountId: accountId ?? null,
     socketPath,
@@ -235,7 +264,8 @@ export function resolveMarmotAccount(
     marmotAccountIdHex: firstNonEmpty(cfg.accountIdHex, env.MARMOT_ACCOUNT_ID_HEX),
     groupIdHex: firstNonEmpty(cfg.groupIdHex, env.MARMOT_GROUP_ID_HEX),
     quicCandidates,
-    streamMode: resolveStreamMode(cfg.streaming, env.MARMOT_STREAM_MODE),
+    streamMode,
+    blockStreaming,
     // On by default: the agent always offers to publish a profile on join; the
     // user's in-chat choice is the consent. Operators can disable it explicitly.
     profileNameOnboarding:

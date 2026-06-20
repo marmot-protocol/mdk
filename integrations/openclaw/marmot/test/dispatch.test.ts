@@ -1,7 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { StreamMode } from "../src/config.js";
-import { MarmotReplySink, type MarmotSinkClient } from "../src/dispatch.js";
+import {
+  createMarmotInboundDispatcher,
+  MarmotReplySink,
+  type MarmotSinkClient,
+  type OpenClawChannelRuntime,
+} from "../src/dispatch.js";
+
+vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
+  buildChannelInboundEventContext: vi.fn((params: unknown) => params),
+  runChannelInboundEvent: vi.fn(
+    async (params: { adapter: { resolveTurn: () => { runDispatch: () => Promise<unknown> } } }) => {
+      await params.adapter.resolveTurn().runDispatch();
+    },
+  ),
+}));
 
 const HEX32 = (b: string) => b.repeat(32);
 const STREAM_ID = HEX32("11");
@@ -10,7 +24,7 @@ const START_ID = HEX32("22");
 const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb730d5c5a81";
 
 interface Calls {
-  sendFinal: { text: string; replyTo: string | null }[];
+  sendFinal: { accountIdHex: string; text: string; replyTo: string | null }[];
   begin: number;
   append: string[];
   status: string[];
@@ -26,7 +40,7 @@ function emptyCalls(): Calls {
 function stubClient(calls: Calls): MarmotSinkClient {
   return {
     async sendFinal(_account: string, _group: string, text: string, replyTo?: string | null) {
-      calls.sendFinal.push({ text, replyTo: replyTo ?? null });
+      calls.sendFinal.push({ accountIdHex: _account, text, replyTo: replyTo ?? null });
       return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
     },
     async streamBegin() {
@@ -195,7 +209,7 @@ describe("MarmotReplySink", () => {
 
   it("can prewarm a live preview before answer text arrives", async () => {
     const calls = emptyCalls();
-    const sink = makeSink(calls);
+    const sink = makeSink(calls, { streamMode: "partial" });
     await sink.prewarm();
     await sink.partial({ text: "done" });
     await sink.flush();
@@ -204,6 +218,19 @@ describe("MarmotReplySink", () => {
     expect(calls.status).toEqual([]);
     expect(calls.append).toEqual(["done"]);
     expect(calls.finalize[0]?.count).toBe(1);
+    expect(calls.sendFinal).toEqual([]);
+  });
+
+  it("abandons partial-only block previews instead of committing tool acknowledgements", async () => {
+    const calls = emptyCalls();
+    const sink = makeSink(calls, { streamMode: "block" });
+    await sink.prewarm();
+    await sink.partial({ text: "Sent." });
+    await sink.flush();
+
+    expect(calls.append).toEqual(["Sent."]);
+    expect(calls.cancel).toHaveLength(1);
+    expect(calls.finalize).toEqual([]);
     expect(calls.sendFinal).toEqual([]);
   });
 
@@ -352,5 +379,74 @@ describe("MarmotReplySink", () => {
     const calls = emptyCalls();
     await makeSink(calls, { streamMode: "off" }).deliver({ text: "searching..." }, { kind: "tool" });
     expect(calls).toEqual(emptyCalls());
+  });
+});
+
+describe("createMarmotInboundDispatcher", () => {
+  it("enables OpenClaw block streaming when Marmot live block streaming is resolved on", async () => {
+    const calls = emptyCalls();
+    const captured: unknown[] = [];
+    const routeInputs: unknown[] = [];
+    const runtimeChannel: OpenClawChannelRuntime = {
+      routing: {
+        resolveAgentRoute: (input) => {
+          routeInputs.push(input);
+          return {
+            agentId: "agent",
+            accountId: "default",
+            sessionKey: "agent:marmot",
+          };
+        },
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-test-session-store",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          captured.push(params);
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "done" }, { kind: "final" });
+        },
+      },
+    };
+    const dispatch = createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel,
+      client: stubClient(calls),
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: true,
+      quicCandidates: [],
+    });
+
+    await dispatch({
+      accountIdHex: HEX32("aa"),
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("dd"),
+      senderAccountIdHex: HEX32("bb"),
+      text: "hello",
+    });
+
+    expect(routeInputs).toEqual([
+      {
+        cfg: {},
+        channel: "marmot",
+        accountId: "default",
+        peer: { kind: "group", id: HEX32("cc") },
+      },
+    ]);
+    expect(captured).toHaveLength(1);
+    expect((captured[0] as { ctx: { accountId: string } }).ctx.accountId).toBe("default");
+    expect(
+      (captured[0] as { replyOptions: { disableBlockStreaming?: boolean } }).replyOptions
+        .disableBlockStreaming,
+    ).toBe(false);
+    expect(calls.sendFinal[0]?.accountIdHex).toBe(HEX32("aa"));
+    expect(calls.sendFinal.map((c) => c.text)).toEqual(["done"]);
   });
 });

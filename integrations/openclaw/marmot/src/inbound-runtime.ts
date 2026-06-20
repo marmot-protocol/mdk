@@ -20,6 +20,13 @@ import {
   maybeSendProfilePromptOnJoin,
   ProfileNameOnboardingStore,
 } from "./profile-onboarding.js";
+import {
+  markMarmotInboundReady,
+  markMarmotInboundReceived,
+  markMarmotInboundReconnect,
+  markMarmotInboundStarting,
+  markMarmotInboundStopped,
+} from "./runtime-state.js";
 import { syncAllowlist } from "./security.js";
 
 /** Minimal logger surface (subset of OpenClaw's PluginLogger). */
@@ -79,13 +86,17 @@ export function startMarmotInbound(
     api.logger.info("marmot: inbound subscription already active; ignoring duplicate start");
     return () => {};
   }
+  const resolved = resolveAccount(api);
+  const statusAccountId = resolved.accountId ?? null;
   inboundActive = true;
+  markMarmotInboundStarting(statusAccountId);
   const controller = new AbortController();
   // Release the guard when the loop is stopped so a clean restart can re-subscribe.
   controller.signal.addEventListener(
     "abort",
     () => {
       inboundActive = false;
+      markMarmotInboundStopped(statusAccountId);
     },
     { once: true },
   );
@@ -99,7 +110,6 @@ export function startMarmotInbound(
     }
   }
   const signal = controller.signal;
-  const resolved = resolveAccount(api);
   const client = (options.clientFactory ?? clientForAccount)(resolved);
   // One-time, opt-in public profile-name flow (default off). Runs ahead of the
   // agent turn so a consent prompt/reply isn't fed to the model.
@@ -113,13 +123,25 @@ export function startMarmotInbound(
       accountIdHex = resolved.marmotAccountIdHex ?? (await resolveSingleAccount(client));
     } catch {
       api.logger.warn("marmot: could not resolve an agent account for the inbound subscription");
+      inboundActive = false;
+      markMarmotInboundStopped(statusAccountId);
       return;
     }
-    api.logger.info("marmot: inbound subscription established");
+    let readyLogged = false;
     const bridge = new MarmotInboundBridge(client, {
       accountIdHex,
       groupIdHex: resolved.groupIdHex ?? null,
+      onReady: () => {
+        markMarmotInboundReady(statusAccountId);
+        api.logger.info(
+          readyLogged
+            ? "marmot: inbound subscription re-established"
+            : "marmot: inbound subscription established",
+        );
+        readyLogged = true;
+      },
       onMessage: async (message) => {
+        markMarmotInboundReceived(statusAccountId);
         if (onboardingStore) {
           const intercepted = await maybeHandleProfileOnboardingInbound({
             store: onboardingStore,
@@ -142,6 +164,7 @@ export function startMarmotInbound(
       },
       onGroupInvite: onboardingStore
         ? async ({ accountIdHex: joinedAccountIdHex, groupIdHex: joinedGroupIdHex }) => {
+            markMarmotInboundReceived(statusAccountId);
             // Greet on join: offer to publish a public profile name (once).
             await maybeSendProfilePromptOnJoin({
               store: onboardingStore,
@@ -154,11 +177,13 @@ export function startMarmotInbound(
           }
         : undefined,
       onResync: ({ droppedEvents }) => {
+        markMarmotInboundReceived(statusAccountId);
         api.logger.warn(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,
         );
       },
       onError: () => {
+        markMarmotInboundReconnect(statusAccountId);
         api.logger.warn("marmot: inbound subscription dropped; reconnecting");
       },
     });

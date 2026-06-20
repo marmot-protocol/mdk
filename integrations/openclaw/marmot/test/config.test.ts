@@ -21,6 +21,7 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.marmotAccountIdHex).toBe("aa");
     expect(resolved.quicCandidates).toEqual(["quic://a:1", "quic://b:2"]);
     expect(resolved.streamMode).toBe("block");
+    expect(resolved.blockStreaming).toBe(true);
     expect(resolved.accountId).toBe("openclaw-acct");
   });
 
@@ -34,6 +35,25 @@ describe("resolveMarmotAccount", () => {
     expect(resolved.marmotAccountIdHex).toBe("bb");
     expect(resolved.quicCandidates).toEqual(["quic://c:3"]);
     expect(resolved.streamMode).toBe("off");
+    expect(resolved.blockStreaming).toBe(false);
+  });
+
+  it("resolves explicit block-streaming controls", () => {
+    expect(
+      resolveMarmotAccount(
+        { quicCandidates: ["quic://c:3"], blockStreaming: false },
+        null,
+        deps({}),
+      ).blockStreaming,
+    ).toBe(false);
+    expect(
+      resolveMarmotAccount(
+        { streaming: { mode: "block", block: { enabled: true } } },
+        null,
+        deps({}),
+      ).blockStreaming,
+    ).toBe(true);
+    expect(resolveMarmotAccount({}, null, deps({ MARMOT_BLOCK_STREAMING: "true" })).blockStreaming).toBe(true);
   });
 
   it("derives the socket path from MARMOT_HOME", () => {

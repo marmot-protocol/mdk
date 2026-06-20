@@ -123,6 +123,10 @@ interface RequestOptions {
   timeoutMs?: number;
 }
 
+interface SubscribeInboundHooks {
+  onReady?: () => void;
+}
+
 type Envelope = Record<string, unknown>;
 
 /** Lowercase, strip an optional `0x`, and validate even-length hexadecimal. */
@@ -336,6 +340,7 @@ export class MarmotAgentControlClient {
   async *subscribeInbound(
     filter: { accountIdHex?: string | null; groupIdHex?: string | null } = {},
     signal?: AbortSignal,
+    hooks: SubscribeInboundHooks = {},
   ): AsyncGenerator<AgentControlEvent> {
     const requestId = randomUUID();
     const socket = await this.connect();
@@ -377,6 +382,7 @@ export class MarmotAgentControlClient {
             clearTimeout(ackTimer);
             ackTimer = undefined;
           }
+          hooks.onReady?.();
           continue;
         }
         yield frame as unknown as AgentControlEvent;

@@ -10,6 +10,11 @@ import {
   createChatChannelPlugin,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/channel-core";
+import {
+  buildBaseChannelStatusSummary,
+  collectStatusIssuesFromLastError,
+  type ChannelAccountSnapshot,
+} from "openclaw/plugin-sdk/status-helpers";
 
 import { resolveSingleAccount } from "./account.js";
 import {
@@ -20,8 +25,18 @@ import {
   type ResolvedMarmotAccount,
 } from "./config.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
+import {
+  DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
+  marmotInboundRuntimeSnapshot,
+} from "./runtime-state.js";
 
 export const MARMOT_CHANNEL_ID = "marmot";
+
+interface MarmotStatusProbe {
+  ok: boolean;
+  accounts: number;
+  localSigningAccounts: number;
+}
 
 interface MarmotChannelsConfig {
   channels?: {
@@ -55,6 +70,45 @@ export function resolveMarmotChannelAccount(
   return resolveMarmotAccount(slice, accountId ?? null);
 }
 
+function accountSnapshot(
+  account: ResolvedMarmotAccount,
+  runtime?: ChannelAccountSnapshot,
+  probe?: unknown,
+): ChannelAccountSnapshot {
+  const accountId = account.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
+  const inbound = marmotInboundRuntimeSnapshot(accountId);
+  return {
+    ...runtime,
+    ...inbound,
+    accountId,
+    name: accountId,
+    enabled: true,
+    configured: true,
+    running: inbound.running === true,
+    connected: inbound.connected === true,
+    lastStartAt: inbound.lastStartAt ?? runtime?.lastStartAt ?? null,
+    lastStopAt: inbound.lastStopAt ?? runtime?.lastStopAt ?? null,
+    lastError: inbound.lastError ?? runtime?.lastError ?? null,
+    lastInboundAt: inbound.lastInboundAt ?? runtime?.lastInboundAt ?? null,
+    lastOutboundAt: inbound.lastOutboundAt ?? runtime?.lastOutboundAt ?? null,
+    reconnectAttempts: inbound.reconnectAttempts ?? runtime?.reconnectAttempts,
+    mode: account.streamMode,
+    dmPolicy: account.dmPolicy ?? "allowlist",
+    allowFrom: account.allowFrom.map(String),
+    probe,
+  };
+}
+
+async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<MarmotStatusProbe> {
+  const response = await clientForAccount(account).accountList();
+  const localSigningAccounts = response.accounts.filter((entry) => entry.local_signing).length;
+  return {
+    ok: localSigningAccounts > 0,
+    accounts: response.accounts.length,
+    localSigningAccounts,
+  };
+}
+
 /** Build the Marmot channel plugin for registration with OpenClaw. */
 export function createMarmotChannelPlugin() {
   return createChatChannelPlugin<ResolvedMarmotAccount>({
@@ -81,6 +135,19 @@ export function createMarmotChannelPlugin() {
           return accounts ? Object.keys(accounts) : ["default"];
         },
         resolveAccount: resolveMarmotChannelAccount,
+      },
+      status: {
+        defaultRuntime: marmotInboundRuntimeSnapshot(DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID),
+        collectStatusIssues: (accounts) => collectStatusIssuesFromLastError("marmot", accounts),
+        buildChannelSummary: ({ snapshot }) =>
+          buildBaseChannelStatusSummary(snapshot, {
+            connected: snapshot.connected ?? null,
+            mode: snapshot.mode ?? null,
+            probe: snapshot.probe,
+          }),
+        probeAccount: async ({ account }) => probeMarmotAccount(account),
+        buildAccountSnapshot: ({ account, runtime, probe }) =>
+          accountSnapshot(account, runtime, probe),
       },
       message: createMarmotMessageAdapter({
         resolveTarget: async (cfg, accountId) => {

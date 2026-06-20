@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { AgentControlEvent, MarmotAgentControlClient } from "../src/client.js";
 import {
@@ -7,6 +7,10 @@ import {
   type InboundPluginApi,
 } from "../src/inbound-runtime.js";
 import type { MarmotInboundMessage } from "../src/inbound.js";
+import {
+  marmotInboundRuntimeSnapshot,
+  resetMarmotInboundRuntimeForTests,
+} from "../src/runtime-state.js";
 
 const HEX32 = (b: string) => b.repeat(32);
 const noopLogger = { info: () => {}, warn: () => {} };
@@ -19,13 +23,22 @@ function inboundStubClient(events: AgentControlEvent[]): MarmotAgentControlClien
         accounts: [{ account_id_hex: HEX32("aa"), label: "agent", local_signing: true }],
       };
     },
-    async *subscribeInbound(): AsyncGenerator<AgentControlEvent> {
+    async *subscribeInbound(
+      _filter?: unknown,
+      _signal?: AbortSignal,
+      hooks?: { onReady?: () => void },
+    ): AsyncGenerator<AgentControlEvent> {
+      hooks?.onReady?.();
       for (const event of events) {
         yield event;
       }
     },
   } as unknown as MarmotAgentControlClient;
 }
+
+afterEach(() => {
+  resetMarmotInboundRuntimeForTests();
+});
 
 describe("startMarmotInbound", () => {
   it("resolves the agent account and dispatches mapped inbound messages", async () => {
@@ -63,7 +76,18 @@ describe("startMarmotInbound", () => {
     );
 
     await firstDispatch;
+    const active = marmotInboundRuntimeSnapshot("default");
+    expect(active.running).toBe(true);
+    expect(active.connected).toBe(true);
+    expect(active.lastStartAt).toEqual(expect.any(Number));
+    expect(active.lastInboundAt).toEqual(expect.any(Number));
+
     stop();
+
+    const stopped = marmotInboundRuntimeSnapshot("default");
+    expect(stopped.running).toBe(false);
+    expect(stopped.connected).toBe(false);
+    expect(stopped.lastStopAt).toEqual(expect.any(Number));
 
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]).toMatchObject({

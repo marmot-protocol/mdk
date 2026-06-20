@@ -88,8 +88,14 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `groupIdHex` | `MARMOT_GROUP_ID_HEX` | — (no filter) |
 | `quicCandidates` | `MARMOT_QUIC_CANDIDATES` | — (final-only) |
 | `streaming.mode` | `MARMOT_STREAM_MODE` | `block` (`off`/`partial`/`block`/`progress`) |
+| `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
+
+`accountIdHex` is the Marmot/dm-agent account id. It is intentionally distinct
+from OpenClaw's channel account id (`default`, or a key under
+`channels.marmot.accounts`) used for routing, session metadata, and message-tool
+target lookup.
 
 The default control socket is same-UID only (parent dir `0700`, socket `0600`,
 no TCP listener). If OpenClaw and `dm-agent` run as different local users, start
@@ -110,8 +116,10 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   chunk count match `dm-agent` byte-for-byte (Rust-anchored parity test in
   `test/transcript.test.ts`). Previews run whenever `streaming.mode` is not
   `off` and `quicCandidates` are set, and OpenClaw is emitting progressive
-  blocks (`streaming.block.enabled` or `agents.defaults.blockStreamingDefault:
-  "on"`) — the docker phone test configures all of this. Like a Telegram preview,
+  blocks. Marmot enables OpenClaw block delivery automatically when
+  `quicCandidates` are configured and `streaming.mode` is not `off`; operators
+  can override it with `blockStreaming`, `streaming.block.enabled`, or
+  `MARMOT_BLOCK_STREAMING`. Like a Telegram preview,
   this is driven by the channel's reply `deliver` callback, not a core-driven
   live adapter (that SDK seam does not exist yet).
   - `block` is the best live-preview mode because it naturally maps onto Marmot's

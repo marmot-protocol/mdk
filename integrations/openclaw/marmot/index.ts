@@ -15,6 +15,7 @@ import {
 import { clientForAccount } from "./src/config.js";
 import { createMarmotInboundDispatcher, type OpenClawChannelRuntime } from "./src/dispatch.js";
 import { startMarmotInbound, syncMarmotAllowlist } from "./src/inbound-runtime.js";
+import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./src/runtime-state.js";
 
 export default defineChannelPluginEntry({
   id: MARMOT_CHANNEL_ID,
@@ -41,7 +42,9 @@ export default defineChannelPluginEntry({
         cfg: api.config,
         runtimeChannel: api.runtime.channel as unknown as OpenClawChannelRuntime,
         client: clientForAccount(resolved),
+        channelAccountId: resolved.accountId ?? DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
         streamMode: resolved.streamMode,
+        blockStreaming: resolved.blockStreaming,
         quicCandidates: resolved.quicCandidates,
         log: (message) => api.logger.info(message),
       });

@@ -20,6 +20,7 @@ import type { MarmotAgentControlClient } from "./client.js";
 import type { StreamMode } from "./config.js";
 import type { MarmotInboundMessage } from "./inbound.js";
 import { MarmotLivePreview, type StreamControlClient } from "./live.js";
+import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./runtime-state.js";
 import { resolveLatestAssistantTextFromSessionStore } from "./session-transcript.js";
 
 // --- reply sink (unit-tested) -----------------------------------------------
@@ -394,6 +395,13 @@ export class MarmotReplySink {
       return;
     }
     this.log("marmot: no explicit final delivery; committing the streamed reply at turn end");
+    if (this.options.streamMode === "block" && this.sawPartialPreview && this.deliveries === 0) {
+      this.log("marmot: no block/final reply deliveries; abandoning partial-only block preview");
+      if (this.preview?.isActive) {
+        await this.abandonPreview("no_deliverable_reply");
+      }
+      return;
+    }
     if (await this.commit(this.latestAnswerText)) {
       return;
     }
@@ -433,7 +441,10 @@ export interface MarmotDispatchDeps {
   /** `api.runtime.channel`. */
   runtimeChannel: OpenClawChannelRuntime;
   client: MarmotSinkClient;
+  /** OpenClaw channel account id ("default" or a configured account key), not the Marmot account hex. */
+  channelAccountId?: string | null;
   streamMode: StreamMode;
+  blockStreaming: boolean;
   quicCandidates: string[];
   chunkBytes?: number;
   /** Optional privacy-safe lifecycle logger. */
@@ -449,16 +460,17 @@ export function createMarmotInboundDispatcher(
   deps: MarmotDispatchDeps,
 ): (message: MarmotInboundMessage) => Promise<void> {
   return async (message) => {
+    const channelAccountId = deps.channelAccountId?.trim() || DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID;
     const route = deps.runtimeChannel.routing.resolveAgentRoute({
       cfg: deps.cfg,
       channel: "marmot",
-      accountId: message.accountIdHex,
+      accountId: channelAccountId,
       peer: { kind: "group", id: message.groupIdHex },
     });
 
     const ctxPayload = buildChannelInboundEventContext({
       channel: "marmot",
-      accountId: message.accountIdHex,
+      accountId: channelAccountId,
       messageId: message.messageIdHex,
       from: message.senderAccountIdHex,
       sender: { id: message.senderAccountIdHex },
@@ -494,7 +506,7 @@ export function createMarmotInboundDispatcher(
     await sink.prewarm();
     await runChannelInboundEvent({
       channel: "marmot",
-      accountId: message.accountIdHex,
+      accountId: channelAccountId,
       raw: message,
       adapter: {
         ingest: () => ({
@@ -504,7 +516,7 @@ export function createMarmotInboundDispatcher(
         }),
         resolveTurn: () => ({
           channel: "marmot",
-          accountId: message.accountIdHex,
+          accountId: channelAccountId,
           routeSessionKey: route.sessionKey,
           storePath,
           ctxPayload,
@@ -518,6 +530,7 @@ export function createMarmotInboundDispatcher(
                   sink.deliver(payload, info),
               },
               replyOptions: {
+                disableBlockStreaming: deps.blockStreaming ? false : true,
                 onPartialReply: (payload: PartialReplyPayloadLike) => sink.partial(payload),
                 onAssistantMessageStart: () => sink.status("Thinking..."),
                 onRunProgress: () => sink.status("Working..."),
