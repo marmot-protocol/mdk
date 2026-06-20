@@ -172,13 +172,19 @@ pub(crate) fn timeline_page_stream_response(
     page: marmot_app::TimelinePage,
     trigger: &str,
     runtime: &marmot_app::MarmotAppRuntime,
+    local_account_id_hex: &str,
 ) -> DaemonStreamResponse {
     let messages = page
         .messages
         .into_iter()
         .map(|message| {
-            let display_name = runtime.display_name_for_account_id(&message.sender);
-            crate::commands::messages::timeline_message_record_json(message, display_name)
+            let mut display_name_for_account =
+                |account_id: &str| runtime.display_name_for_account_id(account_id);
+            crate::commands::messages::timeline_message_record_json(
+                message,
+                Some(local_account_id_hex),
+                &mut display_name_for_account,
+            )
         })
         .collect::<Vec<_>>();
     DaemonStreamResponse::ok(serde_json::json!({
@@ -194,19 +200,25 @@ pub(crate) fn timeline_projection_stream_response(
     update: marmot_app::RuntimeProjectionUpdate,
     runtime: &marmot_app::MarmotAppRuntime,
 ) -> DaemonStreamResponse {
+    let local_account_id_hex = update.account_id_hex.clone();
     let changes = update
         .update
         .timeline_changes
         .into_iter()
-        .map(|change| timeline_message_change_json(change, runtime))
+        .map(|change| timeline_message_change_json(change, runtime, &local_account_id_hex))
         .collect::<Vec<_>>();
     let messages = update
         .update
         .timeline_messages
         .into_iter()
         .map(|message| {
-            let display_name = runtime.display_name_for_account_id(&message.sender);
-            crate::commands::messages::timeline_message_record_json(message, display_name)
+            let mut display_name_for_account =
+                |account_id: &str| runtime.display_name_for_account_id(account_id);
+            crate::commands::messages::timeline_message_record_json(
+                message,
+                Some(&local_account_id_hex),
+                &mut display_name_for_account,
+            )
         })
         .collect::<Vec<_>>();
     DaemonStreamResponse::ok(serde_json::json!({
@@ -225,14 +237,20 @@ pub(crate) fn timeline_projection_stream_response(
 pub(crate) fn timeline_message_change_json(
     change: marmot_app::TimelineMessageChange,
     runtime: &marmot_app::MarmotAppRuntime,
+    local_account_id_hex: &str,
 ) -> serde_json::Value {
     match change {
         marmot_app::TimelineMessageChange::Upsert { trigger, message } => {
-            let display_name = runtime.display_name_for_account_id(&message.sender);
+            let mut display_name_for_account =
+                |account_id: &str| runtime.display_name_for_account_id(account_id);
             serde_json::json!({
                 "type": "upsert",
                 "trigger": trigger,
-                "message": crate::commands::messages::timeline_message_record_json(*message, display_name),
+                "message": crate::commands::messages::timeline_message_record_json(
+                    *message,
+                    Some(local_account_id_hex),
+                    &mut display_name_for_account,
+                ),
             })
         }
         marmot_app::TimelineMessageChange::Remove {

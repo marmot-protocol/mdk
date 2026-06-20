@@ -16,7 +16,11 @@ use cgka_traits::app_components::{
     decode_quic_varint, encode_component_vectors, encode_encrypted_media_policy_v1,
     encode_group_avatar_url_v1, encode_nostr_routing_v1, encode_quic_varint,
 };
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
+use cgka_traits::app_event::{
+    GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
+    GROUP_SYSTEM_EVENT_VERSION, GroupSystemEvent, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MarmotAppEvent as MarmotInnerEvent,
+};
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::Group;
 use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
@@ -66,6 +70,42 @@ pub struct AppGroupMlsState {
     pub epoch: u64,
     pub member_count: usize,
     pub required_app_components: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupSystemEvent {
+    pub system_type: String,
+    pub text: String,
+    pub actor_account_id_hex: Option<String>,
+    pub subject_account_id_hex: Option<String>,
+    pub name: Option<String>,
+}
+
+pub fn group_system_event_from_message(kind: u64, plaintext: &str) -> Option<AppGroupSystemEvent> {
+    if kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+        return None;
+    }
+    let event = GroupSystemEvent::parse(plaintext).ok()?;
+    if event.v != GROUP_SYSTEM_EVENT_VERSION {
+        return None;
+    }
+    let actor_account_id_hex = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_ACTOR);
+    let subject_account_id_hex = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_SUBJECT);
+    let name = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_NAME);
+    Some(AppGroupSystemEvent {
+        system_type: event.system_type,
+        text: event.text,
+        actor_account_id_hex,
+        subject_account_id_hex,
+        name,
+    })
+}
+
+fn non_empty_group_system_data(event: &GroupSystemEvent, key: &str) -> Option<String> {
+    event
+        .data_str(key)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Coarse, app-facing classification of why a stored group failed session-open

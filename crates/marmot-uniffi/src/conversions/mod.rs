@@ -210,6 +210,7 @@ mod tests {
             message.agent_text_stream_json.as_deref(),
             Some(r#"{"stream_id_hex":"22"}"#)
         );
+        assert!(message.group_system.is_none());
         assert_eq!(message.reactions.by_emoji[0].emoji, "+");
         assert_eq!(message.reactions.by_emoji[0].senders, vec!["bob"]);
         assert_eq!(
@@ -221,6 +222,85 @@ mod tests {
             message.deleted_by_message_id_hex.as_deref(),
             Some("delete-1")
         );
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_exposes_group_system_payload() {
+        let content = cgka_traits::app_event::GroupSystemEvent::new(
+            cgka_traits::app_event::GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+            "Member removed",
+            Some(serde_json::json!({
+                cgka_traits::app_event::GROUP_SYSTEM_DATA_ACTOR: "aa".repeat(32),
+                cgka_traits::app_event::GROUP_SYSTEM_DATA_SUBJECT: "bb".repeat(32),
+            })),
+        )
+        .to_content()
+        .unwrap();
+        let record = TimelineMessageRecord {
+            message_id_hex: "system-1".to_owned(),
+            source_message_id_hex: None,
+            source_epoch: Some(4),
+            direction: "system".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: "aa".repeat(32),
+            plaintext: content,
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: vec![vec!["system".to_owned(), "member_removed".to_owned()]],
+            timeline_at: 10,
+            received_at: 11,
+            reply_to_message_id_hex: None,
+            reply_preview: None,
+            media: None,
+            agent_text_stream: None,
+            reactions: TimelineReactionSummary::default(),
+            deleted: false,
+            deleted_by_message_id_hex: None,
+            invalidation_status: None,
+        };
+
+        let ffi = TimelineMessageRecordFfi::from(record);
+
+        assert_eq!(ffi.content_tokens, MarkdownDocumentFfi::default());
+        let system = ffi.group_system.expect("group system payload");
+        assert_eq!(system.system_type, "member_removed");
+        assert_eq!(system.text, "Member removed");
+        assert_eq!(
+            system.actor_account_id_hex.as_deref(),
+            Some("aa".repeat(32).as_str())
+        );
+        assert_eq!(
+            system.subject_account_id_hex.as_deref(),
+            Some("bb".repeat(32).as_str())
+        );
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_ignores_malformed_group_system_payload() {
+        let record = TimelineMessageRecord {
+            message_id_hex: "system-bad".to_owned(),
+            source_message_id_hex: None,
+            source_epoch: Some(4),
+            direction: "system".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: "aa".repeat(32),
+            plaintext: "not-json".to_owned(),
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: vec![vec!["system".to_owned(), "member_removed".to_owned()]],
+            timeline_at: 10,
+            received_at: 11,
+            reply_to_message_id_hex: None,
+            reply_preview: None,
+            media: None,
+            agent_text_stream: None,
+            reactions: TimelineReactionSummary::default(),
+            deleted: false,
+            deleted_by_message_id_hex: None,
+            invalidation_status: None,
+        };
+
+        let ffi = TimelineMessageRecordFfi::from(record);
+
+        assert!(ffi.group_system.is_none());
     }
 
     #[test]

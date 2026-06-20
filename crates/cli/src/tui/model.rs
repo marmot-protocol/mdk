@@ -508,6 +508,15 @@ pub(crate) const GROUP_SYSTEM_KIND: u64 = 1210;
 /// content, e.g. "alice added bob". Falls back to the embedded `text` field, or
 /// `None` when the content is not a parseable group system event.
 pub(crate) fn group_system_summary(value: &Value, plaintext: &str) -> Option<String> {
+    if let Some(summary) = value
+        .get("group_system")
+        .and_then(|system| system.get("summary"))
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        return Some(summary.to_owned());
+    }
+
     let content: Value = serde_json::from_str(plaintext).ok()?;
     let system_type = content.get("system_type").and_then(Value::as_str)?;
     let data = content.get("data");

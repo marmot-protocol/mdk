@@ -639,10 +639,7 @@ pub(crate) fn timeline_stream_message_plain(message: &serde_json::Value) -> Stri
             .get("from")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("<unknown>"),
-        message
-            .get("plaintext")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(""),
+        crate::commands::messages::timeline_message_display_text(message),
         deleted
     )
 }

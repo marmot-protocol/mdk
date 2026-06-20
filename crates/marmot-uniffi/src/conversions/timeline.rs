@@ -2,9 +2,10 @@
 //! subscription-update FFI conversions.
 
 use marmot_app::{
-    AppProjectionUpdate, RuntimeProjectionUpdate, RuntimeTimelineMessageUpdate,
-    TimelineMessageChange, TimelineMessageRecord, TimelinePage, TimelineReactionSummary,
-    TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
+    AppGroupSystemEvent, AppProjectionUpdate, RuntimeProjectionUpdate,
+    RuntimeTimelineMessageUpdate, TimelineMessageChange, TimelineMessageRecord, TimelinePage,
+    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
+    TimelineUserReaction, group_system_event_from_message,
 };
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
@@ -97,6 +98,30 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupSystemEventFfi {
+    pub system_type: String,
+    /// Human-readable fallback from the row content. Prefer rendering from
+    /// `system_type` plus the structured fields so clients can localize and
+    /// render the local account as "you".
+    pub text: String,
+    pub actor_account_id_hex: Option<String>,
+    pub subject_account_id_hex: Option<String>,
+    pub name: Option<String>,
+}
+
+impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
+    fn from(value: AppGroupSystemEvent) -> Self {
+        Self {
+            system_type: value.system_type,
+            text: value.text,
+            actor_account_id_hex: value.actor_account_id_hex,
+            subject_account_id_hex: value.subject_account_id_hex,
+            name: value.name,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineMessageRecordFfi {
     pub message_id_hex: String,
     /// Delivery marker for own (`direction == "sent"`) messages. An own send
@@ -123,6 +148,9 @@ pub struct TimelineMessageRecordFfi {
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
     pub media_json: Option<String>,
     pub agent_text_stream_json: Option<String>,
+    /// Parsed view of kind-1210 group system rows. `None` for chat, reactions,
+    /// stream rows, and malformed/free-text kind-1210 assertions.
+    pub group_system: Option<GroupSystemEventFfi>,
     pub reactions: TimelineReactionSummaryFfi,
     pub deleted: bool,
     pub deleted_by_message_id_hex: Option<String>,
@@ -136,6 +164,7 @@ pub struct TimelineMessageRecordFfi {
 impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let group_system = group_system_event_from_message(value.kind, &value.plaintext);
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -152,6 +181,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             reply_preview: value.reply_preview.map(Into::into),
             media_json: value.media.map(|media| media.to_string()),
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
+            group_system: group_system.map(Into::into),
             reactions: value.reactions.into(),
             deleted: value.deleted,
             deleted_by_message_id_hex: value.deleted_by_message_id_hex,

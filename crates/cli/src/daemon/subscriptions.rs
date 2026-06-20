@@ -290,6 +290,7 @@ pub(crate) async fn handle_timeline_messages_subscription(
         runtime_subscription.take_snapshot(),
         "InitialTimelinePage",
         &runtime,
+        &account_ref,
     );
     if !write_stream_response(stream, &initial).await {
         return Ok(());
@@ -298,7 +299,7 @@ pub(crate) async fn handle_timeline_messages_subscription(
     while let Some(update) = runtime_subscription.recv().await {
         let response = match update {
             marmot_app::RuntimeTimelineMessageUpdate::Page { page } => {
-                timeline_page_stream_response(page, "TimelineUpdated", &runtime)
+                timeline_page_stream_response(page, "TimelineUpdated", &runtime, &account_ref)
             }
             marmot_app::RuntimeTimelineMessageUpdate::Projection(update) => {
                 timeline_projection_stream_response(update, &runtime)
