@@ -1,6 +1,7 @@
 //! TUI data model: row/view/state types, JSON parsers, and pure helpers.
 
 use super::*;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TuiError {
@@ -1172,23 +1173,62 @@ pub(crate) fn group_component_diagnostics(group: &Value) -> Vec<GroupComponentDi
 }
 
 pub(crate) fn terminal_safe_text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_control() && !is_terminal_spoofing_format_control(*ch))
-        .collect()
+    value.chars().filter(|ch| is_terminal_safe(*ch)).collect()
 }
 
-fn is_terminal_spoofing_format_control(ch: char) -> bool {
-    // Deny invisible bidi and zero-width format controls that can spoof
-    // untrusted terminal-rendered labels/messages without being Unicode Cc.
+/// Decide whether a single `char` may be rendered in untrusted terminal text
+/// (message bodies, sender names, chat labels, stream previews).
+///
+/// This replaces the earlier hardcoded BiDi/zero-width denylist (see #201 /
+/// PR #459) with a width-aware whitelist, as #201 anticipated. The denylist
+/// inevitably drifted: a residual class of invisible / format characters
+/// (SOFT HYPHEN, the invisible math operators, language-tag characters, the
+/// interlinear-annotation controls, the Hangul fillers, BRAILLE PATTERN BLANK,
+/// ...) still flowed through and enabled the same homograph / hidden-content
+/// spoofing. See #473.
+///
+/// Policy:
+/// - Drop every C0/C1 control (`char::is_control()`), preserving the prior
+///   behavior of stripping ANSI/OSC escapes, newlines, and tabs.
+/// - Drop the entire Unicode `Cf` (Format) general category. This subsumes
+///   every BiDi override, zero-width joiner/space, word joiner, invisible
+///   operator (U+2061–U+2064), deprecated shaping control (U+206A–U+206F),
+///   interlinear-annotation control (U+FFF9–U+FFFB), SOFT HYPHEN, MONGOLIAN
+///   VOWEL SEPARATOR, the musical-beam formatter, the BOM, and the language
+///   tag / tag characters (U+E0001, U+E0020–U+E007F) — now and for any future
+///   `Cf` additions, so the guard no longer drifts as Unicode evolves.
+/// - Drop a small, explicit set of invisible glyphs that render blank but are
+///   *not* `Cf` (so a category-only rule would miss them) and cannot be
+///   distinguished from legitimate text by category alone: the Hangul fillers
+///   (category `Lo`, alongside real CJK) and BRAILLE PATTERN BLANK (category
+///   `So`, alongside real emoji).
+///
+/// Legitimate zero-width characters are intentionally kept: combining marks
+/// (categories `Mn`/`Mc`/`Me`, e.g. accents, the Devanagari virama, Arabic
+/// vowel marks, and emoji variation selectors) render as part of a visible base
+/// glyph and must not be stripped, or accented/Indic/Arabic/emoji text would be
+/// mangled. They are excluded from the `Cf` and explicit-filler rules above.
+fn is_terminal_safe(ch: char) -> bool {
+    if ch.is_control() {
+        return false;
+    }
+    if matches!(ch.general_category(), GeneralCategory::Format) {
+        return false;
+    }
+    !is_invisible_non_format_glyph(ch)
+}
+
+/// Invisible glyphs that are not Unicode `Cf` and therefore are not caught by
+/// the general-category rule, yet render as a blank cell and can be used for
+/// the same name/label spoofing. Enumerated explicitly because their categories
+/// (`Lo`, `So`) also contain legitimate, visible text (CJK, emoji).
+fn is_invisible_non_format_glyph(ch: char) -> bool {
     matches!(
         ch,
-        '\u{061c}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}'
+        // Hangul fillers (category Lo) — render invisible.
+        '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}'
+        // BRAILLE PATTERN BLANK (category So) — renders as a blank cell.
+            | '\u{2800}'
     )
 }
 

@@ -55,6 +55,9 @@ clap = { version = "4.6", features = ["derive"] }
 # unstable-rendered-line-info exposes Paragraph::line_count for wrap-aware TUI scroll math.
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
+# General-category lookups for the terminal untrusted-text sanitizer (drop the
+# whole Cf format class instead of a drifting hardcoded denylist).
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 rand = "0.8"
 sha2 = "0.10"
 url = "2"

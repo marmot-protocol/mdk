@@ -35,6 +35,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
+unicode-properties.workspace = true
 url.workspace = true
 
 [dev-dependencies]

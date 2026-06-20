@@ -609,6 +609,82 @@ fn terminal_safe_text_strips_bidi_and_zero_width_format_characters() {
 }
 
 #[test]
+fn terminal_safe_text_strips_residual_invisible_and_format_spoofing_characters() {
+    // Each entry is a residual invisible / format vector that the original
+    // hardcoded denylist let through (see #473). All must be stripped, while
+    // the surrounding visible "ab" must survive so we are sure we are not
+    // simply dropping everything.
+    let format_class_cf: &[(char, &str)] = &[
+        ('\u{00ad}', "SOFT HYPHEN"),
+        ('\u{2061}', "FUNCTION APPLICATION"),
+        ('\u{2062}', "INVISIBLE TIMES"),
+        ('\u{2063}', "INVISIBLE SEPARATOR"),
+        ('\u{2064}', "INVISIBLE PLUS"),
+        ('\u{206a}', "INHIBIT SYMMETRIC SWAPPING"),
+        ('\u{206f}', "NOMINAL DIGIT SHAPES"),
+        ('\u{fff9}', "INTERLINEAR ANNOTATION ANCHOR"),
+        ('\u{fffa}', "INTERLINEAR ANNOTATION SEPARATOR"),
+        ('\u{fffb}', "INTERLINEAR ANNOTATION TERMINATOR"),
+        ('\u{180e}', "MONGOLIAN VOWEL SEPARATOR"),
+        ('\u{1d173}', "MUSICAL SYMBOL BEGIN BEAM"),
+        ('\u{061c}', "ARABIC LETTER MARK"),
+        ('\u{e0001}', "LANGUAGE TAG"),
+        ('\u{e0020}', "TAG SPACE"),
+        ('\u{e007e}', "TAG TILDE"),
+        ('\u{e007f}', "CANCEL TAG"),
+    ];
+    let invisible_non_cf: &[(char, &str)] = &[
+        ('\u{115f}', "HANGUL CHOSEONG FILLER"),
+        ('\u{1160}', "HANGUL JUNGSEONG FILLER"),
+        ('\u{3164}', "HANGUL FILLER"),
+        ('\u{ffa0}', "HALFWIDTH HANGUL FILLER"),
+        ('\u{2800}', "BRAILLE PATTERN BLANK"),
+    ];
+
+    for (ch, name) in format_class_cf.iter().chain(invisible_non_cf) {
+        let input = format!("a{ch}b");
+        assert_eq!(
+            terminal_safe_text(&input),
+            "ab",
+            "expected {name} (U+{:04X}) to be stripped",
+            *ch as u32
+        );
+    }
+}
+
+#[test]
+fn terminal_safe_text_preserves_legitimate_visible_and_combining_text() {
+    // Visible scripts, whitespace, and zero-width combining marks (accents,
+    // Indic virama, Arabic vowel marks, emoji variation selectors) must survive
+    // unchanged so the sanitizer does not mangle real localized text. Combining
+    // marks legitimately have zero rendered width, so a naive width-only filter
+    // would corrupt them.
+    let preserved = [
+        "plain ascii",
+        "中文 日本語 한국어",
+        "café",         // precomposed
+        "cafe\u{0301}", // e + COMBINING ACUTE ACCENT
+        "नमस्ते",         // Devanagari incl. virama U+094D
+        "سَلَام",          // Arabic incl. fatha U+064E
+        "❤\u{fe0f}",    // heart + VARIATION SELECTOR-16
+        "emoji 😀 ok",
+        "a b\u{00a0}c", // NO-BREAK SPACE is visible/whitespace, keep
+    ];
+    for sample in preserved {
+        assert_eq!(
+            terminal_safe_text(sample),
+            sample,
+            "expected {sample:?} to pass through unchanged"
+        );
+    }
+    // Tab is a C0 control and is correctly stripped (prior behavior preserved).
+    assert_eq!(
+        terminal_safe_text("with\ttab-was-control"),
+        "withtab-was-control"
+    );
+}
+
+#[test]
 fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
     let messages = vec![MessageRow {
         message_id: "01".to_owned(),
