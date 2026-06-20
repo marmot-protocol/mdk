@@ -126,6 +126,19 @@ export interface StartMarmotInboundOptions {
    * agent as quiet next-turn context. When omitted, those events are only logged.
    */
   surfaceAmbientEvent?: MarmotAmbientSurfacer;
+  /**
+   * Invalidate the dispatcher's cached `is_direct` activation fact for one group.
+   * Called when dm-agent reports a `group_state_changed` event so the next
+   * unaddressed message in that group re-reads fresh membership instead of a
+   * stale cached value. When omitted, the cache is never invalidated from here.
+   */
+  invalidateGroupActivation?: (accountIdHex: string, groupIdHex: string) => void;
+  /**
+   * Drop every cached `is_direct` activation fact. Called on an inbound resync,
+   * where dropped broadcast slots mean a `group_state_changed` for some group may
+   * have been missed, so no cached membership can be trusted.
+   */
+  clearGroupActivationCache?: () => void;
 }
 
 // The gateway can full-load the plugin in more than one in-process context
@@ -288,6 +301,10 @@ export function startMarmotInbound(
         // mapped sentence never carries a member pubkey.
         markMarmotInboundReceived(statusAccountId);
         api.logger.info("marmot: inbound group state change observed");
+        // Drop the cached is_direct activation fact for this group: a
+        // membership change can flip whether the group is an effective DM, so the
+        // next unaddressed message must re-read fresh membership.
+        options.invalidateGroupActivation?.(change.accountIdHex, change.groupIdHex);
         void Promise.resolve(
           options.surfaceAmbientEvent?.({
             accountIdHex: change.accountIdHex,
@@ -318,6 +335,9 @@ export function startMarmotInbound(
         api.logger.warn(
           `marmot: inbound resync required (${droppedEvents} broadcast slots dropped)`,
         );
+        // Dropped broadcast slots can include a missed group_state_changed for any
+        // group, so no cached is_direct fact can be trusted; drop them all.
+        options.clearGroupActivationCache?.();
       },
       onError: () => {
         markMarmotInboundReconnect(statusAccountId);

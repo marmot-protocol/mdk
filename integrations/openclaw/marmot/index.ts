@@ -93,7 +93,12 @@ export default defineChannelPluginEntry({
           enqueue(text, { sessionKey: route.sessionKey, contextKey: contextKey ?? null });
         };
 
-        startMarmotInbound(api, dispatch, { configuredAgentName, surfaceAmbientEvent });
+        startMarmotInbound(api, dispatch, {
+          configuredAgentName,
+          surfaceAmbientEvent,
+          invalidateGroupActivation: dispatch.invalidateGroupActivation,
+          clearGroupActivationCache: dispatch.clearGroupActivationCache,
+        });
       } catch {
         // This runs in a fire-and-forget IIFE, so an unguarded throw (e.g. a
         // malformed channels.marmot config that fails account resolution) would

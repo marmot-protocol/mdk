@@ -630,6 +630,184 @@ describe("createMarmotInboundDispatcher activation gating", () => {
   });
 });
 
+describe("createMarmotInboundDispatcher activation cache", () => {
+  function cachingRuntime(turns: { count: number }): OpenClawChannelRuntime {
+    return {
+      routing: {
+        resolveAgentRoute: () => ({
+          agentId: "agent",
+          accountId: "default",
+          sessionKey: "agent:marmot",
+        }),
+      },
+      session: {
+        resolveStorePath: () => "/tmp/openclaw-marmot-cache-test",
+        recordInboundSession: vi.fn(),
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: async (params: unknown) => {
+          turns.count += 1;
+          const deliver = (params as {
+            dispatcherOptions: {
+              deliver: (payload: { text: string }, info: { kind: "final" }) => Promise<void>;
+            };
+          }).dispatcherOptions.deliver;
+          await deliver({ text: "ok" }, { kind: "final" });
+        },
+      },
+    };
+  }
+
+  /** A control client whose `groupInfo` is call-counted and (optionally) toggleable/erroring. */
+  function countingClient(opts: {
+    isDirect: boolean | (() => boolean);
+    throwError?: () => boolean;
+  }): { client: MarmotDispatchClient; groupInfoCalls: () => number } {
+    let calls = 0;
+    const client = {
+      async sendFinal() {
+        return { type: "final_sent", message_ids_hex: [HEX32("ab")] };
+      },
+      async groupInfo(accountIdHex: string, groupIdHex: string) {
+        calls += 1;
+        if (opts.throwError?.()) {
+          throw new Error("group_info failed");
+        }
+        const isDirect = typeof opts.isDirect === "function" ? opts.isDirect() : opts.isDirect;
+        return {
+          type: "group_info" as const,
+          account_id_hex: accountIdHex,
+          group_id_hex: groupIdHex,
+          member_count: isDirect ? 2 : 5,
+          is_direct: isDirect,
+          subject: null,
+        };
+      },
+    } as unknown as MarmotDispatchClient;
+    return { client, groupInfoCalls: () => calls };
+  }
+
+  const baseMessage: MarmotInboundMessage = {
+    accountIdHex: HEX32("aa"),
+    groupIdHex: HEX32("cc"),
+    messageIdHex: HEX32("dd"),
+    senderAccountIdHex: HEX32("bb"),
+    text: "just chatting amongst ourselves",
+  };
+
+  function makeDispatch(client: MarmotDispatchClient, turns: { count: number }) {
+    return createMarmotInboundDispatcher({
+      cfg: {},
+      runtimeChannel: cachingRuntime(turns),
+      client,
+      channelAccountId: "default",
+      streamMode: "off",
+      blockStreaming: false,
+      quicCandidates: [],
+      groupActivation: "mention",
+      mentionPatterns: [],
+    });
+  }
+
+  it("queries group membership once and reuses the cached is_direct fact", async () => {
+    const turns = { count: 0 };
+    const { client, groupInfoCalls } = countingClient({ isDirect: false });
+    const dispatch = makeDispatch(client, turns);
+
+    await dispatch({ ...baseMessage, messageIdHex: HEX32("01") });
+    await dispatch({ ...baseMessage, messageIdHex: HEX32("02") });
+    await dispatch({ ...baseMessage, messageIdHex: HEX32("03") });
+
+    // One MLS state read for three ambient messages; none ran a turn (multi-party, unaddressed).
+    expect(groupInfoCalls()).toBe(1);
+    expect(turns.count).toBe(0);
+  });
+
+  it("does not consult the cache for an addressed message (no membership read)", async () => {
+    const turns = { count: 0 };
+    const { client, groupInfoCalls } = countingClient({ isDirect: false });
+    const dispatch = makeDispatch(client, turns);
+
+    await dispatch({ ...baseMessage, mentionsSelf: true });
+
+    expect(groupInfoCalls()).toBe(0);
+    expect(turns.count).toBe(1);
+  });
+
+  it("re-reads membership after the activation cache is invalidated", async () => {
+    const turns = { count: 0 };
+    // Membership flips from multi-party to a two-member DM between the two reads.
+    let direct = false;
+    const { client, groupInfoCalls } = countingClient({ isDirect: () => direct });
+    const dispatch = makeDispatch(client, turns);
+
+    expect(await runTurn(dispatch, turns, { ...baseMessage, messageIdHex: HEX32("01") })).toBe(
+      false,
+    );
+    expect(groupInfoCalls()).toBe(1);
+
+    // A membership change invalidates the cached fact and flips is_direct.
+    direct = true;
+    dispatch.invalidateGroupActivation(baseMessage.accountIdHex, baseMessage.groupIdHex);
+
+    expect(await runTurn(dispatch, turns, { ...baseMessage, messageIdHex: HEX32("02") })).toBe(true);
+    expect(groupInfoCalls()).toBe(2);
+  });
+
+  it("clearGroupActivationCache drops every cached fact", async () => {
+    const turns = { count: 0 };
+    const { client, groupInfoCalls } = countingClient({ isDirect: false });
+    const dispatch = makeDispatch(client, turns);
+
+    await dispatch({ ...baseMessage, messageIdHex: HEX32("01") });
+    expect(groupInfoCalls()).toBe(1);
+
+    dispatch.clearGroupActivationCache();
+    await dispatch({ ...baseMessage, messageIdHex: HEX32("02") });
+    expect(groupInfoCalls()).toBe(2);
+  });
+
+  it("fails closed (skips the turn) when the membership lookup errors", async () => {
+    const turns = { count: 0 };
+    const { client, groupInfoCalls } = countingClient({ isDirect: true, throwError: () => true });
+    const dispatch = makeDispatch(client, turns);
+
+    await dispatch({ ...baseMessage });
+
+    // An unaddressed message with an unresolvable membership must NOT barge in.
+    expect(turns.count).toBe(0);
+    expect(groupInfoCalls()).toBe(1);
+  });
+
+  it("does not cache a membership-lookup error (retries on the next message)", async () => {
+    const turns = { count: 0 };
+    let fail = true;
+    const { client, groupInfoCalls } = countingClient({ isDirect: true, throwError: () => fail });
+    const dispatch = makeDispatch(client, turns);
+
+    expect(await runTurn(dispatch, turns, { ...baseMessage, messageIdHex: HEX32("01") })).toBe(
+      false,
+    );
+    expect(groupInfoCalls()).toBe(1);
+
+    // The error was not cached: the next message re-reads, succeeds, and (DM) replies.
+    fail = false;
+    expect(await runTurn(dispatch, turns, { ...baseMessage, messageIdHex: HEX32("02") })).toBe(true);
+    expect(groupInfoCalls()).toBe(2);
+  });
+
+  /** Dispatch a message and report whether an agent turn ran (the gate let it through). */
+  async function runTurn(
+    dispatch: (message: MarmotInboundMessage) => Promise<void>,
+    turns: { count: number },
+    message: MarmotInboundMessage,
+  ): Promise<boolean> {
+    const before = turns.count;
+    await dispatch(message);
+    return turns.count > before;
+  }
+});
+
 describe("createMarmotInboundDispatcher inbound media", () => {
   function mediaRuntime(): OpenClawChannelRuntime {
     return {

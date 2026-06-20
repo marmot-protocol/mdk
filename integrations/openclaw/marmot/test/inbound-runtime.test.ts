@@ -210,6 +210,61 @@ describe("startMarmotInbound", () => {
     expect(surfaced[0]?.text).toBe("A member was added to the group.");
   });
 
+  it("invalidates the dispatcher's group-activation cache on a group_state_changed event", async () => {
+    const invalidated: { accountIdHex: string; groupIdHex: string }[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "group_state_changed",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            change: "member_removed",
+            detail: null,
+          },
+        ]),
+      invalidateGroupActivation: (accountIdHex, groupIdHex) => {
+        invalidated.push({ accountIdHex, groupIdHex });
+      },
+    });
+
+    await waitFor(() => invalidated.length > 0);
+    stop();
+
+    expect(invalidated[0]).toEqual({ accountIdHex: HEX32("aa"), groupIdHex: HEX32("cc") });
+  });
+
+  it("clears the whole group-activation cache on an inbound resync", async () => {
+    let cleared = 0;
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "resync_required",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: null,
+            dropped_events: 3,
+          },
+        ]),
+      clearGroupActivationCache: () => {
+        cleared += 1;
+      },
+    });
+
+    await waitFor(() => cleared > 0);
+    stop();
+
+    expect(cleared).toBe(1);
+  });
+
   it("dispatches distinct groups concurrently and keeps per-group FIFO order", async () => {
     const a1 = HEX32("d1");
     const a2 = HEX32("d2");

@@ -119,8 +119,18 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   trigger (or the agent name), or the conversation is an effective DM (exactly
   two members, resolved via the `group_info` control op). Set
   `groupActivation: "always"` to reply to every message. Effective DMs always
-  reply. Membership is queried lazily (only for otherwise-unaddressed messages)
-  and fails open, so a lookup error never silently drops a message.
+  reply. Membership is queried lazily — only for otherwise-unaddressed messages,
+  so the common addressed case never pays the round-trip — and the resulting
+  `is_direct` fact is cached per (account, group), since it only changes when
+  membership changes. The cache entry is invalidated on a `group_state_changed`
+  event for that group (and cleared entirely on an inbound resync), so the next
+  unaddressed message re-reads fresh membership. On a membership-lookup error
+  the gate fails **closed** (skips the turn) under the `mention` policy: an
+  unaddressed message in a group whose membership can't be resolved is more
+  likely a multi-party conversation the agent wasn't addressed in, and an
+  unrecallable barge-in there is worse than dropping a single reply in a true
+  two-party DM (where the user can re-send or address the agent explicitly). The
+  error is not cached, so the next message retries the lookup.
 - **Durable replies** are sent verbatim as `kind: 9` messages via `send_final`;
   the adapter never merges or rewrites text across sends. Each durable reply is
   **idempotent + retried**: the sink generates one `idempotency_key` per reply
