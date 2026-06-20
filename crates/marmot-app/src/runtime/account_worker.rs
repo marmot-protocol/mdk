@@ -1,6 +1,8 @@
 //! Per-account worker: command surface, the worker loop, reconnect backoff,
 //! and the runtime-event publishing helpers the loop drives.
 
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
@@ -9,7 +11,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
 
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
@@ -324,6 +326,7 @@ async fn run_app_runtime_account_worker(
             return;
         }
     };
+    let mut scheduled_convergence = ScheduledConvergence::new(convergence_settlement_delay(&app));
 
     // The session is hydrated. Capture a read snapshot and signal
     // command-readiness *now*, before the initial relay catch-up. "Ready" means
@@ -425,6 +428,7 @@ async fn run_app_runtime_account_worker(
     let catch_up_result = match startup_sync_result {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+            scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
@@ -476,6 +480,45 @@ async fn run_app_runtime_account_worker(
             _ = &mut shutdown => {
                 return;
             }
+            _ = scheduled_convergence.timer.as_mut() => {
+                let groups = scheduled_convergence.take_ready();
+                match client.sync_runtime_groups().await {
+                    Ok(()) => {
+                        for group_id in groups {
+                            match client.advance_convergence_after_runtime_sync(&group_id).await {
+                                Ok(summary) => {
+                                    scheduled_convergence.note_success(&group_id);
+                                    publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                                    scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+                                    if sync_summary_triggers_audit_tracker_update(&summary) {
+                                        shared.schedule_audit_log_tracker_update("scheduled_convergence");
+                                    }
+                                }
+                                Err(err) => {
+                                    let mut retry_groups = client.take_pending_convergence_groups();
+                                    retry_groups.push(group_id.clone());
+                                    scheduled_convergence.schedule_retry_groups(retry_groups);
+                                    publish_app_runtime_account_error(
+                                        &events,
+                                        &account_id_hex,
+                                        &account_label,
+                                        format!("scheduled convergence failed: {err}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        scheduled_convergence.schedule_retry_groups(groups);
+                        publish_app_runtime_account_error(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            format!("scheduled convergence sync failed: {err}"),
+                        );
+                    }
+                }
+            }
             command = commands.recv() => {
                 match command {
                     Some(command) => {
@@ -488,6 +531,7 @@ async fn run_app_runtime_account_worker(
                             &shared,
                         )
                         .await;
+                        scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
                     }
                     None => return,
                 }
@@ -497,6 +541,7 @@ async fn run_app_runtime_account_worker(
                     Ok(summary) => {
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
+                        scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }
@@ -1155,6 +1200,88 @@ fn account_worker_reconnect_jitter() -> Duration {
     Duration::from_millis(jitter_ms)
 }
 
+const DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
+const IDLE_CONVERGENCE_TIMER_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const MIN_CONVERGENCE_SETTLEMENT_DELAY: Duration = Duration::from_millis(10);
+const CONVERGENCE_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+
+struct ScheduledConvergence {
+    delay: Duration,
+    groups: HashSet<GroupId>,
+    retry_attempts: HashMap<GroupId, u32>,
+    timer: Pin<Box<Sleep>>,
+}
+
+impl ScheduledConvergence {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            groups: HashSet::new(),
+            retry_attempts: HashMap::new(),
+            timer: Box::pin(sleep(IDLE_CONVERGENCE_TIMER_DELAY)),
+        }
+    }
+
+    fn schedule_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
+        let mut saw_group = false;
+        for group_id in groups {
+            saw_group = true;
+            self.retry_attempts.remove(&group_id);
+            self.groups.insert(group_id);
+        }
+        if saw_group {
+            let delay = self.normal_delay();
+            self.timer.as_mut().reset(TokioInstant::now() + delay);
+        }
+    }
+
+    fn schedule_retry_groups(&mut self, groups: impl IntoIterator<Item = GroupId>) {
+        let mut delay: Option<Duration> = None;
+        for group_id in groups {
+            let attempts = self.retry_attempts.entry(group_id.clone()).or_insert(0);
+            *attempts = attempts.saturating_add(1);
+            let group_delay = retry_delay_for_attempt(*attempts);
+            delay = Some(delay.unwrap_or(group_delay).max(group_delay));
+            self.groups.insert(group_id);
+        }
+        if let Some(delay) = delay {
+            self.timer.as_mut().reset(TokioInstant::now() + delay);
+        }
+    }
+
+    fn take_ready(&mut self) -> Vec<GroupId> {
+        self.timer
+            .as_mut()
+            .reset(TokioInstant::now() + IDLE_CONVERGENCE_TIMER_DELAY);
+        self.groups.drain().collect()
+    }
+
+    fn note_success(&mut self, group_id: &GroupId) {
+        self.retry_attempts.remove(group_id);
+    }
+
+    fn normal_delay(&self) -> Duration {
+        self.delay.max(MIN_CONVERGENCE_SETTLEMENT_DELAY)
+    }
+}
+
+fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
+    Duration::from_millis(
+        app.config
+            .dev_settlement_quiescence_ms
+            .unwrap_or(DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS),
+    )
+}
+
+fn retry_delay_for_attempt(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let multiplier = 1u32 << shift;
+    CONVERGENCE_RETRY_BASE_DELAY
+        .saturating_mul(multiplier)
+        .min(CONVERGENCE_RETRY_MAX_DELAY)
+}
+
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
     !summary.joined_groups.is_empty() || !summary.messages.is_empty() || !summary.events.is_empty()
 }
@@ -1270,4 +1397,43 @@ fn publish_app_runtime_account_error(
         account_label: account_label.to_owned(),
         message,
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_group_id(byte: u8) -> GroupId {
+        GroupId::new(vec![byte])
+    }
+
+    #[test]
+    fn retry_delay_for_attempt_backs_off_and_caps() {
+        assert_eq!(retry_delay_for_attempt(0), Duration::from_secs(1));
+        assert_eq!(retry_delay_for_attempt(1), Duration::from_secs(1));
+        assert_eq!(retry_delay_for_attempt(2), Duration::from_secs(2));
+        assert_eq!(retry_delay_for_attempt(3), Duration::from_secs(4));
+        assert_eq!(
+            retry_delay_for_attempt(u32::MAX),
+            CONVERGENCE_RETRY_MAX_DELAY
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_convergence_clamps_zero_delay_and_clears_retry_state() {
+        let group_id = test_group_id(7);
+        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
+
+        assert_eq!(scheduled.normal_delay(), MIN_CONVERGENCE_SETTLEMENT_DELAY);
+
+        scheduled.schedule_retry_groups([group_id.clone()]);
+        assert_eq!(scheduled.retry_attempts.get(&group_id), Some(&1));
+
+        scheduled.schedule_groups([group_id.clone()]);
+        assert!(!scheduled.retry_attempts.contains_key(&group_id));
+
+        let ready = scheduled.take_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0], group_id);
+    }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cgka_engine::key_package::is_last_resort_key_package;
 use cgka_traits::agent_text_stream::{
@@ -63,6 +63,7 @@ pub struct AppClient {
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
+    pub(crate) pending_convergence_groups: HashSet<GroupId>,
 }
 
 /// A point-in-time copy of the live session's read-only group projections
@@ -273,6 +274,14 @@ impl AppClient {
         profiles: &HashMap<String, String>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
         self.ensure_group(group_id)?;
+        self.members_with_profiles_unchecked(group_id, profiles)
+    }
+
+    fn members_with_profiles_unchecked(
+        &self,
+        group_id: &GroupId,
+        profiles: &HashMap<String, String>,
+    ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
         Ok(self
             .runtime
             .members(group_id)?
@@ -291,6 +300,10 @@ impl AppClient {
 
     pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         self.ensure_group(group_id)?;
+        self.group_mls_state_unchecked(group_id)
+    }
+
+    fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         let group = self.runtime.group_record(group_id)?;
         Ok(AppGroupMlsState {
             group_id_hex: hex::encode(group_id.as_slice()),
@@ -343,17 +356,27 @@ impl AppClient {
         let profiles = self.app.profiles_by_id()?;
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
+        let mut skipped_malformed_group_records = 0usize;
         for group in &self.state.groups {
             let Ok(bytes) = hex::decode(&group.group_id_hex) else {
+                skipped_malformed_group_records += 1;
                 continue;
             };
             let group_id = GroupId::new(bytes);
-            if let Ok(records) = self.members_with_profiles(&group_id, &profiles) {
+            if let Ok(records) = self.members_with_profiles_unchecked(&group_id, &profiles) {
                 members.insert(group_id.clone(), records);
             }
-            if let Ok(state) = self.group_mls_state(&group_id) {
+            if let Ok(state) = self.group_mls_state_unchecked(&group_id) {
                 mls_state.insert(group_id, state);
             }
+        }
+        if skipped_malformed_group_records > 0 {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "group_read_snapshot",
+                skipped_malformed_group_records,
+                "skipping malformed group records while building group read snapshot"
+            );
         }
         Ok(GroupReadSnapshot {
             members,

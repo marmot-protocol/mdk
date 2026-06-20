@@ -83,8 +83,7 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = send_intent_group_id(&intent).clone();
-        self.retry_deferred_peels(&group_id).await?;
-        if self.should_queue_outbound_intent(&group_id)? {
+        if self.should_queue_outbound_intent(&group_id).await? {
             return self.queue_outbound_intent(group_id, intent);
         }
 
@@ -129,26 +128,20 @@ impl<S: StorageProvider> Engine<S> {
         Ok(drained)
     }
 
-    fn should_queue_outbound_intent(&mut self, group_id: &GroupId) -> Result<bool, EngineError> {
+    async fn should_queue_outbound_intent(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
         {
             return Ok(false);
         }
 
-        if !self.has_unresolved_convergence_inputs(group_id)? {
-            return Ok(false);
-        }
-
         let now_ms = self.convergence_now_ms();
-        let result = self
-            .converge_stored_openmls_messages(group_id, now_ms)
-            .map_err(|e| EngineError::Backend(format!("converge before send: {e}")))?;
-        if result.convergence_status != crate::canonicalization::ConvergenceStatus::Settled {
-            return Ok(true);
-        }
-
-        self.has_unresolved_convergence_inputs(group_id)
+        Ok(!self
+            .advance_convergence_inputs_until_settled(group_id, now_ms)
+            .await?)
     }
 
     /// Drive stored OpenMLS inputs to stability, retrying raw transport
@@ -242,6 +235,10 @@ impl<S: StorageProvider> Engine<S> {
         Ok(false)
     }
 
+    pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        self.has_unresolved_convergence_inputs(group_id)
+    }
+
     pub async fn retry_deferred_peels(&mut self, group_id: &GroupId) -> Result<usize, EngineError> {
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
@@ -268,9 +265,16 @@ impl<S: StorageProvider> Engine<S> {
                     reason: StaleReason::PeelFailed,
                 }) => {}
                 Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
+                    // The peeled content now has its own content-derived record;
+                    // retire the raw transport wrapper so it does not keep
+                    // re-entering this retry loop as a stale duplicate.
+                    self.update_stored_message_state(&record.id, MessageState::Processed)?;
                     progressed += 1;
                 }
                 Ok(IngestOutcome::Stale { .. }) => {
+                    // Terminal stale classifications are still successful
+                    // reclassifications of this raw deferred row.
+                    self.update_stored_message_state(&record.id, MessageState::Processed)?;
                     progressed += 1;
                 }
                 Err(EngineError::ForkedEpoch {

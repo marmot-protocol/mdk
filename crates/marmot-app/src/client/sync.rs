@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::ingest::IngestOutcome;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -17,6 +18,16 @@ use crate::{
 use super::AppClient;
 
 impl AppClient {
+    pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
+        self.pending_convergence_groups.drain().collect()
+    }
+
+    fn remember_buffered_convergence_outcome(&mut self, outcome: &IngestOutcome) {
+        if let IngestOutcome::Buffered { group_id, .. } = outcome {
+            self.pending_convergence_groups.insert(group_id.clone());
+        }
+    }
+
     pub(crate) async fn sync_runtime_groups(&self) -> Result<(), AppError> {
         let rebuild_since = self
             .relay_plane
@@ -169,6 +180,7 @@ impl AppClient {
             if summary.joined_groups.is_empty()
                 && summary.messages.is_empty()
                 && summary.events.is_empty()
+                && self.pending_convergence_groups.is_empty()
             {
                 continue;
             }
@@ -234,8 +246,55 @@ impl AppClient {
         let source_recorded_at = delivery.message.timestamp.0;
         let effects = self.runtime.ingest_delivery(delivery).await?;
         fail_if_publish_failed(&effects.effects)?;
+        self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_transport_cursor(source_recorded_at);
-        for event in &effects.effects.events {
+        self.observe_account_device_effects(
+            &effects.effects,
+            display_names,
+            summary,
+            &source_message_id_hex,
+            source_recorded_at,
+        )
+        .await
+    }
+
+    pub(crate) async fn advance_convergence_after_runtime_sync(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<SyncSummary, AppError> {
+        // The account worker refreshes transport groups once for the scheduled
+        // convergence batch before calling this per-group path.
+        let effects = self.runtime.advance_convergence(group_id).await?;
+        fail_if_publish_failed(&effects)?;
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+
+        let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
+        let source_message_id_hex = String::new();
+        let source_recorded_at = unix_now_seconds();
+        self.observe_account_device_effects(
+            &effects,
+            &display_names,
+            &mut summary,
+            &source_message_id_hex,
+            source_recorded_at,
+        )
+        .await?;
+        self.prune_plaintext_retention_for_group(group_id)?;
+        self.app.save_state(&self.state)?;
+        Ok(summary)
+    }
+
+    async fn observe_account_device_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        display_names: &HashMap<String, String>,
+        summary: &mut SyncSummary,
+        source_message_id_hex: &str,
+        source_recorded_at: u64,
+    ) -> Result<(), AppError> {
+        for event in &effects.events {
             let before = self.state.groups.len();
             let previous_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -265,7 +324,7 @@ impl AppClient {
                 summary,
                 event,
                 group_projection.as_ref(),
-                &source_message_id_hex,
+                source_message_id_hex,
                 source_recorded_at,
                 self.app.allow_loopback_blob_endpoints(),
             ) {
@@ -328,7 +387,7 @@ impl AppClient {
                 event,
                 previous_group.as_ref(),
                 updated_group.as_ref(),
-                &source_message_id_hex,
+                source_message_id_hex,
             );
             if let cgka_traits::engine::GroupEvent::AppMessageInvalidated {
                 message_id, reason, ..
@@ -344,8 +403,8 @@ impl AppClient {
             // A rolled-back commit on a losing branch invalidates any kind-1210
             // group system rows it synthesized (one commit → many rows). The
             // winning branch's fresh rows are synthesized below from this
-            // delivery's `GroupStateChanged` events, so the timeline converges
-            // to the canonical branch without stale losing-branch rows.
+            // current effect's `GroupStateChanged` events, so the timeline
+            // converges to the canonical branch without stale losing-branch rows.
             if let cgka_traits::engine::GroupEvent::ForkRecovered {
                 invalidated_commit_id,
                 ..
@@ -397,10 +456,9 @@ impl AppClient {
                 );
             }
         }
-        // Synthesize durable kind-1210 system rows from this delivery's
-        // authenticated state changes (peer commits and auto-commits).
-        let system_updates =
-            self.project_group_system_rows(&effects.effects.events, source_recorded_at);
+        // Synthesize durable kind-1210 system rows from authenticated state
+        // changes (peer commits, auto-commits, and scheduled convergence).
+        let system_updates = self.project_group_system_rows(&effects.events, source_recorded_at);
         summary.projection_updates.extend(system_updates);
         Ok(())
     }

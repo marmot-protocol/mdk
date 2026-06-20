@@ -25,6 +25,7 @@ use cgka_traits::message::MessageState;
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::prelude::{
     ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal,
@@ -145,39 +146,45 @@ impl<S: StorageProvider> Engine<S> {
 
             // Peel.
             let ctx = group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
-            let msg_id_hex = hex::encode(msg.id.as_slice());
+            let raw_msg_id = msg.id.clone();
+            let msg_id_hex = hex::encode(raw_msg_id.as_slice());
             let peel_result = self.peeler.peel_group_message(msg, &ctx).await;
-            // Record the raw peeler verdict before any fallback attempt.
-            let raw_outcome = match &peel_result {
-                Ok(_) => marmot_forensics::PeelerOutcomeKind::Success,
-                Err(PeelerError::DecryptFailed) => {
-                    marmot_forensics::PeelerOutcomeKind::DecryptFailed
-                }
-                Err(PeelerError::StaleEpoch { .. }) => {
-                    marmot_forensics::PeelerOutcomeKind::StaleEpoch
-                }
-                Err(PeelerError::Malformed(_)) => marmot_forensics::PeelerOutcomeKind::Malformed,
-                Err(_) => marmot_forensics::PeelerOutcomeKind::Other,
-            };
-            self.audit_group(
-                &group_id,
-                marmot_forensics::AuditEventKind::PeelerOutcome {
-                    msg_id: msg_id_hex.clone(),
-                    outcome: raw_outcome,
-                    fallback_snapshot_used: false,
-                    fallback_snapshot_name: None,
-                    fallback_snapshot_source_epoch: None,
-                    fallback_attempt_count: None,
-                    error_kind: match &peel_result {
-                        Err(e) => Some(crate::audit_helpers::peeler_error_kind(e).to_string()),
-                        Ok(_) => None,
+            // Plain decrypt misses are expected for future epochs, pre-join
+            // messages, and retained-snapshot fallback. The terminal state
+            // transition below is the useful audit breadcrumb for no-snapshot
+            // deferrals; logging every raw miss here swamps Goggles with
+            // routine retry noise.
+            if !matches!(&peel_result, Err(PeelerError::DecryptFailed)) {
+                let raw_outcome = match &peel_result {
+                    Ok(_) => marmot_forensics::PeelerOutcomeKind::Success,
+                    Err(PeelerError::StaleEpoch { .. }) => {
+                        marmot_forensics::PeelerOutcomeKind::StaleEpoch
+                    }
+                    Err(PeelerError::Malformed(_)) => {
+                        marmot_forensics::PeelerOutcomeKind::Malformed
+                    }
+                    Err(_) => marmot_forensics::PeelerOutcomeKind::Other,
+                };
+                self.audit_group(
+                    &group_id,
+                    marmot_forensics::AuditEventKind::PeelerOutcome {
+                        msg_id: msg_id_hex.clone(),
+                        outcome: raw_outcome,
+                        fallback_snapshot_used: false,
+                        fallback_snapshot_name: None,
+                        fallback_snapshot_source_epoch: None,
+                        fallback_attempt_count: None,
+                        error_kind: match &peel_result {
+                            Err(e) => Some(crate::audit_helpers::peeler_error_kind(e).to_string()),
+                            Ok(_) => None,
+                        },
+                        detail: match &peel_result {
+                            Err(e) => Some(format!("{e}")),
+                            Ok(_) => None,
+                        },
                     },
-                    detail: match &peel_result {
-                        Err(e) => Some(format!("{e}")),
-                        Ok(_) => None,
-                    },
-                },
-            );
+                );
+            }
             let peeled = match peel_result {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
@@ -407,6 +414,16 @@ impl<S: StorageProvider> Engine<S> {
                 mls_group.process_message(&provider, proto)
             } {
                 Ok(p) => p,
+                Err(e) if process_message_error_is_too_distant_in_the_past(&e) => {
+                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                    self.mark_raw_transport_message_failed_if_deferred(
+                        &raw_msg_id,
+                        "too_distant_in_the_past",
+                    )?;
+                    return Ok(IngestOutcome::Stale {
+                        reason: StaleReason::PeelFailed,
+                    });
+                }
                 Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
                     let current = EpochId(mls_group.epoch().as_u64());
 
@@ -1024,6 +1041,32 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
+    fn mark_raw_transport_message_failed_if_deferred(
+        &self,
+        raw_msg_id: &MessageId,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        match self.storage.get_message(raw_msg_id) {
+            Ok(record) if record.state == MessageState::PeelDeferred => {
+                self.storage
+                    .update_message_state(raw_msg_id, MessageState::Failed)?;
+                self.audit_group(
+                    &record.group_id,
+                    crate::audit_helpers::message_state_transition_event(
+                        hex::encode(raw_msg_id.as_slice()),
+                        Some(record.state),
+                        MessageState::Failed,
+                        Some(record.epoch),
+                        reason,
+                    ),
+                );
+                Ok(())
+            }
+            Ok(_) | Err(StorageError::NotFound) => Ok(()),
+            Err(err) => Err(EngineError::Storage(err)),
+        }
+    }
+
     fn probe_commit_ordering_metadata_for_recovery(
         &self,
         group_id: &GroupId,
@@ -1238,6 +1281,16 @@ impl<S: StorageProvider> Engine<S> {
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
     }
+}
+
+fn process_message_error_is_too_distant_in_the_past<E>(err: &ProcessMessageError<E>) -> bool {
+    matches!(
+        err,
+        ProcessMessageError::ValidationError(ValidationError::NoPastEpochData)
+            | ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+                MessageDecryptionError::SecretTreeError(SecretTreeError::TooDistantInThePast),
+            ))
+    )
 }
 
 /// Snapshot the two avatar-bearing component byte blobs (avatar-url and

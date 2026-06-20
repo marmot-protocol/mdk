@@ -604,10 +604,13 @@ Emitted around transport peeler results at the engine boundary.
 
 Current `detail` behavior:
 
-- The first raw peeler verdict records `detail = format!("{err}")` for peeler errors.
+- Successful raw peels have no detail.
+- Raw `stale_epoch`, `malformed`, and `other` peeler errors record `detail = format!("{err}")`.
+- Raw `decrypt_failed` peeler errors are not emitted as standalone `peeler_outcome` rows. They are expected for
+  future-epoch messages, pre-join messages, and retained-snapshot fallback; the eventual fallback success or deferred
+  message-state transition records the useful forensic breadcrumb.
 - A recovered decrypt failure records `detail = "recovered_after_decrypt_failed"` with `fallback_snapshot_used = true`.
 - A recovered stale epoch records `detail = "recovered_after_stale_epoch"` with `fallback_snapshot_used = true`.
-- Successful raw peels have no detail.
 
 Metadata notes:
 
@@ -678,11 +681,14 @@ Current `reason` values found in production call sites:
 | `fork_loser` | A same-epoch incumbent branch loses fork resolution and its message is invalidated. |
 | `peel_failed_no_snapshot` | Group-message peel failed and no fallback snapshot could recover it; state becomes `peel_deferred`. |
 | `stale_epoch_no_snapshot` | Stale-epoch peel failed and no fallback snapshot could recover it; state becomes `failed`. |
+| `too_distant_in_the_past` | A deferred raw transport message peeled to MLS bytes, but OpenMLS proved the application ciphertext is outside the retained past-epoch window; state becomes `failed`. |
 
 Metadata notes:
 
 - Some events have `group_ref` (`persist`, fork/publish/peeler paths). The generic `state_update` helper emits without
   group attribution only when the existing message record cannot be read; otherwise it uses that record's `group_id`.
+- Re-persisting a message with the same `group_id`, `epoch`, and `MessageState` does not emit another
+  `message_state_changed` row; this keeps repeated deferred-peel retries from producing duplicate diagnostics.
 
 ### `rejection`
 

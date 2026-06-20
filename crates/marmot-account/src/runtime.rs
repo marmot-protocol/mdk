@@ -287,6 +287,10 @@ where
         self.publish_session_effects(effects).await
     }
 
+    pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> AccountResult<bool> {
+        Ok(self.session.has_pending_convergence_inputs(group_id)?)
+    }
+
     pub fn members(&self, group_id: &GroupId) -> AccountResult<Vec<Member>> {
         Ok(self.session.members(group_id)?)
     }

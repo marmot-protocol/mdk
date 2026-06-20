@@ -809,6 +809,7 @@ impl MarmotApp {
             relay_plane: relay_plane.clone(),
             state: open.state,
             pending_projection_updates: Vec::new(),
+            pending_convergence_groups: std::collections::HashSet::new(),
         })
     }
 

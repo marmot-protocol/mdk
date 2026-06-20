@@ -18,7 +18,7 @@ use cgka_traits::engine::{
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
-use cgka_traits::message::MessageState;
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     GroupStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
@@ -55,6 +55,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 }
 
 struct MockPeeler;
+struct EpochGatePeeler;
 
 fn commit_tiebreak_winner_index(first: &MemberId, second: &MemberId) -> usize {
     if first.as_slice() < second.as_slice() {
@@ -142,6 +143,77 @@ impl TransportPeeler for MockPeeler {
     }
 }
 
+#[async_trait]
+impl TransportPeeler for EpochGatePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if let Ok(projection) = project_mls_message(&msg.payload)
+            && let Some(source_epoch) = projection.source_epoch
+            && ctx.epoch().0 < source_epoch
+        {
+            return Err(PeelerError::DecryptFailed);
+        }
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::MlsMessage {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Ok(PeeledMessage {
+            id: msg.id.clone(),
+            group_id: None,
+            sender: None,
+            content: PeeledContent::Welcome {
+                bytes: msg.payload.clone(),
+            },
+            origin: msg.clone(),
+        })
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        })
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        Ok(TransportMessage {
+            id: hash_id(&payload.ciphertext),
+            payload: payload.ciphertext.clone(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("mock".into()),
+            envelope: TransportEnvelope::Welcome {
+                recipient: recipient.clone(),
+            },
+        })
+    }
+}
+
 fn selfremove_registry() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
     r.register(
@@ -161,6 +233,18 @@ fn build_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorag
     (engine, storage)
 }
 
+fn build_epoch_gate_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(EpochGatePeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
 fn build_client_with_storage(
     id: &[u8],
     storage: SqliteAccountStorage,
@@ -170,6 +254,21 @@ fn build_client_with_storage(
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
         .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn build_client_with_max_past_epochs(
+    id: &[u8],
+    storage: SqliteAccountStorage,
+    max_past_epochs: usize,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .max_past_epochs(max_past_epochs)
         .build()
         .unwrap()
 }
@@ -2470,6 +2569,195 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "send-preflight-retries-deferred".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite_david = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch2, pending_david) = evolution(invite_david);
+    let commit_to_epoch2 = route(commit_to_epoch2, &group_id);
+    alice.confirm_published(pending_david).await.unwrap();
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let invite_eve = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch3, _pending_eve) = evolution(invite_eve);
+    let commit_to_epoch3 = route(commit_to_epoch3, &group_id);
+
+    assert!(matches!(
+        carol.ingest(commit_to_epoch2.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    assert!(matches!(
+        carol.ingest(commit_to_epoch3.clone()).await.unwrap(),
+        IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::PeelFailed
+        }
+    ));
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        carol_storage
+            .get_message(&commit_to_epoch3.id)
+            .expect("raw deferred message stored")
+            .state,
+        MessageState::PeelDeferred
+    );
+
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    });
+    let sent = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"send after full catch-up"),
+        })
+        .await
+        .unwrap();
+
+    let sent_app = match sent {
+        SendResult::ApplicationMessage { msg } => route(msg, &group_id),
+        other => panic!("expected ApplicationMessage after catch-up, got {other:?}"),
+    };
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+    assert_message_state(&carol_storage, &commit_to_epoch2, MessageState::Processed);
+    assert_message_state(&carol_storage, &commit_to_epoch3, MessageState::Processed);
+    assert_eq!(
+        project_mls_message(&sent_app.payload)
+            .expect("sent app projects")
+            .source_epoch,
+        Some(3)
+    );
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epoch_window() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_max_past_epochs(b"bob", bob_storage.clone(), 1);
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "send-preflight-terminal-past-decrypt".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    bob.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    });
+
+    let old_app = send_app(&mut alice, &group_id, b"outside past window".to_vec()).await;
+
+    for invitee_name in [b"carol".as_slice(), b"david".as_slice(), b"eve".as_slice()] {
+        let (mut invitee, _invitee_storage) = build_client(invitee_name);
+        let invitee_kp = invitee.fresh_key_package().await.unwrap();
+        let invite = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![invitee_kp],
+            })
+            .await
+            .unwrap();
+        let (commit, pending) = evolution(invite);
+        alice.confirm_published(pending).await.unwrap();
+        bob.ingest(route(commit, &group_id)).await.unwrap();
+        assert!(
+            bob.advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(4));
+
+    bob_storage
+        .put_message(&MessageRecord {
+            id: old_app.id.clone(),
+            group_id: group_id.clone(),
+            epoch: EpochId(0),
+            state: MessageState::PeelDeferred,
+            payload: StoredMessagePayload::raw_transport(old_app.clone())
+                .encode()
+                .unwrap(),
+        })
+        .unwrap();
+
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, b"send after terminal stale"),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { .. }),
+        "send should proceed after retiring stale deferred app message: {sent:?}"
+    );
+    assert_eq!(
+        bob_storage.get_message(&old_app.id).unwrap().state,
+        MessageState::Failed
+    );
+    assert_message_state(&bob_storage, &old_app, MessageState::Failed);
 }
 
 #[tokio::test]

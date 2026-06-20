@@ -482,6 +482,10 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(results))
     }
 
+    pub fn has_pending_convergence_inputs(&self, group_id: &GroupId) -> SessionResult<bool> {
+        Ok(self.engine.has_pending_convergence_inputs(group_id)?)
+    }
+
     pub async fn confirm_published(
         &mut self,
         pending: PendingStateRef,
