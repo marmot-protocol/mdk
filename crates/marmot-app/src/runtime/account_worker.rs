@@ -251,6 +251,21 @@ pub(crate) enum AccountWorkerCommand {
     },
 }
 
+/// A command held back during the initial background catch-up, replayed in
+/// arrival order once the catch-up completes.
+///
+/// Keeping `CatchUp` waiters inline in this sequence (rather than fulfilling
+/// them all up front) preserves FIFO: a `CatchUp` enqueued after an earlier
+/// deferred mutation is answered only after that mutation has run.
+enum DeferredStartupCommand {
+    /// A non-read command to run against the live session after catch-up. Boxed
+    /// because `AccountWorkerCommand` is far larger than the `CatchUp` variant.
+    Command(Box<AccountWorkerCommand>),
+    /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
+    /// result at this position in the sequence.
+    CatchUp(oneshot::Sender<Result<(), String>>),
+}
+
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
     commands: mpsc::Receiver<AccountWorkerCommand>,
@@ -310,46 +325,147 @@ async fn run_app_runtime_account_worker(
         }
     };
 
+    // The session is hydrated. Capture a read snapshot and signal
+    // command-readiness *now*, before the initial relay catch-up. "Ready" means
+    // "hydrated + serving commands", not "caught up": the conversation's
+    // group-detail reads (`Members` / `GroupMlsState` / `QuarantinedGroups`)
+    // route through this worker, and blocking them on the catch-up made the
+    // first conversation opened after a foreground resume take seconds. The
+    // catch-up still runs (below) and its results flow to subscribers via the
+    // normal event mechanism; it is only removed from the readiness/blocking
+    // path. See `GroupReadSnapshot`. `AccountOpen` (recorded by `reconcile` as
+    // the ready-wait) now measures time-to-command-ready (hydrate + connect +
+    // subscribe), while `AccountSync` (below) measures the catch-up.
+    //
+    // Snapshot capture is best-effort: its only failure is the shared profile
+    // load. On failure, surface the error and serve read commands by deferring
+    // them to the live session after catch-up (matching the live path's error
+    // semantics) instead of masking it as empty profiles. Readiness is never
+    // gated on it.
+    let read_snapshot = match client.group_read_snapshot() {
+        Ok(snapshot) => Some(snapshot),
+        Err(err) => {
+            publish_app_runtime_account_error(
+                &events,
+                &account_id_hex,
+                &account_label,
+                format!("runtime startup snapshot capture failed: {err}"),
+            );
+            None
+        }
+    };
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
+
+    // Run the initial catch-up in the background. The `client.sync()` future
+    // holds `&mut client` for its whole lifetime, so while it is in flight the
+    // command loop must not touch the live session: read commands are answered
+    // from `read_snapshot`, and every other command is deferred and replayed on
+    // live state once the catch-up lands, in arrival order. `CatchUp` requests
+    // that arrive during the initial sync are coalesced onto it (kept in the same
+    // deferred sequence so they cannot jump ahead of an earlier mutation), so a
+    // second concurrent sync on the same client is never started. Shutdown drops
+    // the pinned future, cancelling the sync.
+    let mut deferred: Vec<DeferredStartupCommand> = Vec::new();
     let sync_started_at = Instant::now();
-    let startup_sync_result = tokio::select! {
-        _ = &mut shutdown => {
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err("runtime startup cancelled".into()));
+    let startup_sync_result = {
+        let mut initial_sync = std::pin::pin!(client.sync());
+        loop {
+            tokio::select! {
+                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
+                _ = &mut shutdown => return,
+                result = &mut initial_sync => break result,
+                command = commands.recv() => {
+                    match command {
+                        None => return,
+                        Some(AccountWorkerCommand::Members { group_id, respond }) => {
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.members(&group_id));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::Members { group_id, respond }))),
+                            }
+                        }
+                        Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(snapshot.group_mls_state(&group_id));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::GroupMlsState { group_id, respond }))),
+                            }
+                        }
+                        Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
+                            match &read_snapshot {
+                                Some(snapshot) => {
+                                    let _ = respond.send(Ok(snapshot.quarantined_groups()));
+                                }
+                                None => deferred.push(DeferredStartupCommand::Command(Box::new(AccountWorkerCommand::QuarantinedGroups { respond }))),
+                            }
+                        }
+                        Some(AccountWorkerCommand::CatchUp { respond }) => {
+                            // Coalesce onto the in-flight initial catch-up rather
+                            // than starting a second sync; fulfilled in arrival
+                            // order below when it completes.
+                            deferred.push(DeferredStartupCommand::CatchUp(respond));
+                        }
+                        Some(other) => {
+                            deferred.push(DeferredStartupCommand::Command(Box::new(other)))
+                        }
+                    }
+                }
             }
-            return;
         }
-        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err("runtime startup cancelled".into()));
-            }
-            return;
-        }
-        result = client.sync() => result,
     };
     shared.app_performance_telemetry().record(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
         startup_sync_result.is_ok(),
     );
-    match startup_sync_result {
+    let catch_up_result = match startup_sync_result {
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
+            Ok(())
         }
         Err(err) => {
+            // A failed initial catch-up surfaces as an account error but must not
+            // fail worker readiness — readiness was already signalled above.
+            let message = format!("runtime startup receive failed: {err}");
             publish_app_runtime_account_error(
                 &events,
                 &account_id_hex,
                 &account_label,
-                format!("runtime startup receive failed: {err}"),
+                message.clone(),
             );
+            Err(message)
+        }
+    };
+
+    // Replay commands deferred during the initial catch-up in arrival order, now
+    // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
+    // with the initial catch-up's result.
+    for deferred_command in deferred {
+        match deferred_command {
+            DeferredStartupCommand::CatchUp(respond) => {
+                let _ = respond.send(catch_up_result.clone());
+            }
+            DeferredStartupCommand::Command(command) => {
+                handle_account_worker_command(
+                    &mut client,
+                    *command,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &shared,
+                )
+                .await;
+            }
         }
     }
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(Ok(()));
-    }
+
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
 
     loop {
@@ -362,553 +478,16 @@ async fn run_app_runtime_account_worker(
             }
             command = commands.recv() => {
                 match command {
-                    Some(AccountWorkerCommand::CatchUp { respond }) => {
-                        let sync_started_at = Instant::now();
-                        let result = match client.sync().await {
-                            Ok(summary) => {
-                                publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
-                                if sync_summary_triggers_audit_tracker_update(&summary) {
-                                    shared.schedule_audit_log_tracker_update("catch_up");
-                                }
-                                Ok(())
-                            }
-                            Err(err) => {
-                                let message = format!("runtime catch-up failed: {err}");
-                                publish_app_runtime_account_error(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    message.clone(),
-                                );
-                                Err(message)
-                            }
-                        };
-                        shared.app_performance_telemetry().record(
-                            AppPerformanceOperation::AccountSync,
-                            sync_started_at.elapsed(),
-                            result.is_ok(),
-                        );
-                        let _ = respond.send(result);
-                    }
-                        Some(AccountWorkerCommand::CreateGroup {
-                            name,
-                            members,
-                            description,
-                            respond,
-                        }) => {
-                            let result = async {
-                                let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                                let group_id = client.create_group(&name, &member_refs).await?;
-                                if description.is_some() {
-                                    client
-                                        .update_group_profile(&group_id, None, description.as_deref())
-                                        .await?;
-                                }
-                                Ok(group_id)
-                            }
-                            .await;
-                            if let Ok(group_id) = &result {
-                                publish_app_runtime_group_state_updated(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    group_id,
-                                );
-                            }
-                            let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::Members { group_id, respond }) => {
-                        let result = client.members(&group_id);
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::GroupMlsState { group_id, respond }) => {
-                        let result = client.group_mls_state(&group_id);
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::QuarantinedGroups { respond }) => {
-                        let result = Ok(client.quarantined_groups());
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::RetryHydrateQuarantinedGroup { group_id, respond }) => {
-                        let result = client.retry_hydrate_quarantined_group(&group_id);
-                        if matches!(result, Ok(true)) {
-                            // The group is live again; the engine queued a
-                            // `GroupHydrationRecovered` event. Drain it now so
-                            // subscribers see the typed recovery event
-                            // deterministically at retry time rather than only
-                            // when unrelated relay traffic later triggers a
-                            // drain (darkmatter#426). Publish those events plus a
-                            // `GroupStateUpdated` so chat-list / projection
-                            // consumers refresh and the group leaves the recovery
-                            // surface and reappears as a normal chat.
-                            match client.drain_pending_session_events().await {
-                                Ok(summary) => publish_app_runtime_summary(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    &summary,
-                                ),
-                                Err(err) => publish_app_runtime_account_error(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    format!("retry recovery drain failed: {err}"),
-                                ),
-                            }
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::UpdateMessageRetention {
-                        group_id,
-                        disappearing_message_secs,
-                        respond,
-                    }) => {
-                        let result = client
-                            .update_message_retention(&group_id, disappearing_message_secs)
-                            .await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::ReplaceEncryptedMediaBlobEndpoints {
-                        group_id,
-                        endpoints,
-                        respond,
-                    }) => {
-                        let result = client
-                            .replace_encrypted_media_blob_endpoints(&group_id, endpoints)
-                            .await;
-                        if result.is_ok() {
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::UpdateGroupAvatarUrl {
-                        group_id,
-                        url,
-                        dim,
-                        thumbhash,
-                        respond,
-                    }) => {
-                        let result = client
-                            .update_group_avatar_url(&group_id, url, dim, thumbhash)
-                            .await;
-                        if result.is_ok() {
-                            // Drain the kind-1210 row this commit queued, like the
-                            // sibling UpdateGroupProfile / UpdateGroupImage handlers —
-                            // otherwise the avatar-changed caption reaches live
-                            // timeline subscribers only on the next snapshot reload.
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::SafeExportSecret {
-                        group_id,
-                        component_id,
-                        respond,
-                    }) => {
-                        let result = client.safe_export_secret(&group_id, component_id);
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::ExporterSecret {
-                        group_id,
-                        label,
-                        length,
-                        respond,
-                    }) => {
-                        let result = client.exporter_secret(&group_id, &label, length);
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::InviteMembers {
-                        group_id,
-                        members,
-                        respond,
-                    }) => {
-                        let result = async {
-                            let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                            client.invite_members(&group_id, &member_refs).await
-                        }
+                    Some(command) => {
+                        handle_account_worker_command(
+                            &mut client,
+                            command,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            &shared,
+                        )
                         .await;
-                        if result.is_ok() {
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::RemoveMembers {
-                        group_id,
-                        members,
-                        respond,
-                    }) => {
-                        let result = async {
-                            let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                            client.remove_members(&group_id, &member_refs).await
-                        }
-                        .await;
-                        if result.is_ok() {
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::LeaveGroup { group_id, respond }) => {
-                        let result = client.leave_group(&group_id).await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::AcceptGroupInvite { group_id, respond }) => {
-                        let result = client.accept_group_invite(&group_id);
-                        if result.is_ok() {
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::DeclineGroupInvite { group_id, respond }) => {
-                        let result = client.decline_group_invite(&group_id).await;
-                        if result.is_ok() {
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::SetGroupArchived {
-                        group_id,
-                        archived,
-                        respond,
-                    }) => {
-                        // The archive projection events (ArchiveChanged chat-list
-                        // update + GroupStateUpdated) are published by the single
-                        // caller `MarmotAppRuntime::set_group_archived` after this
-                        // command returns. Emitting `GroupStateUpdated` here too
-                        // would race ahead of the ArchiveChanged trigger and get
-                        // fingerprint-deduped by `subscribe_chat_list`, so
-                        // subscribers would see a generic state change instead of
-                        // the archive-specific trigger. Keep this worker handler
-                        // limited to mutating the authoritative in-memory state.
-                        let result = client.set_group_archived(&group_id, archived);
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::PromoteAdmin {
-                        group_id,
-                        member_ref,
-                        respond,
-                    }) => {
-                        let result = client.promote_admin(&group_id, &member_ref).await;
-                        if result.is_ok() {
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::DemoteAdmin {
-                        group_id,
-                        member_ref,
-                        respond,
-                    }) => {
-                        let result = client.demote_admin(&group_id, &member_ref).await;
-                        if result.is_ok() {
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::SelfDemoteAdmin { group_id, respond }) => {
-                        let result = client.self_demote_admin(&group_id).await;
-                        if result.is_ok() {
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            publish_app_runtime_group_state_updated(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &group_id,
-                            );
-                        }
-                        let _ = respond.send(result);
-                    }
-                        Some(AccountWorkerCommand::UpdateGroupProfile {
-                            group_id,
-                            name,
-                            description,
-                            respond,
-                        }) => {
-                            let result = client
-                                .update_group_profile(&group_id, name.as_deref(), description.as_deref())
-                                .await;
-                            if result.is_ok() {
-                                publish_client_pending_projection_updates(
-                                    &mut client,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                );
-                                publish_app_runtime_group_state_updated(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    &group_id,
-                                );
-                            }
-                            let _ = respond.send(result);
-                        }
-                        Some(AccountWorkerCommand::UpdateGroupImage {
-                            group_id,
-                            plaintext,
-                            media_type,
-                            respond,
-                        }) => {
-                            let result = client
-                                .update_group_image(&group_id, plaintext, &media_type)
-                                .await;
-                            if result.is_ok() {
-                                publish_client_pending_projection_updates(
-                                    &mut client,
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                );
-                                publish_app_runtime_group_state_updated(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    &group_id,
-                                );
-                            }
-                            let _ = respond.send(result);
-                        }
-                        Some(AccountWorkerCommand::DownloadGroupImage { group_id, respond }) => {
-                            let result = client.download_group_image(&group_id).await;
-                            let _ = respond.send(result);
-                        }
-                    Some(AccountWorkerCommand::SendMessage {
-                        group_id,
-                        payload,
-                        respond,
-                    }) => {
-                        let send_started_at = Instant::now();
-                        let result = client
-                            .send_with_local_projection(&group_id, &payload, |update| {
-                                publish_app_runtime_projection_update(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    update,
-                                );
-                            })
-                            .await;
-                        shared.app_performance_telemetry().record(
-                            AppPerformanceOperation::OutboundMessageSend,
-                            send_started_at.elapsed(),
-                            result.is_ok(),
-                        );
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::SendAppEvent {
-                        group_id,
-                        intent,
-                        respond,
-                    }) => {
-                        let send_started_at = Instant::now();
-                        let result = client
-                            .send_app_event_with_local_projection(&group_id, intent, |update| {
-                                publish_app_runtime_projection_update(
-                                    &events,
-                                    &account_id_hex,
-                                    &account_label,
-                                    update,
-                                );
-                            })
-                            .await
-                            .map(|(_event, summary)| summary);
-                        shared.app_performance_telemetry().record(
-                            AppPerformanceOperation::OutboundMessageSend,
-                            send_started_at.elapsed(),
-                            result.is_ok(),
-                        );
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::UploadMedia {
-                        group_id,
-                        request,
-                        respond,
-                    }) => {
-                        let upload_started_at = Instant::now();
-                        let result = client.upload_media(&group_id, request).await;
-                        shared.app_performance_telemetry().record(
-                            AppPerformanceOperation::MediaUpload,
-                            upload_started_at.elapsed(),
-                            result.is_ok(),
-                        );
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::DownloadMedia {
-                        group_id,
-                        reference,
-                        respond,
-                    }) => {
-                        let download_started_at = Instant::now();
-                        let result = client.download_media(&group_id, reference).await;
-                        shared.app_performance_telemetry().record(
-                            AppPerformanceOperation::MediaDownload,
-                            download_started_at.elapsed(),
-                            result.is_ok(),
-                        );
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::StartAgentTextStream {
-                        group_id,
-                        stream_id,
-                        quic_candidates,
-                        respond,
-                    }) => {
-                        let result = client
-                            .start_agent_text_stream_with_local_projection(
-                                &group_id,
-                                &stream_id,
-                                quic_candidates,
-                                |update| {
-                                    publish_app_runtime_projection_update(
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        update,
-                                    );
-                                },
-                            )
-                            .await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::FinishAgentTextStream {
-                        group_id,
-                        request,
-                        respond,
-                    }) => {
-                        let result = client
-                            .finish_agent_text_stream_with_local_projection(
-                                &group_id,
-                                request,
-                                |update| {
-                                    publish_app_runtime_projection_update(
-                                        &events,
-                                        &account_id_hex,
-                                        &account_label,
-                                        update,
-                                    );
-                                },
-                            )
-                            .await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::RetryGroupConvergence { group_id, respond }) => {
-                        let result = client.retry_group_convergence(&group_id).await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::PublishKeyPackage { respond }) => {
-                        let result = async {
-                            let key_package = client.publish_key_package().await?;
-                            Ok(key_package.bytes().len())
-                        }
-                        .await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::RotateKeyPackage { respond }) => {
-                        let result = async {
-                            let key_package = client.rotate_key_package().await?;
-                            Ok(key_package.bytes().len())
-                        }
-                        .await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::SharePushRegistration { respond }) => {
-                        let result = client.share_push_registration().await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::RemovePushRegistration {
-                        registration,
-                        respond,
-                    }) => {
-                        let result = client.remove_push_registration(registration).await;
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::DeleteAuditLog { path, respond }) => {
-                        let result = client.rotate_audit_log_if_active(&path);
-                        let _ = respond.send(result);
-                    }
-                    Some(AccountWorkerCommand::SetAuditRecording { enabled, respond }) => {
-                        client.set_audit_recording(enabled);
-                        let _ = respond.send(Ok(()));
                     }
                     None => return,
                 }
@@ -940,6 +519,12 @@ async fn run_app_runtime_account_worker(
                             result = app.runtime_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                         } {
                             Ok(reopened) => {
+                                // The reopen re-hydrates + reconnects + resubscribes
+                                // (via `runtime_client`) but does NOT run the
+                                // catch-up `sync()` on the readiness path — it
+                                // resumes the live `next_event` tail below — so it
+                                // does not reintroduce the catch-up blocking this
+                                // worker removed from startup.
                                 client = reopened;
                             }
                             Err(setup_err) => {
@@ -959,6 +544,567 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Process a single account-worker command against the live session.
+///
+/// Extracted so the worker can drive commands from two places: the steady-state
+/// command loop, and the deferred-command replay that runs after the initial
+/// catch-up completes (commands that arrived while the catch-up held
+/// `&mut client`). Read commands (`Members` / `GroupMlsState` /
+/// `QuarantinedGroups`) are also intercepted inline during the initial catch-up
+/// and answered from a `GroupReadSnapshot`; here they read the live session.
+async fn handle_account_worker_command(
+    client: &mut AppClient,
+    command: AccountWorkerCommand,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+) {
+    match command {
+        AccountWorkerCommand::CatchUp { respond } => {
+            let sync_started_at = Instant::now();
+            let result = match client.sync().await {
+                Ok(summary) => {
+                    publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    if sync_summary_triggers_audit_tracker_update(&summary) {
+                        shared.schedule_audit_log_tracker_update("catch_up");
+                    }
+                    Ok(())
+                }
+                Err(err) => {
+                    let message = format!("runtime catch-up failed: {err}");
+                    publish_app_runtime_account_error(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        message.clone(),
+                    );
+                    Err(message)
+                }
+            };
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::AccountSync,
+                sync_started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::CreateGroup {
+            name,
+            members,
+            description,
+            respond,
+        } => {
+            let result = async {
+                let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+                let group_id = client.create_group(&name, &member_refs).await?;
+                if description.is_some() {
+                    client
+                        .update_group_profile(&group_id, None, description.as_deref())
+                        .await?;
+                }
+                Ok(group_id)
+            }
+            .await;
+            if let Ok(group_id) = &result {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::Members { group_id, respond } => {
+            let result = client.members(&group_id);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::GroupMlsState { group_id, respond } => {
+            let result = client.group_mls_state(&group_id);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::QuarantinedGroups { respond } => {
+            let result = Ok(client.quarantined_groups());
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::RetryHydrateQuarantinedGroup { group_id, respond } => {
+            let result = client.retry_hydrate_quarantined_group(&group_id);
+            if matches!(result, Ok(true)) {
+                // The group is live again; the engine queued a
+                // `GroupHydrationRecovered` event. Drain it now so
+                // subscribers see the typed recovery event
+                // deterministically at retry time rather than only
+                // when unrelated relay traffic later triggers a
+                // drain (darkmatter#426). Publish those events plus a
+                // `GroupStateUpdated` so chat-list / projection
+                // consumers refresh and the group leaves the recovery
+                // surface and reappears as a normal chat.
+                match client.drain_pending_session_events().await {
+                    Ok(summary) => {
+                        publish_app_runtime_summary(events, account_id_hex, account_label, &summary)
+                    }
+                    Err(err) => publish_app_runtime_account_error(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        format!("retry recovery drain failed: {err}"),
+                    ),
+                }
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UpdateMessageRetention {
+            group_id,
+            disappearing_message_secs,
+            respond,
+        } => {
+            let result = client
+                .update_message_retention(&group_id, disappearing_message_secs)
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::ReplaceEncryptedMediaBlobEndpoints {
+            group_id,
+            endpoints,
+            respond,
+        } => {
+            let result = client
+                .replace_encrypted_media_blob_endpoints(&group_id, endpoints)
+                .await;
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UpdateGroupAvatarUrl {
+            group_id,
+            url,
+            dim,
+            thumbhash,
+            respond,
+        } => {
+            let result = client
+                .update_group_avatar_url(&group_id, url, dim, thumbhash)
+                .await;
+            if result.is_ok() {
+                // Drain the kind-1210 row this commit queued, like the
+                // sibling UpdateGroupProfile / UpdateGroupImage handlers —
+                // otherwise the avatar-changed caption reaches live
+                // timeline subscribers only on the next snapshot reload.
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SafeExportSecret {
+            group_id,
+            component_id,
+            respond,
+        } => {
+            let result = client.safe_export_secret(&group_id, component_id);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::ExporterSecret {
+            group_id,
+            label,
+            length,
+            respond,
+        } => {
+            let result = client.exporter_secret(&group_id, &label, length);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::InviteMembers {
+            group_id,
+            members,
+            respond,
+        } => {
+            let result = async {
+                let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+                client.invite_members(&group_id, &member_refs).await
+            }
+            .await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::RemoveMembers {
+            group_id,
+            members,
+            respond,
+        } => {
+            let result = async {
+                let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
+                client.remove_members(&group_id, &member_refs).await
+            }
+            .await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::LeaveGroup { group_id, respond } => {
+            let result = client.leave_group(&group_id).await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => {
+            let result = client.accept_group_invite(&group_id);
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => {
+            let result = client.decline_group_invite(&group_id).await;
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SetGroupArchived {
+            group_id,
+            archived,
+            respond,
+        } => {
+            // The archive projection events (ArchiveChanged chat-list
+            // update + GroupStateUpdated) are published by the single
+            // caller `MarmotAppRuntime::set_group_archived` after this
+            // command returns. Emitting `GroupStateUpdated` here too
+            // would race ahead of the ArchiveChanged trigger and get
+            // fingerprint-deduped by `subscribe_chat_list`, so
+            // subscribers would see a generic state change instead of
+            // the archive-specific trigger. Keep this worker handler
+            // limited to mutating the authoritative in-memory state.
+            let result = client.set_group_archived(&group_id, archived);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::PromoteAdmin {
+            group_id,
+            member_ref,
+            respond,
+        } => {
+            let result = client.promote_admin(&group_id, &member_ref).await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DemoteAdmin {
+            group_id,
+            member_ref,
+            respond,
+        } => {
+            let result = client.demote_admin(&group_id, &member_ref).await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SelfDemoteAdmin { group_id, respond } => {
+            let result = client.self_demote_admin(&group_id).await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UpdateGroupProfile {
+            group_id,
+            name,
+            description,
+            respond,
+        } => {
+            let result = client
+                .update_group_profile(&group_id, name.as_deref(), description.as_deref())
+                .await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UpdateGroupImage {
+            group_id,
+            plaintext,
+            media_type,
+            respond,
+        } => {
+            let result = client
+                .update_group_image(&group_id, plaintext, &media_type)
+                .await;
+            if result.is_ok() {
+                publish_client_pending_projection_updates(
+                    client,
+                    events,
+                    account_id_hex,
+                    account_label,
+                );
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DownloadGroupImage { group_id, respond } => {
+            let result = client.download_group_image(&group_id).await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SendMessage {
+            group_id,
+            payload,
+            respond,
+        } => {
+            let send_started_at = Instant::now();
+            let result = client
+                .send_with_local_projection(&group_id, &payload, |update| {
+                    publish_app_runtime_projection_update(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        update,
+                    );
+                })
+                .await;
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageSend,
+                send_started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SendAppEvent {
+            group_id,
+            intent,
+            respond,
+        } => {
+            let send_started_at = Instant::now();
+            let result = client
+                .send_app_event_with_local_projection(&group_id, intent, |update| {
+                    publish_app_runtime_projection_update(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        update,
+                    );
+                })
+                .await
+                .map(|(_event, summary)| summary);
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::OutboundMessageSend,
+                send_started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UploadMedia {
+            group_id,
+            request,
+            respond,
+        } => {
+            let upload_started_at = Instant::now();
+            let result = client.upload_media(&group_id, request).await;
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::MediaUpload,
+                upload_started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DownloadMedia {
+            group_id,
+            reference,
+            respond,
+        } => {
+            let download_started_at = Instant::now();
+            let result = client.download_media(&group_id, reference).await;
+            shared.app_performance_telemetry().record(
+                AppPerformanceOperation::MediaDownload,
+                download_started_at.elapsed(),
+                result.is_ok(),
+            );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::StartAgentTextStream {
+            group_id,
+            stream_id,
+            quic_candidates,
+            respond,
+        } => {
+            let result = client
+                .start_agent_text_stream_with_local_projection(
+                    &group_id,
+                    &stream_id,
+                    quic_candidates,
+                    |update| {
+                        publish_app_runtime_projection_update(
+                            events,
+                            account_id_hex,
+                            account_label,
+                            update,
+                        );
+                    },
+                )
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::FinishAgentTextStream {
+            group_id,
+            request,
+            respond,
+        } => {
+            let result = client
+                .finish_agent_text_stream_with_local_projection(&group_id, request, |update| {
+                    publish_app_runtime_projection_update(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        update,
+                    );
+                })
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => {
+            let result = client.retry_group_convergence(&group_id).await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::PublishKeyPackage { respond } => {
+            let result = async {
+                let key_package = client.publish_key_package().await?;
+                Ok(key_package.bytes().len())
+            }
+            .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::RotateKeyPackage { respond } => {
+            let result = async {
+                let key_package = client.rotate_key_package().await?;
+                Ok(key_package.bytes().len())
+            }
+            .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SharePushRegistration { respond } => {
+            let result = client.share_push_registration().await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::RemovePushRegistration {
+            registration,
+            respond,
+        } => {
+            let result = client.remove_push_registration(registration).await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DeleteAuditLog { path, respond } => {
+            let result = client.rotate_audit_log_if_active(&path);
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SetAuditRecording { enabled, respond } => {
+            client.set_audit_recording(enabled);
+            let _ = respond.send(Ok(()));
         }
     }
 }

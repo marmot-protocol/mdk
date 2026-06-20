@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use cgka_engine::key_package::is_last_resort_key_package;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
@@ -61,6 +63,51 @@ pub struct AppClient {
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
+}
+
+/// A point-in-time copy of the live session's read-only group projections
+/// (`members`, `group_mls_state`, `quarantined_groups`).
+///
+/// The account worker captures this from the freshly hydrated session and uses
+/// it to answer read commands *while the initial relay catch-up runs in the
+/// background* — the catch-up future holds `&mut AppClient`, so concurrent reads
+/// cannot touch the live session and are served from this snapshot instead.
+/// Membership/epoch only change on a committed group operation, which the
+/// catch-up surfaces via `GroupStateUpdated` so subscribers re-read once it
+/// lands; the snapshot is therefore a brief, self-healing stand-in, only used
+/// until the initial catch-up completes (after which reads go live again).
+///
+/// Groups whose live read errored at capture time (e.g. quarantined / not yet
+/// live) are simply absent; a read for an absent group returns `UnknownGroup`,
+/// the same shape the live path returns for a group the session does not hold.
+#[derive(Default)]
+pub(crate) struct GroupReadSnapshot {
+    members: HashMap<GroupId, Vec<AppGroupMemberRecord>>,
+    mls_state: HashMap<GroupId, AppGroupMlsState>,
+    quarantined: Vec<AppQuarantinedGroup>,
+}
+
+impl GroupReadSnapshot {
+    pub(crate) fn members(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
+        self.members
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    pub(crate) fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
+        self.mls_state
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
+    }
+
+    pub(crate) fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
+        self.quarantined.clone()
+    }
 }
 
 struct ObservedHumanActionAudit {
@@ -210,8 +257,22 @@ impl AppClient {
     }
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<AppGroupMemberRecord>, AppError> {
-        self.ensure_group(group_id)?;
         let profiles = self.app.profiles_by_id()?;
+        self.members_with_profiles(group_id, &profiles)
+    }
+
+    /// Build a group's member records against a caller-provided account-profile
+    /// map, avoiding a fresh `profiles_by_id` load per group. `members` loads the
+    /// map for a single read; [`AppClient::group_read_snapshot`] loads it once
+    /// and reuses it across every group so capturing the snapshot stays a single
+    /// profile read plus in-memory engine reads (it runs on the worker readiness
+    /// path).
+    fn members_with_profiles(
+        &self,
+        group_id: &GroupId,
+        profiles: &HashMap<String, String>,
+    ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
+        self.ensure_group(group_id)?;
         Ok(self
             .runtime
             .members(group_id)?
@@ -259,6 +320,46 @@ impl AppClient {
                 reason: reason.into(),
             })
             .collect()
+    }
+
+    /// Capture a [`GroupReadSnapshot`] of every known group's read-only
+    /// projections from the live (hydrated) session.
+    ///
+    /// Used by the account worker to answer read commands during the initial
+    /// relay catch-up without blocking on it; see [`GroupReadSnapshot`]. Reads
+    /// that error for a given group (quarantined / not yet live) are omitted —
+    /// the snapshot accessor reports those as `UnknownGroup`, matching the live
+    /// path for a group the session does not hold.
+    ///
+    /// Returns the storage error if the one shared profile load fails, rather
+    /// than masking it as empty profiles (which would make every member read
+    /// `account: None` / `local: false` during the catch-up window). The worker
+    /// then falls back to serving those reads from the live session after
+    /// catch-up, matching the live path's error semantics.
+    pub(crate) fn group_read_snapshot(&self) -> Result<GroupReadSnapshot, AppError> {
+        // Load account profiles once and reuse across every group: the rest of
+        // the capture is in-memory engine reads, so the snapshot adds a single
+        // storage read to the worker readiness path regardless of group count.
+        let profiles = self.app.profiles_by_id()?;
+        let mut members = HashMap::new();
+        let mut mls_state = HashMap::new();
+        for group in &self.state.groups {
+            let Ok(bytes) = hex::decode(&group.group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(bytes);
+            if let Ok(records) = self.members_with_profiles(&group_id, &profiles) {
+                members.insert(group_id.clone(), records);
+            }
+            if let Ok(state) = self.group_mls_state(&group_id) {
+                mls_state.insert(group_id, state);
+            }
+        }
+        Ok(GroupReadSnapshot {
+            members,
+            mls_state,
+            quarantined: self.quarantined_groups(),
+        })
     }
 
     /// Re-attempt hydration of a single quarantined group (darkmatter#426).

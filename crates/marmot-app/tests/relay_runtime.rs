@@ -856,6 +856,110 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
 }
 
 #[tokio::test]
+async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
+    // Regression: the account worker must answer read commands as soon as the
+    // session is hydrated, WITHOUT blocking on the initial relay catch-up. On
+    // iOS the runtime is rebuilt on every foreground resume, so each resume
+    // re-runs worker startup; routing the conversation's `Members` read through
+    // the catch-up made the first conversation opened take seconds.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let mut events = runtime.subscribe();
+
+    // Alice creates a group with Bob. Waiting for Bob's GroupJoined guarantees
+    // Bob received the welcome over the relay (an inbound delivery), so his
+    // persisted transport cursor is advanced to ~now: his next worker startup
+    // re-subscribes from there and the catch-up genuinely has to wait
+    // (SDK_FIRST_SYNC_WAIT / drain) rather than short-circuiting.
+    let group_id = runtime
+        .create_group(&alice_id, "fast reads", std::slice::from_ref(&bob_id), None)
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+
+    // `AccountSync` is recorded only when a worker's catch-up sync COMPLETES.
+    let account_sync_attempts = || {
+        runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .account_sync
+            .attempts
+    };
+    let before_restart = account_sync_attempts();
+
+    // Foreground-resume analog: tear down and rebuild Bob's worker.
+    runtime.restart_account(&bob_id).await.unwrap();
+
+    // Deterministic discriminator: in the fixed code `restart_account` returns
+    // once the worker is hydrated and command-ready, BEFORE the background
+    // catch-up completes — so no new `AccountSync` has been recorded yet. (The
+    // catch-up has a >=250ms drain floor, so it cannot have finished in the
+    // synchronous gap between `restart_account` returning and this read.) In the
+    // pre-fix code, `restart_account`/`reconcile` blocked on the startup sync,
+    // so a new `AccountSync` would already be recorded here. No `.await` runs
+    // between `restart_account` and this read.
+    assert_eq!(
+        account_sync_attempts(),
+        before_restart,
+        "restart must become command-ready before the initial catch-up completes",
+    );
+
+    // And the read is answered with correct membership while (or right after)
+    // the catch-up runs — served from the post-hydration snapshot during the
+    // window, from the live session afterwards. Either way it must not block.
+    let members = timeout(
+        Duration::from_secs(2),
+        runtime.group_members(&bob_id, &group_id),
+    )
+    .await
+    .expect("member read must not block on the initial catch-up")
+    .unwrap();
+    let member_ids = members
+        .into_iter()
+        .map(|member| member.member_id_hex)
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        member_ids.contains(&alice_id) && member_ids.contains(&bob_id),
+        "snapshot/live read must report the full roster",
+    );
+
+    // The catch-up is not dropped — it still runs in the background and records
+    // its completion.
+    let catch_up_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if account_sync_attempts() > before_restart {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < catch_up_deadline,
+            "background catch-up must still complete after readiness",
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -1890,12 +1994,20 @@ async fn directory_sync_worker_ingests_profile_metadata_events() {
         .unwrap();
 
     runtime.start().await.unwrap();
+    // `create_identity` publishes a default profile (kind-0) for this account at
+    // ~now, and the directory keeps only the *newer* of two profiles (ties go to
+    // the cached copy, darkmatter#206). Stamp the test profile a minute ahead so
+    // it deterministically wins regardless of how fast `start()` returns —
+    // `start()` no longer blocks on the account worker's initial catch-up, so the
+    // two profiles can otherwise land in the same wall-clock second and tie. The
+    // offset must stay within `directory_max_future_skew` (5 min) or the event is
+    // rejected as future-dated.
     publish_profile_at(
         &AccountHome::open(dir.path()),
         &setup.account.label,
         &url,
         "sync-alice",
-        test_unix_now_seconds(),
+        test_unix_now_seconds() + 60,
     )
     .await;
 
