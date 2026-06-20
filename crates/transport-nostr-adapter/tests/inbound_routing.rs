@@ -958,6 +958,119 @@ async fn inbox_subscription_since_saturates_at_zero() {
     assert_eq!(inbox_since, Some(Timestamp(0)));
 }
 
+// Regression for darkmatter#482: routing must tolerate non-canonical relay-URL
+// differences between the stored (verbatim, signed-routing) endpoint and the
+// endpoint an inbound event arrives on (built from a parsed `RelayUrl`). A raw
+// `==` silently dropped events that differed only by a trailing slash (or host
+// case / default port). Here the group endpoint is stored slash-less while the
+// event arrives with the trailing slash a parsed `RelayUrl` carries.
+#[tokio::test]
+async fn group_event_routes_despite_trailing_slash_mismatch() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    // Stored verbatim, NOT url-canonical (no trailing slash).
+    let stored_endpoint = TransportEndpoint("wss://group.example".into());
+    // Inbound endpoint as a parsed RelayUrl would serialize it (trailing slash).
+    let inbound_endpoint = TransportEndpoint("wss://group.example/".into());
+    assert_ne!(
+        stored_endpoint, inbound_endpoint,
+        "inputs must differ byte-wise"
+    );
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![stored_endpoint],
+            }],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("activation succeeds");
+
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: inbound_endpoint.clone(),
+            subscription_id: Some("group-sub".into()),
+            event: group_event("11", &transport_group_id),
+        })
+        .await
+        .expect("relay event handled");
+
+    assert_eq!(
+        delivered, 1,
+        "event must route despite trailing-slash mismatch"
+    );
+    let delivery = adapter
+        .receive()
+        .await
+        .expect("receive succeeds")
+        .expect("delivery available");
+    assert_eq!(delivery.account_id, account_id);
+    assert_eq!(delivery.group_id_hint, Some(group_id));
+    assert_eq!(delivery.source.plane, TransportDeliveryPlane::Group);
+    assert_eq!(delivery.source.endpoint, Some(inbound_endpoint));
+}
+
+// Regression for darkmatter#482: welcome inbox routing must tolerate the same
+// non-canonical relay-URL difference as group routing.
+#[tokio::test]
+async fn welcome_event_routes_despite_trailing_slash_mismatch() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let sender =
+        nostr::Keys::parse("6b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+            .unwrap();
+    let receiver =
+        nostr::Keys::parse("7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e")
+            .unwrap();
+    let account_id = MemberId::new(receiver.public_key().to_bytes().to_vec());
+    // Stored verbatim (no trailing slash); inbound carries the RelayUrl slash.
+    let stored_inbox = TransportEndpoint("wss://inbox.example".into());
+    let inbound_inbox = TransportEndpoint("wss://inbox.example/".into());
+    assert_ne!(stored_inbox, inbound_inbox, "inputs must differ byte-wise");
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![stored_inbox],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    let rumor = nostr::EventBuilder::text_note("not yet peeled here").build(sender.public_key());
+    let gift_wrap = nostr::EventBuilder::gift_wrap(&sender, &receiver.public_key(), rumor, [])
+        .await
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&gift_wrap).unwrap();
+
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: inbound_inbox.clone(),
+            subscription_id: Some("inbox-sub".into()),
+            event,
+        })
+        .await
+        .expect("relay event handled");
+
+    assert_eq!(
+        delivered, 1,
+        "welcome must route despite trailing-slash mismatch"
+    );
+    let delivery = adapter.receive().await.unwrap().unwrap();
+    assert_eq!(delivery.account_id, account_id);
+    assert_eq!(delivery.source.plane, TransportDeliveryPlane::AccountInbox);
+    assert_eq!(delivery.source.endpoint, Some(inbound_inbox));
+}
+
 fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
     NostrTransportEvent {
         id: id_byte.repeat(32),

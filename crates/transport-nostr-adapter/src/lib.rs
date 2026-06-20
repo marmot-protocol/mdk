@@ -22,6 +22,7 @@ use cgka_traits::{
     TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
+use nostr::RelayUrl;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinSet;
@@ -691,6 +692,36 @@ struct AdapterState {
     sync: RelaySyncTelemetry,
 }
 
+/// Compare a stored route endpoint against the endpoint an inbound event
+/// arrived on, normalization-safe.
+///
+/// Routing must not depend on callers pre-canonicalizing relay URLs. Inbound
+/// endpoints are built from a parsed nostr `RelayUrl` (`sdk_client`), while
+/// stored group/inbox endpoints carry the verbatim signed routing strings
+/// (`marmot.transport.nostr.routing.v1`), which are intentionally never
+/// rewritten. A raw `==` therefore drops events whenever the two differ only
+/// by a `url`-canonicalizable detail (trailing slash, host case, default
+/// port, percent-encoding) — see darkmatter#482.
+///
+/// Fast path is byte equality. Otherwise both sides are parsed as `RelayUrl`
+/// and compared by value, which folds those canonicalization differences
+/// together. If either side fails to parse as a relay URL (e.g. a non-Nostr
+/// transport endpoint), fall back to the byte comparison so behavior is never
+/// looser than exact match. This is a read-side comparison only; stored
+/// endpoints are left untouched, preserving the signed-routing invariant.
+fn endpoints_match(candidate: &TransportEndpoint, endpoint: &TransportEndpoint) -> bool {
+    if candidate == endpoint {
+        return true;
+    }
+    match (
+        RelayUrl::parse(candidate.as_str()),
+        RelayUrl::parse(endpoint.as_str()),
+    ) {
+        (Ok(candidate), Ok(endpoint)) => candidate == endpoint,
+        _ => false,
+    }
+}
+
 impl AdapterState {
     fn activate(&mut self, activation: TransportAccountActivation, replaced: usize) {
         self.metrics.subscriptions_created += 1 + activation.group_subscriptions.len();
@@ -797,7 +828,7 @@ impl AdapterState {
                                 && group
                                     .endpoints
                                     .iter()
-                                    .any(|candidate| candidate == endpoint)
+                                    .any(|candidate| endpoints_match(candidate, endpoint))
                         })
                         .map(move |group| DeliveryRoute {
                             account_id: account_id.clone(),
@@ -814,7 +845,7 @@ impl AdapterState {
                         && routes
                             .inbox_endpoints
                             .iter()
-                            .any(|candidate| candidate == endpoint)
+                            .any(|candidate| endpoints_match(candidate, endpoint))
                 })
                 .map(|(account_id, _)| DeliveryRoute {
                     account_id: account_id.clone(),
