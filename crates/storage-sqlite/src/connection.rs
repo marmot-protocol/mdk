@@ -9,6 +9,76 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+/// Maximum number of attempts a write operation makes before giving up and
+/// surfacing the transient `Busy` error. The connection already sets
+/// `PRAGMA busy_timeout`, so each attempt blocks for that long inside SQLite
+/// before returning `SQLITE_BUSY`; this retry loop adds a second, coarser layer
+/// so brief contention from a concurrent writer (a background sync, projection
+/// rebuild, retention prune, or a WAL checkpoint racing the send path)
+/// self-resolves instead of bubbling to the user as "Send failed". See issue
+/// #484.
+const BUSY_MAX_ATTEMPTS: u32 = 6;
+
+/// Base backoff between busy retries. Backoff grows exponentially per attempt
+/// (capped at [`BUSY_BACKOFF_CAP`]) with no jitter — the in-process write mutex
+/// already serialises this connection's writers, so contention here is with a
+/// *separate* connection/process and a deterministic backoff is sufficient.
+const BUSY_BACKOFF_BASE: Duration = Duration::from_millis(20);
+
+/// Upper bound on a single busy-retry backoff sleep.
+const BUSY_BACKOFF_CAP: Duration = Duration::from_millis(250);
+
+/// An error that may represent transient SQLite lock contention worth retrying.
+/// Implemented for the two storage error types so [`retry_on_busy`] can drive a
+/// retry loop without knowing which one a call site uses.
+pub(crate) trait TransientError {
+    /// Whether this error is transient lock contention (`SQLITE_BUSY` /
+    /// `SQLITE_LOCKED`) rather than a durable failure.
+    fn is_busy(&self) -> bool;
+}
+
+impl TransientError for StorageError {
+    fn is_busy(&self) -> bool {
+        matches!(self, StorageError::Busy(_))
+    }
+}
+
+/// Run a whole storage operation, retrying with capped exponential backoff while
+/// it fails with transient lock contention. `op` MUST be a complete, idempotent
+/// unit of work (a single autocommit statement or an entire `BEGIN..COMMIT`
+/// transaction) — never a single statement inside a larger transaction, since a
+/// retry re-runs the closure from the top. On `SQLITE_BUSY`/`SQLITE_LOCKED`
+/// SQLite has already rolled back the failed transaction, so re-running is safe.
+/// After [`BUSY_MAX_ATTEMPTS`] the last transient error is returned unchanged so
+/// callers still see a `Busy` (transient) classification.
+pub(crate) fn retry_on_busy<T, E, F>(mut op: F) -> Result<T, E>
+where
+    E: TransientError,
+    F: FnMut() -> Result<T, E>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.is_busy() && attempt + 1 < BUSY_MAX_ATTEMPTS => {
+                let backoff = busy_backoff(attempt);
+                attempt += 1;
+                std::thread::sleep(backoff);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Exponential backoff for busy retry `attempt` (0-indexed), capped at
+/// [`BUSY_BACKOFF_CAP`].
+fn busy_backoff(attempt: u32) -> Duration {
+    let scaled = BUSY_BACKOFF_BASE
+        .checked_mul(1u32 << attempt.min(8))
+        .unwrap_or(BUSY_BACKOFF_CAP);
+    scaled.min(BUSY_BACKOFF_CAP)
+}
+
 #[derive(Clone)]
 pub(crate) struct SharedConnection {
     inner: Arc<SharedConnectionInner>,
@@ -110,7 +180,7 @@ impl SharedConnection {
         *owner = Some(current);
         drop(owner);
 
-        if let Err(err) = self.execute_transaction_boundary("BEGIN IMMEDIATE") {
+        if let Err(err) = self.begin_immediate_with_retry() {
             self.clear_transaction_owner();
             return Err(E::from(err));
         }
@@ -185,6 +255,27 @@ impl SharedConnection {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute_batch(sql)
             .map_err(|e| StorageError::Backend(format!("sqlite transaction {sql}: {e}")))
+    }
+
+    /// Run `BEGIN IMMEDIATE`, retrying with capped exponential backoff on
+    /// transient lock contention. `BEGIN IMMEDIATE` eagerly acquires the SQLite
+    /// write lock, so it is the dominant `SQLITE_BUSY` surface when a separate
+    /// connection/process is mid-write (background sync, projection rebuild,
+    /// retention prune, or WAL checkpoint). No transaction work has run yet at
+    /// this point, so retrying the BEGIN has no side effects. A busy failure
+    /// that survives all attempts is surfaced as the transient
+    /// [`StorageError::Busy`] so callers can tell it apart from a fatal backend
+    /// fault (issue #484).
+    fn begin_immediate_with_retry(&self) -> StorageResult<()> {
+        retry_on_busy(|| {
+            let conn = self
+                .inner
+                .connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(crate::codec::map_sqlite_error)
+        })
     }
 
     fn transaction_unusable_error(&self) -> Option<StorageError> {
@@ -956,6 +1047,122 @@ mod tests {
 
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(reopened.get_group(&gid(1)).unwrap().epoch, EpochId(3));
+    }
+
+    #[test]
+    fn busy_backoff_grows_and_is_capped() {
+        assert_eq!(busy_backoff(0), BUSY_BACKOFF_BASE);
+        assert_eq!(busy_backoff(1), BUSY_BACKOFF_BASE * 2);
+        assert_eq!(busy_backoff(2), BUSY_BACKOFF_BASE * 4);
+        // Large attempt counts saturate at the cap rather than overflowing.
+        assert_eq!(busy_backoff(20), BUSY_BACKOFF_CAP);
+        assert!(busy_backoff(3) <= BUSY_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn retry_on_busy_retries_transient_then_succeeds() {
+        let mut calls = 0u32;
+        let result: Result<u32, StorageError> = retry_on_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(StorageError::Busy("locked".into()))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.unwrap(), 3, "should succeed once the busy clears");
+    }
+
+    #[test]
+    fn retry_on_busy_does_not_retry_fatal_errors() {
+        let mut calls = 0u32;
+        let result: Result<(), StorageError> = retry_on_busy(|| {
+            calls += 1;
+            Err(StorageError::Backend("fatal".into()))
+        });
+        assert!(matches!(result, Err(StorageError::Backend(_))));
+        assert_eq!(calls, 1, "fatal errors must not be retried");
+    }
+
+    #[test]
+    fn retry_on_busy_surfaces_busy_after_exhausting_attempts() {
+        let mut calls = 0u32;
+        let result: Result<(), StorageError> = retry_on_busy(|| {
+            calls += 1;
+            Err(StorageError::Busy("still locked".into()))
+        });
+        assert!(
+            matches!(result, Err(StorageError::Busy(_))),
+            "persistent busy must surface as a transient Busy error, not Backend"
+        );
+        assert_eq!(calls, BUSY_MAX_ATTEMPTS, "must use the full attempt budget");
+    }
+
+    // Regression for issue #484: a concurrent writer on a SECOND connection to
+    // the same database file briefly holds the SQLite write lock. With a busy
+    // timeout shorter than the hold, the first attempt sees SQLITE_BUSY; the
+    // storage layer's retry-with-backoff must wait it out so the send-path
+    // write succeeds instead of bubbling "database is locked" to the user.
+    #[test]
+    fn concurrent_writer_contention_is_retried_not_surfaced() {
+        use crate::storage::test_support::{gid, mid, sample_group, sample_message};
+        use cgka_traits::storage::{GroupStorage, MessageStorage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contention.sqlite");
+        let key = SqlCipherKey::new("contention test key").unwrap();
+        // Short busy timeout so the *first* attempt fails fast and the win comes
+        // from the retry loop, not from SQLite's own busy_timeout wait.
+        let options = SqliteStorageOptions {
+            busy_timeout_ms: 50,
+            ..SqliteStorageOptions::default()
+        };
+
+        let writer =
+            SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+                .unwrap();
+        writer.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+
+        // A separate connection/handle to the same file holds an exclusive write
+        // transaction for longer than one busy-timeout window, then releases.
+        let hold = std::time::Duration::from_millis(200);
+        let blocker_options = options.clone();
+        let blocker_key = SqlCipherKey::new("contention test key").unwrap();
+        let blocker_path = path.clone();
+        let blocker = std::thread::spawn(move || {
+            let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                &blocker_path,
+                &blocker_key,
+                blocker_options,
+            )
+            .unwrap();
+            let conn = blocker.lock().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn.execute(
+                "INSERT INTO cgka_groups (id, record) VALUES (?1, ?2)",
+                rusqlite::params![gid(2).as_slice(), b"blocker".as_slice()],
+            )
+            .ok();
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT").unwrap();
+        });
+
+        // Give the blocker time to take the write lock before we try to write.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        // This write contends with the blocker. Without retry it would return
+        // a "database is locked" error after the 50ms busy timeout; with retry
+        // it waits out the 200ms hold and succeeds.
+        writer
+            .put_message(&sample_message(mid(1), gid(1), 0))
+            .expect("contended write must succeed via busy retry, not surface as failure");
+
+        blocker.join().unwrap();
+        assert_eq!(
+            writer.get_message(&mid(1)).unwrap().id,
+            mid(1),
+            "the message persisted after contention cleared"
+        );
     }
 
     fn pragma_i64(connection: &rusqlite::Connection, name: &str) -> i64 {

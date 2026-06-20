@@ -49,3 +49,12 @@ pub enum SqliteOpenMlsStorageError {
     #[error("connection lock poisoned: {0}")]
     Lock(String),
 }
+
+impl crate::connection::TransientError for SqliteOpenMlsStorageError {
+    fn is_busy(&self) -> bool {
+        match self {
+            SqliteOpenMlsStorageError::Sqlite(error) => crate::codec::is_busy_error(error),
+            _ => false,
+        }
+    }
+}

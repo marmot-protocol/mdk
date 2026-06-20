@@ -29,10 +29,31 @@ pub enum StorageError {
     AlreadyExists,
     #[error("snapshot not found: {0}")]
     SnapshotMissing(String),
+    /// Transient lock contention: the backend could not acquire the database
+    /// lock in time (for SQLite this is `SQLITE_BUSY` / `SQLITE_LOCKED`). It is
+    /// distinct from [`StorageError::Backend`] so callers can recognise a
+    /// retryable condition instead of string-parsing "database is locked" and
+    /// surfacing it to the user as a fatal failure. The storage backend already
+    /// retries with backoff; this variant is what escapes only after those
+    /// retries are exhausted, so callers may retry the whole operation or report
+    /// it as a transient (not fatal) error.
+    #[error("backend busy: {0}")]
+    Busy(String),
     #[error("backend failure: {0}")]
     Backend(String),
     #[error("serialization failure: {0}")]
     Serialization(String),
+}
+
+impl StorageError {
+    /// Whether this error reflects transient contention worth retrying rather
+    /// than a durable failure. Currently only [`StorageError::Busy`] is
+    /// transient; everything else (not-found, serialization, backend faults) is
+    /// terminal for the attempt.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, StorageError::Busy(_))
+    }
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;

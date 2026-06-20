@@ -43,6 +43,14 @@ pub enum MarmotKitError {
         group_id_hex: String,
         member_id_hex: String,
     },
+    /// Transient storage lock contention (`SQLITE_BUSY` / "database is locked")
+    /// that survived the storage layer's internal retry-with-backoff. It is a
+    /// distinct, typed variant — separate from [`MarmotKitError::Runtime`] — so
+    /// the app (#484) can recognise a *transient* condition worth a user retry
+    /// or auto-retry instead of string-parsing "database is locked" and
+    /// surfacing it as a fatal "Send failed".
+    #[error("storage busy: {details}")]
+    StorageBusy { details: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
 }
@@ -71,6 +79,13 @@ impl From<AppError> for MarmotKitError {
             AppError::Publish(details) => Self::Publish { details },
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeStopping => Self::RuntimeStopping,
+            // #484: a transient storage busy error can also surface directly at
+            // the app layer (not only wrapped in an EngineError). Classify it
+            // as the typed transient variant here too, so Android never sees
+            // transient contention as an untyped fatal Runtime error.
+            AppError::Storage(ref storage_err) if storage_err.is_transient() => Self::StorageBusy {
+                details: storage_err.to_string(),
+            },
             other => Self::Runtime {
                 details: other.to_string(),
             },
@@ -97,9 +112,80 @@ impl MarmotKitError {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 member_id_hex: hex::encode(member.as_slice()),
             },
+            // #484: surface transient storage lock contention as a typed,
+            // app-distinguishable variant rather than flattening it into the
+            // untyped `Runtime` bucket. `StorageError::is_transient()` is the
+            // single source of truth for which storage errors are transient.
+            EngineError::Storage(storage_err) if storage_err.is_transient() => Self::StorageBusy {
+                details: storage_err.to_string(),
+            },
             other => Self::Runtime {
                 details: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MarmotKitError;
+    use cgka_traits::error::EngineError;
+    use cgka_traits::storage::StorageError;
+    use marmot_account::AccountError;
+    use marmot_app::AppError;
+
+    // #484: a transient SQLITE_BUSY surfaced from a send must cross the UniFFI
+    // boundary as the typed `StorageBusy` variant — never the untyped `Runtime`
+    // bucket — so Android can distinguish transient contention from a fatal
+    // failure without string-parsing "database is locked".
+    #[test]
+    fn storage_busy_crosses_ffi_as_typed_variant_via_engine() {
+        // Send path: storage Busy wrapped in EngineError, wrapped in AppError
+        // through the account/engine error chain (the real `do_send` shape).
+        let app_err = AppError::Account(AccountError::Engine(EngineError::Storage(
+            StorageError::Busy("database is locked".to_string()),
+        )));
+        let ffi: MarmotKitError = app_err.into();
+        match ffi {
+            MarmotKitError::StorageBusy { details } => {
+                assert!(
+                    details.contains("busy"),
+                    "typed StorageBusy should carry the storage detail, got: {details}"
+                );
+            }
+            other => panic!("expected StorageBusy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_busy_crosses_ffi_as_typed_variant_directly() {
+        // A transient storage Busy can also surface directly at the app layer
+        // (AppError::Storage) without an EngineError wrapper.
+        let app_err = AppError::Storage(StorageError::Busy("database is locked".to_string()));
+        let ffi: MarmotKitError = app_err.into();
+        assert!(
+            matches!(ffi, MarmotKitError::StorageBusy { .. }),
+            "direct AppError::Storage(Busy) must map to StorageBusy, got {ffi:?}"
+        );
+    }
+
+    #[test]
+    fn non_transient_storage_error_stays_runtime() {
+        // A durable backend fault must NOT be misclassified as transient.
+        let app_err = AppError::Storage(StorageError::Backend("disk full".to_string()));
+        let ffi: MarmotKitError = app_err.into();
+        assert!(
+            matches!(ffi, MarmotKitError::Runtime { .. }),
+            "non-transient storage faults must stay Runtime, got {ffi:?}"
+        );
+
+        let engine_app_err = AppError::Account(AccountError::Engine(EngineError::Storage(
+            StorageError::NotFound,
+        )));
+        let engine_ffi: MarmotKitError = engine_app_err.into();
+        assert!(
+            matches!(engine_ffi, MarmotKitError::Runtime { .. }),
+            "non-transient engine storage faults must stay Runtime, got {engine_ffi:?}"
+        );
     }
 }

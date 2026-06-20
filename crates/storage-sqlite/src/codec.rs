@@ -19,8 +19,36 @@ pub(crate) trait SqliteResultExt<T> {
 
 impl<T> SqliteResultExt<T> for rusqlite::Result<T> {
     fn storage(self) -> StorageResult<T> {
-        self.map_err(|e| StorageError::Backend(e.to_string()))
+        self.map_err(map_sqlite_error)
     }
+}
+
+/// Map a `rusqlite::Error` to a [`StorageError`], classifying transient lock
+/// contention (`SQLITE_BUSY` / `SQLITE_LOCKED`, including their extended result
+/// codes) as [`StorageError::Busy`] rather than the catch-all
+/// [`StorageError::Backend`]. This is the single place where the SQLite error
+/// vocabulary is translated, so the transient/fatal distinction (issue #484)
+/// stays in one spot and never has to be re-derived by string-parsing
+/// "database is locked".
+pub(crate) fn map_sqlite_error(error: rusqlite::Error) -> StorageError {
+    if is_busy_error(&error) {
+        StorageError::Busy(error.to_string())
+    } else {
+        StorageError::Backend(error.to_string())
+    }
+}
+
+/// Whether a `rusqlite::Error` is transient SQLite lock contention worth
+/// retrying: `SQLITE_BUSY` (the writer could not acquire the database lock
+/// before the busy timeout) or `SQLITE_LOCKED` (a table in the same connection
+/// is locked). Extended result codes such as `SQLITE_BUSY_RECOVERY` and
+/// `SQLITE_LOCKED_SHAREDCACHE` collapse to these primary codes via
+/// `sqlite_error_code`, so matching the primary codes covers them too.
+pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 pub(crate) fn message_state_to_i64(state: MessageState) -> i64 {
@@ -96,4 +124,59 @@ pub(crate) fn unix_now_seconds() -> u64 {
 /// Current wall-clock seconds since the Unix epoch, saturating at `i64::MAX`.
 pub(crate) fn unix_now_seconds_i64() -> i64 {
     i64::try_from(unix_now_seconds()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_failure(primary: std::os::raw::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(primary),
+            Some("database is locked".to_string()),
+        )
+    }
+
+    #[test]
+    fn busy_and_locked_are_classified_transient() {
+        assert!(is_busy_error(&sqlite_failure(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(is_busy_error(&sqlite_failure(rusqlite::ffi::SQLITE_LOCKED)));
+        // Extended result codes collapse to the primary code via
+        // `sqlite_error_code`, so they classify as transient too.
+        assert!(is_busy_error(&sqlite_failure(
+            rusqlite::ffi::SQLITE_BUSY_RECOVERY
+        )));
+        assert!(is_busy_error(&sqlite_failure(
+            rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE
+        )));
+    }
+
+    #[test]
+    fn other_sqlite_errors_are_not_transient() {
+        assert!(!is_busy_error(&sqlite_failure(
+            rusqlite::ffi::SQLITE_CORRUPT
+        )));
+        assert!(!is_busy_error(&sqlite_failure(rusqlite::ffi::SQLITE_FULL)));
+        assert!(!is_busy_error(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn map_sqlite_error_routes_busy_to_busy_variant() {
+        let mapped = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_BUSY));
+        assert!(
+            matches!(mapped, StorageError::Busy(_)),
+            "SQLITE_BUSY must map to StorageError::Busy, got {mapped:?}"
+        );
+        assert!(mapped.is_transient());
+    }
+
+    #[test]
+    fn map_sqlite_error_routes_other_errors_to_backend() {
+        let mapped = map_sqlite_error(sqlite_failure(rusqlite::ffi::SQLITE_CORRUPT));
+        assert!(
+            matches!(mapped, StorageError::Backend(_)),
+            "non-busy errors must map to StorageError::Backend, got {mapped:?}"
+        );
+        assert!(!mapped.is_transient());
+    }
 }

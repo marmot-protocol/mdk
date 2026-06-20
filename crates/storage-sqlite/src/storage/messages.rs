@@ -1,4 +1,5 @@
 use super::snapshots;
+use crate::connection::retry_on_busy;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, deserialize, epoch_to_i64, message_state_to_i64,
     serialize,
@@ -10,25 +11,31 @@ use rusqlite::{OptionalExtension, params};
 
 impl MessageStorage for SqliteAccountStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
-        self.lock()?
-            .execute(
-                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+        // Single autocommit statement: safe to retry the whole statement on
+        // transient lock contention (issue #484).
+        let serialized = serialize(record)?;
+        let epoch = epoch_to_i64(record.epoch)?;
+        retry_on_busy(|| {
+            self.lock()?
+                .execute(
+                    "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                     group_id = excluded.group_id,
                     epoch = excluded.epoch,
                     state = excluded.state,
                     record = excluded.record",
-                params![
-                    record.id.as_slice(),
-                    record.group_id.as_slice(),
-                    epoch_to_i64(record.epoch)?,
-                    message_state_to_i64(record.state),
-                    serialize(record)?
-                ],
-            )
-            .storage()?;
-        Ok(())
+                    params![
+                        record.id.as_slice(),
+                        record.group_id.as_slice(),
+                        epoch,
+                        message_state_to_i64(record.state),
+                        serialized,
+                    ],
+                )
+                .storage()?;
+            Ok(())
+        })
     }
 
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
@@ -51,14 +58,21 @@ impl MessageStorage for SqliteAccountStorage {
         // commit/rollback, so we must not start a nested one. Mirror the
         // openmls value-store pattern: operate directly on the locked
         // connection when we're the transaction owner, otherwise wrap our own.
-        let mut conn = self.lock()?;
         if self.connection.is_current_thread_transaction_owner() {
+            let conn = self.lock()?;
             update_message_state_on_connection(&conn, id, new_state)
         } else {
-            let tx = conn.transaction().storage()?;
-            update_message_state_on_connection(&tx, id, new_state)?;
-            tx.commit().storage()?;
-            Ok(())
+            // #484: own a fresh transaction here, so retry the whole
+            // read-modify-write on transient lock contention. SQLite rolls the
+            // transaction back on SQLITE_BUSY, so re-running from BEGIN is safe
+            // and idempotent.
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction().storage()?;
+                update_message_state_on_connection(&tx, id, new_state)?;
+                tx.commit().storage()?;
+                Ok(())
+            })
         }
     }
 

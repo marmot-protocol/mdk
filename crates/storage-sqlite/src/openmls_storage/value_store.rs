@@ -1,5 +1,6 @@
 use super::labels::build_key;
 use super::{SqliteOpenMlsStorage, SqliteOpenMlsStorageError};
+use crate::connection::retry_on_busy;
 use openmls_traits::storage::{CURRENT_VERSION, Entity, Key};
 use rusqlite::{OptionalExtension, params};
 use serde::de::DeserializeOwned;
@@ -13,19 +14,23 @@ impl SqliteOpenMlsStorage {
         value: Vec<u8>,
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let storage_key = build_key(label, key);
-        self.lock()?.execute(
-            "INSERT OR REPLACE INTO openmls_values
+        // Single autocommit statement: retry the whole write on transient lock
+        // contention (issue #484).
+        retry_on_busy(|| {
+            self.lock()?.execute(
+                "INSERT OR REPLACE INTO openmls_values
                 (provider_version, label, storage_key, group_key, value)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                CURRENT_VERSION,
-                label,
-                storage_key,
-                group_key.as_deref(),
-                value
-            ],
-        )?;
-        Ok(())
+                params![
+                    CURRENT_VERSION,
+                    label,
+                    storage_key,
+                    group_key.as_deref(),
+                    value
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     pub(in crate::openmls_storage) fn write_entity<T: Entity<CURRENT_VERSION>>(
@@ -59,15 +64,30 @@ impl SqliteOpenMlsStorage {
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let storage_key = build_key(label, key);
-        let mut conn = self.lock()?;
         if self.connection.is_current_thread_transaction_owner() {
+            // Inside a broader engine-owned OpenMLS transaction: execute directly
+            // and let the owning transaction handle retry/rollback. Retrying a
+            // single statement inside someone else's transaction would corrupt it.
+            let conn = self.lock()?;
             append_entity_on_connection(&conn, label, storage_key, group_key.as_deref(), value)?;
+            Ok(())
         } else {
-            let tx = conn.transaction()?;
-            append_entity_on_connection(&tx, label, storage_key, group_key.as_deref(), value)?;
-            tx.commit()?;
+            // Own a fresh transaction: the whole read-modify-write is idempotent,
+            // so retry it on transient lock contention (issue #484).
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction()?;
+                append_entity_on_connection(
+                    &tx,
+                    label,
+                    storage_key.clone(),
+                    group_key.as_deref(),
+                    value,
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
         }
-        Ok(())
     }
 
     pub(in crate::openmls_storage) fn remove_entity<T: Entity<CURRENT_VERSION>>(
@@ -79,8 +99,9 @@ impl SqliteOpenMlsStorage {
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let encoded = serde_json::to_vec(value)?;
         let storage_key = build_key(label, key);
-        let mut conn = self.lock()?;
         if self.connection.is_current_thread_transaction_owner() {
+            // Inside a broader engine-owned OpenMLS transaction: see append_entity.
+            let conn = self.lock()?;
             remove_entity_on_connection(
                 &conn,
                 label,
@@ -88,18 +109,22 @@ impl SqliteOpenMlsStorage {
                 group_key.as_deref(),
                 encoded.as_slice(),
             )?;
+            Ok(())
         } else {
-            let tx = conn.transaction()?;
-            remove_entity_on_connection(
-                &tx,
-                label,
-                storage_key,
-                group_key.as_deref(),
-                encoded.as_slice(),
-            )?;
-            tx.commit()?;
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction()?;
+                remove_entity_on_connection(
+                    &tx,
+                    label,
+                    storage_key.clone(),
+                    group_key.as_deref(),
+                    encoded.as_slice(),
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
         }
-        Ok(())
     }
 
     fn read_raw_list(
@@ -179,12 +204,16 @@ impl SqliteOpenMlsStorage {
         key: Vec<u8>,
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let storage_key = build_key(label, key);
-        self.lock()?.execute(
-            "DELETE FROM openmls_values
+        // Single autocommit statement: retry the whole delete on transient lock
+        // contention (issue #484).
+        retry_on_busy(|| {
+            self.lock()?.execute(
+                "DELETE FROM openmls_values
              WHERE provider_version = ?1 AND storage_key = ?2",
-            params![CURRENT_VERSION, storage_key],
-        )?;
-        Ok(())
+                params![CURRENT_VERSION, storage_key],
+            )?;
+            Ok(())
+        })
     }
 
     pub(in crate::openmls_storage) fn delete_group_value<GroupId: Key<CURRENT_VERSION>>(
@@ -201,7 +230,6 @@ impl SqliteOpenMlsStorage {
         labels: &[&[u8]],
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let group_key = Self::group_key(group_id)?;
-        let mut conn = self.lock()?;
         // Wrap every label delete in a single transaction so the operation is
         // atomic. clear_proposal_queue deletes QUEUED_PROPOSAL_LABEL and
         // PROPOSAL_QUEUE_REFS_LABEL together; a crash (SIGKILL/OOM/power loss)
@@ -211,13 +239,20 @@ impl SqliteOpenMlsStorage {
         // owns a broader OpenMLS transaction, execute directly inside it instead
         // of starting a nested SQLite transaction.
         if self.connection.is_current_thread_transaction_owner() {
+            let conn = self.lock()?;
             delete_group_labels_on_connection(&conn, group_key.as_slice(), labels)?;
+            Ok(())
         } else {
-            let tx = conn.transaction()?;
-            delete_group_labels_on_connection(&tx, group_key.as_slice(), labels)?;
-            tx.commit()?;
+            // Own a fresh transaction: the whole atomic delete is idempotent, so
+            // retry it on transient lock contention (issue #484).
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction()?;
+                delete_group_labels_on_connection(&tx, group_key.as_slice(), labels)?;
+                tx.commit()?;
+                Ok(())
+            })
         }
-        Ok(())
     }
 }
 
