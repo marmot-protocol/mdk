@@ -519,6 +519,21 @@ pub struct AccountKeyPackageRecord {
     pub relay: bool,
 }
 
+/// Per-account unread aggregate, suitable for an account-switcher badge
+/// (darkmatter#461). Computed from each account's materialized chat-list
+/// projection without loading a full session/timeline, so it can be reported
+/// for accounts that are not the active/running one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUnread {
+    pub account_id_hex: String,
+    /// Total unread messages across all unarchived conversations.
+    pub unread_count: u64,
+    /// Number of unarchived conversations with at least one unread message.
+    pub unread_conversations: u64,
+    /// Whether the account has any unread message at all.
+    pub has_unread: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct AccountState {
     pub(crate) label: String,
@@ -1128,6 +1143,56 @@ impl MarmotApp {
             .chat_list_row(group_id_hex)?;
         self.hydrate_chat_list_row(row.as_mut())?;
         Ok(row)
+    }
+
+    /// Per-account unread aggregate for the account-switcher badge
+    /// (darkmatter#461). Each account's count is read from its materialized
+    /// `chat_list_rows` projection (a single grouped `COUNT`/`SUM`), so this
+    /// does not require switching into, or loading a full session/timeline for,
+    /// any account — non-active accounts are reported too.
+    ///
+    /// Only local-signing accounts are reported (matching `managed_accounts`).
+    /// The chat-list projection is built from the on-disk store if missing;
+    /// this is a local operation and never touches the network. Intended for
+    /// account-switcher scale, this does one encrypted database open per local
+    /// signing account. A single account that fails to open or project is
+    /// skipped with a privacy-safe warning rather than failing the whole query.
+    pub fn account_unread_summary(&self) -> Result<Vec<AccountUnread>, AppError> {
+        let accounts = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.local_signing)
+            .collect::<Vec<_>>();
+        let mut summaries = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            match self.account_unread_for(&account) {
+                Ok(summary) => summaries.push(summary),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::storage",
+                        method = "account_unread_summary",
+                        error_kind = error.privacy_safe_kind(),
+                        "skipped an account whose unread aggregate could not be computed"
+                    );
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn account_unread_for(&self, account: &AccountSummary) -> Result<AccountUnread, AppError> {
+        self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(account)?;
+        let total = self
+            .account_storage(&account.label)?
+            .account_unread_total()?;
+        Ok(AccountUnread {
+            account_id_hex: account.account_id_hex.clone(),
+            unread_count: total.unread_count,
+            unread_conversations: total.unread_conversations,
+            has_unread: total.has_unread(),
+        })
     }
 
     fn refresh_chat_list_row(

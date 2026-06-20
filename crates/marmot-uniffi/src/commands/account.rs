@@ -28,6 +28,23 @@ impl Marmot {
             .collect())
     }
 
+    /// Per-account unread aggregate for the account-switcher badge
+    /// (darkmatter#461). Each entry's `unread_count` is read from that
+    /// account's materialized chat-list projection, so this does not require
+    /// switching into, or loading a full session/timeline for, any account —
+    /// non-active (not-`running`) accounts are reported too. Only
+    /// local-signing accounts are included, matching `list_accounts`.
+    pub fn account_unread_summary(
+        &self,
+    ) -> Result<Vec<conversions::AccountUnreadFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .account_unread_summary()?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Remove a local-signing account from this device.
     pub async fn remove_account(&self, account_ref: String) -> Result<(), MarmotKitError> {
         self.runtime.accounts().remove_account(&account_ref).await?;

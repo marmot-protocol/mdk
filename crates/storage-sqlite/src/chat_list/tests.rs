@@ -519,3 +519,68 @@ fn chat_list_preview_is_empty_when_only_invalidated_kind9_exists() {
         .expect("chat row");
     assert_eq!(row.last_message, None);
 }
+
+#[test]
+fn account_unread_total_is_zero_on_empty_store() {
+    let store = setup_store();
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total, AccountUnreadTotal::default());
+    assert!(!total.has_unread());
+}
+
+#[test]
+fn account_unread_total_aggregates_materialized_projection() {
+    let store = setup_store();
+    // Establish a read baseline on existing history, then receive two new
+    // remote kind-9 messages so they count as unread.
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "before first open"))
+        .unwrap();
+    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .record_app_event(&chat("new-1", REMOTE, 11, "after first open"))
+        .unwrap();
+    store
+        .record_app_event(&chat("new-2", REMOTE, 12, "after first open"))
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 2);
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 2);
+    assert_eq!(total.unread_conversations, 1);
+    assert!(total.has_unread());
+}
+
+#[test]
+fn account_unread_total_excludes_archived_conversations() {
+    let mut group = group();
+    group.archived = true;
+    let store = setup_store_with_group(group);
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "before first open"))
+        .unwrap();
+    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .record_app_event(&chat("new", REMOTE, 11, "after first open"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP)
+        .unwrap()
+        .expect("chat row");
+    assert!(row.archived);
+    assert_eq!(row.unread_count, 1);
+
+    // The archived conversation has unread messages, but the account-level
+    // aggregate excludes archived rows.
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total, AccountUnreadTotal::default());
+    assert!(!total.has_unread());
+}

@@ -1,8 +1,8 @@
 //! Account summary, send summary, key-package, and user-profile FFI conversions.
 
 use marmot_app::{
-    AccountKeyPackageRecord, GroupLeaveFailure, LocalCleanupReport, RelayFailure, SendSummary,
-    UserProfileMetadata, WipeOutcome,
+    AccountKeyPackageRecord, AccountUnread, GroupLeaveFailure, LocalCleanupReport, RelayFailure,
+    SendSummary, UserProfileMetadata, WipeOutcome,
 };
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -11,6 +11,32 @@ pub struct AccountSummaryFfi {
     pub account_id_hex: String,
     pub local_signing: bool,
     pub running: bool,
+}
+
+/// Per-account unread aggregate for the account-switcher badge
+/// (darkmatter#461). Computed from each account's materialized chat-list
+/// projection without loading a full session/timeline, so accounts that are
+/// not the active/running one are reported too.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AccountUnreadFfi {
+    pub account_id_hex: String,
+    /// Total unread messages across all unarchived conversations.
+    pub unread_count: u64,
+    /// Number of unarchived conversations with at least one unread message.
+    pub unread_conversations: u64,
+    /// Whether the account has any unread message at all.
+    pub has_unread: bool,
+}
+
+impl From<AccountUnread> for AccountUnreadFfi {
+    fn from(value: AccountUnread) -> Self {
+        Self {
+            account_id_hex: value.account_id_hex,
+            unread_count: value.unread_count,
+            unread_conversations: value.unread_conversations,
+            has_unread: value.has_unread,
+        }
+    }
 }
 
 #[derive(Clone, Debug, uniffi::Record)]

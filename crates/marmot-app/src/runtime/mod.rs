@@ -24,18 +24,19 @@ use crate::notifications;
 use crate::{
     APP_RUNTIME_ACCOUNT_READY_WAIT, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, AccountKeyPackageRecord, AccountRelayListBootstrap,
-    AccountRelayListStatus, AgentOperationEventRequest, AgentTextStreamFinishRequest,
-    AppBlobEndpoint, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp,
-    MarmotRelayPlane, MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, NotificationCollectionStatus, NotificationSettings,
-    NotificationUpdate, NotificationWakeSource, PushPlatform, PushRegistration, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary,
-    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
+    AgentTextStreamFinishRequest, AppBlobEndpoint, AppError, AppGroupMemberRecord,
+    AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
+    AppQuarantinedGroup, AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings,
+    AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
+    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
+    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, TimelineMessageQuery,
+    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
+    unix_now_seconds,
 };
 
 mod account_worker;
@@ -1962,6 +1963,14 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .chat_list(&account.label, include_archived)
+    }
+
+    /// Per-account unread aggregate for the account-switcher badge
+    /// (darkmatter#461). Computed from each account's materialized chat-list
+    /// projection without loading a full session/timeline, so accounts that are
+    /// not the active/running one are reported too.
+    pub fn account_unread_summary(&self) -> Result<Vec<AccountUnread>, AppError> {
+        self.accounts.app.account_unread_summary()
     }
 
     pub async fn set_group_archived(

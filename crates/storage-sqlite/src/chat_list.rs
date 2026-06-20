@@ -13,6 +13,25 @@ pub struct ChatListQuery {
     pub include_archived: bool,
 }
 
+/// Cheap per-account unread aggregate computed directly from the materialized
+/// `chat_list_rows` projection — no timeline/session load required. Archived
+/// conversations are excluded so the total matches what the unarchived chat
+/// list would show.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountUnreadTotal {
+    /// Sum of `unread_count` across all unarchived conversations.
+    pub unread_count: u64,
+    /// Number of unarchived conversations with at least one unread message.
+    pub unread_conversations: u64,
+}
+
+impl AccountUnreadTotal {
+    /// Whether the account has any unread message at all.
+    pub fn has_unread(&self) -> bool {
+        self.unread_count > 0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListAvatar {
     pub image_hash_hex: String,
@@ -83,6 +102,29 @@ impl SqliteAccountStorage {
         let row = chat_list_row_tx(&tx, group_id_hex)?;
         tx.commit().storage()?;
         Ok(row)
+    }
+
+    /// Cheap unread aggregate over the materialized `chat_list_rows`
+    /// projection. Reads only the projection table (a single grouped
+    /// `COUNT`/`SUM`), so it does not materialize timelines or load a session.
+    /// Archived conversations are excluded.
+    pub fn account_unread_total(&self) -> StorageResult<AccountUnreadTotal> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT COALESCE(SUM(unread_count), 0),
+                    COUNT(CASE WHEN unread_count > 0 THEN 1 END)
+             FROM chat_list_rows
+             WHERE archived = 0",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .storage()
+        .and_then(|(unread_count, unread_conversations)| {
+            Ok(AccountUnreadTotal {
+                unread_count: i64_to_u64(unread_count)?,
+                unread_conversations: i64_to_u64(unread_conversations)?,
+            })
+        })
     }
 
     pub fn ensure_chat_list_rows(&self, local_account_id_hex: &str) -> StorageResult<()> {

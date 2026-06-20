@@ -190,6 +190,44 @@ async fn remove_account_updates_list_accounts() {
 }
 
 #[tokio::test]
+async fn account_unread_summary_reports_local_accounts_without_session_load() {
+    // darkmatter#461: the account-switcher badge query must work for accounts
+    // that have never been started/loaded. A fresh local account with no
+    // messages reports zero unread, and the call does not require start().
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    // Empty kit: no accounts, so no unread entries.
+    assert!(
+        kit.account_unread_summary()
+            .expect("unread summary on empty kit")
+            .is_empty()
+    );
+
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("open account home")
+        .create_nostr_account()
+        .expect("create local account");
+
+    // The account is not running (no start()/reconcile()), yet it is reported
+    // with a zero unread count read from its on-disk projection.
+    let summary = kit
+        .account_unread_summary()
+        .expect("unread summary with one account");
+    assert_eq!(summary.len(), 1);
+    let entry = &summary[0];
+    assert_eq!(entry.account_id_hex, account.account_id_hex);
+    assert_eq!(entry.unread_count, 0);
+    assert_eq!(entry.unread_conversations, 0);
+    assert!(!entry.has_unread);
+}
+
+#[tokio::test]
 async fn login_existing_identity_returns_duplicate_identity_error() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");

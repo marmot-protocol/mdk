@@ -21,7 +21,9 @@ pub use account_projection::{
     AccountStoredPushRegistration, StoredAccountGroup, StoredAccountGroupComponent,
     StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord,
 };
-pub use chat_list::{ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow};
+pub use chat_list::{
+    AccountUnreadTotal, ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow,
+};
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
 pub use connection::{
