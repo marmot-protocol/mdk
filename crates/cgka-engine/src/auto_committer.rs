@@ -6,9 +6,11 @@
 //! picks a deterministic committer: the **lowest-index remaining member
 //! that isn't the target of the SelfRemove**.
 //!
-//! This deterministic policy has a known liveness tradeoff: if the
-//! lowest-index eligible member is offline, the commit waits. A later
-//! randomized-delay policy can replace this module without changing ingest.
+//! This function implements the first deterministic SelfRemove round from
+//! `spec/protocol-core/member-departure.md`: the lowest-index eligible member
+//! commits promptly. The spec also allows later deterministic fallback rounds
+//! after quiescence if the earlier committer cannot publish; scheduling those
+//! later rounds is outside this stateless decision helper.
 //!
 //! ## Scope
 //!
