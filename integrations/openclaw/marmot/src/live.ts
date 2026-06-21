@@ -110,6 +110,7 @@ export class MarmotLivePreview {
   async begin(): Promise<void> {
     this.ensureOpen();
     await this.ensureBegun();
+    this.ensureOpen();
   }
 
   /**
@@ -119,6 +120,7 @@ export class MarmotLivePreview {
   async update(fullText: string): Promise<void> {
     this.ensureOpen();
     await this.ensureBegun();
+    this.ensureOpen();
     const current = this.appendOnly.current;
     if (!fullText.startsWith(current)) {
       throw new NonAppendOnlyUpdateError();
@@ -138,6 +140,7 @@ export class MarmotLivePreview {
   async appendDelta(delta: string): Promise<void> {
     this.ensureOpen();
     await this.ensureBegun();
+    this.ensureOpen();
     const suffix = String(delta ?? "");
     if (suffix.length === 0) {
       return;
@@ -155,6 +158,7 @@ export class MarmotLivePreview {
       return;
     }
     await this.ensureBegun();
+    this.ensureOpen();
     await this.client.streamStatus(this.streamIdHex!, text);
     this.transcript!.appendStatus(text, this.chunkBytes);
   }
@@ -166,6 +170,7 @@ export class MarmotLivePreview {
       return;
     }
     await this.ensureBegun();
+    this.ensureOpen();
     await this.client.streamProgress(this.streamIdHex!, progressText);
     this.transcript!.appendProgress(progressText, this.chunkBytes);
   }
@@ -178,6 +183,7 @@ export class MarmotLivePreview {
   async finalize(finalText: string): Promise<MarmotLiveFinalizeResult> {
     this.ensureOpen();
     await this.ensureBegun();
+    this.ensureOpen();
     const current = this.appendOnly.current;
     if (!finalText.startsWith(current)) {
       throw new NonAppendOnlyUpdateError();
@@ -211,6 +217,18 @@ export class MarmotLivePreview {
       return;
     }
     this.closed = true;
+    // `closed` is set before awaiting an in-flight begin so every post-begin
+    // continuation re-checks terminal state before dispatching its first remote
+    // write. A write already inside client.stream* may still land; stream_cancel
+    // is the best-effort terminal signal for that pre-existing window.
+    const pendingBegin = this.beginPromise;
+    if (pendingBegin) {
+      try {
+        await pendingBegin;
+      } catch {
+        return;
+      }
+    }
     if (!this.begun || !this.streamIdHex) {
       return;
     }
