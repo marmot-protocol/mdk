@@ -1776,6 +1776,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         stream_id_hex: begun_stream_id_hex,
         start_message_id_hex,
         quic_candidates,
+        ..
     } = begun.payload
     else {
         panic!("expected stream begun response");

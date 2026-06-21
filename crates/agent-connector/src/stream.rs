@@ -118,6 +118,7 @@ impl AgentConnector {
             stream_id_hex,
             start_message_id_hex,
             quic_candidates,
+            policy_max_plaintext_frame_len,
         })
     }
 

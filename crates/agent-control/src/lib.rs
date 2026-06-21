@@ -289,6 +289,8 @@ pub enum AgentControlResponse {
         stream_id_hex: String,
         start_message_id_hex: String,
         quic_candidates: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_max_plaintext_frame_len: Option<u32>,
     },
     StreamFinalized {
         stream_id_hex: String,
@@ -560,6 +562,23 @@ mod tests {
         assert_eq!(value["idempotency_key"], "key-1");
         let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped, with);
+    }
+
+    #[test]
+    fn stream_begun_response_carries_policy_plaintext_cap_when_present() {
+        let begun = AgentControlResponse::StreamBegun {
+            stream_id_hex: "aa".repeat(32),
+            start_message_id_hex: "bb".repeat(32),
+            quic_candidates: vec!["quic://127.0.0.1:4433".to_owned()],
+            policy_max_plaintext_frame_len: Some(4),
+        };
+
+        let value = serde_json::to_value(&begun).unwrap();
+        assert_eq!(value["type"], "stream_begun");
+        assert_eq!(value["policy_max_plaintext_frame_len"], 4);
+
+        let round_tripped: AgentControlResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, begun);
     }
 
     #[test]

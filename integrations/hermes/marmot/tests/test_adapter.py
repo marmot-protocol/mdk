@@ -517,6 +517,19 @@ class TranscriptTests(unittest.TestCase):
             [1024, 1],
         )
 
+    def test_effective_stream_chunking_clamps_to_policy_frame_len(self):
+        self.assertEqual(
+            self.adapter.effective_stream_chunk_bytes(
+                self.adapter.DEFAULT_STREAM_CHUNK_BYTES,
+                4,
+            ),
+            4,
+        )
+        self.assertEqual(
+            [len(chunk) for chunk in self.adapter.split_text_deltas("abcdefghi", 4)],
+            [4, 4, 1],
+        )
+
     def test_append_only_delta_rejects_replacements(self):
         state = self.adapter.AppendOnlyTextState()
 
@@ -1462,6 +1475,60 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_client.stream_finalizes), 1)
         self.assertEqual(fake_client.stream_finalizes[0][1], "hello")
         self.assertEqual(fake_client.stream_finalizes[0][3], 2)
+        self.assertEqual(fake_client.final_sends, [])
+
+    async def test_stream_transcript_chunks_at_policy_frame_len_from_begin_response(self):
+        class FakeClient:
+            def __init__(self):
+                self.stream_appends = []
+                self.stream_finalizes = []
+                self.final_sends = []
+
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                    "policy_max_plaintext_frame_len": 4,
+                }
+
+            async def stream_append(self, stream_id_hex, append_text):
+                self.stream_appends.append((stream_id_hex, append_text))
+                return {"type": "ack"}
+
+            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count):
+                self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
+                return {
+                    "type": "stream_finalized",
+                    "stream_id_hex": stream_id_hex,
+                    "message_ids_hex": ["77" * 32],
+                }
+
+            async def send_final(self, account_id_hex, group_id_hex, text, reply_to_message_id_hex=None, idempotency_key=None):
+                self.final_sends.append((account_id_hex, group_id_hex, text, reply_to_message_id_hex))
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+        fake_client = FakeClient()
+        adapter = self.adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+
+        preview = await adapter.send("22" * 32, "abcdefghi\u2589")
+        final = await adapter.edit_message("22" * 32, preview.message_id, "abcdefghi", finalize=True)
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(fake_client.stream_appends, [("55" * 32, "abcdefghi")])
+        self.assertEqual(len(fake_client.stream_finalizes), 1)
+        self.assertEqual(fake_client.stream_finalizes[0][1], "abcdefghi")
+        self.assertEqual(fake_client.stream_finalizes[0][3], 3)
         self.assertEqual(fake_client.final_sends, [])
 
     async def test_draft_stream_skips_empty_visible_frames(self):

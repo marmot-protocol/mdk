@@ -32,6 +32,7 @@ PROTOCOL = "marmot.agent-control.v1"
 MAX_FRAME_BYTES = 1024 * 1024
 DEFAULT_SOCKET_HOME = "~/.marmot"
 DEFAULT_STREAM_CHUNK_BYTES = 1024
+AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN = 65519
 TEXT_DELTA_RECORD = 0x01
 STATUS_RECORD = 0x03
 TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
@@ -810,7 +811,10 @@ class MarmotLiveStream:
             group_id_hex=group_id_hex,
             stream_id_hex=response["stream_id_hex"],
             start_message_id_hex=response["start_message_id_hex"],
-            chunk_bytes=chunk_bytes,
+            chunk_bytes=effective_stream_chunk_bytes(
+                chunk_bytes,
+                response.get("policy_max_plaintext_frame_len"),
+            ),
         )
 
     async def append_replacement(self, next_text: str) -> None:
@@ -2055,6 +2059,23 @@ def parse_profile_name_reply(text: str) -> tuple[str, Optional[str], str]:
     if len(value) > MAX_PROFILE_NAME_CHARS:
         return ("invalid", None, PROFILE_NAME_TOO_LONG)
     return ("name", value, "")
+
+
+def effective_plaintext_cap(policy_max_plaintext_frame_len: Any) -> int:
+    try:
+        policy_cap = int(policy_max_plaintext_frame_len)
+    except (TypeError, ValueError):
+        return AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN
+    if policy_cap <= 0:
+        return AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN
+    return min(policy_cap, AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN)
+
+
+def effective_stream_chunk_bytes(requested_chunk_bytes: int, policy_max_plaintext_frame_len: Any) -> int:
+    requested = int(requested_chunk_bytes)
+    if requested <= 0 or requested > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN:
+        return requested
+    return min(requested, effective_plaintext_cap(policy_max_plaintext_frame_len))
 
 
 def split_text_deltas(text: str, max_chunk_bytes: int) -> list[bytes]:
