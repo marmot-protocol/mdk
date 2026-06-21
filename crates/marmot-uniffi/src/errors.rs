@@ -64,6 +64,15 @@ pub enum MarmotKitError {
     /// keystore rather than reporting an opaque runtime error.
     #[error("account keystore unavailable: {details}")]
     KeystoreUnavailable { details: String },
+    /// The user supplied an empty passphrase for NIP-49 encrypted key export.
+    /// Distinct typed variant (#544) so backup UI can keep the user in the
+    /// passphrase sheet instead of showing a generic runtime failure.
+    #[error("passphrase cannot be empty")]
+    EmptyPassphrase,
+    /// NIP-49 encryption failed after keystore access succeeded. Carries only
+    /// library/error classification text, never passphrase or key material.
+    #[error("encrypted secret-key export failed: {details}")]
+    EncryptionFailed { details: String },
     /// A filesystem IO error while reading the key, appending the reveal audit
     /// entry, or persisting the NIP-49 key-security byte. Typed variant (#543)
     /// so a key-backup surface can distinguish disk failures from arbitrary
@@ -106,6 +115,10 @@ impl From<AppError> for MarmotKitError {
             ) => Self::KeystoreUnavailable {
                 details: err.to_string(),
             },
+            AppError::AccountHome(AccountHomeError::EmptyPassphrase) => Self::EmptyPassphrase,
+            AppError::AccountHome(AccountHomeError::EncryptedSecretExport(details)) => {
+                Self::EncryptionFailed { details }
+            }
             // A filesystem IO error reading the key, appending the reveal audit
             // entry, or persisting the key-security byte — surfaced either
             // directly at the app layer or wrapped in an AccountHomeError.
@@ -296,6 +309,32 @@ mod tests {
         assert!(
             matches!(wrapped, MarmotKitError::Io { .. }),
             "AccountHome IO failure must map to Io, got {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn encrypted_export_empty_passphrase_crosses_ffi_as_typed_variant() {
+        let app_err = AppError::AccountHome(AccountHomeError::EmptyPassphrase);
+        let ffi: MarmotKitError = app_err.into();
+        assert!(
+            matches!(ffi, MarmotKitError::EmptyPassphrase),
+            "empty passphrase must map to EmptyPassphrase, got {ffi:?}"
+        );
+    }
+
+    #[test]
+    fn encrypted_export_failure_crosses_ffi_as_typed_variant() {
+        let app_err = AppError::AccountHome(AccountHomeError::EncryptedSecretExport(
+            "scrypt params rejected".to_string(),
+        ));
+        let ffi: MarmotKitError = app_err.into();
+        assert!(
+            matches!(
+                ffi,
+                MarmotKitError::EncryptionFailed { ref details }
+                    if details == "scrypt params rejected"
+            ),
+            "NIP-49 encryption failures must map to EncryptionFailed without duplicating the AccountHomeError prefix, got {ffi:?}"
         );
     }
 }

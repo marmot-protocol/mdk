@@ -278,6 +278,27 @@ impl Marmot {
             .reveal_nsec(&account_ref, "marmot_uniffi::Marmot::reveal_nsec")?)
     }
 
+    /// Export the active account's private key as a password-encrypted NIP-49
+    /// `ncryptsec1...` bech32 backup string (darkmatter#544).
+    ///
+    /// SENSITIVE: the passphrase is accepted as an owned FFI string and zeroed
+    /// on return by the Rust boundary. The encrypted export is logged to the
+    /// per-account audit log, but unlike `reveal_nsec` it does not downgrade the
+    /// account's NIP-49 KEY_SECURITY_BYTE because raw plaintext key material is
+    /// not returned to the host app.
+    pub fn export_encrypted_secret_key(
+        &self,
+        account_ref: String,
+        passphrase: String,
+    ) -> Result<String, MarmotKitError> {
+        let passphrase = zeroize::Zeroizing::new(passphrase);
+        Ok(self.runtime.export_encrypted_secret_key(
+            &account_ref,
+            passphrase.as_str(),
+            "marmot_uniffi::Marmot::export_encrypted_secret_key",
+        )?)
+    }
+
     /// Publish the Nostr kind:0 metadata for `account_ref`. The returned
     /// metadata is what marmot-app actually published (any server-applied
     /// defaults are reflected here).

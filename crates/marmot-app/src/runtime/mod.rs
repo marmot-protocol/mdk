@@ -1057,6 +1057,19 @@ impl MarmotAppRuntime {
         self.accounts.reveal_nsec(account_ref, caller_context)
     }
 
+    /// See [`MarmotApp::export_encrypted_secret_key`]. darkmatter#544.
+    /// `caller_context` is the privacy-safe surface label recorded in the
+    /// encrypted-export audit entry.
+    pub fn export_encrypted_secret_key(
+        &self,
+        account_ref: &str,
+        passphrase: &str,
+        caller_context: &str,
+    ) -> Result<String, AppError> {
+        self.accounts
+            .export_encrypted_secret_key(account_ref, passphrase, caller_context)
+    }
+
     pub async fn agent_text_stream_exporter_secret(
         &self,
         account_ref: &str,

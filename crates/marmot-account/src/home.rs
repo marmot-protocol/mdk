@@ -83,9 +83,9 @@ impl AccountSummary {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct StoredKeySecurity {
-    /// NIP-49 KEY_SECURITY_BYTE. 0x02 = secure (never seen insecurely),
-    /// 0x01 = secure but was handled insecurely in the past, 0x00 = insecure
-    /// (revealed/exported in raw form). We only ever transition toward 0x00.
+    /// NIP-49 KEY_SECURITY_BYTE. 0x00 = weak/insecure (revealed/exported in
+    /// raw form), 0x01 = not known to have been handled insecurely, 0x02 =
+    /// unknown/untracked. We only ever transition toward 0x00.
     key_security_byte: u8,
 }
 
@@ -392,7 +392,7 @@ impl AccountHome {
     }
 
     /// NIP-49 KEY_SECURITY_BYTE for `account_ref`. Defaults to 0x02
-    /// ("never handled insecurely") when no status has been persisted yet.
+    /// (unknown/untracked) when no status has been persisted yet.
     pub fn key_security_byte(&self, account_ref: &str) -> AccountHomeResult<u8> {
         let account = self.account(account_ref)?;
         let path = self
@@ -438,6 +438,29 @@ impl AccountHome {
         // Persist the insecure-handling marker only after a successful encode.
         self.mark_key_handled_insecurely(account_ref)?;
         Ok(nsec)
+    }
+
+    /// Export `account_ref`'s private key as a password-encrypted NIP-49
+    /// `ncryptsec1...` backup string using the fixed mobile-friendly log_n=18.
+    ///
+    /// This does not mark the key as handled insecurely: the raw secret never
+    /// leaves the engine in plaintext, so the persisted KEY_SECURITY_BYTE is
+    /// copied into the encrypted export as associated data and left unchanged.
+    pub fn export_encrypted_secret_key(
+        &self,
+        account_ref: &str,
+        passphrase: &str,
+    ) -> AccountHomeResult<String> {
+        if passphrase.is_empty() {
+            return Err(AccountHomeError::EmptyPassphrase);
+        }
+        let account = self.account(account_ref)?;
+        if !account.is_active_local_signing() {
+            return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
+        }
+        let key_security_byte = self.key_security_byte(&account.label)?;
+        let keys = self.load_signing_keys(&account.label)?;
+        crate::nip49_export::export_ncryptsec(keys.secret_key(), passphrase, key_security_byte)
     }
 
     fn write_signing_account(&self, keys: &nostr::Keys) -> AccountHomeResult<AccountSummary> {

@@ -520,6 +520,32 @@ impl MarmotApp {
         Ok(nsec)
     }
 
+    /// Export the account's private key as a password-encrypted NIP-49
+    /// `ncryptsec1...` backup string (darkmatter#544). Logs an always-on
+    /// encrypted-export record to the per-account audit log without downgrading
+    /// the account's KEY_SECURITY_BYTE.
+    pub fn export_encrypted_secret_key(
+        &self,
+        account_ref: &str,
+        passphrase: &str,
+        caller_context: &str,
+    ) -> Result<String, AppError> {
+        // Resolve first so the audit entry uses the canonical account label and
+        // a valid account id, while the account-home method still owns keystore
+        // validation and active-local-signing checks.
+        let account = self.account_home().account(account_ref)?;
+        let encrypted = self
+            .account_home()
+            .export_encrypted_secret_key(account_ref, passphrase)?;
+        self.append_key_export_audit(
+            &account,
+            "export_encrypted_secret_key",
+            "ncryptsec1_bech32",
+            caller_context,
+        )?;
+        Ok(encrypted)
+    }
+
     /// Append an always-on, privacy-safe reveal record to the per-account
     /// `audit-key-reveal.jsonl` file (darkmatter#543).
     ///
@@ -532,13 +558,23 @@ impl MarmotApp {
         account: &AccountSummary,
         caller_context: &str,
     ) -> Result<(), AppError> {
+        self.append_key_export_audit(account, "reveal_nsec", "nsec1_bech32", caller_context)
+    }
+
+    fn append_key_export_audit(
+        &self,
+        account: &AccountSummary,
+        action: &str,
+        format: &str,
+        caller_context: &str,
+    ) -> Result<(), AppError> {
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let entry = KeyRevealAuditEntry {
             schema_version: "marmot-key-reveal-audit/v1",
             wall_time_ms: system_time_ms(SystemTime::now()).unwrap_or(0),
             account_ref: audit_account_ref_hex(&account_id),
-            action: "reveal_nsec",
-            format: "nsec1_bech32",
+            action,
+            format,
             caller_context,
         };
         let path = self.account_dir(&account.label).join(KEY_REVEAL_AUDIT_FILE);
@@ -752,7 +788,7 @@ mod tests {
         let account = home.import_nostr_account(nsec).unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
-        // Default: NIP-49 "never handled insecurely".
+        // Default: NIP-49 status is unknown/untracked.
         assert_eq!(
             app.account_home()
                 .key_security_byte(&account.account_id_hex)
@@ -788,6 +824,40 @@ mod tests {
         assert!(contents.contains("\"action\":\"reveal_nsec\""));
         assert!(contents.contains("\"caller_context\":\"test::reveal_caller\""));
         assert!(!contents.contains(&revealed));
+        assert!(!contents.contains(&account.account_id_hex));
+    }
+
+    #[test]
+    fn export_encrypted_secret_key_audits_without_marking_key_insecure() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+        let account = home.import_nostr_account(nsec).unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+        let encrypted = app
+            .export_encrypted_secret_key(
+                &account.account_id_hex,
+                "test123",
+                "test::encrypted_backup",
+            )
+            .unwrap();
+
+        assert!(encrypted.starts_with("ncryptsec1"));
+        assert_eq!(
+            app.account_home()
+                .key_security_byte(&account.account_id_hex)
+                .unwrap(),
+            0x02
+        );
+
+        let audit_path = app.account_dir(&account.label).join(KEY_REVEAL_AUDIT_FILE);
+        assert!(audit_path.exists());
+        let contents = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(contents.contains("\"action\":\"export_encrypted_secret_key\""));
+        assert!(contents.contains("\"format\":\"ncryptsec1_bech32\""));
+        assert!(contents.contains("\"caller_context\":\"test::encrypted_backup\""));
+        assert!(!contents.contains(&encrypted));
         assert!(!contents.contains(&account.account_id_hex));
     }
 

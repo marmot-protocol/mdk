@@ -43,6 +43,10 @@ pub enum AccountHomeError {
     SecretStore(String),
     #[error("account secret was not found")]
     SecretNotFound(String),
+    #[error("passphrase cannot be empty")]
+    EmptyPassphrase,
+    #[error("encrypted secret-key export failed: {0}")]
+    EncryptedSecretExport(String),
     #[error("account secret store service name cannot be empty")]
     EmptySecretStoreService,
 }

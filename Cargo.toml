@@ -58,11 +58,14 @@ crossterm = "0.28"
 # General-category lookups for the terminal untrusted-text sanitizer (drop the
 # whole Cf format class instead of a drifting hardcoded denylist).
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+unicode-normalization = "0.1"
 rand = "0.8"
 sha2 = "0.10"
 url = "2"
 psl = "2"
+bech32 = "0.11"
 chacha20poly1305 = "0.10"
+scrypt = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 zeroize = "1"
 keyring-core = "1"
@@ -73,7 +76,7 @@ rustls-pemfile = "2"
 # Already in the graph through quinn's platform-verifier feature; direct dep so
 # the broker can build ALPN-carrying rustls client configs with platform trust.
 rustls-platform-verifier = "0.6"
-nostr = { version = "0.44.2", default-features = false, features = ["std", "nip59"] }
+nostr = { version = "0.44.2", default-features = false, features = ["std", "nip49", "nip59"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 nostr-relay-builder = "0.44"
 # OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated

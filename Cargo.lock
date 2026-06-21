@@ -2652,6 +2652,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]

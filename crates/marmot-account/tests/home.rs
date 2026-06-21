@@ -4,6 +4,8 @@ use std::sync::{Mutex, Once};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSummary,
 };
+use nostr::nips::nip19::FromBech32;
+use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -412,7 +414,7 @@ fn account_home_key_security_byte_defaults_secure_and_flips_after_reveal() {
 
     let created = home.create_nostr_account().unwrap();
 
-    // No reveal yet: NIP-49 "never handled insecurely".
+    // No reveal yet: NIP-49 status is unknown/untracked by default.
     assert_eq!(
         home.key_security_byte(&created.account_id_hex).unwrap(),
         0x02
@@ -453,6 +455,84 @@ fn account_home_reveal_nsec_rejects_public_only_account() {
 
     assert!(matches!(
         home.reveal_nsec(public_key),
+        Err(AccountHomeError::SecretNotFound(_))
+    ));
+}
+
+#[test]
+fn account_home_exports_nip49_encrypted_secret_without_marking_key_insecure() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let imported = home.import_nostr_account(nsec).unwrap();
+
+    let ncryptsec = home
+        .export_encrypted_secret_key(&imported.account_id_hex, "test123")
+        .unwrap();
+
+    assert!(ncryptsec.starts_with("ncryptsec1"));
+    let encrypted = EncryptedSecretKey::from_bech32(&ncryptsec).unwrap();
+    assert_eq!(encrypted.log_n(), 18);
+    assert_eq!(encrypted.key_security(), KeySecurity::Unknown);
+    let decrypted = encrypted.decrypt("test123").unwrap();
+    assert_eq!(
+        decrypted.to_secret_hex(),
+        home.load_signing_keys(&imported.account_id_hex)
+            .unwrap()
+            .secret_key()
+            .to_secret_hex()
+    );
+    // Encrypted export does not reveal the raw key, so the NIP-49 security byte
+    // remains "unknown/untracked" instead of being downgraded to weak.
+    assert_eq!(
+        home.key_security_byte(&imported.account_id_hex).unwrap(),
+        0x02
+    );
+}
+
+#[test]
+fn account_home_nip49_export_uses_persisted_weak_security_after_raw_reveal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let created = home.create_nostr_account().unwrap();
+
+    home.reveal_nsec(&created.account_id_hex).unwrap();
+
+    let ncryptsec = home
+        .export_encrypted_secret_key(&created.account_id_hex, "test123")
+        .unwrap();
+
+    let encrypted = EncryptedSecretKey::from_bech32(&ncryptsec).unwrap();
+    assert_eq!(encrypted.key_security(), KeySecurity::Weak);
+    assert_eq!(
+        home.key_security_byte(&created.account_id_hex).unwrap(),
+        0x00
+    );
+}
+
+#[test]
+fn account_home_nip49_export_rejects_empty_passphrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let created = home.create_nostr_account().unwrap();
+
+    assert!(matches!(
+        home.export_encrypted_secret_key(&created.account_id_hex, ""),
+        Err(AccountHomeError::EmptyPassphrase)
+    ));
+}
+
+#[test]
+fn account_home_nip49_export_rejects_public_only_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let public_key = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    home.add_public_account(public_key).unwrap();
+
+    assert!(matches!(
+        home.export_encrypted_secret_key(public_key, "test123"),
         Err(AccountHomeError::SecretNotFound(_))
     ));
 }

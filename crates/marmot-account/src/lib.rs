@@ -9,6 +9,7 @@ mod home;
 mod io;
 mod key_package;
 mod keyring;
+mod nip49_export;
 mod routing;
 mod runtime;
 mod secret_store;

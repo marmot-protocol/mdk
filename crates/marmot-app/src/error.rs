@@ -182,6 +182,8 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
         AccountHomeError::SecretStoreUnavailable(_) => "account_home_secret_store_unavailable",
         AccountHomeError::SecretStore(_) => "account_home_secret_store",
         AccountHomeError::SecretNotFound(_) => "account_home_secret_not_found",
+        AccountHomeError::EmptyPassphrase => "account_home_empty_passphrase",
+        AccountHomeError::EncryptedSecretExport(_) => "account_home_encrypted_secret_export",
         AccountHomeError::EmptySecretStoreService => "account_home_empty_secret_store_service",
     }
 }
