@@ -78,14 +78,14 @@ Versioned DM Agent builds publish the `dm-agent` binary, the Hermes Marmot plugi
 Releases under `dm-agent-v*` tags. Hermes itself must already be installed.
 
 ```sh
-DM_AGENT_VERSION=0.1.0
+DM_AGENT_VERSION=0.2.0
 curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
 To install and immediately run `dm-agent bootstrap --qr`:
 
 ```sh
-DM_AGENT_VERSION=0.1.0
+DM_AGENT_VERSION=0.2.0
 curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
 ```
 

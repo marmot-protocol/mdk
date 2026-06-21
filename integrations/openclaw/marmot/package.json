@@ -1,6 +1,6 @@
 {
   "name": "@darkmatter/openclaw-marmot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenClaw channel plugin for Marmot through the local dm-agent control socket",
   "type": "module",
   "private": true,

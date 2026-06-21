@@ -1,7 +1,7 @@
 {
   "scenario_name": "partition-clear-leave/v1",
   "vector_version": "1",
-  "conformance_version": "0.1.0",
+  "conformance_version": "0.2.0",
   "seed": null,
   "scenario": {
     "name": "partition-clear-leave/v1",

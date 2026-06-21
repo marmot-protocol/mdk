@@ -26,7 +26,7 @@ Prerequisites:
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
-DM_AGENT_VERSION=0.1.0
+DM_AGENT_VERSION=0.2.0
 curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
 # or install + bootstrap the agent account in one step:
 curl -fsSL ".../install-openclaw-marmot.sh" | bash -s -- --bootstrap

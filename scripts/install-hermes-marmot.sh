@@ -46,7 +46,7 @@ Environment:
   MARMOT_RELAYS         Relay CSV used when --bootstrap starts dm-agent
 
 Example:
-  curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.1.0/install-hermes-marmot.sh | bash
+  curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.2.0/install-hermes-marmot.sh | bash
 
   curl -fsSL .../install-hermes-marmot.sh | bash -s -- --bootstrap
 USAGE

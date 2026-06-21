@@ -29,14 +29,14 @@ Prerequisites:
 One-line install:
 
 ```sh
-DM_AGENT_VERSION=0.1.0
+DM_AGENT_VERSION=0.2.0
 curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
 Install and bootstrap in one step:
 
 ```sh
-DM_AGENT_VERSION=0.1.0
+DM_AGENT_VERSION=0.2.0
 curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
 ```
 

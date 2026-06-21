@@ -7,7 +7,27 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-21
+
 ### Added
+
+- Added the `dm-agent` local connector daemon with `serve` and `bootstrap --qr`, bridging Marmot encrypted groups to
+  agent gateways through the `marmot.agent-control.v1` Unix-socket NDJSON protocol.
+- Added the Hermes Marmot platform plugin (`integrations/hermes/marmot`) and `install-hermes-marmot.sh` for downloading
+  versioned `dm-agent` binaries plus the plugin from `dm-agent-v*` GitHub Releases.
+- Added the OpenClaw Marmot channel plugin (`integrations/openclaw/marmot`) and `install-openclaw-marmot.sh` for the
+  same release cohort; supports durable sends, live QUIC preview streaming, inbound media, reactions, deletes, ambient
+  messages, and NIP-27 mention routing through OpenClaw agent tools.
+- Added a versioned DM Agent release track (`dm-agent-v<version>`) publishing `dm-agent` for linux-x86_64,
+  linux-aarch64, darwin-aarch64, and darwin-x86_64, Hermes and OpenClaw plugin bundles, and pinned installer scripts.
+- UniFFI: added `reveal_nsec` to export the selected account private key as `nsec1` bech32 for in-app key backup.
+- UniFFI: added NIP-49 encrypted private-key export for password-wrapped backup.
+- UniFFI: added per-account `unread_count` without loading a full app session.
+- UniFFI: added `retry_group_convergence` for non-duplicating group repair resends.
+- Added app-side per-group recovery for hydration-quarantined groups.
+- Added engine `sign_out_and_wipe` for full local and remote account teardown, and non-destructive `sign_out` with
+  optional relay KeyPackage cleanup.
+- Added rich reaction notifications scoped to the reacted-to message author.
 
 - Added `--data-dir` to `dm daemon start` (an alias for `--home`), completing `wnd`/`dmd` setup-flag parity
   alongside the existing `--logs-dir`, `--discovery-relays`, and `--default-account-relays`. The resolved home is
@@ -142,6 +162,42 @@ versioning through the workspace version in the root `Cargo.toml`.
   no longer wedge the loop and starve other clients. `dm` rejects oversized requests client-side before sending — even
   on the default implicit daemon socket — so e.g. `dm messages send` with a body over the limit fails locally with a
   clear size-limit error instead of silently falling back to local execution or reaching the daemon.
+- dm-agent: hardened group-system id deduplication and `send_final` idempotency keys.
+- marmot-app: retry distributed convergence after admin promote.
+- Engine: tightened MLS proposal ordering and member departure handling.
+- agent-connector: replay lagged ambient inbound events after subscription reconnect.
+- marmot-account: keep exposed group evolution commits instead of rolling them back after publish.
+- Hermes Marmot adapter: select the local-signing account, clamp stream chunks to the policy cap, per-conversation inbound
+  concurrency, `send_final` idempotency with bounded retry, rename dead `stream_tool` client method to
+  `stream_progress`, and align transcript seed lengths with QUIC varint framing.
+- OpenClaw Marmot plugin: filter QUIC candidates to `quic://`, accept singular `MARMOT_QUIC_CANDIDATE`, guard concurrent
+  live-preview `ensureBegun`, allowlist outbound media paths, preserve debounced inbound media and signals, cancel
+  in-flight live preview begins, and cache per-group `is_direct` with fail-closed lookup errors.
+- OpenClaw/Hermes connector parity: mentions via NIP-27 `p` tags, media upload/download, deletes, and ambient inbound
+  routing aligned across both adapters.
+- marmot-account: confirm relay-accepted auto-publishes instead of rolling back on publish shortfall.
+- marmot-app: schedule group convergence retries correctly; serve account-worker reads after hydration, not after catch-up.
+- storage-sqlite: retry `SQLITE_BUSY` and classify transient lock contention.
+- transport-nostr-adapter: normalization-safe relay URL routing matches.
+- CLI: strip invisible and terminal format-spoofing control characters from safe terminal output.
+- App messages now attach Nostr expiration metadata where the group retention policy requires it.
+- marmot-app: fail over encrypted-media uploads across Blossom endpoints.
+- marmot-account: tolerate corrupt account records; reject Windows drive-relative account labels.
+- UniFFI: normalize group-id hex in `messages()` and `subscribe_messages()`; bound message subscription snapshots.
+- storage-sqlite: exclude invalidated tombstones from unread counts and chat-list previews; group-scope
+  `invalidate_app_event_by_message_id`; disambiguate `epoch_key_pairs_id` key encoding.
+- marmot-account: prune orphaned KeyPackage bundles on publish failure.
+- Shared host-safety classifiers for URL validation across app components.
+- Blossom media download redirect validation.
+- Engine: quarantine bad groups during hydration; lone uncommitted proposals no longer block outbound app payloads.
+- storage-sqlite: recover from corrupt proposal-queue ref-list blobs and undeserializable `QueuedProposal` entries;
+  incrementally project new timeline events and prune timeline projections.
+- traits: accept query strings on encrypted-media endpoint URLs.
+- marmot-app: keep confirmed-but-partial group projections on publish shortfall; avoid rollback after exposed create
+  welcome.
+- cgka-engine: prune fork recovery snapshots.
+- CLI: exponential backoff on failed stream append retries.
+- Engine: cache member-validation marker to skip O(groups × members) reverify on open.
 
 ### Security
 
@@ -240,5 +296,6 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/darkmatter/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/darkmatter/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/marmot-protocol/darkmatter/releases/tag/v0.2.0
 [0.1.0]: https://github.com/marmot-protocol/darkmatter/releases/tag/v0.1.0

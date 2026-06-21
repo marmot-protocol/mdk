@@ -13,7 +13,7 @@ Current tracks:
 
 - Whole-workspace releases use tags like `v0.1.0`. These identify a versioned source snapshot of the protocol draft,
   Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate.
-- DM Agent releases use tags like `dm-agent-v0.1.0`. These publish the `dm-agent` connector binary plus adapter
+- DM Agent releases use tags like `dm-agent-v0.2.0`. These publish the `dm-agent` connector binary plus adapter
   install assets, starting with the Hermes Marmot plugin and installer.
 - MarmotKit binding releases use tags like `marmotkit-v0.1.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
@@ -24,10 +24,10 @@ when those artifacts become independently consumed release surfaces.
 When multiple tracks correspond to the same source snapshot, create the tags on the same commit:
 
 ```sh
-git tag -a v0.1.0 -m "darkmatter v0.1.0"
-git tag -a dm-agent-v0.1.0 -m "DM Agent v0.1.0"
-git tag -a marmotkit-v0.1.0 -m "MarmotKit v0.1.0"
-git push origin v0.1.0 dm-agent-v0.1.0 marmotkit-v0.1.0
+git tag -a v0.2.0 -m "darkmatter v0.2.0"
+git tag -a dm-agent-v0.2.0 -m "DM Agent v0.2.0"
+git tag -a marmotkit-v0.2.0 -m "MarmotKit v0.2.0"
+git push origin v0.2.0 dm-agent-v0.2.0 marmotkit-v0.2.0
 ```
 
 The workspace is not published to crates.io today. The root `Cargo.toml` has `publish = false`, and the crates depend
@@ -40,7 +40,7 @@ app runtime, and generated bindings:
 
 ```toml
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 ```
 
 Use the same version number in:
@@ -131,11 +131,11 @@ Use this for a versioned Darkmatter source/library release.
 5. Create an annotated tag:
 
    ```sh
-   git tag -a v0.1.0 -m "darkmatter v0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.2.0 -m "darkmatter v0.2.0"
+   git push origin v0.2.0
    ```
 
-6. Create or update the GitHub Release for `v0.1.0` on the Darkmatter repo releases page.
+6. Create or update the GitHub Release for `v0.2.0` on the Darkmatter repo releases page.
 7. Include release notes that name the source commit, major user-visible changes, and any migration notes.
 
 Until a dedicated whole-workspace release workflow exists, the whole-workspace GitHub Release is a source release. The
@@ -154,7 +154,7 @@ The workflow lives at:
 ```
 
 Pull requests, master pushes, and manual workflow runs build validation artifacts only. Publishing happens only when a
-tag matching `dm-agent-v*` is pushed. The workflow validates version-like tags such as `dm-agent-v0.1.0` and requires
+tag matching `dm-agent-v*` is pushed. The workflow validates version-like tags such as `dm-agent-v0.2.0` and requires
 the tag version to match the root workspace version in `Cargo.toml`.
 
 Before a DM Agent release, run the normal preflight plus:
@@ -168,13 +168,13 @@ bash scripts/install-openclaw-marmot.sh --dry-run
 Cut the release tag from the current `origin/master` commit:
 
 ```sh
-just release-dm-agent 0.1.0
+just release-dm-agent 0.2.0
 ```
 
 For a dry run:
 
 ```sh
-just release-dm-agent-dry-run 0.1.0
+just release-dm-agent-dry-run 0.2.0
 ```
 
 The helper checks that the workspace version matches, the working tree is clean, `HEAD` matches `origin/master`, and the
@@ -205,9 +205,9 @@ The installer assets are generated during the release and default to their own `
 
 ```sh
 # Hermes gateway
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.1.0/install-hermes-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.2.0/install-hermes-marmot.sh | bash
 # OpenClaw gateway
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.1.0/install-openclaw-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.2.0/install-openclaw-marmot.sh | bash
 ```
 
 ## MarmotKit Binding Release
@@ -221,13 +221,13 @@ The workflow lives at:
 ```
 
 It runs only when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
-`marmotkit-v0.1.0`, builds both binding bundles, and creates or updates the matching GitHub Release.
+`marmotkit-v0.2.0`, builds both binding bundles, and creates or updates the matching GitHub Release.
 
 Create the tag:
 
 ```sh
-git tag -a marmotkit-v0.1.0 -m "MarmotKit v0.1.0"
-git push origin marmotkit-v0.1.0
+git tag -a marmotkit-v0.2.0 -m "MarmotKit v0.2.0"
+git push origin marmotkit-v0.2.0
 ```
 
 The release job creates these assets:
@@ -312,10 +312,10 @@ If a tag points at the wrong commit and nobody should consume it, delete and rec
 testers pin it:
 
 ```sh
-git tag -d dm-agent-v0.1.0
-git push origin :refs/tags/dm-agent-v0.1.0
-git tag -a dm-agent-v0.1.0 -m "DM Agent v0.1.0"
-git push origin dm-agent-v0.1.0
+git tag -d dm-agent-v0.2.0
+git push origin :refs/tags/dm-agent-v0.2.0
+git tag -a dm-agent-v0.2.0 -m "DM Agent v0.2.0"
+git push origin dm-agent-v0.2.0
 ```
 
 If a release has already been consumed, create a new patch version instead.

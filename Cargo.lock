@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "agent-connector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-control",
  "agent-stream-compose",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "agent-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "agent-stream-compose"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgka-traits",
  "hex",
@@ -710,7 +710,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cgka-conformance-simulator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "cgka-traits"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "darkmatter-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-stream-compose",
  "cgka-session",
@@ -2556,7 +2556,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "marmot-account"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
@@ -2582,7 +2582,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cgka-engine",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-forensics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2629,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-markdown"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-uniffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgka-traits",
  "hex",
@@ -4399,7 +4399,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage-sqlite"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgka-traits",
  "hex",
@@ -4926,7 +4926,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -4945,7 +4945,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-peeler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -4962,7 +4962,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-broker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgka-traits",
  "clap",
@@ -4982,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "transport-quic-stream"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cgka-traits",
  "chacha20poly1305",
