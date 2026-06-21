@@ -14,6 +14,7 @@ use crate::error::ConnectorError;
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpEvent, control_event_from_debug_event,
     control_event_from_runtime_event, inbound_message_event_from_record, resync_required_event,
+    runtime_replay_dedup_key,
 };
 use crate::validation::agent_control_request_type;
 
@@ -50,9 +51,9 @@ impl AgentConnector {
         });
         let mut initial_catch_up_pending = true;
 
-        // Tracks the inbound message ids already delivered on this subscription so a
+        // Tracks the durable storage row ids already delivered on this subscription so a
         // storage-backed replay after broadcast lag re-delivers only genuinely-missed
-        // messages (never re-flooding the agent with messages it already handled, and never
+        // events (never re-flooding the agent with facts it already handled, and never
         // double-delivering one that raced live delivery). Bounded so a long-lived
         // subscription cannot grow this set without limit; the queue evicts the oldest ids.
         let mut delivered = DeliveredInboundCursor::new(DELIVERED_INBOUND_CURSOR_CAPACITY);
@@ -102,11 +103,15 @@ impl AgentConnector {
                 }
                 event = runtime_events.recv() => {
                     match event {
-                        Ok(event) => control_event_from_runtime_event(
-                            event,
-                            account_id_hex.as_deref(),
-                            group_id_hex.as_deref(),
-                        ),
+                        Ok(event) => {
+                            let replay_id = runtime_replay_dedup_key(&event);
+                            control_event_from_runtime_event(
+                                event,
+                                account_id_hex.as_deref(),
+                                group_id_hex.as_deref(),
+                            )
+                            .map(|event| (event, replay_id))
+                        }
                         Err(broadcast::error::RecvError::Lagged(dropped)) => {
                             // The broadcast channel overflowed: `dropped` events were evicted
                             // before we could deliver them and are gone from the channel for
@@ -126,8 +131,8 @@ impl AgentConnector {
                                         target: "agent_connector",
                                         method = "stream_inbound_events",
                                         dropped_events = dropped,
-                                        replayed_messages = missed.len(),
-                                        "inbound broadcast lagged; replayed missed messages from storage"
+                                        replayed_events = missed.len(),
+                                        "inbound broadcast lagged; replayed missed events from storage"
                                     );
                                     for replayed in missed {
                                         let envelope = AgentControlEnvelope::new(
@@ -149,10 +154,13 @@ impl AgentConnector {
                                         error_code = err.privacy_safe_code(),
                                         "inbound broadcast lagged; storage replay failed, emitting resync_required"
                                     );
-                                    Some(resync_required_event(
-                                        account_id_hex.as_deref(),
-                                        group_id_hex.as_deref(),
-                                        dropped,
+                                    Some((
+                                        resync_required_event(
+                                            account_id_hex.as_deref(),
+                                            group_id_hex.as_deref(),
+                                            dropped,
+                                        ),
+                                        None,
                                     ))
                                 }
                             }
@@ -166,36 +174,54 @@ impl AgentConnector {
                             event,
                             account_id_hex.as_deref(),
                             group_id_hex.as_deref(),
-                        ),
+                        )
+                        .map(|event| (event, None)),
                         // Debug channel lag is not user-message loss; skip without resync.
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => continue,
                     }
                 }
             };
-            let Some(event) = event else {
+            let Some((event, replay_id)) = event else {
                 continue;
             };
-            // Track delivered inbound message ids so a later storage replay re-delivers only
-            // genuinely-missed messages. Skip a live message the cursor already saw (e.g. one
-            // that was just recovered by a replay) so it is never delivered twice.
-            if let AgentControlEvent::InboundMessage { message_id_hex, .. } = &event {
+            // Track delivered storage row ids so a later replay re-delivers only genuinely-missed
+            // events. Skip a live event the cursor already saw (e.g. one just recovered by a
+            // replay) so it is never delivered twice. Debug-injected inbound messages have no
+            // runtime replay id, so preserve the older message-id dedup behavior for them. If the
+            // debug channel ever starts injecting delete/state-change events, they need a durable
+            // replay id here before they can safely share storage-backed replay dedup.
+            if let Some(replay_id) = replay_id {
+                if delivered.contains(&replay_id) {
+                    continue;
+                }
+                delivered.record(replay_id);
+            } else if let AgentControlEvent::InboundMessage { message_id_hex, .. } = &event {
                 if delivered.contains(message_id_hex) {
                     continue;
                 }
                 delivered.record(message_id_hex.clone());
+            } else {
+                debug_assert!(
+                    !matches!(
+                        &event,
+                        AgentControlEvent::MessageDeleted { .. }
+                            | AgentControlEvent::GroupStateChanged { .. }
+                    ),
+                    "debug-injected ambient events need a durable replay id before delivery"
+                );
             }
             let envelope = AgentControlEnvelope::new(request_id.clone(), event);
             write_frame(writer, &envelope).await?;
         }
     }
 
-    /// Recover inbound messages that were dropped from the broadcast channel by re-reading them
-    /// from durable per-account storage. Returns the missed messages as `InboundMessage` events
-    /// (the same shape the live path emits) scoped to this subscription's filters, skipping any
-    /// id already recorded in `delivered` and recording the ones it returns. This is how a lagged
-    /// subscription recovers user messages instead of dropping them: the connector re-queries its
-    /// own state, exactly the resync the agent could not perform on its own.
+    /// Recover control events that were dropped from the broadcast channel by re-reading durable
+    /// per-account storage. Returns missed chat/delete/group-state events scoped to this
+    /// subscription's filters, skipping any storage row id already recorded in `delivered` and
+    /// recording the ones it returns. This is how a lagged subscription recovers ambient inbound
+    /// facts instead of silently losing them: the connector re-queries its own state, exactly the
+    /// resync the agent could not perform on its own.
     pub(crate) fn replay_missed_inbound(
         &self,
         account_filter: Option<&str>,
@@ -216,6 +242,10 @@ impl AgentConnector {
             };
             let records = self.runtime.messages_with_query(&account.label, query)?;
             for record in records {
+                let replay_id = record.message_id_hex.clone();
+                if delivered.contains(&replay_id) {
+                    continue;
+                }
                 let Some(event) = inbound_message_event_from_record(
                     &account.account_id_hex,
                     record,
@@ -224,12 +254,7 @@ impl AgentConnector {
                 ) else {
                     continue;
                 };
-                if let AgentControlEvent::InboundMessage { message_id_hex, .. } = &event {
-                    if delivered.contains(message_id_hex) {
-                        continue;
-                    }
-                    delivered.record(message_id_hex.clone());
-                }
+                delivered.record(replay_id);
                 events.push(event);
             }
         }

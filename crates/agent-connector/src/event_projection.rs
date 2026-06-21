@@ -9,8 +9,14 @@ use agent_control::{
     AgentControlMediaRef,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, STREAM_TAG,
+    EVENT_REF_TAG, GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
+    GROUP_SYSTEM_EVENT_VERSION, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED, GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+    GROUP_SYSTEM_TYPE_MEMBER_ADDED, GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG, GroupSystemEvent,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, STREAM_TAG,
+    canonical_event_id,
 };
 
 /// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
@@ -253,6 +259,157 @@ pub(crate) fn control_event_from_runtime_event(
     }
 }
 
+/// Return the durable storage row id that corresponds to a live runtime event, when the
+/// storage-backed replay can later project the same fact. Recording this id for live delivery
+/// lets replay recover genuinely dropped chat/delete/group-state events without duplicating facts
+/// this subscription already emitted.
+pub(crate) fn runtime_replay_dedup_key(event: &MarmotAppEvent) -> Option<String> {
+    match event {
+        MarmotAppEvent::MessageReceived(update) => matches!(
+            update.message.kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_DELETE
+        )
+        .then(|| update.message.message_id_hex.clone()),
+        MarmotAppEvent::GroupEvent(group_event) => {
+            if let GroupEvent::GroupStateChanged {
+                group_id,
+                epoch,
+                actor,
+                change,
+                ..
+            } = &group_event.event
+            {
+                group_state_change_replay_id(group_id, epoch.0, actor.as_ref(), change)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn group_state_change_replay_id(
+    group_id: &GroupId,
+    epoch: u64,
+    actor: Option<&cgka_traits::MemberId>,
+    change: &GroupStateChange,
+) -> Option<String> {
+    let (system_type, subject, name, text) = group_system_projection_parts(change);
+    let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
+    let mut data = serde_json::Map::new();
+    if let Some(actor_hex) = actor_hex.as_ref() {
+        data.insert(
+            GROUP_SYSTEM_DATA_ACTOR.to_owned(),
+            serde_json::Value::String(actor_hex.clone()),
+        );
+    }
+    if let Some(subject) = subject {
+        data.insert(
+            GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
+            serde_json::Value::String(hex::encode(subject.as_slice())),
+        );
+    }
+    if let Some(name) = name {
+        data.insert(
+            GROUP_SYSTEM_DATA_NAME.to_owned(),
+            serde_json::Value::String(name.to_owned()),
+        );
+    }
+    let data = (!data.is_empty()).then_some(serde_json::Value::Object(data));
+    let content = GroupSystemEvent::new(system_type, text, data)
+        .to_content()
+        .ok()?;
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let tags = vec![vec![
+        GROUP_SYSTEM_TYPE_TAG.to_owned(),
+        system_type.to_owned(),
+    ]];
+    let sender = actor_hex.unwrap_or_default();
+    let id_preimage = format!("{group_id_hex}\u{1f}{content}");
+    Some(canonical_event_id(
+        &sender,
+        epoch,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        &tags,
+        &id_preimage,
+    ))
+}
+
+fn group_system_projection_parts(
+    change: &GroupStateChange,
+) -> (
+    &'static str,
+    Option<&cgka_traits::MemberId>,
+    Option<&str>,
+    &'static str,
+) {
+    // The `text` values are part of the canonical storage row id preimage. Keep these in lockstep
+    // with marmot_app's group-system projection until the shared derivation is extracted.
+    match change {
+        GroupStateChange::MemberAdded { member } => (
+            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+            Some(member),
+            None,
+            "Member added",
+        ),
+        GroupStateChange::MemberRemoved { member } => (
+            GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+            Some(member),
+            None,
+            "Member removed",
+        ),
+        GroupStateChange::MemberLeft { member } => (
+            GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+            Some(member),
+            None,
+            "Member left",
+        ),
+        GroupStateChange::AdminAdded { member } => (
+            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            Some(member),
+            None,
+            "Admin added",
+        ),
+        GroupStateChange::AdminRemoved { member } => (
+            GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+            Some(member),
+            None,
+            "Admin removed",
+        ),
+        GroupStateChange::GroupRenamed { name } => (
+            GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+            None,
+            Some(name.as_str()),
+            "Group renamed",
+        ),
+        GroupStateChange::GroupAvatarChanged => (
+            GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
+            None,
+            None,
+            "Group avatar changed",
+        ),
+    }
+}
+
+fn group_system_control_parts(event: &GroupSystemEvent) -> Option<(&'static str, Option<String>)> {
+    if event.v != GROUP_SYSTEM_EVENT_VERSION {
+        return None;
+    }
+    match event.system_type.as_str() {
+        GROUP_SYSTEM_TYPE_MEMBER_ADDED => Some(("member_added", None)),
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED => Some(("member_removed", None)),
+        GROUP_SYSTEM_TYPE_MEMBER_LEFT => Some(("member_left", None)),
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED => Some(("admin_added", None)),
+        GROUP_SYSTEM_TYPE_ADMIN_REMOVED => Some(("admin_removed", None)),
+        GROUP_SYSTEM_TYPE_GROUP_RENAMED => Some((
+            "group_renamed",
+            event.data_str(GROUP_SYSTEM_DATA_NAME).map(str::to_owned),
+        )),
+        GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED => Some(("group_avatar_changed", None)),
+        _ => None,
+    }
+}
+
 pub(crate) fn control_event_from_debug_event(
     event: AgentControlEvent,
     account_filter: Option<&str>,
@@ -348,42 +505,65 @@ pub(crate) fn resync_required_event(
     }
 }
 
-/// Project a stored app-message record into the same `InboundMessage` event the live
-/// `MessageReceived` path emits, or `None` if it is not an inbound user message for this
-/// subscription. This keeps storage-backed replay byte-for-byte consistent with live delivery:
-/// only inbound (`direction == "received"`) chat messages from a different sender are surfaced,
-/// agent text-stream starts are skipped (the live path diverts them to a separate signal), and
-/// the subscription's account/group filters are honored.
+/// Project a stored app-message record into the same control event the live path emits, or
+/// `None` if the stored row is not relevant to this subscription. Replay covers the durable event
+/// kinds the live inbound stream surfaces: inbound chat messages, inbound kind-5 deletes, and
+/// synthesized kind-1210 group-system rows for authenticated group-state changes. Other app-event
+/// kinds remain ignored until they have explicit agent-control semantics.
 pub(crate) fn inbound_message_event_from_record(
     account_id_hex: &str,
     record: AppMessageRecord,
     account_filter: Option<&str>,
     group_filter: Option<&str>,
 ) -> Option<AgentControlEvent> {
-    // Only genuine inbound chat messages are user messages to the agent. Outbound (own) sends,
-    // reactions/system events, and kind-1200 agent stream starts (which the live path diverts to
-    // a separate signal) are not re-delivered as inbound. Filtering to the chat kind covers all
-    // of those non-chat kinds, including the stream-start kind.
     debug_assert_ne!(
         MARMOT_APP_EVENT_KIND_CHAT,
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
     );
-    if record.direction != "received" {
-        return None;
-    }
-    if record.kind != MARMOT_APP_EVENT_KIND_CHAT {
-        return None;
-    }
-    // The live path drops messages whose sender is the subscribed account itself.
-    if record.sender == account_id_hex {
-        return None;
-    }
     if !inbound_filter_matches(
         account_filter,
         account_id_hex,
         group_filter,
         &record.group_id_hex,
     ) {
+        return None;
+    }
+
+    if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+        // Only locally synthesized group-system timeline rows represent the live
+        // `GroupEvent::GroupStateChanged` signal. Ignore sent/received kind-1210 app events.
+        if record.direction != "system" {
+            return None;
+        }
+        let group_system = GroupSystemEvent::parse(&record.plaintext).ok()?;
+        let (change, detail) = group_system_control_parts(&group_system)?;
+        return Some(AgentControlEvent::GroupStateChanged {
+            account_id_hex: account_id_hex.to_owned(),
+            group_id_hex: record.group_id_hex,
+            change: change.to_owned(),
+            detail,
+        });
+    }
+
+    if record.direction != "received" {
+        return None;
+    }
+    // The live MessageReceived path drops messages whose sender is the subscribed account itself.
+    if record.sender == account_id_hex {
+        return None;
+    }
+
+    if record.kind == MARMOT_APP_EVENT_KIND_DELETE {
+        let target_message_id_hex = reply_target_from_tags(&record.tags)?;
+        return Some(AgentControlEvent::MessageDeleted {
+            account_id_hex: account_id_hex.to_owned(),
+            group_id_hex: record.group_id_hex,
+            target_message_id_hex,
+            sender_account_id_hex: record.sender,
+        });
+    }
+
+    if record.kind != MARMOT_APP_EVENT_KIND_CHAT {
         return None;
     }
     let mentions_self = message_mentions_account(&record.tags, &record.plaintext, account_id_hex);
@@ -403,12 +583,12 @@ pub(crate) fn inbound_message_event_from_record(
     })
 }
 
-/// Bounded set of inbound message ids already delivered on a subscription, used to dedup
+/// Bounded set of durable replay row ids already delivered on a subscription, used to dedup
 /// storage-backed replay against live delivery (and against itself) after broadcast lag. Keeps a
 /// FIFO of recent ids so a long-lived subscription cannot grow memory without bound; once the
 /// capacity is reached the oldest id is evicted. The capacity comfortably exceeds the broadcast
-/// channel depth, so every message that could plausibly be re-queried after a single overflow is
-/// still tracked.
+/// channel depth, so every row that could plausibly be re-queried after a single overflow is still
+/// tracked.
 pub(crate) struct DeliveredInboundCursor {
     capacity: usize,
     order: VecDeque<String>,

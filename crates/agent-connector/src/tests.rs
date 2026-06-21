@@ -34,6 +34,7 @@ use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
     control_event_from_runtime_event, inbound_message_event_from_record, resync_required_event,
+    runtime_replay_dedup_key,
 };
 use crate::{
     AgentConnector, AgentConnectorConfig, bind_connector_socket, bind_connector_socket_with_mode,
@@ -2248,6 +2249,109 @@ fn inbound_message_event_from_record_projects_received_chat() {
 }
 
 #[test]
+fn inbound_message_event_from_record_projects_received_delete() {
+    // Regression for darkmatter#505: storage replay must surface a missed inbound kind-5
+    // deletion the same way the live MessageReceived path does.
+    let target = "99".repeat(32);
+    let mut record = received_chat_record("dd", "bb", "cc", "");
+    record.kind = MARMOT_APP_EVENT_KIND_DELETE;
+    record.tags = vec![vec!["e".to_owned(), target.clone()]];
+
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    assert_eq!(
+        event,
+        AgentControlEvent::MessageDeleted {
+            account_id_hex: "acct".to_owned(),
+            group_id_hex: "bb".to_owned(),
+            target_message_id_hex: target,
+            sender_account_id_hex: "cc".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn inbound_message_event_from_record_projects_group_system_row() {
+    // Regression for darkmatter#505: durable kind-1210 group-system rows synthesized from
+    // GroupStateChanged events must replay as group_state_changed control events after lag.
+    let content = cgka_traits::app_event::GroupSystemEvent::new(
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+        "Group renamed",
+        Some(serde_json::json!({
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_NAME: "Team",
+            // Subject/actor-like data must not be surfaced in the control event.
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_SUBJECT: "99".repeat(32),
+        })),
+    )
+    .to_content()
+    .unwrap();
+    let mut record = received_chat_record("ee", "bb", "", &content);
+    record.direction = "system".to_owned();
+    record.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+
+    let event =
+        inbound_message_event_from_record("acct", record, Some("acct"), Some("bb")).unwrap();
+    assert_eq!(
+        event,
+        AgentControlEvent::GroupStateChanged {
+            account_id_hex: "acct".to_owned(),
+            group_id_hex: "bb".to_owned(),
+            change: "group_renamed".to_owned(),
+            detail: Some("Team".to_owned()),
+        }
+    );
+}
+
+#[test]
+fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
+    // The live GroupStateChanged event and the synthesized storage row must share the same
+    // replay cursor id, otherwise replay after later lag would duplicate already-delivered state.
+    let group_id = GroupId::new(vec![0x22; 32]);
+    let actor = cgka_traits::MemberId::new(vec![0xbb; 32]);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: "acct".to_owned(),
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: EpochId(3),
+            actor: Some(actor.clone()),
+            change: GroupStateChange::GroupRenamed {
+                name: "Team".to_owned(),
+            },
+            origin_commit_id: None,
+        },
+    });
+
+    let content = cgka_traits::app_event::GroupSystemEvent::new(
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+        "Group renamed",
+        Some(serde_json::json!({
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_ACTOR: hex::encode(actor.as_slice()),
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_NAME: "Team",
+        })),
+    )
+    .to_content()
+    .unwrap();
+    let tags = vec![vec![
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_TAG.to_owned(),
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED.to_owned(),
+    ]];
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let expected = cgka_traits::app_event::canonical_event_id(
+        &hex::encode(actor.as_slice()),
+        3,
+        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        &tags,
+        &format!("{group_id_hex}\u{1f}{content}"),
+    );
+
+    assert_eq!(
+        runtime_replay_dedup_key(&event).as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
 fn inbound_message_event_from_record_extracts_mention_and_reply() {
     // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
     // the reply target. Both let a channel gate/thread without re-parsing tags.
@@ -2343,10 +2447,16 @@ fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
     let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
     assert!(inbound_message_event_from_record("acct", self_authored, None, None).is_none());
 
-    // Non-chat kinds (reactions, agent stream starts, system events) are not user messages.
+    // Unsupported non-chat kinds (reactions, agent stream starts) are not replayed.
     let mut reaction = received_chat_record("aa", "bb", "cc", "+1");
     reaction.kind = MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
     assert!(inbound_message_event_from_record("acct", reaction, None, None).is_none());
+
+    // A group-system row that was received as an app message, rather than synthesized locally,
+    // is not treated as a durable GroupStateChanged replay event.
+    let mut received_system = received_chat_record("aa", "bb", "cc", "{}");
+    received_system.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+    assert!(inbound_message_event_from_record("acct", received_system, None, None).is_none());
 
     // A mismatched group filter excludes the message.
     let other_group = received_chat_record("aa", "bb", "cc", "elsewhere");
