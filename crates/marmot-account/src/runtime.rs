@@ -472,11 +472,12 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        if self
-            .publish_one(commit, output, context.clone())
-            .await?
-            .met_required_acks
-        {
+        let commit_status = self.publish_one(commit, output, context.clone()).await?;
+        if commit_status.met_required_acks || commit_status.accepted_by_any_endpoint {
+            // A commit accepted by any endpoint is externally visible even when
+            // it missed the policy ack threshold. Rolling it back would diverge
+            // the sender from peers that ingest it, so treat unreached endpoints
+            // as recoverable and proceed with welcome publication.
             let effects = self.session.confirm_published(pending).await?;
             output
                 .pending
