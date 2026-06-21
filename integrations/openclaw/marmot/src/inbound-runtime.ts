@@ -82,7 +82,13 @@ function groupStateChangeSentence(change: string, detail?: string | null): strin
   }
 }
 
-/** Merge a debounce batch of same-key inbound messages into one turn (newline-joined text). */
+/**
+ * Merge a debounce batch of same-key inbound messages into one turn.
+ *
+ * The newest message remains the representative for ids/display metadata, while
+ * turn-signaling fields that can appear on any burst member are merged so a
+ * non-last image, mention, or reply does not disappear during debounce.
+ */
 function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMessage {
   const last = items[items.length - 1]!;
   if (items.length === 1) {
@@ -92,7 +98,27 @@ function coalesceInboundMessages(items: MarmotInboundMessage[]): MarmotInboundMe
     .map((item) => item.text)
     .filter((part) => part.length > 0)
     .join("\n");
-  return { ...last, text };
+  const media: NonNullable<MarmotInboundMessage["media"]> = [];
+  const mediaHashes = new Set<string>();
+  for (const item of items) {
+    for (const ref of item.media ?? []) {
+      if (!mediaHashes.has(ref.ciphertext_sha256)) {
+        mediaHashes.add(ref.ciphertext_sha256);
+        media.push(ref);
+      }
+    }
+  }
+  const replyToMessageIdHex =
+    items
+      .toReversed()
+      .find((item) => item.replyToMessageIdHex)?.replyToMessageIdHex ?? null;
+  return {
+    ...last,
+    text,
+    mentionsSelf: items.some((item) => item.mentionsSelf === true),
+    replyToMessageIdHex,
+    media,
+  };
 }
 
 export type InboundAgentDispatcher = (message: MarmotInboundMessage) => void | Promise<void>;

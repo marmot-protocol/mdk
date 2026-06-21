@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AgentControlEvent, MarmotAgentControlClient } from "../src/client.js";
+import type {
+  AgentControlEvent,
+  AgentControlMediaRef,
+  MarmotAgentControlClient,
+} from "../src/client.js";
 import {
   startMarmotInbound,
   syncMarmotAllowlist,
@@ -11,6 +15,8 @@ import {
   marmotInboundRuntimeSnapshot,
   resetMarmotInboundRuntimeForTests,
 } from "../src/runtime-state.js";
+
+type InboundMessageEvent = Extract<AgentControlEvent, { type: "inbound_message" }>;
 
 const HEX32 = (b: string) => b.repeat(32);
 const noopLogger = { info: () => {}, warn: () => {} };
@@ -36,7 +42,7 @@ function inboundStubClient(events: AgentControlEvent[]): MarmotAgentControlClien
   } as unknown as MarmotAgentControlClient;
 }
 
-function inboundEvent(groupByte: string, idByte: string): AgentControlEvent {
+function inboundEvent(groupByte: string, idByte: string): InboundMessageEvent {
   return {
     type: "inbound_message",
     account_id_hex: HEX32("aa"),
@@ -44,6 +50,19 @@ function inboundEvent(groupByte: string, idByte: string): AgentControlEvent {
     message_id_hex: HEX32(idByte),
     sender_account_id_hex: HEX32("bb"),
     text: "hello agent",
+  };
+}
+
+function mediaRef(ciphertextSha256: string, fileName: string): AgentControlMediaRef {
+  return {
+    media_type: "image/png",
+    file_name: fileName,
+    ciphertext_sha256: ciphertextSha256,
+    plaintext_sha256: HEX32("ee"),
+    nonce_hex: "00".repeat(12),
+    version: "v1",
+    source_epoch: 7,
+    locators: [{ kind: "nip94", value: `nostr:${ciphertextSha256}` }],
   };
 }
 
@@ -116,6 +135,59 @@ describe("startMarmotInbound", () => {
       messageIdHex: HEX32("dd"),
       text: "hello agent",
     });
+  });
+
+  it("coalesces debounced bursts without dropping media, mentions, or reply context", async () => {
+    const mediaA = mediaRef(HEX32("a1"), "a.png");
+    const mediaB = mediaRef(HEX32("b2"), "b.png");
+    const dispatched: MarmotInboundMessage[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { debounceMs: 10, profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(
+      api,
+      (message) => {
+        dispatched.push(message);
+      },
+      {
+        clientFactory: () =>
+          inboundStubClient([
+            {
+              ...inboundEvent("cc", "d1"),
+              text: "",
+              mentions_self: true,
+              reply_to_message_id_hex: HEX32("e1"),
+              media: [mediaA],
+            },
+            {
+              ...inboundEvent("cc", "d2"),
+              text: "",
+              media: [{ ...mediaA, file_name: "a-duplicate.png" }, mediaB],
+            },
+            {
+              ...inboundEvent("cc", "d3"),
+              text: "what is this?",
+              mentions_self: false,
+              reply_to_message_id_hex: null,
+              media: [],
+            },
+          ]),
+      },
+    );
+
+    await waitFor(() => dispatched.length > 0);
+    stop();
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({
+      groupIdHex: HEX32("cc"),
+      messageIdHex: HEX32("d3"),
+      text: "what is this?",
+      mentionsSelf: true,
+      replyToMessageIdHex: HEX32("e1"),
+    });
+    expect(dispatched[0]?.media).toEqual([mediaA, mediaB]);
   });
 
   it("surfaces a message deletion to the ambient surfacer with a stable contextKey", async () => {
