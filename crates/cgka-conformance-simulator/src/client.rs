@@ -6,6 +6,7 @@ use crate::bus::{ClientId, TransportBus};
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
+use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{
@@ -26,6 +27,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 use transport_nostr_peeler::NostrMlsPeeler;
 
@@ -573,25 +575,11 @@ impl HarnessClient {
     /// Drain the bus mailbox into the engine. Returns ingest outcomes for
     /// each message in order.
     pub async fn tick(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
-        let inbound = self.bus.mailbox(self.bus_id);
-        let mut outcomes = Vec::with_capacity(inbound.len());
-        let mut buffered_groups = Vec::new();
-        for msg in inbound {
-            let result = self.engine.ingest(msg).await;
-            if let Ok(IngestOutcome::Buffered { group_id, .. }) = &result
-                && !buffered_groups.contains(group_id)
-            {
-                buffered_groups.push(group_id.clone());
-            }
-            if result.is_ok() {
-                self.capture_engine_events();
-            }
-            outcomes.push(result);
-        }
-        for group_id in buffered_groups {
+        let mut outcomes = self.tick_ingest_only().await;
+        if let Some(gid) = self.default_group.clone() {
             match self
                 .engine
-                .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+                .advance_convergence_inputs_until_settled(&gid, 1_000_000)
                 .await
             {
                 Ok(_) => {}
@@ -599,13 +587,93 @@ impl HarnessClient {
                     outcomes.push(Err(EngineError::Backend(format!(
                         "converge buffered group: {e}"
                     ))));
-                    continue;
+                    return outcomes;
                 }
             }
             self.capture_engine_events();
         }
-        // Auto-publish: anything the engine queued in response goes back on
-        // the bus.
+        outcomes.extend(self.drain_auto_publish_confirm().await);
+        outcomes
+    }
+
+    /// Ingest every message in the mailbox without running convergence.
+    ///
+    /// Production clients defer commit application to a scheduled convergence
+    /// pass; this helper models that ingest-only boundary.
+    pub async fn tick_ingest_only(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
+        let inbound = self.bus.mailbox(self.bus_id);
+        let mut outcomes = Vec::with_capacity(inbound.len());
+        for msg in inbound {
+            let result = self.engine.ingest(msg).await;
+            if result.is_ok() {
+                self.capture_engine_events();
+            }
+            outcomes.push(result);
+        }
+        outcomes
+    }
+
+    /// Override the engine-wide convergence policy (quiescence window, etc.).
+    pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
+        self.engine.set_convergence_policy(policy);
+    }
+
+    /// Run the same convergence entry point the app uses after a scheduled
+    /// timer (`CgkaEngine::advance_convergence`), then capture emitted events.
+    pub async fn advance_convergence(&mut self) -> Result<(), EngineError> {
+        let gid = self.default_group.clone().expect("group");
+        self.engine.advance_convergence(&gid).await?;
+        self.capture_engine_events();
+        for result in self.drain_auto_publish_confirm().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Model the fixed marmot-app account worker: if a scheduled pass did not
+    /// settle stored convergence inputs, wait for the quiescence window (+ the
+    /// same schedule margin production uses) and run one retry pass.
+    ///
+    /// Production re-arms repeatedly until inputs settle; this helper models only
+    /// the first re-arm after a premature tick.
+    pub async fn advance_convergence_with_app_retry(
+        &mut self,
+        quiescence_ms: u64,
+    ) -> Result<(), EngineError> {
+        const SCHEDULE_MARGIN_MS: u64 = 100;
+        self.advance_convergence().await?;
+        if !self.has_pending_convergence_inputs() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(
+            quiescence_ms.saturating_add(SCHEDULE_MARGIN_MS),
+        ))
+        .await;
+        self.advance_convergence().await
+    }
+
+    pub fn has_pending_convergence_inputs(&self) -> bool {
+        let gid = self.default_group.clone().expect("group");
+        self.engine
+            .has_pending_convergence_inputs(&gid)
+            .expect("pending convergence probe")
+    }
+
+    pub fn received_app_payloads(&mut self) -> Vec<Vec<u8>> {
+        self.capture_engine_events();
+        self.pending_events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived { payload, .. } => {
+                    Some(decode_harness_app_payload(payload))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn drain_auto_publish_confirm(&mut self) -> Vec<Result<IngestOutcome, EngineError>> {
+        let mut outcomes = Vec::new();
         let auto = self.engine.drain_auto_publish();
         let gid = self.default_group.clone();
         for auto in auto {

@@ -22,6 +22,12 @@ impl AppClient {
         self.pending_convergence_groups.drain().collect()
     }
 
+    pub(crate) fn has_pending_convergence_inputs(&self, group_id: &cgka_traits::GroupId) -> bool {
+        self.runtime
+            .has_pending_convergence_inputs(group_id)
+            .unwrap_or(false)
+    }
+
     fn remember_buffered_convergence_outcome(&mut self, outcome: &IngestOutcome) {
         if let IngestOutcome::Buffered { group_id, .. } = outcome {
             self.pending_convergence_groups.insert(group_id.clone());
