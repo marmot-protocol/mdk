@@ -263,6 +263,21 @@ impl Marmot {
         Ok(status.into())
     }
 
+    /// Export the active account's raw private key in canonical `nsec1...`
+    /// bech32 form for an in-app key-backup display (darkmatter#543).
+    ///
+    /// SENSITIVE: revealing the raw key is logged to the per-account audit log
+    /// and permanently marks the account's NIP-49 KEY_SECURITY_BYTE as 0x00
+    /// ("handled insecurely"). The returned string is computed on demand and is
+    /// never cached by the engine; the caller should display it transiently and
+    /// drop it. Refuses unknown / public-only / cross-account refs via the
+    /// existing keystore validation.
+    pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError> {
+        Ok(self
+            .runtime
+            .reveal_nsec(&account_ref, "marmot_uniffi::Marmot::reveal_nsec")?)
+    }
+
     /// Publish the Nostr kind:0 metadata for `account_ref`. The returned
     /// metadata is what marmot-app actually published (any server-applied
     /// defaults are reflected here).

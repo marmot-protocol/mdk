@@ -12,6 +12,9 @@ use crate::io::{read_json, validate_account_label, write_json};
 use crate::secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
+/// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
+/// byte, never key material, so it is written with public file permissions.
+const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
@@ -76,6 +79,14 @@ impl AccountSummary {
     pub fn is_active_local_signing(&self) -> bool {
         self.local_signing && !self.signed_out
     }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct StoredKeySecurity {
+    /// NIP-49 KEY_SECURITY_BYTE. 0x02 = secure (never seen insecurely),
+    /// 0x01 = secure but was handled insecurely in the past, 0x00 = insecure
+    /// (revealed/exported in raw form). We only ever transition toward 0x00.
+    key_security_byte: u8,
 }
 
 impl AccountHome {
@@ -378,6 +389,55 @@ impl AccountHome {
             return Err(AccountHomeError::AccountIdMismatch);
         }
         Ok(keys)
+    }
+
+    /// NIP-49 KEY_SECURITY_BYTE for `account_ref`. Defaults to 0x02
+    /// ("never handled insecurely") when no status has been persisted yet.
+    pub fn key_security_byte(&self, account_ref: &str) -> AccountHomeResult<u8> {
+        let account = self.account(account_ref)?;
+        let path = self
+            .account_dir(&account.label)
+            .join(ACCOUNT_KEY_SECURITY_FILE);
+        match read_json::<StoredKeySecurity>(&path) {
+            Ok(stored) => Ok(stored.key_security_byte),
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(0x02)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Mark `account_ref`'s key as handled insecurely (NIP-49 KEY_SECURITY_BYTE
+    /// 0x00). Idempotent and monotonic: once 0x00 it stays 0x00 across restarts.
+    pub fn mark_key_handled_insecurely(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let account = self.account(account_ref)?;
+        let path = self
+            .account_dir(&account.label)
+            .join(ACCOUNT_KEY_SECURITY_FILE);
+        write_json(
+            &path,
+            &StoredKeySecurity {
+                key_security_byte: 0x00,
+            },
+        )
+    }
+
+    /// Export `account_ref`'s raw private key in canonical `nsec1...` bech32
+    /// form (NIP-19). Reading the raw key out is a NIP-49 "insecure handling"
+    /// event, so this also flips the persisted KEY_SECURITY_BYTE to 0x00.
+    ///
+    /// The returned String is the only place the bech32 form exists; it is
+    /// neither cached nor logged. Caller should drop it promptly.
+    pub fn reveal_nsec(&self, account_ref: &str) -> AccountHomeResult<String> {
+        use nostr::ToBech32;
+        let keys = self.load_signing_keys(account_ref)?;
+        let nsec = keys
+            .secret_key()
+            .to_bech32()
+            .expect("nsec bech32 encode is infallible");
+        // Persist the insecure-handling marker only after a successful encode.
+        self.mark_key_handled_insecurely(account_ref)?;
+        Ok(nsec)
     }
 
     fn write_signing_account(&self, keys: &nostr::Keys) -> AccountHomeResult<AccountSummary> {

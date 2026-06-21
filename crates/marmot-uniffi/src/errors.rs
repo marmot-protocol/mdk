@@ -51,6 +51,25 @@ pub enum MarmotKitError {
     /// surfacing it as a fatal "Send failed".
     #[error("storage busy: {details}")]
     StorageBusy { details: String },
+    /// The account exists but its raw private key could not be located in the
+    /// keystore — e.g. a public-only / watch-only account, or a secret that was
+    /// never loaded. Distinct, typed variant (#543) so a key-backup surface can
+    /// tell "this account has no exportable key" apart from a generic runtime
+    /// failure without string-parsing.
+    #[error("account secret not found: {details}")]
+    SecretNotFound { details: String },
+    /// The platform secret store / keychain is locked, uninitialized, or
+    /// otherwise unavailable, so the raw private key could not be read. Typed
+    /// variant (#543) so a key-backup surface can prompt the user to unlock the
+    /// keystore rather than reporting an opaque runtime error.
+    #[error("account keystore unavailable: {details}")]
+    KeystoreUnavailable { details: String },
+    /// A filesystem IO error while reading the key, appending the reveal audit
+    /// entry, or persisting the NIP-49 key-security byte. Typed variant (#543)
+    /// so a key-backup surface can distinguish disk failures from arbitrary
+    /// runtime faults.
+    #[error("io error: {details}")]
+    Io { details: String },
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
 }
@@ -67,6 +86,35 @@ impl From<AppError> for MarmotKitError {
             AppError::AccountHome(AccountHomeError::AccountExists(account)) => {
                 Self::DuplicateIdentity { account }
             }
+            // #543: reveal_nsec must surface its required failure modes as typed
+            // FFI errors, not the untyped `Runtime` bucket, so a key-backup
+            // surface can distinguish "no exportable key" / "keystore locked" /
+            // "disk IO" without string-parsing.
+            //
+            // No raw key is loaded for this account (public-only / watch-only,
+            // or the secret was never imported).
+            AppError::AccountHome(ref err @ AccountHomeError::SecretNotFound(_)) => {
+                Self::SecretNotFound {
+                    details: err.to_string(),
+                }
+            }
+            // The platform keystore is locked / uninitialized / unavailable.
+            AppError::AccountHome(
+                ref err @ (AccountHomeError::SecretStoreNotInitialized(_)
+                | AccountHomeError::SecretStoreUnavailable(_)
+                | AccountHomeError::SecretStore(_)),
+            ) => Self::KeystoreUnavailable {
+                details: err.to_string(),
+            },
+            // A filesystem IO error reading the key, appending the reveal audit
+            // entry, or persisting the key-security byte — surfaced either
+            // directly at the app layer or wrapped in an AccountHomeError.
+            AppError::Io(ref err) => Self::Io {
+                details: err.to_string(),
+            },
+            AppError::AccountHome(ref err @ AccountHomeError::Io(_)) => Self::Io {
+                details: err.to_string(),
+            },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
@@ -131,7 +179,7 @@ mod tests {
     use super::MarmotKitError;
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageError;
-    use marmot_account::AccountError;
+    use marmot_account::{AccountError, AccountHomeError};
     use marmot_app::AppError;
 
     // #484: a transient SQLITE_BUSY surfaced from a send must cross the UniFFI
@@ -186,6 +234,68 @@ mod tests {
         assert!(
             matches!(engine_ffi, MarmotKitError::Runtime { .. }),
             "non-transient engine storage faults must stay Runtime, got {engine_ffi:?}"
+        );
+    }
+
+    // #543: reveal_nsec must surface its required failure modes (no exportable
+    // key / keystore locked-or-unavailable / disk IO) as typed FFI variants so
+    // a key-backup surface can react without string-parsing a generic Runtime
+    // error.
+    #[test]
+    fn reveal_secret_not_found_crosses_ffi_as_typed_variant() {
+        let app_err = AppError::AccountHome(AccountHomeError::SecretNotFound(
+            "no secret stored for account".to_string(),
+        ));
+        let ffi: MarmotKitError = app_err.into();
+        assert!(
+            matches!(ffi, MarmotKitError::SecretNotFound { .. }),
+            "public-only / missing secret must map to SecretNotFound, got {ffi:?}"
+        );
+    }
+
+    #[test]
+    fn reveal_keystore_unavailable_crosses_ffi_as_typed_variant() {
+        for app_err in [
+            AppError::AccountHome(AccountHomeError::SecretStoreNotInitialized(
+                "keychain not initialized".to_string(),
+            )),
+            AppError::AccountHome(AccountHomeError::SecretStoreUnavailable(
+                "keychain locked".to_string(),
+            )),
+            AppError::AccountHome(AccountHomeError::SecretStore(
+                "keychain query failed".to_string(),
+            )),
+        ] {
+            let ffi: MarmotKitError = app_err.into();
+            assert!(
+                matches!(ffi, MarmotKitError::KeystoreUnavailable { .. }),
+                "locked / unavailable keystore must map to KeystoreUnavailable, got {ffi:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reveal_io_error_crosses_ffi_as_typed_variant() {
+        // A direct app-layer IO error (e.g. appending the reveal audit line).
+        let direct: MarmotKitError = AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "audit append failed",
+        ))
+        .into();
+        assert!(
+            matches!(direct, MarmotKitError::Io { .. }),
+            "direct app-layer IO failure must map to Io, got {direct:?}"
+        );
+
+        // An IO error wrapped in AccountHomeError (e.g. persisting the
+        // key-security byte or reading the keystore file).
+        let wrapped: MarmotKitError = AppError::AccountHome(AccountHomeError::Io(
+            std::io::Error::other("key-security write failed"),
+        ))
+        .into();
+        assert!(
+            matches!(wrapped, MarmotKitError::Io { .. }),
+            "AccountHome IO failure must map to Io, got {wrapped:?}"
         );
     }
 }

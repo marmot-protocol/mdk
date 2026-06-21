@@ -387,6 +387,76 @@ fn account_home_file_store_keeps_per_label_secrets_for_same_account_id() {
     );
 }
 
+#[test]
+fn account_home_reveal_nsec_round_trips_to_stored_account_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+
+    let imported = home.import_nostr_account(nsec).unwrap();
+
+    let revealed = home.reveal_nsec(&imported.account_id_hex).unwrap();
+    assert_eq!(revealed.len(), 63);
+    assert!(revealed.starts_with("nsec1"));
+    // The revealed nsec parses back to the same public key as the account id.
+    assert_eq!(
+        nostr::Keys::parse(&revealed).unwrap().public_key().to_hex(),
+        imported.account_id_hex
+    );
+}
+
+#[test]
+fn account_home_key_security_byte_defaults_secure_and_flips_after_reveal() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    let created = home.create_nostr_account().unwrap();
+
+    // No reveal yet: NIP-49 "never handled insecurely".
+    assert_eq!(
+        home.key_security_byte(&created.account_id_hex).unwrap(),
+        0x02
+    );
+
+    home.reveal_nsec(&created.account_id_hex).unwrap();
+    assert_eq!(
+        home.key_security_byte(&created.account_id_hex).unwrap(),
+        0x00
+    );
+
+    // The marker is persisted: a fresh home at the same root still reads 0x00.
+    let reopened = AccountHome::open(dir.path());
+    assert_eq!(
+        reopened.key_security_byte(&created.account_id_hex).unwrap(),
+        0x00
+    );
+}
+
+#[test]
+fn account_home_reveal_nsec_rejects_unknown_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+
+    assert!(matches!(
+        home.reveal_nsec("does-not-exist"),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+}
+
+#[test]
+fn account_home_reveal_nsec_rejects_public_only_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let public_key = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    home.add_public_account(public_key).unwrap();
+
+    assert!(matches!(
+        home.reveal_nsec(public_key),
+        Err(AccountHomeError::SecretNotFound(_))
+    ));
+}
+
 #[derive(Default)]
 struct MemorySecretStore {
     keys: Mutex<HashMap<String, String>>,

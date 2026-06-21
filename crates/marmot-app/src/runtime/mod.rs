@@ -1051,6 +1051,12 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// See [`MarmotApp::reveal_nsec`]. darkmatter#543. `caller_context` is the
+    /// privacy-safe surface label recorded in the reveal audit entry.
+    pub fn reveal_nsec(&self, account_ref: &str, caller_context: &str) -> Result<String, AppError> {
+        self.accounts.reveal_nsec(account_ref, caller_context)
+    }
+
     pub async fn agent_text_stream_exporter_secret(
         &self,
         account_ref: &str,
