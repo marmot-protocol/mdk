@@ -97,6 +97,10 @@ pub struct TimelineReplyPreview {
     pub sender: String,
     pub plaintext: String,
     pub kind: u64,
+    /// Source epoch of the previewed (reply target) message, carried so callers
+    /// can resolve its `imeta` media into downloadable attachment references.
+    /// `None` for local sends not yet committed to an epoch.
+    pub source_epoch: Option<u64>,
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub deleted: bool,
@@ -1987,7 +1991,7 @@ fn load_reply_previews(
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted
+            "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch
              FROM message_timeline
              WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
         );
@@ -2029,6 +2033,9 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
             },
         )?,
         deleted: row.get::<_, i64>(6)? != 0,
+        source_epoch: row
+            .get::<_, Option<i64>>(7)?
+            .and_then(|value| value.try_into().ok()),
     })
 }
 

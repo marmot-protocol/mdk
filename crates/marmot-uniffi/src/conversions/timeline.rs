@@ -10,11 +10,17 @@ use marmot_app::{
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
+use super::media::{MediaAttachmentReferenceFfi, timeline_media_references_ffi};
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineReactionEmojiFfi {
     pub emoji: String,
+    /// Number of distinct senders that reacted with this emoji
+    /// (`== senders.len()`), surfaced so clients render the tally without
+    /// counting. This is the authenticated reaction count only; clients overlay
+    /// their own optimistic react/unreact and "did I react" state on top.
+    pub count: u32,
     pub senders: Vec<String>,
 }
 
@@ -41,18 +47,26 @@ impl From<TimelineUserReaction> for TimelineUserReactionFfi {
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct TimelineReactionSummaryFfi {
+    /// Reaction tallies pre-sorted by `count` descending, ties broken by `emoji`
+    /// ascending, so clients render a stable tally without re-sorting.
     pub by_emoji: Vec<TimelineReactionEmojiFfi>,
     pub user_reactions: Vec<TimelineUserReactionFfi>,
 }
 
 impl From<TimelineReactionSummary> for TimelineReactionSummaryFfi {
     fn from(value: TimelineReactionSummary) -> Self {
+        let mut by_emoji = value
+            .by_emoji
+            .into_iter()
+            .map(|(emoji, senders)| TimelineReactionEmojiFfi {
+                count: senders.len().try_into().unwrap_or(u32::MAX),
+                emoji,
+                senders,
+            })
+            .collect::<Vec<_>>();
+        by_emoji.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.emoji.cmp(&b.emoji)));
         Self {
-            by_emoji: value
-                .by_emoji
-                .into_iter()
-                .map(|(emoji, senders)| TimelineReactionEmojiFfi { emoji, senders })
-                .collect(),
+            by_emoji,
             user_reactions: value.user_reactions.into_iter().map(Into::into).collect(),
         }
     }
@@ -77,6 +91,11 @@ pub struct TimelineReplyPreviewFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub media_json: Option<String>,
+    /// Fully-resolved, downloadable media references for the previewed message,
+    /// built from its `imeta` tags + its own `source_epoch` using the same
+    /// resolution and validation as `list_media`. Empty when the previewed
+    /// message has no media or its `imeta` is malformed.
+    pub media: Vec<MediaAttachmentReferenceFfi>,
     pub agent_text_stream_json: Option<String>,
     pub deleted: bool,
 }
@@ -84,6 +103,7 @@ pub struct TimelineReplyPreviewFfi {
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let media = timeline_media_references_ffi(&value.media, value.source_epoch);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
@@ -91,6 +111,7 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             content_tokens,
             kind: value.kind,
             media_json: value.media.map(|media| media.to_string()),
+            media,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             deleted: value.deleted,
         }
@@ -147,6 +168,13 @@ pub struct TimelineMessageRecordFfi {
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
     pub media_json: Option<String>,
+    /// Fully-resolved, downloadable media references for this message, built
+    /// from its `imeta` tags + its own `source_epoch` using the same resolution
+    /// and validation as `list_media` (a `list_media` record and this row's
+    /// `media` resolve identically for the same message). Empty when the message
+    /// has no media; a malformed `imeta` attachment is dropped while the message
+    /// still appears as text.
+    pub media: Vec<MediaAttachmentReferenceFfi>,
     pub agent_text_stream_json: Option<String>,
     /// Parsed view of kind-1210 group system rows. `None` for chat, reactions,
     /// stream rows, and malformed/free-text kind-1210 assertions.
@@ -165,6 +193,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
     fn from(value: TimelineMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let group_system = group_system_event_from_message(value.kind, &value.plaintext);
+        let media = timeline_media_references_ffi(&value.media, value.source_epoch);
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -180,6 +209,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             reply_to_message_id_hex: value.reply_to_message_id_hex,
             reply_preview: value.reply_preview.map(Into::into),
             media_json: value.media.map(|media| media.to_string()),
+            media,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             group_system: group_system.map(Into::into),
             reactions: value.reactions.into(),
@@ -356,5 +386,146 @@ impl From<RuntimeTimelineMessageUpdate> for TimelineSubscriptionUpdateFfi {
                 update: update.into(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn reaction_summary_ffi_carries_count_and_sorts_by_count_then_emoji() {
+        let summary = TimelineReactionSummary {
+            by_emoji: BTreeMap::from([
+                ("👍".to_owned(), vec!["a".to_owned()]),
+                (
+                    "❤️".to_owned(),
+                    vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+                ),
+                ("😂".to_owned(), vec!["a".to_owned(), "b".to_owned()]),
+                ("🎉".to_owned(), vec!["x".to_owned(), "y".to_owned()]),
+            ]),
+            user_reactions: Vec::new(),
+        };
+
+        let ffi: TimelineReactionSummaryFfi = summary.into();
+
+        // count desc, then emoji asc for the two-way tie (🎉 U+1F389 < 😂 U+1F602).
+        let order: Vec<(&str, u32)> = ffi
+            .by_emoji
+            .iter()
+            .map(|entry| (entry.emoji.as_str(), entry.count))
+            .collect();
+        assert_eq!(order, vec![("❤️", 3), ("🎉", 2), ("😂", 2), ("👍", 1)]);
+        // count mirrors the sender list exactly.
+        assert!(
+            ffi.by_emoji
+                .iter()
+                .all(|entry| entry.count as usize == entry.senders.len())
+        );
+    }
+
+    fn imeta_tag(byte: u8, media_type: &str, file_name: &str) -> Vec<String> {
+        vec![
+            "imeta".to_owned(),
+            "v encrypted-media-v1".to_owned(),
+            format!(
+                "locator blossom-v1 https://media.example/{}.bin",
+                hex::encode([byte; 32])
+            ),
+            format!("ciphertext_sha256 {}", hex::encode([byte; 32])),
+            format!(
+                "plaintext_sha256 {}",
+                hex::encode([byte.wrapping_add(1); 32])
+            ),
+            format!("nonce {}", hex::encode([byte; 12])),
+            format!("m {media_type}"),
+            format!("filename {file_name}"),
+        ]
+    }
+
+    fn imeta_metadata(tags: &[Vec<String>]) -> serde_json::Value {
+        serde_json::json!({ "imeta": tags })
+    }
+
+    fn record_with_media(
+        source_epoch: Option<u64>,
+        media: Option<serde_json::Value>,
+        reply_preview: Option<TimelineReplyPreview>,
+    ) -> TimelineMessageRecord {
+        TimelineMessageRecord {
+            message_id_hex: "msg".to_owned(),
+            source_message_id_hex: None,
+            source_epoch,
+            direction: "received".to_owned(),
+            group_id_hex: "11".repeat(32),
+            sender: "alice".to_owned(),
+            plaintext: "see attached".to_owned(),
+            kind: 9,
+            tags: Vec::new(),
+            timeline_at: 10,
+            received_at: 11,
+            reply_to_message_id_hex: reply_preview.as_ref().map(|p| p.message_id_hex.clone()),
+            reply_preview,
+            media,
+            agent_text_stream: None,
+            reactions: TimelineReactionSummary::default(),
+            deleted: false,
+            deleted_by_message_id_hex: None,
+            invalidation_status: None,
+        }
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_resolves_media_with_source_epoch() {
+        let media = imeta_metadata(&[imeta_tag(0x11, "image/png", "diagram.png")]);
+        let record: TimelineMessageRecordFfi = record_with_media(Some(7), Some(media), None).into();
+
+        assert_eq!(record.media.len(), 1);
+        assert_eq!(record.media[0].file_name, "diagram.png");
+        assert_eq!(record.media[0].source_epoch, 7);
+        // Additive: the raw imeta JSON is still exposed during migration.
+        assert!(record.media_json.is_some());
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_keeps_text_when_imeta_malformed() {
+        let malformed = vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()];
+        let media = imeta_metadata(&[malformed]);
+        let record: TimelineMessageRecordFfi = record_with_media(Some(7), Some(media), None).into();
+
+        assert!(record.media.is_empty());
+        assert_eq!(record.plaintext, "see attached");
+    }
+
+    #[test]
+    fn timeline_message_record_ffi_with_no_media_yields_empty() {
+        let record: TimelineMessageRecordFfi = record_with_media(Some(7), None, None).into();
+        assert!(record.media.is_empty());
+    }
+
+    #[test]
+    fn timeline_reply_preview_ffi_resolves_media_with_its_own_source_epoch() {
+        let preview = TimelineReplyPreview {
+            message_id_hex: "parent".to_owned(),
+            sender: "bob".to_owned(),
+            plaintext: "original".to_owned(),
+            kind: 9,
+            // The previewed (target) message lives in its own epoch, distinct
+            // from the replying message's epoch.
+            source_epoch: Some(3),
+            media: Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")])),
+            agent_text_stream: None,
+            deleted: false,
+        };
+        let record: TimelineMessageRecordFfi =
+            record_with_media(Some(7), None, Some(preview)).into();
+
+        let reply = record.reply_preview.expect("reply preview");
+        assert_eq!(reply.media.len(), 1);
+        assert_eq!(reply.media[0].file_name, "clip.mp4");
+        assert_eq!(reply.media[0].source_epoch, 3);
     }
 }

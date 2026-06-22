@@ -413,6 +413,41 @@ fn reply_preview_is_hydrated_even_when_parent_is_outside_page() {
 }
 
 #[test]
+fn reply_preview_carries_parent_source_epoch_and_media() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut parent = chat("parent", "alice", 1, "look at this");
+    parent.source_epoch = Some(5);
+    parent.tags = vec![vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        "m image/png".to_owned(),
+        "filename diagram.png".to_owned(),
+    ]];
+    store.record_app_event(&parent).unwrap();
+    store
+        .record_app_event(&reply("reply", "bob", "parent", 2, "answer"))
+        .unwrap();
+
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some("11".repeat(32)),
+            pagination: TimelinePagination {
+                limit: Some(1),
+                ..TimelinePagination::default()
+            },
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+
+    let preview = page.messages[0]
+        .reply_preview
+        .as_ref()
+        .expect("reply preview");
+    assert_eq!(preview.source_epoch, Some(5));
+    assert!(preview.media.is_some());
+}
+
+#[test]
 fn record_app_event_returns_projection_shaped_reply_delta() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store

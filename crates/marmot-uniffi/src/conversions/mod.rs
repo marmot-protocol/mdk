@@ -143,6 +143,7 @@ mod tests {
                 sender: "bb".repeat(32),
                 plaintext: "parent text".to_owned(),
                 kind: 9,
+                source_epoch: None,
                 media: None,
                 agent_text_stream: None,
                 deleted: false,
@@ -212,6 +213,7 @@ mod tests {
         );
         assert!(message.group_system.is_none());
         assert_eq!(message.reactions.by_emoji[0].emoji, "+");
+        assert_eq!(message.reactions.by_emoji[0].count, 1);
         assert_eq!(message.reactions.by_emoji[0].senders, vec!["bob"]);
         assert_eq!(
             message.reactions.user_reactions[0].reaction_message_id_hex,
