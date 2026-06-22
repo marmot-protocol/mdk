@@ -706,6 +706,57 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every
+    /// retained artifact in place.
+    ///
+    /// Called when the local member is removed from a group (the inbound
+    /// removal-commit apply paths). It deletes the OpenMLS-owned rows for the
+    /// group — ratchet tree, group context, epoch/message secrets, resumption
+    /// PSKs, own-leaf index/nodes, group state/config, the proposal queue, and
+    /// the current-epoch encryption key pairs — via `MlsGroup::delete`. That is
+    /// enough to stop a later re-add Welcome from failing with
+    /// `GroupAlreadyExists` when OpenMLS stages the fresh join, and to keep
+    /// OpenMLS from stacking the re-join on stale epoch keypairs / message
+    /// secrets / own-leaf index (darkmatter#557).
+    ///
+    /// Crucially it does NOT delete the Marmot `cgka_groups` record, the retained
+    /// anchor snapshots, the stored commit/message history, or the convergence
+    /// policy. Keeping those preserves both the removed member's tombstoned
+    /// read-only view (member list + history remain queryable) and the
+    /// retained-anchor reorg material the canonicalization contract requires:
+    /// a competing valid branch arriving within `max_rewind_commits` can still
+    /// roll back a losing removal branch by restoring a retained snapshot
+    /// (`docs/marmot-architecture/cgka-engine-canonicalization-contract.md`).
+    ///
+    /// Idempotent and tolerant of partially-missing state: a group whose live
+    /// OpenMLS state is already gone (or never materialized) is a no-op. The
+    /// in-memory epoch/leave/convergence bookkeeping is intentionally left
+    /// untouched here; the durable record still describes the (now non-member)
+    /// group, and the bookkeeping is reset when the group is re-joined.
+    ///
+    /// No identifiers are logged (observability.md privacy rule).
+    pub(crate) fn clear_live_openmls_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), EngineError> {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+            &provider,
+        );
+        let loaded = openmls::group::MlsGroup::load(storage, &mls_gid)
+            .map_err(|e| EngineError::Backend(format!("load live group: {e:?}")))?;
+        if let Some(mut mls_group) = loaded {
+            mls_group
+                .delete(storage)
+                .map_err(|e| EngineError::Backend(format!("delete live group: {e:?}")))?;
+        }
+        Ok(())
+    }
+
     fn sent_self_remove_leaving_gate_should_restore(
         &self,
         group_id: &GroupId,

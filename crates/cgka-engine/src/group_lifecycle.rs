@@ -28,7 +28,7 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
-use openmls::group::{MlsGroup, MlsGroupCreateConfig, StagedWelcome};
+use openmls::group::{MlsGroup, MlsGroupCreateConfig};
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
 use openmls::treesync::Node;
 use openmls_traits::types::Ciphersuite;
@@ -400,9 +400,52 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         // 5. Stage + land.
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        //
+        // Use the two-step OpenMLS welcome API so we can read the target group
+        // id and clear stale local OpenMLS state BEFORE the join is staged.
+        // `ProcessedWelcome::new_from_welcome` decrypts the GroupInfo (consuming
+        // the KeyPackage init key material — OpenMLS contract, so it runs
+        // exactly once) and exposes the group id via the unverified group info.
+        // If leftover live OpenMLS state survives for this group id (a re-add
+        // after a prior removal, or state that outlived a missed removal commit
+        // / restart) AND we are not currently an active member, clear ONLY that
+        // live OpenMLS group first: otherwise `into_staged_welcome` fails with
+        // `GroupAlreadyExists`, and even if it didn't the re-join would stack on
+        // stale epoch keypairs / message-secrets / own-leaf index
+        // (darkmatter#557).
+        //
+        // The clear is scoped to the live OpenMLS rows only: it does NOT delete
+        // the Marmot record, retained-anchor snapshots, stored message history,
+        // or convergence policy. Removal itself leaves all of that intact (the
+        // removed member keeps a tombstoned read-only view and the engine keeps
+        // the retained material a late winning branch needs to roll back a
+        // losing removal branch within `max_rewind_commits`); the stale live
+        // group is cleared lazily here, only at the moment a re-add arrives, and
+        // only for the group being re-joined. We never clear a group we are
+        // still an active member of.
         let join_config = join_config(self.max_past_epochs);
-        let staged = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
+        let processed = {
+            let provider =
+                EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+            openmls::group::ProcessedWelcome::new_from_welcome(&provider, &join_config, welcome)
+                .map_err(|e| EngineError::Backend(format!("process welcome: {e:?}")))?
+        };
+        let group_id = GroupId::new(
+            processed
+                .unverified_group_info()
+                .group_id()
+                .as_slice()
+                .to_vec(),
+        );
+        // The first provider borrow has ended; the clear takes `&mut self`. Done
+        // before the staged welcome is built so `into_staged_welcome` does not
+        // hit `GroupAlreadyExists`.
+        if self.local_state_is_stale_for_rejoin(&group_id) {
+            self.clear_live_openmls_group(&group_id)?;
+        }
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let staged = processed
+            .into_staged_welcome(&provider, None)
             .map_err(|e| EngineError::Backend(format!("stage welcome: {e:?}")))?;
         let welcome_sender = staged
             .welcome_sender()
@@ -412,7 +455,10 @@ impl<S: StorageProvider> Engine<S> {
             .into_group(&provider)
             .map_err(|e| EngineError::Backend(format!("into_group: {e:?}")))?;
 
-        let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
+        debug_assert_eq!(
+            group_id,
+            GroupId::new(mls_group.group_id().as_slice().to_vec())
+        );
 
         // 5b. Reject the Welcome if any member leaf carries an invalid Marmot
         // credential identity (foundation/identity.md, joining.md:65). The
@@ -514,6 +560,23 @@ impl<S: StorageProvider> Engine<S> {
 
         self.replay_buffered_messages(&group_id).await?;
         Ok(group_id)
+    }
+
+    /// Whether leftover local state for `group_id` is stale for a fresh join —
+    /// i.e. a Marmot group record exists but the local identity is NOT a member
+    /// of it. True means a re-add Welcome would otherwise restage onto leftover
+    /// state and should tear it down first; false covers both "no local state"
+    /// (a genuine first join) and "we are still an active member" (must NOT be
+    /// torn down). Best-effort: a record that fails to load is treated as not
+    /// stale so the normal join path surfaces any real storage error.
+    fn local_state_is_stale_for_rejoin(&self, group_id: &GroupId) -> bool {
+        match self.storage.get_group(group_id) {
+            Ok(group) => !group
+                .members
+                .iter()
+                .any(|member| &member.id == self.identity.self_id()),
+            Err(_) => false,
+        }
     }
 
     pub(crate) fn do_members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {

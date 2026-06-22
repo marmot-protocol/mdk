@@ -615,6 +615,155 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
     );
 }
 
+/// Regression for darkmatter#557: re-adding a previously removed member to the
+/// SAME group must produce a fresh Welcome the receiver decrypts and acts on,
+/// with no special-casing between "first add" and "re-add after removal".
+///
+/// Before the fix, when B applied the inbound commit that removed B, the engine
+/// merged the staged commit but left B's stale OpenMLS group state in storage.
+/// A later re-add Welcome was staged on top of that corrupt leftover state, so B
+/// never ended up with a usable group — the silent no-op the issue describes.
+/// The fix tears down all local state for a group when WE are removed (and
+/// defensively before a re-join Welcome restages), so the re-add lands as a
+/// clean first-join.
+#[tokio::test]
+async fn readd_after_remove_produces_fresh_welcome_join() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+
+    // 1. Alice creates an alice+bob group; bob joins via the first Welcome.
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "readd".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    bob.drain_events();
+    assert!(
+        bob.members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == bob.self_id()),
+        "bob should be a member after the first join"
+    );
+
+    // 2. Alice removes bob (admin Remove) and publishes the commit.
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (remove_commit, remove_pending) = match remove {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(remove_pending).await.unwrap();
+
+    // Bob ingests his own removal commit and observes that he is removed.
+    let routed_remove = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..remove_commit
+    };
+    let outcome = bob.ingest(routed_remove).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    let bob_remove_events = bob.drain_events();
+    assert!(
+        emits_departure_of(&bob_remove_events, &bob.self_id()),
+        "bob should observe his own removal; got {bob_remove_events:?}"
+    );
+    // After being removed, bob retains a tombstoned local record of the group
+    // (the engine does NOT eagerly destroy local state on removal — retaining
+    // it preserves the convergence artifacts a late winning branch needs to
+    // invalidate a losing removal branch within `max_rewind_commits`). Bob is
+    // no longer listed as a member of his own retained record.
+    let bob_after_remove = bob
+        .members(&group_id)
+        .expect("bob should retain a tombstoned group record after removal");
+    assert!(
+        !bob_after_remove
+            .iter()
+            .any(|member| member.id == bob.self_id()),
+        "bob should no longer be a member of his retained record; got {bob_after_remove:?}"
+    );
+
+    // 3. Alice re-adds bob with a brand-new KeyPackage (never reuse the first).
+    let bob_kp_2 = bob.fresh_key_package().await.unwrap();
+    let readd = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_kp_2],
+        })
+        .await
+        .unwrap();
+    let (readd_pending, re_welcome) = match readd {
+        SendResult::GroupEvolution {
+            mut welcomes,
+            pending,
+            ..
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(readd_pending).await.unwrap();
+
+    // 4. Bob ingests the NEW Welcome and must successfully re-join: emit
+    //    GroupJoined, the group is visible again, and bob is a member. Before
+    //    the fix this was a silent no-op / error on stale leftover state.
+    bob.join_welcome(re_welcome).await.unwrap();
+    let rejoin_events = bob.drain_events();
+    assert!(
+        rejoin_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupJoined { group_id: g, .. } if g == &group_id
+        )),
+        "bob should emit GroupJoined on the re-add Welcome; got {rejoin_events:?}"
+    );
+    let bob_members = bob.members(&group_id).unwrap();
+    assert!(
+        bob_members.iter().any(|member| member.id == bob.self_id()),
+        "bob should be a member again after the re-add; got {bob_members:?}"
+    );
+    assert!(
+        bob_members
+            .iter()
+            .any(|member| member.id == alice.self_id()),
+        "alice should still be in bob's re-joined group; got {bob_members:?}"
+    );
+    assert_eq!(
+        alice.members(&group_id).unwrap().len(),
+        bob_members.len(),
+        "alice and bob should agree on the re-added group's membership"
+    );
+}
+
 #[tokio::test]
 async fn own_leaf_index_reports_mls_index_after_blank_leaf() {
     let mut alice = build_client(b"alice");
@@ -1055,8 +1204,11 @@ async fn selfremove_full_flow_with_auto_commit() {
         "alice should emit a departure for bob after confirm; got {alice_events:?}"
     );
 
-    // Bob ingests alice's commit — bob's epoch advances; he sees himself
-    // removed.
+    // Bob ingests alice's commit — his epoch advances and he sees himself
+    // removed. The engine retains his (tombstoned) local group state on removal
+    // so the convergence artifacts needed to invalidate a losing removal branch
+    // survive (darkmatter#557 keeps re-add working via a lazy teardown at
+    // re-join time, not an eager destroy here).
     let commit = auto.msg;
     let routed = TransportMessage {
         envelope: TransportEnvelope::GroupMessage {
