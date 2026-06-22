@@ -561,6 +561,33 @@ fn app_messages_tie_break_on_message_id_matches_cursor_order() {
 }
 
 #[test]
+fn notification_settings_default_local_notifications_on() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let account_id_hex = "aa".repeat(32);
+
+    let settings = store
+        .notification_settings("alice", &account_id_hex)
+        .unwrap();
+
+    assert_eq!(settings.account_label, "alice");
+    assert_eq!(settings.account_id_hex, account_id_hex);
+    assert!(settings.local_notifications_enabled);
+    assert!(!settings.native_push_enabled);
+
+    store
+        .set_local_notifications_enabled("alice", &account_id_hex, false)
+        .unwrap();
+    let rotated_account_id_hex = "bb".repeat(32);
+    let settings = store
+        .notification_settings("alice", &rotated_account_id_hex)
+        .unwrap();
+
+    assert_eq!(settings.account_id_hex, rotated_account_id_hex);
+    assert!(!settings.local_notifications_enabled);
+    assert!(!settings.native_push_enabled);
+}
+
+#[test]
 fn push_registration_preserves_created_at_when_token_rotates() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let registration = AccountPushRegistration {

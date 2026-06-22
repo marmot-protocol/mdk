@@ -98,7 +98,7 @@ impl LegacyAccountProjectionDb {
             CREATE TABLE IF NOT EXISTS notification_settings (
                 account_label TEXT PRIMARY KEY NOT NULL,
                 account_id_hex TEXT NOT NULL,
-                local_notifications_enabled INTEGER NOT NULL DEFAULT 0,
+                local_notifications_enabled INTEGER NOT NULL DEFAULT 1,
                 native_push_enabled INTEGER NOT NULL DEFAULT 0,
                 updated_at_ms INTEGER NOT NULL
             );
@@ -687,7 +687,7 @@ impl LegacyAccountProjectionDb {
                 account_label, account_id_hex, local_notifications_enabled,
                 native_push_enabled, updated_at_ms
              )
-             VALUES (?1, ?2, 0, 0, ?3)
+             VALUES (?1, ?2, 1, 0, ?3)
              ON CONFLICT(account_label) DO UPDATE SET
                 account_id_hex = excluded.account_id_hex",
             params![account_label, account_id_hex, unix_now_ms()],

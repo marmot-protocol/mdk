@@ -754,6 +754,21 @@ fn avatar_url_round_trips_through_account_projection() {
 }
 
 #[test]
+fn notification_settings_default_local_notifications_on_for_new_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    let settings = app.notification_settings("alice").unwrap();
+
+    assert_eq!(settings.account_ref, "alice");
+    assert_eq!(settings.account_id_hex, account.account_id_hex);
+    assert!(settings.local_notifications_enabled);
+    assert!(!settings.native_push_enabled);
+}
+
+#[test]
 fn legacy_account_projection_imports_once_into_account_storage() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -809,6 +824,9 @@ fn legacy_account_projection_imports_once_into_account_storage() {
         .set_native_push_enabled("alice", &account.account_id_hex, true)
         .unwrap();
     legacy
+        .set_local_notifications_enabled("alice", &account.account_id_hex, false)
+        .unwrap();
+    legacy
         .upsert_push_registration(
             PushRegistration {
                 account_ref: "alice".to_owned(),
@@ -845,6 +863,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].plaintext, "from legacy");
     let settings = app.notification_settings("alice").unwrap();
+    assert!(!settings.local_notifications_enabled);
     assert!(settings.native_push_enabled);
     assert!(app.push_registration("alice").unwrap().is_some());
     assert_eq!(app.group_push_tokens("alice", "aa").unwrap().len(), 1);

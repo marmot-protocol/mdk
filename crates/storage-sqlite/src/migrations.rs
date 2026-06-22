@@ -30,6 +30,8 @@ mod migration_0014_message_timeline_reply_lookup_index;
 mod migration_0015_member_validation_cache;
 #[path = "migrations/0016_leave_requests.rs"]
 mod migration_0016_leave_requests;
+#[path = "migrations/0017_notification_settings_default_on.rs"]
+mod migration_0017_notification_settings_default_on;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -121,6 +123,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 16,
         name: "0016_leave_requests",
         apply: migration_0016_leave_requests::apply,
+    },
+    Migration {
+        version: 17,
+        name: "0017_notification_settings_default_on",
+        apply: migration_0017_notification_settings_default_on::apply,
     },
 ];
 
@@ -336,6 +343,92 @@ mod tests {
             "message_timeline",
             "idx_message_timeline_reply_lookup"
         ));
+    }
+
+    #[test]
+    fn notification_settings_default_migration_preserves_existing_choices() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // Versions 1-16 are the schema state immediately before
+        // 0017_notification_settings_default_on.
+        run(&mut conn, &MIGRATIONS[..16]).unwrap();
+        assert_eq!(
+            column_default(
+                &conn,
+                "notification_settings",
+                "local_notifications_enabled"
+            )
+            .as_deref(),
+            Some("0")
+        );
+        conn.execute(
+            "INSERT INTO notification_settings (
+                account_label, account_id_hex, native_push_enabled, updated_at_ms
+             )
+             VALUES ('legacy-default', 'aa', 0, 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notification_settings (
+                account_label, account_id_hex, local_notifications_enabled,
+                native_push_enabled, updated_at_ms
+             )
+             VALUES ('explicit-on', 'bb', 1, 0, 11)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert_eq!(
+            column_default(
+                &conn,
+                "notification_settings",
+                "local_notifications_enabled"
+            )
+            .as_deref(),
+            Some("1")
+        );
+        let preserved_disabled: i64 = conn
+            .query_row(
+                "SELECT local_notifications_enabled
+                 FROM notification_settings
+                 WHERE account_label = 'legacy-default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_disabled, 0);
+        let preserved_enabled: i64 = conn
+            .query_row(
+                "SELECT local_notifications_enabled
+                 FROM notification_settings
+                 WHERE account_label = 'explicit-on'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_enabled, 1);
+
+        conn.execute(
+            "INSERT INTO notification_settings (
+                account_label, account_id_hex, native_push_enabled, updated_at_ms
+             )
+             VALUES ('new-default', 'cc', 0, 12)",
+            [],
+        )
+        .unwrap();
+        let new_default: i64 = conn
+            .query_row(
+                "SELECT local_notifications_enabled
+                 FROM notification_settings
+                 WHERE account_label = 'new-default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_default, 1);
     }
 
     #[test]
@@ -678,6 +771,21 @@ mod tests {
         stmt.query_map([], |row| row.get::<_, String>("name"))
             .unwrap()
             .any(|name| name.as_deref() == Ok(column))
+    }
+
+    fn column_default(conn: &rusqlite::Connection, table: &str, column: &str) -> Option<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>("name")?,
+                row.get::<_, Option<String>>("dflt_value")?,
+            ))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .find_map(|(name, default)| if name == column { default } else { None })
     }
 
     fn connection_has_index(conn: &rusqlite::Connection, table: &str, index: &str) -> bool {

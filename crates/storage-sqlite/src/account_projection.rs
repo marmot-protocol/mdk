@@ -775,7 +775,7 @@ impl SqliteAccountStorage {
                     account_label, account_id_hex, local_notifications_enabled,
                     native_push_enabled, updated_at_ms
                  )
-                 VALUES (?1, ?2, 0, 0, ?3)
+                 VALUES (?1, ?2, 1, 0, ?3)
                  ON CONFLICT(account_label) DO UPDATE SET
                     account_id_hex = excluded.account_id_hex",
                 params![account_label, account_id_hex, unix_now_ms()],
