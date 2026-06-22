@@ -24,6 +24,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/inbound-runtime.ts` — `registerFull` wiring + the inbound→agent dispatch seam.
 - `src/bounded-keyed-async-queue.ts` — per-group inbound dispatch with a depth cap.
 - `src/outbound.ts` — `defineChannelMessageAdapter` durable send → `send_final`.
+- `src/messaging.ts` — `messaging` target-resolution adapter so the shared `message` tool can resolve a Marmot conversation (group id hex).
 - `src/config.ts` — channel config schema + `MARMOT_*` resolution.
 - `src/account.ts` — single agent-account resolution (`account_list`).
 - `src/security.ts` — OpenClaw `dm.allowFrom` → `dm-agent` welcomer allowlist sync.

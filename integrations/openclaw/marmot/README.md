@@ -146,6 +146,16 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   key returns the original message ids without a second send, so a retry after a
   post-write timeout cannot double-post an unrecallable encrypted message.
   (Follow-up: `stream_finalize` is not yet idempotent.)
+- **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
+  delivered automatically from the assistant's final text, so the agent does not
+  need the shared `message` tool to answer. When it *does* call
+  `message(action:"send", to:…)`, the target is a Marmot conversation — always an
+  MLS **group** id hex (a DM is a two-member group), optionally prefixed
+  `marmot:`. The channel's `messaging` adapter exposes `targetResolver.looksLikeId`
+  + `resolveTarget` + `inferTargetChatType` (always `group`) so core resolves a
+  group id as a first-class target (Marmot has no directory to search). Without
+  it the generic resolver rejected a Marmot group id with an "unknown target"
+  error before the durable send could run.
 - **Message deletion**: the control client can retract a prior message via
   `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
   kind-5 deletions from other members surface as a `message_deleted` event,

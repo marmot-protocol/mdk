@@ -29,6 +29,7 @@ import {
   type MarmotChannelAccountConfig,
   type ResolvedMarmotAccount,
 } from "./config.js";
+import { createMarmotMessagingAdapter } from "./messaging.js";
 import { createMarmotMessageAdapter } from "./outbound.js";
 import {
   DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID,
@@ -233,6 +234,19 @@ export function createMarmotChannelPlugin() {
           accountSnapshot(account, runtime, probe),
       },
       message: messageAdapter,
+      // Target resolution for the shared `message` tool: lets an agent-driven
+      // send resolve a Marmot conversation (an MLS group id hex) instead of
+      // erroring on an "unknown target" before the durable send runs.
+      messaging: createMarmotMessagingAdapter(),
+      // Steer the model away from guessing a `message`-tool target: a Marmot
+      // reply is delivered automatically from the assistant's final text, and a
+      // Marmot conversation is addressed by its group id hex (no @handles).
+      agentPrompt: {
+        messageToolHints: () => [
+          "- Marmot replies: to answer the current conversation, just write your reply as normal assistant text — it is delivered to the Marmot group automatically. You do not need the `message` tool to reply.",
+          "- Marmot `message` targets: a Marmot conversation is addressed by its group id hex (optionally prefixed `marmot:`). There are no @handles or #channels.",
+        ],
+      },
       actions,
     },
     security: {
