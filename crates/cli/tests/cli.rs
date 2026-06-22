@@ -4123,9 +4123,11 @@ fn whitenoise_groups_commands_cover_core_group_workflows() {
 #[test]
 fn groups_leave_publishes_self_remove() {
     let home = tempfile::tempdir().expect("tempdir");
+    let relay = TestRelay::new();
+    let relay_url = relay.url();
 
-    let alice = create_account(home.path());
-    let bob = create_account(home.path());
+    let alice = create_account_with_real_relay(home.path(), relay_url);
+    let bob = create_account_with_real_relay(home.path(), relay_url);
     run_json(home.path(), &["--account", &bob, "keys", "publish"]);
 
     let created = run_json(
@@ -4133,7 +4135,7 @@ fn groups_leave_publishes_self_remove() {
         &["--account", &alice, "groups", "create", "departures", &bob],
     );
     let group_id = created["group_id"].as_str().expect("group id");
-    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+    sync_until_joined(home.path(), relay_url, &bob, group_id);
 
     let leave = run_json(
         home.path(),
@@ -4143,8 +4145,7 @@ fn groups_leave_publishes_self_remove() {
     assert_eq!(leave["published"], 1);
     run_json(home.path(), &["--account", &bob, "sync"]);
 
-    let alice_members =
-        sync_until_member_removed(home.path(), test_relay_url(), &alice, group_id, &bob);
+    let alice_members = sync_until_member_removed(home.path(), relay_url, &alice, group_id, &bob);
     assert!(!member_accounts(&alice_members).contains(&bob));
 }
 
