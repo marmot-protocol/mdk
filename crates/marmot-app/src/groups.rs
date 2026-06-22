@@ -818,25 +818,11 @@ pub(crate) fn decode_received_event(
         );
         return None;
     }
-    // The inner app event MUST NOT carry transport routing tags. For the Nostr
-    // binding these are h (group routing id), p (recipient), relays (relay hints),
-    // and expiration (NIP-40); they belong on the outer envelope only. See
-    // spec/protocol-core/group-messaging.md ("App payloads") and
-    // spec/foundation/application-messages.md ("Encoding"). Application-content
-    // tags (e, imeta, system, stream-*) are not routing tags and are allowed.
-    if event.tags.iter().any(|tag| {
-        matches!(
-            tag.first().map(String::as_str),
-            Some("h" | "p" | "relays" | "expiration")
-        )
-    }) {
-        tracing::warn!(
-            target: "marmot_app::ingest",
-            method = "decode_received_event",
-            "rejecting MLS application message: inner app event carries a transport routing tag",
-        );
-        return None;
-    }
+    // The decoder does not police inner tag names — they are opaque application
+    // content (e.g. a `p` reaction/mention target or an `e` reference). Routing
+    // lives only on the transport's outer envelope, built from group state, never
+    // from inner tags; the media check below is structural validation, not tag
+    // policing. See spec/protocol-core/group-messaging.md ("App payloads").
     if event.kind == MARMOT_APP_EVENT_KIND_CHAT
         && event
             .tags
@@ -1284,7 +1270,7 @@ mod confirmation_state_tests {
 }
 
 #[cfg(test)]
-mod routing_tag_tests {
+mod inner_tag_tests {
     use super::*;
 
     fn decode_with_tags(tags: Vec<Vec<String>>) -> Option<ReceivedMessage> {
@@ -1304,20 +1290,34 @@ mod routing_tag_tests {
         )
     }
 
+    // `h`/`p`/`relays`/`expiration` were the old "transport routing tag" denylist;
+    // on the inner event they are application content and must pass through.
     #[test]
-    fn inner_event_with_transport_routing_tag_is_rejected() {
-        for name in ["h", "p", "relays", "expiration"] {
+    fn inner_tags_are_not_policed() {
+        for name in ["h", "p", "relays", "expiration", "e", "k"] {
             assert!(
-                decode_with_tags(vec![vec![name.to_string(), "x".to_string()]]).is_none(),
-                "inner transport routing tag {name} must be rejected"
+                decode_with_tags(vec![vec![name.to_string(), "ab".repeat(32)]]).is_some(),
+                "inner tag {name} must pass through as application content"
             );
         }
     }
 
+    // Accepted tags reach the app projection intact (e.g. a NIP-25 reaction's `e`
+    // target and `p` author), not just survive decode.
     #[test]
-    fn inner_event_with_application_tag_is_accepted() {
-        // `e` (reply/edit target) is application content, not a routing tag.
-        assert!(decode_with_tags(vec![vec!["e".to_string(), "ab".repeat(32)]]).is_some());
+    fn decoded_event_preserves_tags() {
+        let message = decode_with_tags(vec![
+            vec!["p".to_string(), "ab".repeat(32)],
+            vec!["e".to_string(), "cd".repeat(32)],
+        ])
+        .expect("event with inner tags is accepted");
+        assert_eq!(
+            message.tags,
+            vec![
+                vec!["p".to_string(), "ab".repeat(32)],
+                vec!["e".to_string(), "cd".repeat(32)],
+            ]
+        );
     }
 }
 
