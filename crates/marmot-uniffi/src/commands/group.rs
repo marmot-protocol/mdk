@@ -315,6 +315,24 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Set the per-group disappearing-message retention, wrapping the engine's
+    /// `update_message_retention`. `disappearing_message_secs` of `0` disables
+    /// expiry; any positive value is the retention window in seconds. Thin
+    /// passthrough over the already-public engine API (darkmatter#571).
+    pub async fn update_message_retention(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        disappearing_message_secs: u64,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .update_message_retention(&account_ref, &group_id, disappearing_message_secs)
+            .await?;
+        Ok(summary.into())
+    }
+
     pub async fn accept_group_invite(
         &self,
         account_ref: String,

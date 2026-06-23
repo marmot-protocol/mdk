@@ -71,6 +71,7 @@ mod tests {
                     base_url: "https://blossom.primal.net".into(),
                 }],
             },
+            disappearing_message_secs: 0,
             archived: false,
             pending_confirmation: false,
             welcomer_account_id_hex: None,

@@ -27,6 +27,9 @@ pub struct AppGroupRecordFfi {
     pub avatar_dim: Option<String>,
     pub avatar_thumbhash: Option<String>,
     pub encrypted_media: AppGroupEncryptedMediaComponentFfi,
+    /// Per-group disappearing-message retention in seconds
+    /// (`marmot.group.message-retention.v1`). `0` means messages never expire.
+    pub disappearing_message_secs: u64,
     pub archived: bool,
     pub pending_confirmation: bool,
     pub welcomer_account_id_hex: Option<String>,
@@ -45,6 +48,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             ..
         } = value.nostr_routing;
         let avatar = value.avatar_url;
+        let disappearing_message_secs = value.message_retention.disappearing_message_secs;
         Self {
             group_id_hex: value.group_id_hex,
             endpoint: value.endpoint,
@@ -57,6 +61,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             avatar_dim: avatar.dim,
             avatar_thumbhash: avatar.thumbhash,
             encrypted_media: value.encrypted_media.into(),
+            disappearing_message_secs,
             archived: value.archived,
             pending_confirmation: value.pending_confirmation,
             welcomer_account_id_hex: value.welcomer_account_id_hex,
