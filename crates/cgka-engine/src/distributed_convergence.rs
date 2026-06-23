@@ -18,9 +18,9 @@ use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 
-/// Admin pubkeys + avatar component bytes snapshotted on either side of a
-/// convergence apply, for the unattributed group-state-change diffs.
-type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2]);
+/// Admin pubkeys, avatar component bytes, and message retention snapshotted on
+/// either side of a convergence apply, for unattributed group-state-change diffs.
+type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>);
 
 impl<S: StorageProvider> Engine<S> {
     pub fn set_convergence_policy(&mut self, policy: CanonicalizationPolicy) {
@@ -254,6 +254,9 @@ impl<S: StorageProvider> Engine<S> {
             &result,
             max_retained_anchor_rewind,
         )?;
+        let origin_commit_id = single_accepted_commit_id(&result);
+        let origin_commit_actor =
+            single_accepted_commit_actor(&observations, origin_commit_id.as_ref());
 
         if let Some(selected_tip) = result.selected_tip {
             let selected_tip = EpochId(selected_tip);
@@ -284,7 +287,8 @@ impl<S: StorageProvider> Engine<S> {
                 previous_components,
                 previous_tip,
                 selected_tip,
-                single_accepted_commit_id(&result),
+                origin_commit_id,
+                origin_commit_actor,
             )?;
         }
         self.emit_application_replay_events(group_id, &observations);
@@ -295,10 +299,11 @@ impl<S: StorageProvider> Engine<S> {
         Ok(result)
     }
 
-    /// Best-effort load of the live MlsGroup's admin set + avatar component
-    /// bytes for before/after diffing around a convergence apply. `None` when
-    /// the MLS state isn't materialized; the caller skips those diffs rather
-    /// than failing convergence over a missing caption.
+    /// Best-effort load of the live MlsGroup's admin set, avatar component
+    /// bytes, and message-retention seconds for before/after diffing around a
+    /// convergence apply. `None` when the MLS state isn't materialized; the
+    /// caller skips those diffs rather than failing convergence over missing
+    /// presentation components.
     fn reorg_component_snapshot(&self, group_id: &GroupId) -> Option<ReorgComponentSnapshot> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
@@ -314,9 +319,14 @@ impl<S: StorageProvider> Engine<S> {
         .ok()
         .flatten()?;
         let admins = crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
+        let message_retention =
+            crate::app_components::message_retention_seconds_of_group(&mls_group)
+                .ok()
+                .flatten();
         Some((
             admins,
             crate::message_processor::avatar_component_snapshot(&mls_group),
+            message_retention,
         ))
     }
 
@@ -330,6 +340,7 @@ impl<S: StorageProvider> Engine<S> {
         previous_tip: EpochId,
         selected_tip: EpochId,
         origin_commit_id: Option<MessageId>,
+        origin_commit_actor: Option<MemberId>,
     ) -> Result<(), OpenMlsProjectionError> {
         if previous_tip != selected_tip {
             self.events_buf.push_back(GroupEvent::EpochChanged {
@@ -343,18 +354,21 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // `origin_commit_id` is `Some` only when this convergence pass applied a
-        // single accepted commit, so the entire previous-tip → selected-tip diff
-        // is attributable to it; the rows it synthesizes carry that commit id so
-        // they can be tombstoned together if it later loses a fork (see
-        // `single_accepted_commit_id` + `emit_rolled_back_commits`). When several
-        // commits were applied in one pass the delta cannot be split per-commit,
-        // so we fall back to `None` (unattributed) as before. The previous-tip →
-        // selected-tip diff is net of commits the direct seam already applied
-        // (their effects are part of the "previous" snapshot), so changes already
-        // emitted attributed there do not re-emit here as duplicates.
-        if let (Some((before_admins, before_avatar)), Some((after_admins, after_avatar))) =
-            (previous_components, self.reorg_component_snapshot(group_id))
+        // `origin_commit_id` is populated only when this convergence pass applied
+        // a single accepted commit, so the entire previous-tip → selected-tip
+        // component diff can be tombstoned with that commit if it later loses a
+        // fork (see `single_accepted_commit_id` + `emit_rolled_back_commits`).
+        // Message-retention rows also use `origin_commit_actor` in that same
+        // single-commit case so peers render the actor that changed the timer.
+        // When several commits were applied in one pass the delta cannot be
+        // split per-commit, so rows fall back to no origin commit and no actor.
+        // The previous-tip → selected-tip diff is net of commits the direct seam
+        // already applied (their effects are part of the "previous" snapshot),
+        // so changes already emitted there do not re-emit here as duplicates.
+        if let (
+            Some((before_admins, before_avatar, before_message_retention)),
+            Some((after_admins, after_avatar, after_message_retention)),
+        ) = (previous_components, self.reorg_component_snapshot(group_id))
         {
             for change in crate::group_state_changes::admin_changes(&before_admins, &after_admins) {
                 self.push_group_state_change(
@@ -375,6 +389,18 @@ impl<S: StorageProvider> Engine<S> {
                     group_id,
                     selected_tip,
                     None,
+                    change,
+                    origin_commit_id.clone(),
+                );
+            }
+            for change in crate::group_state_changes::message_retention_changes(
+                before_message_retention,
+                after_message_retention,
+            ) {
+                self.push_group_state_change(
+                    group_id,
+                    selected_tip,
+                    origin_commit_actor.clone(),
                     change,
                     origin_commit_id.clone(),
                 );
@@ -574,14 +600,29 @@ impl<S: StorageProvider> Engine<S> {
 /// concrete origin commit when exactly one commit was accepted this pass — then
 /// the entire previous-tip → selected-tip diff is that commit's effect. With
 /// multiple accepted commits the per-commit attribution is ambiguous (the diff
-/// is their combined effect), so the rows stay unattributed (`None`) and are
-/// re-synthesized fresh from the winning branch on a later convergence pass,
-/// matching the pre-existing behavior.
+/// is their combined effect), so the rows use no origin commit and no actor.
 fn single_accepted_commit_id(result: &CanonicalizationResult) -> Option<MessageId> {
     let [only_commit] = result.accepted_commits.as_slice() else {
         return None;
     };
     hex::decode(only_commit).ok().map(MessageId::new)
+}
+
+fn single_accepted_commit_actor(
+    observations: &[OpenMlsReplayObservation],
+    origin_commit_id: Option<&MessageId>,
+) -> Option<MemberId> {
+    let origin_commit_hex = hex::encode(origin_commit_id?.as_slice());
+    observations
+        .iter()
+        .find_map(|observation| match observation {
+            OpenMlsReplayObservation::CommitStaged {
+                message_id,
+                committer,
+                ..
+            } if message_id == &origin_commit_hex => Some(MemberId::new(committer.clone())),
+            _ => None,
+        })
 }
 
 /// Result returned for a group already in `Unrecoverable`: no canonical

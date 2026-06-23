@@ -62,6 +62,24 @@ pub(crate) fn profile_changes(
     changes
 }
 
+/// Disappearing-message retention changes between two snapshots. `None` and
+/// `Some(0)` are both normalized to disabled (`0`) before comparing so missing
+/// legacy component bytes and an explicit off value do not synthesize a row.
+pub(crate) fn message_retention_changes(
+    before: Option<u64>,
+    after: Option<u64>,
+) -> Vec<GroupStateChange> {
+    let old_seconds = before.unwrap_or(0);
+    let new_seconds = after.unwrap_or(0);
+    if old_seconds == new_seconds {
+        return Vec::new();
+    }
+    vec![GroupStateChange::MessageRetentionChanged {
+        old_seconds,
+        new_seconds,
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +134,32 @@ mod tests {
     #[test]
     fn profile_changes_empty_when_unchanged() {
         assert!(profile_changes(Some("x"), Some("x"), &[None], &[None]).is_empty());
+    }
+
+    #[test]
+    fn message_retention_changes_report_old_and_new_seconds() {
+        assert_eq!(
+            message_retention_changes(None, Some(60)),
+            vec![GroupStateChange::MessageRetentionChanged {
+                old_seconds: 0,
+                new_seconds: 60,
+            }]
+        );
+        assert_eq!(
+            message_retention_changes(Some(60), None),
+            vec![GroupStateChange::MessageRetentionChanged {
+                old_seconds: 60,
+                new_seconds: 0,
+            }]
+        );
+        assert_eq!(
+            message_retention_changes(Some(60), Some(120)),
+            vec![GroupStateChange::MessageRetentionChanged {
+                old_seconds: 60,
+                new_seconds: 120,
+            }]
+        );
+        assert!(message_retention_changes(None, None).is_empty());
+        assert!(message_retention_changes(Some(60), Some(60)).is_empty());
     }
 }

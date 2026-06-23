@@ -6,7 +6,8 @@ use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
     AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID,
 };
 use cgka_traits::engine::{GroupStateChange, SendResult};
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -138,6 +139,21 @@ impl<S: StorageProvider> Engine<S> {
                             change: GroupStateChange::GroupRenamed {
                                 name: after_name.to_owned(),
                             },
+                        });
+                    }
+                }
+                GROUP_MESSAGE_RETENTION_COMPONENT_ID => {
+                    let before =
+                        crate::app_components::message_retention_seconds_of_group(&mls_group)?;
+                    let after_seconds =
+                        crate::app_components::decode_message_retention(&update.data)?;
+                    let after = (after_seconds != 0).then_some(after_seconds);
+                    for change in
+                        crate::group_state_changes::message_retention_changes(before, after)
+                    {
+                        staged_changes.push(crate::engine::PendingGroupStateChange {
+                            actor: self_actor.clone(),
+                            change,
                         });
                     }
                 }

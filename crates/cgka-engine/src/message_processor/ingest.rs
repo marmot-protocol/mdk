@@ -658,6 +658,8 @@ impl<S: StorageProvider> Engine<S> {
                         .ok()
                         .flatten();
                     let before_avatar = avatar_component_snapshot(&mls_group);
+                    let before_message_retention =
+                        crate::app_components::message_retention_seconds_of_group(&mls_group)?;
                     self.retain_current_epoch_snapshot_for_group(&group_id)?;
                     // Extract capabilities from Add proposals before the
                     // staged commit is consumed by merge.
@@ -684,6 +686,8 @@ impl<S: StorageProvider> Engine<S> {
                         .ok()
                         .flatten();
                     let after_avatar = avatar_component_snapshot(&mls_group);
+                    let after_message_retention =
+                        crate::app_components::message_retention_seconds_of_group(&mls_group)?;
                     let after_ids: std::collections::HashSet<MemberId> =
                         after_members.iter().map(|m| m.id.clone()).collect();
                     let removed: Vec<MemberId> = before_members
@@ -821,6 +825,18 @@ impl<S: StorageProvider> Engine<S> {
                         after_profile.as_ref().map(|(name, _)| name.as_str()),
                         &before_avatar,
                         &after_avatar,
+                    ) {
+                        self.push_group_state_change(
+                            &group_id,
+                            after,
+                            sender_id.clone(),
+                            change,
+                            origin_commit_id.clone(),
+                        );
+                    }
+                    for change in crate::group_state_changes::message_retention_changes(
+                        before_message_retention,
+                        after_message_retention,
                     ) {
                         self.push_group_state_change(
                             &group_id,

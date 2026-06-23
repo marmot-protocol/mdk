@@ -54,6 +54,9 @@ pub const GROUP_SYSTEM_TYPE_ADMIN_ADDED: &str = "admin_added";
 pub const GROUP_SYSTEM_TYPE_ADMIN_REMOVED: &str = "admin_removed";
 pub const GROUP_SYSTEM_TYPE_GROUP_RENAMED: &str = "group_renamed";
 pub const GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED: &str = "group_avatar_changed";
+/// Product-facing system row for the `marmot.group.message-retention.v1` app
+/// component changing (the app calls this the disappearing-message timer).
+pub const GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED: &str = "disappearing_timer_changed";
 
 /// Human-readable fallback `text` for kind-1210 group system rows. These strings
 /// feed `content` → `id_preimage` → `canonical_event_id`, so they must stay in
@@ -65,13 +68,16 @@ pub const GROUP_SYSTEM_TEXT_ADMIN_ADDED: &str = "Admin added";
 pub const GROUP_SYSTEM_TEXT_ADMIN_REMOVED: &str = "Admin removed";
 pub const GROUP_SYSTEM_TEXT_GROUP_RENAMED: &str = "Group renamed";
 pub const GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED: &str = "Group avatar changed";
+pub const GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED: &str = "Disappearing timer changed";
 
-/// Keys inside the kind-1210 `data` object. Values are lowercase-hex pubkeys
-/// (`actor`/`subject`) or a UTF-8 string (`name`), so renderers can resolve
-/// display names locally and localize the row.
+/// Keys inside the kind-1210 `data` object. `actor`/`subject` are lowercase-hex
+/// pubkeys, `name` is UTF-8, and retention values are seconds where `0` means
+/// disabled. Renderers can resolve display names locally and localize the row.
 pub const GROUP_SYSTEM_DATA_ACTOR: &str = "actor";
 pub const GROUP_SYSTEM_DATA_SUBJECT: &str = "subject";
 pub const GROUP_SYSTEM_DATA_NAME: &str = "name";
+pub const GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS: &str = "old_retention_seconds";
+pub const GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS: &str = "new_retention_seconds";
 
 pub const STREAM_TAG: &str = "stream";
 pub const STREAM_TYPE_TAG: &str = "stream-type";
@@ -266,6 +272,11 @@ impl GroupSystemEvent {
     pub fn data_str(&self, key: &str) -> Option<&str> {
         self.data.as_ref()?.get(key).and_then(Value::as_str)
     }
+
+    /// Read an unsigned integer field out of `data`.
+    pub fn data_u64(&self, key: &str) -> Option<u64> {
+        self.data.as_ref()?.get(key).and_then(Value::as_u64)
+    }
 }
 
 /// Material for a locally synthesized kind-1210 group system row: deterministic
@@ -279,52 +290,84 @@ pub struct GroupSystemEventMaterial {
     pub tags: Vec<Vec<String>>,
 }
 
-fn group_system_projection_parts(
-    change: &GroupStateChange,
-) -> (&'static str, Option<&MemberId>, Option<&str>, &'static str) {
+struct GroupSystemProjectionParts<'a> {
+    system_type: &'static str,
+    subject: Option<&'a MemberId>,
+    name: Option<&'a str>,
+    old_retention_seconds: Option<u64>,
+    new_retention_seconds: Option<u64>,
+    text: &'static str,
+}
+
+fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjectionParts<'_> {
     match change {
-        GroupStateChange::MemberAdded { member } => (
-            GROUP_SYSTEM_TYPE_MEMBER_ADDED,
-            Some(member),
-            None,
-            GROUP_SYSTEM_TEXT_MEMBER_ADDED,
-        ),
-        GroupStateChange::MemberRemoved { member } => (
-            GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
-            Some(member),
-            None,
-            GROUP_SYSTEM_TEXT_MEMBER_REMOVED,
-        ),
-        GroupStateChange::MemberLeft { member } => (
-            GROUP_SYSTEM_TYPE_MEMBER_LEFT,
-            Some(member),
-            None,
-            GROUP_SYSTEM_TEXT_MEMBER_LEFT,
-        ),
-        GroupStateChange::AdminAdded { member } => (
-            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-            Some(member),
-            None,
-            GROUP_SYSTEM_TEXT_ADMIN_ADDED,
-        ),
-        GroupStateChange::AdminRemoved { member } => (
-            GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
-            Some(member),
-            None,
-            GROUP_SYSTEM_TEXT_ADMIN_REMOVED,
-        ),
-        GroupStateChange::GroupRenamed { name } => (
-            GROUP_SYSTEM_TYPE_GROUP_RENAMED,
-            None,
-            Some(name.as_str()),
-            GROUP_SYSTEM_TEXT_GROUP_RENAMED,
-        ),
-        GroupStateChange::GroupAvatarChanged => (
-            GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
-            None,
-            None,
-            GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED,
-        ),
+        GroupStateChange::MemberAdded { member } => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_MEMBER_ADDED,
+            subject: Some(member),
+            name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_MEMBER_ADDED,
+        },
+        GroupStateChange::MemberRemoved { member } => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
+            subject: Some(member),
+            name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_MEMBER_REMOVED,
+        },
+        GroupStateChange::MemberLeft { member } => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_MEMBER_LEFT,
+            subject: Some(member),
+            name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_MEMBER_LEFT,
+        },
+        GroupStateChange::AdminAdded { member } => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+            subject: Some(member),
+            name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_ADMIN_ADDED,
+        },
+        GroupStateChange::AdminRemoved { member } => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+            subject: Some(member),
+            name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_ADMIN_REMOVED,
+        },
+        GroupStateChange::GroupRenamed { name } => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+            subject: None,
+            name: Some(name.as_str()),
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_GROUP_RENAMED,
+        },
+        GroupStateChange::GroupAvatarChanged => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
+            subject: None,
+            name: None,
+            old_retention_seconds: None,
+            new_retention_seconds: None,
+            text: GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED,
+        },
+        GroupStateChange::MessageRetentionChanged {
+            old_seconds,
+            new_seconds,
+        } => GroupSystemProjectionParts {
+            system_type: GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED,
+            subject: None,
+            name: None,
+            old_retention_seconds: Some(*old_seconds),
+            new_retention_seconds: Some(*new_seconds),
+            text: GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED,
+        },
     }
 }
 
@@ -338,7 +381,8 @@ pub fn group_system_event_material(
     actor: Option<&MemberId>,
     change: &GroupStateChange,
 ) -> Result<GroupSystemEventMaterial, MarmotAppEventError> {
-    let (system_type, subject, name, text) = group_system_projection_parts(change);
+    let parts = group_system_projection_parts(change);
+    let system_type = parts.system_type;
     let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
     let mut data = serde_json::Map::new();
     if let Some(actor_hex) = actor_hex.as_ref() {
@@ -347,20 +391,32 @@ pub fn group_system_event_material(
             Value::String(actor_hex.clone()),
         );
     }
-    if let Some(subject) = subject {
+    if let Some(subject) = parts.subject {
         data.insert(
             GROUP_SYSTEM_DATA_SUBJECT.to_owned(),
             Value::String(hex::encode(subject.as_slice())),
         );
     }
-    if let Some(name) = name {
+    if let Some(name) = parts.name {
         data.insert(
             GROUP_SYSTEM_DATA_NAME.to_owned(),
             Value::String(name.to_owned()),
         );
     }
+    if let Some(old_seconds) = parts.old_retention_seconds {
+        data.insert(
+            GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS.to_owned(),
+            Value::from(old_seconds),
+        );
+    }
+    if let Some(new_seconds) = parts.new_retention_seconds {
+        data.insert(
+            GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS.to_owned(),
+            Value::from(new_seconds),
+        );
+    }
     let data = (!data.is_empty()).then_some(Value::Object(data));
-    let content = GroupSystemEvent::new(system_type, text, data).to_content()?;
+    let content = GroupSystemEvent::new(system_type, parts.text, data).to_content()?;
     let group_id_hex = hex::encode(group_id.as_slice());
     let tags = vec![vec![
         GROUP_SYSTEM_TYPE_TAG.to_owned(),
@@ -511,7 +567,7 @@ mod tests {
         let actor = MemberId::new(vec![0xaa; 32]);
         let epoch = 3;
 
-        let cases: [(&str, GroupStateChange, Option<&MemberId>); 7] = [
+        let cases: [(&str, GroupStateChange, Option<&MemberId>); 8] = [
             (
                 "member_added",
                 GroupStateChange::MemberAdded {
@@ -559,6 +615,14 @@ mod tests {
                 GroupStateChange::GroupAvatarChanged,
                 Some(&actor),
             ),
+            (
+                "disappearing_timer_changed",
+                GroupStateChange::MessageRetentionChanged {
+                    old_seconds: 0,
+                    new_seconds: 60,
+                },
+                Some(&actor),
+            ),
         ];
 
         let expected = [
@@ -590,6 +654,10 @@ mod tests {
                 "group_avatar_changed",
                 "db1158ef961902a3f979dc2d8cdf2aba51b1d2568b83e12820490b853188dc40",
             ),
+            (
+                "disappearing_timer_changed",
+                "94c4a1dfc205b1cb52ec17e29d5a33a007a0769046356aaab47edc49bb909b66",
+            ),
         ];
 
         for ((label, change, actor), (expected_label, expected_id)) in
@@ -609,5 +677,42 @@ mod tests {
                 "{label}: material id must match"
             );
         }
+    }
+
+    #[test]
+    fn group_system_event_material_carries_retention_seconds() {
+        let group_id = GroupId::new(vec![0x22; 32]);
+        let actor = MemberId::new(vec![0xaa; 32]);
+        let material = group_system_event_material(
+            &group_id,
+            3,
+            Some(&actor),
+            &GroupStateChange::MessageRetentionChanged {
+                old_seconds: 3600,
+                new_seconds: 0,
+            },
+        )
+        .unwrap();
+
+        let event = GroupSystemEvent::parse(&material.content).unwrap();
+        assert_eq!(
+            event.system_type,
+            GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED
+        );
+        assert_eq!(
+            event.data_u64(GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS),
+            Some(3600)
+        );
+        assert_eq!(
+            event.data_u64(GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS),
+            Some(0)
+        );
+        assert_eq!(
+            material.tags,
+            vec![vec![
+                GROUP_SYSTEM_TYPE_TAG.to_owned(),
+                GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED.to_owned(),
+            ]]
+        );
     }
 }

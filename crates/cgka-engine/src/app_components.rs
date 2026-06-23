@@ -655,7 +655,7 @@ fn group_image_present(bytes: &[u8]) -> bool {
         || !media_type.is_empty()
 }
 
-fn decode_message_retention(bytes: &[u8]) -> Result<u64, EngineError> {
+pub(crate) fn decode_message_retention(bytes: &[u8]) -> Result<u64, EngineError> {
     if bytes.len() != 8 {
         return Err(EngineError::Serialize(format!(
             "message-retention component must be 8 bytes, got {}",

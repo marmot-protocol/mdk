@@ -128,6 +128,10 @@ pub struct GroupSystemEventFfi {
     pub actor_account_id_hex: Option<String>,
     pub subject_account_id_hex: Option<String>,
     pub name: Option<String>,
+    /// Previous disappearing-message retention in seconds; `0` means off.
+    pub old_retention_seconds: Option<u64>,
+    /// New disappearing-message retention in seconds; `0` means off.
+    pub new_retention_seconds: Option<u64>,
 }
 
 impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
@@ -138,6 +142,8 @@ impl From<AppGroupSystemEvent> for GroupSystemEventFfi {
             actor_account_id_hex: value.actor_account_id_hex,
             subject_account_id_hex: value.subject_account_id_hex,
             name: value.name,
+            old_retention_seconds: value.old_retention_seconds,
+            new_retention_seconds: value.new_retention_seconds,
         }
     }
 }

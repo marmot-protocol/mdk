@@ -556,6 +556,21 @@ impl<S: StorageProvider> Engine<S> {
                 via_welcome: welcome_id.clone(),
                 welcomer,
             });
+        if let Some(new_seconds) =
+            crate::app_components::message_retention_seconds_of_group(&mls_group)?
+        {
+            self.events_buf
+                .push_back(cgka_traits::engine::GroupEvent::GroupStateChanged {
+                    group_id: group_id.clone(),
+                    epoch: EpochId(mls_group.epoch().as_u64()),
+                    actor: Some(welcome_sender_id),
+                    change: cgka_traits::engine::GroupStateChange::MessageRetentionChanged {
+                        old_seconds: 0,
+                        new_seconds,
+                    },
+                    origin_commit_id: None,
+                });
+        }
         self.seen_message_ids.insert(welcome_id);
 
         self.replay_buffered_messages(&group_id).await?;

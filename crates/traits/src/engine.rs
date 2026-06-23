@@ -285,6 +285,8 @@ pub enum GroupStateChange {
     GroupRenamed { name: String },
     /// The group avatar/image changed (avatar-url or blossom-image component).
     GroupAvatarChanged,
+    /// The per-group disappearing-message retention changed. `0` means disabled.
+    MessageRetentionChanged { old_seconds: u64, new_seconds: u64 },
 }
 
 /// Why a stored group was skipped during session-open hydration.

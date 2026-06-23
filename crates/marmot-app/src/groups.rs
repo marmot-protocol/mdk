@@ -17,9 +17,10 @@ use cgka_traits::app_components::{
     encode_group_avatar_url_v1, encode_nostr_routing_v1, encode_quic_varint,
 };
 use cgka_traits::app_event::{
-    GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_SUBJECT,
-    GROUP_SYSTEM_EVENT_VERSION, GroupSystemEvent, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MarmotAppEvent as MarmotInnerEvent,
+    GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS,
+    GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS, GROUP_SYSTEM_DATA_SUBJECT, GROUP_SYSTEM_EVENT_VERSION,
+    GroupSystemEvent, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::Group;
@@ -79,6 +80,10 @@ pub struct AppGroupSystemEvent {
     pub actor_account_id_hex: Option<String>,
     pub subject_account_id_hex: Option<String>,
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_retention_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_retention_seconds: Option<u64>,
 }
 
 pub fn group_system_event_from_message(kind: u64, plaintext: &str) -> Option<AppGroupSystemEvent> {
@@ -92,12 +97,16 @@ pub fn group_system_event_from_message(kind: u64, plaintext: &str) -> Option<App
     let actor_account_id_hex = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_ACTOR);
     let subject_account_id_hex = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_SUBJECT);
     let name = non_empty_group_system_data(&event, GROUP_SYSTEM_DATA_NAME);
+    let old_retention_seconds = event.data_u64(GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS);
+    let new_retention_seconds = event.data_u64(GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS);
     Some(AppGroupSystemEvent {
         system_type: event.system_type,
         text: event.text,
         actor_account_id_hex,
         subject_account_id_hex,
         name,
+        old_retention_seconds,
+        new_retention_seconds,
     })
 }
 

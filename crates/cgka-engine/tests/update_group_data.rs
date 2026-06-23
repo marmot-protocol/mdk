@@ -18,7 +18,7 @@ use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GroupAvatarUrlV1, encode_group_avatar_url_v1,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupAvatarUrlV1, encode_group_avatar_url_v1,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
@@ -845,6 +845,54 @@ async fn convergence_emits_unattributed_profile_change_events() {
             } if name == "new-renamed"
         )),
         "convergence apply must emit an unattributed GroupRenamed, got: {events:?}",
+    );
+}
+
+#[tokio::test]
+async fn convergence_emits_attributed_message_retention_change_events() {
+    let (mut alice, mut bob, gid) = create_pair().await;
+    let alice_id = alice.self_id();
+
+    let res = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    bob.ingest(routed).await.unwrap();
+    bob.drain_events();
+    converge_buffered_commit(&mut bob, &gid);
+
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                actor: Some(actor),
+                change: cgka_traits::engine::GroupStateChange::MessageRetentionChanged {
+                    old_seconds: 0,
+                    new_seconds: 60,
+                },
+                ..
+            } if actor == &alice_id
+        )),
+        "convergence apply must emit an attributed MessageRetentionChanged for alice, got: {events:?}",
     );
 }
 
