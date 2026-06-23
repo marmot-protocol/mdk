@@ -215,6 +215,18 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
             failures: 1,
             duration_ms: hist(2),
         },
+        group_invite_engine_publish: AppPerformanceOperationSnapshot {
+            attempts: 1,
+            successes: 1,
+            failures: 0,
+            duration_ms: hist(4),
+        },
+        group_details_read: AppPerformanceOperationSnapshot {
+            attempts: 2,
+            successes: 2,
+            failures: 0,
+            duration_ms: hist(1),
+        },
         ..Default::default()
     };
     let batch = build_export_batch_with_app_performance(
@@ -235,6 +247,14 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     assert!(batch.points.iter().any(|point| {
         point.name == metric_names::APP_START_FAILURES
             && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(1)
+    }));
+    assert!(batch.points.iter().any(|point| {
+        point.name == metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS
+            && point.value == ExportMetricValue::Counter(2)
     }));
 
     let duration = batch

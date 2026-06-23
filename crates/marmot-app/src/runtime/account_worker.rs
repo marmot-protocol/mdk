@@ -794,7 +794,10 @@ async fn handle_account_worker_command(
         } => {
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                client.invite_members(&group_id, &member_refs).await
+                let telemetry = shared.app_performance_telemetry();
+                client
+                    .invite_members_with_telemetry(&group_id, &member_refs, &telemetry)
+                    .await
             }
             .await;
             if result.is_ok() {

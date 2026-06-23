@@ -4,6 +4,8 @@
 //! builders are co-located here because the group commands are their only
 //! callers.
 
+use std::time::Instant;
+
 use cgka_traits::GroupId;
 
 use crate::Marmot;
@@ -21,30 +23,37 @@ pub(crate) async fn group_details_for(
     group_id: &GroupId,
     group_id_hex: &str,
 ) -> Result<GroupDetailsFfi, MarmotKitError> {
-    let account = kit.runtime.accounts().resolve(account_ref)?;
-    let group = kit
-        .app
-        .group(&account.label, group_id_hex)?
-        .ok_or_else(|| MarmotKitError::UnknownGroup {
-            group_id_hex: group_id_hex.to_string(),
-        })?;
-    let group = AppGroupRecordFfi::from(group);
-    let members = kit
-        .runtime
-        .group_members(account_ref, group_id)
-        .await?
-        .into_iter()
-        .map(Into::into)
-        .collect::<Vec<AppGroupMemberRecordFfi>>();
-    let member_ids = members
-        .iter()
-        .map(|member| member.member_id_hex.clone())
-        .collect::<Vec<_>>();
-    let display_names = kit
-        .runtime
-        .display_names_for_account_ids(&member_ids)
-        .unwrap_or_default();
-    group_details_ffi(group, members, &account.account_id_hex, display_names)
+    let started_at = Instant::now();
+    let result = async {
+        let account = kit.runtime.accounts().resolve(account_ref)?;
+        let group = kit
+            .app
+            .group(&account.label, group_id_hex)?
+            .ok_or_else(|| MarmotKitError::UnknownGroup {
+                group_id_hex: group_id_hex.to_string(),
+            })?;
+        let group = AppGroupRecordFfi::from(group);
+        let members = kit
+            .runtime
+            .group_members(account_ref, group_id)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<AppGroupMemberRecordFfi>>();
+        let member_ids = members
+            .iter()
+            .map(|member| member.member_id_hex.clone())
+            .collect::<Vec<_>>();
+        let display_names = kit
+            .runtime
+            .display_names_for_account_ids(&member_ids)
+            .unwrap_or_default();
+        group_details_ffi(group, members, &account.account_id_hex, display_names)
+    }
+    .await;
+    kit.runtime
+        .record_group_details_read(started_at.elapsed(), result.is_ok());
+    result
 }
 
 pub(crate) async fn group_management_state_for(

@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-06-10
+updated: 2026-06-23
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -21,7 +21,7 @@ runtime. It complements the policy docs:
 | --- | --- | --- | --- |
 | Structured tracing/logging | Code uses `tracing` macros with explicit `target` and `method` fields. The app/CLI does not install a global tracing subscriber in the current source, so host apps or tests decide whether these events are collected. | No, unless a host installs and exports a subscriber. | [`overview/observability.md`](./overview/observability.md), [`tracing_audit.rs`](../../crates/cgka-conformance-simulator/tests/tracing_audit.rs) |
 | Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `dm relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
-| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, account reconcile/open/sync/catch-up, one-sided outbound message send, and media upload/download. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
+| Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, account reconcile/open/sync/catch-up, one-sided outbound message send, group invite/admin/read operations, and media upload/download. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Engine reorg telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg counters/histograms. Exposed by `Engine::engine_metrics()`. The relay-plane/export structs have an optional seam for it, but the periodic runtime exporter currently passes `None`. | No via the runtime exporter today. Engine metrics can be exported only if a caller explicitly folds a snapshot into the rollup/batch. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
 | Product analytics / crash reporting | No product analytics or crash reporting SDK integration was found in the current source. Aptabase is mentioned only as future product-analytics context in a doc; it is not wired. | No. | Workspace search on 2026-06-10 |
@@ -195,6 +195,17 @@ Collected operations:
 | `account_catch_up` | `AccountManager::catch_up_accounts()`, including its reconcile step, catch-up command fanout, and waiting for every worker response. | Multi-account aggregate. |
 | `account_sync` | Each account worker `client.sync()` during startup and catch-up. | Coarse envelope for transport activation, subscription setup, relay data drain, processing, projection/state update, and returning a `SyncSummary`. |
 | `outbound_message_send` | Worker `SendMessage` and `SendAppEvent` commands until their send call returns a `SendSummary` or error. | One-sided local send/publish confirmation only. It is not end-to-end remote delivery or read latency. |
+| `group_invite_members` | `AccountManager::invite_members()`, from command dispatch through worker response, post-mutation catch-up, and audit-tracker scheduling. | Measures the public runtime invite envelope after any UniFFI admin preflight. |
+| `group_invite_key_package_lookup` | Invite path KeyPackage resolution for every requested member before routing refresh. | Captures local cached lookups plus relay directory fetches used to obtain invitee KeyPackages. |
+| `group_invite_routing_refresh` | Invite path `AppClient::refresh_routing()` after KeyPackage lookup and before pre-send runtime sync. | Captures local route/projection refresh work that affects publish targets. |
+| `group_invite_pre_send_sync` | Invite path `AppClient::sync_runtime_groups()` immediately before engine send. | Separates pre-send relay/runtime sync from MLS commit and publish. |
+| `group_invite_engine_publish` | Invite path `AccountDeviceRuntime::send_with_audit_context()` plus publish-failure check. | Covers MLS Add/Commit staging, commit publish, local publish confirmation, and Welcome publish. |
+| `group_invite_local_refresh` | Invite path local audit success, publish report cache, group refresh, retention pruning, state save, and projection queueing after publish. | Identifies local projection/storage work after the engine publish stage returns. |
+| `group_invite_notification_trigger` | Invite path best-effort notification-trigger publish. | The helper logs failures internally; the timing sample records the duration of the best-effort call. |
+| `group_invite_post_mutation_catch_up` | The `catch_up_accounts()` call run after `InviteMembers` returns from the account worker. | Also contributes to the aggregate `account_catch_up` metric; this operation scopes that same wait to invite flows. |
+| `group_promote_admin` | `AccountManager::promote_admin()`, from command dispatch through worker response, post-mutation catch-up, and audit-tracker scheduling. | Covers the separate admin-policy mutation path used when invite-as-admin follows member invite. |
+| `group_details_read` | UniFFI `group_details_for()`, including account/group lookup, member read, display-name hydration, and DTO assembly. | Matches the FFI `groupDetails` surface consumed by apps. |
+| `group_mls_state_read` | `AccountManager::group_mls_state()`, from worker command dispatch through the read response. | Captures projection reads used by the conversation developer/debug state surface. |
 | `media_upload` | Worker `UploadMedia` command until `client.upload_media()` returns. | Measures local encryption/upload pipeline and endpoint response time as seen by this device. |
 | `media_download` | Worker `DownloadMedia` command until `client.download_media()` returns. | Measures local fetch/decrypt pipeline and endpoint response time as seen by this device. |
 
@@ -207,8 +218,8 @@ latencies do not immediately fall into overflow:
 60000, 120000, 300000
 ```
 
-These app-performance samples deliberately do not include account labels, account ids, group ids, message ids, relay
-URLs, media URLs, payload sizes, content types, upload endpoints, download endpoints, or error strings.
+These app-performance samples deliberately do not include account labels, account ids, group ids, member refs, message
+ids, relay URLs, media URLs, payload sizes, content types, upload endpoints, download endpoints, or error strings.
 
 ## How local relay telemetry is recorded
 

@@ -25,6 +25,17 @@ pub(crate) enum AppPerformanceOperation {
     AccountCatchUp,
     AccountSync,
     OutboundMessageSend,
+    GroupInviteMembers,
+    GroupInviteKeyPackageLookup,
+    GroupInviteRoutingRefresh,
+    GroupInvitePreSendSync,
+    GroupInviteEnginePublish,
+    GroupInviteLocalRefresh,
+    GroupInviteNotificationTrigger,
+    GroupInvitePostMutationCatchUp,
+    GroupPromoteAdmin,
+    GroupDetailsRead,
+    GroupMlsStateRead,
     MediaUpload,
     MediaDownload,
 }
@@ -50,6 +61,28 @@ pub struct AppPerformanceSnapshot {
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_members: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_key_package_lookup: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_routing_refresh: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_pre_send_sync: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_engine_publish: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_local_refresh: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_notification_trigger: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_invite_post_mutation_catch_up: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_promote_admin: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_details_read: AppPerformanceOperationSnapshot,
+    #[serde(default)]
+    pub group_mls_state_read: AppPerformanceOperationSnapshot,
     pub media_upload: AppPerformanceOperationSnapshot,
     pub media_download: AppPerformanceOperationSnapshot,
 }
@@ -68,6 +101,17 @@ struct AppPerformanceTelemetryInner {
     account_catch_up: AppPerformanceOperationTelemetry,
     account_sync: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
+    group_invite_members: AppPerformanceOperationTelemetry,
+    group_invite_key_package_lookup: AppPerformanceOperationTelemetry,
+    group_invite_routing_refresh: AppPerformanceOperationTelemetry,
+    group_invite_pre_send_sync: AppPerformanceOperationTelemetry,
+    group_invite_engine_publish: AppPerformanceOperationTelemetry,
+    group_invite_local_refresh: AppPerformanceOperationTelemetry,
+    group_invite_notification_trigger: AppPerformanceOperationTelemetry,
+    group_invite_post_mutation_catch_up: AppPerformanceOperationTelemetry,
+    group_promote_admin: AppPerformanceOperationTelemetry,
+    group_details_read: AppPerformanceOperationTelemetry,
+    group_mls_state_read: AppPerformanceOperationTelemetry,
     media_upload: AppPerformanceOperationTelemetry,
     media_download: AppPerformanceOperationTelemetry,
 }
@@ -170,6 +214,45 @@ impl AppPerformanceTelemetry {
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
             }
+            AppPerformanceOperation::GroupInviteMembers => {
+                inner.group_invite_members.record(duration, success);
+            }
+            AppPerformanceOperation::GroupInviteKeyPackageLookup => {
+                inner
+                    .group_invite_key_package_lookup
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupInviteRoutingRefresh => {
+                inner.group_invite_routing_refresh.record(duration, success);
+            }
+            AppPerformanceOperation::GroupInvitePreSendSync => {
+                inner.group_invite_pre_send_sync.record(duration, success);
+            }
+            AppPerformanceOperation::GroupInviteEnginePublish => {
+                inner.group_invite_engine_publish.record(duration, success);
+            }
+            AppPerformanceOperation::GroupInviteLocalRefresh => {
+                inner.group_invite_local_refresh.record(duration, success);
+            }
+            AppPerformanceOperation::GroupInviteNotificationTrigger => {
+                inner
+                    .group_invite_notification_trigger
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupInvitePostMutationCatchUp => {
+                inner
+                    .group_invite_post_mutation_catch_up
+                    .record(duration, success);
+            }
+            AppPerformanceOperation::GroupPromoteAdmin => {
+                inner.group_promote_admin.record(duration, success);
+            }
+            AppPerformanceOperation::GroupDetailsRead => {
+                inner.group_details_read.record(duration, success);
+            }
+            AppPerformanceOperation::GroupMlsStateRead => {
+                inner.group_mls_state_read.record(duration, success);
+            }
             AppPerformanceOperation::MediaUpload => inner.media_upload.record(duration, success),
             AppPerformanceOperation::MediaDownload => {
                 inner.media_download.record(duration, success);
@@ -190,6 +273,19 @@ impl AppPerformanceTelemetry {
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
             outbound_message_send: inner.outbound_message_send.snapshot(),
+            group_invite_members: inner.group_invite_members.snapshot(),
+            group_invite_key_package_lookup: inner.group_invite_key_package_lookup.snapshot(),
+            group_invite_routing_refresh: inner.group_invite_routing_refresh.snapshot(),
+            group_invite_pre_send_sync: inner.group_invite_pre_send_sync.snapshot(),
+            group_invite_engine_publish: inner.group_invite_engine_publish.snapshot(),
+            group_invite_local_refresh: inner.group_invite_local_refresh.snapshot(),
+            group_invite_notification_trigger: inner.group_invite_notification_trigger.snapshot(),
+            group_invite_post_mutation_catch_up: inner
+                .group_invite_post_mutation_catch_up
+                .snapshot(),
+            group_promote_admin: inner.group_promote_admin.snapshot(),
+            group_details_read: inner.group_details_read.snapshot(),
+            group_mls_state_read: inner.group_mls_state_read.snapshot(),
             media_upload: inner.media_upload.snapshot(),
             media_download: inner.media_download.snapshot(),
         }
@@ -214,12 +310,21 @@ mod tests {
             Duration::from_millis(400_000),
             false,
         );
+        telemetry.record(
+            AppPerformanceOperation::GroupInviteMembers,
+            Duration::from_millis(750),
+            true,
+        );
 
         let snapshot = telemetry.snapshot();
         assert_eq!(snapshot.app_start.attempts, 2);
         assert_eq!(snapshot.app_start.successes, 1);
         assert_eq!(snapshot.app_start.failures, 1);
         assert_eq!(snapshot.app_start.duration_ms.sample_count(), 2);
+        assert_eq!(snapshot.group_invite_members.attempts, 1);
+        assert_eq!(snapshot.group_invite_members.successes, 1);
+        assert_eq!(snapshot.group_invite_members.failures, 0);
+        assert_eq!(snapshot.group_invite_members.duration_ms.sample_count(), 1);
         assert!(
             snapshot
                 .app_start

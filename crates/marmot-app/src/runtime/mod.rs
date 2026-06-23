@@ -830,6 +830,16 @@ impl MarmotAppRuntime {
         self.shared.clone()
     }
 
+    /// Record the fixed app-performance sample for the UniFFI
+    /// `groupDetails` DTO builder.
+    pub fn record_group_details_read(&self, duration: Duration, success: bool) {
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupDetailsRead,
+            duration,
+            success,
+        );
+    }
+
     pub fn is_stopping(&self) -> bool {
         self.shared.lifecycle().is_stopping()
     }

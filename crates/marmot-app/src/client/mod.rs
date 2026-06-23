@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use cgka_engine::key_package::is_last_resort_key_package;
 use cgka_traits::agent_text_stream::{
@@ -19,6 +20,7 @@ use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::{GroupId, SecretBytes};
 use marmot_forensics::AuditEventContext;
 
+use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
     EventGroupProjection, GroupConfirmationProjection, add_group, fail_if_publish_failed,
     send_summary_from_effects, validate_group_profile,
@@ -35,7 +37,7 @@ use crate::{
     AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
+    AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
     SendSummary, remember_seen_event, unix_now_seconds,
@@ -165,6 +167,17 @@ impl ObservedHumanActionAudit {
         self.from_epoch = from_epoch;
         self.to_epoch = to_epoch;
         self
+    }
+}
+
+fn record_app_performance(
+    telemetry: Option<&AppPerformanceTelemetry>,
+    operation: AppPerformanceOperation,
+    duration: Duration,
+    success: bool,
+) {
+    if let Some(telemetry) = telemetry {
+        telemetry.record(operation, duration, success);
     }
 }
 
@@ -434,12 +447,55 @@ impl AppClient {
         group_id: &GroupId,
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
+        self.invite_members_with_optional_telemetry(group_id, member_refs, None)
+            .await
+    }
+
+    pub(crate) async fn invite_members_with_telemetry(
+        &mut self,
+        group_id: &GroupId,
+        member_refs: &[&str],
+        telemetry: &AppPerformanceTelemetry,
+    ) -> Result<SendSummary, AppError> {
+        self.invite_members_with_optional_telemetry(group_id, member_refs, Some(telemetry))
+            .await
+    }
+
+    async fn invite_members_with_optional_telemetry(
+        &mut self,
+        group_id: &GroupId,
+        member_refs: &[&str],
+        telemetry: Option<&AppPerformanceTelemetry>,
+    ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        let mut key_packages = Vec::with_capacity(member_refs.len());
-        for member in member_refs {
-            key_packages.push(self.app.member_key_package(member).await?);
+
+        let key_package_started_at = Instant::now();
+        let key_packages = async {
+            let mut key_packages = Vec::with_capacity(member_refs.len());
+            for member in member_refs {
+                key_packages.push(self.app.member_key_package(member).await?);
+            }
+            Ok::<_, AppError>(key_packages)
         }
-        self.refresh_routing()?;
+        .await;
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupInviteKeyPackageLookup,
+            key_package_started_at.elapsed(),
+            key_packages.is_ok(),
+        );
+        let key_packages = key_packages?;
+
+        let routing_refresh_started_at = Instant::now();
+        let routing_refresh = self.refresh_routing();
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupInviteRoutingRefresh,
+            routing_refresh_started_at.elapsed(),
+            routing_refresh.is_ok(),
+        );
+        routing_refresh?;
+
         let audit_context = Self::local_human_action_context(
             "invite_members",
             vec!["members"],
@@ -447,7 +503,17 @@ impl AppClient {
             Some(member_refs.len() as u64),
         );
 
-        self.sync_runtime_groups().await?;
+        let pre_send_sync_started_at = Instant::now();
+        let pre_send_sync = self.sync_runtime_groups().await;
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupInvitePreSendSync,
+            pre_send_sync_started_at.elapsed(),
+            pre_send_sync.is_ok(),
+        );
+        pre_send_sync?;
+
+        let engine_publish_started_at = Instant::now();
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -457,20 +523,53 @@ impl AppClient {
                 },
                 audit_context.clone(),
             )
-            .await?;
-        fail_if_publish_failed(&effects)?;
-        self.record_human_action_succeeded(group_id, &audit_context, &effects);
-        self.remember_published_reports(&effects);
-        self.refresh_group(group_id);
-        self.prune_plaintext_retention_for_group(group_id)?;
-        self.app.save_state(&self.state)?;
-        self.queue_own_group_system_projection_updates(&effects);
+            .await
+            .map_err(AppError::from)
+            .and_then(|effects| {
+                fail_if_publish_failed(&effects)?;
+                Ok(effects)
+            });
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupInviteEnginePublish,
+            engine_publish_started_at.elapsed(),
+            effects.is_ok(),
+        );
+        let effects = effects?;
+
+        let local_refresh_started_at = Instant::now();
+        let local_refresh = (|| {
+            self.record_human_action_succeeded(group_id, &audit_context, &effects);
+            self.remember_published_reports(&effects);
+            self.refresh_group(group_id);
+            self.prune_plaintext_retention_for_group(group_id)?;
+            self.app.save_state(&self.state)?;
+            self.queue_own_group_system_projection_updates(&effects);
+            Ok::<_, AppError>(())
+        })();
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupInviteLocalRefresh,
+            local_refresh_started_at.elapsed(),
+            local_refresh.is_ok(),
+        );
+        local_refresh?;
+
         let summary = send_summary_from_effects(&effects);
+
+        let notification_started_at = Instant::now();
         self.publish_notification_trigger_best_effort(
             group_id,
             notifications::NotificationTrigger::GroupInvite,
         )
         .await;
+        record_app_performance(
+            telemetry,
+            AppPerformanceOperation::GroupInviteNotificationTrigger,
+            notification_started_at.elapsed(),
+            true,
+        );
+
         Ok(summary)
     }
 

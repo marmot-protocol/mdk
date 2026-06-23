@@ -2,11 +2,14 @@
 //! [`AccountWorkerCommand`] to the per-account worker and awaits its oneshot
 //! reply.
 
+use std::time::Instant;
+
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::oneshot;
 
 use super::{AccountManager, AccountWorkerCommand, account_worker_response};
+use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppError,
@@ -62,16 +65,26 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<AppGroupMlsState, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::GroupMlsState {
-                group_id: group_id.clone(),
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let started_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::GroupMlsState {
+                    group_id: group_id.clone(),
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            account_worker_response(response).await
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupMlsStateRead,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     /// Stored groups that failed session-open hydration and were skipped
@@ -204,20 +217,39 @@ impl AccountManager {
         group_id: &GroupId,
         members: &[String],
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::InviteMembers {
-                group_id: group_id.clone(),
-                members: members.to_vec(),
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
-        self.schedule_audit_log_tracker_update("invite_members");
-        Ok(summary)
+        let started_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::InviteMembers {
+                    group_id: group_id.clone(),
+                    members: members.to_vec(),
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            let summary = account_worker_response(response).await?;
+
+            let catch_up_started_at = Instant::now();
+            let catch_up = self.catch_up_accounts().await;
+            self.shared.app_performance_telemetry().record(
+                AppPerformanceOperation::GroupInvitePostMutationCatchUp,
+                catch_up_started_at.elapsed(),
+                catch_up.is_ok(),
+            );
+            catch_up?;
+
+            self.schedule_audit_log_tracker_update("invite_members");
+            Ok(summary)
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupInviteMembers,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     pub async fn remove_members(
@@ -455,20 +487,30 @@ impl AccountManager {
         group_id: &GroupId,
         member_ref: &str,
     ) -> Result<SendSummary, AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::PromoteAdmin {
-                group_id: group_id.clone(),
-                member_ref: member_ref.to_owned(),
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
-        self.schedule_audit_log_tracker_update("promote_admin");
-        Ok(summary)
+        let started_at = Instant::now();
+        let result = async {
+            let command = self.worker_commands(account_ref).await?;
+            let (respond, response) = oneshot::channel();
+            command
+                .send(AccountWorkerCommand::PromoteAdmin {
+                    group_id: group_id.clone(),
+                    member_ref: member_ref.to_owned(),
+                    respond,
+                })
+                .await
+                .map_err(|_| AppError::TransportClosed)?;
+            let summary = account_worker_response(response).await?;
+            self.catch_up_accounts().await?;
+            self.schedule_audit_log_tracker_update("promote_admin");
+            Ok(summary)
+        }
+        .await;
+        self.shared.app_performance_telemetry().record(
+            AppPerformanceOperation::GroupPromoteAdmin,
+            started_at.elapsed(),
+            result.is_ok(),
+        );
+        result
     }
 
     pub async fn demote_admin(

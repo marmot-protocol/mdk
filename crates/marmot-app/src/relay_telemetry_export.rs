@@ -147,6 +147,122 @@ pub mod metric_names {
     pub const APP_OUTBOUND_MESSAGE_SEND_SUCCESSES: &str = "app_outbound_message_send_successes";
     /// Failed one-sided outbound message sends.
     pub const APP_OUTBOUND_MESSAGE_SEND_FAILURES: &str = "app_outbound_message_send_failures";
+    /// Group invite-member runtime duration histogram.
+    pub const APP_GROUP_INVITE_MEMBERS_DURATION: &str = "app_group_invite_members_duration_ms";
+    /// Group invite-member attempts.
+    pub const APP_GROUP_INVITE_MEMBERS_ATTEMPTS: &str = "app_group_invite_members_attempts";
+    /// Successful group invite-member operations.
+    pub const APP_GROUP_INVITE_MEMBERS_SUCCESSES: &str = "app_group_invite_members_successes";
+    /// Failed group invite-member operations.
+    pub const APP_GROUP_INVITE_MEMBERS_FAILURES: &str = "app_group_invite_members_failures";
+    /// Group invite KeyPackage lookup duration histogram.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_DURATION: &str =
+        "app_group_invite_key_package_lookup_duration_ms";
+    /// Group invite KeyPackage lookup attempts.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_ATTEMPTS: &str =
+        "app_group_invite_key_package_lookup_attempts";
+    /// Successful group invite KeyPackage lookups.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_SUCCESSES: &str =
+        "app_group_invite_key_package_lookup_successes";
+    /// Failed group invite KeyPackage lookups.
+    pub const APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_FAILURES: &str =
+        "app_group_invite_key_package_lookup_failures";
+    /// Group invite routing refresh duration histogram.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_DURATION: &str =
+        "app_group_invite_routing_refresh_duration_ms";
+    /// Group invite routing refresh attempts.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_ATTEMPTS: &str =
+        "app_group_invite_routing_refresh_attempts";
+    /// Successful group invite routing refreshes.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_SUCCESSES: &str =
+        "app_group_invite_routing_refresh_successes";
+    /// Failed group invite routing refreshes.
+    pub const APP_GROUP_INVITE_ROUTING_REFRESH_FAILURES: &str =
+        "app_group_invite_routing_refresh_failures";
+    /// Group invite pre-send sync duration histogram.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_DURATION: &str =
+        "app_group_invite_pre_send_sync_duration_ms";
+    /// Group invite pre-send sync attempts.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_ATTEMPTS: &str =
+        "app_group_invite_pre_send_sync_attempts";
+    /// Successful group invite pre-send syncs.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_SUCCESSES: &str =
+        "app_group_invite_pre_send_sync_successes";
+    /// Failed group invite pre-send syncs.
+    pub const APP_GROUP_INVITE_PRE_SEND_SYNC_FAILURES: &str =
+        "app_group_invite_pre_send_sync_failures";
+    /// Group invite engine send/publish duration histogram.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_DURATION: &str =
+        "app_group_invite_engine_publish_duration_ms";
+    /// Group invite engine send/publish attempts.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_ATTEMPTS: &str =
+        "app_group_invite_engine_publish_attempts";
+    /// Successful group invite engine send/publish operations.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_SUCCESSES: &str =
+        "app_group_invite_engine_publish_successes";
+    /// Failed group invite engine send/publish operations.
+    pub const APP_GROUP_INVITE_ENGINE_PUBLISH_FAILURES: &str =
+        "app_group_invite_engine_publish_failures";
+    /// Group invite local refresh duration histogram.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_DURATION: &str =
+        "app_group_invite_local_refresh_duration_ms";
+    /// Group invite local refresh attempts.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_ATTEMPTS: &str =
+        "app_group_invite_local_refresh_attempts";
+    /// Successful group invite local refreshes.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_SUCCESSES: &str =
+        "app_group_invite_local_refresh_successes";
+    /// Failed group invite local refreshes.
+    pub const APP_GROUP_INVITE_LOCAL_REFRESH_FAILURES: &str =
+        "app_group_invite_local_refresh_failures";
+    /// Group invite notification trigger duration histogram.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_DURATION: &str =
+        "app_group_invite_notification_trigger_duration_ms";
+    /// Group invite notification trigger attempts.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_ATTEMPTS: &str =
+        "app_group_invite_notification_trigger_attempts";
+    /// Successful group invite notification triggers.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_SUCCESSES: &str =
+        "app_group_invite_notification_trigger_successes";
+    /// Failed group invite notification triggers.
+    pub const APP_GROUP_INVITE_NOTIFICATION_TRIGGER_FAILURES: &str =
+        "app_group_invite_notification_trigger_failures";
+    /// Group invite post-mutation catch-up duration histogram.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_DURATION: &str =
+        "app_group_invite_post_mutation_catch_up_duration_ms";
+    /// Group invite post-mutation catch-up attempts.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_ATTEMPTS: &str =
+        "app_group_invite_post_mutation_catch_up_attempts";
+    /// Successful group invite post-mutation catch-ups.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_SUCCESSES: &str =
+        "app_group_invite_post_mutation_catch_up_successes";
+    /// Failed group invite post-mutation catch-ups.
+    pub const APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_FAILURES: &str =
+        "app_group_invite_post_mutation_catch_up_failures";
+    /// Group promote-admin runtime duration histogram.
+    pub const APP_GROUP_PROMOTE_ADMIN_DURATION: &str = "app_group_promote_admin_duration_ms";
+    /// Group promote-admin attempts.
+    pub const APP_GROUP_PROMOTE_ADMIN_ATTEMPTS: &str = "app_group_promote_admin_attempts";
+    /// Successful group promote-admin operations.
+    pub const APP_GROUP_PROMOTE_ADMIN_SUCCESSES: &str = "app_group_promote_admin_successes";
+    /// Failed group promote-admin operations.
+    pub const APP_GROUP_PROMOTE_ADMIN_FAILURES: &str = "app_group_promote_admin_failures";
+    /// Group details read duration histogram.
+    pub const APP_GROUP_DETAILS_READ_DURATION: &str = "app_group_details_read_duration_ms";
+    /// Group details read attempts.
+    pub const APP_GROUP_DETAILS_READ_ATTEMPTS: &str = "app_group_details_read_attempts";
+    /// Successful group details reads.
+    pub const APP_GROUP_DETAILS_READ_SUCCESSES: &str = "app_group_details_read_successes";
+    /// Failed group details reads.
+    pub const APP_GROUP_DETAILS_READ_FAILURES: &str = "app_group_details_read_failures";
+    /// Group MLS state read duration histogram.
+    pub const APP_GROUP_MLS_STATE_READ_DURATION: &str = "app_group_mls_state_read_duration_ms";
+    /// Group MLS state read attempts.
+    pub const APP_GROUP_MLS_STATE_READ_ATTEMPTS: &str = "app_group_mls_state_read_attempts";
+    /// Successful group MLS state reads.
+    pub const APP_GROUP_MLS_STATE_READ_SUCCESSES: &str = "app_group_mls_state_read_successes";
+    /// Failed group MLS state reads.
+    pub const APP_GROUP_MLS_STATE_READ_FAILURES: &str = "app_group_mls_state_read_failures";
     /// Media upload duration histogram.
     pub const APP_MEDIA_UPLOAD_DURATION: &str = "app_media_upload_duration_ms";
     /// Media upload attempts.
@@ -478,6 +594,94 @@ fn append_app_performance_points(
         metric_names::APP_OUTBOUND_MESSAGE_SEND_ATTEMPTS,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_SUCCESSES,
         metric_names::APP_OUTBOUND_MESSAGE_SEND_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_members,
+        metric_names::APP_GROUP_INVITE_MEMBERS_DURATION,
+        metric_names::APP_GROUP_INVITE_MEMBERS_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_MEMBERS_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_MEMBERS_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_key_package_lookup,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_DURATION,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_KEY_PACKAGE_LOOKUP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_routing_refresh,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_DURATION,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_ROUTING_REFRESH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_pre_send_sync,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_DURATION,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_PRE_SEND_SYNC_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_engine_publish,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_DURATION,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_ENGINE_PUBLISH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_local_refresh,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_DURATION,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_LOCAL_REFRESH_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_notification_trigger,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_DURATION,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_NOTIFICATION_TRIGGER_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_invite_post_mutation_catch_up,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_DURATION,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_ATTEMPTS,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_SUCCESSES,
+        metric_names::APP_GROUP_INVITE_POST_MUTATION_CATCH_UP_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_promote_admin,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_DURATION,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_ATTEMPTS,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_SUCCESSES,
+        metric_names::APP_GROUP_PROMOTE_ADMIN_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_details_read,
+        metric_names::APP_GROUP_DETAILS_READ_DURATION,
+        metric_names::APP_GROUP_DETAILS_READ_ATTEMPTS,
+        metric_names::APP_GROUP_DETAILS_READ_SUCCESSES,
+        metric_names::APP_GROUP_DETAILS_READ_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.group_mls_state_read,
+        metric_names::APP_GROUP_MLS_STATE_READ_DURATION,
+        metric_names::APP_GROUP_MLS_STATE_READ_ATTEMPTS,
+        metric_names::APP_GROUP_MLS_STATE_READ_SUCCESSES,
+        metric_names::APP_GROUP_MLS_STATE_READ_FAILURES,
     );
     append_app_operation_points(
         points,
