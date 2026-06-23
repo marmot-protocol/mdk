@@ -17,12 +17,12 @@ use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
 use crate::{MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE};
 
 /// Nostr pubkey-reference (`p`) tag name.
-const PUBKEY_REF_TAG: &str = "p";
+pub(crate) const PUBKEY_REF_TAG: &str = "p";
 
 /// Extract the mentioned pubkey hex from a token following a `nostr:` scheme (or
 /// a bare hex/npub), covering NIP-21 `npub` + `nprofile` and a raw hex pubkey.
 /// Event/coordinate references (`note`/`nevent`/`naddr`) are not pubkey mentions.
-fn mention_pubkey_hex(token: &str) -> Option<String> {
+pub(crate) fn mention_pubkey_hex(token: &str) -> Option<String> {
     if let Ok(parsed) = Nip21::parse(&format!("nostr:{token}")) {
         return match parsed {
             Nip21::Pubkey(pubkey) => Some(pubkey.to_hex()),
@@ -34,6 +34,26 @@ fn mention_pubkey_hex(token: &str) -> Option<String> {
     parse_account_id_hex(token).ok()
 }
 
+/// Extract pubkey mentions from inline NIP-27 `nostr:` entities in message
+/// content. Event/coordinate references and unparseable tokens are ignored.
+pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
+    content
+        .match_indices("nostr:")
+        .filter_map(|(idx, _)| {
+            let rest = &content[idx + "nostr:".len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len());
+            let token = &rest[..end];
+            if token.is_empty() {
+                None
+            } else {
+                mention_pubkey_hex(token)
+            }
+        })
+        .collect()
+}
+
 /// Derive NIP-27 `["p", <pubkey-hex>]` tags from inline `nostr:` mentions in
 /// message content. Each distinct mentioned pubkey gets one tag (in first-seen
 /// order); event references and unparseable tokens are ignored. This is how a
@@ -42,18 +62,8 @@ fn mention_pubkey_hex(token: &str) -> Option<String> {
 fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
     let mut seen = std::collections::HashSet::new();
     let mut tags = Vec::new();
-    for (idx, _) in content.match_indices("nostr:") {
-        let rest = &content[idx + "nostr:".len()..];
-        let end = rest
-            .find(|c: char| !c.is_ascii_alphanumeric())
-            .unwrap_or(rest.len());
-        let token = &rest[..end];
-        if token.is_empty() {
-            continue;
-        }
-        if let Some(hex) = mention_pubkey_hex(token)
-            && seen.insert(hex.clone())
-        {
+    for hex in inline_mention_pubkey_hexes(content) {
+        if seen.insert(hex.clone()) {
             tags.push(vec![PUBKEY_REF_TAG.to_owned(), hex]);
         }
     }

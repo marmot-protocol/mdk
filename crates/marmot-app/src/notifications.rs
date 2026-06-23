@@ -21,6 +21,7 @@ use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
 };
 
+use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
 use crate::{
     AppError, AppGroupRecord, MarmotApp, MarmotAppEvent, ReceivedMessage, RuntimeMessageReceived,
     tag_value,
@@ -166,6 +167,11 @@ pub struct NotificationUpdate {
     pub group_id_hex: String,
     pub group_name: Option<String>,
     pub is_dm: bool,
+    /// True when this notification's receiving account is mentioned by a NIP-27
+    /// pubkey-reference (`p`) tag or inline `nostr:` pubkey entity on the inbound
+    /// app event. This is computed from event semantics, not the rendered
+    /// preview text.
+    pub is_mention: bool,
     pub message_id_hex: Option<String>,
     pub sender: NotificationUser,
     pub receiver: NotificationUser,
@@ -702,6 +708,7 @@ fn notification_update_from_message(
         group_id_hex,
         group_name: group_name(group.as_ref()),
         is_dm: false,
+        is_mention: notification_is_mention(&event.message, &event.account_id_hex, is_from_self),
         message_id_hex: Some(event.message.message_id_hex.clone()),
         sender,
         receiver,
@@ -744,6 +751,7 @@ fn notification_update_from_group_join(
         group_id_hex,
         group_name: group_name(group.as_ref()),
         is_dm: false,
+        is_mention: false,
         message_id_hex: None,
         sender,
         receiver,
@@ -763,6 +771,32 @@ fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {
 
 fn preview_text_for_message(message: &ReceivedMessage) -> Option<String> {
     preview_text_for_kind(message.kind, &message.plaintext)
+}
+
+fn notification_is_mention(
+    message: &ReceivedMessage,
+    account_id_hex: &str,
+    is_from_self: bool,
+) -> bool {
+    !is_from_self && message_mentions_account(message, account_id_hex)
+}
+
+fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> bool {
+    if message.kind != MARMOT_APP_EVENT_KIND_CHAT || account_id_hex.is_empty() {
+        return false;
+    }
+    if message.tags.iter().any(|tag| {
+        tag.first().is_some_and(|name| name == PUBKEY_REF_TAG)
+            && tag
+                .get(1)
+                .and_then(|value| mention_pubkey_hex(value))
+                .is_some_and(|value| value.eq_ignore_ascii_case(account_id_hex))
+    }) {
+        return true;
+    }
+    inline_mention_pubkey_hexes(&message.plaintext)
+        .iter()
+        .any(|mentioned| mentioned.eq_ignore_ascii_case(account_id_hex))
 }
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
