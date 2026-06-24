@@ -5,6 +5,10 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_TAG,
 };
 
+fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
+    false
+}
+
 fn group(id: &str, name: &str) -> StoredAccountGroup {
     StoredAccountGroup {
         group_id_hex: id.to_owned(),
@@ -419,7 +423,9 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         format!("locator blossom-v1 https://blossom.example/{media_hash}"),
     ]];
     store.record_app_event(&old).unwrap();
-    store.refresh_chat_list_row("alice-account", "aa").unwrap();
+    store
+        .refresh_chat_list_row("alice-account", "aa", &no_mentions)
+        .unwrap();
     {
         let conn = store.lock().unwrap();
         let (busy, _, _): (i64, i64, i64) = conn
@@ -548,7 +554,9 @@ fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
     let mut old = app_event("old-aa", "aa", 10);
     old.plaintext = "chat list should not retain this".to_owned();
     store.record_app_event(&old).unwrap();
-    store.refresh_chat_list_row("alice-account", "aa").unwrap();
+    store
+        .refresh_chat_list_row("alice-account", "aa", &no_mentions)
+        .unwrap();
     assert_eq!(
         store
             .chat_list_row("aa")
