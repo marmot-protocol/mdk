@@ -946,6 +946,8 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         last_message: None,
         unread_count: 0,
         has_unread: false,
+        unread_mention_count: 0,
+        has_unread_mention: false,
         first_unread_message_id_hex: None,
         last_read_message_id_hex: None,
         last_read_timeline_at: None,

@@ -13,6 +13,11 @@ pub struct ChatListQuery {
     pub include_archived: bool,
 }
 
+/// Predicate deciding whether a timeline message (by plaintext + tag set)
+/// mentions the local account. Injected by the caller so the storage layer
+/// stays free of nostr/NIP parsing.
+pub type MentionClassifier<'a> = dyn Fn(&str, &[Vec<String>]) -> bool + 'a;
+
 /// Cheap per-account unread aggregate computed directly from the materialized
 /// `chat_list_rows` projection — no timeline/session load required. Archived
 /// conversations are excluded so the total matches what the unarchived chat
@@ -64,6 +69,8 @@ pub struct ChatListRow {
     pub last_message: Option<ChatListMessagePreview>,
     pub unread_count: u64,
     pub has_unread: bool,
+    pub unread_mention_count: u64,
+    pub has_unread_mention: bool,
     pub first_unread_message_id_hex: Option<String>,
     pub last_read_message_id_hex: Option<String>,
     pub last_read_timeline_at: Option<u64>,
@@ -133,19 +140,27 @@ impl SqliteAccountStorage {
         })
     }
 
-    pub fn ensure_chat_list_rows(&self, local_account_id_hex: &str) -> StorageResult<()> {
+    pub fn ensure_chat_list_rows(
+        &self,
+        local_account_id_hex: &str,
+        mention_classifier: &MentionClassifier<'_>,
+    ) -> StorageResult<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        if !chat_list_projection_complete_tx(&tx)? {
-            rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex)?;
+        if !chat_list_projection_complete_tx(&tx, local_account_id_hex, mention_classifier)? {
+            rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex, mention_classifier)?;
         }
         tx.commit().storage()
     }
 
-    pub fn refresh_chat_list_rows(&self, local_account_id_hex: &str) -> StorageResult<()> {
+    pub fn refresh_chat_list_rows(
+        &self,
+        local_account_id_hex: &str,
+        mention_classifier: &MentionClassifier<'_>,
+    ) -> StorageResult<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex)?;
+        rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex, mention_classifier)?;
         tx.commit().storage()
     }
 
@@ -153,10 +168,12 @@ impl SqliteAccountStorage {
         &self,
         local_account_id_hex: &str,
         group_id_hex: &str,
+        mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
-        let row = refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
+        let row =
+            refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex, mention_classifier)?;
         tx.commit().storage()?;
         Ok(row)
     }
@@ -165,6 +182,7 @@ impl SqliteAccountStorage {
         &self,
         local_account_id_hex: &str,
         group_id_hex: &str,
+        mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
@@ -194,7 +212,7 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         }
-        rebuild_chat_list_row_for_group_tx(&tx, local_account_id_hex, group)?;
+        rebuild_chat_list_row_for_group_tx(&tx, local_account_id_hex, group, mention_classifier)?;
         let row = chat_list_row_tx(&tx, group_id_hex)?;
         tx.commit().storage()?;
         Ok(row)
@@ -205,6 +223,7 @@ impl SqliteAccountStorage {
         local_account_id_hex: &str,
         group_id_hex: &str,
         message_id_hex: &str,
+        mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().storage()?;
@@ -242,7 +261,8 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
         }
-        let row = refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex)?;
+        let row =
+            refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex, mention_classifier)?;
         tx.commit().storage()?;
         Ok(row)
     }
@@ -251,11 +271,12 @@ impl SqliteAccountStorage {
 fn rebuild_all_chat_list_rows_tx(
     tx: &Transaction<'_>,
     local_account_id_hex: &str,
+    mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
     tx.execute("DELETE FROM chat_list_rows", []).storage()?;
     let groups = account_groups_tx(tx)?;
     for group in groups {
-        rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group)?;
+        rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group, mention_classifier)?;
     }
     Ok(())
 }
@@ -264,6 +285,7 @@ fn refresh_chat_list_row_tx(
     tx: &Transaction<'_>,
     local_account_id_hex: &str,
     group_id_hex: &str,
+    mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<Option<ChatListRow>> {
     let Some(group) = account_group_tx(tx, group_id_hex)? else {
         tx.execute(
@@ -273,11 +295,15 @@ fn refresh_chat_list_row_tx(
         .storage()?;
         return Ok(None);
     };
-    rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group)?;
+    rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group, mention_classifier)?;
     chat_list_row_tx(tx, group_id_hex)
 }
 
-fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool> {
+fn chat_list_projection_complete_tx(
+    tx: &Transaction<'_>,
+    local_account_id_hex: &str,
+    mention_classifier: &MentionClassifier<'_>,
+) -> StorageResult<bool> {
     if projection_has_rows_tx(
         tx,
         "SELECT EXISTS(
@@ -420,7 +446,40 @@ fn chat_list_projection_complete_tx(tx: &Transaction<'_>) -> StorageResult<bool>
     )? {
         return Ok(false);
     }
+    // Mention classification needs the injected closure (not expressible in pure
+    // SQL), so the remaining checks recompute the unread-mention count per group
+    // and compare it to the stored value. This corrects rows upgraded via
+    // migration 0018 (which defaults the new column to 0) for groups that
+    // actually have unread mentions.
+    for (group_id_hex, stored_mention_count) in chat_list_stored_mention_counts_tx(tx)? {
+        let read_state = read_state_tx(tx, &group_id_hex)?;
+        let unread = unread_summary_tx(
+            tx,
+            local_account_id_hex,
+            &group_id_hex,
+            read_state.as_ref(),
+            mention_classifier,
+        )?;
+        if unread.mention_count != stored_mention_count {
+            return Ok(false);
+        }
+    }
     Ok(true)
+}
+
+fn chat_list_stored_mention_counts_tx(tx: &Transaction<'_>) -> StorageResult<Vec<(String, u64)>> {
+    let mut stmt = tx
+        .prepare("SELECT group_id_hex, unread_mention_count FROM chat_list_rows")
+        .storage()?;
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })
+    .storage()?
+    .map(|entry| {
+        let (group_id_hex, count) = entry.storage()?;
+        Ok((group_id_hex, i64_to_u64(count)?))
+    })
+    .collect()
 }
 
 fn projection_has_rows_tx<P: Params>(
@@ -436,6 +495,7 @@ fn rebuild_chat_list_row_for_group_tx(
     tx: &Transaction<'_>,
     local_account_id_hex: &str,
     group: AccountGroupRow,
+    mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
     let latest = latest_kind9_message_tx(tx, &group.group_id_hex)?;
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
@@ -444,6 +504,7 @@ fn rebuild_chat_list_row_for_group_tx(
         local_account_id_hex,
         &group.group_id_hex,
         read_state.as_ref(),
+        mention_classifier,
     )?;
     let now = unix_now_seconds();
     tx.execute(
@@ -454,12 +515,12 @@ fn rebuild_chat_list_row_for_group_tx(
             avatar_image_upload_key_hex, avatar_media_type,
             last_message_id_hex, last_message_sender, last_message_preview,
             last_message_kind, last_message_timeline_at, last_message_deleted,
-            unread_count, first_unread_message_id_hex, last_read_message_id_hex,
-            last_read_timeline_at, updated_at
+            unread_count, unread_mention_count, first_unread_message_id_hex,
+            last_read_message_id_hex, last_read_timeline_at, updated_at
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -479,6 +540,7 @@ fn rebuild_chat_list_row_for_group_tx(
             last_message_timeline_at = excluded.last_message_timeline_at,
             last_message_deleted = excluded.last_message_deleted,
             unread_count = excluded.unread_count,
+            unread_mention_count = excluded.unread_mention_count,
             first_unread_message_id_hex = excluded.first_unread_message_id_hex,
             last_read_message_id_hex = excluded.last_read_message_id_hex,
             last_read_timeline_at = excluded.last_read_timeline_at,
@@ -526,6 +588,7 @@ fn rebuild_chat_list_row_for_group_tx(
                 .map(|message| bool_i64(message.deleted))
                 .unwrap_or(0),
             u64_to_i64(unread.count)?,
+            u64_to_i64(unread.mention_count)?,
             unread.first_message_id.as_deref(),
             read_state
                 .as_ref()
@@ -545,6 +608,7 @@ fn rebuild_chat_list_row_for_group_tx(
 #[derive(Clone, Debug)]
 struct UnreadSummary {
     count: u64,
+    mention_count: u64,
     first_message_id: Option<String>,
 }
 
@@ -553,10 +617,12 @@ fn unread_summary_tx(
     local_account_id_hex: &str,
     group_id_hex: &str,
     read_state: Option<&ConversationReadState>,
+    mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<UnreadSummary> {
     let Some(read_state) = read_state else {
         return Ok(UnreadSummary {
             count: 0,
+            mention_count: 0,
             first_message_id: None,
         });
     };
@@ -624,8 +690,43 @@ fn unread_summary_tx(
         )
         .optional()
         .storage()?;
+    // Recompute the mention count over the SAME unread window. Mention
+    // classification is injected (the storage layer never parses nostr/NIP-21),
+    // so iterate the unread rows and apply the predicate to each plaintext/tag
+    // pair. A tag blob that fails to decode is treated as no tags (no mention)
+    // so one malformed row never errors the whole projection.
+    let mention_sql = format!(
+        "SELECT plaintext, tags_json
+         FROM message_timeline
+         WHERE group_id_hex = ?1
+           AND kind = ?2
+           AND deleted = 0
+           AND invalidation_status IS NULL
+           AND sender != ?3
+           AND {where_sql}"
+    );
+    let mut mention_stmt = tx.prepare(&mention_sql).storage()?;
+    let mut mention_rows = mention_stmt
+        .query(params![
+            group_id_hex,
+            u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?,
+            local_account_id_hex,
+            u64_to_i64(marker_at)?,
+            marker_id,
+        ])
+        .storage()?;
+    let mut mention_count: u64 = 0;
+    while let Some(row) = mention_rows.next().storage()? {
+        let plaintext: String = row.get(0).storage()?;
+        let tags_json: String = row.get(1).storage()?;
+        let tags = crate::tags_from_json(tags_json).unwrap_or_default();
+        if mention_classifier(&plaintext, &tags) {
+            mention_count += 1;
+        }
+    }
     Ok(UnreadSummary {
         count,
+        mention_count,
         first_message_id,
     })
 }
@@ -783,7 +884,8 @@ fn chat_list_rows_tx(
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
                 last_message_kind, last_message_timeline_at, last_message_deleted,
-                unread_count, first_unread_message_id_hex, last_read_message_id_hex,
+                unread_count, unread_mention_count, first_unread_message_id_hex,
+                last_read_message_id_hex,
                 last_read_timeline_at, updated_at
          FROM chat_list_rows
          ORDER BY last_message_timeline_at DESC, group_id_hex"
@@ -794,7 +896,8 @@ fn chat_list_rows_tx(
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
                 last_message_kind, last_message_timeline_at, last_message_deleted,
-                unread_count, first_unread_message_id_hex, last_read_message_id_hex,
+                unread_count, unread_mention_count, first_unread_message_id_hex,
+                last_read_message_id_hex,
                 last_read_timeline_at, updated_at
          FROM chat_list_rows
          WHERE archived = 0
@@ -818,7 +921,8 @@ fn chat_list_row_tx(
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
                 last_message_kind, last_message_timeline_at, last_message_deleted,
-                unread_count, first_unread_message_id_hex, last_read_message_id_hex,
+                unread_count, unread_mention_count, first_unread_message_id_hex,
+                last_read_message_id_hex,
                 last_read_timeline_at, updated_at
          FROM chat_list_rows
          WHERE group_id_hex = ?1",
@@ -863,6 +967,10 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
     let unread_count = raw_unread_count
         .try_into()
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(17, raw_unread_count))?;
+    let raw_unread_mention_count = row.get::<_, i64>(18)?;
+    let unread_mention_count = raw_unread_mention_count
+        .try_into()
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(18, raw_unread_mention_count))?;
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
         archived: row.get::<_, i64>(1)? != 0,
@@ -880,12 +988,14 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
         last_message,
         unread_count,
         has_unread: unread_count > 0,
-        first_unread_message_id_hex: row.get(18)?,
-        last_read_message_id_hex: row.get(19)?,
+        unread_mention_count,
+        has_unread_mention: unread_mention_count > 0,
+        first_unread_message_id_hex: row.get(19)?,
+        last_read_message_id_hex: row.get(20)?,
         last_read_timeline_at: row
-            .get::<_, Option<i64>>(20)?
+            .get::<_, Option<i64>>(21)?
             .and_then(|value| value.try_into().ok()),
-        updated_at: row.get::<_, i64>(21)?.try_into().unwrap_or_default(),
+        updated_at: row.get::<_, i64>(22)?.try_into().unwrap_or_default(),
     })
 }
 

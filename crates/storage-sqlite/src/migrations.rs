@@ -34,6 +34,8 @@ mod migration_0016_leave_requests;
 mod migration_0017_notification_settings_default_on;
 #[path = "migrations/0018_account_group_self_membership.rs"]
 mod migration_0018_account_group_self_membership;
+#[path = "migrations/0019_chat_list_unread_mention_count.rs"]
+mod migration_0019_chat_list_unread_mention_count;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -135,6 +137,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 18,
         name: "0018_account_group_self_membership",
         apply: migration_0018_account_group_self_membership::apply,
+    },
+    Migration {
+        version: 19,
+        name: "0019_chat_list_unread_mention_count",
+        apply: migration_0019_chat_list_unread_mention_count::apply,
     },
 ];
 

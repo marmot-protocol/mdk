@@ -782,10 +782,29 @@ fn notification_is_mention(
 }
 
 fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> bool {
-    if message.kind != MARMOT_APP_EVENT_KIND_CHAT || account_id_hex.is_empty() {
+    message_text_mentions_account(
+        message.kind,
+        &message.plaintext,
+        &message.tags,
+        account_id_hex,
+    )
+}
+
+/// Pure mention predicate over a timeline message's raw fields. A message
+/// mentions `account_id_hex` when it is a kind-9 chat that either carries a
+/// NIP-27 pubkey-reference (`p`) tag resolving to the account, or an inline
+/// `nostr:` pubkey entity referencing it. Shared with the chat-list unread
+/// projection so the @-badge reuses the exact notification classification.
+pub(crate) fn message_text_mentions_account(
+    kind: u64,
+    plaintext: &str,
+    tags: &[Vec<String>],
+    account_id_hex: &str,
+) -> bool {
+    if kind != MARMOT_APP_EVENT_KIND_CHAT || account_id_hex.is_empty() {
         return false;
     }
-    if message.tags.iter().any(|tag| {
+    if tags.iter().any(|tag| {
         tag.first().is_some_and(|name| name == PUBKEY_REF_TAG)
             && tag
                 .get(1)
@@ -794,7 +813,7 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
     }) {
         return true;
     }
-    inline_mention_pubkey_hexes(&message.plaintext)
+    inline_mention_pubkey_hexes(plaintext)
         .iter()
         .any(|mentioned| mentioned.eq_ignore_ascii_case(account_id_hex))
 }

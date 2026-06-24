@@ -383,6 +383,56 @@ fn mention_classification_ignores_non_chat_p_tags() {
 }
 
 #[test]
+fn message_text_mentions_account_matches_message_mentions_account() {
+    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let npub = crate::npub_for_account_id(&receiver).unwrap();
+    let other = nostr::Keys::generate().public_key().to_hex();
+
+    let cases = [
+        // p-tag hex mention.
+        received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]),
+        // npub p-tag mention (normalized to hex).
+        received_chat("hi", vec![vec!["p".to_owned(), npub.clone()]]),
+        // inline NIP-27 mention.
+        received_chat(&format!("hi nostr:{npub}"), Vec::new()),
+        // negative: mentions a different account.
+        received_chat("hi", vec![vec!["p".to_owned(), other.clone()]]),
+        // negative: plain text containing the hex is not a mention.
+        received_chat(&format!("hi {receiver}"), Vec::new()),
+    ];
+
+    for message in cases {
+        assert_eq!(
+            message_text_mentions_account(
+                message.kind,
+                &message.plaintext,
+                &message.tags,
+                &receiver,
+            ),
+            message_mentions_account(&message, &receiver),
+            "parity mismatch for plaintext={:?} tags={:?}",
+            message.plaintext,
+            message.tags,
+        );
+    }
+
+    // The p-tag case is a genuine positive (guards against the parity check
+    // passing only because both always return false).
+    assert!(message_text_mentions_account(
+        MARMOT_APP_EVENT_KIND_CHAT,
+        "hi",
+        &[vec!["p".to_owned(), receiver.clone()]],
+        &receiver,
+    ));
+    assert!(!message_text_mentions_account(
+        MARMOT_APP_EVENT_KIND_CHAT,
+        "hi",
+        &[vec!["p".to_owned(), other]],
+        &receiver,
+    ));
+}
+
+#[test]
 fn mention_notification_suppresses_self_mentions() {
     let receiver = "aa".repeat(32);
     let message = received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]);

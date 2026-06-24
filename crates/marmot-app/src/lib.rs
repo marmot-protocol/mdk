@@ -39,6 +39,7 @@ pub use cgka_traits::app_components::{
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
 };
+use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -1237,9 +1238,10 @@ impl MarmotApp {
         group_id_hex: &str,
     ) -> Result<Option<ChatListRow>, AppError> {
         let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let mut row = self
             .account_storage(&account.label)?
-            .refresh_chat_list_row(&account.account_id_hex, group_id_hex)?;
+            .refresh_chat_list_row(&account.account_id_hex, group_id_hex, &classifier)?;
         self.hydrate_chat_list_row(row.as_mut())?;
         Ok(row)
     }
@@ -1251,9 +1253,10 @@ impl MarmotApp {
     ) -> Result<Option<ChatListRow>, AppError> {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(&account.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let mut row = self
             .account_storage(&account.label)?
-            .initialize_chat_read_state(&account.account_id_hex, group_id_hex)?;
+            .initialize_chat_read_state(&account.account_id_hex, group_id_hex, &classifier)?;
         self.hydrate_chat_list_row(row.as_mut())?;
         Ok(row)
     }
@@ -1266,9 +1269,15 @@ impl MarmotApp {
     ) -> Result<Option<ChatListRow>, AppError> {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(&account.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let mut row = self
             .account_storage(&account.label)?
-            .mark_timeline_message_read(&account.account_id_hex, group_id_hex, message_id_hex)?;
+            .mark_timeline_message_read(
+                &account.account_id_hex,
+                group_id_hex,
+                message_id_hex,
+                &classifier,
+            )?;
         self.hydrate_chat_list_row(row.as_mut())?;
         Ok(row)
     }
@@ -2188,6 +2197,26 @@ impl MarmotApp {
         Ok(())
     }
 
+    /// Build the unread-mention classifier injected into the chat-list
+    /// projection. The storage layer never parses nostr/NIP-21, so it calls back
+    /// into the same notification mention classification (`p`-tag + inline
+    /// `nostr:` pubkey references) used for push notifications, scoped to the
+    /// local account. The unread window is already kind-9 filtered, but the real
+    /// chat kind is passed for correctness.
+    fn chat_list_mention_classifier(
+        account_id_hex: &str,
+    ) -> impl Fn(&str, &[Vec<String>]) -> bool + use<> {
+        let account_id_hex = account_id_hex.to_owned();
+        move |plaintext, tags| {
+            crate::notifications::message_text_mentions_account(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                plaintext,
+                tags,
+                &account_id_hex,
+            )
+        }
+    }
+
     fn ensure_chat_list_projection(&self, account: &AccountSummary) -> Result<(), AppError> {
         let stale = self
             .chat_list_projection_stale
@@ -2203,10 +2232,11 @@ impl MarmotApp {
             return Ok(());
         }
         let storage = self.account_storage(&account.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         if stale {
-            storage.refresh_chat_list_rows(&account.account_id_hex)?;
+            storage.refresh_chat_list_rows(&account.account_id_hex, &classifier)?;
         } else {
-            storage.ensure_chat_list_rows(&account.account_id_hex)?;
+            storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?;
         }
         self.chat_list_projection_warmed
             .lock()

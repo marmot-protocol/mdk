@@ -33,6 +33,16 @@ fn group() -> StoredAccountGroup {
 }
 
 fn chat(id: &str, sender: &str, at: u64, plaintext: &str) -> StoredAppEvent {
+    chat_with_tags(id, sender, at, plaintext, Vec::new())
+}
+
+fn chat_with_tags(
+    id: &str,
+    sender: &str,
+    at: u64,
+    plaintext: &str,
+    tags: Vec<Vec<String>>,
+) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: GROUP.to_owned(),
         message_id_hex: id.to_owned(),
@@ -42,11 +52,28 @@ fn chat(id: &str, sender: &str, at: u64, plaintext: &str) -> StoredAppEvent {
         sender: sender.to_owned(),
         plaintext: plaintext.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
-        tags: Vec::new(),
+        tags,
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
     }
+}
+
+/// Classifier that never matches; used by tests that exercise unread counting
+/// without caring about mention detection.
+fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
+    false
+}
+
+/// Test classifier independent of nostr parsing: a message mentions LOCAL when
+/// it carries a `["p", LOCAL]` tag or names LOCAL inline in its plaintext. This
+/// validates the counting/windowing logic while the real nostr/NIP-21 parsing
+/// is unit-tested in marmot-app.
+fn mentions_local(plaintext: &str, tags: &[Vec<String>]) -> bool {
+    tags.iter().any(|tag| {
+        tag.first().map(String::as_str) == Some("p")
+            && tag.get(1).map(String::as_str) == Some(LOCAL)
+    }) || plaintext.contains(LOCAL)
 }
 
 fn reaction(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
@@ -104,7 +131,7 @@ fn initialize_chat_read_state_returns_none_for_unknown_group() {
     let store = setup_store();
 
     let row = store
-        .initialize_chat_read_state(LOCAL, "missing-group")
+        .initialize_chat_read_state(LOCAL, "missing-group", &no_mentions)
         .unwrap();
 
     assert_eq!(row, None);
@@ -118,7 +145,7 @@ fn refresh_chat_list_row_returns_refreshed_single_group_projection() {
         .unwrap();
 
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
 
@@ -130,7 +157,9 @@ fn refresh_chat_list_row_returns_refreshed_single_group_projection() {
         Some("latest")
     );
     assert_eq!(
-        store.refresh_chat_list_row(LOCAL, "missing-group").unwrap(),
+        store
+            .refresh_chat_list_row(LOCAL, "missing-group", &no_mentions)
+            .unwrap(),
         None
     );
 }
@@ -144,7 +173,7 @@ fn refresh_chat_list_row_projects_group_avatar_url() {
     let store = setup_store_with_group(group);
 
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
 
@@ -168,7 +197,9 @@ fn chat_list_reads_cached_projection_without_rebuilding() {
         Vec::new()
     );
 
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
@@ -186,7 +217,9 @@ fn chat_list_reads_cached_projection_without_rebuilding() {
         .expect("chat row");
     assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "old");
 
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
@@ -202,7 +235,7 @@ fn ensure_chat_list_rows_backfills_missing_projection_rows() {
         .record_app_event(&chat("latest", REMOTE, 10, "backfilled"))
         .unwrap();
 
-    store.ensure_chat_list_rows(LOCAL).unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
@@ -216,7 +249,9 @@ fn ensure_chat_list_rows_backfills_missing_projection_rows() {
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_account_group_rows() {
     let store = setup_store();
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -228,7 +263,7 @@ fn ensure_chat_list_rows_rebuilds_stale_account_group_rows() {
         .unwrap();
     }
 
-    store.ensure_chat_list_rows(LOCAL).unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
@@ -245,12 +280,14 @@ fn ensure_chat_list_rows_rebuilds_stale_message_rows() {
     store
         .record_app_event(&chat("old", REMOTE, 10, "old preview"))
         .unwrap();
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     store
         .record_app_event(&chat("new", REMOTE, 11, "new preview"))
         .unwrap();
 
-    store.ensure_chat_list_rows(LOCAL).unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
@@ -268,7 +305,9 @@ fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
     store
         .record_app_event(&chat("unread", REMOTE, 10, "needs read state"))
         .unwrap();
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -287,7 +326,7 @@ fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
         .unwrap();
     }
 
-    store.ensure_chat_list_rows(LOCAL).unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
@@ -306,7 +345,7 @@ fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
         .unwrap();
 
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     assert_eq!(row.group_id_hex, GROUP);
@@ -314,7 +353,9 @@ fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
     assert_eq!(row.unread_count, 0);
     assert_eq!(row.last_message.as_ref().unwrap().message_id_hex, "old");
 
-    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     store
         .record_app_event(&reaction("reaction", REMOTE, "old", 11))
         .unwrap();
@@ -323,14 +364,14 @@ fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
         .unwrap();
 
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     assert_eq!(row.unread_count, 1);
     assert_eq!(row.first_unread_message_id_hex.as_deref(), Some("new"));
 
     store
-        .mark_timeline_message_read(LOCAL, GROUP, "new")
+        .mark_timeline_message_read(LOCAL, GROUP, "new", &no_mentions)
         .unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
@@ -349,7 +390,9 @@ fn invalidated_kind9_tombstones_do_not_count_as_unread() {
     // markable chat rows, so the read pointer can never advance past them. They
     // must not keep `unread_count` pinned above zero.
     let store = setup_store();
-    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
 
     // A visible received chat the client will actually read.
     store
@@ -367,7 +410,7 @@ fn invalidated_kind9_tombstones_do_not_count_as_unread() {
     // Before invalidation: all four received chats are unread.
     assert_eq!(
         store
-            .refresh_chat_list_row(LOCAL, GROUP)
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row")
             .unread_count,
@@ -383,7 +426,7 @@ fn invalidated_kind9_tombstones_do_not_count_as_unread() {
 
     // The client reads the only visible chat row.
     store
-        .mark_timeline_message_read(LOCAL, GROUP, "visible")
+        .mark_timeline_message_read(LOCAL, GROUP, "visible", &no_mentions)
         .unwrap();
 
     let row = store
@@ -402,13 +445,15 @@ fn invalidated_kind9_tombstones_do_not_count_as_unread() {
 #[test]
 fn own_kind9_send_clears_existing_unread_without_counting_as_unread() {
     let store = setup_store();
-    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     store
         .record_app_event(&chat("remote", REMOTE, 10, "unread"))
         .unwrap();
     assert_eq!(
         store
-            .refresh_chat_list_row(LOCAL, GROUP)
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row")
             .unread_count,
@@ -419,7 +464,7 @@ fn own_kind9_send_clears_existing_unread_without_counting_as_unread() {
         .record_app_event(&chat("own", LOCAL, 11, "my reply"))
         .unwrap();
     store
-        .mark_timeline_message_read(LOCAL, GROUP, "own")
+        .mark_timeline_message_read(LOCAL, GROUP, "own", &no_mentions)
         .unwrap();
     let row = store
         .chat_list_rows(crate::ChatListQuery::default())
@@ -453,7 +498,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
 
     // Before invalidation the latest row wins, as usual.
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     let last_message = row.last_message.expect("last message");
@@ -467,7 +512,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
     // Preview and sort anchor must fall back to the visible delivered message,
     // not the invalidated tombstone.
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     let last_message = row.last_message.expect("last message");
@@ -488,7 +533,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
 
     // And the completeness check considers the projection up to date, so a
     // subsequent ensure pass is a no-op rather than perpetually rebuilding.
-    store.ensure_chat_list_rows(LOCAL).unwrap();
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     let after_ensure = store
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
@@ -514,10 +559,185 @@ fn chat_list_preview_is_empty_when_only_invalidated_kind9_exists() {
         .unwrap();
 
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     assert_eq!(row.last_message, None);
+}
+
+#[test]
+fn unread_p_tag_mention_of_local_account_counts() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat_with_tags(
+            "ping",
+            REMOTE,
+            10,
+            "hey there",
+            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        ))
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.unread_mention_count, 1);
+    assert!(row.has_unread_mention);
+}
+
+#[test]
+fn unread_inline_mention_of_local_account_counts() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat("inline", REMOTE, 10, &format!("yo {LOCAL} around?")))
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.unread_mention_count, 1);
+    assert!(row.has_unread_mention);
+}
+
+#[test]
+fn unread_mention_of_other_account_does_not_count() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat_with_tags(
+            "ping-other",
+            REMOTE,
+            10,
+            "no inline mention here",
+            vec![vec!["p".to_owned(), REMOTE.to_owned()]],
+        ))
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.unread_mention_count, 0);
+    assert!(!row.has_unread_mention);
+}
+
+#[test]
+fn already_read_mention_does_not_count_as_unread_mention() {
+    let store = setup_store();
+    // A mention arrives, then the client reads it: it is before the read marker
+    // and must not contribute to the unread-mention count.
+    store
+        .record_app_event(&chat_with_tags(
+            "read-mention",
+            REMOTE,
+            10,
+            "mention before read",
+            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        ))
+        .unwrap();
+    store
+        .mark_timeline_message_read(LOCAL, GROUP, "read-mention", &mentions_local)
+        .unwrap();
+    // A later non-mention message keeps the conversation unread overall.
+    store
+        .record_app_event(&chat("after", REMOTE, 11, "plain follow-up"))
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(row.unread_count, 1);
+    assert_eq!(row.unread_mention_count, 0);
+    assert!(!row.has_unread_mention);
+}
+
+#[test]
+fn self_sent_mention_does_not_count_as_unread_mention() {
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    // A message authored by the local account that references the local account
+    // is excluded by the unread window (sender == local), so it cannot count.
+    store
+        .record_app_event(&chat_with_tags(
+            "self",
+            LOCAL,
+            10,
+            &format!("note to self {LOCAL}"),
+            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        ))
+        .unwrap();
+
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
+        .unwrap()
+        .expect("chat row");
+
+    assert_eq!(row.unread_count, 0);
+    assert_eq!(row.unread_mention_count, 0);
+    assert!(!row.has_unread_mention);
+}
+
+#[test]
+fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
+    // Mirrors a migration-0018 upgrade: the projection exists and is otherwise
+    // complete, but `unread_mention_count` defaults to 0. `ensure_chat_list_rows`
+    // must recompute the mention count per group and rebuild rows that are wrong.
+    let store = setup_store();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .record_app_event(&chat_with_tags(
+            "ping",
+            REMOTE,
+            10,
+            "mention",
+            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        ))
+        .unwrap();
+    // Build the projection WITHOUT mention awareness (count stays 0), then
+    // simulate the post-migration default explicitly.
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows SET unread_mention_count = 0 WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &mentions_local).unwrap();
+    let row = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap()
+        .pop()
+        .expect("chat row");
+
+    assert_eq!(row.unread_mention_count, 1);
+    assert!(row.has_unread_mention);
 }
 
 #[test]
@@ -537,8 +757,12 @@ fn account_unread_total_aggregates_materialized_projection() {
     store
         .record_app_event(&chat("old", REMOTE, 10, "before first open"))
         .unwrap();
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
-    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     store
         .record_app_event(&chat("new-1", REMOTE, 11, "after first open"))
         .unwrap();
@@ -547,7 +771,7 @@ fn account_unread_total_aggregates_materialized_projection() {
         .unwrap();
 
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     assert_eq!(row.unread_count, 2);
@@ -566,13 +790,17 @@ fn account_unread_total_excludes_archived_conversations() {
     store
         .record_app_event(&chat("old", REMOTE, 10, "before first open"))
         .unwrap();
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
-    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     store
         .record_app_event(&chat("new", REMOTE, 11, "after first open"))
         .unwrap();
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     assert!(row.archived);
@@ -592,13 +820,17 @@ fn setup_store_with_one_unread() -> SqliteAccountStorage {
     store
         .record_app_event(&chat("old", REMOTE, 10, "before first open"))
         .unwrap();
-    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
-    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+    store
+        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        .unwrap();
     store
         .record_app_event(&chat("new", REMOTE, 11, "after first open"))
         .unwrap();
     let row = store
-        .refresh_chat_list_row(LOCAL, GROUP)
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     assert_eq!(row.unread_count, 1);
