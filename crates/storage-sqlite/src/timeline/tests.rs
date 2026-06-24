@@ -1156,3 +1156,200 @@ fn timeline_message_target_reflects_invalidated_row() {
     assert!(found.invalidated);
     assert!(!found.deleted);
 }
+
+fn modifier_edge_count(store: &SqliteAccountStorage, modifier_message_id_hex: &str) -> i64 {
+    let conn = store.lock().unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM message_modifier_edges
+         WHERE group_id_hex = ?1 AND modifier_message_id_hex = ?2",
+        params![&"11".repeat(32), modifier_message_id_hex],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn reaction_appears_in_summary_via_indexed_edge() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+
+    let message = list(&store).pop().unwrap();
+
+    assert_eq!(message.reactions.user_reactions.len(), 1);
+    assert_eq!(
+        message.reactions.user_reactions[0].reaction_message_id_hex,
+        "reaction-1"
+    );
+    assert_eq!(message.reactions.user_reactions[0].emoji, "+");
+    assert_eq!(
+        message.reactions.by_emoji.get("+").map(Vec::as_slice),
+        Some(["bob".to_owned()].as_slice())
+    );
+}
+
+#[test]
+fn reaction_deleted_by_its_sender_is_excluded_but_other_sender_does_not_retract() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+
+    // A delete from a DIFFERENT sender than the reaction author must not retract
+    // the reaction.
+    store
+        .record_app_event(&delete("mallory-retract", "mallory", "reaction-1", 3))
+        .unwrap();
+    let message = list(&store).pop().unwrap();
+    assert_eq!(
+        message.reactions.user_reactions.len(),
+        1,
+        "a delete by a different sender must not retract the reaction"
+    );
+
+    // The reaction author's own delete retracts it.
+    store
+        .record_app_event(&delete("bob-retract", "bob", "reaction-1", 4))
+        .unwrap();
+    let message = list(&store).pop().unwrap();
+    assert!(
+        message.reactions.user_reactions.is_empty(),
+        "a delete by the reaction author retracts the reaction"
+    );
+    assert!(message.reactions.by_emoji.is_empty());
+}
+
+#[test]
+fn message_delete_by_sender_clears_content_and_reactions_but_other_sender_does_not() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "secret"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+
+    // A delete from someone other than the message author leaves it intact.
+    store
+        .record_app_event(&delete("mallory-delete", "mallory", "target", 3))
+        .unwrap();
+    let message = list(&store).pop().unwrap();
+    assert!(!message.deleted);
+    assert_eq!(message.plaintext, "secret");
+    assert_eq!(message.reactions.user_reactions.len(), 1);
+
+    // The message author's own delete clears content and reactions.
+    store
+        .record_app_event(&delete("alice-delete", "alice", "target", 4))
+        .unwrap();
+    let message = list(&store).pop().unwrap();
+    assert!(message.deleted);
+    assert_eq!(
+        message.deleted_by_message_id_hex.as_deref(),
+        Some("alice-delete")
+    );
+    assert_eq!(message.plaintext, "");
+    assert!(message.reactions.user_reactions.is_empty());
+    assert!(message.reactions.by_emoji.is_empty());
+}
+
+#[test]
+fn re_recording_reaction_does_not_duplicate_edges_or_reaction() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+    // Re-record the identical reaction (upsert on the same modifier id).
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+
+    assert_eq!(
+        modifier_edge_count(&store, "reaction-1"),
+        1,
+        "re-recording a reaction must not duplicate its modifier edge"
+    );
+    let message = list(&store).pop().unwrap();
+    assert_eq!(
+        message.reactions.user_reactions.len(),
+        1,
+        "the reaction must appear exactly once after an upsert"
+    );
+}
+
+#[test]
+fn pruning_modifier_event_cascades_its_edges() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 100, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-old", "bob", "target", 10, "+"))
+        .unwrap();
+    assert_eq!(modifier_edge_count(&store, "reaction-old"), 1);
+
+    store.prune_app_events_before(&"11".repeat(32), 50).unwrap();
+
+    assert_eq!(
+        modifier_edge_count(&store, "reaction-old"),
+        0,
+        "pruning the modifier app_event must cascade-delete its modifier edges"
+    );
+}
+
+#[test]
+fn many_reactions_retract_across_bind_parameter_chunk_boundary() {
+    // Exercises the chunked deleted-reaction lookup: a single hot message with
+    // more reactions than SQLITE_BIND_PARAMETER_CHUNK forces the retract query
+    // to span multiple chunks. Every reaction author then deletes their own
+    // reaction, so the full set must be retracted regardless of which chunk a
+    // given reaction id lands in.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+
+    let count = SQLITE_BIND_PARAMETER_CHUNK + 50;
+    for i in 0..count {
+        let sender = format!("sender-{i}");
+        let reaction_id = format!("reaction-{i}");
+        store
+            .record_app_event(&reaction(&reaction_id, &sender, "target", 2, "+"))
+            .unwrap();
+    }
+
+    let message = list(&store).pop().unwrap();
+    assert_eq!(
+        message.reactions.user_reactions.len(),
+        count,
+        "every recorded reaction must appear before any retraction"
+    );
+
+    // Each reaction author retracts their own reaction. The final projection
+    // re-derives over all reaction ids, which crosses the chunk boundary.
+    for i in 0..count {
+        let sender = format!("sender-{i}");
+        let delete_id = format!("delete-{i}");
+        let target_reaction = format!("reaction-{i}");
+        store
+            .record_app_event(&delete(&delete_id, &sender, &target_reaction, 3))
+            .unwrap();
+    }
+
+    let message = list(&store).pop().unwrap();
+    assert!(
+        message.reactions.user_reactions.is_empty(),
+        "all reactions must retract even when the lookup spans multiple bind-parameter chunks"
+    );
+    assert!(message.reactions.by_emoji.is_empty());
+}

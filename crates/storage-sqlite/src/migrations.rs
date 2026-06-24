@@ -36,6 +36,8 @@ mod migration_0017_notification_settings_default_on;
 mod migration_0018_account_group_self_membership;
 #[path = "migrations/0019_chat_list_unread_mention_count.rs"]
 mod migration_0019_chat_list_unread_mention_count;
+#[path = "migrations/0020_message_modifier_edges.rs"]
+mod migration_0020_message_modifier_edges;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -142,6 +144,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 19,
         name: "0019_chat_list_unread_mention_count",
         apply: migration_0019_chat_list_unread_mention_count::apply,
+    },
+    Migration {
+        version: 20,
+        name: "0020_message_modifier_edges",
+        apply: migration_0020_message_modifier_edges::apply,
     },
 ];
 
@@ -483,6 +490,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_membership, "member");
+    }
+
+    #[test]
+    fn message_modifier_edges_migration_backfills_existing_reaction_and_delete_rows() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // Versions 1-19 are the schema state immediately before
+        // 0020_message_modifier_edges.
+        run(&mut conn, &MIGRATIONS[..19]).unwrap();
+
+        let group = "11".repeat(32);
+        // A reaction app_event referencing one target via an "e" tag.
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                plaintext, kind, tags_json, recorded_at, received_at
+             )
+             VALUES (?1, 'reaction-1', 'source-reaction-1', 'received', 'bob',
+                     '+', 7, ?2, 2, 2)",
+            params![group, r#"[["e","target"]]"#],
+        )
+        .unwrap();
+        // A delete app_event referencing two targets, producing two edges.
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                plaintext, kind, tags_json, recorded_at, received_at
+             )
+             VALUES (?1, 'delete-1', 'source-delete-1', 'received', 'alice',
+                     '', 5, ?2, 3, 3)",
+            params![group, r#"[["e","target"],["e","other"]]"#],
+        )
+        .unwrap();
+        // A non-modifier chat event must NOT produce any edge.
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                plaintext, kind, tags_json, recorded_at, received_at
+             )
+             VALUES (?1, 'chat-1', 'source-chat-1', 'received', 'alice',
+                     'hello', 9, '[]', 1, 1)",
+            params![group],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let edges: Vec<(String, String, i64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT modifier_message_id_hex, target_message_id_hex, kind, sender
+                     FROM message_modifier_edges
+                     ORDER BY modifier_message_id_hex, target_message_id_hex",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+
+        assert_eq!(
+            edges,
+            vec![
+                (
+                    "delete-1".to_owned(),
+                    "other".to_owned(),
+                    5,
+                    "alice".to_owned()
+                ),
+                (
+                    "delete-1".to_owned(),
+                    "target".to_owned(),
+                    5,
+                    "alice".to_owned()
+                ),
+                (
+                    "reaction-1".to_owned(),
+                    "target".to_owned(),
+                    7,
+                    "bob".to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

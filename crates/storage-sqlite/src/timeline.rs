@@ -320,6 +320,7 @@ impl SqliteAccountStorage {
                 ],
             )
             .storage()?;
+            upsert_message_modifier_edges_tx(&conn, event)?;
             if can_incrementally_project {
                 upsert_message_timeline_projection_for_message_tx(
                     &conn,
@@ -696,6 +697,8 @@ pub(crate) fn secure_prune_app_events_before_tx(
         // under `secure_delete` before DELETE also rewrites the old index key.
         scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
 
+        // Deleting the owning app_events rows cascades to message_modifier_edges
+        // via its ON DELETE CASCADE foreign key.
         let pruned = tx
             .execute(
                 "DELETE FROM app_events
@@ -927,6 +930,48 @@ fn project_single_message_timeline_tx(
     Ok(Some((row, stream_start)))
 }
 
+/// Mirror a REACTION/DELETE event's `EVENT_REF_TAG` ("e") targets into the
+/// indexed `message_modifier_edges` table so modifier lookups can run as an
+/// indexed equality join instead of a JSON `LIKE` substring scan. Non-modifier
+/// events have no edges. `record_app_event` upserts the owning `app_events` row,
+/// so existing edges for this modifier are deleted first and re-inserted from
+/// the event's current tags, keeping edges consistent with any tag change.
+fn upsert_message_modifier_edges_tx(tx: &Connection, event: &StoredAppEvent) -> StorageResult<()> {
+    if !matches!(
+        event.kind,
+        MARMOT_APP_EVENT_KIND_REACTION | MARMOT_APP_EVENT_KIND_DELETE
+    ) {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM message_modifier_edges
+         WHERE group_id_hex = ?1 AND modifier_message_id_hex = ?2",
+        params![&event.group_id_hex, &event.message_id_hex],
+    )
+    .storage()?;
+    let kind = u64_to_i64(event.kind)?;
+    let recorded_at = u64_to_i64(event.recorded_at)?;
+    for target in tag_values(&event.tags, EVENT_REF_TAG) {
+        tx.execute(
+            "INSERT OR IGNORE INTO message_modifier_edges (
+                group_id_hex, modifier_message_id_hex, target_message_id_hex,
+                kind, sender, recorded_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &event.group_id_hex,
+                &event.message_id_hex,
+                target,
+                kind,
+                &event.sender,
+                recorded_at,
+            ],
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
 fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> StorageResult<()> {
     let reactions = app_events_targeting_message_tx(
         tx,
@@ -990,19 +1035,64 @@ fn deleted_reaction_ids_for_target_tx(
     group_id_hex: &str,
     reactions: &[RawAppEvent],
 ) -> StorageResult<HashSet<String>> {
-    let mut deleted = HashSet::new();
-    for reaction in reactions {
-        let deletes = app_events_targeting_message_tx(
-            tx,
-            group_id_hex,
+    if reactions.is_empty() {
+        return Ok(HashSet::new());
+    }
+    // Set-based queries collect every (reaction id, deleting sender) pair for
+    // the given reactions instead of issuing one lookup per reaction (N+1). A
+    // reaction is retracted only when a non-invalidated DELETE by the SAME
+    // sender targets it. Reaction ids are bound in fixed-size chunks so the
+    // placeholder count per statement stays well under SQLite's variable limit
+    // even on hot messages with very many reactions (same pattern as
+    // `delete_timeline_projection_rows_by_ids_tx`).
+    let mut delete_pairs = Vec::<(String, String)>::new();
+    for chunk in reactions.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT edges.target_message_id_hex, app_events.sender
+             FROM message_modifier_edges AS edges
+             JOIN app_events
+               ON app_events.group_id_hex = edges.group_id_hex
+              AND app_events.message_id_hex = edges.modifier_message_id_hex
+             WHERE edges.group_id_hex = ?
+               AND edges.kind = ?
+               AND app_events.invalidated = 0
+               AND edges.target_message_id_hex IN ({placeholders})"
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
+        values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        values.push(rusqlite::types::Value::Integer(u64_to_i64(
             MARMOT_APP_EVENT_KIND_DELETE,
-            &reaction.message_id_hex,
-        )?;
-        if deletes
-            .iter()
-            .any(|delete| delete.sender == reaction.sender)
+        )?));
+        values.extend(
+            chunk
+                .iter()
+                .map(|reaction| rusqlite::types::Value::Text(reaction.message_id_hex.clone())),
+        );
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_pairs = stmt
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        delete_pairs.extend(chunk_pairs);
+    }
+
+    let reaction_senders: HashMap<&str, &str> = reactions
+        .iter()
+        .map(|reaction| (reaction.message_id_hex.as_str(), reaction.sender.as_str()))
+        .collect();
+    let mut deleted = HashSet::new();
+    for (target, delete_sender) in &delete_pairs {
+        if reaction_senders
+            .get(target.as_str())
+            .is_some_and(|reaction_sender| *reaction_sender == delete_sender.as_str())
         {
-            deleted.insert(reaction.message_id_hex.clone());
+            deleted.insert(target.clone());
         }
     }
     Ok(deleted)
@@ -1014,34 +1104,35 @@ fn app_events_targeting_message_tx(
     kind: u64,
     target_message_id_hex: &str,
 ) -> StorageResult<Vec<RawAppEvent>> {
-    let target_pattern = json_string_like_pattern(target_message_id_hex)?;
+    // The edge table encodes exactly the old `tag_values(tags, EVENT_REF_TAG)
+    // .any(|t| t == target)` relationship (one edge per "e" tag value), so the
+    // indexed join is equivalent to the former JSON `LIKE` scan plus Rust-side
+    // re-filter, without either. Ordering is preserved byte-for-byte.
     let mut stmt = tx
         .prepare(
-            "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
-                    plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason
-             FROM app_events
-             WHERE group_id_hex = ?1
-               AND kind = ?2
-               AND invalidated = 0
-               AND tags_json LIKE ?3 ESCAPE '\\'
-             ORDER BY recorded_at, message_id_hex, insert_order",
+            "SELECT app_events.group_id_hex, app_events.message_id_hex, app_events.source_message_id_hex,
+                    app_events.source_epoch, app_events.direction, app_events.sender,
+                    app_events.plaintext, app_events.kind, app_events.tags_json,
+                    app_events.recorded_at, app_events.received_at,
+                    app_events.invalidated, app_events.invalidation_reason
+             FROM message_modifier_edges AS edges
+             JOIN app_events
+               ON app_events.group_id_hex = edges.group_id_hex
+              AND app_events.message_id_hex = edges.modifier_message_id_hex
+             WHERE edges.group_id_hex = ?1
+               AND edges.kind = ?2
+               AND edges.target_message_id_hex = ?3
+               AND app_events.invalidated = 0
+             ORDER BY app_events.recorded_at, app_events.message_id_hex, app_events.insert_order",
         )
         .storage()?;
-    let events = stmt
-        .query_map(
-            params![group_id_hex, u64_to_i64(kind)?, target_pattern],
-            raw_event_from_row,
-        )
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
-    Ok(events
-        .into_iter()
-        .filter(|event| {
-            tag_values(&event.tags, EVENT_REF_TAG).any(|target| target == target_message_id_hex)
-        })
-        .collect())
+    stmt.query_map(
+        params![group_id_hex, u64_to_i64(kind)?, target_message_id_hex],
+        raw_event_from_row,
+    )
+    .storage()?
+    .collect::<Result<Vec<_>, _>>()
+    .storage()
 }
 
 fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> StorageResult<()> {
@@ -1122,23 +1213,6 @@ fn upsert_agent_stream_start_tx(tx: &Connection, start: &StreamStartRow) -> Stor
     )
     .storage()?;
     Ok(())
-}
-
-fn json_string_like_pattern(value: &str) -> StorageResult<String> {
-    let quoted =
-        serde_json::to_string(value).map_err(|err| StorageError::Serialization(err.to_string()))?;
-    Ok(format!("%{}%", escape_like_literal(&quoted)))
-}
-
-fn escape_like_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
 }
 
 fn app_events_for_rebuild_tx(
