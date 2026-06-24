@@ -83,9 +83,9 @@ These are the scenarios another implementation should be able to load from JSON 
 ### `drop-queued/v1`
 
 - File: `vectors/drop-queued.v1.json`
-- Setup: Alice creates a group with Bob, then Bob sends Alice an app message.
-- Pressure: the queued app message is dropped before delivery.
-- Expected: Alice stays stable and does not receive the dropped payload.
+- Setup: Alice creates a group with Bob, then Bob sends Alice two app messages.
+- Pressure: the first queued app message is dropped before delivery; the second is delivered.
+- Expected: Alice stays stable, never receives the dropped payload, and receives only the delivered payload.
 
 ### `queue-faults/v1`
 

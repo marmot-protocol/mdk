@@ -248,7 +248,8 @@ jobs:
         run: |
           cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
             --vectors crates/cgka-conformance-simulator/vectors \
-            --out target/cgka-conformance-simulator-reports
+            --out target/cgka-conformance-simulator-reports \
+            --strict-oracle
 
       - name: Upload vector report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

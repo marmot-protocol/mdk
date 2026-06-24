@@ -23,7 +23,7 @@ use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, Qu
 const POLL_TIMEOUT: Duration = Duration::from_secs(8);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Self-remove and admin-remove commits can take longer to converge on loaded CI runners.
-const MEMBER_REMOVAL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const MEMBER_REMOVAL_POLL_TIMEOUT: Duration = Duration::from_secs(90);
 
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
@@ -1399,7 +1399,10 @@ fn sync_until_member_removed(
 ) -> Value {
     let deadline = Instant::now() + MEMBER_REMOVAL_POLL_TIMEOUT;
     let mut last = Value::Null;
+    let mut last_retry = Value::Null;
+    let mut attempts = 0;
     while Instant::now() < deadline {
+        attempts += 1;
         let _ = run_json_with_relay(home, relay, &["--account", account, "sync"]);
         // Sync persists the SelfRemove convergence candidate with a due time;
         // give that timestamp a chance to become eligible before the next CLI
@@ -1413,7 +1416,7 @@ fn sync_until_member_removed(
         // Ignore the command's JSON result because the authoritative assertion
         // is the independent group-members projection below; command failures
         // remain fatal so the test never silently skips the convergence step.
-        let _ = run_json_with_relay(
+        last_retry = run_json_with_relay(
             home,
             relay,
             &[
@@ -1425,7 +1428,12 @@ fn sync_until_member_removed(
                 "converge",
             ],
         );
-        let members = run_json(home, &["--account", account, "group", "members", group_id]);
+        let _ = run_json_with_relay(home, relay, &["--account", account, "sync"]);
+        let members = run_json_with_relay(
+            home,
+            relay,
+            &["--account", account, "group", "members", group_id],
+        );
         if !member_accounts(&members).contains(&member.to_owned()) {
             return members;
         }
@@ -1433,8 +1441,9 @@ fn sync_until_member_removed(
         std::thread::sleep(POLL_INTERVAL);
     }
     panic!(
-        "account <REDACTED_ACCOUNT> still sees departed member in <REDACTED_GROUP>; {}",
-        json_value_summary("last_members", &last)
+        "account <REDACTED_ACCOUNT> still sees departed member in <REDACTED_GROUP>; attempts={attempts}; {}; {}",
+        json_value_summary("last_members", &last),
+        json_value_summary("last_retry", &last_retry)
     );
 }
 

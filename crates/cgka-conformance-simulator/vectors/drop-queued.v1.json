@@ -52,6 +52,11 @@
         "index": 0
       },
       {
+        "type": "send_app_message",
+        "sender": "bob",
+        "payload": "bob:delivered"
+      },
+      {
         "type": "deliver_all"
       },
       {
@@ -81,7 +86,9 @@
       "client": "alice",
       "epoch": 1,
       "member_count": 2,
-      "received_payloads": []
+      "received_payloads": [
+        "bob:delivered"
+      ]
     }
   ]
 }
