@@ -250,6 +250,44 @@ async fn epoch_confirmed_inherits_operation_human_action() {
         .expect("epoch_confirmed should inherit the operation's human_action");
     assert_eq!(human_action.action, "create_group");
     assert_eq!(human_action.origin, "local_user");
+
+    let state_rows = events
+        .iter()
+        .filter(|event| matches!(event.kind, AuditEventKind::EpochStateChanged { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        state_rows.iter().any(|event| {
+            matches!(
+                &event.kind,
+                AuditEventKind::EpochStateChanged {
+                    new_state,
+                    reason,
+                    ..
+                } if new_state == "pending_publish" && reason == "begin_pending"
+            )
+        }),
+        "begin_pending state transition should be recorded"
+    );
+    let confirmed_state = state_rows
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.kind,
+                AuditEventKind::EpochStateChanged {
+                    new_state,
+                    reason,
+                    ..
+                } if new_state == "stable" && reason == "publish_confirmed"
+            )
+        })
+        .expect("publish_confirmed state transition should be recorded");
+    let state_human_action = confirmed_state
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.human_action.as_ref())
+        .expect("epoch_state_changed should inherit the operation's human_action");
+    assert_eq!(state_human_action.action, "create_group");
+    assert_eq!(state_human_action.origin, "local_user");
 }
 
 #[tokio::test]

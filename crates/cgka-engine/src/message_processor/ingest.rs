@@ -452,7 +452,23 @@ impl<S: StorageProvider> Engine<S> {
                                 mls_bytes.as_slice(),
                             )? {
                                 ForkResolution::MissingSnapshot => {
+                                    let previous_state =
+                                        self.epoch_manager.state(&group_id).map(|state| {
+                                            crate::audit_helpers::epoch_state_name_str(state.name())
+                                                .to_string()
+                                        });
                                     self.epoch_manager.detect_fork(&group_id, vec![]);
+                                    self.audit_group(
+                                        &group_id,
+                                        crate::audit_helpers::epoch_state_changed_event(
+                                            previous_state.as_deref(),
+                                            "recovering",
+                                            msg_epoch,
+                                            "fork_detected",
+                                            None,
+                                            None,
+                                        ),
+                                    );
                                     self.update_stored_message_state(
                                         &msg.id,
                                         MessageState::EpochInvalidated,
@@ -502,7 +518,23 @@ impl<S: StorageProvider> Engine<S> {
                                 });
                             }
                             ForkResolution::MissingSnapshot => {
+                                let previous_state =
+                                    self.epoch_manager.state(&group_id).map(|state| {
+                                        crate::audit_helpers::epoch_state_name_str(state.name())
+                                            .to_string()
+                                    });
                                 self.epoch_manager.detect_fork(&group_id, vec![]);
+                                self.audit_group(
+                                    &group_id,
+                                    crate::audit_helpers::epoch_state_changed_event(
+                                        previous_state.as_deref(),
+                                        "recovering",
+                                        msg_epoch,
+                                        "fork_detected",
+                                        None,
+                                        None,
+                                    ),
+                                );
                                 self.update_stored_message_state(
                                     &msg.id,
                                     MessageState::EpochInvalidated,

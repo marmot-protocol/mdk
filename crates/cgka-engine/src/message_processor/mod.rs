@@ -432,6 +432,15 @@ impl<S: StorageProvider> Engine<S> {
         change: GroupStateChange,
         origin_commit_id: Option<MessageId>,
     ) {
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::group_state_changed_event(
+                epoch,
+                actor.as_ref(),
+                &change,
+                origin_commit_id.as_ref(),
+            ),
+        );
         self.events_buf.push_back(GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch,

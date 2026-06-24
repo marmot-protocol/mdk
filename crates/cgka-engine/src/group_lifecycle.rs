@@ -300,6 +300,19 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::CreateGroup,
             self.current_audit_context.clone(),
         )?;
+        self.audit_group(
+            &group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                Some("stable"),
+                "pending_publish",
+                projected_epoch,
+                "begin_pending",
+                Some(pending_ref),
+                Some(crate::audit_helpers::pending_kind_str(
+                    crate::epoch_manager::PendingKind::CreateGroup,
+                )),
+            ),
+        );
 
         if let Some(guard) = pending_commit_guard {
             guard.disarm();
@@ -531,8 +544,21 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         // 7. State machine: Stable at the post-welcome epoch.
+        let joined_epoch = EpochId(mls_group.epoch().as_u64());
         self.epoch_manager
-            .set_stable(group_id.clone(), EpochId(mls_group.epoch().as_u64()));
+            .set_stable(group_id.clone(), joined_epoch);
+        self.audit_group(
+            &group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                None,
+                "stable",
+                joined_epoch,
+                "join_welcome",
+                None,
+                None,
+            ),
+        );
+        self.audit_group_context(&group_id, "join_welcome");
 
         // 8. Persist durable dedup state for direct `join_welcome`
         // callers. The ingest path records the welcome after this

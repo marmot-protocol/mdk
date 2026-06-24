@@ -118,6 +118,18 @@ impl<S: StorageProvider> Engine<S> {
                 crate::audit_helpers::pending_kind_str(kind),
             ),
         );
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context.clone(),
+            crate::audit_helpers::epoch_state_changed_event(
+                Some("pending_publish"),
+                "stable",
+                new_epoch,
+                "publish_confirmed",
+                Some(pending),
+                Some(crate::audit_helpers::pending_kind_str(kind)),
+            ),
+        );
         // The transport id of the commit we just confirmed. It identifies the
         // rows the upcoming `GroupStateChanged` events synthesize, so they can be
         // invalidated by origin commit if this commit later loses a fork.
@@ -217,11 +229,23 @@ impl<S: StorageProvider> Engine<S> {
         let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
         self.audit_with_context(
             Some(&group_id),
-            audit_context,
+            audit_context.clone(),
             crate::audit_helpers::epoch_rolled_back_event(
                 pending_epoch_pre,
                 prior_epoch,
                 crate::audit_helpers::pending_kind_str(kind),
+            ),
+        );
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context,
+            crate::audit_helpers::epoch_state_changed_event(
+                Some("pending_publish"),
+                "stable",
+                prior_epoch,
+                "publish_failed",
+                Some(pending),
+                Some(crate::audit_helpers::pending_kind_str(kind)),
             ),
         );
         self.pending_state_changes.remove(&pending);

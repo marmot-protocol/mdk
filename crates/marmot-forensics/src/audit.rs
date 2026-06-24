@@ -45,6 +45,9 @@ pub type GroupRefHex = String;
 /// Hex-encoded `MessageId` bytes.
 pub type MessageRefHex = String;
 
+/// Hex-encoded 16-byte stable hash of Marmot member identity bytes.
+pub type MemberRefHex = String;
+
 /// Hex-encoded 32-byte SHA-256 digest.
 pub type DigestHex = String;
 
@@ -311,6 +314,41 @@ pub enum AuditEventKind {
         restored_epoch: u64,
         pending_kind: String,
     },
+    /// The per-group engine epoch state changed. This is the compact state
+    /// machine breadcrumb; epoch deltas and publish details remain on the
+    /// more specific rows such as `epoch_confirmed`.
+    EpochStateChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_state: Option<String>,
+        new_state: String,
+        epoch: u64,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_ref: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_kind: Option<String>,
+    },
+    /// A durable, MLS-authenticated group-state delta was surfaced through
+    /// `GroupEvent::GroupStateChanged`. Value-bearing changes intentionally
+    /// carry digests/lengths rather than plaintext profile values.
+    GroupStateChanged {
+        epoch: u64,
+        change_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_member_ref: Option<MemberRefHex>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_member_ref: Option<MemberRefHex>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_commit_id: Option<MessageRefHex>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fields: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        component_ids: Vec<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value_digest: Option<DigestHex>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value_len: Option<u64>,
+    },
     /// Session open found an OpenMLS staged commit persisted under the
     /// publish-before-apply contract with no in-memory pending state to
     /// resolve it (the process crashed between publish and
@@ -360,6 +398,8 @@ pub enum AuditEventKind {
         selected_fork_epoch: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected_tip_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        error_kinds: Vec<String>,
     },
     /// Transport peeler returned a result at the engine boundary.
     PeelerOutcome {
@@ -427,6 +467,8 @@ impl AuditEventKind {
             AuditEventKind::PublishFailure { .. } => "publish_failure",
             AuditEventKind::EpochConfirmed { .. } => "epoch_confirmed",
             AuditEventKind::EpochRolledBack { .. } => "epoch_rolled_back",
+            AuditEventKind::EpochStateChanged { .. } => "epoch_state_changed",
+            AuditEventKind::GroupStateChanged { .. } => "group_state_changed",
             AuditEventKind::PendingCommitRecoveredOnOpen { .. } => {
                 "pending_commit_recovered_on_open"
             }

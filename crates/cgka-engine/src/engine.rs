@@ -629,6 +629,18 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         self.epoch_manager.set_stable(group_id.clone(), group.epoch);
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                None,
+                "stable",
+                group.epoch,
+                "hydrate_stable_group",
+                None,
+                None,
+            ),
+        );
+        self.audit_group_context(group_id, "hydrate_stable_group");
         Ok(group.epoch)
     }
 

@@ -316,6 +316,19 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+        self.audit_group(
+            &group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                Some("stable"),
+                "pending_publish",
+                new_epoch,
+                "begin_pending",
+                Some(pending_ref),
+                Some(crate::audit_helpers::pending_kind_str(
+                    crate::epoch_manager::PendingKind::GroupEvolution,
+                )),
+            ),
+        );
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),

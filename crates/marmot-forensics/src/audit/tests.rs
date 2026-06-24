@@ -270,9 +270,8 @@ fn audit_event_round_trips_through_serde() {
     assert_eq!(parsed, event);
 }
 
-#[test]
-fn audit_event_kind_round_trips_all_variants() {
-    let kinds = vec![
+fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
+    vec![
         AuditEventKind::RecorderStarted {
             recorder_session_id: "recorder-1".into(),
             recorder: "jsonl".into(),
@@ -394,7 +393,30 @@ fn audit_event_kind_round_trips_all_variants() {
             restored_epoch: 0,
             pending_kind: "group_evolution".into(),
         },
+        AuditEventKind::EpochStateChanged {
+            previous_state: Some("pending_publish".into()),
+            new_state: "stable".into(),
+            epoch: 1,
+            reason: "publish_confirmed".into(),
+            pending_ref: Some(7),
+            pending_kind: Some("group_evolution".into()),
+        },
+        AuditEventKind::GroupStateChanged {
+            epoch: 2,
+            change_kind: "member_added".into(),
+            actor_member_ref: Some("a".repeat(32)),
+            subject_member_ref: Some("b".repeat(32)),
+            origin_commit_id: Some("m".into()),
+            fields: vec!["members".into()],
+            component_ids: Vec::new(),
+            value_digest: None,
+            value_len: None,
+        },
         AuditEventKind::PendingCommitRecoveredOnOpen { recovered_epoch: 3 },
+        AuditEventKind::GroupHydrationQuarantined {
+            group_digest: "b".repeat(64),
+            reason: "openmls_load_failed".into(),
+        },
         AuditEventKind::GroupHydrationRecovered {
             group_digest: "a".repeat(64),
         },
@@ -402,6 +424,13 @@ fn audit_event_kind_round_trips_all_variants() {
             snapshot_name: "fork-1-2-abc".into(),
             source_epoch: 0,
             reason: "pre_commit".into(),
+        },
+        AuditEventKind::ForkResolution {
+            source_epoch: 2,
+            candidate_digest: "c".repeat(64),
+            incumbent_digest: Some("d".repeat(64)),
+            winner: ForkWinner::Candidate,
+            invalidated_msg_id: Some("m".into()),
         },
         AuditEventKind::ConvergenceDecision {
             current_tip_epoch: 3,
@@ -411,6 +440,7 @@ fn audit_event_kind_round_trips_all_variants() {
             selected_branch_id: Some("br-1".into()),
             selected_fork_epoch: Some(2),
             selected_tip_epoch: Some(3),
+            error_kinds: vec!["missing_retained_anchor".into()],
         },
         AuditEventKind::PeelerOutcome {
             msg_id: "m".into(),
@@ -438,8 +468,12 @@ fn audit_event_kind_round_trips_all_variants() {
             msg_id: "m".into(),
             reason: "unattributable_sender".into(),
         },
-    ];
-    for kind in kinds {
+    ]
+}
+
+#[test]
+fn audit_event_kind_round_trips_all_variants() {
+    for kind in sample_audit_event_kinds() {
         let event = AuditEvent {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
             seq: 0,
@@ -455,4 +489,37 @@ fn audit_event_kind_round_trips_all_variants() {
         let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.kind, kind);
     }
+}
+
+#[test]
+fn audit_log_event_schema_tracks_kind_catalog() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v1.schema.json")).unwrap();
+    assert_eq!(
+        schema
+            .pointer("/properties/schema_version/const")
+            .and_then(serde_json::Value::as_str),
+        Some(AUDIT_LOG_SCHEMA_VERSION)
+    );
+
+    let schema_tags = schema
+        .pointer("/$defs/auditEventKind/oneOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("schema kind oneOf")
+        .iter()
+        .map(|variant| {
+            variant
+                .pointer("/properties/type/const")
+                .and_then(serde_json::Value::as_str)
+                .expect("kind type const")
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let code_tags = sample_audit_event_kinds()
+        .iter()
+        .map(|kind| kind.type_tag().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(schema_tags, code_tags);
 }

@@ -1,0 +1,584 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.marmot.dev/forensics/audit-log-event.v1.schema.json",
+  "title": "Marmot forensic audit log event",
+  "description": "Schema for one line in a Marmot append-only forensic audit JSONL file.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "seq", "wall_time_ms", "engine_id", "kind"],
+  "properties": {
+    "schema_version": {
+      "const": "marmot-forensics-audit/v1"
+    },
+    "seq": {
+      "$ref": "#/$defs/u64"
+    },
+    "wall_time_ms": {
+      "$ref": "#/$defs/u64"
+    },
+    "recorder_session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "account_ref": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{32}$"
+    },
+    "engine_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "group_ref": {
+      "$ref": "#/$defs/hexString"
+    },
+    "context": {
+      "$ref": "#/$defs/auditEventContext"
+    },
+    "kind": {
+      "$ref": "#/$defs/auditEventKind"
+    }
+  },
+  "$defs": {
+    "u64": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "u16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "hexString": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]+$"
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "u16Array": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/u16"
+      }
+    },
+    "messageRefArray": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/hexString"
+      }
+    },
+    "auditEventContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation_id": {
+          "type": "string"
+        },
+        "human_action": {
+          "$ref": "#/$defs/auditHumanActionContext"
+        },
+        "transport": {
+          "$ref": "#/$defs/auditTransportContext"
+        },
+        "engine": {
+          "$ref": "#/$defs/auditEngineContext"
+        },
+        "group": {
+          "$ref": "#/$defs/auditGroupContext"
+        }
+      }
+    },
+    "auditHumanActionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "origin"],
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "origin": {
+          "type": "string"
+        },
+        "fields": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "component_ids": {
+          "$ref": "#/$defs/u16Array"
+        },
+        "target_count": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "auditTransportContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport_source"],
+      "properties": {
+        "transport_source": {
+          "type": "string"
+        },
+        "delivery_plane": {
+          "type": "string"
+        },
+        "relay_url": {
+          "type": "string"
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      }
+    },
+    "auditEngineContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ciphersuite": {
+          "$ref": "#/$defs/u16"
+        },
+        "max_past_epochs": {
+          "$ref": "#/$defs/u64"
+        },
+        "convergence_max_rewind_commits": {
+          "$ref": "#/$defs/u64"
+        },
+        "supported_app_component_count": {
+          "$ref": "#/$defs/u64"
+        },
+        "feature_count": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "auditGroupContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/u64"
+        },
+        "member_count": {
+          "$ref": "#/$defs/u64"
+        },
+        "required_app_component_count": {
+          "$ref": "#/$defs/u64"
+        },
+        "admin_count": {
+          "$ref": "#/$defs/u64"
+        },
+        "convergence_max_rewind_commits": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "publishRelayFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relay_url", "reason"],
+      "properties": {
+        "relay_url": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "forkWinner": {
+      "enum": ["candidate", "incumbent", "missing_snapshot"]
+    },
+    "peelerOutcomeKind": {
+      "enum": ["success", "decrypt_failed", "stale_epoch", "malformed", "other"]
+    },
+    "auditEventKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "recorder_session_id", "recorder"],
+          "properties": {
+            "type": { "const": "recorder_started" },
+            "recorder_session_id": { "type": "string" },
+            "recorder": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "context"],
+          "properties": {
+            "type": { "const": "engine_context" },
+            "context": { "$ref": "#/$defs/auditEngineContext" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "reason", "context"],
+          "properties": {
+            "type": { "const": "group_context" },
+            "reason": { "type": "string" },
+            "context": { "$ref": "#/$defs/auditGroupContext" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "serialization_failures", "write_failures", "flush_failures"],
+          "properties": {
+            "type": { "const": "recorder_health" },
+            "serialization_failures": { "$ref": "#/$defs/u64" },
+            "write_failures": { "$ref": "#/$defs/u64" },
+            "flush_failures": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "action", "origin", "phase"],
+          "properties": {
+            "type": { "const": "human_action" },
+            "action": { "type": "string" },
+            "origin": { "type": "string" },
+            "phase": { "type": "string" },
+            "fields": { "$ref": "#/$defs/stringArray" },
+            "component_ids": { "$ref": "#/$defs/u16Array" },
+            "target_count": { "$ref": "#/$defs/u64" },
+            "message_ids": { "$ref": "#/$defs/messageRefArray" },
+            "from_epoch": { "$ref": "#/$defs/u64" },
+            "to_epoch": { "$ref": "#/$defs/u64" },
+            "error_kind": { "type": "string" },
+            "detail": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "envelope_kind", "transport_source", "payload_len", "payload_digest"],
+          "properties": {
+            "type": { "const": "ingest_entry" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "envelope_kind": { "type": "string" },
+            "transport_source": { "type": "string" },
+            "payload_len": { "$ref": "#/$defs/u64" },
+            "payload_digest": { "$ref": "#/$defs/hexString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "outcome_kind"],
+          "properties": {
+            "type": { "const": "ingest_outcome" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "outcome_kind": { "type": "string" },
+            "stale_reason": { "type": "string" },
+            "epoch": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "error_kind"],
+          "properties": {
+            "type": { "const": "ingest_error" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "error_kind": { "type": "string" },
+            "detail": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "intent_kind"],
+          "properties": {
+            "type": { "const": "send_entry" },
+            "intent_kind": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "intent_kind", "result_kind"],
+          "properties": {
+            "type": { "const": "send_outcome" },
+            "intent_kind": { "type": "string" },
+            "result_kind": { "type": "string" },
+            "outbound_msg_id": { "$ref": "#/$defs/hexString" },
+            "outbound_welcome_msg_ids": { "$ref": "#/$defs/messageRefArray" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "intent_kind", "error_kind"],
+          "properties": {
+            "type": { "const": "send_error" },
+            "intent_kind": { "type": "string" },
+            "error_kind": { "type": "string" },
+            "detail": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "member_count", "required_feature_count", "app_component_count", "initial_admin_count"],
+          "properties": {
+            "type": { "const": "create_group_entry" },
+            "member_count": { "$ref": "#/$defs/u64" },
+            "required_feature_count": { "$ref": "#/$defs/u64" },
+            "app_component_count": { "$ref": "#/$defs/u64" },
+            "initial_admin_count": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "result_kind"],
+          "properties": {
+            "type": { "const": "create_group_outcome" },
+            "result_kind": { "type": "string" },
+            "outbound_welcome_msg_ids": { "$ref": "#/$defs/messageRefArray" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "error_kind"],
+          "properties": {
+            "type": { "const": "create_group_error" },
+            "error_kind": { "type": "string" },
+            "detail": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "target_kind", "required_acks"],
+          "properties": {
+            "type": { "const": "publish_attempt" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "target_kind": { "type": "string" },
+            "relay_urls": { "$ref": "#/$defs/stringArray" },
+            "required_acks": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "target_kind", "required_acks", "met_required_acks"],
+          "properties": {
+            "type": { "const": "publish_outcome" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "target_kind": { "type": "string" },
+            "accepted_relay_urls": { "$ref": "#/$defs/stringArray" },
+            "failed_relays": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/publishRelayFailure" }
+            },
+            "required_acks": { "$ref": "#/$defs/u64" },
+            "met_required_acks": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "stage", "target_kind", "reason"],
+          "properties": {
+            "type": { "const": "publish_failure" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "stage": { "type": "string" },
+            "target_kind": { "type": "string" },
+            "relay_urls": { "$ref": "#/$defs/stringArray" },
+            "reason": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "from_epoch", "to_epoch", "pending_kind"],
+          "properties": {
+            "type": { "const": "epoch_confirmed" },
+            "from_epoch": { "$ref": "#/$defs/u64" },
+            "to_epoch": { "$ref": "#/$defs/u64" },
+            "pending_kind": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "pending_epoch", "restored_epoch", "pending_kind"],
+          "properties": {
+            "type": { "const": "epoch_rolled_back" },
+            "pending_epoch": { "$ref": "#/$defs/u64" },
+            "restored_epoch": { "$ref": "#/$defs/u64" },
+            "pending_kind": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "new_state", "epoch", "reason"],
+          "properties": {
+            "type": { "const": "epoch_state_changed" },
+            "previous_state": { "type": "string" },
+            "new_state": { "type": "string" },
+            "epoch": { "$ref": "#/$defs/u64" },
+            "reason": { "type": "string" },
+            "pending_ref": { "$ref": "#/$defs/u64" },
+            "pending_kind": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "epoch", "change_kind"],
+          "properties": {
+            "type": { "const": "group_state_changed" },
+            "epoch": { "$ref": "#/$defs/u64" },
+            "change_kind": {
+              "enum": [
+                "member_added",
+                "member_removed",
+                "member_left",
+                "admin_added",
+                "admin_removed",
+                "group_renamed",
+                "group_avatar_changed",
+                "message_retention_changed"
+              ]
+            },
+            "actor_member_ref": { "type": "string", "pattern": "^[0-9A-Fa-f]{32}$" },
+            "subject_member_ref": { "type": "string", "pattern": "^[0-9A-Fa-f]{32}$" },
+            "origin_commit_id": { "$ref": "#/$defs/hexString" },
+            "fields": { "$ref": "#/$defs/stringArray" },
+            "component_ids": { "$ref": "#/$defs/u16Array" },
+            "value_digest": { "$ref": "#/$defs/hexString" },
+            "value_len": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "recovered_epoch"],
+          "properties": {
+            "type": { "const": "pending_commit_recovered_on_open" },
+            "recovered_epoch": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "group_digest", "reason"],
+          "properties": {
+            "type": { "const": "group_hydration_quarantined" },
+            "group_digest": { "$ref": "#/$defs/hexString" },
+            "reason": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "group_digest"],
+          "properties": {
+            "type": { "const": "group_hydration_recovered" },
+            "group_digest": { "$ref": "#/$defs/hexString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "snapshot_name", "source_epoch", "reason"],
+          "properties": {
+            "type": { "const": "snapshot_created" },
+            "snapshot_name": { "type": "string" },
+            "source_epoch": { "$ref": "#/$defs/u64" },
+            "reason": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "source_epoch", "candidate_digest", "winner"],
+          "properties": {
+            "type": { "const": "fork_resolution" },
+            "source_epoch": { "$ref": "#/$defs/u64" },
+            "candidate_digest": { "$ref": "#/$defs/hexString" },
+            "incumbent_digest": { "$ref": "#/$defs/hexString" },
+            "winner": { "$ref": "#/$defs/forkWinner" },
+            "invalidated_msg_id": { "$ref": "#/$defs/hexString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "current_tip_epoch", "candidate_count", "eligible_count", "max_rewind_commits"],
+          "properties": {
+            "type": { "const": "convergence_decision" },
+            "current_tip_epoch": { "$ref": "#/$defs/u64" },
+            "candidate_count": { "$ref": "#/$defs/u64" },
+            "eligible_count": { "$ref": "#/$defs/u64" },
+            "max_rewind_commits": { "$ref": "#/$defs/u64" },
+            "selected_branch_id": { "type": "string" },
+            "selected_fork_epoch": { "$ref": "#/$defs/u64" },
+            "selected_tip_epoch": { "$ref": "#/$defs/u64" },
+            "error_kinds": { "$ref": "#/$defs/stringArray" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "outcome", "fallback_snapshot_used"],
+          "properties": {
+            "type": { "const": "peeler_outcome" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "outcome": { "$ref": "#/$defs/peelerOutcomeKind" },
+            "fallback_snapshot_used": { "type": "boolean" },
+            "fallback_snapshot_name": { "type": "string" },
+            "fallback_snapshot_source_epoch": { "$ref": "#/$defs/u64" },
+            "fallback_attempt_count": { "$ref": "#/$defs/u64" },
+            "error_kind": { "type": "string" },
+            "detail": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "proposal_kind", "decision"],
+          "properties": {
+            "type": { "const": "auto_commit_decision" },
+            "proposal_kind": { "type": "string" },
+            "decision": { "type": "string" },
+            "reason": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "new_state", "reason"],
+          "properties": {
+            "type": { "const": "message_state_changed" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "previous_state": { "type": "string" },
+            "new_state": { "type": "string" },
+            "epoch": { "$ref": "#/$defs/u64" },
+            "reason": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "msg_id", "reason"],
+          "properties": {
+            "type": { "const": "rejection" },
+            "msg_id": { "$ref": "#/$defs/hexString" },
+            "reason": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}

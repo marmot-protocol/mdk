@@ -221,6 +221,11 @@ impl<S: StorageProvider> Engine<S> {
                 selected_branch_id: result.selected_branch_id.clone(),
                 selected_fork_epoch: result.selected_fork_epoch,
                 selected_tip_epoch: result.selected_tip,
+                error_kinds: result
+                    .errors
+                    .iter()
+                    .map(|error| canonicalization_error_tag(*error).to_string())
+                    .collect(),
             },
         );
         if matches!(
@@ -238,7 +243,23 @@ impl<S: StorageProvider> Engine<S> {
             .errors
             .contains(&CanonicalizationError::MissingRetainedAnchor)
         {
+            let previous_state = self
+                .epoch_manager
+                .state(group_id)
+                .map(|state| crate::audit_helpers::epoch_state_name_str(state.name()).to_string());
             self.epoch_manager.mark_unrecoverable(group_id);
+            let epoch = self.epoch_manager.epoch(group_id).unwrap_or(previous_tip);
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::EpochStateChanged {
+                    previous_state,
+                    new_state: "unrecoverable".to_string(),
+                    epoch: epoch.0,
+                    reason: "missing_retained_anchor".to_string(),
+                    pending_ref: None,
+                    pending_kind: None,
+                },
+            );
             self.events_buf.push_back(GroupEvent::GroupUnrecoverable {
                 group_id: group_id.clone(),
             });
@@ -664,6 +685,17 @@ fn app_invalidation_reason(reason: InvalidatedAppMessageReason) -> AppMessageInv
         InvalidatedAppMessageReason::UndecryptableInCanonicalState => {
             AppMessageInvalidationReason::UndecryptableInCanonicalState
         }
+    }
+}
+
+fn canonicalization_error_tag(error: CanonicalizationError) -> &'static str {
+    match error {
+        CanonicalizationError::UnsupportedPolicy => "unsupported_policy",
+        CanonicalizationError::MissingRetainedAnchor => "missing_retained_anchor",
+        CanonicalizationError::CandidateStateUnavailable => "candidate_state_unavailable",
+        CanonicalizationError::MlsValidationFailed => "mls_validation_failed",
+        CanonicalizationError::OutboundIntentStale => "outbound_intent_stale",
+        CanonicalizationError::StorageUnavailable => "storage_unavailable",
     }
 }
 

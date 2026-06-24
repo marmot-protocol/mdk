@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-06-10
+updated: 2026-06-24
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -21,7 +21,7 @@ treated like telemetry.
 | --- | --- |
 | Local JSONL recording | Implemented by `marmot-forensics::JsonlRecorder`, installed into each `AccountDeviceSession` only when app-level `AuditLogSettings.enabled` is true before that account session opens. |
 | Default behavior | Off. Without an installed recorder, the engine uses `NoopRecorder` and emits no JSONL records. |
-| File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v1`. |
+| File shape | Append-only JSONL/NDJSON, one `AuditEvent` per line, schema version `marmot-forensics-audit/v1`; the line-level JSON Schema is [`audit-log-event.v1.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v1.schema.json). |
 | Local file location | `<account_dir>/audit-<engine_id>.jsonl` for app-opened account sessions. |
 | Upload/listing | App and UniFFI expose listing and explicit upload of local `audit-*.jsonl` files. Runtime can also post all local audit files to a configured tracker. |
 | Static bundle analyzer | Not present in the current repo path. The current artifact model is raw append-only JSONL audit logs. |
@@ -30,10 +30,10 @@ treated like telemetry.
 
 | Area | Files |
 | --- | --- |
-| Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs) |
+| Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v1.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v1.schema.json) |
 | Engine recorder installation point | [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs), [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) |
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
-| Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor.rs`](../../crates/cgka-engine/src/message_processor.rs), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`fork_recovery.rs`](../../crates/cgka-engine/src/fork_recovery.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs) |
+| Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`fork_recovery.rs`](../../crates/cgka-engine/src/fork_recovery.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
 | Account publish audit call sites | [`crates/marmot-account/src/lib.rs`](../../crates/marmot-account/src/lib.rs) |
 | App settings, file identities, listing, upload | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
 | Runtime tracker scheduling | [`crates/marmot-app/src/runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
@@ -151,10 +151,14 @@ Each line serializes an `AuditEvent`:
 ```
 
 Optional fields are omitted when `None`. Empty vectors such as `outbound_welcome_msg_ids`, `relay_urls`,
-`accepted_relay_urls`, and `failed_relays` are omitted when empty.
+`accepted_relay_urls`, `failed_relays`, `fields`, `component_ids`, and `error_kinds` are omitted when empty.
 
 Do not treat `seq` as globally unique. It is recorder-local and can reset after reopening. For ingest/storage tooling,
 prefer file hash plus line number, or raw line hash plus line number, for dedupe and indexing.
+
+The JSON Schema validates one `AuditEvent` object, not a whole JSONL file. JSONL/NDJSON consumers should parse each line
+independently against [`audit-log-event.v1.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v1.schema.json)
+and retain the raw line for forward-compatible reprocessing.
 
 ### `context`
 
@@ -232,7 +236,7 @@ join from "what the human did" to "what the engine and relays did."
 | Field | Meaning |
 | --- | --- |
 | `action` | Stable app-level action label. |
-| `origin` | `local_user` for actions initiated by this device, or `observed_group_event` for actions inferred from inbound group state. |
+| `origin` | `local_user` for actions initiated by this device, `observed_group_event` for actions inferred from inbound group state, or `system` for rows the recorder backfilled because no human action context was supplied. |
 | `phase` | `succeeded` for local actions after publish success, or `observed` for inbound actions inferred from received group events. |
 | `fields` | Stable field labels affected by the action. Raw names, descriptions, URLs, pubkeys, member ids, and payloads are not written here. |
 | `component_ids` | App component ids touched by the action, when the action maps to app component data. |
@@ -249,6 +253,13 @@ Current local-user action labels:
 - `invite_members`
 - `remove_members`
 - `leave_group`
+- `send_message`
+- `reply_message`
+- `edit_message`
+- `react`
+- `unreact`
+- `delete_message`
+- `send_media`
 - `decline_group_invite`
 - `promote_admin`
 - `demote_admin`
@@ -277,6 +288,8 @@ Current observed action labels:
 
 Group-state coverage:
 
+- MLS-authenticated group-state deltas are recorded directly as `group_state_changed` with epoch, change kind,
+  stable member refs, affected fields/components, and origin commit id when attributable;
 - name changes are recorded as `update_group_profile` with field `name`;
 - description changes are recorded as `update_group_profile` with field `description`;
 - admin additions/removals are recorded as `promote_admin`, `demote_admin`, or `update_admin_policy` with field
@@ -526,6 +539,77 @@ Metadata notes:
 - This event has `group_ref`.
 - After rollback the engine clears pending recovery state and replays buffered messages.
 
+### `epoch_state_changed`
+
+Emitted when the engine's per-group `EpochState` changes or is re-established during session hydration.
+
+| Field | Meaning |
+| --- | --- |
+| `previous_state` | Previous state when known. Omitted when the previous state is absent or intentionally not read. |
+| `new_state` | New engine state. |
+| `epoch` | Epoch associated with the new state. |
+| `reason` | Stable call-site reason. |
+| `pending_ref` | Pending publish ref when the transition concerns a pending publish. |
+| `pending_kind` | `create_group` or `group_evolution` when the transition concerns a pending publish. |
+
+Current `new_state` values:
+
+- `stable`
+- `pending_publish`
+- `recovering`
+- `unrecoverable`
+
+Current `reason` values found in production call sites:
+
+- `hydrate_stable_group`
+- `join_welcome`
+- `begin_pending`
+- `publish_confirmed`
+- `publish_failed`
+- `fork_detected`
+- `missing_retained_anchor`
+
+Metadata notes:
+
+- `epoch_confirmed` and `epoch_rolled_back` remain the detailed publish lifecycle rows. `epoch_state_changed` is the
+  state-machine breadcrumb that lets analyzers reconstruct the client's group state without replaying engine internals.
+
+### `group_state_changed`
+
+Emitted from the engine's `GroupEvent::GroupStateChanged` choke point for MLS-authenticated durable group-state deltas.
+
+| Field | Meaning |
+| --- | --- |
+| `epoch` | Epoch reached when the change was applied. |
+| `change_kind` | Normalized change kind. |
+| `actor_member_ref` | Optional stable 16-byte hash of the committing/acting member identity. |
+| `subject_member_ref` | Optional stable 16-byte hash of the changed member/admin identity. |
+| `origin_commit_id` | Commit message id that produced this change when attributable. |
+| `fields` | Stable field labels affected by the change. |
+| `component_ids` | App component ids touched by the change when applicable. |
+| `value_digest` | Domain-separated SHA-256 digest for value-bearing changes such as rename. |
+| `value_len` | Byte length of the value digested in `value_digest`. |
+
+`change_kind` values:
+
+- `member_added`
+- `member_removed`
+- `member_left`
+- `admin_added`
+- `admin_removed`
+- `group_renamed`
+- `group_avatar_changed`
+- `message_retention_changed`
+
+Metadata notes:
+
+- Member refs are stable hashes, not raw member ids, so a dashboard can correlate membership/admin changes across client
+  audit files without storing the raw pubkey in this row.
+- Rename and message-retention rows include `value_digest` and `value_len`, not the raw value. Avatar rows identify the
+  affected avatar field family but do not include URL, image key, or image bytes.
+- For convergence reorgs that apply several accepted commits in one pass, `origin_commit_id` remains omitted because the
+  net diff cannot be safely split per commit. A single accepted commit pass carries the commit id.
+
 ### `snapshot_created`
 
 Emitted after fork-recovery snapshot creation succeeds.
@@ -581,11 +665,23 @@ Emitted when `select_canonical_branch` / canonicalization evaluates stored candi
 | `selected_branch_id` | Optional id of the selected branch. |
 | `selected_fork_epoch` | Optional fork epoch of the selected branch. |
 | `selected_tip_epoch` | Optional tip epoch of the selected branch. |
+| `error_kinds` | Stable selector error tags reported by canonicalization, omitted when empty. |
+
+`error_kinds` values:
+
+- `unsupported_policy`
+- `missing_retained_anchor`
+- `candidate_state_unavailable`
+- `mls_validation_failed`
+- `outbound_intent_stale`
+- `storage_unavailable`
 
 Metadata notes:
 
 - This event has `group_ref`.
 - `candidate_count` and `eligible_count` are copied from the canonicalization result that drove the decision.
+- If `error_kinds` contains `missing_retained_anchor`, the engine also emits `epoch_state_changed` with
+  `new_state = "unrecoverable"` and `reason = "missing_retained_anchor"`.
 
 ### `peeler_outcome`
 
@@ -722,11 +818,16 @@ metadata keys for indexing.
 | `target_kind` | `group`, `inbox`, `unknown` |
 | `publish stage` | `routing`, `adapter`, `required_acks` |
 | `delivery_plane` | `discovery`, `account_inbox`, `group`, `ephemeral` |
-| `human_action.origin` | `local_user`, `observed_group_event` |
+| `human_action.origin` | `local_user`, `observed_group_event`, `system` |
 | `human_action.phase` | `succeeded`, `observed` |
-| `human_action.action` | `create_group`, `invite_members`, `remove_members`, `leave_group`, `decline_group_invite`, `promote_admin`, `demote_admin`, `self_demote_admin`, `update_admin_policy`, `update_message_retention`, `replace_encrypted_media_blob_endpoints`, `update_group_avatar_url`, `update_group_profile`, `group_joined`, `update_group_image`, `epoch_changed` |
-| `human_action.fields` | `name`, `description`, `admins`, `members`, `membership`, `avatar_url`, `image`, `message_retention`, `encrypted_media` |
+| `human_action.action` | local/observed action labels such as `create_group`, `invite_members`, `remove_members`, `leave_group`, `send_message`, `reply_message`, `edit_message`, `react`, `unreact`, `delete_message`, `send_media`, `decline_group_invite`, `promote_admin`, `demote_admin`, `self_demote_admin`, `update_admin_policy`, `update_message_retention`, `replace_encrypted_media_blob_endpoints`, `update_group_avatar_url`, `update_group_profile`, `group_joined`, `update_group_image`, `epoch_changed`; `system` rows use the audit event kind tag as the action. |
+| `human_action.fields` | `name`, `description`, `admins`, `members`, `membership`, `avatar_url`, `avatar`, `image`, `message_retention`, `encrypted_media` |
 | `pending_kind` | `create_group`, `group_evolution` |
+| `epoch_state.new_state` | `stable`, `pending_publish`, `recovering`, `unrecoverable` |
+| `epoch_state.reason` | `hydrate_stable_group`, `join_welcome`, `begin_pending`, `publish_confirmed`, `publish_failed`, `fork_detected`, `missing_retained_anchor` |
+| `group_state.change_kind` | `member_added`, `member_removed`, `member_left`, `admin_added`, `admin_removed`, `group_renamed`, `group_avatar_changed`, `message_retention_changed` |
+| `group_state.fields` | `members`, `membership`, `admins`, `name`, `avatar`, `message_retention` |
+| `convergence error_kinds` | `unsupported_policy`, `missing_retained_anchor`, `candidate_state_unavailable`, `mls_validation_failed`, `outbound_intent_stale`, `storage_unavailable` |
 | `proposal_kind` | `add`, `update`, `remove`, `pre_shared_key`, `re_init`, `external_init`, `group_context_extensions`, `self_remove`, `app_ephemeral`, `app_data_update`, `custom` |
 | `new_state` | `sent`, `created`, `processed`, `failed`, `retryable`, `peel_deferred`, `epoch_invalidated` |
 | `ForkWinner` | `candidate`, `incumbent`, `missing_snapshot` |
@@ -866,6 +967,34 @@ The runtime has a coalescing uploader queue of size `1`. It schedules tracker up
 Tracker scheduling itself logs only the trigger, skip reason, uploaded count, failed count, and file index for failed
 uploads. It does not log audit file contents.
 
+## Coverage audit
+
+The current JSONL surface is intended to reconstruct a group timeline from the perspective of one account-device, then
+let server-side tooling collate multiple devices into group-level analytics.
+
+| Question | Current audit coverage |
+| --- | --- |
+| Which recorder/session/account/device produced the row? | Top-level `recorder_session_id`, `account_ref`, `engine_id`, `seq`, and `wall_time_ms`. |
+| What operation was running? | `context.operation_id`, `context.human_action`, `send_*`, `create_group_*`, and app-level `human_action` rows. |
+| What inbound/outbound message entered the engine? | `ingest_entry`, `ingest_outcome`, `ingest_error`, `send_entry`, `send_outcome`, `send_error`, and `message_state_changed`. |
+| How did publish-before-apply resolve? | `publish_attempt`, `publish_outcome`, `publish_failure`, `epoch_confirmed`, `epoch_rolled_back`, and `epoch_state_changed`. |
+| What state did the engine believe the group was in? | `group_context` snapshots and `epoch_state_changed` rows for hydrate, join, pending publish, publish resolution, fork recovery, and unrecoverable transitions. |
+| How did MLS-authenticated group state change? | `group_state_changed` rows for membership, self-leave, admin, rename, avatar, and message-retention deltas, including epoch and origin commit id when attributable. |
+| Why did a fork/convergence decision happen? | `snapshot_created`, `fork_resolution`, `convergence_decision`, `peeler_outcome`, `auto_commit_decision`, and message-state invalidation rows. |
+| Which app-level state changed outside core membership/profile/admin deltas? | Observed/local `human_action` rows cover message retention, encrypted-media endpoints, avatar URL/image updates, and profile/admin projection deltas. |
+| Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. |
+
+Intentional non-goals / limits:
+
+- Founding group state is represented by `create_group_*`, `group_context`, and `epoch_state_changed`, not as a bundle of
+  synthetic `group_state_changed` rows for every initial member/admin.
+- A convergence pass that applies several commits emits the net `group_state_changed` diff without `origin_commit_id`;
+  only a single accepted commit pass can safely attribute the whole diff to one commit.
+- The schema does not include plaintext message payloads, ciphertext, raw MLS bytes, group names, descriptions, avatar
+  URLs, image keys, or raw member ids in the new group-state rows.
+- The repo still does not contain a static bundle analyzer; external tooling should consume JSONL files using the
+  committed schema.
+
 ## Data sensitivity
 
 Audit JSONL can include:
@@ -880,6 +1009,9 @@ Audit JSONL can include:
 - epoch numbers, branch ids, fork epochs, and convergence policy values;
 - engine and group context snapshots such as ciphersuite, retained-history limit, component counts, member count, admin
   count, and convergence rewind policy;
+- group-state change kinds, stable actor/subject member refs, origin commit ids, affected fields/components, and
+  value digests/lengths for value-bearing changes;
+- epoch-state transition rows, including pending refs and stable transition reasons;
 - human-action labels, changed-field labels, touched app component ids, target counts, and linked message ids;
 - peeler error strings in `peeler_outcome.detail`;
 - local wall-clock timestamps.
@@ -889,6 +1021,7 @@ Audit JSONL does not currently include:
 - plaintext message content;
 - ciphertext or raw MLS bytes;
 - raw account ids or Nostr pubkeys as top-level fields;
+- raw member ids in `group_state_changed` rows;
 - raw changed group-profile values such as group name, description, avatar URL, image keys, admin pubkeys, or member ids
   in `human_action`;
 - upload endpoint, upload token, or upload source headers;
@@ -912,7 +1045,8 @@ Recommended indexes for downstream ingestion:
 - `group_ref`;
 - `kind.type`;
 - event-specific fields such as `msg_id`, `outcome_kind`, `stale_reason`, `new_state`, `reason`, `selected_branch_id`,
-  `selected_fork_epoch`, and `winner`.
+  `selected_fork_epoch`, `error_kinds`, `winner`, `change_kind`, `actor_member_ref`, `subject_member_ref`, and
+  `origin_commit_id`.
 
 Recommended parser behavior:
 

@@ -4,13 +4,20 @@
 //! sites. These produce stable, low-cardinality strings that an analyzer
 //! can group on.
 
-use cgka_traits::engine::{SendIntent, SendResult};
+use cgka_traits::app_components::{
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID,
+};
+use cgka_traits::engine::{GroupStateChange, SendIntent, SendResult};
+use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use cgka_traits::message::MessageState;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
-use cgka_traits::types::EpochId;
-use marmot_forensics::{AuditEventKind, DigestHex, MessageRefHex};
+use cgka_traits::types::{EpochId, MemberId, MessageId};
+use marmot_forensics::{AuditEventKind, DigestHex, MemberRefHex, MessageRefHex};
+use sha2::{Digest, Sha256};
 
 use crate::epoch_manager::PendingKind;
 use openmls::prelude::Proposal;
@@ -150,9 +157,142 @@ pub(crate) fn message_state_str(state: MessageState) -> &'static str {
     }
 }
 
+pub(crate) fn epoch_state_name_str(name: &str) -> &'static str {
+    match name {
+        "Stable" => "stable",
+        "PendingPublish" => "pending_publish",
+        "Merging" => "merging",
+        "Recovering" => "recovering",
+        "Unrecoverable" => "unrecoverable",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn member_ref_hex(member: &MemberId) -> MemberRefHex {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-audit-member-ref/v1");
+    hasher.update(member.as_slice());
+    hex::encode(&hasher.finalize()[..16])
+}
+
+fn value_digest_hex(change_kind: &str, value: &[u8]) -> DigestHex {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-audit-group-state-value/v1");
+    hasher.update(change_kind.as_bytes());
+    hasher.update(value);
+    hex::encode(hasher.finalize())
+}
+
+pub(crate) fn group_state_change_kind_str(change: &GroupStateChange) -> &'static str {
+    match change {
+        GroupStateChange::MemberAdded { .. } => "member_added",
+        GroupStateChange::MemberRemoved { .. } => "member_removed",
+        GroupStateChange::MemberLeft { .. } => "member_left",
+        GroupStateChange::AdminAdded { .. } => "admin_added",
+        GroupStateChange::AdminRemoved { .. } => "admin_removed",
+        GroupStateChange::GroupRenamed { .. } => "group_renamed",
+        GroupStateChange::GroupAvatarChanged => "group_avatar_changed",
+        GroupStateChange::MessageRetentionChanged { .. } => "message_retention_changed",
+    }
+}
+
+fn group_state_change_fields(change: &GroupStateChange) -> Vec<String> {
+    let fields: &[&str] = match change {
+        GroupStateChange::MemberAdded { .. } | GroupStateChange::MemberRemoved { .. } => {
+            &["members"]
+        }
+        GroupStateChange::MemberLeft { .. } => &["membership"],
+        GroupStateChange::AdminAdded { .. } | GroupStateChange::AdminRemoved { .. } => &["admins"],
+        GroupStateChange::GroupRenamed { .. } => &["name"],
+        GroupStateChange::GroupAvatarChanged => &["avatar"],
+        GroupStateChange::MessageRetentionChanged { .. } => &["message_retention"],
+    };
+    fields.iter().map(|field| (*field).to_string()).collect()
+}
+
+fn group_state_change_component_ids(change: &GroupStateChange) -> Vec<u16> {
+    match change {
+        GroupStateChange::AdminAdded { .. } | GroupStateChange::AdminRemoved { .. } => {
+            vec![GROUP_ADMIN_POLICY_COMPONENT_ID]
+        }
+        GroupStateChange::GroupRenamed { .. } => vec![GROUP_PROFILE_COMPONENT_ID],
+        GroupStateChange::GroupAvatarChanged => vec![
+            GROUP_AVATAR_URL_COMPONENT_ID,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        ],
+        GroupStateChange::MessageRetentionChanged { .. } => {
+            vec![GROUP_MESSAGE_RETENTION_COMPONENT_ID]
+        }
+        GroupStateChange::MemberAdded { .. }
+        | GroupStateChange::MemberRemoved { .. }
+        | GroupStateChange::MemberLeft { .. } => Vec::new(),
+    }
+}
+
+fn group_state_subject_member_ref(change: &GroupStateChange) -> Option<MemberRefHex> {
+    match change {
+        GroupStateChange::MemberAdded { member }
+        | GroupStateChange::MemberRemoved { member }
+        | GroupStateChange::MemberLeft { member }
+        | GroupStateChange::AdminAdded { member }
+        | GroupStateChange::AdminRemoved { member } => Some(member_ref_hex(member)),
+        GroupStateChange::GroupRenamed { .. }
+        | GroupStateChange::GroupAvatarChanged
+        | GroupStateChange::MessageRetentionChanged { .. } => None,
+    }
+}
+
+pub(crate) fn group_state_changed_event(
+    epoch: EpochId,
+    actor: Option<&MemberId>,
+    change: &GroupStateChange,
+    origin_commit_id: Option<&MessageId>,
+) -> AuditEventKind {
+    let change_kind = group_state_change_kind_str(change);
+    let (value_digest, value_len) = match change {
+        GroupStateChange::GroupRenamed { name } => (
+            Some(value_digest_hex(change_kind, name.as_bytes())),
+            Some(name.len() as u64),
+        ),
+        GroupStateChange::MessageRetentionChanged { new_seconds, .. } => (
+            Some(value_digest_hex(change_kind, &new_seconds.to_be_bytes())),
+            Some(new_seconds.to_be_bytes().len() as u64),
+        ),
+        _ => (None, None),
+    };
+    AuditEventKind::GroupStateChanged {
+        epoch: epoch.0,
+        change_kind: change_kind.to_string(),
+        actor_member_ref: actor.map(member_ref_hex),
+        subject_member_ref: group_state_subject_member_ref(change),
+        origin_commit_id: origin_commit_id.map(|id| hex::encode(id.as_slice())),
+        fields: group_state_change_fields(change),
+        component_ids: group_state_change_component_ids(change),
+        value_digest,
+        value_len,
+    }
+}
+
+pub(crate) fn epoch_state_changed_event(
+    previous_state: Option<&str>,
+    new_state: &str,
+    epoch: EpochId,
+    reason: &str,
+    pending_ref: Option<PendingStateRef>,
+    pending_kind: Option<&str>,
+) -> AuditEventKind {
+    AuditEventKind::EpochStateChanged {
+        previous_state: previous_state.map(str::to_string),
+        new_state: new_state.to_string(),
+        epoch: epoch.0,
+        reason: reason.to_string(),
+        pending_ref: pending_ref.map(PendingStateRef::as_u64),
+        pending_kind: pending_kind.map(str::to_string),
+    }
+}
+
 /// Build an `IngestEntry` event from an inbound transport message.
 pub(crate) fn ingest_entry_event(msg: &TransportMessage) -> AuditEventKind {
-    use sha2::{Digest, Sha256};
     AuditEventKind::IngestEntry {
         msg_id: hex::encode(msg.id.as_slice()),
         envelope_kind: envelope_kind_str(&msg.envelope).to_string(),
