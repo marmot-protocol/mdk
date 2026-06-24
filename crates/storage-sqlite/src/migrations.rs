@@ -32,6 +32,8 @@ mod migration_0015_member_validation_cache;
 mod migration_0016_leave_requests;
 #[path = "migrations/0017_notification_settings_default_on.rs"]
 mod migration_0017_notification_settings_default_on;
+#[path = "migrations/0018_account_group_self_membership.rs"]
+mod migration_0018_account_group_self_membership;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -128,6 +130,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 17,
         name: "0017_notification_settings_default_on",
         apply: migration_0017_notification_settings_default_on::apply,
+    },
+    Migration {
+        version: 18,
+        name: "0018_account_group_self_membership",
+        apply: migration_0018_account_group_self_membership::apply,
     },
 ];
 
@@ -429,6 +436,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(new_default, 1);
+    }
+
+    #[test]
+    fn account_group_self_membership_migration_defaults_existing_rows_to_member() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // Versions 1-17 are the schema state immediately before
+        // 0018_account_group_self_membership.
+        run(&mut conn, &MIGRATIONS[..17]).unwrap();
+        assert!(!connection_has_column(
+            &conn,
+            "account_groups",
+            "self_membership"
+        ));
+        conn.execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
+             VALUES ('11', 'relay', 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert!(connection_has_column(
+            &conn,
+            "account_groups",
+            "self_membership"
+        ));
+        assert_eq!(
+            column_default(&conn, "account_groups", "self_membership").as_deref(),
+            Some("'member'")
+        );
+        let legacy_membership: String = conn
+            .query_row(
+                "SELECT self_membership FROM account_groups WHERE group_id_hex = '11'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_membership, "member");
     }
 
     #[test]

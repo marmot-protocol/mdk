@@ -107,14 +107,20 @@ impl SqliteAccountStorage {
     /// Cheap unread aggregate over the materialized `chat_list_rows`
     /// projection. Reads only the projection table (a single grouped
     /// `COUNT`/`SUM`), so it does not materialize timelines or load a session.
-    /// Archived conversations are excluded.
+    /// Archived conversations are excluded. Groups whose local
+    /// `account_groups.self_membership` is known to be `'removed'` (the local
+    /// account left or was removed) are also excluded; unknown membership
+    /// (`'member'`, the default, or no matching `account_groups` row) preserves
+    /// the unread count so uncertainty never suppresses.
     pub fn account_unread_total(&self) -> StorageResult<AccountUnreadTotal> {
         let conn = self.lock()?;
         conn.query_row(
-            "SELECT COALESCE(SUM(unread_count), 0),
-                    COUNT(CASE WHEN unread_count > 0 THEN 1 END)
-             FROM chat_list_rows
-             WHERE archived = 0",
+            "SELECT COALESCE(SUM(row.unread_count), 0),
+                    COUNT(CASE WHEN row.unread_count > 0 THEN 1 END)
+             FROM chat_list_rows AS row
+             LEFT JOIN account_groups AS ag ON ag.group_id_hex = row.group_id_hex
+             WHERE row.archived = 0
+               AND COALESCE(ag.self_membership, 'member') != 'removed'",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )

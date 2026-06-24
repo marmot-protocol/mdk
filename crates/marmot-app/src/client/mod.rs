@@ -690,7 +690,78 @@ impl AppClient {
         self.remember_published_reports(&effects);
         self.app.save_state(&self.state)?;
         self.queue_own_group_system_projection_updates(&effects);
+        // A local leave / decline departs the group just like an observed
+        // self-removal does. The inbound `observe_account_device_effects` path
+        // suppresses the account unread aggregate for self-removal, but our own
+        // relay echoes are skipped, so the locally initiated departure must
+        // suppress here too. No-op if no `account_groups` row exists yet, so it
+        // never resurrects pruned projection state. This is the source-of-truth
+        // write for the account unread aggregate, so propagate its error (like
+        // the nearby projection writes) rather than swallow it: a silently
+        // failed update would leave `account_unread_total()` returning an
+        // inflated badge after a leave that otherwise reports success.
+        self.app.set_group_self_membership(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            true,
+        )?;
         Ok(send_summary_from_effects(&effects))
+    }
+
+    /// One-time open/upgrade backfill of `account_groups.self_membership`.
+    ///
+    /// Migration 0018 defaults every existing `account_groups` row to
+    /// `'member'`, which means accounts that already left / were removed from a
+    /// group *before* upgrading keep an inflated `account_unread_total()`: the
+    /// frozen unread row has no future removal event to flip the flag to
+    /// `'removed'`. This backfill closes that gap by deriving membership from
+    /// current engine state once, right after the account is opened.
+    ///
+    /// For each row still carrying the default `'member'`, it asks the engine
+    /// for the group's roster (`runtime.members`, sourced from the Marmot
+    /// record's authoritative post-merge member set) and flips the row to
+    /// `'removed'` only when the call succeeds and the local account id is
+    /// definitively absent. Engine errors / unknown groups are skipped so
+    /// uncertainty never suppresses (matching the projection's existing
+    /// invariant). The work is gated behind a once-only account-import marker,
+    /// so subsequent opens are a single marker read and the hot path stays
+    /// projection-only.
+    pub(crate) fn backfill_self_membership_once(&self) -> Result<(), AppError> {
+        if self
+            .app
+            .account_import_marker(&self.state.label, crate::SELF_MEMBERSHIP_BACKFILL_MARKER)?
+        {
+            return Ok(());
+        }
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
+        for group_id_hex in self
+            .app
+            .account_group_ids_defaulting_to_member(&self.state.label)?
+        {
+            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            // Authoritative roster from engine state. On any engine error
+            // (unknown/quarantined group, partially-missing live state) leave
+            // the row at the preserving default — uncertainty never suppresses.
+            let Ok(members) = self.runtime.members(&group_id) else {
+                continue;
+            };
+            if local_account_removed_from_roster(&members, &local_account_id_hex) {
+                self.app
+                    .set_group_self_membership(&self.state.label, &group_id_hex, true)?;
+            }
+        }
+        self.app.mark_account_import_complete(
+            &self.state.label,
+            crate::SELF_MEMBERSHIP_BACKFILL_MARKER,
+        )?;
+        Ok(())
     }
 
     pub fn accept_group_invite(&mut self, group_id: &GroupId) -> Result<AppGroupRecord, AppError> {
@@ -1881,5 +1952,56 @@ impl AppClient {
             let event_id = hex::encode(report.message_id.as_slice());
             remember_seen_event(&mut self.state, event_id);
         }
+    }
+}
+
+/// Whether the local account (`local_account_id_hex`) is absent from a group's
+/// engine roster — the backfill's suppression decision. MLS member ids in this
+/// design are the Nostr account pubkey hex, so an account is "still a member"
+/// iff some roster entry's hex id matches the local id (case-insensitively).
+/// An empty roster is treated as absent. Kept pure and named so
+/// [`AppClient::backfill_self_membership_once`] is unit-testable without an
+/// engine harness.
+fn local_account_removed_from_roster(
+    members: &[cgka_traits::group::Member],
+    local_account_id_hex: &str,
+) -> bool {
+    !members
+        .iter()
+        .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
+}
+
+#[cfg(test)]
+mod self_membership_backfill_tests {
+    use super::local_account_removed_from_roster;
+    use cgka_traits::MemberId;
+    use cgka_traits::group::Member;
+
+    fn member(id_hex: &str) -> Member {
+        Member {
+            id: MemberId::new(hex::decode(id_hex).unwrap()),
+            credential: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn local_account_in_roster_is_not_removed() {
+        let roster = vec![member("aa"), member("bb")];
+        // Local account ("aa") is still a member: must not be flagged removed.
+        assert!(!local_account_removed_from_roster(&roster, "aa"));
+        // Case-insensitive id match (uppercase local id).
+        assert!(!local_account_removed_from_roster(&roster, "AA"));
+    }
+
+    #[test]
+    fn local_account_absent_from_roster_is_removed() {
+        // Roster has only peers; the local account ("aa") was removed/left.
+        let roster = vec![member("bb"), member("cc")];
+        assert!(local_account_removed_from_roster(&roster, "aa"));
+    }
+
+    #[test]
+    fn empty_roster_is_treated_as_removed() {
+        assert!(local_account_removed_from_roster(&[], "aa"));
     }
 }

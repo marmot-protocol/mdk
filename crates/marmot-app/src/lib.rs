@@ -190,6 +190,10 @@ use relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 
 const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
+/// Once-only marker for the open/upgrade backfill that derives
+/// `account_groups.self_membership` from current engine state for rows that
+/// predate migration 0018 (where every row defaulted to `'member'`).
+const SELF_MEMBERSHIP_BACKFILL_MARKER: &str = "self-membership-backfill-v1";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
 const SESSION_DB_FILE: &str = "session.sqlite";
@@ -842,7 +846,7 @@ impl MarmotApp {
             lifecycle.ensure_running()?;
         }
         open.runtime.sync_transport_groups(rebuild_since).await?;
-        Ok(AppClient {
+        let client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
             adapter: open.adapter,
@@ -851,7 +855,14 @@ impl MarmotApp {
             state: open.state,
             pending_projection_updates: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
-        })
+        };
+        // One-time upgrade backfill: derive `self_membership` for pre-0018 rows
+        // from current engine state so groups the local account already left /
+        // was removed from stop inflating `account_unread_total()`. Gated by a
+        // once-only marker, so this is a single marker read on every later open
+        // and the hot path stays projection-only.
+        client.backfill_self_membership_once()?;
+        Ok(client)
     }
 
     pub fn status(&self, label: &str) -> Result<AppStatus, AppError> {
@@ -1459,6 +1470,59 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
             .remove_group_push_tokens_for_member(group_id_hex, member_id_hex)?;
+        Ok(())
+    }
+
+    pub(crate) fn set_group_self_membership(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        removed: bool,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .set_group_self_membership(group_id_hex, removed)?;
+        Ok(())
+    }
+
+    /// `group_id_hex` of every `account_groups` row still carrying the migration
+    /// default `self_membership = 'member'`. The one-time open/upgrade backfill
+    /// uses this to derive membership for legacy rows from current engine state.
+    pub(crate) fn account_group_ids_defaulting_to_member(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .account_group_ids_defaulting_to_member()?)
+    }
+
+    /// Whether the named once-only account-import marker has been recorded.
+    pub(crate) fn account_import_marker(
+        &self,
+        account_ref: &str,
+        name: &str,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .account_import_marker(name)?)
+    }
+
+    /// Record the named once-only account-import marker as complete.
+    pub(crate) fn mark_account_import_complete(
+        &self,
+        account_ref: &str,
+        name: &str,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .mark_account_import_complete(name)?;
         Ok(())
     }
 

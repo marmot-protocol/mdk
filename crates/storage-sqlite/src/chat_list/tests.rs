@@ -584,3 +584,199 @@ fn account_unread_total_excludes_archived_conversations() {
     assert_eq!(total, AccountUnreadTotal::default());
     assert!(!total.has_unread());
 }
+
+/// Seed `GROUP` with one unread remote message and a materialized chat-list
+/// row, returning the store. The single conversation has `unread_count == 1`.
+fn setup_store_with_one_unread() -> SqliteAccountStorage {
+    let store = setup_store();
+    store
+        .record_app_event(&chat("old", REMOTE, 10, "before first open"))
+        .unwrap();
+    store.refresh_chat_list_row(LOCAL, GROUP).unwrap();
+    store.initialize_chat_read_state(LOCAL, GROUP).unwrap();
+    store
+        .record_app_event(&chat("new", REMOTE, 11, "after first open"))
+        .unwrap();
+    let row = store
+        .refresh_chat_list_row(LOCAL, GROUP)
+        .unwrap()
+        .expect("chat row");
+    assert_eq!(row.unread_count, 1);
+    store
+}
+
+#[test]
+fn account_unread_total_suppresses_removed_self_membership_group() {
+    let store = setup_store_with_one_unread();
+
+    // Default 'member' membership still counts.
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
+
+    store.set_group_self_membership(GROUP, true).unwrap();
+
+    // Once the local account is known-removed, the group's unread is suppressed.
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total, AccountUnreadTotal::default());
+    assert!(!total.has_unread());
+}
+
+#[test]
+fn account_unread_total_preserves_member_self_membership_group() {
+    let store = setup_store_with_one_unread();
+
+    // Default state (no observed self-removal) is 'member' and must preserve the
+    // unread count: uncertainty never suppresses.
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
+
+    // Re-affirming 'member' (e.g. after a re-add) keeps the unread counted.
+    store.set_group_self_membership(GROUP, false).unwrap();
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
+}
+
+#[test]
+fn account_unread_total_unsuppresses_after_rejoin() {
+    let store = setup_store_with_one_unread();
+
+    store.set_group_self_membership(GROUP, true).unwrap();
+    assert_eq!(
+        store.account_unread_total().unwrap(),
+        AccountUnreadTotal::default()
+    );
+
+    // A re-add restores counting.
+    store.set_group_self_membership(GROUP, false).unwrap();
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
+}
+
+#[test]
+fn account_unread_total_preserves_rows_without_account_group_row() {
+    // A chat-list row with no matching account_groups row (LEFT JOIN edge) must
+    // be preserved: COALESCE(self_membership, 'member') keeps unknown unread.
+    // `chat_list_rows` normally cascades from `account_groups`, so drop the
+    // parent with foreign keys off to leave a transient orphan projection row
+    // and confirm the aggregate still counts it.
+    let store = setup_store_with_one_unread();
+    {
+        let conn = store.lock().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "DELETE FROM account_groups WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+    }
+
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total.unread_count, 1);
+    assert_eq!(total.unread_conversations, 1);
+}
+
+#[test]
+fn set_group_self_membership_survives_projection_resave() {
+    // A routine projection re-save (profile/avatar metadata) must not clobber the
+    // self_membership owned by the sync membership-change path.
+    let store = setup_store_with_one_unread();
+    store.set_group_self_membership(GROUP, true).unwrap();
+    assert_eq!(
+        store.account_unread_total().unwrap(),
+        AccountUnreadTotal::default()
+    );
+
+    let mut renamed = group();
+    renamed.profile_name = "Renamed Lab".to_owned();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![renamed],
+                ..StoredAccountState::default()
+            },
+            256,
+        )
+        .unwrap();
+
+    // Membership stays 'removed' across the re-save, so the total stays suppressed.
+    let total = store.account_unread_total().unwrap();
+    assert_eq!(total, AccountUnreadTotal::default());
+    assert!(!total.has_unread());
+}
+
+#[test]
+fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
+    // Backfill candidate set: rows still carrying the migration default
+    // 'member' are returned; rows explicitly flipped to 'removed' are not, so
+    // re-running the one-time backfill stays idempotent.
+    let other_group = StoredAccountGroup {
+        group_id_hex: "22".to_owned(),
+        ..group()
+    };
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group(), other_group],
+                ..StoredAccountState::default()
+            },
+            256,
+        )
+        .unwrap();
+
+    // Both rows start at the default 'member', so both are candidates.
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec![GROUP.to_owned(), "22".to_owned()]
+    );
+
+    // Once a row is flipped to 'removed' it drops out of the candidate set.
+    store.set_group_self_membership(GROUP, true).unwrap();
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["22".to_owned()]
+    );
+
+    // Re-affirming 'member' keeps a row in the candidate set (still default).
+    store.set_group_self_membership("22", false).unwrap();
+    assert_eq!(
+        store.account_group_ids_defaulting_to_member().unwrap(),
+        vec!["22".to_owned()]
+    );
+
+    // No defaulted rows left once every row is explicitly resolved.
+    store.set_group_self_membership("22", true).unwrap();
+    assert!(
+        store
+            .account_group_ids_defaulting_to_member()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn set_group_self_membership_propagates_backend_errors() {
+    // darkmatter#573 review follow-up (blocking finding 2): the
+    // `self_membership` projection write is the source of truth for the account
+    // unread aggregate, so a backend failure must surface as an `Err` (the sync
+    // / local-leave callers propagate it with `?`) instead of being swallowed.
+    // Drop the table out from under the update to force a backend error.
+    let store = setup_store_with_one_unread();
+    {
+        let conn = store.lock().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch("DROP TABLE account_groups;").unwrap();
+    }
+    let result = store.set_group_self_membership(GROUP, true);
+    assert!(
+        result.is_err(),
+        "a failed self_membership projection write must return an error, not silently succeed"
+    );
+}

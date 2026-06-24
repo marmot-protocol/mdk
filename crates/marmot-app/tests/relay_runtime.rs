@@ -2816,6 +2816,257 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
 }
 
 #[tokio::test]
+async fn self_removal_suppresses_account_unread_while_peer_removal_preserves_it() {
+    // darkmatter#573: the projection-only account unread aggregate must exclude
+    // groups the local account left / was removed from, but a peer removal must
+    // leave the observer's own unread untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let carol_account = home.create_account("carol").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut carol = app.client("carol").await.unwrap();
+    carol.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("departures", &["bob", "carol"])
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+    carol.sync().await.unwrap();
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // Establish a read baseline on existing history for bob and carol, then send
+    // a fresh message so it lands as unread for both observers. `timeline_at` is
+    // second-granular and the read watermark is set from the baseline message's
+    // timestamp, so the unread message must land in a strictly later second to
+    // advance past the watermark; wait out the current second before sending it.
+    alice.send(&group_id, b"baseline").await.unwrap();
+    bob.sync().await.unwrap();
+    carol.sync().await.unwrap();
+    app.initialize_chat_read_state("bob", &group_id_hex)
+        .unwrap();
+    app.initialize_chat_read_state("carol", &group_id_hex)
+        .unwrap();
+
+    sleep(Duration::from_millis(1100)).await;
+    alice.send(&group_id, b"unread one").await.unwrap();
+
+    let unread_for = |account_id_hex: &str| {
+        app.account_unread_summary()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.account_id_hex == account_id_hex)
+            .map(|summary| summary.unread_count)
+            .unwrap_or(0)
+    };
+
+    // Relay delivery is asynchronous, so a single `sync()` poll can return before
+    // the message lands. Poll each observer until the expected unread state
+    // materializes (bounded by a deadline) so the test is order-independent under
+    // CI's serial `--test-threads=1` run.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        bob.sync().await.unwrap();
+        carol.sync().await.unwrap();
+        if unread_for(&bob_account.account_id_hex) == 1
+            && unread_for(&carol_account.account_id_hex) == 1
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for bob and carol to each register one unread before any removal"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    let _ = &alice_account;
+
+    // Alice removes carol. From carol's perspective this is a self-removal; from
+    // bob's it is a peer removal.
+    alice.remove_members(&group_id, &["carol"]).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        bob.sync().await.unwrap();
+        carol.sync().await.unwrap();
+        // carol's self-removal must zero her summary; bob's peer-removal view must
+        // leave his own unread untouched.
+        if unread_for(&carol_account.account_id_hex) == 0
+            && unread_for(&bob_account.account_id_hex) == 1
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for carol's self-removal to suppress while bob's count is preserved"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        unread_for(&carol_account.account_id_hex),
+        0,
+        "carol's self-removal must suppress her account unread total"
+    );
+    assert_eq!(
+        unread_for(&bob_account.account_id_hex),
+        1,
+        "a peer removal must not suppress bob's own account unread total"
+    );
+}
+
+#[tokio::test]
+async fn local_leave_suppresses_account_unread_total() {
+    // darkmatter#573 review follow-up: a locally initiated leave departs the
+    // group just like an observed self-removal, but the leaver's own relay echo
+    // is skipped, so `observe_account_device_effects` never fires for it. The
+    // leave path itself must suppress the account unread aggregate, otherwise a
+    // frozen unread row for the left group keeps inflating the leaver's total.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // Establish a read baseline for bob, then send a fresh message in a strictly
+    // later second so it advances past the second-granular read watermark and
+    // lands as unread.
+    alice.send(&group_id, b"baseline").await.unwrap();
+    bob.sync().await.unwrap();
+    app.initialize_chat_read_state("bob", &group_id_hex)
+        .unwrap();
+
+    sleep(Duration::from_millis(1100)).await;
+    alice.send(&group_id, b"unread one").await.unwrap();
+
+    let unread_for = |account_id_hex: &str| {
+        app.account_unread_summary()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.account_id_hex == account_id_hex)
+            .map(|summary| summary.unread_count)
+            .unwrap_or(0)
+    };
+
+    // Poll until bob registers the unread before leaving.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        bob.sync().await.unwrap();
+        if unread_for(&bob_account.account_id_hex) == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for bob to register one unread before leaving"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Bob leaves the group locally. No inbound sync observes his own departure,
+    // so the leave path must suppress his account unread aggregate directly.
+    bob.leave_group(&group_id).await.unwrap();
+
+    assert_eq!(
+        unread_for(&bob_account.account_id_hex),
+        0,
+        "a local leave must suppress the leaver's frozen account unread total"
+    );
+}
+
+#[tokio::test]
+async fn open_backfill_preserves_unread_for_still_member_account() {
+    // darkmatter#573 review follow-up (blocking finding 1): the one-time
+    // open/upgrade backfill derives `self_membership` from current engine
+    // state for rows that predate migration 0018. It must only suppress groups
+    // the local account is no longer a member of — a still-member account that
+    // reopens must keep its unread counted (uncertainty / membership never
+    // suppresses). This exercises the open-path wiring + the no-op/idempotent
+    // direction; the removed-roster direction is unit-tested over the pure
+    // `local_account_removed_from_roster` decision.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("backfill", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    // Establish a read baseline, then send a strictly-later unread message.
+    alice.send(&group_id, b"baseline").await.unwrap();
+    bob.sync().await.unwrap();
+    app.initialize_chat_read_state("bob", &group_id_hex)
+        .unwrap();
+    sleep(Duration::from_millis(1100)).await;
+    alice.send(&group_id, b"unread one").await.unwrap();
+
+    let unread_for = |account_id_hex: &str| {
+        app.account_unread_summary()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.account_id_hex == account_id_hex)
+            .map(|summary| summary.unread_count)
+            .unwrap_or(0)
+    };
+
+    // Poll until bob registers the unread.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        bob.sync().await.unwrap();
+        if unread_for(&bob_account.account_id_hex) == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for bob to register one unread"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Reopen bob's account. `client()` runs the one-time backfill on open. Bob
+    // is still a member, so the backfill must derive 'member' (no suppression)
+    // and the unread stays counted.
+    drop(bob);
+    let _bob_reopened = app.client("bob").await.unwrap();
+    assert_eq!(
+        unread_for(&bob_account.account_id_hex),
+        1,
+        "open backfill must not suppress unread for an account still in the roster"
+    );
+
+    // A second reopen is gated by the once-only marker and likewise preserves
+    // the count (idempotent, projection-only hot path).
+    drop(_bob_reopened);
+    let _bob_reopened_again = app.client("bob").await.unwrap();
+    assert_eq!(
+        unread_for(&bob_account.account_id_hex),
+        1,
+        "repeat open must remain a no-op for a still-member account"
+    );
+}
+
+#[tokio::test]
 async fn relay_app_runtime_publishes_member_leave() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

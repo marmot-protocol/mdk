@@ -310,6 +310,14 @@ impl AppClient {
         source_message_id_hex: &str,
         source_recorded_at: u64,
     ) -> Result<(), AppError> {
+        // MLS member ids in this design are the Nostr account pubkey hex, so a
+        // membership change whose subject matches the local account id hex is
+        // the local account leaving / being removed (or, for joins, returning).
+        let local_account_id_hex = self
+            .app
+            .account_home()
+            .account(&self.state.label)?
+            .account_id_hex;
         for event in &effects.events {
             let before = self.state.groups.len();
             let previous_group =
@@ -470,6 +478,29 @@ impl AppClient {
                     &group_id_hex,
                     &member_id_hex,
                 );
+                // Only the local account leaving / being removed suppresses our
+                // own unread aggregate for the group; a peer removal must not.
+                // This projection write is the source of truth for the account
+                // unread aggregate, so propagate its error (matching the nearby
+                // timeline/message projection writes) instead of swallowing it:
+                // silently leaving the flag stale would keep
+                // `account_unread_total()` returning an inflated badge after a
+                // self-removal that sync otherwise reports as successful.
+                if member_id_hex.eq_ignore_ascii_case(&local_account_id_hex) {
+                    self.app
+                        .set_group_self_membership(&self.state.label, &group_id_hex, true)?;
+                }
+            }
+            // A (re-)join or create restores the local account's membership so a
+            // re-add after removal un-suppresses the group's unread count. Same
+            // source-of-truth write as the removal path above: propagate the
+            // error rather than swallow it.
+            if let cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. }
+            | cgka_traits::engine::GroupEvent::GroupCreated { group_id } = event
+            {
+                let group_id_hex = hex::encode(group_id.as_slice());
+                self.app
+                    .set_group_self_membership(&self.state.label, &group_id_hex, false)?;
             }
         }
         // Synthesize durable kind-1210 system rows from authenticated state

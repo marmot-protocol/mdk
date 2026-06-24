@@ -401,6 +401,55 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Record the local account's own membership in `group_id_hex` so the
+    /// removed-group-suppressed unread aggregate can exclude groups the account
+    /// has left or been removed from. `removed = true` marks the group
+    /// `'removed'` (suppress its unread); `removed = false` re-affirms `'member'`
+    /// (preserve / un-suppress on re-add). No-op when the group has no
+    /// `account_groups` row yet, so this never resurrects pruned projection
+    /// state.
+    pub fn set_group_self_membership(
+        &self,
+        group_id_hex: &str,
+        removed: bool,
+    ) -> StorageResult<()> {
+        let self_membership = if removed { "removed" } else { "member" };
+        self.lock()?
+            .execute(
+                "UPDATE account_groups
+                 SET self_membership = ?2
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex, self_membership],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    /// `group_id_hex` of every `account_groups` row whose `self_membership` is
+    /// still the migration default `'member'`. Used by the one-time
+    /// open/upgrade backfill to decide which legacy rows need their membership
+    /// derived from current engine state — rows already explicitly flipped to
+    /// `'removed'` (or re-affirmed `'member'` by a live event) are skipped, so
+    /// the backfill stays idempotent and the hot path keeps reading the
+    /// projection only.
+    pub fn account_group_ids_defaulting_to_member(&self) -> StorageResult<Vec<String>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT group_id_hex
+                 FROM account_groups
+                 WHERE self_membership = 'member'
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        Ok(ids)
+    }
+
     pub fn app_messages(
         &self,
         query: StoredAppMessageQuery,
