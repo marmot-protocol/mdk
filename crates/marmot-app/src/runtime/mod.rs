@@ -1125,6 +1125,16 @@ impl MarmotAppRuntime {
         self.accounts.leave_group(account_ref, group_id).await
     }
 
+    pub async fn delete_group_local(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .delete_group_local(account_ref, group_id)
+            .await
+    }
+
     pub async fn accept_group_invite(
         &self,
         account_ref: &str,

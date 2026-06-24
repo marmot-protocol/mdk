@@ -324,6 +324,26 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Delete this group's local app data without performing an MLS leave. The
+    /// caller should cancel any active UI subscriptions for the group before
+    /// invoking the wipe. The runtime removes the active transport route, then
+    /// transactionally drops the chat-list/account projection, plaintext app
+    /// events, timeline rows, agent-stream projection rows, push-token rows, and
+    /// cached encrypted-media epoch secrets. MLS/OpenMLS group state is left
+    /// intact; a future fresh group delivery can recreate a local chat row.
+    /// Returns true if any local rows or a live route were removed.
+    pub async fn delete_group_local(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .delete_group_local(&account_ref, &group_id)
+            .await?)
+    }
+
     /// Set the per-group disappearing-message retention, wrapping the engine's
     /// `update_message_retention`. `disappearing_message_secs` of `0` disables
     /// expiry; any positive value is the retention window in seconds. Thin

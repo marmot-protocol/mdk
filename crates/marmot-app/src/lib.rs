@@ -2082,6 +2082,26 @@ impl MarmotApp {
         Ok(())
     }
 
+    pub(crate) fn delete_group_local_data(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        self.ensure_account_state(label)?;
+        let deleted = self
+            .account_storage(label)?
+            .delete_local_group_data(group_id_hex)?;
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(label.to_owned());
+        self.chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        Ok(deleted)
+    }
+
     fn ensure_account_state(&self, label: &str) -> Result<(), AppError> {
         let _span = tracing::debug_span!(
             target: "marmot_app::storage",

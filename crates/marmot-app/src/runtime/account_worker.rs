@@ -135,6 +135,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    DeleteGroupLocal {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
     AcceptGroupInvite {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupRecord, AppError>>,
@@ -844,6 +848,18 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::LeaveGroup { group_id, respond } => {
             let result = client.leave_group(&group_id).await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::DeleteGroupLocal { group_id, respond } => {
+            let result = client.delete_group_local(&group_id).await;
+            if matches!(result, Ok(true)) {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
             let _ = respond.send(result);
         }
         AccountWorkerCommand::AcceptGroupInvite { group_id, respond } => {

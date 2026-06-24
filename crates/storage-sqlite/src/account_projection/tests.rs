@@ -618,3 +618,178 @@ fn push_registration_preserves_created_at_when_token_rotates() {
     assert_eq!(stored.registration.last_shared_at_ms, None);
     assert_eq!(stored.token_bytes, vec![4, 5, 6]);
 }
+
+#[test]
+fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_state() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: vec!["seen-aa".to_owned()],
+        last_transport_timestamp: Some(1_700_000_001),
+        groups: vec![group("aa", "alpha"), group("bb", "beta")],
+    };
+    store.save_account_projection_state(&state, 16).unwrap();
+    store
+        .record_app_event(&app_event("msg-aa", "aa", 10))
+        .unwrap();
+    store
+        .record_app_event(&agent_stream_start_event(
+            "stream-aa",
+            "aa",
+            &"11".repeat(32),
+            11,
+        ))
+        .unwrap();
+    store
+        .record_app_event(&app_event("msg-bb", "bb", 12))
+        .unwrap();
+    store
+        .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+        .unwrap();
+    store
+        .remember_encrypted_media_epoch_secret("bb", 0x8008, 7, &[4, 5, 6])
+        .unwrap();
+    insert_group_push_token(&store, "aa", "member-aa");
+    insert_group_push_token(&store, "bb", "member-bb");
+    insert_read_and_chat_rows(&store, "aa");
+    insert_protocol_group_marker(&store, &[0xaa]);
+
+    assert!(store.delete_local_group_data("aa").unwrap());
+
+    for table in [
+        "account_groups",
+        "account_group_app_components",
+        "app_events",
+        "message_timeline",
+        "agent_stream_starts",
+        "conversation_read_state",
+        "chat_list_rows",
+        "group_push_tokens",
+        "encrypted_media_epoch_secrets",
+    ] {
+        assert_eq!(group_row_count(&store, table, "aa"), 0, "{table}");
+    }
+    for table in [
+        "account_groups",
+        "account_group_app_components",
+        "app_events",
+        "message_timeline",
+        "group_push_tokens",
+        "encrypted_media_epoch_secrets",
+    ] {
+        assert!(group_row_count(&store, table, "bb") > 0, "{table}");
+    }
+    assert_eq!(all_row_count(&store, "seen_events"), 1);
+    assert_eq!(all_row_count(&store, "cgka_groups"), 1);
+    assert!(!store.delete_local_group_data("aa").unwrap());
+}
+
+#[test]
+fn delete_local_group_data_rejects_blank_group_id() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let err = store
+        .delete_local_group_data(" \t ")
+        .expect_err("blank group IDs must be rejected before opening a transaction");
+
+    assert!(format!("{err}").contains("local group delete id must not be empty"));
+}
+
+#[test]
+fn delete_local_group_data_rolls_back_all_tables_on_failure() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let state = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![group("aa", "alpha")],
+    };
+    store.save_account_projection_state(&state, 16).unwrap();
+    store
+        .record_app_event(&app_event("msg-aa", "aa", 10))
+        .unwrap();
+    store
+        .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+        .unwrap();
+    insert_group_push_token(&store, "aa", "member-aa");
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER abort_local_delete\n             AFTER DELETE ON message_timeline\n             WHEN old.group_id_hex = 'aa'\n             BEGIN\n                SELECT RAISE(ABORT, 'abort local delete');\n             END;",
+        )
+        .unwrap();
+
+    let err = store
+        .delete_local_group_data("aa")
+        .expect_err("trigger should abort the transaction");
+    assert!(format!("{err}").contains("abort local delete"));
+
+    for table in [
+        "account_groups",
+        "account_group_app_components",
+        "app_events",
+        "message_timeline",
+        "group_push_tokens",
+        "encrypted_media_epoch_secrets",
+    ] {
+        assert!(group_row_count(&store, table, "aa") > 0, "{table}");
+    }
+}
+
+fn insert_group_push_token(store: &SqliteAccountStorage, group_id_hex: &str, member_id_hex: &str) {
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO group_push_tokens (\n                group_id_hex, member_id_hex, leaf_index, platform, token_fingerprint,\n                server_pubkey_hex, relay_hint, encrypted_token, updated_at_ms\n             ) VALUES (?1, ?2, 0, 1, 'token', ?3, NULL, x'0102', 123)",
+            rusqlite::params![group_id_hex, member_id_hex, "cc".repeat(32)],
+        )
+        .unwrap();
+}
+
+fn insert_read_and_chat_rows(store: &SqliteAccountStorage, group_id_hex: &str) {
+    let conn = store.lock().unwrap();
+    conn.execute(
+        "INSERT INTO conversation_read_state (\n            group_id_hex, last_read_message_id_hex, last_read_timeline_at,\n            initialized_at, updated_at\n         ) VALUES (?1, 'msg-aa', 10, 10, 10)",
+        rusqlite::params![group_id_hex],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chat_list_rows (\n            group_id_hex, archived, pending_confirmation, title, group_name,\n            last_message_id_hex, last_message_sender, last_message_preview,\n            last_message_kind, last_message_timeline_at, unread_count, updated_at\n         ) VALUES (?1, 0, 0, 'alpha', 'alpha', 'msg-aa', 'sender', 'hello', 9, 10, 0, 10)",
+        rusqlite::params![group_id_hex],
+    )
+    .unwrap();
+}
+
+fn insert_protocol_group_marker(store: &SqliteAccountStorage, group_id: &[u8]) {
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, 0, x'00')",
+            rusqlite::params![group_id],
+        )
+        .unwrap();
+}
+
+fn group_row_count(store: &SqliteAccountStorage, table: &str, group_id_hex: &str) -> i64 {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            &format!("SELECT count(*) FROM {table} WHERE group_id_hex = ?1"),
+            rusqlite::params![group_id_hex],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn all_row_count(store: &SqliteAccountStorage, table: &str) -> i64 {
+    store
+        .lock()
+        .unwrap()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}

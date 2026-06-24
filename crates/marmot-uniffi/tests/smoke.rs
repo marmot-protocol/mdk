@@ -308,6 +308,23 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
 }
 
 #[tokio::test]
+async fn delete_group_local_binding_is_public_and_validates_group_hex() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+
+    let error = kit
+        .delete_group_local("alice".into(), "not-hex".into())
+        .await
+        .expect_err("invalid group hex should fail before local delete");
+    assert!(format!("{error}").contains("invalid hex"));
+}
+
+#[tokio::test]
 async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");

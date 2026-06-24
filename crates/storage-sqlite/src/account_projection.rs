@@ -360,6 +360,47 @@ impl SqliteAccountStorage {
         tx.commit().storage()
     }
 
+    /// Transactionally removes all app-local data for one group without touching
+    /// the stored MLS/OpenMLS group state. This is the storage primitive for the
+    /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
+    /// app events, timeline rows, agent-stream start projection rows, cached
+    /// encrypted-media epoch secrets, and group push-token rows keyed by
+    /// `group_id_hex`. `seen_events` and protocol/MLS tables are intentionally
+    /// left intact so old relay deliveries stay suppressed while a future fresh
+    /// group message can re-create the app projection.
+    pub fn delete_local_group_data(&self, group_id_hex: &str) -> StorageResult<bool> {
+        if group_id_hex.trim().is_empty() {
+            return Err(StorageError::Backend(
+                "local group delete id must not be empty".to_owned(),
+            ));
+        }
+
+        self.connection.with_transaction(|| -> StorageResult<bool> {
+            let conn = self.lock()?;
+            let mut deleted = 0usize;
+            for table in [
+                "app_events",
+                "message_timeline",
+                "agent_stream_starts",
+                "conversation_read_state",
+                "chat_list_rows",
+                "account_group_app_components",
+                "group_push_tokens",
+                "encrypted_media_epoch_secrets",
+                "account_groups",
+            ] {
+                deleted = deleted.saturating_add(
+                    conn.execute(
+                        &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
+                        params![group_id_hex],
+                    )
+                    .storage()?,
+                );
+            }
+            Ok(deleted > 0)
+        })
+    }
+
     pub fn app_messages(
         &self,
         query: StoredAppMessageQuery,

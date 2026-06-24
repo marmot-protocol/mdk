@@ -857,6 +857,141 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
 }
 
 #[tokio::test]
+async fn app_runtime_delete_group_local_removes_projection_without_publishing_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "local delete",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+    runtime
+        .accept_group_invite(&bob_id, &group_id)
+        .await
+        .unwrap();
+
+    runtime
+        .send_message(&alice_id, &group_id, b"local rows must be wiped".to_vec())
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "local rows must be wiped"
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    runtime
+        .initialize_chat_read_state(&bob_id, &group_id_hex)
+        .unwrap();
+    assert!(app.group(&bob_label, &group_id_hex).unwrap().is_some());
+    assert!(
+        !app.messages_with_query(
+            &bob_label,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                limit: None,
+            },
+        )
+        .unwrap()
+        .is_empty(),
+        "fixture must contain group-scoped app events before the wipe"
+    );
+    assert!(
+        !app.timeline_messages_with_query(
+            &bob_label,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .is_empty(),
+        "fixture must contain materialized timeline rows before the wipe"
+    );
+
+    assert!(
+        runtime
+            .delete_group_local(&bob_id, &group_id)
+            .await
+            .unwrap()
+    );
+
+    assert!(app.group(&bob_label, &group_id_hex).unwrap().is_none());
+    assert!(
+        app.visible_groups(&bob_label)
+            .unwrap()
+            .iter()
+            .all(|group| group.group_id_hex != group_id_hex)
+    );
+    assert!(
+        app.messages_with_query(
+            &bob_label,
+            AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                limit: None,
+            },
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        app.timeline_messages_with_query(
+            &bob_label,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+        .is_empty()
+    );
+
+    let alice_members = runtime.group_members(&alice_id, &group_id).await.unwrap();
+    assert!(
+        alice_members
+            .iter()
+            .any(|member| member.member_id_hex == bob_id),
+        "local delete must not publish an MLS leave visible to other members"
+    );
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     // Regression: the account worker must answer read commands as soon as the
     // session is hydrated, WITHOUT blocking on the initial relay catch-up. On

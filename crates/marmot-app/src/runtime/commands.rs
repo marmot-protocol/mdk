@@ -8,7 +8,10 @@ use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::oneshot;
 
-use super::{AccountManager, AccountWorkerCommand, account_worker_response};
+use super::{
+    AccountManager, AccountWorkerCommand, account_worker_response,
+    publish_app_runtime_group_state_updated,
+};
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -292,6 +295,41 @@ impl AccountManager {
         self.catch_up_accounts().await?;
         self.schedule_audit_log_tracker_update("leave_group");
         Ok(summary)
+    }
+
+    pub async fn delete_group_local(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if !account.is_active_local_signing() {
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let deleted = self
+                .app
+                .delete_group_local_data(&account.label, &group_id_hex)?;
+            if deleted {
+                publish_app_runtime_group_state_updated(
+                    &self.events,
+                    &account.account_id_hex,
+                    &account.label,
+                    group_id,
+                );
+            }
+            return Ok(deleted);
+        }
+
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DeleteGroupLocal {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     pub async fn accept_group_invite(

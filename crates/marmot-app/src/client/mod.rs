@@ -622,6 +622,52 @@ impl AppClient {
             .await
     }
 
+    /// Delete only this group's app-local data. This intentionally does not send
+    /// an MLS leave and does not delete the stored MLS/OpenMLS group state; a
+    /// future fresh group delivery can recreate the chat-list projection.
+    ///
+    /// The live transport route is removed and synced before the DB wipe so the
+    /// account stops actively subscribing to the group before local rows vanish.
+    pub async fn delete_group_local(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let original_groups = self.state.groups.clone();
+        let was_live = original_groups
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex);
+
+        if was_live {
+            self.state
+                .groups
+                .retain(|group| group.group_id_hex != group_id_hex);
+            if let Err(error) = self.refresh_routing() {
+                self.state.groups = original_groups;
+                self.refresh_routing()?;
+                return Err(error);
+            }
+            if let Err(error) = self.sync_runtime_groups().await {
+                self.state.groups = original_groups;
+                self.refresh_routing()?;
+                self.sync_runtime_groups().await?;
+                return Err(error);
+            }
+        }
+
+        match self
+            .app
+            .delete_group_local_data(&self.state.label, &group_id_hex)
+        {
+            Ok(deleted) => Ok(deleted || was_live),
+            Err(error) => {
+                if was_live {
+                    self.state.groups = original_groups;
+                    self.refresh_routing()?;
+                    self.sync_runtime_groups().await?;
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn leave_group_with_audit_context(
         &mut self,
         group_id: &GroupId,
