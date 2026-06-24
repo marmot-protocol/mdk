@@ -5,7 +5,7 @@ use crate::{
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, Params, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,19 +96,13 @@ struct ConversationReadState {
 
 impl SqliteAccountStorage {
     pub fn chat_list_rows(&self, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let rows = chat_list_rows_tx(&tx, query)?;
-        tx.commit().storage()?;
-        Ok(rows)
+        let conn = self.lock()?;
+        chat_list_rows_tx(&conn, query)
     }
 
     pub fn chat_list_row(&self, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let row = chat_list_row_tx(&tx, group_id_hex)?;
-        tx.commit().storage()?;
-        Ok(row)
+        let conn = self.lock()?;
+        chat_list_row_tx(&conn, group_id_hex)
     }
 
     /// Cheap unread aggregate over the materialized `chat_list_rows`
@@ -145,12 +139,13 @@ impl SqliteAccountStorage {
         local_account_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<()> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        if !chat_list_projection_complete_tx(&tx, local_account_id_hex, mention_classifier)? {
-            rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex, mention_classifier)?;
-        }
-        tx.commit().storage()
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !chat_list_projection_complete_tx(&conn, local_account_id_hex, mention_classifier)? {
+                rebuild_all_chat_list_rows_tx(&conn, local_account_id_hex, mention_classifier)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn refresh_chat_list_rows(
@@ -158,10 +153,10 @@ impl SqliteAccountStorage {
         local_account_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<()> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        rebuild_all_chat_list_rows_tx(&tx, local_account_id_hex, mention_classifier)?;
-        tx.commit().storage()
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            rebuild_all_chat_list_rows_tx(&conn, local_account_id_hex, mention_classifier)
+        })
     }
 
     pub fn refresh_chat_list_row(
@@ -170,12 +165,15 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let row =
-            refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex, mention_classifier)?;
-        tx.commit().storage()?;
-        Ok(row)
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            refresh_chat_list_row_tx(
+                &conn,
+                local_account_id_hex,
+                group_id_hex,
+                mention_classifier,
+            )
+        })
     }
 
     pub fn initialize_chat_read_state(
@@ -184,38 +182,41 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let Some(group) = account_group_tx(&tx, group_id_hex)? else {
-            tx.commit().storage()?;
-            return Ok(None);
-        };
-        if read_state_tx(&tx, group_id_hex)?.is_none() {
-            let latest = latest_kind9_message_tx(&tx, group_id_hex)?;
-            let (last_read_message_id_hex, last_read_timeline_at) = latest
-                .map(|message| (Some(message.message_id_hex), Some(message.timeline_at)))
-                .unwrap_or((None, None));
-            let initialized_at = last_read_timeline_at.unwrap_or(0);
-            tx.execute(
-                "INSERT INTO conversation_read_state (
-                    group_id_hex, last_read_message_id_hex, last_read_timeline_at,
-                    initialized_at, updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    group_id_hex,
-                    last_read_message_id_hex,
-                    optional_u64_to_i64(last_read_timeline_at)?,
-                    u64_to_i64(initialized_at)?,
-                    u64_to_i64(unix_now_seconds())?
-                ],
-            )
-            .storage()?;
-        }
-        rebuild_chat_list_row_for_group_tx(&tx, local_account_id_hex, group, mention_classifier)?;
-        let row = chat_list_row_tx(&tx, group_id_hex)?;
-        tx.commit().storage()?;
-        Ok(row)
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let Some(group) = account_group_tx(&conn, group_id_hex)? else {
+                return Ok(None);
+            };
+            if read_state_tx(&conn, group_id_hex)?.is_none() {
+                let latest = latest_kind9_message_tx(&conn, group_id_hex)?;
+                let (last_read_message_id_hex, last_read_timeline_at) = latest
+                    .map(|message| (Some(message.message_id_hex), Some(message.timeline_at)))
+                    .unwrap_or((None, None));
+                let initialized_at = last_read_timeline_at.unwrap_or(0);
+                conn.execute(
+                    "INSERT INTO conversation_read_state (
+                        group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                        initialized_at, updated_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        group_id_hex,
+                        last_read_message_id_hex,
+                        optional_u64_to_i64(last_read_timeline_at)?,
+                        u64_to_i64(initialized_at)?,
+                        u64_to_i64(unix_now_seconds())?
+                    ],
+                )
+                .storage()?;
+            }
+            rebuild_chat_list_row_for_group_tx(
+                &conn,
+                local_account_id_hex,
+                group,
+                mention_classifier,
+            )?;
+            chat_list_row_tx(&conn, group_id_hex)
+        })
     }
 
     pub fn mark_timeline_message_read(
@@ -225,51 +226,54 @@ impl SqliteAccountStorage {
         message_id_hex: &str,
         mention_classifier: &MentionClassifier<'_>,
     ) -> StorageResult<Option<ChatListRow>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        if let Some(target) =
-            timeline_message_for_read_marker_tx(&tx, group_id_hex, message_id_hex)?
-        {
-            let should_advance = read_state_tx(&tx, group_id_hex)?
-                .and_then(|state| {
-                    state
-                        .last_read_timeline_at
-                        .zip(state.last_read_message_id_hex)
-                })
-                .is_none_or(|(at, id)| {
-                    timeline_tuple_after(target.timeline_at, &target.message_id_hex, at, &id)
-                });
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if let Some(target) =
+                timeline_message_for_read_marker_tx(&conn, group_id_hex, message_id_hex)?
+            {
+                let should_advance = read_state_tx(&conn, group_id_hex)?
+                    .and_then(|state| {
+                        state
+                            .last_read_timeline_at
+                            .zip(state.last_read_message_id_hex)
+                    })
+                    .is_none_or(|(at, id)| {
+                        timeline_tuple_after(target.timeline_at, &target.message_id_hex, at, &id)
+                    });
 
-            if should_advance {
-                tx.execute(
-                    "INSERT INTO conversation_read_state (
-                        group_id_hex, last_read_message_id_hex, last_read_timeline_at,
-                        initialized_at, updated_at
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?4)
-                     ON CONFLICT(group_id_hex) DO UPDATE SET
-                        last_read_message_id_hex = excluded.last_read_message_id_hex,
-                        last_read_timeline_at = excluded.last_read_timeline_at,
-                        updated_at = excluded.updated_at",
-                    params![
-                        group_id_hex,
-                        &target.message_id_hex,
-                        u64_to_i64(target.timeline_at)?,
-                        u64_to_i64(unix_now_seconds())?
-                    ],
-                )
-                .storage()?;
+                if should_advance {
+                    conn.execute(
+                        "INSERT INTO conversation_read_state (
+                            group_id_hex, last_read_message_id_hex, last_read_timeline_at,
+                            initialized_at, updated_at
+                         )
+                         VALUES (?1, ?2, ?3, ?4, ?4)
+                         ON CONFLICT(group_id_hex) DO UPDATE SET
+                            last_read_message_id_hex = excluded.last_read_message_id_hex,
+                            last_read_timeline_at = excluded.last_read_timeline_at,
+                            updated_at = excluded.updated_at",
+                        params![
+                            group_id_hex,
+                            &target.message_id_hex,
+                            u64_to_i64(target.timeline_at)?,
+                            u64_to_i64(unix_now_seconds())?
+                        ],
+                    )
+                    .storage()?;
+                }
             }
-        }
-        let row =
-            refresh_chat_list_row_tx(&tx, local_account_id_hex, group_id_hex, mention_classifier)?;
-        tx.commit().storage()?;
-        Ok(row)
+            refresh_chat_list_row_tx(
+                &conn,
+                local_account_id_hex,
+                group_id_hex,
+                mention_classifier,
+            )
+        })
     }
 }
 
 fn rebuild_all_chat_list_rows_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     local_account_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
@@ -282,7 +286,7 @@ fn rebuild_all_chat_list_rows_tx(
 }
 
 fn refresh_chat_list_row_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     local_account_id_hex: &str,
     group_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
@@ -300,7 +304,7 @@ fn refresh_chat_list_row_tx(
 }
 
 fn chat_list_projection_complete_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     local_account_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<bool> {
@@ -467,7 +471,7 @@ fn chat_list_projection_complete_tx(
     Ok(true)
 }
 
-fn chat_list_stored_mention_counts_tx(tx: &Transaction<'_>) -> StorageResult<Vec<(String, u64)>> {
+fn chat_list_stored_mention_counts_tx(tx: &Connection) -> StorageResult<Vec<(String, u64)>> {
     let mut stmt = tx
         .prepare("SELECT group_id_hex, unread_mention_count FROM chat_list_rows")
         .storage()?;
@@ -482,17 +486,13 @@ fn chat_list_stored_mention_counts_tx(tx: &Transaction<'_>) -> StorageResult<Vec
     .collect()
 }
 
-fn projection_has_rows_tx<P: Params>(
-    tx: &Transaction<'_>,
-    sql: &str,
-    params: P,
-) -> StorageResult<bool> {
+fn projection_has_rows_tx<P: Params>(tx: &Connection, sql: &str, params: P) -> StorageResult<bool> {
     let exists: i64 = tx.query_row(sql, params, |row| row.get(0)).storage()?;
     Ok(exists != 0)
 }
 
 fn rebuild_chat_list_row_for_group_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     local_account_id_hex: &str,
     group: AccountGroupRow,
     mention_classifier: &MentionClassifier<'_>,
@@ -613,7 +613,7 @@ struct UnreadSummary {
 }
 
 fn unread_summary_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     local_account_id_hex: &str,
     group_id_hex: &str,
     read_state: Option<&ConversationReadState>,
@@ -731,7 +731,7 @@ fn unread_summary_tx(
     })
 }
 
-fn account_groups_tx(tx: &Transaction<'_>) -> StorageResult<Vec<AccountGroupRow>> {
+fn account_groups_tx(tx: &Connection) -> StorageResult<Vec<AccountGroupRow>> {
     let mut stmt = tx
         .prepare(
             "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
@@ -752,10 +752,7 @@ fn account_groups_tx(tx: &Transaction<'_>) -> StorageResult<Vec<AccountGroupRow>
     .storage()
 }
 
-fn account_group_tx(
-    tx: &Transaction<'_>,
-    group_id_hex: &str,
-) -> StorageResult<Option<AccountGroupRow>> {
+fn account_group_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<AccountGroupRow>> {
     tx.query_row(
         "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                 image_hash_hex, image_key_hex, image_nonce_hex,
@@ -801,7 +798,7 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
 }
 
 fn latest_kind9_message_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<ChatListMessagePreview>> {
     tx.query_row(
@@ -819,7 +816,7 @@ fn latest_kind9_message_tx(
 }
 
 fn timeline_message_for_read_marker_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<ChatListMessagePreview>> {
@@ -851,7 +848,7 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
 }
 
 fn read_state_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Option<ConversationReadState>> {
     tx.query_row(
@@ -873,10 +870,7 @@ fn read_state_tx(
     .storage()
 }
 
-fn chat_list_rows_tx(
-    tx: &Transaction<'_>,
-    query: ChatListQuery,
-) -> StorageResult<Vec<ChatListRow>> {
+fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
     let sql = if query.include_archived {
         "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
                 avatar_url,
@@ -910,10 +904,7 @@ fn chat_list_rows_tx(
         .storage()
 }
 
-fn chat_list_row_tx(
-    tx: &Transaction<'_>,
-    group_id_hex: &str,
-) -> StorageResult<Option<ChatListRow>> {
+fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
     tx.query_row(
         "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
                 avatar_url,

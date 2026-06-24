@@ -4,7 +4,7 @@ use crate::{
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, params, params_from_iter,
+    Connection, OptionalExtension, params, params_from_iter,
     types::{Type, Value},
 };
 
@@ -237,127 +237,128 @@ impl SqliteAccountStorage {
         max_seen_events: usize,
     ) -> StorageResult<()> {
         let now = unix_now_seconds_i64();
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        tx.execute(
-            "INSERT INTO account_state (label, updated_at, last_transport_timestamp)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(label) DO UPDATE SET
-                updated_at = excluded.updated_at,
-                last_transport_timestamp = excluded.last_transport_timestamp",
-            params![
-                &state.label,
-                now,
-                state
-                    .last_transport_timestamp
-                    .and_then(|value| i64::try_from(value).ok()),
-            ],
-        )
-        .storage()?;
-
-        let retained_start = state.seen_events.len().saturating_sub(max_seen_events);
-        for event_id in &state.seen_events[retained_start..] {
-            tx.execute(
-                "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
-                 VALUES (?1, ?2)",
-                params![event_id, now],
-            )
-            .storage()?;
-        }
-        tx.execute(
-            "DELETE FROM seen_events
-             WHERE event_id NOT IN (
-                SELECT event_id FROM seen_events
-                ORDER BY seen_at DESC, rowid DESC
-                LIMIT ?1
-             )",
-            params![usize_to_i64(max_seen_events)?],
-        )
-        .storage()?;
-
-        if state.groups.is_empty() {
-            tx.execute("DELETE FROM account_groups", []).storage()?;
-        } else {
-            let retained_group_ids = state
-                .groups
-                .iter()
-                .map(|group| Value::Text(group.group_id_hex.clone()))
-                .collect::<Vec<_>>();
-            let placeholders = (0..retained_group_ids.len())
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(", ");
-            tx.execute(
-                &format!("DELETE FROM account_groups WHERE group_id_hex NOT IN ({placeholders})"),
-                params_from_iter(retained_group_ids),
-            )
-            .storage()?;
-        }
-
-        for group in &state.groups {
-            tx.execute(
-                "INSERT INTO account_groups (
-                    group_id_hex, endpoint, profile_name, profile_description,
-                    image_hash_hex, image_key_hex, image_nonce_hex,
-                    image_upload_key_hex, image_media_type, admin_keys_hex, archived,
-                    pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
-                    updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                 ON CONFLICT(group_id_hex) DO UPDATE SET
-                    endpoint = excluded.endpoint,
-                    profile_name = excluded.profile_name,
-                    profile_description = excluded.profile_description,
-                    image_hash_hex = excluded.image_hash_hex,
-                    image_key_hex = excluded.image_key_hex,
-                    image_nonce_hex = excluded.image_nonce_hex,
-                    image_upload_key_hex = excluded.image_upload_key_hex,
-                    image_media_type = excluded.image_media_type,
-                    admin_keys_hex = excluded.admin_keys_hex,
-                    archived = excluded.archived,
-                    pending_confirmation = excluded.pending_confirmation,
-                    welcomer_account_id_hex = excluded.welcomer_account_id_hex,
-                    via_welcome_message_id_hex = excluded.via_welcome_message_id_hex,
-                    updated_at = excluded.updated_at
-                 WHERE account_groups.endpoint IS NOT excluded.endpoint
-                    OR account_groups.profile_name IS NOT excluded.profile_name
-                    OR account_groups.profile_description IS NOT excluded.profile_description
-                    OR account_groups.image_hash_hex IS NOT excluded.image_hash_hex
-                    OR account_groups.image_key_hex IS NOT excluded.image_key_hex
-                    OR account_groups.image_nonce_hex IS NOT excluded.image_nonce_hex
-                    OR account_groups.image_upload_key_hex IS NOT excluded.image_upload_key_hex
-                    OR account_groups.image_media_type IS NOT excluded.image_media_type
-                    OR account_groups.admin_keys_hex IS NOT excluded.admin_keys_hex
-                    OR account_groups.archived IS NOT excluded.archived
-                    OR account_groups.pending_confirmation IS NOT excluded.pending_confirmation
-                    OR account_groups.welcomer_account_id_hex IS NOT excluded.welcomer_account_id_hex
-                    OR account_groups.via_welcome_message_id_hex IS NOT excluded.via_welcome_message_id_hex",
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute(
+                "INSERT INTO account_state (label, updated_at, last_transport_timestamp)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(label) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    last_transport_timestamp = excluded.last_transport_timestamp",
                 params![
-                    &group.group_id_hex,
-                    &group.endpoint,
-                    &group.profile_name,
-                    &group.profile_description,
-                    &group.image_hash_hex,
-                    &group.image_key_hex,
-                    &group.image_nonce_hex,
-                    &group.image_upload_key_hex,
-                    &group.image_media_type,
-                    &group.admin_keys_hex,
-                    bool_i64(group.archived),
-                    bool_i64(group.pending_confirmation),
-                    &group.welcomer_account_id_hex,
-                    &group.via_welcome_message_id_hex,
-                    now
+                    &state.label,
+                    now,
+                    state
+                        .last_transport_timestamp
+                        .and_then(|value| i64::try_from(value).ok()),
                 ],
             )
             .storage()?;
 
-            delete_stale_group_components(&tx, &group.group_id_hex, &group.components)?;
-            for component in &group.components {
-                upsert_group_component(&tx, &group.group_id_hex, component, now)?;
+            let retained_start = state.seen_events.len().saturating_sub(max_seen_events);
+            for event_id in &state.seen_events[retained_start..] {
+                conn.execute(
+                    "INSERT OR IGNORE INTO seen_events (event_id, seen_at)
+                     VALUES (?1, ?2)",
+                    params![event_id, now],
+                )
+                .storage()?;
             }
-        }
-        tx.commit().storage()
+            conn.execute(
+                "DELETE FROM seen_events
+                 WHERE event_id NOT IN (
+                    SELECT event_id FROM seen_events
+                    ORDER BY seen_at DESC, rowid DESC
+                    LIMIT ?1
+                 )",
+                params![usize_to_i64(max_seen_events)?],
+            )
+            .storage()?;
+
+            if state.groups.is_empty() {
+                conn.execute("DELETE FROM account_groups", []).storage()?;
+            } else {
+                let retained_group_ids = state
+                    .groups
+                    .iter()
+                    .map(|group| Value::Text(group.group_id_hex.clone()))
+                    .collect::<Vec<_>>();
+                let placeholders = (0..retained_group_ids.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conn.execute(
+                    &format!("DELETE FROM account_groups WHERE group_id_hex NOT IN ({placeholders})"),
+                    params_from_iter(retained_group_ids),
+                )
+                .storage()?;
+            }
+
+            for group in &state.groups {
+                conn.execute(
+                    "INSERT INTO account_groups (
+                        group_id_hex, endpoint, profile_name, profile_description,
+                        image_hash_hex, image_key_hex, image_nonce_hex,
+                        image_upload_key_hex, image_media_type, admin_keys_hex, archived,
+                        pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
+                        updated_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                     ON CONFLICT(group_id_hex) DO UPDATE SET
+                        endpoint = excluded.endpoint,
+                        profile_name = excluded.profile_name,
+                        profile_description = excluded.profile_description,
+                        image_hash_hex = excluded.image_hash_hex,
+                        image_key_hex = excluded.image_key_hex,
+                        image_nonce_hex = excluded.image_nonce_hex,
+                        image_upload_key_hex = excluded.image_upload_key_hex,
+                        image_media_type = excluded.image_media_type,
+                        admin_keys_hex = excluded.admin_keys_hex,
+                        archived = excluded.archived,
+                        pending_confirmation = excluded.pending_confirmation,
+                        welcomer_account_id_hex = excluded.welcomer_account_id_hex,
+                        via_welcome_message_id_hex = excluded.via_welcome_message_id_hex,
+                        updated_at = excluded.updated_at
+                     WHERE account_groups.endpoint IS NOT excluded.endpoint
+                        OR account_groups.profile_name IS NOT excluded.profile_name
+                        OR account_groups.profile_description IS NOT excluded.profile_description
+                        OR account_groups.image_hash_hex IS NOT excluded.image_hash_hex
+                        OR account_groups.image_key_hex IS NOT excluded.image_key_hex
+                        OR account_groups.image_nonce_hex IS NOT excluded.image_nonce_hex
+                        OR account_groups.image_upload_key_hex IS NOT excluded.image_upload_key_hex
+                        OR account_groups.image_media_type IS NOT excluded.image_media_type
+                        OR account_groups.admin_keys_hex IS NOT excluded.admin_keys_hex
+                        OR account_groups.archived IS NOT excluded.archived
+                        OR account_groups.pending_confirmation IS NOT excluded.pending_confirmation
+                        OR account_groups.welcomer_account_id_hex IS NOT excluded.welcomer_account_id_hex
+                        OR account_groups.via_welcome_message_id_hex IS NOT excluded.via_welcome_message_id_hex",
+                    params![
+                        &group.group_id_hex,
+                        &group.endpoint,
+                        &group.profile_name,
+                        &group.profile_description,
+                        &group.image_hash_hex,
+                        &group.image_key_hex,
+                        &group.image_nonce_hex,
+                        &group.image_upload_key_hex,
+                        &group.image_media_type,
+                        &group.admin_keys_hex,
+                        bool_i64(group.archived),
+                        bool_i64(group.pending_confirmation),
+                        &group.welcomer_account_id_hex,
+                        &group.via_welcome_message_id_hex,
+                        now
+                    ],
+                )
+                .storage()?;
+
+                delete_stale_group_components(&conn, &group.group_id_hex, &group.components)?;
+                for component in &group.components {
+                    upsert_group_component(&conn, &group.group_id_hex, component, now)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Transactionally removes all app-local data for one group without touching
@@ -538,24 +539,25 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         cutoff_recorded_at: u64,
     ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let outcome = crate::timeline::secure_prune_app_events_before_tx(
-            &tx,
-            group_id_hex,
-            cutoff_recorded_at,
-        )?;
-        tx.commit().storage()?;
-        if outcome.pruned_messages > 0
-            && let Err(error) = checkpoint_wal_truncate_after_secure_prune(&conn)
-        {
-            tracing::warn!(
-                target: "storage_sqlite::retention",
-                method = "secure_prune_app_events_before",
-                pruned_messages = outcome.pruned_messages,
-                error = %error,
-                "retention secure-delete WAL checkpoint failed after committed prune"
-            );
+        let outcome = self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            crate::timeline::secure_prune_app_events_before_tx(
+                &conn,
+                group_id_hex,
+                cutoff_recorded_at,
+            )
+        })?;
+        if outcome.pruned_messages > 0 {
+            let conn = self.lock()?;
+            if let Err(error) = checkpoint_wal_truncate_after_secure_prune(&conn) {
+                tracing::warn!(
+                    target: "storage_sqlite::retention",
+                    method = "secure_prune_app_events_before",
+                    pruned_messages = outcome.pruned_messages,
+                    error = %error,
+                    "retention secure-delete WAL checkpoint failed after committed prune"
+                );
+            }
         }
         Ok(outcome)
     }
@@ -942,7 +944,7 @@ fn account_group_components(
 }
 
 fn delete_stale_group_components(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     components: &[StoredAccountGroupComponent],
 ) -> StorageResult<()> {
@@ -973,7 +975,7 @@ fn delete_stale_group_components(
 }
 
 fn upsert_group_component(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     component: &StoredAccountGroupComponent,
     now: i64,

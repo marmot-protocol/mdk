@@ -12,7 +12,7 @@ use cgka_traits::app_event::{
     STREAM_START_TAG, STREAM_TAG,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -279,64 +279,72 @@ impl SqliteAccountStorage {
         &self,
         event: &StoredAppEvent,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let affected_message_ids = affected_timeline_message_ids_tx(&tx, event)?;
-        let can_incrementally_project =
-            !app_event_exists_tx(&tx, &event.group_id_hex, &event.message_id_hex)?
-                && can_project_record_app_event_incrementally(event.kind);
-        tx.execute(
-            "INSERT INTO app_events (
-                group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
-                plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
-                source_message_id_hex = excluded.source_message_id_hex,
-                source_epoch = excluded.source_epoch,
-                direction = excluded.direction,
-                sender = excluded.sender,
-                plaintext = excluded.plaintext,
-                kind = excluded.kind,
-                tags_json = excluded.tags_json,
-                recorded_at = excluded.recorded_at,
-                received_at = excluded.received_at,
-                origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
-                invalidated = 0,
-                invalidation_reason = NULL",
-            params![
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let affected_message_ids = affected_timeline_message_ids_tx(&conn, event)?;
+            let can_incrementally_project =
+                !app_event_exists_tx(&conn, &event.group_id_hex, &event.message_id_hex)?
+                    && can_project_record_app_event_incrementally(event.kind);
+            conn.execute(
+                "INSERT INTO app_events (
+                    group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
+                    plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
+                    source_message_id_hex = excluded.source_message_id_hex,
+                    source_epoch = excluded.source_epoch,
+                    direction = excluded.direction,
+                    sender = excluded.sender,
+                    plaintext = excluded.plaintext,
+                    kind = excluded.kind,
+                    tags_json = excluded.tags_json,
+                    recorded_at = excluded.recorded_at,
+                    received_at = excluded.received_at,
+                    origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
+                    invalidated = 0,
+                    invalidation_reason = NULL",
+                params![
+                    &event.group_id_hex,
+                    &event.message_id_hex,
+                    &event.source_message_id_hex,
+                    optional_u64_to_i64(event.source_epoch)?,
+                    &event.direction,
+                    &event.sender,
+                    &event.plaintext,
+                    u64_to_i64(event.kind)?,
+                    tags_json(&event.tags)?,
+                    u64_to_i64(event.recorded_at)?,
+                    u64_to_i64(event.received_at)?,
+                    &event.origin_commit_id,
+                ],
+            )
+            .storage()?;
+            if can_incrementally_project {
+                upsert_message_timeline_projection_for_message_tx(
+                    &conn,
+                    &event.group_id_hex,
+                    &event.message_id_hex,
+                )?;
+            } else {
+                rebuild_message_timeline_for_group_tx(&conn, &event.group_id_hex)?;
+            }
+            let messages = timeline_records_by_ids_tx(
+                &conn,
                 &event.group_id_hex,
-                &event.message_id_hex,
-                &event.source_message_id_hex,
-                optional_u64_to_i64(event.source_epoch)?,
-                &event.direction,
-                &event.sender,
-                &event.plaintext,
-                u64_to_i64(event.kind)?,
-                tags_json(&event.tags)?,
-                u64_to_i64(event.recorded_at)?,
-                u64_to_i64(event.received_at)?,
-                &event.origin_commit_id,
-            ],
-        )
-        .storage()?;
-        if can_incrementally_project {
-            upsert_message_timeline_projection_for_message_tx(
-                &tx,
-                &event.group_id_hex,
-                &event.message_id_hex,
+                affected_message_ids.clone(),
             )?;
-        } else {
-            rebuild_message_timeline_for_group_tx(&tx, &event.group_id_hex)?;
-        }
-        let messages =
-            timeline_records_by_ids_tx(&tx, &event.group_id_hex, affected_message_ids.clone())?;
-        let changes =
-            timeline_changes_for_event(&event.message_id_hex, event.kind, &event.tags, &messages);
-        tx.commit().storage().map(|()| TimelineProjectionUpdate {
-            group_id_hex: event.group_id_hex.clone(),
-            messages,
-            changes,
+            let changes = timeline_changes_for_event(
+                &event.message_id_hex,
+                event.kind,
+                &event.tags,
+                &messages,
+            );
+            Ok(TimelineProjectionUpdate {
+                group_id_hex: event.group_id_hex.clone(),
+                messages,
+                changes,
+            })
         })
     }
 
@@ -400,79 +408,81 @@ impl SqliteAccountStorage {
         origin_commit_id: &str,
         reason: &str,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        // Fetch all rows the commit synthesized. They all share one group (a
-        // commit belongs to a single group), so one rebuild + change set covers
-        // them. `origin_commit_id` is non-unique by design (multi-row-per-commit).
-        let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT group_id_hex, message_id_hex, kind, tags_json
-                     FROM app_events
-                     WHERE origin_commit_id = ?1",
-                )
-                .storage()?;
-            stmt.query_map(params![origin_commit_id], |row| {
-                let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            // Fetch all rows the commit synthesized. They all share one group (a
+            // commit belongs to a single group), so one rebuild + change set covers
+            // them. `origin_commit_id` is non-unique by design (multi-row-per-commit).
+            let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT group_id_hex, message_id_hex, kind, tags_json
+                         FROM app_events
+                         WHERE origin_commit_id = ?1",
                     )
-                })?;
-                Ok((row.get(0)?, row.get(1)?, kind, tags))
-            })
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?
-        };
-        let Some(group_id_hex) = rows.first().map(|(group_id_hex, ..)| group_id_hex.clone()) else {
-            return Ok(None);
-        };
-        // Collect the set of timeline message ids affected across all matched
-        // rows so we can diff before/after for the change set.
-        let mut affected_message_ids = BTreeSet::new();
-        for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
-            affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
-                &tx,
-                row_group_id_hex,
-                message_id_hex,
-                *kind,
-                tags,
-            )?);
-        }
-        let before = timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
-        tx.execute(
-            "UPDATE app_events
-             SET invalidated = 1, invalidation_reason = ?2
-             WHERE origin_commit_id = ?1",
-            params![origin_commit_id, reason],
-        )
-        .storage()?;
-        rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
-        let messages =
-            timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
-        // One change set covers all invalidated rows. Each invalidated row's own
-        // message id anchors its change; pass each in turn and merge.
-        let mut changes = Vec::new();
-        for (_, message_id_hex, kind, tags) in &rows {
-            changes.extend(timeline_changes_for_invalidation(
-                message_id_hex,
-                *kind,
-                tags,
-                &before,
-                &messages,
-            ));
-        }
-        dedup_timeline_changes(&mut changes);
-        tx.commit().storage()?;
-        Ok(Some(TimelineProjectionUpdate {
-            group_id_hex,
-            messages,
-            changes,
-        }))
+                    .storage()?;
+                stmt.query_map(params![origin_commit_id], |row| {
+                    let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                    let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+                    Ok((row.get(0)?, row.get(1)?, kind, tags))
+                })
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?
+            };
+            let Some(group_id_hex) = rows.first().map(|(group_id_hex, ..)| group_id_hex.clone())
+            else {
+                return Ok(None);
+            };
+            // Collect the set of timeline message ids affected across all matched
+            // rows so we can diff before/after for the change set.
+            let mut affected_message_ids = BTreeSet::new();
+            for (row_group_id_hex, message_id_hex, kind, tags) in &rows {
+                affected_message_ids.extend(affected_timeline_message_ids_for_parts_tx(
+                    &conn,
+                    row_group_id_hex,
+                    message_id_hex,
+                    *kind,
+                    tags,
+                )?);
+            }
+            let before =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
+            conn.execute(
+                "UPDATE app_events
+                 SET invalidated = 1, invalidation_reason = ?2
+                 WHERE origin_commit_id = ?1",
+                params![origin_commit_id, reason],
+            )
+            .storage()?;
+            rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
+            let messages =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
+            // One change set covers all invalidated rows. Each invalidated row's own
+            // message id anchors its change; pass each in turn and merge.
+            let mut changes = Vec::new();
+            for (_, message_id_hex, kind, tags) in &rows {
+                changes.extend(timeline_changes_for_invalidation(
+                    message_id_hex,
+                    *kind,
+                    tags,
+                    &before,
+                    &messages,
+                ));
+            }
+            dedup_timeline_changes(&mut changes);
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex,
+                messages,
+                changes,
+            }))
+        })
     }
 
     /// Invalidate the single app-event row addressed by `lookup_params`.
@@ -495,55 +505,57 @@ impl SqliteAccountStorage {
         lookup_params: &[&dyn rusqlite::ToSql],
         reason: &str,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let row: Option<(String, String, u64, Vec<Vec<String>>)> = tx
-            .query_row(select_sql, lookup_params, |row| {
-                let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
-                let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?;
-                Ok((row.get(0)?, row.get(1)?, kind, tags))
-            })
-            .optional()
-            .storage()?;
-        let Some((group_id_hex, message_id_hex, kind, tags)) = row else {
-            return Ok(None);
-        };
-        let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
-            &tx,
-            &group_id_hex,
-            &message_id_hex,
-            kind,
-            &tags,
-        )?;
-        let before = timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
-        // The UPDATE shares the lookup predicate and appends `reason` last.
-        let mut update_params: Vec<&dyn rusqlite::ToSql> = lookup_params.to_vec();
-        update_params.push(&reason);
-        tx.execute(update_sql, update_params.as_slice()).storage()?;
-        rebuild_message_timeline_for_group_tx(&tx, &group_id_hex)?;
-        let messages =
-            timeline_records_by_ids_tx(&tx, &group_id_hex, affected_message_ids.clone())?;
-        let changes =
-            timeline_changes_for_invalidation(&message_id_hex, kind, &tags, &before, &messages);
-        tx.commit().storage()?;
-        Ok(Some(TimelineProjectionUpdate {
-            group_id_hex,
-            messages,
-            changes,
-        }))
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let row: Option<(String, String, u64, Vec<Vec<String>>)> = conn
+                .query_row(select_sql, lookup_params, |row| {
+                    let kind = row.get::<_, i64>(2)?.try_into().unwrap_or_default();
+                    let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+                    Ok((row.get(0)?, row.get(1)?, kind, tags))
+                })
+                .optional()
+                .storage()?;
+            let Some((group_id_hex, message_id_hex, kind, tags)) = row else {
+                return Ok(None);
+            };
+            let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+                &conn,
+                &group_id_hex,
+                &message_id_hex,
+                kind,
+                &tags,
+            )?;
+            let before =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
+            // The UPDATE shares the lookup predicate and appends `reason` last.
+            let mut update_params: Vec<&dyn rusqlite::ToSql> = lookup_params.to_vec();
+            update_params.push(&reason);
+            conn.execute(update_sql, update_params.as_slice())
+                .storage()?;
+            rebuild_message_timeline_for_group_tx(&conn, &group_id_hex)?;
+            let messages =
+                timeline_records_by_ids_tx(&conn, &group_id_hex, affected_message_ids.clone())?;
+            let changes =
+                timeline_changes_for_invalidation(&message_id_hex, kind, &tags, &before, &messages);
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex,
+                messages,
+                changes,
+            }))
+        })
     }
 
     pub fn rebuild_message_timeline_for_group(&self, group_id_hex: &str) -> StorageResult<()> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        rebuild_message_timeline_for_group_tx(&tx, group_id_hex)?;
-        tx.commit().storage()
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            rebuild_message_timeline_for_group_tx(&conn, group_id_hex)
+        })
     }
 
     pub fn message_timeline(&self, query: TimelineMessageQuery) -> StorageResult<TimelinePage> {
@@ -629,7 +641,7 @@ impl SqliteAccountStorage {
 }
 
 pub(crate) fn rebuild_message_timeline_for_group_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<()> {
     let events = app_events_for_rebuild_tx(tx, group_id_hex)?;
@@ -654,7 +666,7 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
 }
 
 pub(crate) fn secure_prune_app_events_before_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     cutoff_recorded_at: u64,
 ) -> StorageResult<SecurePruneAppEventsResult> {
@@ -708,7 +720,7 @@ pub(crate) fn secure_prune_app_events_before_tx(
 }
 
 fn with_secure_delete_enabled_tx<T>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     op: impl FnOnce() -> StorageResult<T>,
 ) -> StorageResult<T> {
     let original_secure_delete = tx
@@ -725,13 +737,13 @@ fn with_secure_delete_enabled_tx<T>(
     }
 }
 
-fn set_secure_delete_tx(tx: &Transaction<'_>, value: i64) -> StorageResult<()> {
+fn set_secure_delete_tx(tx: &Connection, value: i64) -> StorageResult<()> {
     tx.execute_batch(&format!("PRAGMA secure_delete = {value};"))
         .storage()
 }
 
 fn refresh_chat_list_last_message_after_secure_prune_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<()> {
     let latest = tx
@@ -811,7 +823,7 @@ fn can_project_record_app_event_incrementally(kind: u64) -> bool {
 }
 
 fn app_event_exists_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<bool> {
@@ -829,7 +841,7 @@ fn app_event_exists_tx(
 }
 
 fn upsert_message_timeline_projection_for_message_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<()> {
@@ -860,7 +872,7 @@ fn upsert_message_timeline_projection_for_message_tx(
 }
 
 fn project_single_message_timeline_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<(TimelineRow, Option<StreamStartRow>)>> {
@@ -915,7 +927,7 @@ fn project_single_message_timeline_tx(
     Ok(Some((row, stream_start)))
 }
 
-fn apply_targeted_modifiers_tx(tx: &Transaction<'_>, row: &mut TimelineRow) -> StorageResult<()> {
+fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> StorageResult<()> {
     let reactions = app_events_targeting_message_tx(
         tx,
         &row.group_id_hex,
@@ -974,7 +986,7 @@ fn apply_targeted_modifiers_tx(tx: &Transaction<'_>, row: &mut TimelineRow) -> S
 }
 
 fn deleted_reaction_ids_for_target_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     reactions: &[RawAppEvent],
 ) -> StorageResult<HashSet<String>> {
@@ -997,7 +1009,7 @@ fn deleted_reaction_ids_for_target_tx(
 }
 
 fn app_events_targeting_message_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     kind: u64,
     target_message_id_hex: &str,
@@ -1032,7 +1044,7 @@ fn app_events_targeting_message_tx(
         .collect())
 }
 
-fn upsert_message_timeline_row_tx(tx: &Transaction<'_>, row: &TimelineRow) -> StorageResult<()> {
+fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> StorageResult<()> {
     tx.execute(
         "INSERT INTO message_timeline (
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
@@ -1083,7 +1095,7 @@ fn upsert_message_timeline_row_tx(tx: &Transaction<'_>, row: &TimelineRow) -> St
     Ok(())
 }
 
-fn upsert_agent_stream_start_tx(tx: &Transaction<'_>, start: &StreamStartRow) -> StorageResult<()> {
+fn upsert_agent_stream_start_tx(tx: &Connection, start: &StreamStartRow) -> StorageResult<()> {
     tx.execute(
         "INSERT INTO agent_stream_starts (
             group_id_hex, message_id_hex, source_message_id_hex, sender, stream_id_hex,
@@ -1130,7 +1142,7 @@ fn escape_like_literal(value: &str) -> String {
 }
 
 fn app_events_for_rebuild_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
 ) -> StorageResult<Vec<RawAppEvent>> {
     // Invalidated events are intentionally NOT filtered out here: convergence-
@@ -1154,7 +1166,7 @@ fn app_events_for_rebuild_tx(
 }
 
 fn app_events_before_cutoff_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     cutoff_recorded_at: u64,
 ) -> StorageResult<Vec<PrunedAppEvent>> {
@@ -1190,7 +1202,7 @@ fn app_events_before_cutoff_tx(
 }
 
 fn scrub_app_events_before_cutoff_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     cutoff_recorded_at: u64,
 ) -> StorageResult<()> {
@@ -1213,7 +1225,7 @@ fn scrub_app_events_before_cutoff_tx(
 }
 
 fn scrub_timeline_projection_rows_by_ids_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_ids: &BTreeSet<String>,
 ) -> StorageResult<()> {
@@ -1314,7 +1326,7 @@ fn collect_media_ciphertext_hashes(tags: &[Vec<String>], out: &mut BTreeSet<Stri
 }
 
 fn delete_timeline_projection_rows_by_ids_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_ids: &BTreeSet<String>,
 ) -> StorageResult<()> {
@@ -1343,7 +1355,7 @@ fn delete_timeline_projection_rows_by_ids_tx(
 }
 
 fn affected_timeline_message_ids_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     event: &StoredAppEvent,
 ) -> StorageResult<BTreeSet<String>> {
     affected_timeline_message_ids_for_parts_tx(
@@ -1356,7 +1368,7 @@ fn affected_timeline_message_ids_tx(
 }
 
 fn affected_timeline_message_ids_for_parts_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
     kind: u64,
@@ -1373,7 +1385,7 @@ fn affected_timeline_message_ids_for_parts_tx(
 }
 
 fn affected_timeline_message_ids_for_pruned_event_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
     kind: u64,
@@ -1395,7 +1407,7 @@ fn affected_timeline_message_ids_for_pruned_event_tx(
 }
 
 fn affected_timeline_message_ids_for_parts_with_options_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
     kind: u64,
@@ -1620,7 +1632,7 @@ fn timeline_trigger_for_event_row(
 }
 
 fn reply_message_ids_for_targets_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     target_message_ids: &[String],
 ) -> StorageResult<Vec<String>> {
@@ -1652,7 +1664,7 @@ fn reply_message_ids_for_targets_tx(
 }
 
 fn reaction_target_message_id_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_id_hex: &str,
 ) -> StorageResult<Option<String>> {
@@ -1686,7 +1698,7 @@ fn reaction_target_message_id_tx(
 }
 
 fn timeline_records_by_ids_tx(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     group_id_hex: &str,
     message_ids: BTreeSet<String>,
 ) -> StorageResult<Vec<TimelineMessageRecord>> {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::StoredAppEvent;
+use crate::{SqlCipherKey, SqliteStorageOptions, StoredAppEvent};
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_TAG,
@@ -1092,6 +1092,53 @@ fn delete_local_group_data_rolls_back_all_tables_on_failure() {
     ] {
         assert!(group_row_count(&store, table, "aa") > 0, "{table}");
     }
+}
+
+#[test]
+fn record_app_event_retries_concurrent_writer_contention() {
+    // Representative projection-writer regression: the other projection writers use the
+    // same with_transaction retry path.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("projection-contention.sqlite");
+    let key = SqlCipherKey::new("projection contention key").unwrap();
+    let options = SqliteStorageOptions {
+        busy_timeout_ms: 50,
+        ..SqliteStorageOptions::default()
+    };
+
+    let writer = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+        .expect("writer storage opens");
+
+    let blocker_path = path.clone();
+    let blocker_options = options.clone();
+    let blocker_key = SqlCipherKey::new("projection contention key").unwrap();
+    let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
+    let blocker = std::thread::spawn(move || {
+        let blocker = SqliteAccountStorage::open_encrypted_with_options(
+            &blocker_path,
+            &blocker_key,
+            blocker_options,
+        )
+        .expect("blocker storage opens");
+        let conn = blocker.lock().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        lock_acquired_tx
+            .send(())
+            .expect("signal BEGIN IMMEDIATE acquired");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+
+    lock_acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("blocker should hold BEGIN IMMEDIATE before writer starts");
+
+    writer
+        .record_app_event(&app_event("contended", "aa", 10))
+        .expect("projection writer should wait out transient sqlite write-lock contention");
+
+    blocker.join().unwrap();
+    assert_eq!(writer.app_message_count().unwrap(), 1);
 }
 
 fn insert_group_push_token(store: &SqliteAccountStorage, group_id_hex: &str, member_id_hex: &str) {
