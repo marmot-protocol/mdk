@@ -1,6 +1,9 @@
 //! Message-record and message-subscription-update FFI conversions.
 
-use marmot_app::{AppMessageRecord, ReceivedMessage, RuntimeMessageReceived, RuntimeMessageUpdate};
+use marmot_app::{
+    AppMessageRecord, ReceivedMessage, RuntimeMessageReceived, RuntimeMessageUpdate,
+    SecureDeleteExpiredResult,
+};
 
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
 use crate::markdown::MarkdownDocumentFfi;
@@ -35,6 +38,21 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             tags: message_tags_ffi(value.tags),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct SecureDeleteExpiredResultFfi {
+    pub pruned_messages: u64,
+    pub media_ciphertext_sha256: Vec<String>,
+}
+
+impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
+    fn from(value: SecureDeleteExpiredResult) -> Self {
+        Self {
+            pruned_messages: value.pruned_messages,
+            media_ciphertext_sha256: value.media_ciphertext_sha256,
         }
     }
 }

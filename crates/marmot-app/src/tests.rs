@@ -1629,3 +1629,72 @@ fn relay_telemetry_settings_reject_invalid_persisted_interval() {
 
     assert!(matches!(err, AppError::InvalidRelayTelemetrySettings(_)));
 }
+
+#[test]
+fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![AppGroupRecord::new(
+            "aa".to_owned(),
+            AppGroupNostrRoutingComponent::new(
+                NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+            "alpha".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )],
+    })
+    .unwrap();
+    let media_hash = "ef".repeat(32);
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            message_id_hex: "old-aa".to_owned(),
+            source_message_id_hex: None,
+            direction: "received".to_owned(),
+            group_id_hex: "aa".to_owned(),
+            sender: account.account_id_hex,
+            plaintext: "expired plaintext".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: vec![vec![
+                "imeta".to_owned(),
+                "v encrypted-media-v1".to_owned(),
+                format!("ciphertext_sha256 {media_hash}"),
+            ]],
+            source_epoch: None,
+            recorded_at: Some(10),
+            origin_commit_id: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        app.chat_list_row("alice", "aa")
+            .unwrap()
+            .unwrap()
+            .last_message
+            .is_some()
+    );
+
+    let outcome = app
+        .secure_prune_account_app_events_before("alice", "aa", 15)
+        .unwrap();
+
+    assert_eq!(outcome.pruned_messages, 1);
+    assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash]);
+    assert!(
+        app.chat_list_row("alice", "aa")
+            .unwrap()
+            .unwrap()
+            .last_message
+            .is_none()
+    );
+}

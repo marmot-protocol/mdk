@@ -3,7 +3,9 @@
 use marmot_app::AppMessageQuery;
 
 use crate::Marmot;
-use crate::conversions::{AppMessageRecordFfi, SendSummaryFfi, group_id_from_hex};
+use crate::conversions::{
+    AppMessageRecordFfi, SecureDeleteExpiredResultFfi, SendSummaryFfi, group_id_from_hex,
+};
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
 
@@ -116,6 +118,23 @@ impl Marmot {
             .delete_message(&account_ref, &group_id, &target_message_id)
             .await?;
         Ok(summary.into())
+    }
+
+    /// Securely scrub and prune expired disappearing-message plaintext for a
+    /// group according to its active retention component. The media hash list
+    /// identifies pruned encrypted-media blobs so host apps can purge their own
+    /// decrypted-media disk caches keyed by ciphertext hash.
+    pub async fn secure_delete_expired(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<SecureDeleteExpiredResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let outcome = self
+            .runtime
+            .secure_delete_expired_plaintext(&account_ref, &group_id)
+            .await?;
+        Ok(outcome.into())
     }
 
     /// Edit `target_message_id` by publishing a kind-1009 event that

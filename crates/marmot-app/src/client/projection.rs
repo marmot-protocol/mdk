@@ -11,7 +11,7 @@ use crate::{
     AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageInput,
     AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupRecord,
-    AppMessageProjection, unix_now_seconds,
+    AppMessageProjection, SecureDeleteExpiredResult, unix_now_seconds,
 };
 
 use super::AppClient;
@@ -142,17 +142,24 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<(), AppError> {
+        self.secure_delete_expired_plaintext_for_group(group_id)
+            .map(|_| ())
+    }
+
+    pub fn secure_delete_expired_plaintext_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
         let retention = self.message_retention_for_group(group_id);
         if retention.disappearing_message_secs == 0 {
-            return Ok(());
+            return Ok(SecureDeleteExpiredResult::default());
         }
         let cutoff = unix_now_seconds().saturating_sub(retention.disappearing_message_secs);
-        self.app.prune_account_app_events_before(
+        self.app.secure_prune_account_app_events_before(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
             cutoff,
-        )?;
-        Ok(())
+        )
     }
 
     pub(crate) fn agent_text_stream_for_group(

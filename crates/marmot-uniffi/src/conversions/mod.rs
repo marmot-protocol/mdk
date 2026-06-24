@@ -43,8 +43,8 @@ mod tests {
     use super::*;
     use crate::markdown::{MarkdownBlockFfi, MarkdownDocumentFfi, MarkdownInlineFfi};
     use marmot_app::{
-        AppMessageRecord, TimelineMessageRecord, TimelinePage, TimelineReactionSummary,
-        TimelineReplyPreview, TimelineUserReaction,
+        AppMessageRecord, SecureDeleteExpiredResult, TimelineMessageRecord, TimelinePage,
+        TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     };
     use std::collections::BTreeMap;
 
@@ -122,6 +122,20 @@ mod tests {
         assert!(bob_action.can_remove);
         assert!(bob_action.can_promote);
         assert!(!bob_action.can_demote);
+    }
+
+    #[test]
+    fn secure_delete_expired_result_ffi_preserves_count_and_hashes() {
+        let ffi = SecureDeleteExpiredResultFfi::from(SecureDeleteExpiredResult {
+            pruned_messages: 2,
+            media_ciphertext_sha256: vec!["aa".repeat(32), "bb".repeat(32)],
+        });
+
+        assert_eq!(ffi.pruned_messages, 2);
+        assert_eq!(
+            ffi.media_ciphertext_sha256,
+            vec!["aa".repeat(32), "bb".repeat(32)]
+        );
     }
 
     #[test]

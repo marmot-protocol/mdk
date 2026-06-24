@@ -34,9 +34,9 @@ use crate::{
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
     NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
     PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SendSummary, TimelineMessageQuery,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary,
+    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1695,6 +1695,19 @@ impl MarmotAppRuntime {
     ) -> Result<MediaDownloadResult, AppError> {
         self.accounts
             .download_media(account_ref, group_id, reference)
+            .await
+    }
+
+    /// Securely scrub and prune expired disappearing-message plaintext for this
+    /// group. The returned media hashes are the encrypted blob identifiers from
+    /// pruned media messages, for host-side decrypted-cache purges.
+    pub async fn secure_delete_expired_plaintext(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
+        self.accounts
+            .secure_delete_expired_plaintext(account_ref, group_id)
             .await
     }
 

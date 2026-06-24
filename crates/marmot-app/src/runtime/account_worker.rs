@@ -27,7 +27,7 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppProjectionUpdate, AppQuarantinedGroup,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PushRegistration, ReceivedMessage,
-    SendSummary, SyncSummary,
+    SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -218,6 +218,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         reference: MediaAttachmentReference,
         respond: oneshot::Sender<Result<MediaDownloadResult, AppError>>,
+    },
+    SecureDeleteExpiredPlaintext {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<SecureDeleteExpiredResult, AppError>>,
     },
     StartAgentTextStream {
         group_id: GroupId,
@@ -1092,6 +1096,10 @@ async fn handle_account_worker_command(
                 download_started_at.elapsed(),
                 result.is_ok(),
             );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SecureDeleteExpiredPlaintext { group_id, respond } => {
+            let result = client.secure_delete_expired_plaintext_for_group(&group_id);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::StartAgentTextStream {

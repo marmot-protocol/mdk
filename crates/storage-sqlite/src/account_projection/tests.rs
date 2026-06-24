@@ -284,6 +284,356 @@ fn app_messages_list_raw_events_and_prune_updates_timeline() {
 }
 
 #[test]
+fn prune_app_events_before_scrubs_pruned_plaintext_and_media_before_deleting() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut old = app_event("old-aa", "aa", 10);
+    old.plaintext = "secret disappearing plaintext".to_owned();
+    old.tags = vec![vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        format!("ciphertext_sha256 {}", "aa".repeat(32)),
+        format!("plaintext_sha256 {}", "bb".repeat(32)),
+        "nonce 000102030405060708090a0b".to_owned(),
+        "m image/png".to_owned(),
+        "filename secret.png".to_owned(),
+        format!(
+            "locator blossom-v1 https://blossom.example/{}",
+            "aa".repeat(32)
+        ),
+    ]];
+    store.record_app_event(&old).unwrap();
+    {
+        let conn = store.lock().unwrap();
+        let media_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM message_timeline
+                 WHERE message_id_hex = 'old-aa' AND media_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(media_rows, 1, "test fixture must project media metadata");
+        conn.execute_batch(
+            "CREATE TEMP TABLE prune_delete_audit (
+                table_name TEXT NOT NULL,
+                plaintext BLOB NOT NULL,
+                tags_json BLOB NOT NULL,
+                media_json BLOB
+             );
+             CREATE TEMP TRIGGER audit_app_event_delete
+             BEFORE DELETE ON app_events
+             WHEN OLD.message_id_hex = 'old-aa'
+             BEGIN
+                INSERT INTO prune_delete_audit(table_name, plaintext, tags_json, media_json)
+                VALUES ('app_events', OLD.plaintext, OLD.tags_json, NULL);
+             END;
+             CREATE TEMP TRIGGER audit_timeline_delete
+             BEFORE DELETE ON message_timeline
+             WHEN OLD.message_id_hex = 'old-aa'
+             BEGIN
+                INSERT INTO prune_delete_audit(table_name, plaintext, tags_json, media_json)
+                VALUES ('message_timeline', OLD.plaintext, OLD.tags_json, OLD.media_json);
+             END;",
+        )
+        .unwrap();
+    }
+
+    assert_eq!(store.prune_app_events_before("aa", 15).unwrap(), 1);
+
+    let conn = store.lock().unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT table_name, plaintext, tags_json, media_json
+             FROM prune_delete_audit
+             ORDER BY table_name",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (table_name, plaintext, tags_json, media_json) in rows {
+        assert!(
+            !plaintext.is_empty() && plaintext.iter().all(|byte| *byte == 0),
+            "{table_name} plaintext must be zeroed before DELETE"
+        );
+        assert!(
+            !tags_json.is_empty() && tags_json.iter().all(|byte| *byte == 0),
+            "{table_name} tags must be zeroed before DELETE"
+        );
+        if table_name == "message_timeline" {
+            let media_json = media_json.expect("timeline row must carry scrubbed media metadata");
+            assert!(
+                !media_json.is_empty() && media_json.iter().all(|byte| *byte == 0),
+                "{table_name} media metadata must be zeroed before DELETE"
+            );
+        } else {
+            assert_eq!(media_json, None);
+        }
+    }
+}
+
+#[test]
+fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("account.sqlite");
+    let options = crate::SqliteStorageOptions {
+        secure_delete: false,
+        ..crate::SqliteStorageOptions::default()
+    };
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        options,
+    )
+    .unwrap();
+    let secret = "secure-prune-disk-secret-586-plaintext";
+    let secret_filename = "secure-prune-disk-secret-586.png";
+    let media_hash = "ca".repeat(32);
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha")],
+            },
+            16,
+        )
+        .unwrap();
+    let mut old = app_event("old-disk", "aa", 10);
+    old.plaintext = secret.to_owned();
+    old.tags = vec![vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        format!("ciphertext_sha256 {media_hash}"),
+        "m image/png".to_owned(),
+        format!("filename {secret_filename}"),
+        format!("locator blossom-v1 https://blossom.example/{media_hash}"),
+    ]];
+    store.record_app_event(&old).unwrap();
+    store.refresh_chat_list_row("alice-account", "aa").unwrap();
+    {
+        let conn = store.lock().unwrap();
+        let (busy, _, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+    }
+    assert!(
+        file_contains(&db_path, secret.as_bytes()),
+        "fixture should place plaintext in the database file before secure prune"
+    );
+
+    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+    assert_eq!(outcome.pruned_messages, 1);
+    assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash.clone()]);
+    assert!(
+        store
+            .chat_list_row("aa")
+            .unwrap()
+            .unwrap()
+            .last_message
+            .is_none()
+    );
+    drop(store);
+
+    for path in [
+        db_path.clone(),
+        db_path.with_extension("sqlite-wal"),
+        db_path.with_extension("sqlite-shm"),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        assert!(
+            !file_contains(&path, secret.as_bytes()),
+            "{} must not retain pruned plaintext",
+            path.display()
+        );
+        assert!(
+            !file_contains(&path, secret_filename.as_bytes()),
+            "{} must not retain pruned media metadata",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn secure_prune_removes_pruned_plaintext_from_search_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("account.sqlite");
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            secure_delete: false,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let old_secret = "secure-prune-index-secret-586-old";
+    let survivor_secret = "secure-prune-index-secret-586-survivor";
+    let mut old = app_event("old-index", "aa", 10);
+    old.plaintext = old_secret.to_owned();
+    let mut survivor = app_event("survivor-index", "aa", 20);
+    survivor.plaintext = survivor_secret.to_owned();
+    store.record_app_event(&old).unwrap();
+    store.record_app_event(&survivor).unwrap();
+    let indexed = store
+        .message_timeline(crate::TimelineMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            search: Some("secure-prune-index-secret".to_owned()),
+            ..crate::TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(indexed.messages.len(), 2);
+    {
+        let conn = store.lock().unwrap();
+        let (busy, _, _): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+    }
+    assert!(
+        file_contains(&db_path, old_secret.as_bytes()),
+        "fixture should place indexed plaintext in the database file before secure prune"
+    );
+
+    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+
+    assert_eq!(outcome.pruned_messages, 1);
+    drop(store);
+    assert!(
+        !file_contains(&db_path, old_secret.as_bytes()),
+        "search-indexed pruned plaintext must be scrubbed from the database file"
+    );
+    assert!(
+        file_contains(&db_path, survivor_secret.as_bytes()),
+        "surviving indexed plaintext must not be scrubbed"
+    );
+}
+
+fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
+    let haystack = std::fs::read(path).unwrap();
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[test]
+fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha")],
+            },
+            16,
+        )
+        .unwrap();
+    let mut old = app_event("old-aa", "aa", 10);
+    old.plaintext = "chat list should not retain this".to_owned();
+    store.record_app_event(&old).unwrap();
+    store.refresh_chat_list_row("alice-account", "aa").unwrap();
+    assert_eq!(
+        store
+            .chat_list_row("aa")
+            .unwrap()
+            .unwrap()
+            .last_message
+            .unwrap()
+            .plaintext,
+        "chat list should not retain this"
+    );
+
+    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+
+    assert_eq!(outcome.pruned_messages, 1);
+    assert!(
+        store
+            .chat_list_row("aa")
+            .unwrap()
+            .unwrap()
+            .last_message
+            .is_none()
+    );
+}
+
+#[test]
+fn secure_prune_restores_caller_secure_delete_setting() {
+    let store = SqliteAccountStorage::in_memory_with_options(crate::SqliteStorageOptions {
+        secure_delete: false,
+        ..crate::SqliteStorageOptions::default()
+    })
+    .unwrap();
+    assert_eq!(secure_delete_pragma(&store), 0);
+    store
+        .record_app_event(&app_event("old-aa", "aa", 10))
+        .unwrap();
+
+    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+
+    assert_eq!(outcome.pruned_messages, 1);
+    assert_eq!(secure_delete_pragma(&store), 0);
+}
+
+#[test]
+fn secure_prune_returns_hashes_when_wal_checkpoint_is_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("account.sqlite");
+    let store = SqliteAccountStorage::from_connection_with_options(
+        rusqlite::Connection::open(&db_path).unwrap(),
+        crate::SqliteStorageOptions {
+            busy_timeout_ms: 1,
+            ..crate::SqliteStorageOptions::default()
+        },
+    )
+    .unwrap();
+    let media_hash = "db".repeat(32);
+    let mut old = app_event("old-aa", "aa", 10);
+    old.tags = vec![vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        format!("ciphertext_sha256 {media_hash}"),
+    ]];
+    store.record_app_event(&old).unwrap();
+
+    let reader = rusqlite::Connection::open(&db_path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM app_events", [], |row| row.get(0))
+        .unwrap();
+
+    let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
+
+    assert_eq!(outcome.pruned_messages, 1);
+    assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash]);
+    reader.execute_batch("COMMIT").unwrap();
+}
+
+fn secure_delete_pragma(store: &SqliteAccountStorage) -> i64 {
+    store
+        .lock()
+        .unwrap()
+        .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
 fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store

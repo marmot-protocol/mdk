@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     SqliteAccountStorage, SqliteResultExt, optional_u64_to_i64, tags_from_json, u64_to_i64,
+    unix_now_seconds,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
@@ -149,6 +150,14 @@ pub struct TimelineProjectionUpdate {
     pub group_id_hex: String,
     pub messages: Vec<TimelineMessageRecord>,
     pub changes: Vec<TimelineMessageChange>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecurePruneAppEventsResult {
+    pub pruned_messages: usize,
+    /// Sorted set of encrypted-media blob ids referenced by pruned messages.
+    /// Callers should treat this as an unordered purge set.
+    pub media_ciphertext_sha256: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -644,45 +653,150 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     Ok(())
 }
 
-pub(crate) fn prune_app_events_before_tx(
+pub(crate) fn secure_prune_app_events_before_tx(
     tx: &Transaction<'_>,
     group_id_hex: &str,
     cutoff_recorded_at: u64,
-) -> StorageResult<usize> {
-    let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
-    if pruned_events.is_empty() {
-        return Ok(0);
-    }
+) -> StorageResult<SecurePruneAppEventsResult> {
+    with_secure_delete_enabled_tx(tx, || {
+        let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+        if pruned_events.is_empty() {
+            return Ok(SecurePruneAppEventsResult::default());
+        }
 
-    let mut pruned_message_ids = BTreeSet::new();
-    let mut affected_message_ids = BTreeSet::new();
-    for event in &pruned_events {
-        pruned_message_ids.insert(event.message_id_hex.clone());
-        affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
-            tx,
-            group_id_hex,
-            &event.message_id_hex,
-            event.kind,
-            &event.tags,
-        )?);
-    }
+        let mut pruned_message_ids = BTreeSet::new();
+        let mut affected_message_ids = BTreeSet::new();
+        let mut media_ciphertext_sha256 = BTreeSet::new();
+        for event in &pruned_events {
+            pruned_message_ids.insert(event.message_id_hex.clone());
+            collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
+            affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
+                tx,
+                group_id_hex,
+                &event.message_id_hex,
+                event.kind,
+                &event.tags,
+            )?);
+        }
 
-    let pruned = tx
-        .execute(
-            "DELETE FROM app_events
+        scrub_app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+        // `message_timeline.plaintext` is indexed for search; overwriting it
+        // under `secure_delete` before DELETE also rewrites the old index key.
+        scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+
+        let pruned = tx
+            .execute(
+                "DELETE FROM app_events
+                 WHERE group_id_hex = ?1
+                   AND recorded_at < ?2",
+                params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
+            )
+            .storage()?;
+
+        delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+        affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
+        for message_id in affected_message_ids {
+            upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
+        }
+        refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
+
+        Ok(SecurePruneAppEventsResult {
+            pruned_messages: pruned,
+            media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
+        })
+    })
+}
+
+fn with_secure_delete_enabled_tx<T>(
+    tx: &Transaction<'_>,
+    op: impl FnOnce() -> StorageResult<T>,
+) -> StorageResult<T> {
+    let original_secure_delete = tx
+        .query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+        .storage()?;
+    tx.execute_batch("PRAGMA secure_delete = ON;").storage()?;
+    let outcome = op();
+    let restore = set_secure_delete_tx(tx, original_secure_delete);
+    match (outcome, restore) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Err(_)) => Err(err),
+    }
+}
+
+fn set_secure_delete_tx(tx: &Transaction<'_>, value: i64) -> StorageResult<()> {
+    tx.execute_batch(&format!("PRAGMA secure_delete = {value};"))
+        .storage()
+}
+
+fn refresh_chat_list_last_message_after_secure_prune_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+) -> StorageResult<()> {
+    let latest = tx
+        .query_row(
+            "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
+             FROM message_timeline
              WHERE group_id_hex = ?1
-               AND recorded_at < ?2",
-            params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
+               AND kind = ?2
+               AND invalidation_status IS NULL
+             ORDER BY timeline_at DESC, message_id_hex DESC
+             LIMIT 1",
+            params![group_id_hex, u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .storage()?;
+    let updated_at = u64_to_i64(unix_now_seconds())?;
+    if let Some((message_id, sender, plaintext, kind, timeline_at, deleted)) = latest {
+        tx.execute(
+            "UPDATE chat_list_rows
+             SET last_message_id_hex = ?1,
+                 last_message_sender = ?2,
+                 last_message_preview = ?3,
+                 last_message_kind = ?4,
+                 last_message_timeline_at = ?5,
+                 last_message_deleted = ?6,
+                 updated_at = ?7
+             WHERE group_id_hex = ?8",
+            params![
+                message_id,
+                sender,
+                plaintext,
+                kind,
+                timeline_at,
+                deleted,
+                updated_at,
+                group_id_hex
+            ],
         )
         .storage()?;
-
-    delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
-    affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
-    for message_id in affected_message_ids {
-        upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
+    } else {
+        tx.execute(
+            "UPDATE chat_list_rows
+             SET last_message_id_hex = NULL,
+                 last_message_sender = NULL,
+                 last_message_preview = NULL,
+                 last_message_kind = NULL,
+                 last_message_timeline_at = NULL,
+                 last_message_deleted = 0,
+                 updated_at = ?1
+             WHERE group_id_hex = ?2",
+            params![updated_at, group_id_hex],
+        )
+        .storage()?;
     }
-
-    Ok(pruned)
+    Ok(())
 }
 
 fn can_project_record_app_event_incrementally(kind: u64) -> bool {
@@ -1075,6 +1189,130 @@ fn app_events_before_cutoff_tx(
     .storage()
 }
 
+fn scrub_app_events_before_cutoff_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    cutoff_recorded_at: u64,
+) -> StorageResult<()> {
+    tx.execute(
+        "UPDATE app_events
+         SET source_message_id_hex = NULL,
+             source_epoch = NULL,
+             direction = '',
+             sender = '',
+             plaintext = zeroblob(length(plaintext)),
+             tags_json = zeroblob(length(tags_json)),
+             invalidation_reason = NULL,
+             origin_commit_id = NULL
+         WHERE group_id_hex = ?1
+           AND recorded_at < ?2",
+        params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn scrub_timeline_projection_rows_by_ids_tx(
+    tx: &Transaction<'_>,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<()> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        tx.execute(
+            &format!(
+                "UPDATE message_timeline
+                 SET source_message_id_hex = NULL,
+                     source_epoch = NULL,
+                     direction = '',
+                     sender = '',
+                     plaintext = zeroblob(length(plaintext)),
+                     tags_json = zeroblob(length(tags_json)),
+                     reply_to_message_id_hex = NULL,
+                     media_json = CASE
+                         WHEN media_json IS NULL THEN NULL
+                         ELSE zeroblob(length(media_json))
+                     END,
+                     agent_stream_json = CASE
+                         WHEN agent_stream_json IS NULL THEN NULL
+                         ELSE zeroblob(length(agent_stream_json))
+                     END,
+                     reactions_json = zeroblob(length(reactions_json)),
+                     deleted_by_message_id_hex = NULL,
+                     invalidation_status = NULL
+                 WHERE group_id_hex = ?
+                   AND message_id_hex IN ({placeholders})"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        tx.execute(
+            &format!(
+                "UPDATE agent_stream_starts
+                 SET source_message_id_hex = NULL,
+                     sender = zeroblob(length(sender)),
+                     stream_id_hex = zeroblob(length(stream_id_hex)),
+                     tags_json = zeroblob(length(tags_json))
+                 WHERE group_id_hex = ?
+                   AND message_id_hex IN ({placeholders})"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
+fn group_and_message_id_values(
+    group_id_hex: &str,
+    message_ids: &[&String],
+) -> Vec<rusqlite::types::Value> {
+    let mut values = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
+    values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+    values.extend(
+        message_ids
+            .iter()
+            .map(|message_id| rusqlite::types::Value::Text((*message_id).clone())),
+    );
+    values
+}
+
+fn collect_media_ciphertext_hashes(tags: &[Vec<String>], out: &mut BTreeSet<String>) {
+    let mut malformed_media_hashes = 0usize;
+    for tag in tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|name| name == "imeta"))
+    {
+        for field in tag.iter().skip(1) {
+            let Some(hash) = field.strip_prefix("ciphertext_sha256 ") else {
+                continue;
+            };
+            let hash = hash.trim().to_ascii_lowercase();
+            if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                out.insert(hash);
+            } else {
+                malformed_media_hashes += 1;
+            }
+        }
+    }
+    if malformed_media_hashes > 0 {
+        tracing::debug!(
+            target: "storage_sqlite::retention",
+            method = "collect_media_hashes",
+            malformed_media_hashes,
+            "ignored malformed media hashes during secure prune"
+        );
+    }
+}
+
 fn delete_timeline_projection_rows_by_ids_tx(
     tx: &Transaction<'_>,
     group_id_hex: &str,
@@ -1089,13 +1327,7 @@ fn delete_timeline_projection_rows_by_ids_tx(
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
-            values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-            values.extend(
-                chunk
-                    .iter()
-                    .map(|message_id| rusqlite::types::Value::Text((*message_id).clone())),
-            );
+            let values = group_and_message_id_values(group_id_hex, chunk);
             tx.execute(
                 &format!(
                     "DELETE FROM {table}
