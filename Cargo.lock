@@ -49,6 +49,7 @@ dependencies = [
  "libc",
  "marmot-account",
  "marmot-app",
+ "marmot-markdown",
  "nostr-relay-builder",
  "rand 0.8.6",
  "serde",

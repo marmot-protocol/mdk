@@ -155,7 +155,10 @@ export type AgentControlEvent =
       message_id_hex: string;
       sender_account_id_hex: string;
       text: string;
-      /** True when the receiving agent's account is mentioned (`p`-tagged). */
+      /**
+       * True when the message addresses the agent via p-tag, nostr hex, or
+       * visible npub mention.
+       */
       mentions_self?: boolean;
       /** The message id this message replies to (`e` tag), when present. */
       reply_to_message_id_hex?: string | null;

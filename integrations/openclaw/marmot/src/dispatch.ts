@@ -539,7 +539,7 @@ export class GroupActivationCache {
 
 /**
  * Decide whether an inbound group message should run an agent turn. Always reply
- * when addressed (agent p-tagged, a trigger matches) or in an effective DM
+ * when addressed (`mentionsSelf`, a trigger matches) or in an effective DM
  * (exactly two members). Membership is queried lazily — only when the message is
  * otherwise unaddressed — to avoid a round-trip on the common addressed case, and
  * the `is_direct` result is cached per (account, group) so repeated ambient

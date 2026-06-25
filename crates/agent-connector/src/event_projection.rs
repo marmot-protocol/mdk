@@ -17,6 +17,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     STREAM_TAG, group_system_canonical_id,
 };
+use marmot_markdown::{Block, Inline, NostrHrp};
 
 /// Nostr pubkey-mention tag name. A `["p", <account-pubkey-hex>]` tag means that
 /// account was mentioned/addressed in the message.
@@ -44,27 +45,84 @@ fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_he
         return true;
     }
     // Fallback for a p-tag-less mention: an inline NIP-21 `nostr:` reference to
-    // the account in the body, in either hex or bech32 (`npub`) form (the
-    // displayed mention text). `nprofile` mentions still rely on the p-tag above.
-    if plaintext_has_nostr_ref(plaintext, account_id_hex) {
+    // the account hex in the body, or the visible bech32 (`npub`) forms parsed
+    // by marmot-markdown (`nostr:npub1…` and bare `@npub1…`).
+    // `nprofile` mentions still rely on the p-tag above.
+    if plaintext_has_nostr_hex_ref(plaintext, account_id_hex) {
         return true;
     }
     marmot_app::npub_for_account_id(account_id_hex)
-        .is_ok_and(|npub| plaintext_has_nostr_ref(plaintext, &npub))
+        .is_ok_and(|npub| plaintext_has_visible_npub_ref(plaintext, &npub))
 }
 
-/// Whether `plaintext` contains a `nostr:<reference>` token that is not glued to
-/// surrounding alphanumerics (so `nostr:<hex>junk` does NOT match the reference).
-/// Case-insensitive on both sides.
-fn plaintext_has_nostr_ref(plaintext: &str, reference: &str) -> bool {
+/// Whether `plaintext` contains a `nostr:<hex>` token that is not glued to
+/// surrounding token characters (so `nostr:<hex>junk` does NOT match the
+/// reference). Case-insensitive on both sides.
+fn plaintext_has_nostr_hex_ref(plaintext: &str, reference: &str) -> bool {
+    plaintext_has_prefixed_ref(plaintext, "nostr:", reference)
+}
+
+/// Whether `plaintext` contains a visible npub mention token for the account.
+///
+/// Use the display parser instead of duplicating its token-boundary rules here:
+/// this keeps `AgentControlEvent::InboundMessage.mentions_self` aligned with the
+/// markdown surface that humans actually see (`nostr:npub1…` URIs and bare
+/// `@npub1…` mentions, with the same lowercase and `_`/`/` boundary rules).
+fn plaintext_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
+    markdown_blocks_have_npub_ref(&marmot_markdown::parse(plaintext).blocks, npub)
+}
+
+fn markdown_blocks_have_npub_ref(blocks: &[Block], npub: &str) -> bool {
+    blocks.iter().any(|block| match block {
+        Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
+            markdown_inlines_have_npub_ref(inlines, npub)
+        }
+        Block::BlockQuote { blocks } => markdown_blocks_have_npub_ref(blocks, npub),
+        Block::List { items, .. } => items
+            .iter()
+            .any(|item| markdown_blocks_have_npub_ref(&item.blocks, npub)),
+        Block::Table { header, rows, .. } => header
+            .iter()
+            .chain(rows.iter().flatten())
+            .any(|cell| markdown_inlines_have_npub_ref(&cell.inlines, npub)),
+        Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => false,
+    })
+}
+
+fn markdown_inlines_have_npub_ref(inlines: &[Inline], npub: &str) -> bool {
+    inlines.iter().any(|inline| match inline {
+        Inline::NostrMention(entity) | Inline::NostrUri(entity) => {
+            entity.hrp == NostrHrp::Npub && entity.bech32 == npub
+        }
+        Inline::Emph(children) | Inline::Strong(children) | Inline::Strikethrough(children) => {
+            markdown_inlines_have_npub_ref(children, npub)
+        }
+        Inline::Link { children, .. } => markdown_inlines_have_npub_ref(children, npub),
+        // Image alt text is metadata for fallback/rendering, not a visible
+        // addressed mention in the message body.
+        Inline::Image { .. } => false,
+        Inline::Text(_)
+        | Inline::SoftBreak
+        | Inline::HardBreak
+        | Inline::Code(_)
+        | Inline::Autolink { .. }
+        | Inline::Math(_) => false,
+    })
+}
+
+fn plaintext_has_prefixed_ref(plaintext: &str, prefix: &str, reference: &str) -> bool {
     let body = plaintext.to_ascii_lowercase();
-    let needle = format!("nostr:{}", reference.to_ascii_lowercase());
+    let needle = format!("{prefix}{}", reference.to_ascii_lowercase());
     body.match_indices(&needle).any(|(start, _)| {
         let end = start + needle.len();
-        let before_ok = start == 0 || !body.as_bytes()[start - 1].is_ascii_alphanumeric();
-        let after_ok = end == body.len() || !body.as_bytes()[end].is_ascii_alphanumeric();
+        let before_ok = start == 0 || token_boundary_ok(body.as_bytes()[start - 1]);
+        let after_ok = end == body.len() || token_boundary_ok(body.as_bytes()[end]);
         before_ok && after_ok
     })
+}
+
+fn token_boundary_ok(b: u8) -> bool {
+    !matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'/')
 }
 
 /// The replied-to message id from the first `e` tag, if present. The tag value is

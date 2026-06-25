@@ -2396,6 +2396,84 @@ fn inbound_message_event_detects_npub_bech32_mention() {
     );
 }
 
+fn inbound_message_mentions_self_for_text(account: &str, text: &str) -> bool {
+    let record = received_chat_record("11", "bb", "cc", text);
+    let event = inbound_message_event_from_record(account, record, None, Some("bb")).unwrap();
+    let AgentControlEvent::InboundMessage { mentions_self, .. } = event else {
+        panic!("expected inbound message event");
+    };
+    mentions_self
+}
+
+#[test]
+fn inbound_message_event_detects_bare_at_npub_mention() {
+    // Clients can emit the visible bare `@npub1…` handle without a p-tag or
+    // `nostr:` scheme; agent-control mention classification must still fire.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+
+    assert!(
+        inbound_message_mentions_self_for_text(&account, &format!("hey @{npub} can you help?")),
+        "bare @npub bech32 mention should be detected"
+    );
+}
+
+#[test]
+fn inbound_message_event_uses_markdown_boundaries_for_bare_at_npub_mention() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+
+    for text in [
+        format!("not-a-mention@{npub}"),
+        format!("a_@{npub}"),
+        format!("/@{npub}"),
+        format!("@{npub}_tail"),
+        format!("@{npub}/tail"),
+    ] {
+        assert!(
+            !inbound_message_mentions_self_for_text(&account, &text),
+            "non-visible markdown mention must not be detected: {text}"
+        );
+    }
+}
+
+#[test]
+fn inbound_message_event_ignores_uppercase_bare_at_npub_mention() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("@{}", npub.to_ascii_uppercase());
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "uppercase @NPUB is not a visible marmot-markdown mention"
+    );
+}
+
+#[test]
+fn inbound_message_event_ignores_different_account_bare_at_npub_mention() {
+    let account = "aa".repeat(32);
+    let other_account = "bb".repeat(32);
+    let other_npub = marmot_app::npub_for_account_id(&other_account).unwrap();
+    let text = format!("hey @{other_npub}");
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "visible mention for a different account must not mention this account"
+    );
+}
+
+#[test]
+fn inbound_message_event_ignores_bare_at_npub_in_image_alt_text() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("![hey @{npub}](https://example.invalid/a.png)");
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "image alt text should not count as a visible addressed mention"
+    );
+}
+
 #[test]
 fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
     // The p-tag is authoritative: a mention with only the structured tag (no

@@ -335,8 +335,10 @@ pub enum AgentControlEvent {
         message_id_hex: String,
         sender_account_id_hex: String,
         text: String,
-        /// True when the receiving agent's account is `p`-tagged (mentioned) in
-        /// the message. Lets a channel gate group replies on being addressed.
+        /// True when the message addresses the receiving agent account: a `p`
+        /// tag, an inline `nostr:<account-pubkey-hex>` reference, or a visible
+        /// `npub` mention parsed from the message body. Lets a channel gate
+        /// group replies on being addressed.
         #[serde(default)]
         mentions_self: bool,
         /// The message id this message replies to (`e` tag), when present.

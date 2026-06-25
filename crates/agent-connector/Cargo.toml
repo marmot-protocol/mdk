@@ -19,6 +19,7 @@ sha2.workspace = true
 libc.workspace = true
 marmot-account.workspace = true
 marmot-app.workspace = true
+marmot-markdown.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -18,7 +18,10 @@ export interface MarmotInboundMessage {
   messageIdHex: string;
   senderAccountIdHex: string;
   text: string;
-  /** True when the agent's account is mentioned (`p`-tagged) in this message. */
+  /**
+   * True when the message addresses the agent via p-tag, nostr hex, or visible
+   * npub mention.
+   */
   mentionsSelf?: boolean;
   /** The message id this message replies to, when present. */
   replyToMessageIdHex?: string | null;
