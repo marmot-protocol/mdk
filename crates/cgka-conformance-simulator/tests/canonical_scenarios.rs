@@ -6,8 +6,8 @@
 
 use cgka_conformance_simulator::{
     ClientBuilder, EpochChangeObservation, GeneratedScenarioCase, HarnessClient,
-    PendingResolutionObservation, ScenarioSpec, ScenarioStep, ScenarioTrace, TraceExpectation,
-    TransportBus, VectorFixture, generate_convergence_chaos_family,
+    PendingResolutionObservation, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
+    TraceExpectation, TransportBus, VectorFixture, generate_convergence_chaos_family,
     generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
     run_generated_case_report, run_scenario_report, run_scenario_report_with_outcomes,
     run_scenario_spec, run_vector_fixture_report,
@@ -658,7 +658,43 @@ async fn convergence_e2e_delivery_family_runs_generated_variants() {
     }
 }
 
-#[tokio::test]
+/// Runs independent generated chaos cases concurrently across the multi-thread
+/// runtime's worker threads, applying `check` to each `(case, report)` pair.
+///
+/// Each chaos case is a self-contained, CPU-bound simulation, so the previous
+/// serial `for … .await` loops left every core but one idle (the 24-case suite
+/// ran for 8+ minutes on CI). Spawning one task per case bounds real
+/// concurrency at the runtime's worker-thread count. A panic inside any case
+/// (e.g. an expectation assertion) is re-raised with its original message and
+/// backtrace preserved, so failures read exactly as they did when serial.
+async fn for_each_chaos_case_concurrently<F>(cases: Vec<GeneratedScenarioCase>, check: F)
+where
+    F: Fn(&GeneratedScenarioCase, &ScenarioReport) + Send + Sync + 'static,
+{
+    let check = std::sync::Arc::new(check);
+    let mut handles = Vec::with_capacity(cases.len());
+    for case in cases {
+        let check = std::sync::Arc::clone(&check);
+        handles.push(tokio::spawn(async move {
+            let report = run_generated_case_report(&case, None)
+                .await
+                .expect("generated chaos case report runs");
+            check(&case, &report);
+        }));
+    }
+    for handle in handles {
+        if let Err(err) = handle.await {
+            // Re-raise the case's panic so the test fails with the original
+            // assertion message rather than an opaque JoinError.
+            match err.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(_) => panic!("chaos case task was cancelled before completion"),
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
     let cases = generate_convergence_chaos_family(123, 24);
 
@@ -769,10 +805,9 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
         assert_eq!(case.generator_version, "3");
         assert_eq!(case.seed, 123);
         assert_eq!(case.case_index, case_index as u64);
+    }
 
-        let report = run_generated_case_report(case, None)
-            .await
-            .expect("generated convergence chaos report runs");
+    for_each_chaos_case_concurrently(cases, |case, report| {
         assert_eq!(report.expected_outcomes, case.expected_outcomes);
         assert!(
             report.expectation_failures.is_empty(),
@@ -782,10 +817,11 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
         );
         assert!(report.invariant_failures.is_empty());
         assert_eq!(report.scenario, case.scenario);
-    }
+    })
+    .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn convergence_chaos_family_seed_changes_scenarios() {
     // Regression for darkmatter#166: distinct seeds must produce distinct
     // chaos scenarios. Before the fix, every shape except the rollback case was
@@ -831,10 +867,9 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 
     // Every seed-driven scenario must still satisfy its pinned expectations,
     // so the divergence reflects real behavior variation, not breakage.
-    for case in seed_a.iter().chain(seed_b.iter()) {
-        let report = run_generated_case_report(case, None)
-            .await
-            .expect("seeded chaos case reports");
+    let seeded_cases: Vec<GeneratedScenarioCase> =
+        seed_a.iter().chain(seed_b.iter()).cloned().collect();
+    for_each_chaos_case_concurrently(seeded_cases, |case, report| {
         assert!(
             report.expectation_failures.is_empty(),
             "case {} (seed {}) failed expectations: {:?}",
@@ -843,7 +878,8 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
             report.expectation_failures
         );
         assert!(report.invariant_failures.is_empty());
-    }
+    })
+    .await;
 }
 
 #[tokio::test]

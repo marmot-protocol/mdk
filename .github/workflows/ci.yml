@@ -133,11 +133,47 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run workspace tests
-        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --locked --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime))'
+        # The subprocess-heavy `darkmatter-cli::cli` suite runs in its own
+        # `cli-e2e` job so its fan-out never starves these fast unit tests
+        # (issue #103). `relay_runtime` keeps its own serial job.
+        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(darkmatter-cli) & binary(cli))'
 
       - name: Run doctests
         if: matrix.partition == 1
         run: cargo test --workspace --exclude cgka-conformance-simulator --doc --locked
+
+  cli-e2e:
+    name: CLI e2e (mock relay)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run CLI end-to-end tests
+        # Dedicated job: this subprocess-heavy suite is capped by the `cli-e2e`
+        # test-group and the `ci` profile adds retries + a hung-test backstop.
+        # The real-relay test self-skips here; it has its own `Relay CLI E2E`
+        # job with a docker relay stack.
+        run: cargo nextest run -p darkmatter-cli --test cli --locked --profile ci
 
   relay-runtime:
     name: Relay runtime tests
@@ -202,7 +238,7 @@ jobs:
       - name: Run real relay CLI E2E
         env:
           DARKMATTER_E2E_REQUIRE_RELAYS: "1"
-        run: cargo nextest run -p darkmatter-cli --test cli --locked -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
+        run: cargo nextest run -p darkmatter-cli --test cli --locked --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
 
       - name: Dump local relay logs
         if: failure()
@@ -239,7 +275,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Run simulator tests
-        run: cargo nextest run -p cgka-conformance-simulator --locked
+        run: cargo nextest run -p cgka-conformance-simulator --locked --profile ci
 
       - name: Run simulator doctests
         run: cargo test -p cgka-conformance-simulator --doc --locked

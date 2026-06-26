@@ -7,10 +7,22 @@
 # per-test setup is multiplied across the box and worker/daemon startup is
 # starved, surfacing as `account worker startup timed out` flakes (issue #103).
 #
-# Cap the concurrency of just that binary so it is not scheduled like cheap unit
-# tests. The rest of the workspace keeps full parallelism, so the fast unit-test
-# path is unaffected. The serial `marmot-app::relay_runtime` suite stays on its
-# own `cargo test --test-threads=1` job (PR #100) and is unaffected by this.
+# Two layers keep that suite from starving the rest of the workspace:
+#   1. The `cli-e2e` test-group caps its concurrency (below), so local `just
+#      test` runs stay sane.
+#   2. CI runs this binary in its own dedicated job (`.github/workflows/ci.yml`,
+#      job `cli-e2e`) instead of inside the partitioned unit matrix, so the
+#      subprocess fan-out never competes for cores with the fast unit tests.
+# The serial `marmot-app::relay_runtime` suite stays on its own
+# `cargo test --test-threads=1` job (PR #100) and is unaffected by this.
+
+[profile.default]
+# The multi-threaded conformance chaos tests spin up a worker pool that can take
+# longer than nextest's 100 ms default to wind down once the box is CPU-bound,
+# which surfaces as a spurious "leaky" label even though the test passed and the
+# threads do exit. A larger budget avoids the false positive without hiding a
+# genuinely leaked subprocess (those persist indefinitely, far past this window).
+leak-timeout = "500ms"
 
 [test-groups]
 # Reduced concurrency for the subprocess-heavy CLI end-to-end tests. Tunable: 1
@@ -20,3 +32,23 @@ cli-e2e = { max-threads = 2 }
 [[profile.default.overrides]]
 filter = 'package(darkmatter-cli) & binary(cli)'
 test-group = 'cli-e2e'
+
+# CI profile (`cargo nextest run --profile ci`).
+#
+# Retries are a safety net for transient infrastructure hiccups (mock-relay bind
+# races, momentary worker-startup starvation). They do NOT replace the dedicated
+# `cli-e2e` job, which is the real fix for the starvation flake (issue #103): a
+# retried-then-passed test is reported as FLAKY, so masking still surfaces.
+[profile.ci]
+retries = 1
+# Keep the SLOW marker informative at 60s. No global `terminate-after`: the
+# conformance simulator chaos suites legitimately run for several minutes.
+slow-timeout = { period = "60s" }
+
+# The subprocess-heavy CLI e2e suite is the one that starves under load. Give it
+# a couple of retries and a generous hung-test backstop so a wedged subprocess
+# wait is killed and retried instead of burning the whole job's 30-minute budget.
+[[profile.ci.overrides]]
+filter = 'package(darkmatter-cli) & binary(cli)'
+retries = 2
+slow-timeout = { period = "60s", terminate-after = 4 }
