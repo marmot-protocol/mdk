@@ -112,6 +112,10 @@ impl ForkRecoveryManager {
         );
     }
 
+    fn peek_pending(&self, pending: PendingStateRef) -> Option<MessageId> {
+        self.pending.get(&pending).map(|r| r.storage_id.clone())
+    }
+
     fn promote_pending(&mut self, pending: PendingStateRef) -> Option<MessageId> {
         if let Some(record) = self.pending.remove(&pending) {
             let storage_id = record.storage_id.clone();
@@ -242,6 +246,19 @@ impl<S: StorageProvider> Engine<S> {
         pending: PendingStateRef,
     ) -> Option<MessageId> {
         self.fork_recovery.promote_pending(pending)
+    }
+
+    /// Read the origin-commit storage id for a pending entry **without**
+    /// consuming the recovery record. `do_confirm_published` needs this id to
+    /// mark the commit `Processed` inside its durable transaction, but it must
+    /// not promote the pending → incumbent until the transaction has committed
+    /// (promotion is in-memory state that a rolled-back, retried confirm would
+    /// otherwise have already mutated).
+    pub(crate) fn peek_pending_commit_for_recovery(
+        &self,
+        pending: PendingStateRef,
+    ) -> Option<MessageId> {
+        self.fork_recovery.peek_pending(pending)
     }
 
     pub(crate) fn forget_pending_commit_for_recovery(

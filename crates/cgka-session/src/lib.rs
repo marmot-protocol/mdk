@@ -44,6 +44,20 @@ pub enum SessionError {
     Engine(#[from] EngineError),
 }
 
+impl SessionError {
+    /// Whether this error reflects transient backend contention worth retrying
+    /// (a `SQLITE_BUSY` that survived the backend's own retries) rather than a
+    /// durable failure. Used by the account layer to retry the retry-safe
+    /// `confirm_published` path instead of surfacing a lock blip as fatal.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            SessionError::Storage(e) => e.is_transient(),
+            SessionError::Engine(e) => e.is_transient(),
+        }
+    }
+}
+
 pub struct SessionConfig {
     database_path: PathBuf,
     database_key: SqlCipherKey,

@@ -388,6 +388,41 @@ where
         Ok(output)
     }
 
+    /// Confirm a published commit, retrying on transient backend contention.
+    ///
+    /// `confirm_published` is the apply half of publish-before-apply: by the
+    /// time it runs the commit is already on the wire, so abandoning it on a
+    /// transient `SQLITE_BUSY` would leave the local device behind an epoch the
+    /// group has accepted — a self-inflicted fork seam. The engine's confirm
+    /// path is structured to be retry-safe (the in-memory state-machine
+    /// transition only runs after its durable storage transaction commits), so
+    /// re-running after a lock blip converges. The backend already blocks up to
+    /// its `busy_timeout` per attempt; these few extra attempts cover the rare
+    /// case where contention outlives that window. A non-transient error, or
+    /// exhausted attempts, propagates as before.
+    async fn confirm_published_retrying(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> AccountResult<SessionEffects> {
+        const MAX_CONFIRM_ATTEMPTS: u32 = 4;
+        let mut attempt = 0;
+        loop {
+            match self.session.confirm_published(pending).await {
+                Ok(effects) => return Ok(effects),
+                Err(e) if e.is_transient() && attempt + 1 < MAX_CONFIRM_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "confirm_published_retrying",
+                        attempt,
+                        "confirm hit a transient backend lock; retrying"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     async fn publish_pending(
         &mut self,
         messages: Vec<TransportMessage>,
@@ -413,7 +448,7 @@ where
         }
 
         if all_published || any_accepted {
-            let effects = self.session.confirm_published(pending).await?;
+            let effects = self.confirm_published_retrying(pending).await?;
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
@@ -450,7 +485,7 @@ where
         }
 
         if all_published || any_welcome_exposed {
-            let effects = self.session.confirm_published(pending).await?;
+            let effects = self.confirm_published_retrying(pending).await?;
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
@@ -480,7 +515,7 @@ where
             // it missed the policy ack threshold. Rolling it back would diverge
             // the sender from peers that ingest it, so treat unreached endpoints
             // as recoverable and proceed with welcome publication.
-            let effects = self.session.confirm_published(pending).await?;
+            let effects = self.confirm_published_retrying(pending).await?;
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });

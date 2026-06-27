@@ -101,6 +101,20 @@ pub enum EngineError {
     Other(String),
 }
 
+impl EngineError {
+    /// Whether this error reflects transient backend contention (a
+    /// [`crate::storage::StorageError::Busy`] that survived the backend's own
+    /// retries) rather than a durable failure. Callers driving the
+    /// publish-before-apply lifecycle use this to retry `confirm_published`
+    /// instead of surfacing a lock blip as a fatal failure — the confirm path
+    /// is structured to be retry-safe (the in-memory state-machine transition
+    /// only runs after the durable storage transaction commits).
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, EngineError::Storage(e) if e.is_transient())
+    }
+}
+
 /// Errors returned by the peeler. The split mirrors the four-method peeler
 /// surface (group/welcome × peel/wrap).
 #[derive(Debug, thiserror::Error)]

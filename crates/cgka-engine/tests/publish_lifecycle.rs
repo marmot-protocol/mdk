@@ -18,17 +18,27 @@ use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::EngineError;
+use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::MessageStorage;
+use cgka_traits::storage::{
+    AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
+    ConvergencePolicyStorage, GroupStorage, LeaveRequest, LeaveRequestStorage,
+    MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{Backend, EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::welcome::PendingWelcome;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::SqliteAccountStorage;
 
@@ -754,4 +764,321 @@ async fn welcome_wrapped_pre_merge_lands_recipient_at_post_stage_epoch() {
     // Alice confirms after bob has already joined — fully legal.
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+}
+
+// ── 5. Transient backend lock during confirm is retry-safe ─────────────────
+//
+// Regression for the "DB-locked-during-commit leaves fork chances" seam: under
+// publish-before-apply, `confirm_published` runs after the commit is already on
+// the wire. If a storage write during confirm hits `SQLITE_BUSY`, the confirm
+// must roll back as a unit and stay *retryable* — the in-memory state-machine
+// transition that consumes the pending entry may not run before the durable
+// writes commit. Before the fix, the `Processed` message-state write ran AFTER
+// `epoch_manager.confirm_publish` had already consumed the pending slot, so a
+// lock there advanced the epoch durably yet made a retry fail with
+// `UnknownPending` — a half-applied, unrecoverable confirm.
+
+/// Shared, arm-able fault switch: while armed, the next `update_message_state`
+/// to `Processed` returns `StorageError::Busy` once, then disarms.
+#[derive(Clone, Default)]
+struct ProcessedFault(Arc<AtomicUsize>);
+
+impl ProcessedFault {
+    fn arm(&self, times: usize) {
+        self.0.store(times, Ordering::SeqCst);
+    }
+
+    /// True (consuming one armed count) if this call should fail.
+    fn should_fail(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+}
+
+/// `SqliteAccountStorage` wrapper that injects a transient `Busy` on the
+/// confirm-path `Processed` write. Every other call delegates unchanged.
+struct FaultStorage {
+    inner: SqliteAccountStorage,
+    fault: ProcessedFault,
+}
+
+impl GroupStorage for FaultStorage {
+    fn put_group(&self, group: &Group) -> StorageResult<()> {
+        self.inner.put_group(group)
+    }
+    fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
+        self.inner.get_group(id)
+    }
+    fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_group(id)
+    }
+    fn list_groups(&self) -> StorageResult<Vec<GroupId>> {
+        self.inner.list_groups()
+    }
+}
+
+impl MessageStorage for FaultStorage {
+    fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
+        self.inner.put_message(record)
+    }
+    fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
+        self.inner.get_message(id)
+    }
+    fn update_message_state(&self, id: &MessageId, new_state: MessageState) -> StorageResult<()> {
+        if new_state == MessageState::Processed && self.fault.should_fail() {
+            return Err(StorageError::Busy("injected confirm-path lock".into()));
+        }
+        self.inner.update_message_state(id, new_state)
+    }
+    fn list_messages(
+        &self,
+        group_id: &GroupId,
+        at_or_after_epoch: EpochId,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        self.inner.list_messages(group_id, at_or_after_epoch)
+    }
+    fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.inner.create_group_snapshot(group_id, name)
+    }
+    fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>> {
+        self.inner.list_group_snapshots(group_id)
+    }
+    fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.inner.rollback_group_to_snapshot(group_id, name)
+    }
+    fn release_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.inner.release_group_snapshot(group_id, name)
+    }
+}
+
+impl OutboundIntentStorage for FaultStorage {
+    fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
+        self.inner.put_queued_outbound_intent(record)
+    }
+    fn list_queued_outbound_intents(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<QueuedOutboundIntent>> {
+        self.inner.list_queued_outbound_intents(group_id)
+    }
+    fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_queued_outbound_intent(id)
+    }
+}
+
+impl LeaveRequestStorage for FaultStorage {
+    fn put_leave_request(&self, request: &LeaveRequest) -> StorageResult<()> {
+        self.inner.put_leave_request(request)
+    }
+    fn leave_request(&self, group_id: &GroupId) -> StorageResult<Option<LeaveRequest>> {
+        self.inner.leave_request(group_id)
+    }
+    fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.clear_leave_request(group_id)
+    }
+}
+
+impl WelcomeStorage for FaultStorage {
+    fn put_welcome(&self, welcome: &PendingWelcome) -> StorageResult<()> {
+        self.inner.put_welcome(welcome)
+    }
+    fn take_welcome(&self, id: &MessageId) -> StorageResult<PendingWelcome> {
+        self.inner.take_welcome(id)
+    }
+    fn list_welcomes(&self) -> StorageResult<Vec<PendingWelcome>> {
+        self.inner.list_welcomes()
+    }
+}
+
+impl CapabilityStorage for FaultStorage {
+    fn register_feature(&self, feature: Feature, req: CapabilityRequirement) -> StorageResult<()> {
+        self.inner.register_feature(feature, req)
+    }
+    fn feature_requirement(
+        &self,
+        feature: &Feature,
+    ) -> StorageResult<Option<CapabilityRequirement>> {
+        self.inner.feature_requirement(feature)
+    }
+    fn save_member_capabilities(
+        &self,
+        group_id: &GroupId,
+        member: &Member,
+        capabilities: GroupCapabilities,
+    ) -> StorageResult<()> {
+        self.inner
+            .save_member_capabilities(group_id, member, capabilities)
+    }
+    fn member_capabilities(
+        &self,
+        group_id: &GroupId,
+        member_id: &MemberId,
+    ) -> StorageResult<Option<GroupCapabilities>> {
+        self.inner.member_capabilities(group_id, member_id)
+    }
+}
+
+impl ConvergencePolicyStorage for FaultStorage {
+    fn put_convergence_policy(&self, group_id: &GroupId, policy: &[u8]) -> StorageResult<()> {
+        self.inner.put_convergence_policy(group_id, policy)
+    }
+    fn convergence_policy(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.convergence_policy(group_id)
+    }
+}
+
+impl MemberValidationCacheStorage for FaultStorage {
+    fn put_validated_tree_marker(&self, group_id: &GroupId, marker: &[u8]) -> StorageResult<()> {
+        self.inner.put_validated_tree_marker(group_id, marker)
+    }
+    fn validated_tree_marker(&self, group_id: &GroupId) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.validated_tree_marker(group_id)
+    }
+}
+
+impl AccountDeviceSignerStorage for FaultStorage {
+    fn put_account_device_signer(&self, binding: &AccountDeviceSignerBinding) -> StorageResult<()> {
+        self.inner.put_account_device_signer(binding)
+    }
+    fn account_device_signer(
+        &self,
+        marmot_identity: &MemberId,
+    ) -> StorageResult<Option<AccountDeviceSignerBinding>> {
+        self.inner.account_device_signer(marmot_identity)
+    }
+}
+
+impl StorageProvider for FaultStorage {
+    type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
+
+    fn mls_storage(&self) -> &Self::Mls {
+        self.inner.mls_storage()
+    }
+
+    fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        Self: Sized,
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        // Drive the real SQLite BEGIN/COMMIT on the inner connection, but run
+        // the closure against the wrapper so its (delegating, fault-injecting)
+        // writes join the same transaction and roll back together.
+        self.inner.with_transaction(|_inner| f(self))
+    }
+
+    fn backend(&self) -> Backend {
+        self.inner.backend()
+    }
+}
+
+/// Returns the engine plus a storage handle that shares the same underlying
+/// connection (`SqliteAccountStorage` is `Clone` over a shared connection), so
+/// the test can read durable state out-of-band to assert the rollback invariant.
+fn build_fault_engine(
+    id: &[u8],
+    fault: ProcessedFault,
+) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let engine = EngineBuilder::new(FaultStorage { inner, fault })
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, handle)
+}
+
+#[tokio::test]
+async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
+    let fault = ProcessedFault::default();
+    let (mut alice, storage) = build_fault_engine(b"alice", fault.clone());
+    let mut bob = build(b"bob");
+    let mut carol = build(b"carol");
+
+    // Bootstrap a 2-member group (fault disarmed).
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "g".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.epoch(&gid).unwrap().0, 1);
+
+    // Invite carol — staged, on the wire, awaiting confirm.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let inv_pending = match invite {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => panic!("expected GroupEvolution"),
+    };
+
+    // Durable baseline before the confirm: the invite is staged but unmerged, so
+    // the persisted Marmot record still sits at the pre-merge epoch. (`epoch()`
+    // reports the *projected* epoch during pending, so it can't witness the
+    // rollback — the persisted record can.)
+    let persisted_epoch_before = storage.get_group(&gid).unwrap().epoch.0;
+    assert_eq!(persisted_epoch_before, 1, "record unmerged before confirm");
+
+    // Arm the lock for the confirm's `Processed` write, then confirm.
+    fault.arm(1);
+    let first = alice.confirm_published(inv_pending).await;
+    let err = first.expect_err("confirm must surface the injected lock, not swallow it");
+    assert!(
+        err.is_transient(),
+        "lock must surface as a transient error, got {err:?}"
+    );
+
+    // The durable transaction (merge + record mirror + `Processed` write) rolled
+    // back as a unit: the persisted record is still at the pre-merge epoch, so no
+    // partial write survived the injected lock. This is the rollback invariant —
+    // without it, a half-applied merge could persist while the slot stayed
+    // retryable, diverging the record from the MLS state.
+    assert_eq!(
+        storage.get_group(&gid).unwrap().epoch.0,
+        persisted_epoch_before,
+        "rolled-back confirm must leave the persisted record unchanged"
+    );
+    // The pending slot was never consumed either, so the retry below converges.
+
+    // Retrying the SAME pending must now succeed — this is the orphan check.
+    // Before the fix, the pending slot was already consumed and this returned
+    // `EngineError::UnknownPending`.
+    alice
+        .confirm_published(inv_pending)
+        .await
+        .expect("retry after a transient lock must converge, not orphan the commit");
+
+    assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+    assert_eq!(
+        alice.members(&gid).unwrap().len(),
+        3,
+        "alice + bob + carol after retried confirm"
+    );
+
+    // The slot is now genuinely consumed: a further confirm is UnknownPending.
+    let third = alice.confirm_published(inv_pending).await;
+    assert!(matches!(third, Err(EngineError::UnknownPending)));
 }
