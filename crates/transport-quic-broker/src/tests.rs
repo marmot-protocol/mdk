@@ -1181,6 +1181,47 @@ async fn broker_state_retains_no_backlog_with_default_zero_replay_ttl() {
 }
 
 #[tokio::test]
+async fn broker_state_skips_record_encoding_when_replay_retention_is_disabled() {
+    let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
+    // `BrokerState` receives records that the frame decoder already validated.
+    // This invalid record is a white-box canary: `encode()` rejects it, so a
+    // no-replay publish must not touch the encode path at all.
+    let invalid_record = AgentTextStreamRecordV1::text_delta(Vec::<u8>::new(), 1, b"live");
+    assert!(invalid_record.encode().is_err());
+
+    let no_replay_state = BrokerState::new(
+        DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        DEFAULT_BROKER_REPLAY_TTL,
+    );
+    assert_eq!(
+        no_replay_state
+            .publish(&key, invalid_record.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(no_replay_state.backlog_bytes_for_test().await, 0);
+
+    let retaining_state = BrokerState::new(
+        DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
+        DEFAULT_BROKER_BACKLOG_DEPTH,
+        DEFAULT_BROKER_MAX_ROOMS,
+        DEFAULT_BROKER_MAX_BACKLOG_BYTES,
+        Duration::from_secs(30),
+    );
+    assert!(matches!(
+        retaining_state
+            .publish(&key, invalid_record)
+            .await
+            .unwrap_err(),
+        QuicBrokerError::Record(_)
+    ));
+}
+
+#[tokio::test]
 async fn broker_serves_no_backlog_to_late_subscriber_by_default() {
     // Default config: replay_ttl is zero, so a late subscriber sees only
     // live records. Its first record is ahead of seq 1, which it must

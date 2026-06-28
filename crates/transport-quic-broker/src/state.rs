@@ -175,13 +175,18 @@ impl BrokerState {
         // zero the broker retains nothing and records reach live subscribers
         // only.
         let retain_backlog = !self.replay_ttl.is_zero();
-        let record_bytes = record.encode()?.len();
-        if retain_backlog && record_bytes > self.max_backlog_bytes {
-            return Err(QuicBrokerError::BacklogRecordTooLarge {
-                record_bytes,
-                limit: self.max_backlog_bytes,
-            });
-        }
+        let record_bytes = if retain_backlog {
+            let record_bytes = record.encode()?.len();
+            if record_bytes > self.max_backlog_bytes {
+                return Err(QuicBrokerError::BacklogRecordTooLarge {
+                    record_bytes,
+                    limit: self.max_backlog_bytes,
+                });
+            }
+            Some(record_bytes)
+        } else {
+            None
+        };
         let mut inner = self.inner.lock().await;
         self.purge_expired_rooms(&mut inner);
         if inner
@@ -201,6 +206,7 @@ impl BrokerState {
         let room = inner.rooms.entry(key.clone()).or_default();
         room.last_activity_at = Instant::now();
         if retain_backlog {
+            let record_bytes = record_bytes.expect("record bytes computed when retaining backlog");
             let freed = purge_expired_backlog(room, self.replay_ttl);
             total_backlog_bytes = total_backlog_bytes.saturating_sub(freed);
             room.backlog.push_back(BacklogRecord {
