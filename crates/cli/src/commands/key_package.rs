@@ -55,7 +55,7 @@ pub(crate) async fn key_package_command_with_runtime(
                 },
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "keys": keys,
                 }),
             })
@@ -68,12 +68,12 @@ pub(crate) async fn key_package_command_with_runtime(
             Ok(CommandOutput {
                 plain: format!(
                     "published key package for {} bytes={}",
-                    npub_for_account_id(&account.account_id_hex),
+                    npub_for_account_id(&account.account_id_hex)?,
                     key_package_bytes
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "key_package_bytes": key_package_bytes,
                 }),
             })
@@ -86,12 +86,12 @@ pub(crate) async fn key_package_command_with_runtime(
             Ok(CommandOutput {
                 plain: format!(
                     "rotated key package for {} bytes={}",
-                    npub_for_account_id(&account.account_id_hex),
+                    npub_for_account_id(&account.account_id_hex)?,
                     key_package_bytes
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "key_package_bytes": key_package_bytes,
                     "rotated": true,
                 }),
@@ -126,7 +126,7 @@ pub(crate) async fn key_package_command_with_runtime(
                 plain: format!("key package available for {account_id}"),
                 json: json!({
                     "account_id": account_id,
-                    "npub": npub_for_account_id(&account_id),
+                    "npub": npub_for_account_id(&account_id)?,
                     "available": true,
                     "key_package": key_package_fetch_json(fetched),
                 }),

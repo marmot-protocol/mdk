@@ -44,7 +44,7 @@ pub(crate) async fn relays_command_with_runtime(
                 },
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "relay_type": relay_type,
                     "relays": relays,
                     "relay_lists": relay_lists_json(status),
@@ -129,7 +129,7 @@ async fn update_relay_list(
         plain: relays.join("\n"),
         json: json!({
             "account_id": account.account_id_hex,
-            "npub": npub_for_account_id(&account.account_id_hex),
+            "npub": npub_for_account_id(&account.account_id_hex)?,
             "relay_type": relay_type,
             "relays": relays,
             "relay_lists": relay_lists_json(status),

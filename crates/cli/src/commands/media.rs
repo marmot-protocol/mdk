@@ -80,7 +80,7 @@ pub(crate) async fn media_command_with_runtime(
                 },
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": group_id_hex,
                     "attachments": upload.attachments.iter().map(media_upload_attachment_json).collect::<Vec<_>>(),
                     "sent": upload.sent.map(send_summary_json),
@@ -115,7 +115,7 @@ pub(crate) async fn media_command_with_runtime(
                 plain: output_path.display().to_string(),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": group_id_hex,
                     "media": media_attachment_json(&reference),
                     "output_path": output_path.display().to_string(),
@@ -148,7 +148,7 @@ pub(crate) async fn media_command_with_runtime(
                 },
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": group_id_hex,
                     "media": media,
                 }),

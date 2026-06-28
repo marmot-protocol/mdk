@@ -47,7 +47,7 @@ pub(crate) fn users_command(
                 },
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "query": query,
                     "users": results,
                 }),

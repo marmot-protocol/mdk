@@ -17,7 +17,7 @@ pub(crate) async fn sync_command(
     let summary = client.sync().await?;
     Ok(CommandOutput {
         plain: sync_plain(&summary),
-        json: sync_json(app, account, summary),
+        json: sync_json(app, account, summary)?,
     })
 }
 
@@ -49,10 +49,10 @@ fn sync_json(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
     summary: SyncSummary,
-) -> Value {
-    json!({
+) -> Result<Value, DmError> {
+    Ok(json!({
         "account_id": account.account_id_hex,
-        "npub": npub_for_account_id(&account.account_id_hex),
+        "npub": npub_for_account_id(&account.account_id_hex)?,
         "joined_groups": summary.joined_groups.into_iter().map(|group_id| {
             hex::encode(group_id.as_slice())
         }).collect::<Vec<_>>(),
@@ -82,5 +82,5 @@ fn sync_json(
             value
         }).collect::<Vec<_>>(),
         "events": summary.events.len(),
-    })
+    }))
 }

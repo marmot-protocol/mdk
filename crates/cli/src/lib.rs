@@ -16,7 +16,6 @@ use marmot_app::{
     AccountRelayListStatus, AppError, AppGroupRecord, MarmotApp, MarmotAppConfig, StreamStartView,
     UserProfileMetadata, tag_value,
 };
-use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -686,13 +685,13 @@ pub(crate) fn group_show_output(
     let json = match mls {
         Some(mls) => json!({
             "account_id": account.account_id_hex,
-            "npub": npub_for_account_id(&account.account_id_hex),
+            "npub": npub_for_account_id(&account.account_id_hex)?,
             "group": group,
             "mls": mls,
         }),
         None => json!({
             "account_id": account.account_id_hex,
-            "npub": npub_for_account_id(&account.account_id_hex),
+            "npub": npub_for_account_id(&account.account_id_hex)?,
             "group": group,
         }),
     };
@@ -940,11 +939,8 @@ pub(crate) fn parse_public_key(value: &str) -> Result<String, DmError> {
         .map_err(|_| DmError::InvalidPublicKey)
 }
 
-pub(crate) fn npub_for_account_id(account_id: &str) -> String {
-    nostr::PublicKey::parse(account_id)
-        .expect("stored account ids are valid Nostr public keys")
-        .to_bech32()
-        .expect("stored account ids can be encoded as npub")
+pub(crate) fn npub_for_account_id(account_id: &str) -> Result<String, DmError> {
+    marmot_app::npub_for_account_id(account_id).map_err(DmError::from)
 }
 
 pub(crate) fn normalize_group_id_hex(value: &str) -> Result<String, DmError> {
@@ -1144,7 +1140,7 @@ mod tests {
     };
     use super::{
         Cli, Command, DmError, StreamCommand, daemon, daemon_socket_for_client,
-        default_home_from_env, relay_endpoints, resolve_relay, run_from,
+        default_home_from_env, npub_for_account_id, relay_endpoints, resolve_relay, run_from,
     };
 
     use marmot_app::{
@@ -1206,6 +1202,22 @@ mod tests {
                 ..RelayPlaneHealth::default()
             },
         }
+    }
+
+    #[test]
+    fn npub_for_account_id_rejects_invalid_input_without_panicking() {
+        let npub =
+            npub_for_account_id("aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4")
+                .expect("valid account ids must render as npub");
+        assert_eq!(
+            npub,
+            "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
+        );
+
+        let err = npub_for_account_id("not-a-public-key")
+            .expect_err("invalid account ids must surface as a CLI error");
+        let rendered = super::dm_error_json(&err);
+        assert_eq!(rendered["code"], "invalid_public_key");
     }
 
     fn test_cli(command: Command) -> Cli {

@@ -96,6 +96,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- CLI and daemon command JSON builders now return the existing `invalid_public_key` error instead of panicking if a
+  stored account id cannot be converted to `npub`.
+
 - `dm --help`, `dm <subcommand> --help`, and `dm --version` now print to stdout instead of stderr (exit code 0 was
   already correct). Previously every clap parse result — including the help/version display "errors" that carry exit
   code 0 — was routed to stderr, leaving stdout empty and breaking shell piping and scripts (e.g. `dm --help | less`).

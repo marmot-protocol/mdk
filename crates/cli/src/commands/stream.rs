@@ -218,7 +218,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "stream_id": hex::encode(stream_id),
                     "published": summary.published,
@@ -401,7 +401,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "stream_id": hex::encode(stream_id),
                     "published": summary.published,
@@ -464,7 +464,7 @@ pub(crate) async fn stream_command_app_with_runtime(
                 plain: format!("stream {stream_id_hex} verified={verified}"),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": group_id_hex,
                     "stream_id": stream_id_hex,
                     "verified": verified,

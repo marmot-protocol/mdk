@@ -41,7 +41,7 @@ pub(crate) async fn chats_command_with_runtime(
                 plain: group_list_plain(&chats),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "include_archived": include_archived,
                     "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
                 }),
@@ -76,7 +76,7 @@ pub(crate) async fn chats_command_with_runtime(
                 plain: group_list_plain(&chats),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
                 }),
             })
@@ -108,7 +108,7 @@ async fn group_archive_output(
         plain: format!("{verb} group {group_id}"),
         json: json!({
             "account_id": account.account_id_hex,
-            "npub": npub_for_account_id(&account.account_id_hex),
+            "npub": npub_for_account_id(&account.account_id_hex)?,
             "group": group_json(group),
         }),
     })

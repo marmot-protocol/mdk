@@ -39,7 +39,7 @@ pub(crate) async fn profile_command_with_runtime(
                     .expect("JSON response serialization cannot fail"),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "profile": entry.and_then(|entry| entry.profile),
                 }),
             })
@@ -113,11 +113,11 @@ pub(crate) async fn profile_command_with_runtime(
             Ok(CommandOutput {
                 plain: format!(
                     "updated profile {}",
-                    npub_for_account_id(&account.account_id_hex)
+                    npub_for_account_id(&account.account_id_hex)?
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "profile": profile,
                 }),
             })

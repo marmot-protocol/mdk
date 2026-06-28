@@ -25,13 +25,13 @@ pub(crate) fn debug_command(
                         .account_relay_list_status_for_account_id(&account.account_id_hex)
                         .map(relay_lists_json)
                         .unwrap_or_else(|err| json!({"error": err.to_string()}));
-                    json!({
+                    Ok(json!({
                         "account_id": account.account_id_hex,
-                        "npub": npub_for_account_id(&account.account_id_hex),
+                        "npub": npub_for_account_id(&account.account_id_hex)?,
                         "relay_lists": relay_lists,
-                    })
+                    }))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, DmError>>()?;
             Ok(CommandOutput {
                 plain: serde_json::to_string_pretty(&statuses)
                     .expect("JSON response serialization cannot fail"),
@@ -48,7 +48,7 @@ pub(crate) fn debug_command(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "healthy": true,
                     "groups": status.group_count,
                     "messages": status.message_count,

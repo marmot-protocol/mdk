@@ -47,12 +47,15 @@ pub(crate) async fn follows_command_with_runtime(
                 .unwrap_or_default();
             let follows_target = follows.iter().any(|follow| follow == &target);
             Ok(CommandOutput {
-                plain: format!("follows {}: {follows_target}", npub_for_account_id(&target)),
+                plain: format!(
+                    "follows {}: {follows_target}",
+                    npub_for_account_id(&target)?
+                ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "pubkey": target,
-                    "user": npub_for_account_id(&target),
+                    "user": npub_for_account_id(&target)?,
                     "follows": follows_target,
                 }),
             })
@@ -113,12 +116,12 @@ fn follows_output(account_id: String, follows: Vec<String>) -> Result<CommandOut
     let follows_json = follows
         .iter()
         .map(|follow| {
-            json!({
+            Ok(json!({
                 "account_id": follow,
-                "npub": npub_for_account_id(follow),
-            })
+                "npub": npub_for_account_id(follow)?,
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, DmError>>()?;
     Ok(CommandOutput {
         plain: if follows_json.is_empty() {
             "no follows".to_owned()
@@ -131,7 +134,7 @@ fn follows_output(account_id: String, follows: Vec<String>) -> Result<CommandOut
         },
         json: json!({
             "account_id": account_id,
-            "npub": npub_for_account_id(&account_id),
+            "npub": npub_for_account_id(&account_id)?,
             "follows": follows_json,
         }),
     })

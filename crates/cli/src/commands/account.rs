@@ -72,12 +72,12 @@ pub(crate) fn whoami_command(
     if account_flag.is_some() {
         let account = resolve_account(account_home, account_flag)?;
         let status = if account.local_signing {
-            dm_status_json(app.status(&account.label)?, &runtime_info)
+            dm_status_json(app.status(&account.label)?, &runtime_info)?
         } else {
             public_account_status_json(
                 &account,
                 app.account_relay_list_status_for_account_id(&account.account_id_hex)?,
-            )
+            )?
         };
         return Ok(CommandOutput {
             plain: serde_json::to_string_pretty(&status)
@@ -90,7 +90,7 @@ pub(crate) fn whoami_command(
     let accounts_json = accounts
         .into_iter()
         .map(|account| account_summary_json(app, account))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let plain = if accounts_json.is_empty() {
         "no accounts".to_owned()
     } else {
@@ -126,10 +126,10 @@ pub(crate) fn logout_command(
     let account_id = parse_public_key(&pubkey)?;
     account_home.remove_account(&account_id)?;
     Ok(CommandOutput {
-        plain: format!("logged out {}", npub_for_account_id(&account_id)),
+        plain: format!("logged out {}", npub_for_account_id(&account_id)?),
         json: json!({
             "account_id": account_id,
-            "npub": npub_for_account_id(&account_id),
+            "npub": npub_for_account_id(&account_id)?,
             "logged_out": true,
         }),
     })
@@ -202,14 +202,14 @@ pub(crate) fn account_setup_command_output(
     Ok(CommandOutput {
         plain: format!(
             "created identity {} local-signing={} relay-lists={}{}",
-            npub_for_account_id(&setup.account.account_id_hex),
+            npub_for_account_id(&setup.account.account_id_hex)?,
             setup.account.local_signing,
             relay_setup_plain(&setup.relay_lists),
             key_package_plain
         ),
         json: json!({
             "account_id": setup.account.account_id_hex,
-            "npub": npub_for_account_id(&setup.account.account_id_hex),
+            "npub": npub_for_account_id(&setup.account.account_id_hex)?,
             "local_signing": setup.account.local_signing,
             "relay_lists": relay_lists_json(setup.relay_lists),
             "key_package": setup.key_package_bytes.map(|bytes| json!({
@@ -280,7 +280,7 @@ pub(crate) async fn account_command(
             let accounts_json = accounts
                 .into_iter()
                 .map(|account| account_summary_json(app, account))
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
             let plain = if accounts_json.is_empty() {
                 "no accounts".to_owned()
             } else {
@@ -313,7 +313,7 @@ pub(crate) async fn account_command(
             if !account.local_signing {
                 let relay_lists =
                     app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
-                let json = public_account_status_json(&account, relay_lists);
+                let json = public_account_status_json(&account, relay_lists)?;
                 return Ok(CommandOutput {
                     plain: serde_json::to_string_pretty(&json)
                         .expect("JSON response serialization cannot fail"),
@@ -321,10 +321,11 @@ pub(crate) async fn account_command(
                 });
             }
             let status = app.status(&account.label)?;
+            let json = dm_status_json(status, &runtime_info)?;
             Ok(CommandOutput {
-                plain: serde_json::to_string_pretty(&dm_status_json(status.clone(), &runtime_info))
+                plain: serde_json::to_string_pretty(&json)
                     .expect("JSON response serialization cannot fail"),
-                json: dm_status_json(status, &runtime_info),
+                json,
             })
         }
         AccountCommand::RelayLists {
@@ -342,7 +343,7 @@ pub(crate) async fn account_command(
                 plain: relay_setup_plain(&relay_lists),
                 json: json!({
                     "account_id": account_id,
-                    "npub": npub_for_account_id(&account_id),
+                    "npub": npub_for_account_id(&account_id)?,
                     "relay_lists": relay_lists_json(relay_lists),
                 }),
             })
@@ -380,20 +381,23 @@ async fn relay_list_status_for_account_id(
     }
 }
 
-fn account_summary_json(app: &MarmotApp, account: marmot_account::AccountSummary) -> Value {
+fn account_summary_json(
+    app: &MarmotApp,
+    account: marmot_account::AccountSummary,
+) -> Result<Value, DmError> {
     let profile = app
         .directory_entry_for_account_id(&account.account_id_hex)
         .ok()
         .flatten()
         .and_then(|entry| entry.profile);
     let display_name = profile_display_name(profile.as_ref());
-    json!({
+    Ok(json!({
         "account_id": account.account_id_hex,
-        "npub": npub_for_account_id(&account.account_id_hex),
+        "npub": npub_for_account_id(&account.account_id_hex)?,
         "display_name": display_name,
         "profile": profile,
         "local_signing": account.local_signing,
-    })
+    }))
 }
 
 fn account_display_name_or_npub(account: &Value) -> &str {
@@ -405,10 +409,10 @@ fn account_display_name_or_npub(account: &Value) -> &str {
         .unwrap_or("")
 }
 
-fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Value {
-    json!({
+fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Result<Value, DmError> {
+    Ok(json!({
         "account_id": status.account_id_hex,
-        "npub": npub_for_account_id(&status.account_id_hex),
+        "npub": npub_for_account_id(&status.account_id_hex)?,
         "local_signing": true,
         "transport": status.transport,
         "groups": status.groups,
@@ -421,7 +425,7 @@ fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Value {
         "secret_store": secret_store_json(runtime_info),
         "projections": status.projections,
         "relay_lists": relay_lists_json(status.relay_lists),
-    })
+    }))
 }
 
 fn secret_store_json(runtime_info: &CliRuntimeInfo) -> Value {
@@ -439,13 +443,13 @@ fn secret_store_json(runtime_info: &CliRuntimeInfo) -> Value {
 fn public_account_status_json(
     account: &marmot_account::AccountSummary,
     relay_lists: AccountRelayListStatus,
-) -> Value {
-    json!({
+) -> Result<Value, DmError> {
+    Ok(json!({
         "account_id": account.account_id_hex,
-        "npub": npub_for_account_id(&account.account_id_hex),
+        "npub": npub_for_account_id(&account.account_id_hex)?,
         "local_signing": false,
         "relay_lists": relay_lists_json(relay_lists),
-    })
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

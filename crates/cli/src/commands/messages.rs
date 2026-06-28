@@ -74,7 +74,7 @@ pub(crate) async fn message_command_with_runtime(
                 plain: format!("sent message published={}", summary.published),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
@@ -99,7 +99,7 @@ pub(crate) async fn message_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "target_message_id": message_id,
                     "published": summary.published,
@@ -122,7 +122,7 @@ pub(crate) async fn message_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "target_event_id": event_id,
                     "retry_scope": "group_convergence",
@@ -150,7 +150,7 @@ pub(crate) async fn message_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "target_message_id": message_id,
                     "emoji": emoji,
@@ -177,7 +177,7 @@ pub(crate) async fn message_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "target_message_id": message_id,
                     "published": summary.published,
@@ -231,7 +231,7 @@ pub(crate) async fn message_command_with_runtime(
                 plain: message_list_plain(&messages),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "messages": message_list_json_with_profiles(app, messages),
                 }),
             })
@@ -252,7 +252,7 @@ pub(crate) async fn message_command_with_runtime(
                 plain: message_list_plain(&messages),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "query": query,
                     "messages": message_list_json_with_profiles(app, messages),
                 }),
@@ -267,7 +267,7 @@ pub(crate) async fn message_command_with_runtime(
                 plain: message_list_plain(&messages),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "query": query,
                     "messages": message_list_json_with_profiles(app, messages),
                 }),
@@ -314,12 +314,7 @@ fn handle_message_timeline_command(
                     },
                 },
             )?;
-            Ok(timeline_page_output(
-                app,
-                &account.account_id_hex,
-                page,
-                None,
-            ))
+            timeline_page_output(app, &account.account_id_hex, page, None)
         }
         MessageTimelineCommand::Search {
             query,
@@ -344,12 +339,7 @@ fn handle_message_timeline_command(
                     },
                 },
             )?;
-            Ok(timeline_page_output(
-                app,
-                &account.account_id_hex,
-                page,
-                Some(query),
-            ))
+            timeline_page_output(app, &account.account_id_hex, page, Some(query))
         }
         MessageTimelineCommand::Subscribe { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
     }
@@ -477,12 +467,12 @@ fn timeline_page_output(
     account_id_hex: &str,
     page: TimelinePage,
     query: Option<String>,
-) -> CommandOutput {
+) -> Result<CommandOutput, DmError> {
     let messages = timeline_message_list_json_with_profiles(app, page.messages, account_id_hex);
     let plain = timeline_message_list_plain(&messages);
     let mut json = json!({
         "account_id": account_id_hex,
-        "npub": npub_for_account_id(account_id_hex),
+        "npub": npub_for_account_id(account_id_hex)?,
         "messages": messages,
         "has_more_before": page.has_more_before,
         "has_more_after": page.has_more_after,
@@ -490,7 +480,7 @@ fn timeline_page_output(
     if let Some(query) = query {
         json["query"] = json!(query);
     }
-    CommandOutput { plain, json }
+    Ok(CommandOutput { plain, json })
 }
 
 fn timeline_message_list_plain(messages: &[Value]) -> String {

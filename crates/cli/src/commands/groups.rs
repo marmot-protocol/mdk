@@ -49,14 +49,14 @@ pub(crate) async fn group_command_with_runtime(
                 plain: format!("created group {group_id_hex}"),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": group.group_id_hex,
                     "name": group.profile.name.clone(),
                     "profile": group.profile,
                     "image": group.image,
                     "admin_policy": group.admin_policy,
                     "agent_text_stream": group.agent_text_stream,
-                    "members": group_members_json(members),
+                    "members": group_members_json(members)?,
                 }),
             })
         }
@@ -67,12 +67,12 @@ pub(crate) async fn group_command_with_runtime(
             let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group)?)?);
             let members = runtime.group_members(&account.label, &group_id).await?;
             Ok(CommandOutput {
-                plain: group_members_plain(&members),
+                plain: group_members_plain(&members)?,
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
-                    "members": group_members_json(members),
+                    "members": group_members_json(members)?,
                 }),
             })
         }
@@ -92,7 +92,7 @@ pub(crate) async fn group_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "members": members,
                     "published": summary.published,
@@ -116,7 +116,7 @@ pub(crate) async fn group_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "members": members,
                     "published": summary.published,
@@ -147,7 +147,7 @@ pub(crate) async fn group_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group": group_json(group),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
@@ -204,7 +204,7 @@ pub(crate) async fn group_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group": group_json(group),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
@@ -241,7 +241,7 @@ pub(crate) async fn groups_command_with_runtime(
                 plain: group_list_plain(&groups),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "groups": groups.into_iter().map(group_json).collect::<Vec<_>>(),
                 }),
             })
@@ -324,12 +324,12 @@ pub(crate) async fn groups_command_with_runtime(
                 .admins
                 .iter()
                 .map(|admin| {
-                    json!({
+                    Ok(json!({
                         "admin_id": admin,
-                        "npub": npub_for_account_id(admin),
-                    })
+                        "npub": npub_for_account_id(admin)?,
+                    }))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, DmError>>()?;
             Ok(CommandOutput {
                 plain: if admins.is_empty() {
                     "no admins".to_owned()
@@ -342,7 +342,7 @@ pub(crate) async fn groups_command_with_runtime(
                 },
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": group_id,
                     "admins": admins,
                 }),
@@ -360,7 +360,7 @@ pub(crate) async fn groups_command_with_runtime(
                 plain: group.endpoint.clone(),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": group_id,
                     "relays": [group.endpoint],
                 }),
@@ -380,7 +380,7 @@ pub(crate) async fn groups_command_with_runtime(
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
-                    "npub": npub_for_account_id(&account.account_id_hex),
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
                     "group_id": hex::encode(group_id.as_slice()),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
@@ -515,12 +515,12 @@ async fn group_admin_policy_output(
     let group = app
         .group(&account.label, &group_id_hex)?
         .ok_or_else(|| AppError::UnknownGroup(group_id_hex.clone()))?;
-    let admin_npub = npub_for_account_id(&admin_id);
+    let admin_npub = npub_for_account_id(&admin_id)?;
     Ok(CommandOutput {
         plain: format!("{verb} admin {} published={}", admin_id, summary.published),
         json: json!({
             "account_id": account.account_id_hex,
-            "npub": npub_for_account_id(&account.account_id_hex),
+            "npub": npub_for_account_id(&account.account_id_hex)?,
             "group_id": group_id_hex,
             "admin_id": admin_id,
             "admin_npub": admin_npub,
@@ -540,26 +540,26 @@ pub(crate) fn group_mls_state_json(state: AppGroupMlsState) -> Value {
     })
 }
 
-fn group_members_plain(members: &[AppGroupMemberRecord]) -> String {
+fn group_members_plain(members: &[AppGroupMemberRecord]) -> Result<String, DmError> {
     if members.is_empty() {
-        return "no members".to_owned();
+        return Ok("no members".to_owned());
     }
-    members
+    Ok(members
         .iter()
         .map(|member| npub_for_account_id(&member.member_id_hex))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n"))
 }
 
-fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Vec<Value> {
+fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, DmError> {
     members
         .into_iter()
         .map(|member| {
-            json!({
+            Ok(json!({
                 "member_id": member.member_id_hex,
-                "npub": npub_for_account_id(&member.member_id_hex),
+                "npub": npub_for_account_id(&member.member_id_hex)?,
                 "local": member.local,
-            })
+            }))
         })
         .collect()
 }
