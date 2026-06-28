@@ -42,6 +42,13 @@ pub(crate) const LOCAL_SERVER_BIND: SocketAddr =
 pub(crate) const MAX_FRAME_SIZE: usize =
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize + AGENT_TEXT_STREAM_FRAME_ALLOWANCE;
 pub(crate) const PUBLISH_SUBSCRIBER_GRACE: Duration = Duration::from_secs(5);
+/// Application-level read deadline for a subscriber's record-frame reads. The
+/// broker is untrusted, so this bounds how long a single record read can park
+/// (or a malicious broker can starve the read) before the subscriber aborts.
+/// It is generous enough to ride out the long idle gaps a live agent preview
+/// can have between records (e.g. a quiet tool call), unlike the publisher
+/// handshake deadline.
+pub(crate) const SUBSCRIBER_RECORD_READ_DEADLINE: Duration = Duration::from_secs(120);
 pub(crate) const FINISHED_ROOM_TTL: Duration = Duration::from_secs(60);
 // Stale unfinished rooms are a defense-in-depth cleanup path for task
 // cancellation, so keep the same retention window as finished backlog rooms.

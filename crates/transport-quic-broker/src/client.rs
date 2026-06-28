@@ -15,15 +15,15 @@ use cgka_traits::agent_text_stream::{
 use quinn::Endpoint;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
-    AgentTextStreamCrypto, AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimits,
-    ReceivedTextChunk, ReceivedTextStream, SentTextStream, decrypt_record, effective_plaintext_cap,
-    encrypt_record, frame_len_cap,
+    AgentTextStreamCrypto, AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimitError,
+    AgentTextStreamReceiveLimits, ReceivedTextChunk, ReceivedTextStream, SentTextStream,
+    decrypt_record, effective_plaintext_cap, encrypt_record, frame_len_cap,
 };
 
 use crate::control::QuicBrokerControlEnvelopeV1;
 use crate::error::QuicBrokerError;
 use crate::frame::{read_record_frame, write_control_frame, write_record_frame};
-use crate::protocol::SEND_STOP_WAIT;
+use crate::protocol::{SEND_STOP_WAIT, SUBSCRIBER_RECORD_READ_DEADLINE};
 use crate::tls::client_endpoint;
 
 #[derive(Clone, Debug)]
@@ -280,8 +280,29 @@ where
         AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
     let mut limit_state = AgentTextStreamReceiveAccumulator::new(limits);
     let max_frame_len = frame_len_cap(Some(limits.max_plaintext_frame_len));
+    // The broker is untrusted and can replay `seq <= high_water` frames
+    // forever. Those discards never reach `limit_state.observe`, so count every
+    // frame read off the wire here and trip `max_records` before the dedup
+    // `continue` can silently bypass it. A read deadline (instead of `None`)
+    // breaks a starved read so a malicious broker cannot wedge the loop.
+    let mut frames_read = 0_u64;
 
-    while let Some(record) = read_record_frame(&mut recv, None, max_frame_len).await? {
+    while let Some(record) = read_record_frame(
+        &mut recv,
+        Some(SUBSCRIBER_RECORD_READ_DEADLINE),
+        max_frame_len,
+    )
+    .await?
+    {
+        frames_read = frames_read.saturating_add(1);
+        if frames_read > limits.max_records {
+            return Err(QuicBrokerError::ReceiveLimit(
+                AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+                    attempted: frames_read,
+                    limit: limits.max_records,
+                },
+            ));
+        }
         if record.seq <= high_water {
             continue;
         }

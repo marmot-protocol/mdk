@@ -1385,6 +1385,90 @@ async fn subscriber_discards_duplicate_records_replayed_through_broker() {
 }
 
 #[tokio::test]
+async fn broker_subscriber_counts_replayed_duplicates_against_record_limit() {
+    // Regression: a malicious/compromised broker can replay `seq <= high_water`
+    // frames forever. The subscriber's dedup `continue` discards them before
+    // limit accounting, so before the fix those frames never counted against
+    // `max_records` and the loop read/allocated unboundedly. Here a custom
+    // publisher sends one accepted record then a duplicate `seq=1`; with
+    // `max_records: 1` the subscriber must trip the record limit on the
+    // duplicate frame instead of silently discarding it and succeeding.
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let stream_id = vec![0xe5; 32];
+    let start_event_id = MessageId::new(vec![0x75; 32]);
+    let subscriber = tokio::spawn(subscribe_text_from_broker_with_limits(
+        SubscribeTextFromBroker {
+            broker_addr,
+            server_name: "localhost".to_owned(),
+            trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+            stream_id: stream_id.clone(),
+            start_event_id: start_event_id.clone(),
+            crypto: None,
+        },
+        AgentTextStreamReceiveLimits {
+            max_records: 1,
+            max_plaintext_bytes: 1024,
+            ..AgentTextStreamReceiveLimits::default()
+        },
+        |_| {},
+    ));
+    sleep(Duration::from_millis(100)).await;
+
+    // Raw publisher that sends one accepted record then re-sends `seq=1`, like
+    // a broker replaying retained backlog. The duplicate must count against the
+    // limit, not be discarded before accounting.
+    let endpoint =
+        client_endpoint(BrokerServerTrust::CertificateDer(server_cert), broker_addr).unwrap();
+    let connection = endpoint
+        .connect(broker_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut send = connection.open_uni().await.unwrap();
+    write_control_frame(
+        &mut send,
+        &QuicBrokerControlEnvelopeV1::publish(stream_id.clone(), &start_event_id),
+    )
+    .await
+    .unwrap();
+    let accepted = AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"hi".to_vec());
+    for record in [&accepted, &accepted] {
+        write_record_frame(&mut send, record).await.unwrap();
+    }
+    send.finish().unwrap();
+    let _ = timeout(SEND_STOP_WAIT, send.stopped()).await;
+
+    let err = timeout(Duration::from_secs(5), subscriber)
+        .await
+        .expect("subscriber should trip the record limit on the replayed duplicate")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        QuicBrokerError::ReceiveLimit(AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+            attempted: 2,
+            limit: 1
+        })
+    ));
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn broker_negotiates_v1_alpn_and_rejects_clients_without_it() {
     let server = QuicBrokerServer::bind(QuicBrokerConfig {
         bind_addr: LOCAL_SERVER_BIND,
