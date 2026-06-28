@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +15,8 @@ use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMe
 #[derive(Clone)]
 pub(crate) struct DirectoryCache {
     conn: Arc<Mutex<Connection>>,
+    #[cfg(test)]
+    put_count: Arc<AtomicUsize>,
 }
 
 impl DirectoryCache {
@@ -43,9 +47,21 @@ impl DirectoryCache {
         initialize_schema(&conn)?;
         let cache = Self {
             conn: Arc::new(Mutex::new(conn)),
+            #[cfg(test)]
+            put_count: Arc::new(AtomicUsize::new(0)),
         };
         cache.migrate_legacy_json_records()?;
         Ok(cache)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_count_for_test(&self) -> usize {
+        self.put_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_put_count_for_test(&self) {
+        self.put_count.store(0, Ordering::SeqCst);
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -100,6 +116,8 @@ impl DirectoryCache {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), AppError> {
+        #[cfg(test)]
+        self.put_count.fetch_add(1, Ordering::SeqCst);
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         Self::put_with_reason_locked(&tx, entry, reason)?;

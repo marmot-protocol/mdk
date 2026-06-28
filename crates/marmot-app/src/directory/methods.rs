@@ -899,14 +899,38 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let proposed_entry = self.hydrate_directory_record(entry.clone())?;
         let shared_storage = self.shared_storage()?;
-        let shared_entry = shared_storage
-            .public_directory_user(&proposed_entry.account_id_hex)?
+        let shared_record = shared_storage.public_directory_user(&proposed_entry.account_id_hex)?;
+        let shared_entry = shared_record
+            .clone()
             .map(|record| self.hydrate_public_directory_record(record))
             .transpose()?;
-        let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry)
+        let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry.clone())
             .expect("proposed directory entry should be present");
-        shared_storage.put_public_directory_user(&public_directory_user_record(&entry)?)?;
-        for cache in self.directory_caches()? {
+        let caches = self.directory_caches()?;
+        let public_entry = public_directory_user_record(&entry)?;
+        let shared_entry_matches = shared_record.as_ref() == Some(&public_entry);
+        let mut caches_match = true;
+        for cache in &caches {
+            let cached_entry = cache
+                .entry(&entry.account_id_hex)?
+                .map(|record| self.hydrate_directory_record(record))
+                .transpose()?;
+            if cached_entry.as_ref() != Some(&entry) {
+                caches_match = false;
+                break;
+            }
+        }
+        if shared_entry_matches && caches_match {
+            // Do not call `put_with_reason` just to refresh
+            // `directory_known_user_reasons.last_seen_at`: this is the receive
+            // hot path for duplicate senders, and a write-per-message would
+            // recreate the amplification this guard prevents. Today the reason
+            // table is provenance for persisted directory entries, not an
+            // activity log.
+            return Ok(());
+        }
+        shared_storage.put_public_directory_user(&public_entry)?;
+        for cache in caches {
             cache.put_with_reason(&entry, reason)?;
         }
         self.request_directory_sync_rebuild();

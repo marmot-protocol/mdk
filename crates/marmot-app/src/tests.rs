@@ -264,6 +264,33 @@ fn test_directory_record(account_id_hex: &str, name: &str, created_at: u64) -> U
 }
 
 #[test]
+fn duplicate_directory_entry_save_skips_cache_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let cache = app.directory_cache_for_account(&account).unwrap();
+    let account_id = format!("{:064x}", 42);
+    let mut entry = test_directory_record(&account_id, "cached-peer", 1_700_000_042);
+    entry.profile.as_mut().unwrap().source_relays = vec!["wss://profiles.example".into()];
+
+    cache.reset_put_count_for_test();
+    app.save_directory_entry_with_reason(&entry, "message")
+        .unwrap();
+    assert_eq!(cache.put_count_for_test(), 1);
+
+    cache.reset_put_count_for_test();
+    app.save_directory_entry_with_reason(&entry, "message")
+        .unwrap();
+    assert_eq!(cache.put_count_for_test(), 0);
+
+    entry.profile.as_mut().unwrap().display_name = Some("cached peer".into());
+    app.save_directory_entry_with_reason(&entry, "message")
+        .unwrap();
+    assert_eq!(cache.put_count_for_test(), 1);
+}
+
+#[test]
 fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
     // Regression for darkmatter#206: Nostr `created_at` is second-resolution,
     // so a rapid profile republish can carry the same timestamp as the
