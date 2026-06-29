@@ -21,12 +21,13 @@ use crate::limits::{
     AgentTextStreamReceiveLimits,
 };
 use crate::protocol::{
-    AGENT_TEXT_STREAM_FRAME_ALLOWANCE, LOCAL_BIND, MAX_FRAME_SIZE, QUIC_STREAM_ALPN_V1,
+    AGENT_TEXT_STREAM_FRAME_ALLOWANCE, DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL,
+    DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT, LOCAL_BIND, MAX_FRAME_SIZE, QUIC_STREAM_ALPN_V1,
     QUIC_STREAM_PROTOCOL_V1, SEND_CLOSE_WAIT, frame_len_cap,
 };
 use crate::receive::{QuicTextStreamReceiver, ServerTrust, stream_record_text};
 use crate::send::{SendTextStream, send_text_stream, split_text_deltas};
-use crate::tls::client_endpoint;
+use crate::tls::{client_endpoint, configure_server};
 use tokio::time::{sleep, timeout};
 
 #[test]
@@ -34,6 +35,46 @@ fn direct_path_alpn_is_the_pinned_wire_value() {
     // Wire-visible interop id; both peers must offer exactly this (quic.md).
     assert_eq!(QUIC_STREAM_PROTOCOL_V1, "marmot.quic_stream.v1");
     assert_eq!(QUIC_STREAM_ALPN_V1, b"marmot.quic_stream.v1");
+}
+
+#[test]
+fn direct_server_config_sets_quic_liveness_backstop() {
+    let (server_config, _cert_der) = configure_server().unwrap();
+
+    assert_eq!(
+        DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT,
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL,
+        Duration::from_secs(10)
+    );
+    assert!(DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL < DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT);
+
+    let default_transport = format!("{:?}", quinn::TransportConfig::default());
+    assert!(
+        default_transport.contains("max_idle_timeout: Some(30000)"),
+        "{default_transport}"
+    );
+    assert!(
+        default_transport.contains("keep_alive_interval: None"),
+        "{default_transport}"
+    );
+
+    // Quinn exposes setters for these transport knobs but no public getters, so
+    // this config-level regression test uses its Debug output as the least
+    // invasive check that configure_server attached the intended direct-path
+    // transport config. If Quinn reformats Debug, re-check the wiring rather
+    // than treating the string shape as protocol behavior.
+    let transport = format!("{:?}", server_config.transport);
+    assert!(
+        transport.contains("max_idle_timeout: Some(30000)"),
+        "{transport}"
+    );
+    assert!(
+        transport.contains("keep_alive_interval: Some(10s)"),
+        "{transport}"
+    );
 }
 
 #[test]

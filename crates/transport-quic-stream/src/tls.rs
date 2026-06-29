@@ -5,12 +5,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls_platform_verifier::BuilderVerifierExt;
 
 use crate::error::QuicTextStreamError;
-use crate::protocol::{LOCAL_BIND, QUIC_STREAM_ALPN_V1};
+use crate::protocol::{
+    DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL, DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT, LOCAL_BIND,
+    QUIC_STREAM_ALPN_V1,
+};
 use crate::receive::ServerTrust;
 
 pub(crate) fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStreamError> {
@@ -29,11 +32,23 @@ pub(crate) fn configure_server() -> Result<(ServerConfig, Vec<u8>), QuicTextStre
         .with_single_cert(vec![cert_der.clone()], key_der.into())
         .map_err(|err| QuicTextStreamError::Certificate(err.to_string()))?;
     crypto.alpn_protocols = vec![QUIC_STREAM_ALPN_V1.to_vec()];
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(crypto)
             .map_err(|err| QuicTextStreamError::Certificate(err.to_string()))?,
     ));
+    server_config.transport_config(Arc::new(direct_transport_config()?));
     Ok((server_config, cert_der.as_ref().to_vec()))
+}
+
+fn direct_transport_config() -> Result<TransportConfig, QuicTextStreamError> {
+    let mut transport = TransportConfig::default();
+    // Keepalive must stay below the idle timeout so healthy but app-silent
+    // senders ACK keepalive packets, while transport-dead peers still hit the
+    // explicit idle backstop.
+    transport
+        .max_idle_timeout(Some(DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT.try_into()?))
+        .keep_alive_interval(Some(DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL));
+    Ok(transport)
 }
 
 pub(crate) fn client_endpoint(

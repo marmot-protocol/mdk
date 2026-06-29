@@ -15,6 +15,8 @@ pub enum QuicTextStreamError {
     Rustls(#[from] rustls::Error),
     #[error(transparent)]
     QuinnConfig(#[from] quinn::ConfigError),
+    #[error("direct QUIC transport value exceeds varint bounds")]
+    TransportValueTooLarge(#[from] quinn::VarIntBoundsExceeded),
     #[error(transparent)]
     Connect(#[from] quinn::ConnectError),
     #[error(transparent)]
