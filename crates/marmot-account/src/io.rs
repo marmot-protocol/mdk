@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 
@@ -19,6 +20,13 @@ pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
+    path: impl AsRef<Path>,
+) -> AccountHomeResult<T> {
+    let bytes = Zeroizing::new(fs::read(path)?);
+    Ok(serde_json::from_slice(bytes.as_slice())?)
+}
+
 pub(crate) fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> AccountHomeResult<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     write_file_atomically(path.as_ref(), &bytes, FileMode::Public)
@@ -28,8 +36,8 @@ pub(crate) fn write_secret_json<T: Serialize>(
     path: impl AsRef<Path>,
     value: &T,
 ) -> AccountHomeResult<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    write_file_atomically(path.as_ref(), &bytes, FileMode::Private)
+    let bytes = Zeroizing::new(serde_json::to_vec_pretty(value)?);
+    write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Private)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

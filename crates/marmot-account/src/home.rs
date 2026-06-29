@@ -9,7 +9,10 @@ use std::fs;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{read_json, validate_account_label, write_json};
-use crate::secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
+use crate::secret_store::{
+    AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
+    scrub_and_remove_local_secret_file,
+};
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
 /// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
@@ -300,11 +303,26 @@ impl AccountHome {
         // Drop the signing secret unless a twin record still depends on a
         // shared (account-id-keyed) credential. For the local-file store the
         // secret lived inside the account directory we just renamed, so this is
-        // a no-op (NotFound -> Ok); the bytes are destroyed with the tombstone
-        // below. For the keychain store the entry is independent of the
-        // directory and is removed here.
+        // a no-op (NotFound -> Ok); the tombstoned secret file is scrubbed below
+        // before recursive directory deletion. For the keychain store the entry
+        // is independent of the directory and is removed here.
         if !self.secret_shared_with_other_record(&account)? {
             self.secret_store.remove_secret(&account)?;
+        }
+
+        // For the local-file secret store, the signing secret moved into the
+        // tombstone with the account directory before `remove_secret` ran. Scrub
+        // that file explicitly before the recursive unlink so destructive wipe
+        // does not devolve to `remove_dir_all` on plaintext key material.
+        if let Some(tombstone) = tombstone.as_ref() {
+            let secret_path = tombstone.join(ACCOUNT_SECRET_FILE);
+            if scrub_and_remove_local_secret_file(&secret_path).is_err() {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "remove_account",
+                    "failed to scrub tombstoned local signing secret before directory deletion"
+                );
+            }
         }
 
         // Best-effort deletion of the tombstoned bytes. A failure here leaves

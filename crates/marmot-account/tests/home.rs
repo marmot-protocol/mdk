@@ -389,6 +389,45 @@ fn account_home_file_store_keeps_per_label_secrets_for_same_account_id() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn account_home_scrubs_tombstoned_local_secret_before_failed_recursive_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("wipe-secret").unwrap();
+    let account_dir = dir.path().join("accounts").join(&account.label);
+    let secret_path = account_dir.join("secret.json");
+    assert!(secret_path.exists());
+
+    // Force tombstone deletion to fail after `remove_account` has renamed the
+    // live account out of `accounts/`, letting the test inspect the tombstone.
+    let stubborn_dir = account_dir.join("stubborn");
+    std::fs::create_dir(&stubborn_dir).unwrap();
+    let mut permissions = std::fs::metadata(&stubborn_dir).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&stubborn_dir, permissions).unwrap();
+
+    home.remove_account(&account.label).unwrap();
+
+    let tombstone_root = dir.path().join(".wipe-tombstones");
+    let tombstones: Vec<_> = std::fs::read_dir(&tombstone_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(tombstones.len(), 1);
+    assert!(!dir.path().join("accounts").join(&account.label).exists());
+    assert!(!tombstones[0].join("secret.json").exists());
+
+    // Restore permissions so the tempdir cleanup can remove the tombstone.
+    let stubborn_tombstone = tombstones[0].join("stubborn");
+    let mut permissions = std::fs::metadata(&stubborn_tombstone)
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&stubborn_tombstone, permissions).unwrap();
+    std::fs::remove_dir_all(&tombstone_root).unwrap();
+}
+
 #[test]
 fn account_home_reveal_nsec_round_trips_to_stored_account_id() {
     let dir = tempfile::tempdir().unwrap();
