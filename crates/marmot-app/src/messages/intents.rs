@@ -1,4 +1,6 @@
-use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN;
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN,
+};
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
@@ -18,6 +20,12 @@ use crate::{MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH
 
 /// Nostr pubkey-reference (`p`) tag name.
 pub(crate) const PUBKEY_REF_TAG: &str = "p";
+
+/// Upper bound for app-internal Markdown mention scans over untrusted message
+/// plaintext. The sender stores the full content, but p-tag derivation only
+/// parses this bounded prefix so one hostile message cannot force unbounded
+/// synchronous Markdown work before send/classification (darkmatter#654).
+const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
 /// Extract the mentioned pubkey hex from a token following a `nostr:` scheme (or
 /// a bare hex/npub), covering NIP-21 `npub` + `nprofile` and a raw hex pubkey.
@@ -46,10 +54,21 @@ pub(crate) fn mention_pubkey_hex(token: &str) -> Option<String> {
 /// unparseable tokens are ignored.
 pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
     let mut hexes = Vec::new();
-    for block in &marmot_markdown::parse(content).blocks {
+    for block in &marmot_markdown::parse(markdown_mention_scan_input(content)).blocks {
         collect_block_mention_hexes(block, &mut hexes);
     }
     hexes
+}
+
+fn markdown_mention_scan_input(content: &str) -> &str {
+    if content.len() <= MAX_MARKDOWN_MENTION_SCAN_BYTES {
+        return content;
+    }
+    let mut end = MAX_MARKDOWN_MENTION_SCAN_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
 }
 
 fn collect_block_mention_hexes(block: &marmot_markdown::Block, out: &mut Vec<String>) {
@@ -678,5 +697,25 @@ mod mention_tests {
         );
         assert!(event.tags.contains(&vec![QUOTE_REF_TAG.to_owned(), target]));
         assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn mention_scan_input_cap_preserves_utf8_boundary() {
+        let input = format!("{}🦫", "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
+        let capped = markdown_mention_scan_input(&input);
+        assert_eq!(capped, "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
+        assert!(capped.is_char_boundary(capped.len()));
+    }
+
+    #[test]
+    fn mention_p_tags_caps_pathological_markdown_before_parsing() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let input = format!(
+            "{}{} @{npub}",
+            "[".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES + 1024),
+            "]".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES + 1024)
+        );
+        assert!(mention_p_tags(&input).is_empty());
     }
 }

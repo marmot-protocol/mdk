@@ -459,6 +459,30 @@ fn mention_classification_covers_bare_npub_mention() {
 }
 
 #[test]
+fn mention_classification_uses_p_tag_for_mentions_beyond_inline_scan_cap() {
+    let receiver = nostr::Keys::generate().public_key().to_hex();
+    let npub = crate::npub_for_account_id(&receiver).unwrap();
+    let cap = cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+    let plaintext = format!("{} @{npub}", "a".repeat(cap + 1));
+
+    // The inline fallback intentionally scans only the bounded prefix. A
+    // mention beyond that prefix is classified only when the sender supplied
+    // the NIP-27 p-tag; this keeps receive-side notification parsing bounded.
+    assert!(!message_text_mentions_account(
+        MARMOT_APP_EVENT_KIND_CHAT,
+        &plaintext,
+        &[],
+        &receiver,
+    ));
+    assert!(message_text_mentions_account(
+        MARMOT_APP_EVENT_KIND_CHAT,
+        &plaintext,
+        &[vec![PUBKEY_REF_TAG.to_owned(), receiver.clone()]],
+        &receiver,
+    ));
+}
+
+#[test]
 fn mention_notification_suppresses_self_mentions() {
     let receiver = "aa".repeat(32);
     let message = received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]);

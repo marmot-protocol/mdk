@@ -238,6 +238,16 @@ fn shallow_image_nesting_still_parses_normally() {
 }
 
 #[test]
+fn image_nesting_can_reach_depth_ceiling_without_off_by_one() {
+    // Link/image delimiter tracking is capped to the same value as emitted
+    // inline nesting. A cap one lower would reject the legitimate max-depth
+    // image tree; a cap one higher would keep useless openers that can never
+    // produce a deeper display tree.
+    let doc = parse(&nested_images(DEPTH_CEILING - 1));
+    assert_eq!(max_inline_depth(&doc), DEPTH_CEILING);
+}
+
+#[test]
 fn excess_emphasis_delimiters_stay_literal_not_dropped() {
     // The cap leaves un-paired delimiter runs as literal text rather than
     // silently discarding content. Concatenating all Text leaves must recover

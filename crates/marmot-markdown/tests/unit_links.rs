@@ -86,6 +86,11 @@ fn parse_blocks_within(input: &str, max_elapsed: Duration) -> Vec<Block> {
     blocks
 }
 
+/// Mirrors the crate-internal `MAX_OPEN_BRACKET_DELIMITERS` /
+/// `MAX_INLINE_NESTING_DEPTH` constants. They are intentionally not public API,
+/// but the boundary behavior is security-relevant for darkmatter#654.
+const BRACKET_DELIM_CAP: usize = 96;
+
 // ----- Inline links ---------------------------------------------------
 
 #[test]
@@ -224,6 +229,40 @@ fn unmatched_bracket_falls_through() {
 #[test]
 fn unmatched_close_bracket_is_text() {
     assert_eq!(parse_inlines("foo]"), vec![t("foo]")]);
+}
+
+#[test]
+fn many_unmatched_link_brackets_stay_literal_without_quadratic_work() {
+    // Regression for darkmatter#654: `"[" * N + "]" * N` used to keep every
+    // `[` on the delimiter stack and then spend quadratic time scanning and
+    // shifting that stack on the closing `]` run. The parser now caps the open
+    // bracket stack and advances one opener per unmatched close.
+    let n = 100_000;
+    let input = format!("{}{}", "[".repeat(n), "]".repeat(n));
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
+#[test]
+fn many_unmatched_image_brackets_stay_literal_without_quadratic_work() {
+    let n = 50_000;
+    let input = format!("{}{}", "![".repeat(n), "]".repeat(n));
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
+#[test]
+fn excess_open_brackets_pair_with_latest_kept_opener() {
+    // Once the opener cap is reached, later `[` bytes remain literal text.
+    // A subsequent valid close therefore pairs with the latest kept opener,
+    // not the latest literal `[`. Pin this pathological-but-intentional split
+    // so future changes do not accidentally uncap the delimiter stack.
+    let input = format!("{}text](url)", "[".repeat(BRACKET_DELIM_CAP + 1));
+    assert_eq!(
+        parse_inlines(&input),
+        vec![
+            t(&"[".repeat(BRACKET_DELIM_CAP - 1)),
+            link("url", None, vec![t("[text")]),
+        ]
+    );
 }
 
 #[test]

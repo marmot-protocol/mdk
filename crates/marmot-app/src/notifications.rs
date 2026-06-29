@@ -795,7 +795,9 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
 /// NIP-27 pubkey-reference (`p`) tag resolving to the account, or an inline
 /// nostr pubkey entity referencing it (a bare `@npub1…` handle or an explicit
 /// `nostr:` URI). Shared with the chat-list unread projection so the @-badge
-/// reuses the exact notification classification.
+/// reuses the exact notification classification. The inline Markdown fallback
+/// is intentionally bounded (darkmatter#654); send-side / wire `p` tags are the
+/// authoritative mention signal for content beyond that cap.
 pub(crate) fn message_text_mentions_account(
     kind: u64,
     plaintext: &str,
@@ -814,6 +816,9 @@ pub(crate) fn message_text_mentions_account(
     }) {
         return true;
     }
+    // Keep this fallback bounded with the sender-side p-tag derivation. Do not
+    // reintroduce full-content Markdown parsing here: hostile received content
+    // can otherwise spend unbounded CPU before notification classification.
     inline_mention_pubkey_hexes(plaintext)
         .iter()
         .any(|mentioned| mentioned.eq_ignore_ascii_case(account_id_hex))

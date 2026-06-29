@@ -47,6 +47,13 @@ const INLINE_SPECIAL: [bool; 128] = {
 /// darkmatter#208.
 pub(crate) const MAX_INLINE_NESTING_DEPTH: usize = 96;
 
+/// Maximum number of simultaneously-open link/image bracket delimiters kept on
+/// the delimiter stack. Excess openers remain literal text. This mirrors the
+/// emitted inline nesting cap: a deeper bracket stack cannot produce valid
+/// display nesting, and keeping it unbounded lets hostile input spend quadratic
+/// time repeatedly searching/dropping unmatched openers (darkmatter#654).
+const MAX_OPEN_BRACKET_DELIMITERS: usize = MAX_INLINE_NESTING_DEPTH;
+
 /// Returns `true` if any inline in `items` is nested at least `cap` levels
 /// deep, counting the items in `items` themselves as level 1.
 ///
@@ -180,20 +187,15 @@ struct BracketDelim {
     /// For runs: can this run open / close emphasis?
     can_open: bool,
     can_close: bool,
-    /// Previous active `[` delimiter index at the time this delimiter was
-    /// pushed. This lets link absorption deactivate earlier link openers by
-    /// following only the bracket chain, instead of rescanning an arbitrarily
-    /// large stack of unrelated emphasis delimiters.
-    prev_link_opener: Option<usize>,
+    /// Previous active link/image bracket delimiter at the time this delimiter
+    /// was pushed. Maintained only for `[` / `![` delimiters so bracket closing
+    /// and link-opener deactivation can walk bracket delimiters directly instead
+    /// of rescanning the full mixed delimiter vector on every `]` or link wrap.
+    prev_bracket: Option<usize>,
 }
 
 impl BracketDelim {
-    fn bracket(
-        kind: u8,
-        out_pos: usize,
-        input_pos: usize,
-        prev_link_opener: Option<usize>,
-    ) -> Self {
+    fn bracket(kind: u8, out_pos: usize, input_pos: usize, prev_bracket: Option<usize>) -> Self {
         Self {
             kind,
             out_pos,
@@ -203,7 +205,7 @@ impl BracketDelim {
             len: 0,
             can_open: false,
             can_close: false,
-            prev_link_opener,
+            prev_bracket,
         }
     }
 }
@@ -217,7 +219,8 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
     // reallocation chain (4→8→16→…) as the first text run accumulates.
     let mut buf = String::with_capacity(raw.len());
     let mut delims: Vec<BracketDelim> = Vec::new();
-    let mut last_active_link_opener: Option<usize> = None;
+    let mut last_bracket_delim: Option<usize> = None;
+    let mut open_bracket_delims = 0usize;
     let mut i = 0;
     let mut inline_math_closer_exhausted = false;
 
@@ -311,29 +314,36 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 }
             },
             b'[' => {
-                flush_text(&mut out, &mut buf, &delims);
-                let out_pos = out.len();
-                out.push(Inline::Text("[".to_string()));
-                let delim_idx = delims.len();
-                delims.push(BracketDelim::bracket(
-                    b'[',
-                    out_pos,
-                    i,
-                    last_active_link_opener,
-                ));
-                last_active_link_opener = Some(delim_idx);
+                if open_bracket_delims < MAX_OPEN_BRACKET_DELIMITERS {
+                    flush_text(&mut out, &mut buf, &delims);
+                    let out_pos = out.len();
+                    out.push(Inline::Text("[".to_string()));
+                    let delim_idx = delims.len();
+                    delims.push(BracketDelim::bracket(b'[', out_pos, i, last_bracket_delim));
+                    last_bracket_delim = Some(delim_idx);
+                    open_bracket_delims += 1;
+                } else {
+                    buf.push('[');
+                }
                 i += 1;
             }
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
-                flush_text(&mut out, &mut buf, &delims);
-                let out_pos = out.len();
-                out.push(Inline::Text("![".to_string()));
-                delims.push(BracketDelim::bracket(
-                    b'!',
-                    out_pos,
-                    i + 1,
-                    last_active_link_opener,
-                ));
+                if open_bracket_delims < MAX_OPEN_BRACKET_DELIMITERS {
+                    flush_text(&mut out, &mut buf, &delims);
+                    let out_pos = out.len();
+                    out.push(Inline::Text("![".to_string()));
+                    let delim_idx = delims.len();
+                    delims.push(BracketDelim::bracket(
+                        b'!',
+                        out_pos,
+                        i + 1,
+                        last_bracket_delim,
+                    ));
+                    last_bracket_delim = Some(delim_idx);
+                    open_bracket_delims += 1;
+                } else {
+                    buf.push_str("![");
+                }
                 i += 2;
             }
             b'*' | b'_' | b'~' => {
@@ -354,7 +364,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     len: run_len,
                     can_open,
                     can_close,
-                    prev_link_opener: None,
+                    prev_bracket: None,
                 });
                 i += run_len;
             }
@@ -365,8 +375,9 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     i,
                     &mut out,
                     &mut delims,
+                    &mut last_bracket_delim,
+                    &mut open_bracket_delims,
                     refs,
-                    &mut last_active_link_opener,
                 ) {
                     i = end;
                 } else {
@@ -547,7 +558,9 @@ fn flush_text(out: &mut Vec<Inline>, buf: &mut String, delims: &[BracketDelim]) 
         return;
     }
     let last_idx = out.len().wrapping_sub(1);
-    let blocked = delims.last().is_some_and(|d| d.out_pos == last_idx);
+    let blocked = delims
+        .last()
+        .is_some_and(|d| d.active && d.out_pos == last_idx);
     if !blocked && let Some(Inline::Text(prev)) = out.last_mut() {
         prev.push_str(buf);
         buf.clear();
@@ -697,6 +710,57 @@ enum InlineMathScan {
 // Links + images (delimiter-stack closer)
 // ---------------------------------------------------------------------------
 
+fn is_bracket_delim_kind(kind: u8) -> bool {
+    kind == b'[' || kind == b'!'
+}
+
+fn previous_active_bracket_delim(
+    delims: &[BracketDelim],
+    mut cursor: Option<usize>,
+) -> Option<usize> {
+    while let Some(idx) = cursor {
+        let delim = delims.get(idx)?;
+        if delim.active && is_bracket_delim_kind(delim.kind) {
+            return Some(idx);
+        }
+        cursor = delim.prev_bracket;
+    }
+    None
+}
+
+fn active_bracket_delim_count(delims: &[BracketDelim], mut cursor: Option<usize>) -> usize {
+    let mut count = 0;
+    while let Some(idx) = previous_active_bracket_delim(delims, cursor) {
+        count += 1;
+        cursor = delims[idx].prev_bracket;
+    }
+    count
+}
+
+fn refresh_active_bracket_state(
+    delims: &[BracketDelim],
+    last_bracket_delim: &mut Option<usize>,
+    open_bracket_delims: &mut usize,
+) {
+    *last_bracket_delim = previous_active_bracket_delim(delims, *last_bracket_delim);
+    *open_bracket_delims = active_bracket_delim_count(delims, *last_bracket_delim);
+}
+
+fn deactivate_bracket_delim(
+    delims: &mut [BracketDelim],
+    opener_idx: usize,
+    last_bracket_delim: &mut Option<usize>,
+    open_bracket_delims: &mut usize,
+) {
+    if let Some(opener) = delims.get_mut(opener_idx)
+        && opener.active
+        && is_bracket_delim_kind(opener.kind)
+    {
+        opener.active = false;
+    }
+    refresh_active_bracket_state(delims, last_bracket_delim, open_bracket_delims);
+}
+
 /// Handle a `]` byte at position `i`. Returns the byte index past the close
 /// on success, or `None` if the `]` should be emitted as literal text.
 fn try_close_bracket(
@@ -704,20 +768,17 @@ fn try_close_bracket(
     i: usize,
     out: &mut Vec<Inline>,
     delims: &mut Vec<BracketDelim>,
+    last_bracket_delim: &mut Option<usize>,
+    open_bracket_delims: &mut usize,
     refs: &HashMap<String, LinkRef>,
-    last_active_link_opener: &mut Option<usize>,
 ) -> Option<usize> {
-    // Find the most recent active opener (`[` or `![`).
-    let opener_idx = delims
-        .iter()
-        .rposition(|d| d.kind == b'[' || d.kind == b'!')?;
+    // Find the most recent active opener (`[` or `![`) through the bracket-only
+    // chain. This is the bracket analogue of the emphasis openers-bottom
+    // optimization: every unmatched `]` consumes at most one opener instead of
+    // rescanning/removing from the full mixed delimiter vector.
+    let opener_idx = previous_active_bracket_delim(delims, *last_bracket_delim)?;
+    *last_bracket_delim = Some(opener_idx);
     let opener = delims[opener_idx];
-
-    if !opener.active {
-        // Inactive opener: drop it and emit literal `]`.
-        remove_bracket_delim(delims, opener_idx, last_active_link_opener);
-        return None;
-    }
 
     // 1. Inline link: `](dest "title")`
     if bytes.get(i + 1) == Some(&b'(')
@@ -729,11 +790,14 @@ fn try_close_bracket(
             opener_idx,
             dest,
             title,
-            last_active_link_opener,
+            last_bracket_delim,
+            open_bracket_delims,
         ) {
             return Some(end);
         }
-        // Wrapping refused (depth cap): treat `]` as literal text.
+        // Wrapping refused (depth cap): make this opener literal and emit the
+        // close bracket as text so future `]` bytes advance to earlier openers.
+        deactivate_bracket_delim(delims, opener_idx, last_bracket_delim, open_bracket_delims);
         return None;
     }
 
@@ -751,10 +815,12 @@ fn try_close_bracket(
                 opener_idx,
                 dest,
                 title,
-                last_active_link_opener,
+                last_bracket_delim,
+                open_bracket_delims,
             ) {
                 return Some(end);
             }
+            deactivate_bracket_delim(delims, opener_idx, last_bracket_delim, open_bracket_delims);
             return None;
         }
         // Empty `[]` after `]` — collapsed reference: use the link text as
@@ -769,10 +835,17 @@ fn try_close_bracket(
                     opener_idx,
                     dest,
                     title,
-                    last_active_link_opener,
+                    last_bracket_delim,
+                    open_bracket_delims,
                 ) {
                     return Some(end);
                 }
+                deactivate_bracket_delim(
+                    delims,
+                    opener_idx,
+                    last_bracket_delim,
+                    open_bracket_delims,
+                );
                 return None;
             }
         }
@@ -790,27 +863,18 @@ fn try_close_bracket(
             opener_idx,
             dest,
             title,
-            last_active_link_opener,
+            last_bracket_delim,
+            open_bracket_delims,
         ) {
             return Some(i + 1);
         }
+        deactivate_bracket_delim(delims, opener_idx, last_bracket_delim, open_bracket_delims);
         return None;
     }
 
-    // No match — drop the opener and emit literal `]`.
-    remove_bracket_delim(delims, opener_idx, last_active_link_opener);
+    // No match — make the opener literal and emit literal `]`.
+    deactivate_bracket_delim(delims, opener_idx, last_bracket_delim, open_bracket_delims);
     None
-}
-
-fn remove_bracket_delim(
-    delims: &mut Vec<BracketDelim>,
-    opener_idx: usize,
-    last_active_link_opener: &mut Option<usize>,
-) {
-    if delims[opener_idx].kind == b'[' && *last_active_link_opener == Some(opener_idx) {
-        *last_active_link_opener = delims[opener_idx].prev_link_opener;
-    }
-    delims.remove(opener_idx);
 }
 
 /// Parse `(dest "title")` starting at the `(`.
@@ -889,19 +953,22 @@ fn label_text(b: &[u8], start: usize, end: usize) -> String {
 /// refused because it would push the inline tree past
 /// [`MAX_INLINE_NESTING_DEPTH`] (darkmatter#208). On refusal `out`/`delims`
 /// are left untouched so the caller can fall back to literal-text handling
-/// of the closing `]`.
+/// of the closing `]` after deactivating the refused opener.
 fn absorb_link(
     out: &mut Vec<Inline>,
     delims: &mut Vec<BracketDelim>,
     opener_idx: usize,
     dest: String,
     title: Option<String>,
-    last_active_link_opener: &mut Option<usize>,
+    last_bracket_delim: &mut Option<usize>,
+    open_bracket_delims: &mut usize,
 ) -> bool {
     // First, pair any emphasis runs strictly inside the link before
     // wrapping — emphasis inside link text DOES get processed (per spec).
     process_emphasis(out, delims, opener_idx + 1);
+    refresh_active_bracket_state(delims, last_bracket_delim, open_bracket_delims);
     let opener = delims[opener_idx];
+    let prev_bracket = opener.prev_bracket;
 
     // Depth guard (darkmatter#208). Wrapping the children in a Link/Image node
     // produces a node one level deeper than its deepest child, exactly like
@@ -935,23 +1002,24 @@ fn absorb_link(
         });
     }
     // Pop all delimiters from opener_idx onward (any inner unclosed openers
-    // are now part of the link's children). For links, prevent nested links by
-    // deactivating earlier `[` openers through the link-opener chain. That is
-    // proportional to earlier brackets, not to unrelated emphasis delimiters
-    // that can accumulate around links.
-    let prev_link_opener = opener.prev_link_opener;
-    if kind_is_image {
-        delims.truncate(opener_idx);
-        *last_active_link_opener = prev_link_opener;
-    } else {
-        let mut cursor = prev_link_opener;
+    // are now part of the link's children). The bracket-only cursor/count are
+    // refreshed from the surviving chain below, so this is a truncate rather
+    // than repeated `Vec::remove` shifting. For links, prevent nested links by
+    // deactivating earlier `[` openers through the same bracket chain; this is
+    // proportional to active bracket openers, not unrelated emphasis delimiters.
+    delims.truncate(opener_idx);
+    if !kind_is_image {
+        let mut cursor = previous_active_bracket_delim(delims, prev_bracket);
         while let Some(idx) = cursor {
-            cursor = delims[idx].prev_link_opener;
-            delims[idx].active = false;
+            let prev = delims[idx].prev_bracket;
+            if delims[idx].kind == b'[' {
+                delims[idx].active = false;
+            }
+            cursor = previous_active_bracket_delim(delims, prev);
         }
-        delims.truncate(opener_idx);
-        *last_active_link_opener = None;
     }
+    *last_bracket_delim = previous_active_bracket_delim(delims, prev_bracket);
+    *open_bracket_delims = active_bracket_delim_count(delims, *last_bracket_delim);
     true
 }
 
