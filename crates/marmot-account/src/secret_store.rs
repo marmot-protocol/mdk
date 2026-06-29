@@ -5,8 +5,8 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, AccountSummary, LOCAL_FILE_SECRET_BACKEND};
@@ -19,15 +19,41 @@ struct StoredAccountSecret {
     version: u32,
     #[serde(default = "stored_secret_backend")]
     backend: String,
-    secret_key_hex: String,
+    secret_key_hex: StoredSecretKeyHex,
 }
 
-impl Drop for StoredAccountSecret {
-    fn drop(&mut self) {
-        // The local-file backend deserializes the raw signing key into this
-        // struct, so wipe the plaintext hex when the record is dropped rather
-        // than leaving it in a freed allocation.
-        self.secret_key_hex.zeroize();
+/// Zeroizing wrapper for the `secret_key_hex` JSON string field.
+///
+/// The custom serde impls intentionally preserve the old on-disk wire format:
+/// `"secret_key_hex"` remains a plain JSON string, while Rust-owned buffers
+/// zeroize the decoded secret hex when dropped.
+struct StoredSecretKeyHex(Zeroizing<String>);
+
+impl StoredSecretKeyHex {
+    fn new(secret_key_hex: String) -> Self {
+        Self(Zeroizing::new(secret_key_hex))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Serialize for StoredSecretKeyHex {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredSecretKeyHex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
     }
 }
 
@@ -70,16 +96,14 @@ impl AccountSecretStore for LocalFileSecretStore {
     }
 
     fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
-        // Keep the plaintext hex in a zeroizing buffer; the `StoredAccountSecret`
-        // it is moved into wipes itself on drop, so the cleartext key never
-        // outlives this call in a freed allocation.
-        let secret_key_hex = Zeroizing::new(keys.secret_key().to_secret_hex());
+        // Move the plaintext hex directly into a zeroizing field before JSON
+        // serialization so no crate-owned String copy is dropped unwiped.
         write_secret_json(
             self.secret_path(&account.label),
             &StoredAccountSecret {
                 version: stored_secret_version(),
                 backend: stored_secret_backend(),
-                secret_key_hex: secret_key_hex.to_string(),
+                secret_key_hex: StoredSecretKeyHex::new(keys.secret_key().to_secret_hex()),
             },
         )
     }
@@ -91,7 +115,8 @@ impl AccountSecretStore for LocalFileSecretStore {
                 secret.backend.clone(),
             ));
         }
-        nostr::Keys::parse(&secret.secret_key_hex).map_err(|_| AccountHomeError::InvalidSecretKey)
+        nostr::Keys::parse(secret.secret_key_hex.as_str())
+            .map_err(|_| AccountHomeError::InvalidSecretKey)
     }
 
     fn remove_secret(&self, account: &AccountSummary) -> AccountHomeResult<()> {
@@ -171,15 +196,19 @@ impl AccountSecretStore for KeychainSecretStore {
 
     fn has_secret_for_account_id(&self, account_id_hex: &str) -> AccountHomeResult<bool> {
         match self.entry_for_account(account_id_hex)?.get_password() {
-            Ok(_) => Ok(true),
+            Ok(secret_key) => {
+                let _secret_key = Zeroizing::new(secret_key);
+                Ok(true)
+            }
             Err(keyring_core::Error::NoEntry) => Ok(false),
             Err(err) => Err(map_keyring_error(err)),
         }
     }
 
     fn write_secret(&self, account: &AccountSummary, keys: &nostr::Keys) -> AccountHomeResult<()> {
+        let secret_key_hex = Zeroizing::new(keys.secret_key().to_secret_hex());
         self.entry_for_account(&account.account_id_hex)?
-            .set_password(&keys.secret_key().to_secret_hex())
+            .set_password(secret_key_hex.as_str())
             .map_err(map_keyring_error)
     }
 
@@ -189,7 +218,9 @@ impl AccountSecretStore for KeychainSecretStore {
             .get_password()
         {
             Ok(secret_key) => {
-                nostr::Keys::parse(&secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)
+                let secret_key = Zeroizing::new(secret_key);
+                nostr::Keys::parse(secret_key.as_str())
+                    .map_err(|_| AccountHomeError::InvalidSecretKey)
             }
             Err(keyring_core::Error::NoEntry) => Err(AccountHomeError::SecretNotFound(
                 account.account_id_hex.clone(),

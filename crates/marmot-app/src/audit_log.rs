@@ -21,6 +21,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
+use zeroize::Zeroizing;
 
 use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_storage};
 use crate::error::AppError;
@@ -588,7 +589,11 @@ impl MarmotApp {
     /// recorded in the audit entry so users can see which surface requested the
     /// export. It must never carry a user identifier, account id, or key
     /// material.
-    pub fn reveal_nsec(&self, account_ref: &str, caller_context: &str) -> Result<String, AppError> {
+    pub fn reveal_nsec(
+        &self,
+        account_ref: &str,
+        caller_context: &str,
+    ) -> Result<Zeroizing<String>, AppError> {
         // Resolve to confirm the account exists before doing anything else.
         let account = self.account_home().account(account_ref)?;
         let nsec = self.account_home().reveal_nsec(account_ref)?;
@@ -981,7 +986,10 @@ mod tests {
         assert_eq!(revealed.len(), 63);
         assert!(revealed.starts_with("nsec1"));
         assert_eq!(
-            nostr::Keys::parse(&revealed).unwrap().public_key().to_hex(),
+            nostr::Keys::parse(revealed.as_str())
+                .unwrap()
+                .public_key()
+                .to_hex(),
             account.account_id_hex
         );
 
@@ -1002,7 +1010,7 @@ mod tests {
         let contents = std::fs::read_to_string(&audit_path).unwrap();
         assert!(contents.contains("\"action\":\"reveal_nsec\""));
         assert!(contents.contains("\"caller_context\":\"test::reveal_caller\""));
-        assert!(!contents.contains(&revealed));
+        assert!(!contents.contains(revealed.as_str()));
         assert!(!contents.contains(&account.account_id_hex));
     }
 

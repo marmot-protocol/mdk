@@ -1,3 +1,5 @@
+use zeroize::Zeroizing;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -1056,7 +1058,11 @@ impl MarmotAppRuntime {
 
     /// See [`MarmotApp::reveal_nsec`]. darkmatter#543. `caller_context` is the
     /// privacy-safe surface label recorded in the reveal audit entry.
-    pub fn reveal_nsec(&self, account_ref: &str, caller_context: &str) -> Result<String, AppError> {
+    pub fn reveal_nsec(
+        &self,
+        account_ref: &str,
+        caller_context: &str,
+    ) -> Result<Zeroizing<String>, AppError> {
         self.accounts.reveal_nsec(account_ref, caller_context)
     }
 

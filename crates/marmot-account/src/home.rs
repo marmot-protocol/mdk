@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{read_json, validate_account_label, write_json};
@@ -444,15 +445,18 @@ impl AccountHome {
     /// form (NIP-19). Reading the raw key out is a NIP-49 "insecure handling"
     /// event, so this also flips the persisted KEY_SECURITY_BYTE to 0x00.
     ///
-    /// The returned String is the only place the bech32 form exists; it is
-    /// neither cached nor logged. Caller should drop it promptly.
-    pub fn reveal_nsec(&self, account_ref: &str) -> AccountHomeResult<String> {
+    /// The returned value is zeroized on drop for Rust callers. That guarantee
+    /// stops once a caller clones or converts it into a plain `String`, including
+    /// at the UniFFI boundary; unwrap it only there and keep the host-side string
+    /// transient.
+    pub fn reveal_nsec(&self, account_ref: &str) -> AccountHomeResult<Zeroizing<String>> {
         use nostr::ToBech32;
         let keys = self.load_signing_keys(account_ref)?;
-        let nsec = keys
-            .secret_key()
-            .to_bech32()
-            .expect("nsec bech32 encode is infallible");
+        let nsec = Zeroizing::new(
+            keys.secret_key()
+                .to_bech32()
+                .expect("nsec bech32 encode is infallible"),
+        );
         // Persist the insecure-handling marker only after a successful encode.
         self.mark_key_handled_insecurely(account_ref)?;
         Ok(nsec)

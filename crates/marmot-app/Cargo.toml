@@ -44,6 +44,7 @@ transport-nostr-peeler.workspace = true
 transport-quic-broker.workspace = true
 transport-quic-stream.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true

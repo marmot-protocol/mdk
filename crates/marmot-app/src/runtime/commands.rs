@@ -2,6 +2,8 @@
 //! [`AccountWorkerCommand`] to the per-account worker and awaits its oneshot
 //! reply.
 
+use zeroize::Zeroizing;
+
 use std::time::Instant;
 
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
@@ -176,7 +178,11 @@ impl AccountManager {
     /// See `MarmotApp::reveal_nsec`. darkmatter#543. Reads from the keystore
     /// directly; does not require a running account worker. `caller_context` is
     /// the privacy-safe surface label recorded in the reveal audit entry.
-    pub fn reveal_nsec(&self, account_ref: &str, caller_context: &str) -> Result<String, AppError> {
+    pub fn reveal_nsec(
+        &self,
+        account_ref: &str,
+        caller_context: &str,
+    ) -> Result<Zeroizing<String>, AppError> {
         self.app.reveal_nsec(account_ref, caller_context)
     }
 

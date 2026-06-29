@@ -6,6 +6,7 @@ use marmot_account::{
 };
 use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
+use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -436,12 +437,15 @@ fn account_home_reveal_nsec_round_trips_to_stored_account_id() {
 
     let imported = home.import_nostr_account(nsec).unwrap();
 
-    let revealed = home.reveal_nsec(&imported.account_id_hex).unwrap();
+    let revealed: Zeroizing<String> = home.reveal_nsec(&imported.account_id_hex).unwrap();
     assert_eq!(revealed.len(), 63);
     assert!(revealed.starts_with("nsec1"));
     // The revealed nsec parses back to the same public key as the account id.
     assert_eq!(
-        nostr::Keys::parse(&revealed).unwrap().public_key().to_hex(),
+        nostr::Keys::parse(revealed.as_str())
+            .unwrap()
+            .public_key()
+            .to_hex(),
         imported.account_id_hex
     );
 }
