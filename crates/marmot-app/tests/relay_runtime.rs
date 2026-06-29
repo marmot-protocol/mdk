@@ -2328,7 +2328,7 @@ async fn directory_sync_worker_ingests_profile_metadata_events() {
 }
 
 #[tokio::test]
-async fn directory_sync_worker_admits_follow_list_users() {
+async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -2353,20 +2353,31 @@ async fn directory_sync_worker_admits_follow_list_users() {
     )
     .await;
 
+    // The local account's own contact list is ingested and its follow edges are
+    // cached on the account's directory entry for bounded search, but the
+    // followed pubkey must NOT be promoted into a known directory entry: doing
+    // so would feed the unbounded transitive social-graph crawl (darkmatter#687).
     timeout(Duration::from_secs(5), async {
         loop {
-            if app
-                .directory_entry_for_account_id(&followed)
+            let cached_follow = app
+                .directory_entry_for_account_id(&setup.account.account_id_hex)
                 .unwrap()
-                .is_some()
-            {
+                .is_some_and(|entry| entry.follows.contains(&followed));
+            if cached_follow {
                 return;
             }
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("followed user admitted");
+    .expect("follow edge cached on the account's own directory entry");
+
+    assert!(
+        app.directory_entry_for_account_id(&followed)
+            .unwrap()
+            .is_none(),
+        "ingested follows must not be promoted into known directory entries"
+    );
     runtime.shutdown().await;
 }
 

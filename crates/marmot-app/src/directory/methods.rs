@@ -615,21 +615,23 @@ impl MarmotApp {
     }
 
     pub(crate) fn directory_sync_plan(&self) -> Result<DirectorySyncPlan, AppError> {
-        let mut account_ids = self
+        let local_account_ids = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.is_active_local_signing())
+            .map(|account| account.account_id_hex)
+            .collect::<Vec<_>>();
+        let mut known_user_ids = self
             .directory_entries()?
             .into_iter()
             .map(|entry| entry.account_id_hex)
             .collect::<Vec<_>>();
-        account_ids.extend(
-            self.account_home()
-                .accounts()?
-                .into_iter()
-                .filter(|account| account.is_active_local_signing())
-                .map(|account| account.account_id_hex),
-        );
+        known_user_ids.extend(local_account_ids.iter().cloned());
         Ok(DirectorySyncPlan::from_known_users(
             self.relay_endpoints(),
-            account_ids,
+            local_account_ids,
+            known_user_ids,
             None,
         ))
     }
@@ -793,6 +795,45 @@ impl MarmotApp {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn remember_directory_follow_list_for_test(
+        &self,
+        account_id_hex: &str,
+        follow_list: &FetchedFollowList,
+    ) -> Result<(), AppError> {
+        self.remember_directory_follow_list(account_id_hex, follow_list)
+    }
+
+    /// Persist the follow edges from an ingested remote contact list for
+    /// bounded directory search, without promoting the author's follows into
+    /// known directory entries.
+    ///
+    /// Promoting every followed pubkey via [`Self::remember_directory_user`]
+    /// would schedule a directory-sync rebuild that watches the new pubkeys,
+    /// whose own contact lists would in turn be ingested — an unbounded
+    /// transitive social-graph crawl (darkmatter#687). Instead the edges are
+    /// recorded in the per-account search graph, which directory search reads
+    /// but [`Self::directory_sync_plan`] does not. When the author is already a
+    /// known directory entry (e.g. a local account whose contact list we sync),
+    /// its own cached follow edges are refreshed too, but its follows are still
+    /// not promoted.
+    fn remember_directory_follow_edges_for_search(
+        &self,
+        account_id_hex: &str,
+        follow_list: &FetchedFollowList,
+    ) -> Result<(), AppError> {
+        let npub = npub_for_account_id_lossy(account_id_hex);
+        for cache in self.directory_caches()? {
+            cache.remember_search_graph_follows(account_id_hex, &npub, &follow_list.follows)?;
+        }
+        if let Some(mut entry) = self.directory_entry_for_account_id(account_id_hex)? {
+            entry.follows = follow_list.follows.clone();
+            entry.follow_source_relays = follow_list.source_relays.clone();
+            self.save_directory_entry(&entry)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn remember_directory_profile(
         &self,
         account_id_hex: &str,
@@ -871,7 +912,7 @@ impl MarmotApp {
             }
             KIND_NOSTR_CONTACT_LIST => {
                 let follow_list = follow_list_from_record(record);
-                self.remember_directory_follow_list(&account_id_hex, &follow_list)?;
+                self.remember_directory_follow_edges_for_search(&account_id_hex, &follow_list)?;
             }
             KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST => {
                 self.remember_directory_relay_list_event(&account_id_hex, &record)?;

@@ -16,7 +16,23 @@ use crate::{
 
 pub(crate) const DIRECTORY_SYNC_USER_BATCH_SIZE: usize = 200;
 
+/// Records synced for every known directory user (local or transitively
+/// discovered). Contact lists are deliberately excluded here: subscribing to
+/// kind-3 for transitively discovered users and persisting every followed
+/// pubkey would turn directory sync into an unbounded social-graph crawler
+/// (darkmatter#687). See [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`].
 pub(crate) const DIRECTORY_SYNC_KINDS: &[u64] = &[
+    KIND_NOSTR_METADATA,
+    KIND_NIP65_RELAY_LIST,
+    KIND_MARMOT_INBOX_RELAY_LIST,
+    KIND_MARMOT_KEY_PACKAGE,
+];
+
+/// Records synced for the app's own local accounts. These are bounded by the
+/// number of signed-in local identities, so following their contact lists does
+/// not amplify: their follows feed search/discovery without scheduling new
+/// contact-list subscriptions for the discovered users.
+pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
     KIND_NOSTR_METADATA,
     KIND_NOSTR_CONTACT_LIST,
     KIND_NIP65_RELAY_LIST,
@@ -62,14 +78,25 @@ enum DirectorySyncCommand {
 }
 
 impl DirectorySyncPlan {
+    /// Build a sync plan over the app's local accounts and the broader set of
+    /// known directory users.
+    ///
+    /// `local_account_ids` are the app's own signed-in identities; they sync
+    /// the full [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`] including contact lists.
+    /// `known_user_ids` are every known directory user (including the local
+    /// accounts); the non-local subset syncs only [`DIRECTORY_SYNC_KINDS`],
+    /// which omits contact lists so transitively discovered users cannot feed
+    /// new kind-3 subscriptions back into the plan (darkmatter#687).
     pub(crate) fn from_known_users(
         endpoints: Vec<TransportEndpoint>,
-        account_ids: Vec<String>,
+        local_account_ids: Vec<String>,
+        known_user_ids: Vec<String>,
         since: Option<u64>,
     ) -> Self {
         Self::from_known_users_with_batch_size(
             endpoints,
-            account_ids,
+            local_account_ids,
+            known_user_ids,
             since,
             DIRECTORY_SYNC_USER_BATCH_SIZE,
         )
@@ -77,34 +104,69 @@ impl DirectorySyncPlan {
 
     fn from_known_users_with_batch_size(
         mut endpoints: Vec<TransportEndpoint>,
-        mut account_ids: Vec<String>,
+        mut local_account_ids: Vec<String>,
+        mut known_user_ids: Vec<String>,
         since: Option<u64>,
         batch_size: usize,
     ) -> Self {
         endpoints.sort();
         endpoints.dedup();
-        account_ids.sort();
-        account_ids.dedup();
+        local_account_ids.sort();
+        local_account_ids.dedup();
+        known_user_ids.sort();
+        known_user_ids.dedup();
+
+        // Non-local known users only get the contact-list-free kinds. Local
+        // accounts are handled in their own batches with the full kind set, so
+        // drop them from the remote group to avoid duplicate authors/kinds.
+        let remote_user_ids = known_user_ids
+            .iter()
+            .filter(|account_id| !local_account_ids.contains(account_id))
+            .cloned()
+            .collect::<Vec<_>>();
 
         let batch_size = batch_size.max(1);
-        let batches = account_ids
-            .chunks(batch_size)
-            .enumerate()
-            .map(|(index, authors)| {
-                let authors = authors.to_vec();
-                DirectorySyncBatch {
-                    subscription_id: directory_subscription_id(index, &authors),
-                    authors,
-                    kinds: DIRECTORY_SYNC_KINDS.to_vec(),
-                    since,
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut batches = Vec::new();
+        Self::extend_batches(
+            &mut batches,
+            "local",
+            &local_account_ids,
+            DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS,
+            since,
+            batch_size,
+        );
+        Self::extend_batches(
+            &mut batches,
+            "users",
+            &remote_user_ids,
+            DIRECTORY_SYNC_KINDS,
+            since,
+            batch_size,
+        );
 
         Self {
             endpoints,
-            watched_user_count: account_ids.len(),
+            watched_user_count: local_account_ids.len() + remote_user_ids.len(),
             batches,
+        }
+    }
+
+    fn extend_batches(
+        batches: &mut Vec<DirectorySyncBatch>,
+        group: &str,
+        account_ids: &[String],
+        kinds: &[u64],
+        since: Option<u64>,
+        batch_size: usize,
+    ) {
+        for (index, authors) in account_ids.chunks(batch_size).enumerate() {
+            let authors = authors.to_vec();
+            batches.push(DirectorySyncBatch {
+                subscription_id: directory_subscription_id(group, index, &authors),
+                authors,
+                kinds: kinds.to_vec(),
+                since,
+            });
         }
     }
 }
@@ -221,14 +283,16 @@ async fn run_directory_sync_once(
     })
 }
 
-fn directory_subscription_id(index: usize, authors: &[String]) -> String {
+fn directory_subscription_id(group: &str, index: usize, authors: &[String]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update((group.len() as u64).to_be_bytes());
+    hasher.update(group.as_bytes());
     for author in authors {
         hasher.update((author.len() as u64).to_be_bytes());
         hasher.update(author.as_bytes());
     }
     let digest = hex::encode(hasher.finalize());
-    format!("directory_users_{index}_{}", &digest[..16])
+    format!("directory_{group}_{index}_{}", &digest[..16])
 }
 
 #[cfg(test)]
@@ -261,6 +325,7 @@ mod tests {
                 TransportEndpoint("wss://relay.example".to_owned()),
                 TransportEndpoint("wss://relay.example".to_owned()),
             ],
+            Vec::new(),
             users,
             Some(100),
             2,
@@ -280,6 +345,48 @@ mod tests {
         assert_ne!(
             plan.batches[0].subscription_id,
             plan.batches[1].subscription_id
+        );
+    }
+
+    #[test]
+    fn sync_plan_omits_contact_list_for_non_local_known_users() {
+        let local = account_id(1);
+        let remote = account_id(2);
+
+        let plan = DirectorySyncPlan::from_known_users_with_batch_size(
+            vec![TransportEndpoint("wss://relay.example".to_owned())],
+            vec![local.clone()],
+            vec![local.clone(), remote.clone()],
+            None,
+            200,
+        );
+
+        let local_batch = plan
+            .batches
+            .iter()
+            .find(|batch| batch.authors == vec![local.clone()])
+            .expect("local account should be watched");
+        let remote_batch = plan
+            .batches
+            .iter()
+            .find(|batch| batch.authors == vec![remote.clone()])
+            .expect("non-local known user should be watched");
+
+        assert!(local_batch.kinds.contains(&KIND_NOSTR_CONTACT_LIST));
+        assert!(
+            !remote_batch.kinds.contains(&KIND_NOSTR_CONTACT_LIST),
+            "non-local known users must not be subscribed to kind-3 contact lists"
+        );
+        assert!(remote_batch.kinds.contains(&KIND_NOSTR_METADATA));
+        assert!(remote_batch.kinds.contains(&KIND_MARMOT_KEY_PACKAGE));
+        // The local account must not also appear in a remote (contact-list-free)
+        // batch, which would defeat its contact-list subscription.
+        assert_eq!(
+            plan.batches
+                .iter()
+                .filter(|batch| batch.authors.contains(&local))
+                .count(),
+            1
         );
     }
 

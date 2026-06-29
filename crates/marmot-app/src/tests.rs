@@ -16,7 +16,7 @@ use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
 use crate::conversions::{app_group_from_stored_group, stored_group_from_app_group};
-use crate::directory::records::public_directory_user_record;
+use crate::directory::records::{FetchedFollowList, public_directory_user_record};
 use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
     relay_list_queries, require_key_package_tag, require_multi_value_key_package_tag,
@@ -745,6 +745,183 @@ fn directory_sync_plan_watches_local_accounts_and_known_users() {
     assert_eq!(plan.watched_user_count, 2);
     assert!(watched.contains(&account.account_id_hex));
     assert!(watched.contains(&contact));
+}
+
+#[test]
+fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let sender = format!("{:064x}", 42);
+
+    // A non-local known user (e.g. a message sender) is admitted to the
+    // directory but must never have its kind-3 contact list subscribed: doing
+    // so feeds the unbounded transitive social-graph crawl (darkmatter#687).
+    app.remember_directory_user_with_reason(&sender, "message")
+        .unwrap();
+
+    let plan = app.directory_sync_plan().unwrap();
+
+    let local_kinds = plan
+        .batches
+        .iter()
+        .find(|batch| batch.authors.contains(&account.account_id_hex))
+        .map(|batch| batch.kinds.clone())
+        .expect("local account should be watched");
+    let remote_kinds = plan
+        .batches
+        .iter()
+        .find(|batch| batch.authors.contains(&sender))
+        .map(|batch| batch.kinds.clone())
+        .expect("non-local known user should be watched");
+
+    assert!(
+        local_kinds.contains(&KIND_NOSTR_CONTACT_LIST),
+        "local accounts may still sync their own contact list"
+    );
+    assert!(
+        !remote_kinds.contains(&KIND_NOSTR_CONTACT_LIST),
+        "non-local known users must not be subscribed to kind-3 contact lists"
+    );
+    assert!(remote_kinds.contains(&KIND_NOSTR_METADATA));
+    assert!(remote_kinds.contains(&KIND_MARMOT_KEY_PACKAGE));
+    // The local account's own batch keeps the full kind set; it must not be
+    // double-listed in a contact-list-free remote batch.
+    assert_eq!(
+        plan.batches
+            .iter()
+            .filter(|batch| batch.authors.contains(&account.account_id_hex))
+            .count(),
+        1
+    );
+}
+
+fn contact_list_event(author_hex: &str, follows: &[String]) -> NostrTransportEvent {
+    NostrTransportEvent {
+        id: "00".repeat(32),
+        pubkey: author_hex.to_owned(),
+        created_at: 1,
+        kind: KIND_NOSTR_CONTACT_LIST,
+        tags: follows
+            .iter()
+            .map(|follow| vec!["p".to_owned(), follow.clone()])
+            .collect(),
+        content: String::new(),
+        sig: None,
+    }
+}
+
+#[test]
+fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follows() {
+    use crate::directory::records::MAX_FOLLOW_LIST_ENTRIES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+
+    // A remote, non-local user whose contact list arrives over a relay.
+    let author = format!("{:064x}", 42);
+    app.remember_directory_user_with_reason(&author, "message")
+        .unwrap();
+
+    // Build a contact list far larger than the per-list cap.
+    let total_follows = MAX_FOLLOW_LIST_ENTRIES + 50;
+    let follows = (0..total_follows)
+        .map(|index| format!("{:064x}", index + 1000))
+        .collect::<Vec<_>>();
+    let record = crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
+        event: contact_list_event(&author, &follows),
+    };
+
+    app.ingest_directory_relay_event(record).unwrap();
+
+    // None of the followed pubkeys may be promoted into known directory entries.
+    let known_ids = app
+        .directory_entries()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.account_id_hex)
+        .collect::<std::collections::HashSet<_>>();
+    for follow in &follows {
+        assert!(
+            !known_ids.contains(follow),
+            "ingested follows must not be promoted into known directory entries"
+        );
+    }
+
+    // The author's cached follow edges are bounded by the per-list cap.
+    let author_entry = app
+        .directory_entry_for_account_id(&author)
+        .unwrap()
+        .unwrap();
+    assert_eq!(author_entry.follows.len(), MAX_FOLLOW_LIST_ENTRIES);
+
+    // The directory sync plan still watches only the author and local account,
+    // never the discovered follows — so no transitive crawl is scheduled.
+    let plan = app.directory_sync_plan().unwrap();
+    let watched = plan
+        .batches
+        .iter()
+        .flat_map(|batch| batch.authors.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(watched.contains(&account.account_id_hex));
+    assert!(watched.contains(&author));
+    for follow in &follows {
+        assert!(
+            !watched.contains(follow),
+            "discovered follows must not become watched directory users"
+        );
+    }
+
+    // The follow edges remain available for bounded directory search via the
+    // per-account search graph, even though the follows are not promoted.
+    let cache = app.directory_cache_for_account(&account).unwrap();
+    let search_record = cache.search_record(&author).unwrap().unwrap();
+    assert_eq!(search_record.follows.len(), MAX_FOLLOW_LIST_ENTRIES);
+}
+
+#[test]
+fn local_account_directory_refresh_still_promotes_follows() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let follow = format!("{:064x}", 7);
+
+    // A user-initiated refresh of a local account's own follow list (distinct
+    // from passive relay ingest) intentionally records its follows so they are
+    // searchable and watched.
+    app.remember_directory_user_with_reason(&account.account_id_hex, "local")
+        .unwrap();
+    let follow_list = FetchedFollowList {
+        follows: vec![follow.clone()],
+        source_relays: vec!["wss://relay.example".to_owned()],
+    };
+    app.remember_directory_follow_list_for_test(&account.account_id_hex, &follow_list)
+        .unwrap();
+
+    let entry = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.follows, vec![follow.clone()]);
+    assert!(
+        app.directory_entry_for_account_id(&follow)
+            .unwrap()
+            .is_some(),
+        "an explicit follow-list refresh promotes follows into directory entries"
+    );
+
+    let plan = app.directory_sync_plan().unwrap();
+    let local_batch = plan
+        .batches
+        .iter()
+        .find(|batch| batch.authors.contains(&account.account_id_hex))
+        .expect("local account should be watched");
+    assert!(local_batch.kinds.contains(&KIND_NOSTR_CONTACT_LIST));
 }
 
 #[test]

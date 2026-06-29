@@ -7,7 +7,7 @@
 //! cache/sync modules in `directory/`; they hold no `MarmotApp` state and
 //! operate purely on records.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use storage_sqlite::PublicDirectoryUserRecord;
@@ -422,19 +422,31 @@ pub(crate) fn latest_follow_list_from_records(
     }
 }
 
+/// Defensive cap on accepted `p` tags per ingested contact list. Nostr kind-3
+/// events are attacker-controlled (anyone can publish a list with arbitrarily
+/// many follows to a relay), so we bound the follows stored from any single
+/// list to keep a malicious mega-list from bloating the directory/search cache.
+/// This is generous for legitimate follow lists while capping the worst case.
+pub(crate) const MAX_FOLLOW_LIST_ENTRIES: usize = 2048;
+
 pub(crate) fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollowList {
-    let mut follows = record
-        .event
-        .tags
-        .iter()
-        .filter(|tag| tag.first().is_some_and(|name| name == "p"))
-        .filter_map(|tag| tag.get(1))
-        .filter_map(|value| parse_account_id_hex(value).ok())
-        .collect::<Vec<_>>();
-    follows.sort();
-    follows.dedup();
+    let mut follows = BTreeSet::new();
+    for tag in &record.event.tags {
+        if follows.len() >= MAX_FOLLOW_LIST_ENTRIES {
+            break;
+        }
+        if tag.first().is_none_or(|name| name != "p") {
+            continue;
+        }
+        let Some(value) = tag.get(1) else {
+            continue;
+        };
+        if let Ok(account_id) = parse_account_id_hex(value) {
+            follows.insert(account_id);
+        }
+    }
     FetchedFollowList {
-        follows,
+        follows: follows.into_iter().collect(),
         source_relays: source_relays_from_record(&record),
     }
 }

@@ -284,6 +284,50 @@ impl DirectoryCache {
         Ok(())
     }
 
+    /// Record a remote contact list's follow edges in the search graph without
+    /// promoting the author or its follows into known directory entries
+    /// (`directory_users`). This keeps follow edges available for bounded
+    /// directory search while avoiding the unbounded social-graph crawl that
+    /// promoting every follow would trigger (darkmatter#687). The author's
+    /// cached profile metadata in the search graph is preserved; only the
+    /// follow edges are replaced.
+    pub(crate) fn remember_search_graph_follows(
+        &self,
+        account_id_hex: &str,
+        npub: &str,
+        follows: &[String],
+    ) -> Result<(), AppError> {
+        let now = unix_now_seconds() as i64;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO directory_search_graph_users (
+                account_id_hex,
+                npub,
+                follows_known,
+                follows_updated_at,
+                created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, 1, ?3, ?3, ?3)
+             ON CONFLICT(account_id_hex) DO UPDATE SET
+                npub = excluded.npub,
+                follows_known = 1,
+                follows_updated_at = excluded.follows_updated_at,
+                updated_at = excluded.updated_at",
+            params![account_id_hex, npub, now],
+        )?;
+        Self::replace_follow_rows(
+            &tx,
+            "directory_search_graph_follows",
+            account_id_hex,
+            follows,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn put_search_graph_record_locked(
         conn: &Connection,
         record: &DirectorySearchGraphRecord,
