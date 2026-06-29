@@ -2475,6 +2475,81 @@ fn inbound_message_event_ignores_bare_at_npub_in_image_alt_text() {
 }
 
 #[test]
+fn inbound_message_mention_check_is_fast_on_hostile_markdown_without_npub() {
+    // Regression for darkmatter#663: mention classification ran the unbounded
+    // Markdown parser on attacker-controlled inbound plaintext. A bracket/image
+    // emphasis bomb with no p-tag and no npub reference forced a super-linear
+    // full parse on every kind-9 chat message (live projection and replay).
+    // With no visible npub token present, classification must short-circuit
+    // before parsing and stay fast.
+    let account = "aa".repeat(32);
+    // `![a](` repeated has known super-linear parse cost; 80 KB of it parses in
+    // well over a second unbounded. It contains no npub and no p-tag, so the
+    // correct answer is "not a mention" and the cheap path must reach it.
+    let hostile = "![a](".repeat(16_000);
+
+    let start = std::time::Instant::now();
+    let mentions = inbound_message_mentions_self_for_text(&account, &hostile);
+    let elapsed = start.elapsed();
+
+    assert!(
+        !mentions,
+        "hostile markdown without an npub is not a mention"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "mention classification must not run the unbounded parser on hostile \
+         markdown (took {elapsed:?})"
+    );
+}
+
+#[test]
+fn inbound_message_mention_check_is_fast_on_hostile_markdown_with_visible_npub() {
+    // A visible candidate npub must not send the remaining hostile plaintext
+    // through the Markdown parser. The parser path previously spent hundreds of
+    // milliseconds on this capped prefix; the bounded token scanner should be
+    // effectively linear and still detect the visible mention.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let hostile = format!("hey @{npub} {}", "![a](".repeat(16_000));
+
+    let start = std::time::Instant::now();
+    let mentions = inbound_message_mentions_self_for_text(&account, &hostile);
+    let elapsed = start.elapsed();
+
+    assert!(mentions, "visible @npub mention should be detected");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "visible-npub classification must not parse hostile markdown \
+         (took {elapsed:?})"
+    );
+}
+
+#[test]
+fn inbound_message_mention_check_ignores_image_alt_npub_fast_on_hostile_markdown() {
+    // Review regression for PR #677: putting the target npub in image alt text
+    // made the old pre-filter call the Markdown parser on the hostile capped
+    // prefix even though image alt text is not an addressed visible mention.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let hostile = format!("![hey @{npub}]({}", "![a](".repeat(16_000));
+
+    let start = std::time::Instant::now();
+    let mentions = inbound_message_mentions_self_for_text(&account, &hostile);
+    let elapsed = start.elapsed();
+
+    assert!(
+        !mentions,
+        "npub in image alt text should not count as a visible addressed mention"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "image-alt npub classification must not parse hostile markdown \
+         (took {elapsed:?})"
+    );
+}
+
+#[test]
 fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
     // The p-tag is authoritative: a mention with only the structured tag (no
     // inline nostr: reference in the body) is still detected.
