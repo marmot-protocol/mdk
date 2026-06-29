@@ -775,6 +775,118 @@ async fn published_group_event_is_fanned_out_to_matching_local_accounts() {
     );
 }
 
+async fn directory_plane_with_active_subscription(
+    subscription_id: &str,
+    authors: Vec<String>,
+    kinds: Vec<u64>,
+) -> DirectoryRelayPlane {
+    let directory = DirectoryRelayPlane::new(Arc::new(RecordingDirectoryFetcher::default()));
+    let mut desired = HashMap::new();
+    desired.insert(
+        subscription_id.to_owned(),
+        DirectorySubscriptionFilter::new(authors, kinds),
+    );
+    directory
+        .replace_subscriptions(desired)
+        .await
+        .expect("active subscription is recorded");
+    directory
+}
+
+#[tokio::test]
+async fn directory_live_event_matching_active_subscription_is_accepted() {
+    let author = "11".repeat(32);
+    let directory = directory_plane_with_active_subscription(
+        "directory_users_0_abc",
+        vec![author.clone()],
+        vec![0],
+    )
+    .await;
+
+    assert!(
+        directory
+            .accepts_live_event("directory_users_0_abc", &author, 0)
+            .await,
+        "an event matching the active subscription id, author, and kind must be accepted"
+    );
+}
+
+#[tokio::test]
+async fn directory_live_event_with_unknown_subscription_id_is_rejected() {
+    let author = "11".repeat(32);
+    let directory = directory_plane_with_active_subscription(
+        "directory_users_0_abc",
+        vec![author.clone()],
+        vec![0],
+    )
+    .await;
+
+    assert!(
+        !directory
+            .accepts_live_event("directory_users_0_stale", &author, 0)
+            .await,
+        "an unknown/stale subscription id must be rejected even with a matching author and kind"
+    );
+}
+
+#[tokio::test]
+async fn directory_live_event_with_wrong_author_is_rejected() {
+    let author = "11".repeat(32);
+    let other_author = "22".repeat(32);
+    let directory =
+        directory_plane_with_active_subscription("directory_users_0_abc", vec![author], vec![0])
+            .await;
+
+    assert!(
+        !directory
+            .accepts_live_event("directory_users_0_abc", &other_author, 0)
+            .await,
+        "an author the subscription never requested must be rejected (darkmatter#709)"
+    );
+}
+
+#[tokio::test]
+async fn directory_live_event_with_wrong_kind_is_rejected() {
+    let author = "11".repeat(32);
+    let directory = directory_plane_with_active_subscription(
+        "directory_users_0_abc",
+        vec![author.clone()],
+        vec![0],
+    )
+    .await;
+
+    // Kind 3 (contact list) is the unsolicited write the issue calls out: a
+    // subscription requesting only kind 0 must never admit a kind-3 event.
+    assert!(
+        !directory
+            .accepts_live_event("directory_users_0_abc", &author, 3)
+            .await,
+        "a kind outside the subscription filter must be rejected (darkmatter#709)"
+    );
+}
+
+#[tokio::test]
+async fn directory_live_event_rejected_after_subscription_removed() {
+    let author = "11".repeat(32);
+    let directory = directory_plane_with_active_subscription(
+        "directory_users_0_abc",
+        vec![author.clone()],
+        vec![0],
+    )
+    .await;
+    directory
+        .replace_subscriptions(HashMap::new())
+        .await
+        .expect("subscriptions can be cleared");
+
+    assert!(
+        !directory
+            .accepts_live_event("directory_users_0_abc", &author, 0)
+            .await,
+        "once a subscription is no longer active, its events must not be admitted to the cache"
+    );
+}
+
 fn group_event(id_prefix: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
     NostrTransportEvent {
         id: id_prefix.repeat(32),

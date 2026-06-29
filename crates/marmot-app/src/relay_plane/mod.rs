@@ -37,8 +37,8 @@ pub use telemetry::{
 
 pub(crate) use directory::{
     DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayEventRecord, DirectoryRelayFetcher,
-    DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionSyncSummary,
-    NostrSdkDirectoryRelayFetcher,
+    DirectoryRelayPlane, DirectoryRelayStats, DirectorySubscriptionFilter,
+    DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
 pub(crate) use safety::RelaySafetyPolicy;
 pub(crate) use telemetry::rollup_from_snapshots;
@@ -350,7 +350,7 @@ impl MarmotRelayPlane {
             return self
                 .inner
                 .directory
-                .replace_subscription_ids(HashSet::new())
+                .replace_subscriptions(HashMap::new())
                 .await;
         }
         let sdk_relay_client = self
@@ -393,10 +393,13 @@ impl MarmotRelayPlane {
                 .unsubscribe(&SubscriptionId::new(subscription_id.clone()))
                 .await;
         }
+        // The validation filter persisted for every batch (added or already
+        // active) is keyed on the same canonical-hex authors and kinds the SDK
+        // subscription is issued with, so a live notification is only forwarded
+        // into the directory cache when it matches an active subscription's
+        // requested authors and kinds (darkmatter#709).
+        let mut desired = HashMap::with_capacity(plan.batches.len());
         for batch in &plan.batches {
-            if !to_add.contains(&batch.subscription_id) {
-                continue;
-            }
             let authors = batch
                 .authors
                 .iter()
@@ -411,6 +414,16 @@ impl MarmotRelayPlane {
                         .map_err(|_| format!("unsupported Nostr kind {kind}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // Canonical lowercase hex matches the `event.pubkey` form a forwarded
+            // SDK event carries, so the membership check is exact.
+            let filter_authors = authors.iter().map(PublicKey::to_hex).collect::<Vec<_>>();
+            desired.insert(
+                batch.subscription_id.clone(),
+                DirectorySubscriptionFilter::new(filter_authors, batch.kinds.clone()),
+            );
+            if !to_add.contains(&batch.subscription_id) {
+                continue;
+            }
             let mut filter = Filter::new()
                 .authors(authors)
                 .kinds(kinds)
@@ -430,10 +443,7 @@ impl MarmotRelayPlane {
                 .map_err(|err| format!("directory subscription subscribe: {err}"))?;
         }
 
-        self.inner
-            .directory
-            .replace_subscription_ids(desired_ids)
-            .await
+        self.inner.directory.replace_subscriptions(desired).await
     }
 
     pub async fn shutdown(&self) {
@@ -491,6 +501,7 @@ impl MarmotRelayPlane {
                 sdk_relay_client.clone(),
                 self.inner.transport.adapter.clone(),
                 self.inner.transport.directory_events.clone(),
+                self.inner.directory.clone(),
             ));
         }
         let transport = self.inner.transport.clone();
@@ -582,6 +593,7 @@ fn spawn_relay_notification_forwarder(
     sdk_relay_client: NostrSdkRelayClient,
     adapter: NostrTransportAdapter,
     directory_events: broadcast::Sender<DirectoryRelayEventRecord>,
+    directory: DirectoryRelayPlane,
 ) -> JoinHandle<()> {
     let client = sdk_relay_client.client().clone();
     tokio::spawn(async move {
@@ -589,6 +601,7 @@ fn spawn_relay_notification_forwarder(
             .handle_notifications(move |notification| {
                 let adapter = adapter.clone();
                 let directory_events = directory_events.clone();
+                let directory = directory.clone();
                 async move {
                     match notification {
                         RelayPoolNotification::Event {
@@ -603,16 +616,39 @@ fn spawn_relay_notification_forwarder(
                                     "forwarding SDK relay event"
                                 );
                                 let endpoint = TransportEndpoint(relay_url.to_string());
+                                let subscription_id = subscription_id.to_string();
                                 let relay_event = transport_nostr_adapter::NostrRelayEvent {
                                     endpoint: endpoint.clone(),
-                                    subscription_id: Some(subscription_id.to_string()),
+                                    subscription_id: Some(subscription_id.clone()),
                                     event: event.clone(),
                                 };
+                                // The transport adapter path is unchanged: every
+                                // SDK event still feeds account/group delivery
+                                // and telemetry. Only the directory cache path is
+                                // gated, so an unsolicited or filter-mismatched
+                                // event from a malicious or buggy relay cannot
+                                // create persistent directory search-graph writes
+                                // (darkmatter#709).
                                 let _ = adapter.handle_relay_event(relay_event).await;
-                                let _ = directory_events.send(DirectoryRelayEventRecord {
-                                    endpoints: vec![endpoint],
-                                    event,
-                                });
+                                if directory
+                                    .accepts_live_event(
+                                        &subscription_id,
+                                        &event.pubkey,
+                                        event.kind,
+                                    )
+                                    .await
+                                {
+                                    let _ = directory_events.send(DirectoryRelayEventRecord {
+                                        endpoints: vec![endpoint],
+                                        event,
+                                    });
+                                } else {
+                                    tracing::trace!(
+                                        target: "marmot_app::relay_plane",
+                                        method = "spawn_relay_notification_forwarder",
+                                        "dropping directory relay event: no matching active directory subscription"
+                                    );
+                                }
                             }
                             Ok(false)
                         }
