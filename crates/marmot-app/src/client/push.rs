@@ -16,6 +16,10 @@ impl AppClient {
         if !settings.native_push_enabled {
             return Ok(0);
         }
+        let keys = self
+            .app
+            .account_home()
+            .load_signing_keys(&self.state.label)?;
         let mut shared = 0_usize;
         for group in self.state.groups.clone() {
             let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
@@ -30,6 +34,7 @@ impl AppClient {
                 member_id_hex,
                 leaf_index,
                 &registration,
+                &keys,
             )?;
             self.app.upsert_group_push_token(&account.label, &record)?;
             let content = serde_json::to_string(&payload)?;
@@ -59,16 +64,26 @@ impl AppClient {
         registration: crate::PushRegistration,
     ) -> Result<usize, AppError> {
         let account = self.app.account_home().account(&self.state.label)?;
+        let keys = self
+            .app
+            .account_home()
+            .load_signing_keys(&self.state.label)?;
         let mut removed = 0_usize;
         for group in self.state.groups.clone() {
             let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
                 continue;
             };
             let group_id = GroupId::new(group_id_bytes);
-            let Ok((member_id_hex, _leaf_index)) = self.local_member_leaf(&group_id) else {
+            let Ok((member_id_hex, leaf_index)) = self.local_member_leaf(&group_id) else {
                 continue;
             };
-            let payload = notifications::local_token_removal_payload(member_id_hex, &registration);
+            let (payload, removal_record) = notifications::local_token_removal_payload(
+                &group.group_id_hex,
+                member_id_hex,
+                leaf_index,
+                &registration,
+                &keys,
+            )?;
             let content = serde_json::to_string(&payload)?;
             match self
                 .send_app_event(&group_id, AppMessageIntent::PushTokenRemoval { content })
@@ -83,10 +98,13 @@ impl AppClient {
                     );
                 }
             }
-            self.app.remove_group_push_tokens_for_member(
+            // Tombstone our own record locally with the same owner-signed stamp, so
+            // a later stale kind 448 relaying our pre-removal record cannot
+            // resurrect it.
+            self.app.apply_local_push_removal(
                 &account.label,
                 &group.group_id_hex,
-                &account.account_id_hex,
+                &removal_record,
             )?;
         }
         Ok(removed)

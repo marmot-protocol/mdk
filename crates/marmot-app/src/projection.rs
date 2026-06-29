@@ -1049,6 +1049,11 @@ fn group_push_token_from_row(
         server_pubkey_hex: row.get(5)?,
         relay_hint: row.get(6)?,
         encrypted_token: row.get(7)?,
+        // The legacy projection predates owner authentication. Imported rows
+        // carry a zero stamp and empty signature, so any real owner-signed
+        // gossip (owner_ts > 0) supersedes them and they never re-serve as valid.
+        owner_ts: 0,
+        owner_sig: String::new(),
         updated_at_ms: row.get(8)?,
     })
 }

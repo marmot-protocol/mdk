@@ -91,6 +91,8 @@ fn token_records_by_server_keeps_hintless_records_for_10050_fallback() {
             server_pubkey_hex: server.clone(),
             relay_hint: None,
             encrypted_token: vec![1, 2, 3],
+            owner_ts: 0,
+            owner_sig: String::new(),
             updated_at_ms: 0,
         },
         GroupPushTokenRecord {
@@ -102,6 +104,8 @@ fn token_records_by_server_keeps_hintless_records_for_10050_fallback() {
             server_pubkey_hex: server.clone(),
             relay_hint: Some("wss://hint.example".to_owned()),
             encrypted_token: vec![4, 5, 6],
+            owner_ts: 0,
+            owner_sig: String::new(),
             updated_at_ms: 0,
         },
     ];
@@ -113,14 +117,14 @@ fn token_records_by_server_keeps_hintless_records_for_10050_fallback() {
 #[test]
 fn apns_token_encryption_uses_platform_byte_0x01() {
     let secret = server_secret();
-    let blob = encrypted_mip05_token(
+    let blob = encrypted_push_token(
         PushPlatform::Apns,
         &[0xAA, 0xBB, 0xCC],
         &server_pubkey_hex(&secret),
     )
     .unwrap();
-    assert_eq!(blob.len(), MIP05_ENCRYPTED_TOKEN_LEN);
-    let (platform, token) = decrypt_mip05_token_for_test(&blob, &secret).unwrap();
+    assert_eq!(blob.len(), PUSH_ENCRYPTED_TOKEN_LEN);
+    let (platform, token) = decrypt_push_token_for_test(&blob, &secret).unwrap();
     assert_eq!(platform.platform_byte(), 0x01);
     assert_eq!(token, vec![0xAA, 0xBB, 0xCC]);
 }
@@ -128,29 +132,29 @@ fn apns_token_encryption_uses_platform_byte_0x01() {
 #[test]
 fn fcm_token_encryption_uses_platform_byte_0x02() {
     let secret = server_secret();
-    let blob = encrypted_mip05_token(
+    let blob = encrypted_push_token(
         PushPlatform::Fcm,
         b"opaque-fcm-token",
         &server_pubkey_hex(&secret),
     )
     .unwrap();
-    assert_eq!(blob.len(), MIP05_ENCRYPTED_TOKEN_LEN);
-    let (platform, token) = decrypt_mip05_token_for_test(&blob, &secret).unwrap();
+    assert_eq!(blob.len(), PUSH_ENCRYPTED_TOKEN_LEN);
+    let (platform, token) = decrypt_push_token_for_test(&blob, &secret).unwrap();
     assert_eq!(platform.platform_byte(), 0x02);
     assert_eq!(token, b"opaque-fcm-token");
 }
 
 #[test]
-fn mip05_key_derivation_uses_raw_shared_point_x_coordinate() {
+fn push_key_derivation_uses_raw_shared_point_x_coordinate() {
     let server_secret = SecretKey::from_slice(&[0x11; 32]).unwrap();
     let peer_secret = SecretKey::from_slice(&[0x22; 32]).unwrap();
     let peer_public = SecpPublicKey::from_secret_key_global(&peer_secret);
 
     let shared_x = secp256k1_ecdh_x(&peer_public, &server_secret);
-    let raw_x_key = mip05_encryption_key(&shared_x).unwrap();
+    let raw_x_key = push_encryption_key(&shared_x).unwrap();
 
     let hashed_shared = SharedSecret::new(&peer_public, &server_secret).secret_bytes();
-    let hashed_helper_key = mip05_encryption_key(&hashed_shared).unwrap();
+    let hashed_helper_key = push_encryption_key(&hashed_shared).unwrap();
 
     assert_ne!(raw_x_key, hashed_helper_key);
 }
@@ -180,17 +184,17 @@ fn empty_malformed_or_too_long_tokens_are_rejected_without_secret_material() {
             assert!(!err.to_string().contains(token));
         }
     }
-    let too_long = "x".repeat(MIP05_MAX_PROVIDER_TOKEN_LEN + 1);
+    let too_long = "x".repeat(PUSH_MAX_PROVIDER_TOKEN_LEN + 1);
     let err = parse_provider_token(PushPlatform::Fcm, &too_long).unwrap_err();
     assert!(!err.to_string().contains(&too_long));
 }
 
 #[test]
 fn kind_446_content_is_base64_concatenated_tokens_with_version_tag() {
-    let token = vec![7_u8; MIP05_ENCRYPTED_TOKEN_LEN];
+    let token = vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN];
     let content = build_notification_rumor_content(&[token.clone(), token.clone()]).unwrap();
     let decoded = BASE64_STANDARD.decode(content).unwrap();
-    assert_eq!(decoded.len(), MIP05_ENCRYPTED_TOKEN_LEN * 2);
+    assert_eq!(decoded.len(), PUSH_ENCRYPTED_TOKEN_LEN * 2);
 }
 
 #[tokio::test]
@@ -199,7 +203,7 @@ async fn kind_446_rumor_only_carries_version_tag_and_no_routing_metadata() {
 
     let secret = server_secret();
     let server_pubkey_hex = server_pubkey_hex(&secret);
-    let token = vec![7_u8; MIP05_ENCRYPTED_TOKEN_LEN];
+    let token = vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN];
 
     let wrap = build_notification_gift_wrap(&server_pubkey_hex, &[token.clone(), token])
         .await
@@ -218,18 +222,12 @@ async fn kind_446_rumor_only_carries_version_tag_and_no_routing_metadata() {
     let tag_slices: Vec<&[String]> = rumor.tags.iter().map(|tag| tag.as_slice()).collect();
     assert_eq!(
         tag_slices,
-        vec![
-            [
-                NOTIFICATION_VERSION_TAG.to_owned(),
-                MIP05_VERSION.to_owned()
-            ]
-            .as_slice()
-        ],
+        vec![[NOTIFICATION_VERSION_TAG.to_owned(), PUSH_VERSION.to_owned()].as_slice()],
         "rumor must carry only the version tag; any p/e/k/h/d/relays tag would leak routing metadata"
     );
 
     let decoded = BASE64_STANDARD.decode(&rumor.content).unwrap();
-    assert_eq!(decoded.len(), MIP05_ENCRYPTED_TOKEN_LEN * 2);
+    assert_eq!(decoded.len(), PUSH_ENCRYPTED_TOKEN_LEN * 2);
 }
 
 #[test]
@@ -632,5 +630,184 @@ fn push_platform_from_str_is_lowercase_only() {
             PushPlatform::from_str(bad).is_err(),
             "case/whitespace variant {bad:?} must be rejected"
         );
+    }
+}
+
+// ---- Owner-authenticated token gossip (spec: "Owner authentication") ----
+
+fn signed_token_record(
+    keys: &Keys,
+    group_id_hex: &str,
+    leaf_index: u32,
+    server_pubkey_hex: &str,
+    owner_ts: i64,
+) -> GroupPushTokenRecord {
+    let mut record = GroupPushTokenRecord {
+        group_id_hex: group_id_hex.to_owned(),
+        member_id_hex: keys.public_key().to_hex(),
+        leaf_index,
+        platform: PushPlatform::Apns,
+        // Vary the fingerprint by stamp so distinct records get distinct digests.
+        token_fingerprint: push_token_fingerprint(PushPlatform::Apns, &owner_ts.to_be_bytes()),
+        server_pubkey_hex: server_pubkey_hex.to_owned(),
+        relay_hint: Some("wss://relay.example".to_owned()),
+        encrypted_token: vec![0_u8; PUSH_ENCRYPTED_TOKEN_LEN],
+        owner_ts,
+        owner_sig: String::new(),
+        updated_at_ms: owner_ts,
+    };
+    record.sign_owner(keys).unwrap();
+    record
+}
+
+fn signed_removal_record(
+    keys: &Keys,
+    group_id_hex: &str,
+    leaf_index: u32,
+    server_pubkey_hex: &str,
+    owner_ts: i64,
+) -> PushTokenRemovalRecord {
+    let mut record = PushTokenRemovalRecord {
+        member_id_hex: keys.public_key().to_hex(),
+        leaf_index,
+        platform: PushPlatform::Apns,
+        token_fingerprint: push_token_fingerprint(PushPlatform::Apns, &[1, 2, 3]),
+        server_pubkey_hex: server_pubkey_hex.to_owned(),
+        owner_ts,
+        owner_sig: String::new(),
+    };
+    record.sign_owner(group_id_hex, keys).unwrap();
+    record
+}
+
+#[test]
+fn verify_keeps_owner_signed_self_update() {
+    let keys = Keys::generate();
+    let group = "ee".repeat(32);
+    let record = signed_token_record(&keys, &group, 1, &"dd".repeat(32), 100);
+    let action = verify_push_gossip(
+        PushGossipAction::Upsert(vec![record.clone()]),
+        &group,
+        &[keys.public_key().to_hex()],
+    );
+    assert_eq!(action, PushGossipAction::Upsert(vec![record]));
+}
+
+#[test]
+fn verify_keeps_transitively_relayed_record_from_other_member() {
+    // A record owned and signed by B, relayed in a kind 448 by C. verify never
+    // consults the carrying sender, so B's record applies (offline-member
+    // bootstrap) as long as B is a current member.
+    let b = Keys::generate();
+    let c_id = Keys::generate().public_key().to_hex();
+    let group = "ee".repeat(32);
+    let record = signed_token_record(&b, &group, 2, &"dd".repeat(32), 100);
+    let action = verify_push_gossip(
+        PushGossipAction::Upsert(vec![record.clone()]),
+        &group,
+        &[b.public_key().to_hex(), c_id],
+    );
+    assert_eq!(action, PushGossipAction::Upsert(vec![record]));
+}
+
+#[test]
+fn verify_drops_forged_record_for_other_member() {
+    // Attacker A signs a record, then relabels it as victim B. B's signature is
+    // absent, so it is dropped even though B is a current member.
+    let attacker = Keys::generate();
+    let victim = Keys::generate();
+    let group = "ee".repeat(32);
+    let mut record = signed_token_record(&attacker, &group, 1, &"dd".repeat(32), 100);
+    record.member_id_hex = victim.public_key().to_hex();
+    let action = verify_push_gossip(
+        PushGossipAction::Upsert(vec![record]),
+        &group,
+        &[victim.public_key().to_hex(), attacker.public_key().to_hex()],
+    );
+    assert_eq!(action, PushGossipAction::Upsert(vec![]));
+}
+
+#[test]
+fn verify_drops_validly_signed_record_for_non_member() {
+    let keys = Keys::generate();
+    let group = "ee".repeat(32);
+    let record = signed_token_record(&keys, &group, 1, &"dd".repeat(32), 100);
+    let action = verify_push_gossip(
+        PushGossipAction::Upsert(vec![record]),
+        &group,
+        &["bb".repeat(32)],
+    );
+    assert_eq!(action, PushGossipAction::Upsert(vec![]));
+}
+
+#[test]
+fn verify_drops_record_signed_for_a_different_group() {
+    // group_id is bound into the signature: a record signed for X must not verify
+    // when relabeled and presented under Y.
+    let keys = Keys::generate();
+    let group_x = "11".repeat(32);
+    let group_y = "22".repeat(32);
+    let mut record = signed_token_record(&keys, &group_x, 1, &"dd".repeat(32), 100);
+    record.group_id_hex = group_y.clone();
+    let action = verify_push_gossip(
+        PushGossipAction::Upsert(vec![record]),
+        &group_y,
+        &[keys.public_key().to_hex()],
+    );
+    assert_eq!(action, PushGossipAction::Upsert(vec![]));
+}
+
+#[test]
+fn verify_drops_record_with_repointed_server() {
+    // server_pubkey is bound into the signature: repointing it after signing
+    // invalidates the record, so a relayer cannot redirect push routing.
+    let keys = Keys::generate();
+    let group = "ee".repeat(32);
+    let mut record = signed_token_record(&keys, &group, 1, &"dd".repeat(32), 100);
+    record.server_pubkey_hex = "cc".repeat(32);
+    let action = verify_push_gossip(
+        PushGossipAction::Upsert(vec![record]),
+        &group,
+        &[keys.public_key().to_hex()],
+    );
+    assert_eq!(action, PushGossipAction::Upsert(vec![]));
+}
+
+#[test]
+fn verify_keeps_owner_signed_removal_and_drops_forged() {
+    let owner = Keys::generate();
+    let attacker = Keys::generate();
+    let group = "ee".repeat(32);
+    let good = signed_removal_record(&owner, &group, 1, &"dd".repeat(32), 100);
+    let mut forged = signed_removal_record(&attacker, &group, 1, &"dd".repeat(32), 100);
+    forged.member_id_hex = owner.public_key().to_hex();
+    let action = verify_push_gossip(
+        PushGossipAction::Remove(vec![good.clone(), forged]),
+        &group,
+        &[owner.public_key().to_hex(), attacker.public_key().to_hex()],
+    );
+    assert_eq!(action, PushGossipAction::Remove(vec![good]));
+}
+
+#[test]
+fn signed_record_survives_wire_round_trip_and_verifies() {
+    // from_record -> JSON content -> parse_push_gossip -> verify, end to end.
+    let keys = Keys::generate();
+    let group = "ee".repeat(32);
+    let record = signed_token_record(&keys, &group, 3, &"dd".repeat(32), 100);
+    let payload = PushTokenGossipPayload {
+        v: PUSH_VERSION.to_owned(),
+        tokens: vec![PushTokenGossipEntry::from_record(&record)],
+    };
+    let content = serde_json::to_string(&payload).unwrap();
+    let action =
+        parse_push_gossip(MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, &group, &content).unwrap();
+    let verified = verify_push_gossip(action, &group, &[keys.public_key().to_hex()]);
+    match verified {
+        PushGossipAction::Upsert(records) => {
+            assert_eq!(records.len(), 1);
+            assert!(records[0].verify_owner_sig());
+        }
+        other => panic!("expected upsert, got {other:?}"),
     }
 }

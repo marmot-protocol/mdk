@@ -99,6 +99,13 @@ pub struct AccountGroupPushToken {
     pub server_pubkey_hex: String,
     pub relay_hint: Option<String>,
     pub encrypted_token: Vec<u8>,
+    /// Owner-signed millisecond ordering stamp (high half of the primitive).
+    pub owner_ts: i64,
+    /// 128-hex BIP-340 signature by `member_id_hex` over the canonical record.
+    pub owner_sig: String,
+    /// `SHA-256(SignedRecord)` hex — the ordering tie-breaker. Stored so the
+    /// engine-free storage layer can compare stamps without the crypto code.
+    pub record_digest: String,
     pub updated_at_ms: i64,
 }
 
@@ -389,6 +396,7 @@ impl SqliteAccountStorage {
                 "chat_list_rows",
                 "account_group_app_components",
                 "group_push_tokens",
+                "group_push_token_tombstones",
                 "encrypted_media_epoch_secrets",
                 "account_groups",
             ] {
@@ -755,35 +763,170 @@ impl SqliteAccountStorage {
         Ok(existing)
     }
 
+    /// Unconditional upsert keyed on `(group, member, leaf, platform, server)`.
+    /// Used for the local account's own self-update (always its newest token) and
+    /// legacy import. Inbound gossip from other members goes through
+    /// [`Self::apply_group_push_token`], which enforces the ordering primitive and
+    /// tombstones.
     pub fn upsert_group_push_token(&self, token: &AccountGroupPushToken) -> StorageResult<()> {
-        self.lock()?
-            .execute(
-                "INSERT INTO group_push_tokens (
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO group_push_tokens (
                     group_id_hex, member_id_hex, leaf_index, platform, token_fingerprint,
-                    server_pubkey_hex, relay_hint, encrypted_token, updated_at_ms
+                    server_pubkey_hex, relay_hint, encrypted_token, owner_ts, owner_sig,
+                    record_digest, updated_at_ms
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(group_id_hex, member_id_hex, platform, server_pubkey_hex)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex)
                  DO UPDATE SET
-                    leaf_index = excluded.leaf_index,
                     token_fingerprint = excluded.token_fingerprint,
                     relay_hint = excluded.relay_hint,
                     encrypted_token = excluded.encrypted_token,
+                    owner_ts = excluded.owner_ts,
+                    owner_sig = excluded.owner_sig,
+                    record_digest = excluded.record_digest,
                     updated_at_ms = excluded.updated_at_ms",
-                params![
-                    &token.group_id_hex,
-                    &token.member_id_hex,
-                    u32_to_i64(token.leaf_index),
-                    i64::from(token.platform),
-                    &token.token_fingerprint,
-                    &token.server_pubkey_hex,
-                    &token.relay_hint,
-                    &token.encrypted_token,
-                    token.updated_at_ms,
-                ],
-            )
-            .storage()?;
+            params![
+                &token.group_id_hex,
+                &token.member_id_hex,
+                u32_to_i64(token.leaf_index),
+                i64::from(token.platform),
+                &token.token_fingerprint,
+                &token.server_pubkey_hex,
+                &token.relay_hint,
+                &token.encrypted_token,
+                token.owner_ts,
+                &token.owner_sig,
+                &token.record_digest,
+                token.updated_at_ms,
+            ],
+        )
+        .storage()?;
         Ok(())
+    }
+
+    /// Apply an owner-verified inbound token record under the spec's ordering
+    /// primitive: store it only when its `(owner_ts, record_digest)` stamp is
+    /// strictly greater than both the existing live record and any tombstone for
+    /// the same record key, and clear the tombstone when it does. Returns whether
+    /// the record was applied. Callers verify `owner_sig` and group membership
+    /// before calling.
+    pub fn apply_group_push_token(&self, token: &AccountGroupPushToken) -> StorageResult<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let incoming = (token.owner_ts, token.record_digest.as_str());
+        let key = PushTokenKey {
+            group_id_hex: &token.group_id_hex,
+            member_id_hex: &token.member_id_hex,
+            leaf_index: token.leaf_index,
+            platform: token.platform,
+            server_pubkey_hex: &token.server_pubkey_hex,
+        };
+        let tombstone = read_push_tombstone_stamp(&tx, key)?;
+        let live = read_push_token_stamp(&tx, key)?;
+        let strictly_newer = |stored: &Option<(i64, String)>| {
+            push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
+        };
+        if !strictly_newer(&tombstone) || !strictly_newer(&live) {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO group_push_tokens (
+                    group_id_hex, member_id_hex, leaf_index, platform, token_fingerprint,
+                    server_pubkey_hex, relay_hint, encrypted_token, owner_ts, owner_sig,
+                    record_digest, updated_at_ms
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex)
+                 DO UPDATE SET
+                    token_fingerprint = excluded.token_fingerprint,
+                    relay_hint = excluded.relay_hint,
+                    encrypted_token = excluded.encrypted_token,
+                    owner_ts = excluded.owner_ts,
+                    owner_sig = excluded.owner_sig,
+                    record_digest = excluded.record_digest,
+                    updated_at_ms = excluded.updated_at_ms",
+            params![
+                &token.group_id_hex,
+                &token.member_id_hex,
+                u32_to_i64(token.leaf_index),
+                i64::from(token.platform),
+                &token.token_fingerprint,
+                &token.server_pubkey_hex,
+                &token.relay_hint,
+                &token.encrypted_token,
+                token.owner_ts,
+                &token.owner_sig,
+                &token.record_digest,
+                token.updated_at_ms,
+            ],
+        )
+        .storage()?;
+        delete_push_tombstone(&tx, key)?;
+        tx.commit().storage()?;
+        Ok(true)
+    }
+
+    /// Apply an owner-verified removal: when its `(owner_ts, record_digest)` stamp
+    /// is strictly greater than both the live record and any existing tombstone
+    /// for the key, delete the live record and write/refresh the durable
+    /// tombstone. Returns whether the removal was applied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_group_push_token_tombstone(
+        &self,
+        group_id_hex: &str,
+        member_id_hex: &str,
+        leaf_index: u32,
+        platform: u8,
+        server_pubkey_hex: &str,
+        owner_ts: i64,
+        record_digest: &str,
+        created_at_ms: i64,
+    ) -> StorageResult<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let incoming = (owner_ts, record_digest);
+        let key = PushTokenKey {
+            group_id_hex,
+            member_id_hex,
+            leaf_index,
+            platform,
+            server_pubkey_hex,
+        };
+        let tombstone = read_push_tombstone_stamp(&tx, key)?;
+        let live = read_push_token_stamp(&tx, key)?;
+        let strictly_newer = |stored: &Option<(i64, String)>| {
+            push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
+        };
+        if !strictly_newer(&tombstone) || !strictly_newer(&live) {
+            return Ok(false);
+        }
+        delete_push_token(&tx, key)?;
+        tx.execute(
+            "INSERT INTO group_push_token_tombstones (
+                    group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex,
+                    owner_ts, record_digest, created_at_ms
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex)
+                 DO UPDATE SET
+                    owner_ts = excluded.owner_ts,
+                    record_digest = excluded.record_digest,
+                    created_at_ms = excluded.created_at_ms",
+            params![
+                group_id_hex,
+                member_id_hex,
+                u32_to_i64(leaf_index),
+                i64::from(platform),
+                server_pubkey_hex,
+                owner_ts,
+                record_digest,
+                created_at_ms,
+            ],
+        )
+        .storage()?;
+        tx.commit().storage()?;
+        Ok(true)
     }
 
     pub fn group_push_tokens(
@@ -795,10 +938,10 @@ impl SqliteAccountStorage {
             .prepare(
                 "SELECT group_id_hex, member_id_hex, leaf_index, platform,
                         token_fingerprint, server_pubkey_hex, relay_hint,
-                        encrypted_token, updated_at_ms
+                        encrypted_token, owner_ts, owner_sig, record_digest, updated_at_ms
                  FROM group_push_tokens
                  WHERE group_id_hex = ?1
-                 ORDER BY member_id_hex, platform, server_pubkey_hex",
+                 ORDER BY member_id_hex, leaf_index, platform, server_pubkey_hex",
             )
             .storage()?;
         statement
@@ -836,19 +979,32 @@ impl SqliteAccountStorage {
         Ok(())
     }
 
+    /// Local cleanup when a member leaves the group: drop every live record and
+    /// every tombstone for that member, per the spec's member-cleanup rule. The
+    /// member is gone, so no relayed record for them can ever verify against
+    /// current membership again, which is why the durable tombstones are safe to
+    /// clear here (and only here).
     pub fn remove_group_push_tokens_for_member(
         &self,
         group_id_hex: &str,
         member_id_hex: &str,
     ) -> StorageResult<()> {
-        self.lock()?
-            .execute(
+        self.connection.with_transaction(|| -> StorageResult<()> {
+            let conn = self.lock()?;
+            conn.execute(
                 "DELETE FROM group_push_tokens
                  WHERE group_id_hex = ?1 AND member_id_hex = ?2",
                 params![group_id_hex, member_id_hex],
             )
             .storage()?;
-        Ok(())
+            conn.execute(
+                "DELETE FROM group_push_token_tombstones
+                 WHERE group_id_hex = ?1 AND member_id_hex = ?2",
+                params![group_id_hex, member_id_hex],
+            )
+            .storage()?;
+            Ok(())
+        })
     }
 
     pub fn remove_stale_group_push_tokens(
@@ -856,29 +1012,50 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         active_members: &[String],
     ) -> StorageResult<usize> {
-        if active_members.is_empty() {
-            return self
-                .lock()?
-                .execute(
-                    "DELETE FROM group_push_tokens WHERE group_id_hex = ?1",
-                    params![group_id_hex],
+        self.connection
+            .with_transaction(|| -> StorageResult<usize> {
+                let conn = self.lock()?;
+                if active_members.is_empty() {
+                    conn.execute(
+                        "DELETE FROM group_push_token_tombstones WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                    )
+                    .storage()?;
+                    return conn
+                        .execute(
+                            "DELETE FROM group_push_tokens WHERE group_id_hex = ?1",
+                            params![group_id_hex],
+                        )
+                        .storage();
+                }
+                let placeholders = std::iter::repeat_n("?", active_members.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut values = Vec::with_capacity(active_members.len() + 1);
+                values.push(Value::Text(group_id_hex.to_owned()));
+                values.extend(active_members.iter().cloned().map(Value::Text));
+                // Clear tombstones for departed members too: once a member is gone, no
+                // relayed record for them can verify against current membership, so their
+                // tombstones are no longer load-bearing.
+                conn.execute(
+                    &format!(
+                        "DELETE FROM group_push_token_tombstones
+                 WHERE group_id_hex = ?
+                   AND member_id_hex NOT IN ({placeholders})"
+                    ),
+                    params_from_iter(values.iter()),
                 )
-                .storage();
-        }
-        let placeholders = std::iter::repeat_n("?", active_members.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "DELETE FROM group_push_tokens
-             WHERE group_id_hex = ?
-               AND member_id_hex NOT IN ({placeholders})"
-        );
-        let mut values = Vec::with_capacity(active_members.len() + 1);
-        values.push(Value::Text(group_id_hex.to_owned()));
-        values.extend(active_members.iter().cloned().map(Value::Text));
-        self.lock()?
-            .execute(&sql, params_from_iter(values.iter()))
-            .storage()
+                .storage()?;
+                conn.execute(
+                    &format!(
+                        "DELETE FROM group_push_tokens
+                 WHERE group_id_hex = ?
+                   AND member_id_hex NOT IN ({placeholders})"
+                    ),
+                    params_from_iter(values.iter()),
+                )
+                .storage()
+            })
     }
 
     fn ensure_notification_settings(
@@ -1053,8 +1230,111 @@ fn group_push_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Accoun
         server_pubkey_hex: row.get(5)?,
         relay_hint: row.get(6)?,
         encrypted_token: row.get(7)?,
-        updated_at_ms: row.get(8)?,
+        owner_ts: row.get(8)?,
+        owner_sig: row.get(9)?,
+        record_digest: row.get(10)?,
+        updated_at_ms: row.get(11)?,
     })
+}
+
+/// Identifies one push record key `(group, member, leaf, platform, server)`,
+/// shared by the live `group_push_tokens` table and the tombstone table.
+#[derive(Clone, Copy)]
+struct PushTokenKey<'a> {
+    group_id_hex: &'a str,
+    member_id_hex: &'a str,
+    leaf_index: u32,
+    platform: u8,
+    server_pubkey_hex: &'a str,
+}
+
+/// True when `incoming` is strictly greater than `stored` under the
+/// `(owner_ts, record_digest)` ordering primitive (and always when there is no
+/// stored stamp).
+fn push_stamp_strictly_newer(incoming: (i64, &str), stored: Option<(i64, &str)>) -> bool {
+    match stored {
+        None => true,
+        Some((ts, digest)) => incoming.0 > ts || (incoming.0 == ts && incoming.1 > digest),
+    }
+}
+
+fn read_push_token_stamp(
+    tx: &rusqlite::Transaction<'_>,
+    key: PushTokenKey<'_>,
+) -> StorageResult<Option<(i64, String)>> {
+    tx.query_row(
+        "SELECT owner_ts, record_digest FROM group_push_tokens
+         WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3
+           AND platform = ?4 AND server_pubkey_hex = ?5",
+        params![
+            key.group_id_hex,
+            key.member_id_hex,
+            u32_to_i64(key.leaf_index),
+            i64::from(key.platform),
+            key.server_pubkey_hex,
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .storage()
+}
+
+fn read_push_tombstone_stamp(
+    tx: &rusqlite::Transaction<'_>,
+    key: PushTokenKey<'_>,
+) -> StorageResult<Option<(i64, String)>> {
+    tx.query_row(
+        "SELECT owner_ts, record_digest FROM group_push_token_tombstones
+         WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3
+           AND platform = ?4 AND server_pubkey_hex = ?5",
+        params![
+            key.group_id_hex,
+            key.member_id_hex,
+            u32_to_i64(key.leaf_index),
+            i64::from(key.platform),
+            key.server_pubkey_hex,
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .storage()
+}
+
+fn delete_push_token(tx: &rusqlite::Transaction<'_>, key: PushTokenKey<'_>) -> StorageResult<()> {
+    tx.execute(
+        "DELETE FROM group_push_tokens
+         WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3
+           AND platform = ?4 AND server_pubkey_hex = ?5",
+        params![
+            key.group_id_hex,
+            key.member_id_hex,
+            u32_to_i64(key.leaf_index),
+            i64::from(key.platform),
+            key.server_pubkey_hex,
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
+fn delete_push_tombstone(
+    tx: &rusqlite::Transaction<'_>,
+    key: PushTokenKey<'_>,
+) -> StorageResult<()> {
+    tx.execute(
+        "DELETE FROM group_push_token_tombstones
+         WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3
+           AND platform = ?4 AND server_pubkey_hex = ?5",
+        params![
+            key.group_id_hex,
+            key.member_id_hex,
+            u32_to_i64(key.leaf_index),
+            i64::from(key.platform),
+            key.server_pubkey_hex,
+        ],
+    )
+    .storage()?;
+    Ok(())
 }
 
 fn u32_to_i64(value: u32) -> i64 {

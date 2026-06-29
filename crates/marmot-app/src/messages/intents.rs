@@ -519,12 +519,12 @@ pub(crate) fn build_inner_event(
         }
         AppMessageIntent::PushTokenUpdate { content } => Ok(event(
             MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
-            vec![vec!["v".to_owned(), crate::MIP05_VERSION.to_owned()]],
+            vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
             content.clone(),
         )),
         AppMessageIntent::PushTokenRemoval { content } => Ok(event(
             MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
-            vec![vec!["v".to_owned(), crate::MIP05_VERSION.to_owned()]],
+            vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
             content.clone(),
         )),
     }

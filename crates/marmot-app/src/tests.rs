@@ -1057,6 +1057,8 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             server_pubkey_hex: "bb".repeat(32),
             relay_hint: None,
             encrypted_token: vec![9, 8, 7],
+            owner_ts: 0,
+            owner_sig: String::new(),
             updated_at_ms: 12,
         })
         .unwrap();
@@ -1089,6 +1091,104 @@ fn legacy_account_projection_imports_once_into_account_storage() {
         })
         .unwrap();
     assert_eq!(app.messages("alice").unwrap().len(), 1);
+}
+
+#[test]
+fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
+    use nostr::base64::Engine as _;
+    use nostr::base64::engine::general_purpose::STANDARD as B64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    // Marmot MLS group ids are 16 bytes (variable-length in general); use that
+    // here so the canonical-encoding length prefix is exercised realistically.
+    let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let owner = nostr::Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let relayer = nostr::Keys::generate().public_key().to_hex();
+
+    // Build a token gossip `content` whose record is signed by `signer` but
+    // claims `claimed_owner`. For an honest record the two match; for a spoof the
+    // attacker signs while naming the victim.
+    let gossip_content = |signer: &nostr::Keys, claimed_owner: &str, owner_ts: i64| -> String {
+        let mut record = GroupPushTokenRecord {
+            group_id_hex: group_id_hex.clone(),
+            member_id_hex: signer.public_key().to_hex(),
+            leaf_index: 1,
+            platform: PushPlatform::Apns,
+            token_fingerprint: crate::notifications::push_token_fingerprint(
+                PushPlatform::Apns,
+                &owner_ts.to_be_bytes(),
+            ),
+            server_pubkey_hex: "dd".repeat(32),
+            relay_hint: Some("wss://relay.example".to_owned()),
+            encrypted_token: vec![0_u8; crate::notifications::PUSH_ENCRYPTED_TOKEN_LEN],
+            owner_ts,
+            owner_sig: String::new(),
+            updated_at_ms: owner_ts,
+        };
+        record.sign_owner(signer).unwrap();
+        serde_json::json!({
+            "v": "marmot-push-v1",
+            "tokens": [{
+                "member_id_hex": claimed_owner,
+                "leaf_index": record.leaf_index,
+                "platform": "apns",
+                "token_fingerprint": record.token_fingerprint,
+                "server_pubkey_hex": record.server_pubkey_hex,
+                "relay_hint": record.relay_hint,
+                "encrypted_token": B64.encode(&record.encrypted_token),
+                "owner_ts": record.owner_ts,
+                "owner_sig": record.owner_sig,
+            }]
+        })
+        .to_string()
+    };
+
+    let message = |content: String, sender: &str| ReceivedMessage {
+        message_id_hex: "11".repeat(32),
+        source_message_id_hex: "22".repeat(32),
+        sender: sender.to_owned(),
+        sender_display_name: None,
+        group_id: group_id.clone(),
+        source_epoch: 1,
+        plaintext: content,
+        kind: crate::notifications::MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        tags: vec![vec!["v".to_owned(), "marmot-push-v1".to_owned()]],
+        recorded_at: 1,
+    };
+
+    // Transitive list response: the owner's own-signed record, relayed by another
+    // member, is applied even though `message.sender` is not the owner.
+    let honest = gossip_content(&owner, &owner_id, 1000);
+    app.ingest_push_gossip_message(
+        "alice",
+        &message(honest, &relayer),
+        &[owner_id.clone(), relayer.clone()],
+    )
+    .unwrap();
+    let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
+    assert_eq!(stored.len(), 1, "owner-signed transitive record applies");
+    assert_eq!(stored[0].member_id_hex, owner_id);
+
+    // Spoof: an attacker (a current member) signs a record but names the victim
+    // as owner, with a strictly-newer stamp. Only the signature check can stop it
+    // — and does, so the victim's record is untouched.
+    let attacker = nostr::Keys::generate();
+    let spoof = gossip_content(&attacker, &owner_id, 2000);
+    app.ingest_push_gossip_message(
+        "alice",
+        &message(spoof, &relayer),
+        &[owner_id.clone(), relayer, attacker.public_key().to_hex()],
+    )
+    .unwrap();
+    let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
+    assert_eq!(stored.len(), 1, "spoofed record is dropped");
+    assert_eq!(stored[0].owner_ts, 1000, "victim's original stamp survives");
 }
 
 #[test]

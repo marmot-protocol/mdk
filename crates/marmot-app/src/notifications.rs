@@ -10,7 +10,10 @@ use nostr::{
     EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, UnsignedEvent,
     base64::Engine as _,
     base64::engine::general_purpose::STANDARD as BASE64_STANDARD,
-    secp256k1::{Parity, PublicKey as SecpPublicKey, SecretKey, XOnlyPublicKey, ecdh},
+    secp256k1::{
+        Message, Parity, PublicKey as SecpPublicKey, SECP256K1, SecretKey, XOnlyPublicKey, ecdh,
+        schnorr::Signature as SchnorrSignature,
+    },
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -33,13 +36,18 @@ pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST: u64 = 448;
 pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL: u64 = 449;
 pub const KIND_MARMOT_NOTIFICATION_RUMOR: u64 = 446;
 pub const KIND_MARMOT_NOTIFICATION_SERVER_RELAYS: u64 = 10050;
-pub const MIP05_VERSION: &str = "mip05-v1";
-pub const MIP05_ENCRYPTED_TOKEN_LEN: usize = 1084;
-const MIP05_TOKEN_PLAINTEXT_LEN: usize = 1024;
-const MIP05_MAX_PROVIDER_TOKEN_LEN: usize = MIP05_TOKEN_PLAINTEXT_LEN - 3;
-const MIP05_CIPHERTEXT_LEN: usize = MIP05_TOKEN_PLAINTEXT_LEN + 16;
-const MIP05_HKDF_SALT: &[u8] = b"mip05-v1";
-const MIP05_HKDF_INFO: &[u8] = b"mip05-token-encryption";
+pub const PUSH_VERSION: &str = "marmot-push-v1";
+pub const PUSH_ENCRYPTED_TOKEN_LEN: usize = 1084;
+const PUSH_TOKEN_PLAINTEXT_LEN: usize = 1024;
+const PUSH_MAX_PROVIDER_TOKEN_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN - 3;
+const PUSH_CIPHERTEXT_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN + 16;
+const PUSH_HKDF_SALT: &[u8] = b"marmot-push-token-v1";
+const PUSH_HKDF_INFO: &[u8] = b"marmot-push-token-encryption";
+/// Owner-signature domain tags from the push-notifications spec's "Owner
+/// authentication" section. Token entries (447/448) and removals (449) sign
+/// distinct preimages so a signature cannot be cross-applied between them.
+const PUSH_RECORD_DOMAIN: &[u8] = b"marmot-push-token-record-v1";
+const PUSH_REMOVAL_DOMAIN: &[u8] = b"marmot-push-token-removal-v1";
 const NOTIFICATION_VERSION_TAG: &str = "v";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -147,6 +155,12 @@ pub struct GroupPushTokenRecord {
     pub server_pubkey_hex: String,
     pub relay_hint: Option<String>,
     pub encrypted_token: Vec<u8>,
+    /// Owner-signed millisecond stamp; the high half of the `(owner_ts, digest)`
+    /// ordering primitive. Distinct from `updated_at_ms` (local receive time).
+    pub owner_ts: i64,
+    /// 64-byte BIP-340 Schnorr signature (128 lowercase hex) by `member_id_hex`
+    /// over the canonical `SignedRecord`. See `push_record_signing_digest`.
+    pub owner_sig: String,
     pub updated_at_ms: i64,
 }
 
@@ -248,6 +262,8 @@ pub(crate) struct PushTokenGossipEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_hint: Option<String>,
     pub encrypted_token: String,
+    pub owner_ts: i64,
+    pub owner_sig: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,9 +276,12 @@ pub(crate) struct PushTokenRemovalPayload {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PushTokenRemovalEntry {
     pub member_id_hex: String,
+    pub leaf_index: u32,
     pub platform: String,
     pub token_fingerprint: String,
     pub server_pubkey_hex: String,
+    pub owner_ts: i64,
+    pub owner_sig: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,9 +293,12 @@ pub(crate) enum PushGossipAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PushTokenRemovalRecord {
     pub member_id_hex: String,
+    pub leaf_index: u32,
     pub platform: PushPlatform,
     pub token_fingerprint: String,
     pub server_pubkey_hex: String,
+    pub owner_ts: i64,
+    pub owner_sig: String,
 }
 
 pub fn parse_provider_token(platform: PushPlatform, raw_token: &str) -> Result<Vec<u8>, AppError> {
@@ -309,9 +331,9 @@ fn validate_provider_token_len(token: &[u8]) -> Result<(), AppError> {
             "push token must not be empty".into(),
         ));
     }
-    if token.len() > MIP05_MAX_PROVIDER_TOKEN_LEN {
+    if token.len() > PUSH_MAX_PROVIDER_TOKEN_LEN {
         return Err(AppError::InvalidPushToken(
-            "push token is too long for mip05-v1".into(),
+            "push token is too long for marmot-push-v1".into(),
         ));
     }
     Ok(())
@@ -325,7 +347,7 @@ pub fn push_token_fingerprint(platform: PushPlatform, token_bytes: &[u8]) -> Str
     format!("sha256:{}", &digest[..24])
 }
 
-pub fn encrypted_mip05_token(
+pub fn encrypted_push_token(
     platform: PushPlatform,
     token_bytes: &[u8],
     server_pubkey_hex: &str,
@@ -347,12 +369,13 @@ pub fn encrypted_mip05_token(
     let ephemeral_pubkey = SecpPublicKey::from_secret_key_global(&ephemeral_secret);
     let (ephemeral_xonly, _) = ephemeral_pubkey.x_only_public_key();
     let shared_x = secp256k1_ecdh_x(&server_pubkey, &ephemeral_secret);
-    let key = mip05_encryption_key(&shared_x)?;
+    let key = push_encryption_key(&shared_x)?;
 
-    let mut plaintext = [0_u8; MIP05_TOKEN_PLAINTEXT_LEN];
+    let mut plaintext = [0_u8; PUSH_TOKEN_PLAINTEXT_LEN];
     plaintext[0] = platform.platform_byte();
-    let token_len = u16::try_from(token_bytes.len())
-        .map_err(|_| AppError::InvalidPushToken("push token is too long for mip05-v1".into()))?;
+    let token_len = u16::try_from(token_bytes.len()).map_err(|_| {
+        AppError::InvalidPushToken("push token is too long for marmot-push-v1".into())
+    })?;
     plaintext[1..3].copy_from_slice(&token_len.to_be_bytes());
     plaintext[3..3 + token_bytes.len()].copy_from_slice(token_bytes);
     OsRng.fill_bytes(&mut plaintext[3 + token_bytes.len()..]);
@@ -360,7 +383,7 @@ pub fn encrypted_mip05_token(
     let mut nonce = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|_| AppError::InvalidPushToken("mip05-v1 key setup failed".into()))?;
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 key setup failed".into()))?;
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -369,18 +392,18 @@ pub fn encrypted_mip05_token(
                 aad: &[],
             },
         )
-        .map_err(|_| AppError::InvalidPushToken("mip05-v1 token encryption failed".into()))?;
-    if ciphertext.len() != MIP05_CIPHERTEXT_LEN {
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 token encryption failed".into()))?;
+    if ciphertext.len() != PUSH_CIPHERTEXT_LEN {
         return Err(AppError::InvalidPushToken(
-            "mip05-v1 token encryption produced invalid length".into(),
+            "marmot-push-v1 token encryption produced invalid length".into(),
         ));
     }
 
-    let mut out = Vec::with_capacity(MIP05_ENCRYPTED_TOKEN_LEN);
+    let mut out = Vec::with_capacity(PUSH_ENCRYPTED_TOKEN_LEN);
     out.extend_from_slice(&ephemeral_xonly.serialize());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
-    debug_assert_eq!(out.len(), MIP05_ENCRYPTED_TOKEN_LEN);
+    debug_assert_eq!(out.len(), PUSH_ENCRYPTED_TOKEN_LEN);
     Ok(out)
 }
 
@@ -401,25 +424,218 @@ fn secp256k1_ecdh_x(point: &SecpPublicKey, scalar: &SecretKey) -> [u8; 32] {
         .expect("shared point X coordinate is 32 bytes")
 }
 
-fn mip05_encryption_key(shared_x: &[u8; 32]) -> Result<[u8; 32], AppError> {
-    let hkdf = Hkdf::<Sha256>::new(Some(MIP05_HKDF_SALT), shared_x);
+fn push_encryption_key(shared_x: &[u8; 32]) -> Result<[u8; 32], AppError> {
+    let hkdf = Hkdf::<Sha256>::new(Some(PUSH_HKDF_SALT), shared_x);
     let mut key = [0_u8; 32];
-    hkdf.expand(MIP05_HKDF_INFO, &mut key)
-        .map_err(|_| AppError::InvalidPushToken("mip05-v1 token key derivation failed".into()))?;
+    hkdf.expand(PUSH_HKDF_INFO, &mut key).map_err(|_| {
+        AppError::InvalidPushToken("marmot-push-v1 token key derivation failed".into())
+    })?;
     Ok(key)
+}
+
+fn validate_owner_sig_hex(owner_sig: &str) -> Result<(), AppError> {
+    let decoded = hex::decode(owner_sig).map_err(|_| {
+        AppError::InvalidPushGossip("owner_sig must be 64-byte lowercase hex".into())
+    })?;
+    if decoded.len() != 64 || owner_sig.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(AppError::InvalidPushGossip(
+            "owner_sig must be 64-byte lowercase hex".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The 12 raw bytes that a `sha256:`-prefixed token fingerprint encodes.
+fn fingerprint_bytes(token_fingerprint: &str) -> Result<[u8; 12], AppError> {
+    let hex_part = token_fingerprint.strip_prefix("sha256:").ok_or_else(|| {
+        AppError::InvalidPushGossip("token fingerprint must start with sha256:".into())
+    })?;
+    let decoded = hex::decode(hex_part)
+        .map_err(|_| AppError::InvalidPushGossip("token fingerprint must be hex".into()))?;
+    decoded
+        .try_into()
+        .map_err(|_| AppError::InvalidPushGossip("token fingerprint must be 12 bytes".into()))
+}
+
+fn decode_hex_32(value: &str, name: &str) -> Result<[u8; 32], AppError> {
+    let decoded = hex::decode(value)
+        .map_err(|_| AppError::InvalidPushGossip(format!("{name} must be 32-byte hex")))?;
+    decoded
+        .try_into()
+        .map_err(|_| AppError::InvalidPushGossip(format!("{name} must be 32-byte hex")))
+}
+
+/// Canonical `SignedRecord` bytes from the spec's "Owner authentication" section.
+/// `encrypted_token` is `Some` for token entries (kinds 447/448, `PUSH_RECORD_DOMAIN`)
+/// and `None` for removals (kind 449, `PUSH_REMOVAL_DOMAIN`), which omit the field.
+#[allow(clippy::too_many_arguments)]
+fn push_signed_record_bytes(
+    domain: &[u8],
+    group_id_hex: &str,
+    member_id_hex: &str,
+    leaf_index: u32,
+    platform_byte: u8,
+    server_pubkey_hex: &str,
+    token_fingerprint: &str,
+    owner_ts: i64,
+    relay_hint: Option<&str>,
+    encrypted_token: Option<&[u8]>,
+) -> Result<Vec<u8>, AppError> {
+    // `group_id` is the MLS group id and is variable-length (16 bytes for the
+    // current Nostr binding, but the protocol does not fix it), so it is
+    // length-prefixed. `member_id` and `server_pubkey` are Nostr x-only keys and
+    // are always 32 bytes.
+    let group_id = hex::decode(group_id_hex)
+        .map_err(|_| AppError::InvalidPushGossip("group id must be hex".into()))?;
+    let member_id = decode_hex_32(member_id_hex, "member id")?;
+    let server_pubkey = decode_hex_32(server_pubkey_hex, "server pubkey")?;
+    let fingerprint = fingerprint_bytes(token_fingerprint)?;
+    let group_id_len = u16::try_from(group_id.len())
+        .map_err(|_| AppError::InvalidPushGossip("group id too long".into()))?;
+    // Blank/whitespace-only hints sign as absent so signer and verifier agree.
+    let relay = relay_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .unwrap_or("");
+    let relay_bytes = relay.as_bytes();
+    let relay_len = u16::try_from(relay_bytes.len())
+        .map_err(|_| AppError::InvalidPushGossip("relay hint too long".into()))?;
+
+    let mut buf = Vec::with_capacity(
+        domain.len() + 91 + group_id.len() + relay_bytes.len() + PUSH_ENCRYPTED_TOKEN_LEN,
+    );
+    buf.extend_from_slice(domain);
+    buf.extend_from_slice(&group_id_len.to_be_bytes());
+    buf.extend_from_slice(&group_id);
+    buf.extend_from_slice(&member_id);
+    buf.extend_from_slice(&leaf_index.to_be_bytes());
+    buf.push(platform_byte);
+    buf.extend_from_slice(&server_pubkey);
+    buf.extend_from_slice(&fingerprint);
+    // owner_ts is i64 throughout (codebase timestamp convention + SQLite INTEGER).
+    // For a non-negative millisecond timestamp its two's-complement big-endian
+    // bytes are identical to the spec's `u64` encoding, so no cast is needed.
+    buf.extend_from_slice(&owner_ts.to_be_bytes());
+    buf.extend_from_slice(&relay_len.to_be_bytes());
+    buf.extend_from_slice(relay_bytes);
+    if let Some(token) = encrypted_token {
+        buf.extend_from_slice(token);
+    }
+    Ok(buf)
+}
+
+fn push_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Verify a BIP-340 Schnorr signature by `member_id_hex` over `digest`. Returns
+/// false on any malformed input rather than erroring, so a bad entry is dropped.
+fn verify_push_owner_sig(member_id_hex: &str, owner_sig_hex: &str, digest: [u8; 32]) -> bool {
+    let Ok(member_bytes) = hex::decode(member_id_hex) else {
+        return false;
+    };
+    let Ok(xonly) = XOnlyPublicKey::from_slice(&member_bytes) else {
+        return false;
+    };
+    let Ok(sig_bytes) = hex::decode(owner_sig_hex) else {
+        return false;
+    };
+    let Ok(sig) = SchnorrSignature::from_slice(&sig_bytes) else {
+        return false;
+    };
+    SECP256K1
+        .verify_schnorr(&sig, &Message::from_digest(digest), &xonly)
+        .is_ok()
+}
+
+impl GroupPushTokenRecord {
+    fn signing_digest(&self) -> Result<[u8; 32], AppError> {
+        let bytes = push_signed_record_bytes(
+            PUSH_RECORD_DOMAIN,
+            &self.group_id_hex,
+            &self.member_id_hex,
+            self.leaf_index,
+            self.platform.platform_byte(),
+            &self.server_pubkey_hex,
+            &self.token_fingerprint,
+            self.owner_ts,
+            self.relay_hint.as_deref(),
+            Some(&self.encrypted_token),
+        )?;
+        Ok(push_digest(&bytes))
+    }
+
+    /// `SHA-256(SignedRecord)` as lowercase hex: the ordering-primitive tie-breaker.
+    pub(crate) fn record_digest(&self) -> Result<String, AppError> {
+        Ok(hex::encode(self.signing_digest()?))
+    }
+
+    /// Sign this record with the owner account `keys`, populating `owner_sig`.
+    pub(crate) fn sign_owner(&mut self, keys: &Keys) -> Result<(), AppError> {
+        let digest = self.signing_digest()?;
+        let sig = keys.sign_schnorr(&Message::from_digest(digest));
+        self.owner_sig = hex::encode(sig.serialize());
+        Ok(())
+    }
+
+    /// True when `owner_sig` is a valid BIP-340 signature by `member_id_hex`.
+    pub(crate) fn verify_owner_sig(&self) -> bool {
+        match self.signing_digest() {
+            Ok(digest) => verify_push_owner_sig(&self.member_id_hex, &self.owner_sig, digest),
+            Err(_) => false,
+        }
+    }
+}
+
+impl PushTokenRemovalRecord {
+    fn signing_digest(&self, group_id_hex: &str) -> Result<[u8; 32], AppError> {
+        let bytes = push_signed_record_bytes(
+            PUSH_REMOVAL_DOMAIN,
+            group_id_hex,
+            &self.member_id_hex,
+            self.leaf_index,
+            self.platform.platform_byte(),
+            &self.server_pubkey_hex,
+            &self.token_fingerprint,
+            self.owner_ts,
+            None,
+            None,
+        )?;
+        Ok(push_digest(&bytes))
+    }
+
+    pub(crate) fn record_digest(&self, group_id_hex: &str) -> Result<String, AppError> {
+        Ok(hex::encode(self.signing_digest(group_id_hex)?))
+    }
+
+    pub(crate) fn sign_owner(&mut self, group_id_hex: &str, keys: &Keys) -> Result<(), AppError> {
+        let digest = self.signing_digest(group_id_hex)?;
+        let sig = keys.sign_schnorr(&Message::from_digest(digest));
+        self.owner_sig = hex::encode(sig.serialize());
+        Ok(())
+    }
+
+    pub(crate) fn verify_owner_sig(&self, group_id_hex: &str) -> bool {
+        match self.signing_digest(group_id_hex) {
+            Ok(digest) => verify_push_owner_sig(&self.member_id_hex, &self.owner_sig, digest),
+            Err(_) => false,
+        }
+    }
 }
 
 pub fn build_notification_rumor_content(tokens: &[Vec<u8>]) -> Result<String, AppError> {
     if tokens.is_empty()
         || tokens
             .iter()
-            .any(|token| token.len() != MIP05_ENCRYPTED_TOKEN_LEN)
+            .any(|token| token.len() != PUSH_ENCRYPTED_TOKEN_LEN)
     {
         return Err(AppError::InvalidPushToken(
-            "notification rumor requires mip05-v1 encrypted tokens".into(),
+            "notification rumor requires marmot-push-v1 encrypted tokens".into(),
         ));
     }
-    let mut joined = Vec::with_capacity(tokens.len() * MIP05_ENCRYPTED_TOKEN_LEN);
+    let mut joined = Vec::with_capacity(tokens.len() * PUSH_ENCRYPTED_TOKEN_LEN);
     for token in tokens {
         joined.extend_from_slice(token);
     }
@@ -439,7 +655,7 @@ pub async fn build_notification_gift_wrap(
         EventBuilder::new(Kind::Custom(KIND_MARMOT_NOTIFICATION_RUMOR as u16), content)
             .tags([Tag::custom(
                 TagKind::custom(NOTIFICATION_VERSION_TAG),
-                [MIP05_VERSION],
+                [PUSH_VERSION],
             )])
             .build(seal_keys.public_key());
     let gift_wrap = EventBuilder::gift_wrap(&seal_keys, &server_pubkey, rumor, [])
@@ -454,43 +670,69 @@ pub(crate) fn local_token_gossip_payload(
     member_id_hex: String,
     leaf_index: u32,
     registration: &StoredPushRegistration,
+    keys: &Keys,
 ) -> Result<(PushTokenGossipPayload, GroupPushTokenRecord), AppError> {
-    let encrypted_token = encrypted_mip05_token(
+    let encrypted_token = encrypted_push_token(
         registration.registration.platform,
         &registration.token_bytes,
         &registration.registration.server_pubkey_hex,
     )?;
-    let record = GroupPushTokenRecord {
+    let now = unix_now_ms();
+    let mut record = GroupPushTokenRecord {
         group_id_hex,
-        member_id_hex: member_id_hex.clone(),
+        member_id_hex,
         leaf_index,
         platform: registration.registration.platform,
         token_fingerprint: registration.registration.token_fingerprint.clone(),
         server_pubkey_hex: registration.registration.server_pubkey_hex.clone(),
-        relay_hint: registration.registration.relay_hint.clone(),
-        encrypted_token: encrypted_token.clone(),
-        updated_at_ms: unix_now_ms(),
+        relay_hint: registration
+            .registration
+            .relay_hint
+            .clone()
+            .filter(|relay| !relay.trim().is_empty()),
+        encrypted_token,
+        owner_ts: now,
+        owner_sig: String::new(),
+        updated_at_ms: now,
     };
+    record.sign_owner(keys)?;
     let payload = PushTokenGossipPayload {
-        v: MIP05_VERSION.to_owned(),
+        v: PUSH_VERSION.to_owned(),
         tokens: vec![PushTokenGossipEntry::from_record(&record)],
     };
     Ok((payload, record))
 }
 
 pub(crate) fn local_token_removal_payload(
+    group_id_hex: &str,
     member_id_hex: String,
+    leaf_index: u32,
     registration: &PushRegistration,
-) -> PushTokenRemovalPayload {
-    PushTokenRemovalPayload {
-        v: MIP05_VERSION.to_owned(),
+    keys: &Keys,
+) -> Result<(PushTokenRemovalPayload, PushTokenRemovalRecord), AppError> {
+    let mut record = PushTokenRemovalRecord {
+        member_id_hex,
+        leaf_index,
+        platform: registration.platform,
+        token_fingerprint: registration.token_fingerprint.clone(),
+        server_pubkey_hex: registration.server_pubkey_hex.clone(),
+        owner_ts: unix_now_ms(),
+        owner_sig: String::new(),
+    };
+    record.sign_owner(group_id_hex, keys)?;
+    let payload = PushTokenRemovalPayload {
+        v: PUSH_VERSION.to_owned(),
         removals: vec![PushTokenRemovalEntry {
-            member_id_hex,
-            platform: registration.platform.as_str().to_owned(),
-            token_fingerprint: registration.token_fingerprint.clone(),
-            server_pubkey_hex: registration.server_pubkey_hex.clone(),
+            member_id_hex: record.member_id_hex.clone(),
+            leaf_index: record.leaf_index,
+            platform: record.platform.as_str().to_owned(),
+            token_fingerprint: record.token_fingerprint.clone(),
+            server_pubkey_hex: record.server_pubkey_hex.clone(),
+            owner_ts: record.owner_ts,
+            owner_sig: record.owner_sig.clone(),
         }],
-    }
+    };
+    Ok((payload, record))
 }
 
 pub(crate) fn parse_push_gossip(
@@ -502,7 +744,7 @@ pub(crate) fn parse_push_gossip(
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE | MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST => {
             let payload: PushTokenGossipPayload = serde_json::from_str(content)
                 .map_err(|_| AppError::InvalidPushGossip("malformed push token gossip".into()))?;
-            if payload.v != MIP05_VERSION {
+            if payload.v != PUSH_VERSION {
                 return Err(AppError::InvalidPushGossip(
                     "unsupported push token gossip version".into(),
                 ));
@@ -517,7 +759,7 @@ pub(crate) fn parse_push_gossip(
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL => {
             let payload: PushTokenRemovalPayload = serde_json::from_str(content)
                 .map_err(|_| AppError::InvalidPushGossip("malformed push token removal".into()))?;
-            if payload.v != MIP05_VERSION {
+            if payload.v != PUSH_VERSION {
                 return Err(AppError::InvalidPushGossip(
                     "unsupported push token removal version".into(),
                 ));
@@ -535,6 +777,39 @@ pub(crate) fn parse_push_gossip(
     }
 }
 
+/// Drop push-gossip entries that are not owner-authenticated. Each surviving
+/// entry carries a valid `owner_sig` by its own `member_id_hex` and names a
+/// current group member. Verification is per entry and silent, so one bad entry
+/// never poisons the batch — and a verified entry is applied no matter which
+/// member relayed it (kind 447 self-update or kind 448 transitive list response),
+/// which is what makes offline-member bootstrap safe.
+pub(crate) fn verify_push_gossip(
+    action: PushGossipAction,
+    group_id_hex: &str,
+    active_members: &[String],
+) -> PushGossipAction {
+    let active: HashSet<&str> = active_members.iter().map(String::as_str).collect();
+    match action {
+        PushGossipAction::Upsert(records) => PushGossipAction::Upsert(
+            records
+                .into_iter()
+                .filter(|record| {
+                    active.contains(record.member_id_hex.as_str()) && record.verify_owner_sig()
+                })
+                .collect(),
+        ),
+        PushGossipAction::Remove(removals) => PushGossipAction::Remove(
+            removals
+                .into_iter()
+                .filter(|removal| {
+                    active.contains(removal.member_id_hex.as_str())
+                        && removal.verify_owner_sig(group_id_hex)
+                })
+                .collect(),
+        ),
+    }
+}
+
 impl PushTokenGossipEntry {
     fn from_record(record: &GroupPushTokenRecord) -> Self {
         Self {
@@ -545,6 +820,8 @@ impl PushTokenGossipEntry {
             server_pubkey_hex: record.server_pubkey_hex.clone(),
             relay_hint: record.relay_hint.clone(),
             encrypted_token: BASE64_STANDARD.encode(&record.encrypted_token),
+            owner_ts: record.owner_ts,
+            owner_sig: record.owner_sig.clone(),
         }
     }
 
@@ -553,7 +830,7 @@ impl PushTokenGossipEntry {
         let encrypted_token = BASE64_STANDARD
             .decode(self.encrypted_token)
             .map_err(|_| AppError::InvalidPushGossip("invalid encrypted token base64".into()))?;
-        if encrypted_token.len() != MIP05_ENCRYPTED_TOKEN_LEN {
+        if encrypted_token.len() != PUSH_ENCRYPTED_TOKEN_LEN {
             return Err(AppError::InvalidPushGossip(
                 "invalid encrypted token length".into(),
             ));
@@ -561,6 +838,7 @@ impl PushTokenGossipEntry {
         validate_account_hex(&self.member_id_hex, "member id")?;
         validate_account_hex(&self.server_pubkey_hex, "server pubkey")?;
         validate_fingerprint(&self.token_fingerprint)?;
+        validate_owner_sig_hex(&self.owner_sig)?;
         Ok(GroupPushTokenRecord {
             group_id_hex: group_id_hex.to_owned(),
             member_id_hex: self.member_id_hex,
@@ -570,6 +848,8 @@ impl PushTokenGossipEntry {
             server_pubkey_hex: self.server_pubkey_hex,
             relay_hint: self.relay_hint.filter(|relay| !relay.trim().is_empty()),
             encrypted_token,
+            owner_ts: self.owner_ts,
+            owner_sig: self.owner_sig,
             updated_at_ms: unix_now_ms(),
         })
     }
@@ -580,11 +860,15 @@ impl PushTokenRemovalEntry {
         validate_account_hex(&self.member_id_hex, "member id")?;
         validate_account_hex(&self.server_pubkey_hex, "server pubkey")?;
         validate_fingerprint(&self.token_fingerprint)?;
+        validate_owner_sig_hex(&self.owner_sig)?;
         Ok(PushTokenRemovalRecord {
             member_id_hex: self.member_id_hex,
+            leaf_index: self.leaf_index,
             platform: PushPlatform::from_str(&self.platform)?,
             token_fingerprint: self.token_fingerprint,
             server_pubkey_hex: self.server_pubkey_hex,
+            owner_ts: self.owner_ts,
+            owner_sig: self.owner_sig,
         })
     }
 }
@@ -1037,11 +1321,11 @@ pub(crate) fn unix_now_ms() -> i64 {
 }
 
 #[cfg(test)]
-pub(crate) fn decrypt_mip05_token_for_test(
+pub(crate) fn decrypt_push_token_for_test(
     blob: &[u8],
     server_secret: &SecretKey,
 ) -> Result<(PushPlatform, Vec<u8>), AppError> {
-    if blob.len() != MIP05_ENCRYPTED_TOKEN_LEN {
+    if blob.len() != PUSH_ENCRYPTED_TOKEN_LEN {
         return Err(AppError::InvalidPushToken(
             "invalid encrypted token length".into(),
         ));
@@ -1050,9 +1334,9 @@ pub(crate) fn decrypt_mip05_token_for_test(
         .map_err(|_| AppError::InvalidPushToken("invalid encrypted token ephemeral key".into()))?;
     let ephemeral_pubkey = SecpPublicKey::from_x_only_public_key(ephemeral_xonly, Parity::Even);
     let shared_x = secp256k1_ecdh_x(&ephemeral_pubkey, server_secret);
-    let key = mip05_encryption_key(&shared_x)?;
+    let key = push_encryption_key(&shared_x)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|_| AppError::InvalidPushToken("mip05-v1 key setup failed".into()))?;
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 key setup failed".into()))?;
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&blob[32..44]),
@@ -1061,8 +1345,8 @@ pub(crate) fn decrypt_mip05_token_for_test(
                 aad: &[],
             },
         )
-        .map_err(|_| AppError::InvalidPushToken("mip05-v1 token decrypt failed".into()))?;
-    if plaintext.len() != MIP05_TOKEN_PLAINTEXT_LEN {
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 token decrypt failed".into()))?;
+    if plaintext.len() != PUSH_TOKEN_PLAINTEXT_LEN {
         return Err(AppError::InvalidPushToken(
             "invalid token plaintext length".into(),
         ));

@@ -150,10 +150,10 @@ pub use notifications::{
     GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR, KIND_MARMOT_NOTIFICATION_SERVER_RELAYS,
     LocalPushRegistrationDebug, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
-    MIP05_ENCRYPTED_TOKEN_LEN, MIP05_VERSION, NotificationCollectionStatus, NotificationSettings,
-    NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
-    PushPlatform, PushRegistration, build_notification_gift_wrap, build_notification_rumor_content,
-    encrypted_mip05_token, parse_provider_token, push_token_fingerprint,
+    NotificationCollectionStatus, NotificationSettings, NotificationTrigger, NotificationUpdate,
+    NotificationUser, NotificationWakeSource, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform,
+    PushRegistration, build_notification_gift_wrap, build_notification_rumor_content,
+    encrypted_push_token, parse_provider_token, push_token_fingerprint,
 };
 pub use relay_plane::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth,
@@ -1465,29 +1465,45 @@ impl MarmotApp {
             .collect()
     }
 
+    /// Ingest inbound push-token gossip (kinds 447/448/449) into
+    /// `group_push_tokens`. `active_member_ids` is the carrying group's current
+    /// MLS member set; entries are owner-authenticated and bound to it by
+    /// [`notifications::verify_push_gossip`] before the spec's
+    /// `(owner_ts, record_digest)` ordering primitive and tombstones (enforced by
+    /// the storage `apply_*` calls) decide what mutates state. Because authority
+    /// comes from each record's `owner_sig`, a kind 448 may carry — and apply —
+    /// records owned by members other than `message.sender`.
     pub(crate) fn ingest_push_gossip_message(
         &self,
         account_ref: &str,
         message: &ReceivedMessage,
+        active_member_ids: &[String],
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         let group_id_hex = hex::encode(message.group_id.as_slice());
         let storage = self.account_storage(&account.label)?;
-        match notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)? {
+        let action =
+            notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)?;
+        let action = notifications::verify_push_gossip(action, &group_id_hex, active_member_ids);
+        match action {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
-                    storage.upsert_group_push_token(&account_group_push_token_from_app(&record))?;
+                    storage.apply_group_push_token(&account_group_push_token_from_app(&record))?;
                 }
             }
             notifications::PushGossipAction::Remove(removals) => {
                 for removal in removals {
-                    storage.remove_group_push_token(
+                    let digest = removal.record_digest(&group_id_hex)?;
+                    storage.apply_group_push_token_tombstone(
                         &group_id_hex,
                         &removal.member_id_hex,
+                        removal.leaf_index,
                         removal.platform.platform_byte(),
-                        &removal.token_fingerprint,
                         &removal.server_pubkey_hex,
+                        removal.owner_ts,
+                        &digest,
+                        notifications::unix_now_ms(),
                     )?;
                 }
             }
@@ -1505,6 +1521,32 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
             .remove_group_push_tokens_for_member(group_id_hex, member_id_hex)?;
+        Ok(())
+    }
+
+    /// Apply our own owner-signed removal locally: tombstone the record key with
+    /// the removal's `(owner_ts, record_digest)` stamp so a later stale kind 448
+    /// relaying our pre-removal record cannot resurrect it.
+    pub(crate) fn apply_local_push_removal(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        removal: &notifications::PushTokenRemovalRecord,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let digest = removal.record_digest(group_id_hex)?;
+        self.account_storage(&account.label)?
+            .apply_group_push_token_tombstone(
+                group_id_hex,
+                &removal.member_id_hex,
+                removal.leaf_index,
+                removal.platform.platform_byte(),
+                &removal.server_pubkey_hex,
+                removal.owner_ts,
+                &digest,
+                notifications::unix_now_ms(),
+            )?;
         Ok(())
     }
 

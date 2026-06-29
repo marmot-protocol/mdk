@@ -374,6 +374,13 @@ pub(crate) fn account_group_push_token_from_app(
         server_pubkey_hex: token.server_pubkey_hex.clone(),
         relay_hint: token.relay_hint.clone(),
         encrypted_token: token.encrypted_token.clone(),
+        owner_ts: token.owner_ts,
+        owner_sig: token.owner_sig.clone(),
+        // Stored so the storage layer can compare ordering stamps without the
+        // crypto code. Recomputed from the record's owner-signed bytes;
+        // best-effort because legacy/placeholder records may carry non-canonical
+        // fields — owner-verified gossip records always produce a real digest.
+        record_digest: token.record_digest().unwrap_or_default(),
         updated_at_ms: token.updated_at_ms,
     }
 }
@@ -390,6 +397,8 @@ pub(crate) fn group_push_token_from_account(
         server_pubkey_hex: token.server_pubkey_hex,
         relay_hint: token.relay_hint,
         encrypted_token: token.encrypted_token,
+        owner_ts: token.owner_ts,
+        owner_sig: token.owner_sig,
         updated_at_ms: token.updated_at_ms,
     })
 }

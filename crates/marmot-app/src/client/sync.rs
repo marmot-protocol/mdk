@@ -350,10 +350,28 @@ impl AppClient {
                 self.app.allow_loopback_blob_endpoints(),
             ) {
                 if notifications::is_push_gossip_kind(message.kind) {
-                    if let Err(err) = self
-                        .app
-                        .ingest_push_gossip_message(&self.state.label, &message)
-                    {
+                    // Bind inbound gossip to the carrying group's authenticated MLS
+                    // member set; owner signatures are then verified per record so
+                    // a kind 448 may apply other members' records (offline-member
+                    // bootstrap) without trusting the relaying sender.
+                    let ingest_result = self
+                        .runtime
+                        .members(&message.group_id)
+                        .map_err(AppError::from)
+                        .map(|members| {
+                            members
+                                .into_iter()
+                                .map(|member| hex::encode(member.id.as_slice()))
+                                .collect::<Vec<_>>()
+                        })
+                        .and_then(|active_member_ids| {
+                            self.app.ingest_push_gossip_message(
+                                &self.state.label,
+                                &message,
+                                &active_member_ids,
+                            )
+                        });
+                    if let Err(err) = ingest_result {
                         tracing::warn!(
                             target: "marmot_app::notifications",
                             method = "ingest_delivery",
