@@ -51,6 +51,8 @@ pub enum QuicTextStreamError {
     EmptyFrame,
     #[error("agent text stream frame is too large: {0}")]
     FrameTooLarge(usize),
+    #[error("agent text stream frame read timed out")]
+    ReadTimeout,
     #[error("agent text stream chunk size cannot be zero")]
     EmptyChunkSize,
     #[error("agent text stream chunk size exceeds app profile max: {0}")]

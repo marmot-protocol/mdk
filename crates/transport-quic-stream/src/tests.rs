@@ -27,7 +27,7 @@ use crate::protocol::{
 use crate::receive::{QuicTextStreamReceiver, ServerTrust, stream_record_text};
 use crate::send::{SendTextStream, send_text_stream, split_text_deltas};
 use crate::tls::client_endpoint;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 #[test]
 fn direct_path_alpn_is_the_pinned_wire_value() {
@@ -143,6 +143,16 @@ fn receive_limits_bound_record_count_and_plaintext_bytes() {
         ..AgentTextStreamReceiveLimits::default()
     });
     record_limited.observe(&record).unwrap();
+    assert_eq!(record_limited.wire_records(), 0);
+    record_limited.observe_wire_record().unwrap();
+    assert_eq!(record_limited.wire_records(), 1);
+    assert!(matches!(
+        record_limited.observe_wire_record(),
+        Err(AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+            attempted: 2,
+            limit: 1
+        })
+    ));
     assert!(matches!(
         record_limited.observe(&record),
         Err(AgentTextStreamReceiveLimitError::RecordLimitExceeded {
@@ -357,6 +367,19 @@ async fn raw_record_sender(
     endpoint.wait_idle().await;
 }
 
+async fn stalled_uni_sender(server_addr: SocketAddr, server_cert: Vec<u8>, hold: Duration) {
+    let endpoint = client_endpoint(ServerTrust::CertificateDer(server_cert), server_addr).unwrap();
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let _send = connection.open_uni().await.unwrap();
+    sleep(hold).await;
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+}
+
 #[tokio::test]
 async fn receiver_silently_discards_replayed_records_at_or_below_high_water() {
     let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
@@ -402,6 +425,56 @@ async fn receiver_silently_discards_replayed_records_at_or_below_high_water() {
     transcript.append(2, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b"lo");
     transcript.append(3, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, b" world");
     assert_eq!(received.transcript_hash, transcript.hash());
+}
+
+#[tokio::test]
+async fn receiver_counts_replayed_records_toward_receive_record_limit() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let stream_id = vec![0x42; 32];
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let limits = AgentTextStreamReceiveLimits {
+        max_records: 2,
+        max_plaintext_bytes: 1024,
+        ..AgentTextStreamReceiveLimits::default()
+    };
+    let receive = tokio::spawn(receiver.receive_once_with_limits(start_event_id, None, limits));
+
+    let duplicate = AgentTextStreamRecordV1::text_delta(stream_id, 0, b"dupe".to_vec());
+    raw_record_sender(
+        server_addr,
+        server_cert,
+        vec![duplicate.clone(), duplicate.clone(), duplicate],
+    )
+    .await;
+
+    let err = receive.await.unwrap().unwrap_err();
+    assert!(matches!(
+        err,
+        QuicTextStreamError::ReceiveLimit(AgentTextStreamReceiveLimitError::RecordLimitExceeded {
+            attempted: 3,
+            limit: 2
+        })
+    ));
+}
+
+#[tokio::test]
+async fn receiver_times_out_when_peer_stalls_before_first_frame() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let limits = AgentTextStreamReceiveLimits {
+        read_timeout: Duration::from_millis(50),
+        ..AgentTextStreamReceiveLimits::default()
+    };
+    let receive = tokio::spawn(receiver.receive_once_with_limits(start_event_id, None, limits));
+
+    stalled_uni_sender(server_addr, server_cert, Duration::from_millis(200)).await;
+
+    let err = receive.await.unwrap().unwrap_err();
+    assert!(matches!(err, QuicTextStreamError::ReadTimeout));
 }
 
 #[tokio::test]

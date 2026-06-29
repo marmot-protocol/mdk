@@ -14,7 +14,7 @@ use quinn::Endpoint;
 
 use crate::crypto::{AgentTextStreamCrypto, decrypt_record};
 use crate::error::QuicTextStreamError;
-use crate::frame::read_record;
+use crate::frame::{read_deadline, read_record};
 use crate::limits::{AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimits};
 use crate::protocol::frame_len_cap;
 use crate::tls::configure_server;
@@ -67,7 +67,7 @@ impl QuicTextStreamReceiver {
             .await
             .ok_or(QuicTextStreamError::EndpointClosed)?;
         let connection = incoming.await?;
-        let mut recv = connection.accept_uni().await?;
+        let mut recv = read_deadline(limits.read_timeout, connection.accept_uni()).await?;
         let mut stream_id = None;
         // Last-accepted seq high-water mark per the QUIC transport binding:
         // records at or below it (duplicates, transport-level replay) are
@@ -80,7 +80,8 @@ impl QuicTextStreamReceiver {
         let mut limit_state = AgentTextStreamReceiveAccumulator::new(limits);
         let max_frame_len = frame_len_cap(Some(limits.max_plaintext_frame_len));
 
-        while let Some(record) = read_record(&mut recv, max_frame_len).await? {
+        while let Some(record) = read_record(&mut recv, max_frame_len, limits.read_timeout).await? {
+            limit_state.observe_wire_record()?;
             if record.seq <= high_water {
                 continue;
             }
