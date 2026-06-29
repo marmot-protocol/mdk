@@ -399,7 +399,7 @@ pub(crate) fn control_event_from_runtime_event(
                     GroupStateChange::MemberLeft { .. } => ("member_left", None),
                     GroupStateChange::AdminAdded { .. } => ("admin_added", None),
                     GroupStateChange::AdminRemoved { .. } => ("admin_removed", None),
-                    GroupStateChange::GroupRenamed { name } => ("group_renamed", Some(name)),
+                    GroupStateChange::GroupRenamed { name, .. } => ("group_renamed", Some(name)),
                     GroupStateChange::GroupAvatarChanged => ("group_avatar_changed", None),
                     GroupStateChange::MessageRetentionChanged { .. } => {
                         ("disappearing_timer_changed", None)

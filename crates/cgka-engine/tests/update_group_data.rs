@@ -631,6 +631,7 @@ async fn admin_policy_update_listing_non_member_is_rejected() {
 #[tokio::test]
 async fn update_group_data_with_only_name_preserves_description() {
     let (mut alice, _bob, gid) = create_pair().await;
+    alice.drain_events();
 
     let res = alice
         .send(SendIntent::UpdateGroupData {
@@ -646,6 +647,21 @@ async fn update_group_data_with_only_name_preserves_description() {
     };
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+
+    let events = alice.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::GroupRenamed {
+                    name,
+                    previous_name: Some(previous_name),
+                },
+                ..
+            } if name == "renamed" && previous_name == "original"
+        )),
+        "local rename must carry the previous group name, got: {events:?}",
+    );
 }
 
 // ── Rollback ────────────────────────────────────────────────────────────────
@@ -840,9 +856,12 @@ async fn convergence_emits_unattributed_profile_change_events() {
             event,
             cgka_traits::engine::GroupEvent::GroupStateChanged {
                 actor: None,
-                change: cgka_traits::engine::GroupStateChange::GroupRenamed { name },
+                change: cgka_traits::engine::GroupStateChange::GroupRenamed {
+                    name,
+                    previous_name: Some(previous_name),
+                },
                 ..
-            } if name == "new-renamed"
+            } if name == "new-renamed" && previous_name == "original-name"
         )),
         "convergence apply must emit an unattributed GroupRenamed, got: {events:?}",
     );

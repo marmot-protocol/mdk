@@ -76,6 +76,7 @@ pub const GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED: &str = "Disappearing tim
 pub const GROUP_SYSTEM_DATA_ACTOR: &str = "actor";
 pub const GROUP_SYSTEM_DATA_SUBJECT: &str = "subject";
 pub const GROUP_SYSTEM_DATA_NAME: &str = "name";
+pub const GROUP_SYSTEM_DATA_OLD_NAME: &str = "old_name";
 pub const GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS: &str = "old_retention_seconds";
 pub const GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS: &str = "new_retention_seconds";
 
@@ -294,6 +295,7 @@ struct GroupSystemProjectionParts<'a> {
     system_type: &'static str,
     subject: Option<&'a MemberId>,
     name: Option<&'a str>,
+    old_name: Option<&'a str>,
     old_retention_seconds: Option<u64>,
     new_retention_seconds: Option<u64>,
     text: &'static str,
@@ -305,6 +307,7 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             system_type: GROUP_SYSTEM_TYPE_MEMBER_ADDED,
             subject: Some(member),
             name: None,
+            old_name: None,
             old_retention_seconds: None,
             new_retention_seconds: None,
             text: GROUP_SYSTEM_TEXT_MEMBER_ADDED,
@@ -313,6 +316,7 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             system_type: GROUP_SYSTEM_TYPE_MEMBER_REMOVED,
             subject: Some(member),
             name: None,
+            old_name: None,
             old_retention_seconds: None,
             new_retention_seconds: None,
             text: GROUP_SYSTEM_TEXT_MEMBER_REMOVED,
@@ -321,6 +325,7 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             system_type: GROUP_SYSTEM_TYPE_MEMBER_LEFT,
             subject: Some(member),
             name: None,
+            old_name: None,
             old_retention_seconds: None,
             new_retention_seconds: None,
             text: GROUP_SYSTEM_TEXT_MEMBER_LEFT,
@@ -329,6 +334,7 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             system_type: GROUP_SYSTEM_TYPE_ADMIN_ADDED,
             subject: Some(member),
             name: None,
+            old_name: None,
             old_retention_seconds: None,
             new_retention_seconds: None,
             text: GROUP_SYSTEM_TEXT_ADMIN_ADDED,
@@ -337,14 +343,19 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             system_type: GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
             subject: Some(member),
             name: None,
+            old_name: None,
             old_retention_seconds: None,
             new_retention_seconds: None,
             text: GROUP_SYSTEM_TEXT_ADMIN_REMOVED,
         },
-        GroupStateChange::GroupRenamed { name } => GroupSystemProjectionParts {
+        GroupStateChange::GroupRenamed {
+            name,
+            previous_name,
+        } => GroupSystemProjectionParts {
             system_type: GROUP_SYSTEM_TYPE_GROUP_RENAMED,
             subject: None,
             name: Some(name.as_str()),
+            old_name: previous_name.as_deref(),
             old_retention_seconds: None,
             new_retention_seconds: None,
             text: GROUP_SYSTEM_TEXT_GROUP_RENAMED,
@@ -353,6 +364,7 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             system_type: GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED,
             subject: None,
             name: None,
+            old_name: None,
             old_retention_seconds: None,
             new_retention_seconds: None,
             text: GROUP_SYSTEM_TEXT_GROUP_AVATAR_CHANGED,
@@ -364,6 +376,7 @@ fn group_system_projection_parts(change: &GroupStateChange) -> GroupSystemProjec
             system_type: GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED,
             subject: None,
             name: None,
+            old_name: None,
             old_retention_seconds: Some(*old_seconds),
             new_retention_seconds: Some(*new_seconds),
             text: GROUP_SYSTEM_TEXT_DISAPPEARING_TIMER_CHANGED,
@@ -403,6 +416,12 @@ pub fn group_system_event_material(
             Value::String(name.to_owned()),
         );
     }
+    if let Some(old_name) = parts.old_name {
+        data.insert(
+            GROUP_SYSTEM_DATA_OLD_NAME.to_owned(),
+            Value::String(old_name.to_owned()),
+        );
+    }
     if let Some(old_seconds) = parts.old_retention_seconds {
         data.insert(
             GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS.to_owned(),
@@ -423,6 +442,9 @@ pub fn group_system_event_material(
         system_type.to_owned(),
     ]];
     let sender = actor_hex.unwrap_or_default();
+    // The encoded content is part of the row-id preimage. For a rename this
+    // includes `old_name` when known, so live events and storage replay must
+    // pass the same snapshot-derived `previous_name` to deduplicate.
     let id_preimage = format!("{group_id_hex}\u{1f}{content}");
     let message_id_hex = canonical_event_id(
         &sender,
@@ -607,6 +629,7 @@ mod tests {
                 "group_renamed",
                 GroupStateChange::GroupRenamed {
                     name: "Team".to_owned(),
+                    previous_name: None,
                 },
                 Some(&actor),
             ),
@@ -714,5 +737,26 @@ mod tests {
                 GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED.to_owned(),
             ]]
         );
+    }
+
+    #[test]
+    fn group_system_event_material_carries_rename_old_name() {
+        let group_id = GroupId::new(vec![0x22; 32]);
+        let actor = MemberId::new(vec![0xaa; 32]);
+        let material = group_system_event_material(
+            &group_id,
+            3,
+            Some(&actor),
+            &GroupStateChange::GroupRenamed {
+                name: "Team Two".to_owned(),
+                previous_name: Some("Team One".to_owned()),
+            },
+        )
+        .unwrap();
+
+        let event = GroupSystemEvent::parse(&material.content).unwrap();
+        assert_eq!(event.system_type, GROUP_SYSTEM_TYPE_GROUP_RENAMED);
+        assert_eq!(event.data_str(GROUP_SYSTEM_DATA_NAME), Some("Team Two"));
+        assert_eq!(event.data_str(GROUP_SYSTEM_DATA_OLD_NAME), Some("Team One"));
     }
 }

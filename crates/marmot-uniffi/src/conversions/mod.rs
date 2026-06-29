@@ -249,6 +249,8 @@ mod tests {
             Some(serde_json::json!({
                 cgka_traits::app_event::GROUP_SYSTEM_DATA_ACTOR: "aa".repeat(32),
                 cgka_traits::app_event::GROUP_SYSTEM_DATA_SUBJECT: "bb".repeat(32),
+                cgka_traits::app_event::GROUP_SYSTEM_DATA_OLD_NAME: "Team One",
+                cgka_traits::app_event::GROUP_SYSTEM_DATA_NAME: "Team Two",
                 cgka_traits::app_event::GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS: 60,
                 cgka_traits::app_event::GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS: 0,
             })),
@@ -291,6 +293,8 @@ mod tests {
             system.subject_account_id_hex.as_deref(),
             Some("bb".repeat(32).as_str())
         );
+        assert_eq!(system.name.as_deref(), Some("Team Two"));
+        assert_eq!(system.old_name.as_deref(), Some("Team One"));
         assert_eq!(system.old_retention_seconds, Some(60));
         assert_eq!(system.new_retention_seconds, Some(0));
     }

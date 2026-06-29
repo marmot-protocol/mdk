@@ -248,7 +248,7 @@ pub(crate) fn group_state_changed_event(
     let change_kind = group_state_change_kind_str(change);
     // Always carry digest+len; the cleartext value (text/json) is full-data only.
     let value = match change {
-        GroupStateChange::GroupRenamed { name } => Some(marmot_forensics::GroupStateValue {
+        GroupStateChange::GroupRenamed { name, .. } => Some(marmot_forensics::GroupStateValue {
             digest: Some(value_digest_hex(change_kind, name.as_bytes())),
             len: Some(name.len() as u64),
             text: full_data.then(|| name.clone()),

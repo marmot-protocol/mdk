@@ -39,6 +39,13 @@ pub(crate) fn admin_changes(before: &[[u8; 32]], after: &[[u8; 32]]) -> Vec<Grou
     changes
 }
 
+/// Previous display name to carry on a rename event. Empty means no stable
+/// pre-change name existed, so callers omit it rather than rendering a fake
+/// blank-to-name diff.
+pub(crate) fn previous_display_name(name: &str) -> Option<String> {
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// Profile changes between two snapshots: a rename when the display name moved,
 /// and an avatar change when either avatar component's bytes moved. `None`
 /// snapshots are treated as absent (empty name / no avatar bytes).
@@ -52,8 +59,10 @@ pub(crate) fn profile_changes(
     let before_name = before_name.unwrap_or("");
     let after_name = after_name.unwrap_or("");
     if before_name != after_name {
+        let previous_name = previous_display_name(before_name);
         changes.push(GroupStateChange::GroupRenamed {
             name: after_name.to_owned(),
+            previous_name,
         });
     }
     if before_avatar != after_avatar {
@@ -124,10 +133,29 @@ mod tests {
             changes,
             vec![
                 GroupStateChange::GroupRenamed {
-                    name: "new".to_owned()
+                    name: "new".to_owned(),
+                    previous_name: Some("old".to_owned()),
                 },
                 GroupStateChange::GroupAvatarChanged,
             ]
+        );
+    }
+
+    #[test]
+    fn profile_changes_omits_previous_name_when_absent_or_blank() {
+        assert_eq!(
+            profile_changes(None, Some("new"), &[None], &[None]),
+            vec![GroupStateChange::GroupRenamed {
+                name: "new".to_owned(),
+                previous_name: None,
+            }]
+        );
+        assert_eq!(
+            profile_changes(Some(""), Some("new"), &[None], &[None]),
+            vec![GroupStateChange::GroupRenamed {
+                name: "new".to_owned(),
+                previous_name: None,
+            }]
         );
     }
 

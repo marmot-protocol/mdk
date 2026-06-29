@@ -168,6 +168,7 @@ fn control_event_projects_group_rename_as_group_state_changed() {
             actor: None,
             change: GroupStateChange::GroupRenamed {
                 name: "Team".to_owned(),
+                previous_name: None,
             },
             origin_commit_id: None,
         },
@@ -2306,8 +2307,24 @@ fn inbound_message_event_from_record_projects_group_system_row() {
 fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
     // The live GroupStateChanged event and the synthesized storage row must share the same
     // replay cursor id, otherwise replay after later lag would duplicate already-delivered state.
+    assert_runtime_replay_dedup_key_matches_group_rename(None);
+}
+
+#[test]
+fn runtime_replay_dedup_key_matches_group_system_storage_row_id_with_old_name() {
+    // `previous_name` is rendered as `data.old_name`, which participates in the
+    // canonical row id. Live delivery and replay must therefore agree when it is
+    // populated, not only when it is absent.
+    assert_runtime_replay_dedup_key_matches_group_rename(Some("Old Team"));
+}
+
+fn assert_runtime_replay_dedup_key_matches_group_rename(previous_name: Option<&str>) {
     let group_id = GroupId::new(vec![0x22; 32]);
     let actor = cgka_traits::MemberId::new(vec![0xbb; 32]);
+    let change = GroupStateChange::GroupRenamed {
+        name: "Team".to_owned(),
+        previous_name: previous_name.map(str::to_owned),
+    };
     let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
         account_id_hex: "acct".to_owned(),
         account_label: "agent".to_owned(),
@@ -2315,22 +2332,14 @@ fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
             group_id: group_id.clone(),
             epoch: EpochId(3),
             actor: Some(actor.clone()),
-            change: GroupStateChange::GroupRenamed {
-                name: "Team".to_owned(),
-            },
+            change: change.clone(),
             origin_commit_id: None,
         },
     });
 
-    let expected = cgka_traits::app_event::group_system_canonical_id(
-        &group_id,
-        3,
-        Some(&actor),
-        &GroupStateChange::GroupRenamed {
-            name: "Team".to_owned(),
-        },
-    )
-    .unwrap();
+    let expected =
+        cgka_traits::app_event::group_system_canonical_id(&group_id, 3, Some(&actor), &change)
+            .unwrap();
 
     assert_eq!(
         runtime_replay_dedup_key(&event).as_deref(),

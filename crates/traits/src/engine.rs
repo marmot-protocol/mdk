@@ -281,8 +281,15 @@ pub enum GroupStateChange {
     AdminAdded { member: MemberId },
     /// `member`'s group admin was revoked.
     AdminRemoved { member: MemberId },
-    /// The group display name changed to `name`.
-    GroupRenamed { name: String },
+    /// The group display name changed to `name`. `previous_name` is present
+    /// when the pre-change non-empty display name is known. Downstream
+    /// kind-1210 row synthesis includes it in the canonical row id, so live and
+    /// replay paths must derive it from the same pre-change snapshot.
+    GroupRenamed {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_name: Option<String>,
+    },
     /// The group avatar/image changed (avatar-url or blossom-image component).
     GroupAvatarChanged,
     /// The per-group disappearing-message retention changed. `0` means disabled.

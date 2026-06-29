@@ -138,6 +138,9 @@ impl<S: StorageProvider> Engine<S> {
                             actor: self_actor.clone(),
                             change: GroupStateChange::GroupRenamed {
                                 name: after_name.to_owned(),
+                                previous_name: crate::group_state_changes::previous_display_name(
+                                    before_name,
+                                ),
                             },
                         });
                     }
