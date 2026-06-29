@@ -8,6 +8,7 @@
 //! read-only helpers. Group creation, ingest/send, publish lifecycle,
 //! convergence, and capability logic live in focused sibling modules.
 
+use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 use async_trait::async_trait;
@@ -115,12 +116,18 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) pending_state_changes: HashMap<PendingStateRef, Vec<PendingGroupStateChange>>,
 
     /// MessageIds the engine has ingested. Backs `StaleReason::AlreadySeen`.
-    pub(crate) seen_message_ids: HashSet<MessageId>,
+    ///
+    /// Bounded hot-process cache in front of the authoritative durable
+    /// `MessageRecord` store (checked first in `do_ingest`), so an id that ages
+    /// out of the cap is still classified by storage.
+    pub(crate) seen_message_ids: BoundedIdSet<MessageId>,
 
     /// MessageIds this engine has produced via `send` or `create_group` /
     /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
     /// bounces back via ingest before we filter it client-side.
-    pub(crate) sent_message_ids: HashSet<MessageId>,
+    ///
+    /// Bounded hot-process cache; see `seen_message_ids` above.
+    pub(crate) sent_message_ids: BoundedIdSet<MessageId>,
 
     /// Durable leave requests keyed by group. This is the source of truth for
     /// a user's request to leave across epoch changes and restarts.
@@ -297,8 +304,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
             pending_state_changes: HashMap::new(),
-            seen_message_ids: HashSet::new(),
-            sent_message_ids: HashSet::new(),
+            seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
+            sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
             scheduled_self_remove_auto_commits: HashMap::new(),

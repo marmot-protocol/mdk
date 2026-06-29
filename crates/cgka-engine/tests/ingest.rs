@@ -12,14 +12,16 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::message::MessageState;
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
+use cgka_traits::storage::MessageStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use storage_sqlite::SqliteAccountStorage;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 mod support;
 use support::proof_signer;
@@ -68,6 +70,12 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
     MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+fn content_id(msg: &TransportMessage) -> MessageId {
+    use sha2::{Digest, Sha256};
+
+    MessageId::new(Sha256::digest(&msg.payload).to_vec())
 }
 
 #[async_trait]
@@ -228,14 +236,33 @@ fn selfremove_registry() -> FeatureRegistry {
 }
 
 fn build_client(id: &[u8]) -> Engine<SqliteAccountStorage> {
-    build_client_with_peeler(id, Box::new(MockPeeler))
+    build_client_with_storage_and_peeler(
+        SqliteAccountStorage::in_memory().unwrap(),
+        id,
+        Box::new(MockPeeler),
+    )
 }
 
 fn build_client_with_peeler(
     id: &[u8],
     peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
-    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+    build_client_with_storage_and_peeler(SqliteAccountStorage::in_memory().unwrap(), id, peeler)
+}
+
+fn build_client_with_storage(
+    storage: SqliteAccountStorage,
+    id: &[u8],
+) -> Engine<SqliteAccountStorage> {
+    build_client_with_storage_and_peeler(storage, id, Box::new(MockPeeler))
+}
+
+fn build_client_with_storage_and_peeler(
+    storage: SqliteAccountStorage,
+    id: &[u8],
+    peeler: Box<dyn TransportPeeler>,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -502,6 +529,84 @@ async fn ingest_own_created_message_returns_own_echo() {
         }
     ));
     let _ = (bob, create);
+}
+
+#[tokio::test]
+async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
+    // Alice's hot-process sent-message cache is gone after restart. A re-wrapped
+    // echo with a fresh transport id must still hit a durable content-derived
+    // Sent marker and classify as OwnEcho instead of being processed again.
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("durable own echo content marker").unwrap();
+
+    let group_id;
+    let app_msg;
+    {
+        let alice_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+        let mut alice = build_client_with_storage(alice_store, b"alice-own-restart");
+        let mut bob = build_client(b"bob-own-restart");
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+
+        let (gid, create) = alice
+            .create_group(CreateGroupRequest {
+                name: "x".into(),
+                description: "".into(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        group_id = gid.clone();
+        let pending = match create {
+            SendResult::GroupCreated { pending, .. } => pending,
+            _ => unreachable!(),
+        };
+        alice.confirm_published(pending).await.unwrap();
+
+        app_msg = match alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, b"durable own echo"),
+            })
+            .await
+            .unwrap()
+        {
+            SendResult::ApplicationMessage { msg } => msg,
+            _ => unreachable!(),
+        };
+    }
+
+    let sent_content_id = content_id(&app_msg);
+    let reopened_store = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
+    let marker = reopened_store
+        .get_message(&sent_content_id)
+        .expect("outbound OpenMLS send must persist a content-derived Sent marker");
+    assert_eq!(marker.state, MessageState::Sent);
+
+    let mut alice = build_client_with_storage(reopened_store, b"alice-own-restart");
+    alice.hydrate_stable_groups_from_storage().unwrap();
+    let rewrapped = TransportMessage {
+        id: MessageId::new(b"fresh-own-echo-transport-id".to_vec()),
+        timestamp: Timestamp(app_msg.timestamp.0 + 1),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..app_msg
+    };
+
+    let outcome = alice.ingest(rewrapped).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::OwnEcho
+            }
+        ),
+        "re-wrapped own OpenMLS echo after restart must be OwnEcho, got {outcome:?}"
+    );
 }
 
 #[tokio::test]

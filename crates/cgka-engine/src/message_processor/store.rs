@@ -73,16 +73,19 @@ impl<S: StorageProvider> Engine<S> {
         epoch: EpochId,
     ) -> Result<(), EngineError> {
         self.sent_message_ids.insert(msg.id.clone());
-        // Also remember the content-derived id so our own commit / app message
-        // echoed back inside a freshly re-wrapped transport envelope (different
-        // transport id) is still classified `OwnEcho` by the post-peel content
-        // check, not reprocessed.
-        self.sent_message_ids.insert(content_dedup_id(mls_bytes));
+        // Also remember and persist the content-derived id so our own commit /
+        // app message echoed back inside a freshly re-wrapped transport envelope
+        // (different transport id) is still classified `OwnEcho` by the
+        // post-peel content check after the hot-process cache misses or the
+        // engine restarts.
+        let content_id = content_dedup_id(mls_bytes);
+        self.sent_message_ids.insert(content_id.clone());
         let openmls_msg = TransportMessage {
             payload: mls_bytes.to_vec(),
             ..msg.clone()
         };
-        self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)
+        self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)?;
+        self.persist_sent_openmls_content_marker(&openmls_msg, content_id, group_id, epoch)
     }
 
     pub(crate) fn record_sent_openmls_message_with_leave_request(
@@ -97,7 +100,7 @@ impl<S: StorageProvider> Engine<S> {
             payload: mls_bytes.to_vec(),
             ..msg.clone()
         };
-        let payload = StoredMessagePayload::openmls_wire(openmls_msg)
+        let payload = StoredMessagePayload::openmls_wire(openmls_msg.clone())
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         let record = MessageRecord {
@@ -119,7 +122,9 @@ impl<S: StorageProvider> Engine<S> {
         })?;
 
         self.sent_message_ids.insert(msg.id.clone());
-        self.sent_message_ids.insert(content_dedup_id(mls_bytes));
+        let content_id = content_dedup_id(mls_bytes);
+        self.sent_message_ids.insert(content_id.clone());
+        self.persist_sent_openmls_content_marker(&openmls_msg, content_id, group_id, epoch)?;
         self.leaving_groups.insert(request.group_id.clone());
         self.leave_requests
             .insert(request.group_id.clone(), request.clone());
@@ -134,6 +139,26 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         Ok(())
+    }
+
+    fn persist_sent_openmls_content_marker(
+        &self,
+        openmls_msg: &TransportMessage,
+        content_id: MessageId,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        if content_id == openmls_msg.id {
+            return Ok(());
+        }
+        // Marker-only row: storage classifies the content id as Sent/OwnEcho,
+        // but canonicalization ignores RawTransport Sent rows so the same MLS
+        // bytes do not enter the OpenMLS candidate graph twice.
+        let marker = TransportMessage {
+            id: content_id,
+            ..openmls_msg.clone()
+        };
+        self.persist_transport_message(&marker, group_id, epoch, MessageState::Sent)
     }
 
     pub(crate) fn persist_transport_message(
