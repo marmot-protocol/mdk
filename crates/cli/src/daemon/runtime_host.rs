@@ -625,8 +625,11 @@ pub(crate) async fn auto_watch_agent_stream_starts(
             continue;
         }
         let group_id = hex::encode(message.group_id.as_slice());
-        let insecure_local =
-            crate::commands::stream::first_quic_candidate_is_loopback(&start.quic_candidates);
+        // Daemon auto-watch is triggered by sender-controlled stream-start
+        // candidates, so it must never select no-cert-verification trust or
+        // resolve to local/private endpoints. Local trust is only ever chosen
+        // via an explicit local user `--insecure-local`, never here.
+        let insecure_local = false;
         let stream_id = start.stream_id_hex;
         if stream_manager.watch_exists(Some(account_id), &group_id, Some(stream_id.as_str())) {
             continue;

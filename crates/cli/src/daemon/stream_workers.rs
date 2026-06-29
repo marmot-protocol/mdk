@@ -391,11 +391,17 @@ pub(crate) async fn open_stream_compose(
         Ok(candidate) => candidate,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
-    let candidate_addr =
-        match crate::commands::stream::resolve_quic_candidate_addr(&parsed_candidate).await {
-            Ok(addr) => addr,
-            Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
-        };
+    // Only an explicit local `--insecure-local` opt-in may resolve to a
+    // local/private endpoint; otherwise reject unsafe candidates.
+    let candidate_addr = match crate::commands::stream::resolve_quic_candidate_addr(
+        &parsed_candidate,
+        insecure_local,
+    )
+    .await
+    {
+        Ok(addr) => addr,
+        Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
+    };
     let trust = match crate::commands::stream::broker_trust(candidate_addr, None, insecure_local) {
         Ok(trust) => trust,
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),

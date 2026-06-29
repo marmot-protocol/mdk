@@ -1137,6 +1137,7 @@ mod tests {
     use super::commands::relay_stats::{relay_stats_output, relay_stats_plain};
     use super::commands::stream::{
         first_quic_candidate_is_loopback, parse_quic_candidate, quic_candidate_host,
+        resolve_quic_candidate_addr,
     };
     use super::{
         Cli, Command, DmError, StreamCommand, daemon, daemon_socket_for_client,
@@ -1597,6 +1598,66 @@ mod tests {
         assert!(!first_quic_candidate_is_loopback(&[
             "quic://quic-broker.ipf.dev:4450".to_owned()
         ]));
+    }
+
+    #[tokio::test]
+    async fn resolve_quic_candidate_rejects_unsafe_endpoints_without_opt_in() {
+        // Numeric IP candidates resolve without network access so this regression
+        // does not depend on DNS. Sender-controlled candidates that resolve to
+        // loopback/private/link-local/ULA must be rejected unless the local user
+        // explicitly opts into local endpoints.
+        for candidate in [
+            "quic://127.0.0.1:4450",          // IPv4 loopback
+            "quic://10.0.0.1:4450",           // RFC1918 private
+            "quic://192.168.1.1:4450",        // RFC1918 private
+            "quic://100.64.0.1:4450",         // shared address space
+            "quic://169.254.169.254:4450",    // link-local cloud metadata
+            "quic://192.0.2.1:4450",          // documentation range
+            "quic://192.88.99.1:4450",        // 6to4 relay anycast
+            "quic://198.18.0.1:4450",         // benchmarking range
+            "quic://224.0.0.1:4450",          // multicast
+            "quic://255.255.255.255:4450",    // limited broadcast
+            "quic://[::1]:4450",              // IPv6 loopback
+            "quic://[::ffff:127.0.0.1]:4450", // IPv4-mapped loopback
+            "quic://[::ffff:10.0.0.1]:4450",  // IPv4-mapped private
+            "quic://[fd00::1]:4450",          // IPv6 unique-local (ULA)
+            "quic://[fe80::1]:4450",          // IPv6 unicast link-local
+            "quic://[ff02::1]:4450",          // IPv6 multicast
+            "quic://[2001::1]:4450",          // Teredo transition prefix
+            "quic://[2001:db8::1]:4450",      // IPv6 documentation range
+            "quic://[2002::1]:4450",          // 6to4 transition prefix
+            "quic://[3fff::1]:4450",          // IPv6 documentation range
+            "quic://0.0.0.0:4450",            // unspecified
+        ] {
+            let parsed = parse_quic_candidate(candidate).expect("candidate parses");
+            let result = resolve_quic_candidate_addr(&parsed, false).await;
+            assert!(
+                matches!(result, Err(DmError::UnsafeQuicCandidateEndpoint { .. })),
+                "expected {candidate} to be rejected without opt-in, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_quic_candidate_allows_local_endpoint_with_opt_in() {
+        // With explicit local opt-in (`--insecure-local`), a loopback candidate
+        // resolves successfully; final loopback trust enforcement still happens in
+        // `broker_trust`/`stream_trust`.
+        let parsed = parse_quic_candidate("quic://127.0.0.1:4450").expect("candidate parses");
+        let addr = resolve_quic_candidate_addr(&parsed, true)
+            .await
+            .expect("loopback resolves with opt-in");
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn resolve_quic_candidate_accepts_public_address() {
+        // A public numeric address is accepted even without local opt-in.
+        let parsed = parse_quic_candidate("quic://93.184.216.34:4450").expect("candidate parses");
+        let addr = resolve_quic_candidate_addr(&parsed, false)
+            .await
+            .expect("public address resolves");
+        assert_eq!(addr.to_string(), "93.184.216.34:4450");
     }
 
     #[test]

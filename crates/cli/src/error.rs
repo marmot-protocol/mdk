@@ -66,6 +66,10 @@ pub(crate) enum DmError {
         candidate: String,
         source: std::io::Error,
     },
+    #[error(
+        "QUIC candidate {candidate} resolved to a local/private endpoint {addr}; pass --insecure-local to allow local endpoints"
+    )]
+    UnsafeQuicCandidateEndpoint { candidate: String, addr: SocketAddr },
     #[error("transcript hash must be 32 bytes, got {0}")]
     InvalidTranscriptHashLength(usize),
     #[error("choose either --server-cert-der-hex or --insecure-local")]
@@ -240,6 +244,12 @@ pub(crate) fn dm_error_json(err: &DmError) -> Value {
             "message": err.to_string(),
             "candidate": candidate,
             "source": source.to_string(),
+        }),
+        DmError::UnsafeQuicCandidateEndpoint { candidate, addr } => json!({
+            "code": "unsafe_quic_candidate_endpoint",
+            "message": err.to_string(),
+            "candidate": candidate,
+            "addr": addr.to_string(),
         }),
         DmError::InvalidTranscriptHashLength(actual) => json!({
             "code": "invalid_transcript_hash",

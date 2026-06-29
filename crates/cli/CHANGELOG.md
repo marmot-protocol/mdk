@@ -7,6 +7,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Security
+
+- Daemon auto-watch of inbound agent stream starts (kind:1200) no longer derives no-cert-verification
+  (`insecure_local`) trust from the sender-controlled `quic://` candidate, and QUIC candidate resolution now rejects
+  sender-provided candidates that resolve to loopback, RFC1918/private, link-local (including `169.254.169.254`),
+  multicast, unspecified, broadcast, IPv6 unique-local (ULA), or IPv6 unicast link-local endpoints. Local endpoints are
+  only reachable when the local user explicitly passes `--insecure-local` (SSRF + trust downgrade hardening).
+
 ## [0.2.0] - 2026-06-21
 
 ### Added

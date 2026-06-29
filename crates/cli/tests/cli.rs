@@ -3436,7 +3436,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
 }
 
 #[test]
-fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
+fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_message() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("dmd.sock");
     let broker = spawn_quic_broker();
@@ -3519,33 +3519,23 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
     });
 
-    poll_json_until(
-        home.path(),
-        &["daemon", "status"],
-        Duration::from_secs(8),
-        |status| {
-            status
-                .get("stream_watches")
-                .and_then(Value::as_array)
-                .is_some_and(|watches| {
-                    watches.iter().any(|watch| {
-                        watch["account"] == bob
-                            && watch["group_id"] == group_id
-                            && watch["stream_id"] == stream_id
-                            && watch["status"] == "running"
-                    })
-                })
-        },
-    );
-
-    subscription.wait_for(Duration::from_secs(20), |line| {
-        matches!(
-            line["result"]["trigger"].as_str(),
-            Some("InitialStreamPreview" | "StreamPreviewUpdated")
-        ) && line["result"]["type"] == "stream_preview"
+    // Daemon auto-watch is triggered by a sender-controlled stream-start
+    // candidate, so it must refuse to connect to the loopback broker: the watch
+    // surfaces a `StreamPreviewFailed` with the unsafe-endpoint code instead of
+    // silently selecting local trust (issue #659). The local composer side still
+    // works because it used an explicit `--insecure-local` opt-in above.
+    let failed = subscription.wait_for(Duration::from_secs(20), |line| {
+        line["result"]["trigger"] == "StreamPreviewFailed"
+            && line["result"]["type"] == "stream_preview"
             && line["result"]["stream_preview"]["stream_id"] == stream_id
-            && line["result"]["stream_preview"]["status"] == "running"
+            && line["result"]["stream_preview"]["status"] == "failed"
     });
+    assert!(
+        failed["result"]["stream_preview"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unsafe_quic_candidate_endpoint")),
+        "auto-watch should fail with the unsafe-endpoint code, got {failed}"
+    );
 
     run_json(
         home.path(),
@@ -3559,13 +3549,6 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
             "hello ",
         ],
     );
-    let delta = subscription.wait_for(Duration::from_secs(20), |line| {
-        line["result"]["trigger"] == "AgentStreamDelta"
-            && line["result"]["type"] == "agent_stream_delta"
-            && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
-            && line["result"]["agent_stream_delta"]["text"] == "hello "
-    });
-    assert_eq!(delta["result"]["agent_stream_delta"]["group_id"], group_id);
 
     run_json(
         home.path(),
@@ -3595,32 +3578,15 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
     assert_eq!(finished["chunk_count"], 2);
     assert!(finished["transcript_hash"].as_str().is_some());
 
-    let mut preview = None;
-    let mut final_marker = None;
-    subscription.wait_until(Duration::from_secs(20), |line| {
-        if line["result"]["trigger"] == "StreamPreviewCompleted"
-            && line["result"]["type"] == "stream_preview"
-            && line["result"]["stream_preview"]["stream_id"] == stream_id
-        {
-            preview = Some(line.clone());
-        }
-        // The kind-9 stream-final now arrives as a normal timeline message; it
-        // is still classified as `agent_stream_final` via its stream tags.
-        if line["result"]["trigger"] == "MessageReceived"
+    // Auto-watch never connected to the loopback broker, so there is no
+    // `StreamPreviewCompleted`. The kind-9 stream-final still arrives as a normal
+    // timeline message over the relay and stays classified as
+    // `agent_stream_final` via its stream tags.
+    let final_marker = subscription.wait_for(Duration::from_secs(20), |line| {
+        line["result"]["trigger"] == "MessageReceived"
             && line["result"]["type"] == "agent_stream_final"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
-        {
-            final_marker = Some(line.clone());
-        }
-        preview.is_some() && final_marker.is_some()
     });
-    let preview = preview.expect("completed stream preview");
-    assert_eq!(preview["result"]["stream_preview"]["text"], "hello world");
-    assert_eq!(
-        preview["result"]["stream_preview"]["transcript_hash"],
-        finished["transcript_hash"]
-    );
-    let final_marker = final_marker.expect("agent stream final marker");
     assert_eq!(
         final_marker["result"]["message"]["agent_text_stream"]["final_text_or_reference"],
         "hello world"
@@ -3631,7 +3597,8 @@ fn tui_style_stream_compose_auto_watches_and_publishes_final_message() {
 }
 
 #[test]
-fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env() {
+fn daemon_defaults_create_identities_and_block_loopback_auto_watch_without_manual_sync_or_relay_env()
+ {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("dmd.sock");
     let broker = spawn_quic_broker();
@@ -3791,34 +3758,34 @@ fn daemon_defaults_create_identities_and_stream_without_manual_sync_or_relay_env
     assert_eq!(finished["status"], "finished");
     assert_eq!(finished["text"], "hello stream");
 
-    let mut delta_seen = false;
-    let mut preview = None;
+    // Daemon auto-watch refuses the sender-controlled loopback candidate, so it
+    // emits a `StreamPreviewFailed` with the unsafe-endpoint code rather than
+    // streaming deltas/preview (issue #659). The kind-9 stream-final still
+    // arrives as a normal timeline message over the relay.
+    let mut failed = None;
     let mut final_marker = None;
     subscription.wait_until(Duration::from_secs(20), |line| {
-        if line["result"]["trigger"] == "AgentStreamDelta"
-            && line["result"]["type"] == "agent_stream_delta"
-            && line["result"]["agent_stream_delta"]["stream_id"] == stream_id
-        {
-            delta_seen = true;
-        }
-        if line["result"]["trigger"] == "StreamPreviewCompleted"
+        if line["result"]["trigger"] == "StreamPreviewFailed"
             && line["result"]["type"] == "stream_preview"
             && line["result"]["stream_preview"]["stream_id"] == stream_id
         {
-            preview = Some(line.clone());
+            failed = Some(line.clone());
         }
-        // The kind-9 stream-final now arrives as a normal timeline message; it
-        // is still classified as `agent_stream_final` via its stream tags.
         if line["result"]["trigger"] == "MessageReceived"
             && line["result"]["type"] == "agent_stream_final"
             && line["result"]["message"]["agent_text_stream"]["stream_id"] == stream_id
         {
             final_marker = Some(line.clone());
         }
-        delta_seen && preview.is_some() && final_marker.is_some()
+        failed.is_some() && final_marker.is_some()
     });
-    let preview = preview.expect("completed stream preview");
-    assert_eq!(preview["result"]["stream_preview"]["text"], "hello stream");
+    let failed = failed.expect("failed stream preview");
+    assert!(
+        failed["result"]["stream_preview"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unsafe_quic_candidate_endpoint")),
+        "auto-watch should fail with the unsafe-endpoint code, got {failed}"
+    );
     let final_marker = final_marker.expect("agent stream final marker");
     assert_eq!(
         final_marker["result"]["message"]["agent_text_stream"]["final_text_or_reference"],
