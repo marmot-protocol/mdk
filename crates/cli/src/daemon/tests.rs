@@ -452,6 +452,40 @@ async fn daemon_request_reader_rejects_oversized_requests() {
 }
 
 #[tokio::test]
+async fn daemon_request_reader_size_cap_excludes_the_framing_newline() {
+    // A frame whose payload is exactly MAX_DAEMON_REQUEST_BYTES, followed by the
+    // framing newline (MAX + 1 bytes on the wire), is within the cap: the size
+    // check counts payload bytes only. It must get past the size gate and fail
+    // at JSON parsing instead of being rejected as oversized. This guards the
+    // BufReader + take().read_until() rewrite, which now strips the trailing
+    // newline before the cap check.
+    let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
+    let writer = tokio::spawn(async move {
+        let mut frame = vec![b'a'; MAX_DAEMON_REQUEST_BYTES];
+        frame.push(b'\n');
+        client
+            .write_all(&frame)
+            .await
+            .expect("write max-size frame");
+        client.shutdown().await.expect("shutdown client");
+    });
+
+    let err = read_daemon_request(&mut server)
+        .await
+        .expect_err("a non-JSON payload at the cap should fail to parse");
+
+    assert!(
+        !err.to_string().contains("daemon request exceeds"),
+        "max-size payload must clear the size cap, got: {err}"
+    );
+    assert!(
+        err.downcast_ref::<serde_json::Error>().is_some(),
+        "expected a JSON parse error, got: {err}"
+    );
+    writer.await.expect("writer task");
+}
+
+#[tokio::test]
 async fn daemon_request_reader_times_out_on_stalled_client() {
     // A same-UID client that connects but never sends a newline-terminated
     // frame must not wedge the accept loop. The bounded read returns a

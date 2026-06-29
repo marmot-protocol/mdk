@@ -302,28 +302,30 @@ pub(crate) async fn read_daemon_request(
     stream: &mut UnixStream,
 ) -> Result<DaemonRequest, Box<dyn std::error::Error + Send + Sync>> {
     let mut request = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        let read = stream.read(&mut byte).await?;
-        if read == 0 {
-            if request.is_empty() {
-                return Err(DaemonClientError::EmptyResponse.into());
-            }
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        if request.len() == MAX_DAEMON_REQUEST_BYTES {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("daemon request exceeds {MAX_DAEMON_REQUEST_BYTES} bytes"),
-            )
-            .into());
-        }
-        request.push(byte[0]);
+    // Buffer the raw stream so a near-1-MiB frame (e.g. an `Execute` request
+    // carrying the whole `Cli`) costs a handful of `read()` syscalls instead of
+    // one per byte. Cap the read at one byte past the limit so a client that
+    // never sends a newline cannot make us buffer unbounded memory before the
+    // size check runs (read_until on a Take adapter stops silently at the limit
+    // instead of erroring). Mirrors agent-control's `read_frame`.
+    let limit = (MAX_DAEMON_REQUEST_BYTES + 1) as u64;
+    let read = {
+        let mut reader = BufReader::new(&mut *stream).take(limit);
+        reader.read_until(b'\n', &mut request).await?
+    };
+    if read == 0 {
+        return Err(DaemonClientError::EmptyResponse.into());
     }
-    Ok(serde_json::from_slice(&request)?)
+    // The size cap counts payload bytes only, excluding the framing newline.
+    let payload = request.strip_suffix(b"\n").unwrap_or(&request);
+    if payload.len() > MAX_DAEMON_REQUEST_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("daemon request exceeds {MAX_DAEMON_REQUEST_BYTES} bytes"),
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(payload)?)
 }
 
 /// Read a daemon request frame, but give up after `timeout` if the client

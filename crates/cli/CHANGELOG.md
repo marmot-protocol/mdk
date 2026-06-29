@@ -15,6 +15,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   multicast, unspecified, broadcast, IPv6 unique-local (ULA), or IPv6 unicast link-local endpoints. Local endpoints are
   only reachable when the local user explicitly passes `--insecure-local` (SSRF + trust downgrade hardening).
 
+### Fixed
+
+- `dmd` now buffers daemon request frames before scanning for the newline delimiter, avoiding one async `read()` call per
+  byte for large `Execute` requests while preserving the existing 1 MiB request cap and stalled-client timeout.
+
 ## [0.2.0] - 2026-06-21
 
 ### Added
