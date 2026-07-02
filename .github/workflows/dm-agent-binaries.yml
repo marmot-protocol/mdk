@@ -1,0 +1,418 @@
+name: dm-agent Binaries
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/dm-agent-binaries.yml
+      - scripts/install-hermes-marmot.sh
+      - integrations/hermes/marmot/**
+      - scripts/install-openclaw-marmot.sh
+      - integrations/openclaw/marmot/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/agent-connector/**
+      - crates/agent-control/**
+      - crates/agent-stream-compose/**
+      - crates/cgka-engine/**
+      - crates/cgka-session/**
+      - crates/marmot-account/**
+      - crates/marmot-app/**
+      - crates/storage-sqlite/**
+      - crates/traits/**
+      - crates/transport-nostr-adapter/**
+      - crates/transport-nostr-peeler/**
+      - crates/transport-quic-broker/**
+      - crates/transport-quic-stream/**
+  push:
+    branches:
+      - master
+    tags:
+      - dm-agent-v*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dm-agent-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  build:
+    name: Build dm-agent (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux-x86_64
+            rust_target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: linux-aarch64
+            rust_target: aarch64-unknown-linux-gnu
+          - runner: macos-latest
+            target: darwin-aarch64
+            rust_target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: darwin-x86_64
+            rust_target: x86_64-apple-darwin
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --target "${{ matrix.rust_target }}"
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build dm-agent
+        run: cargo build --locked --release -p agent-connector --bin dm-agent --target "${{ matrix.rust_target }}"
+
+      - name: Smoke test dm-agent
+        run: ./target/${{ matrix.rust_target }}/release/dm-agent --help
+
+      - name: Package dm-agent bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          rust_target="${{ matrix.rust_target }}"
+          sha_short="${GITHUB_SHA::12}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          release_tag=""
+          artifact_version="$sha_short"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+            if [[ ! "$release_tag" =~ ^dm-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: dm-agent releases must use a version tag like dm-agent-v0.1.0" >&2
+              exit 1
+            fi
+            artifact_version="${release_tag#dm-agent-v}"
+            if [ "$artifact_version" != "$workspace_version" ]; then
+              echo "error: dm-agent release version $artifact_version does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
+          fi
+          lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          stage_parent="$RUNNER_TEMP/dm-agent-stage"
+          bundle_dir="$stage_parent/dm-agent-$target"
+          asset="$RUNNER_TEMP/dm-agent-$target-$artifact_version.tar.gz"
+
+          rm -rf "$stage_parent" "$asset" "$asset.sha256"
+          mkdir -p "$bundle_dir"
+          install -m 0755 "target/$rust_target/release/dm-agent" "$bundle_dir/dm-agent"
+
+          cat > "$bundle_dir/manifest.json" <<EOF
+          {
+            "name": "dm-agent",
+            "target": "$target",
+            "rust_target": "$rust_target",
+            "release_tag": "$release_tag",
+            "artifact_version": "$artifact_version",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version",
+            "cargo_lock_sha256": "$lock_sha",
+            "rustc": "$(rustc --version)",
+            "cargo": "$(cargo --version)",
+            "contents": [
+              "dm-agent",
+              "manifest.json"
+            ]
+          }
+          EOF
+
+          (
+            cd "$stage_parent"
+            tar -czf "$asset" "dm-agent-$target"
+          )
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p "dist/dm-agent-$target"
+          cp "$asset" "$asset.sha256" "dist/dm-agent-$target/"
+
+      - name: Upload dm-agent bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dm-agent-${{ matrix.target }}
+          path: dist/dm-agent-${{ matrix.target }}/*
+          if-no-files-found: error
+
+  plugin:
+    name: Package Hermes plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Package Hermes Marmot plugin bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_short="${GITHUB_SHA::12}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          release_tag=""
+          artifact_version="$sha_short"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+            if [[ ! "$release_tag" =~ ^dm-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: dm-agent releases must use a version tag like dm-agent-v0.1.0" >&2
+              exit 1
+            fi
+            artifact_version="${release_tag#dm-agent-v}"
+            if [ "$artifact_version" != "$workspace_version" ]; then
+              echo "error: dm-agent release version $artifact_version does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
+          fi
+          stage_parent="$RUNNER_TEMP/hermes-marmot-plugin-stage"
+          bundle_dir="$stage_parent/hermes-marmot-plugin"
+          asset="$RUNNER_TEMP/hermes-marmot-plugin-$artifact_version.tar.gz"
+
+          rm -rf "$stage_parent" "$asset" "$asset.sha256"
+          mkdir -p "$bundle_dir"
+          cp integrations/hermes/marmot/plugin.yaml "$bundle_dir/"
+          cp integrations/hermes/marmot/__init__.py "$bundle_dir/"
+          cp integrations/hermes/marmot/adapter.py "$bundle_dir/"
+          cp integrations/hermes/marmot/README.md "$bundle_dir/"
+
+          cat > "$bundle_dir/manifest.json" <<EOF
+          {
+            "name": "hermes-marmot-plugin",
+            "release_tag": "$release_tag",
+            "artifact_version": "$artifact_version",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version",
+            "contents": [
+              "plugin.yaml",
+              "__init__.py",
+              "adapter.py",
+              "README.md",
+              "manifest.json"
+            ]
+          }
+          EOF
+
+          (
+            cd "$stage_parent"
+            tar -czf "$asset" "hermes-marmot-plugin"
+          )
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p dist/hermes-marmot-plugin
+          cp "$asset" "$asset.sha256" dist/hermes-marmot-plugin/
+
+      - name: Upload Hermes plugin bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: hermes-marmot-plugin
+          path: dist/hermes-marmot-plugin/*
+          if-no-files-found: error
+
+  openclaw-plugin:
+    name: Package OpenClaw plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Package OpenClaw Marmot plugin tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_short="${GITHUB_SHA::12}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          artifact_version="$sha_short"
+          release_tag=""
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+            if [[ ! "$release_tag" =~ ^dm-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: dm-agent releases must use a version tag like dm-agent-v0.1.0" >&2
+              exit 1
+            fi
+            artifact_version="${release_tag#dm-agent-v}"
+            if [ "$artifact_version" != "$workspace_version" ]; then
+              echo "error: release version $artifact_version does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
+          fi
+          corepack enable
+          corepack prepare pnpm@10.13.1 --activate
+          packed_dir="$RUNNER_TEMP/openclaw-pack"
+          rm -rf "$packed_dir"; mkdir -p "$packed_dir"
+          # Build dist/ before packing: package.json#files ships dist (which is
+          # gitignored), and the gateway requires compiled runtime output rather
+          # than the TypeScript sources.
+          ( cd integrations/openclaw/marmot && pnpm install --frozen-lockfile && pnpm build )
+          # Provenance manifest (release.md requires one in each artifact); ships
+          # via package.json#files alongside the built plugin.
+          cat > integrations/openclaw/marmot/manifest.json <<EOF
+          {
+            "name": "openclaw-marmot-plugin",
+            "release_tag": "$release_tag",
+            "artifact_version": "$artifact_version",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version"
+          }
+          EOF
+          # On a release tag, sync the tarball's package version to the cohort
+          # (dm-agent / workspace version). Off-tag validation runs keep 0.1.0.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            ( cd integrations/openclaw/marmot && npm pkg set version="$artifact_version" )
+          fi
+          ( cd integrations/openclaw/marmot && pnpm pack --pack-destination "$packed_dir" )
+          packed="$(ls "$packed_dir"/*.tgz | head -n 1)"
+          asset="$RUNNER_TEMP/openclaw-marmot-plugin-$artifact_version.tgz"
+          mv "$packed" "$asset"
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p dist/openclaw-marmot-plugin
+          cp "$asset" "$asset.sha256" dist/openclaw-marmot-plugin/
+
+      - name: Upload OpenClaw plugin tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openclaw-marmot-plugin
+          path: dist/openclaw-marmot-plugin/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish dm-agent release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/dm-agent-v')
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - plugin
+      - openclaw-plugin
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/plugin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dm-agent-linux-x86_64 --dir dist/linux
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dm-agent-linux-aarch64 --dir dist/linux-arm
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dm-agent-darwin-aarch64 --dir dist/darwin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dm-agent-darwin-x86_64 --dir dist/darwin-intel
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name hermes-marmot-plugin --dir dist/plugin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name openclaw-marmot-plugin --dir dist/plugin
+
+      - name: Prepare versioned installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#dm-agent-v}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ ! "$tag" =~ ^dm-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: dm-agent releases must use a version tag like dm-agent-v0.1.0" >&2
+            exit 1
+          fi
+          if [ "$version" != "$workspace_version" ]; then
+            echo "error: dm-agent release version $version does not match workspace version $workspace_version" >&2
+            exit 1
+          fi
+
+          mkdir -p dist/install
+          sed \
+            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
+            -e "s/^DM_AGENT_VERSION_DEFAULT=.*/DM_AGENT_VERSION_DEFAULT=\"${version}\"/" \
+            scripts/install-hermes-marmot.sh > dist/install/install-hermes-marmot.sh
+          chmod 0755 dist/install/install-hermes-marmot.sh
+          sed \
+            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
+            -e "s/^DM_AGENT_VERSION_DEFAULT=.*/DM_AGENT_VERSION_DEFAULT=\"${version}\"/" \
+            scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
+          chmod 0755 dist/install/install-openclaw-marmot.sh
+
+      - name: Create or update dm-agent release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#dm-agent-v}"
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          DM Agent \`$version\` from Darkmatter commit \`$GITHUB_SHA\`.
+
+          Install with:
+
+          \`\`\`sh
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-hermes-marmot.sh | bash
+          \`\`\`
+
+          Assets:
+          - \`dm-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
+          - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
+          - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
+          - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
+          - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
+
+          Verify downloads with the accompanying \`.sha256\` files.
+          EOF
+
+          assets=(
+            dist/linux/dm-agent-linux-x86_64-"$version".tar.gz
+            dist/linux/dm-agent-linux-x86_64-"$version".tar.gz.sha256
+            dist/linux-arm/dm-agent-linux-aarch64-"$version".tar.gz
+            dist/linux-arm/dm-agent-linux-aarch64-"$version".tar.gz.sha256
+            dist/darwin/dm-agent-darwin-aarch64-"$version".tar.gz
+            dist/darwin/dm-agent-darwin-aarch64-"$version".tar.gz.sha256
+            dist/darwin-intel/dm-agent-darwin-x86_64-"$version".tar.gz
+            dist/darwin-intel/dm-agent-darwin-x86_64-"$version".tar.gz.sha256
+            dist/plugin/hermes-marmot-plugin-"$version".tar.gz
+            dist/plugin/hermes-marmot-plugin-"$version".tar.gz.sha256
+            dist/plugin/openclaw-marmot-plugin-"$version".tgz
+            dist/plugin/openclaw-marmot-plugin-"$version".tgz.sha256
+            dist/install/install-hermes-marmot.sh
+            dist/install/install-openclaw-marmot.sh
+          )
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "DM Agent $version" --notes-file "$notes" --prerelease
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "DM Agent $version" \
+              --notes-file "$notes" \
+              --prerelease
+          fi

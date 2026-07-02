@@ -1,0 +1,14 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "IngestOutcome::Stale\n{\n    reason: StaleReason::AlreadyAtEpoch\n    { current: EpochId(2), msg_epoch: EpochId(1), }\n}"
+---
+{
+  "Stale": {
+    "reason": {
+      "AlreadyAtEpoch": {
+        "current": 2,
+        "msg_epoch": 1
+      }
+    }
+  }
+}

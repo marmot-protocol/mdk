@@ -1,0 +1,32 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: openmls_payload
+---
+{
+  "kind": "open_mls_wire",
+  "message": {
+    "id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "payload": [
+      171,
+      205
+    ],
+    "timestamp": 1717171717,
+    "causal_deps": [],
+    "source": "nostr",
+    "envelope": {
+      "GroupMessage": {
+        "transport_group_id": [
+          204,
+          204,
+          204,
+          204
+        ]
+      }
+    }
+  }
+}

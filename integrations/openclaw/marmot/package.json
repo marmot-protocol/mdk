@@ -1,0 +1,35 @@
+{
+  "name": "@darkmatter/openclaw-marmot",
+  "version": "0.2.0",
+  "description": "OpenClaw channel plugin for Marmot through the local dm-agent control socket",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "setupEntry": "./setup-entry.ts",
+    "channel": {
+      "id": "marmot",
+      "label": "Marmot",
+      "blurb": "End-to-end encrypted Marmot groups through the local dm-agent connector."
+    }
+  },
+  "files": ["dist", "index.ts", "setup-entry.ts", "src", "openclaw.plugin.json", "manifest.json", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoketest": "node ./scripts/dm-agent-smoketest.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "openclaw": "2026.6.8",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

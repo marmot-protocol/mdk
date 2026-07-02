@@ -1,0 +1,15 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "CapabilityRequirement\n{\n    requires: Capability::Extension(0xF2EB), level:\n    RequirementLevel::TransportRequired { transport: TransportKind::Nostr },\n    description: \"nostr metadata\",\n}"
+---
+{
+  "requires": {
+    "Extension": 62187
+  },
+  "level": {
+    "TransportRequired": {
+      "transport": "Nostr"
+    }
+  },
+  "description": "nostr metadata"
+}

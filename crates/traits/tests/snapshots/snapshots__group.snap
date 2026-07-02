@@ -1,0 +1,35 @@
+---
+source: crates/traits/tests/snapshots.rs
+assertion_line: 510
+expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for ops talk\".into(), epoch:\n    EpochId(3), members: vec![Member { id: mem_id(), credential: vec![], }],\n    required_capabilities: GroupCapabilities::default(),\n}"
+---
+{
+  "id": [
+    170,
+    170,
+    170,
+    170
+  ],
+  "name": "ops",
+  "description": "for ops talk",
+  "epoch": 3,
+  "members": [
+    {
+      "id": [
+        97,
+        108,
+        105,
+        99,
+        101
+      ],
+      "credential": []
+    }
+  ],
+  "required_capabilities": {
+    "proposals": [],
+    "extensions": [],
+    "app_components": {
+      "ids": []
+    }
+  }
+}

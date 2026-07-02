@@ -1,0 +1,277 @@
+{
+  "manifest_version": "1",
+  "updated": "2026-05-13",
+  "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
+  "entries": [
+    {
+      "id": "three-client-message-exchange/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "three-client-message-exchange.v1.json",
+      "coverage": [
+        "group creation with two invitees",
+        "welcome processing",
+        "same-epoch application messages",
+        "implementation-neutral trace comparison"
+      ],
+      "next": "Keep as the smoke fixture for independent implementations."
+    },
+    {
+      "id": "publish-fail/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "publish-fail.v1.json",
+      "coverage": [
+        "publish-before-apply rollback",
+        "pending publish failure",
+        "stable pre-publish epoch after rollback"
+      ],
+      "next": "Use as the smoke fixture for pending rollback traces."
+    },
+    {
+      "id": "invite-member/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "invite-member.v1.json",
+      "coverage": [
+        "post-create member invite",
+        "welcome processing for new member",
+        "member-add observation"
+      ],
+      "next": "Use as the basic invite lifecycle fixture."
+    },
+    {
+      "id": "invite-publish-fail/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "invite-publish-fail.v1.json",
+      "coverage": [
+        "invite rollback",
+        "pending publish failure after stable group creation",
+        "pre-invite epoch and member state"
+      ],
+      "next": "Use as the invite-side pending rollback fixture."
+    },
+    {
+      "id": "group-data-update/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "group-data-update.v1.json",
+      "coverage": [
+        "group data update commit",
+        "recipient epoch advance",
+        "stable member set across metadata update"
+      ],
+      "next": "Extend with explicit group profile state once ScenarioTrace carries component state."
+    },
+    {
+      "id": "admin-policy-update/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "admin-policy-update.v1.json",
+      "coverage": [
+        "non-admin admin-policy update rejection",
+        "invalid empty admin-policy rejection",
+        "admin promotion through app-component update",
+        "promoted member group-data update",
+        "admin self-demotion through app-component update",
+        "admin-policy convergence across clients"
+      ],
+      "next": "Extend with fork-recovery races between competing admin-policy updates."
+    },
+    {
+      "id": "group-data-fork-recovery/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "group-data-fork-recovery.v1.json",
+      "coverage": [
+        "same-epoch group-data update race",
+        "semantic fork recovery outcome",
+        "rollback recovery observation"
+      ],
+      "next": "Use as the first semantic portable fork-recovery fixture and extend this style to invite races."
+    },
+    {
+      "id": "concurrent-invite-fork-recovery/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "concurrent-invite-fork-recovery.v1.json",
+      "coverage": [
+        "same-epoch invite race",
+        "semantic fork recovery outcome",
+        "post-recovery member count"
+      ],
+      "next": "Extend the trace format so the selected branch member identity can be asserted portably."
+    },
+    {
+      "id": "drop-queued/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "drop-queued.v1.json",
+      "coverage": [
+        "explicit queue drop fault",
+        "application payload non-delivery",
+        "stable recipient state after loss"
+      ],
+      "next": "Use as the smallest scheduled-delivery-fault fixture."
+    },
+    {
+      "id": "queue-faults/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "queue-faults.v1.json",
+      "coverage": [
+        "duplicate queued message",
+        "delayed queued message",
+        "queued message reorder"
+      ],
+      "next": "Use as the compact queue scheduler fixture."
+    },
+    {
+      "id": "partition-clear-leave/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "partition-clear-leave.v1.json",
+      "coverage": [
+        "partitioned delivery",
+        "partition heal",
+        "self-remove leave flow"
+      ],
+      "next": "Extend with multi-member leave and admin-policy variants."
+    },
+    {
+      "id": "delayed-past-epoch-app-message/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "delayed-past-epoch-app-message.v1.json",
+      "coverage": [
+        "retained epoch context peel",
+        "past-epoch application message acceptance",
+        "late payload delivery after group epoch advance"
+      ],
+      "next": "Use as the retained-anchor app-message fixture."
+    },
+    {
+      "id": "restart-delivery-faults/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "restart-delivery-faults.v1.json",
+      "coverage": [
+        "engine restart over durable in-memory storage",
+        "stable group hydration after restart",
+        "delayed duplicate delivery after restart",
+        "single app payload emission after replay"
+      ],
+      "next": "Use as the restart-plus-delivery-fault fixture."
+    },
+    {
+      "id": "convergence-e2e-group-events/v1",
+      "kind": "scenario",
+      "status": "rust_only_bridge",
+      "coverage": [
+        "real Nostr peeler ingress",
+        "same-epoch invite race",
+        "canonical branch application payload",
+        "losing branch payload exclusion"
+      ],
+      "next": "Promote to a portable scenario vector after the trace format covers its selected-branch payload checks."
+    },
+    {
+      "id": "welcome-before-commit-rejects-commit-echo/v1",
+      "kind": "scenario",
+      "status": "rust_only",
+      "coverage": [
+        "welcome before matching invite commit",
+        "terminal stale commit classification for invitee echo"
+      ],
+      "next": "Promote to a portable scenario vector once stale classifications are part of the trace format."
+    },
+    {
+      "id": "send-leave/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "arbitrary send and leave intent sequences",
+        "event conservation",
+        "seeded report artifacts"
+      ],
+      "next": "Promote only minimized failures or cases that should become named contracts."
+    },
+    {
+      "id": "convergence-e2e-delivery/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "duplicate delivery",
+        "delay and release",
+        "reorder before convergence observation"
+      ],
+      "next": "Promote only selected variants after their semantic recovery outcomes are stable."
+    },
+    {
+      "id": "convergence-chaos/v1",
+      "kind": "generated_scenario_family",
+      "status": "generated",
+      "coverage": [
+        "same-epoch invite fork recovery",
+        "same-epoch group-data fork recovery",
+        "publish rollback with duplicate delayed delivery",
+        "partition heal and leave",
+        "delayed past-epoch application delivery",
+        "duplicate delay and reorder queue faults",
+        "20+ client message storms",
+        "20+ client partitioned delivery storms",
+        "multi-committer group-data storms",
+        "mixed large message and commit storms",
+        "restart plus duplicate delivery",
+        "greedy generated-failure minimization"
+      ],
+      "next": "Run seeded batches, promote only cases we want named, and improve the minimizer."
+    },
+    {
+      "id": "selector-policy-cases/v1",
+      "kind": "formal_case_fixture",
+      "status": "portable_policy_fixture",
+      "artifact": "../../../formal/tamarin/policy_cases.json",
+      "coverage": [
+        "Tamarin-derived branch selector cases",
+        "candidate order invariance"
+      ],
+      "next": "Keep this linked to formal model names and Rust selector tests."
+    },
+    {
+      "id": "marmot.transport.nostr.routing.v1/state-valid-two-relays/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-routing-v1-valid-state.v1.json",
+      "coverage": [
+        "component state bytes",
+        "sorted relay list",
+        "32-byte Nostr group routing id"
+      ],
+      "next": "Use as the first cross-implementation app-component state decode vector."
+    },
+    {
+      "id": "marmot.transport.nostr.routing.v1/update-valid-two-relays/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-routing-v1-valid-update.v1.json",
+      "coverage": [
+        "component update bytes",
+        "relay-only update payload"
+      ],
+      "next": "Use as the first cross-implementation app-component update decode vector."
+    },
+    {
+      "id": "marmot.transport.nostr.routing.v1/update-invalid-duplicate-relay/v1",
+      "kind": "byte_fixture",
+      "status": "portable",
+      "artifact": "byte-fixtures/nostr-routing-v1-invalid-duplicate-relay.v1.json",
+      "coverage": [
+        "component update validation",
+        "duplicate relay rejection"
+      ],
+      "next": "Add unsorted, malformed URL, and oversized relay-list vectors."
+    }
+  ]
+}

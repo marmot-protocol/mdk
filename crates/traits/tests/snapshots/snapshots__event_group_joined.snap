@@ -1,0 +1,28 @@
+---
+source: crates/traits/tests/snapshots.rs
+assertion_line: 416
+expression: "GroupEvent::GroupJoined\n{ group_id: gid(), via_welcome: mid(), welcomer: Some(mem_id()), }"
+---
+{
+  "GroupJoined": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "via_welcome": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "welcomer": [
+      97,
+      108,
+      105,
+      99,
+      101
+    ]
+  }
+}

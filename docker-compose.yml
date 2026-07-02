@@ -1,0 +1,177 @@
+services:
+  setup:
+    image: busybox:1.37.0
+    volumes:
+      - ./dev/data:/data
+    command: >
+      sh -c "
+        mkdir -p /data/nostr-rs-relay /data/strfry-db &&
+        chown 1000:1000 /data/nostr-rs-relay /data/strfry-db &&
+        chmod 750 /data/nostr-rs-relay /data/strfry-db &&
+        echo 'Data directories created successfully'
+      "
+
+  nostr-rs-relay:
+    image: scsibug/nostr-rs-relay:0.9.0
+    platform: linux/amd64
+    ports:
+      - "127.0.0.1:28080:8080"
+    volumes:
+      - ./dev/data/nostr-rs-relay:/usr/src/app/db
+      - ./dev/nostr-rs-relay-config.toml:/usr/src/app/config.toml:ro
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  strfry-nostr-relay:
+    image: dockurr/strfry:1.0.4
+    ports:
+      - "127.0.0.1:27777:7777"
+    volumes:
+      - ./dev/strfry.conf:/etc/strfry.conf:ro
+      - ./dev/data/strfry-db:/app/strfry-db
+    restart: unless-stopped
+    command: ["./strfry", "relay", "-v", "1"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  quic-broker:
+    image: marmot-quic-broker:local
+    build:
+      context: .
+      dockerfile: Dockerfile.quic-broker
+    ports:
+      - "127.0.0.1:4450:4450/udp"
+    restart: unless-stopped
+    command: ["--bind", "0.0.0.0:4450"]
+
+  hermes-marmot-phone-test:
+    profiles: ["hermes-phone-test"]
+    image: hermes-marmot-phone-test:local
+    build:
+      context: .
+      dockerfile: Dockerfile.hermes-marmot
+      args:
+        HERMES_AGENT_REPO_URL: ${HERMES_AGENT_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}
+        HERMES_AGENT_REF: ${HERMES_AGENT_REF:-}
+    environment:
+      MARMOT_HOME: /data/marmot-agent
+      HERMES_HOME: /data/hermes-home
+      MARMOT_AGENT_SOCKET: /run/marmot-agent/dm-agent.sock
+      MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
+      MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
+      MARMOT_AGENT_SOCKET_MODE: "0660"
+      MARMOT_AGENT_ALLOW_ANY: "1"
+      MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
+      MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
+      HERMES_MARMOT_AUTO_BOOTSTRAP: "1"
+      HERMES_MARMOT_START_GATEWAY: "1"
+      HERMES_MARMOT_STREAMING: ${HERMES_MARMOT_STREAMING:-1}
+      HERMES_MARMOT_STREAMING_TRANSPORT: ${HERMES_MARMOT_STREAMING_TRANSPORT:-auto}
+      HERMES_MARMOT_TOOL_PROGRESS: ${HERMES_MARMOT_TOOL_PROGRESS:-off}
+      HERMES_MARMOT_INTERIM_MESSAGES: ${HERMES_MARMOT_INTERIM_MESSAGES:-0}
+      HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS: ${HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS:-0}
+      HERMES_MARMOT_BUSY_ACK_DETAIL: ${HERMES_MARMOT_BUSY_ACK_DETAIL:-0}
+      MARMOT_PROFILE_NAME_ONBOARDING: ${MARMOT_PROFILE_NAME_ONBOARDING:-1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      HERMES_MODEL: ${HERMES_MODEL:-}
+      HERMES_PROVIDER: ${HERMES_PROVIDER:-}
+    tmpfs:
+      - /run/marmot-agent
+    volumes:
+      - hermes-marmot-phone-test-data:/data
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+  openclaw-marmot-phone-test:
+    profiles: ["openclaw-phone-test"]
+    image: openclaw-marmot-phone-test:local
+    build:
+      context: .
+      dockerfile: Dockerfile.openclaw-marmot
+      args:
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-2026.6.8}
+    environment:
+      MARMOT_HOME: /data/marmot-agent
+      OPENCLAW_HOME: /data/openclaw-home
+      MARMOT_AGENT_SOCKET: /run/marmot-agent/dm-agent.sock
+      MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
+      MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
+      MARMOT_AGENT_SOCKET_MODE: "0660"
+      MARMOT_AGENT_ALLOW_ANY: "1"
+      MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
+      MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
+      MARMOT_STREAM_MODE: ${MARMOT_STREAM_MODE:-block}
+      # The agent offers to publish a public Nostr profile name when it joins a
+      # group (on by default; the user's in-chat reply is the consent). Uncomment
+      # to disable that prompt:
+      # MARMOT_PROFILE_NAME_ONBOARDING: "0"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+    tmpfs:
+      - /run/marmot-agent
+    volumes:
+      - openclaw-marmot-phone-test-data:/data
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+  # Self-contained local harness: a real OpenClaw gateway + Marmot plugin +
+  # dm-agent wired to the in-repo nostr relay + QUIC broker (no public relays,
+  # no phone needed). dm-agent runs with --allow-any + --debug-controls so an
+  # inbound message can be injected over the control socket to wire/validate the
+  # inbound->agent turn dispatch and live-preview paths.
+  openclaw-gateway:
+    profiles: ["openclaw-gateway"]
+    image: openclaw-marmot-gateway:local
+    build:
+      context: .
+      dockerfile: Dockerfile.openclaw-marmot
+      args:
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-2026.6.8}
+    environment:
+      MARMOT_HOME: /data/marmot-agent
+      OPENCLAW_HOME: /data/openclaw-home
+      MARMOT_AGENT_SOCKET: /run/marmot-agent/dm-agent.sock
+      MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
+      MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
+      MARMOT_AGENT_SOCKET_MODE: "0660"
+      MARMOT_AGENT_ALLOW_ANY: "1"
+      MARMOT_AGENT_DEBUG_CONTROLS: "1"
+      MARMOT_RELAYS: ws://nostr-rs-relay:8080
+      MARMOT_QUIC_CANDIDATES: quic://quic-broker:4450
+      MARMOT_STREAM_MODE: ${MARMOT_STREAM_MODE:-block}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+    depends_on:
+      nostr-rs-relay:
+        condition: service_started
+      quic-broker:
+        condition: service_started
+    tmpfs:
+      - /run/marmot-agent
+    volumes:
+      - openclaw-marmot-gateway-data:/data
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  hermes-marmot-phone-test-data:
+  openclaw-marmot-phone-test-data:
+  openclaw-marmot-gateway-data:

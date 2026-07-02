@@ -1,0 +1,10 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendResult::GroupCreated\n{ welcomes: vec![], pending: PendingStateRef::new(7), }"
+---
+{
+  "GroupCreated": {
+    "welcomes": [],
+    "pending": 7
+  }
+}

@@ -1,28 +1,15 @@
 /target
-
 .DS_Store
 
-# Coverage reports
-coverage/
-*.profraw
-*.profdata
+# Python bytecode (Hermes plugin tests, etc.)
+__pycache__/
+*.py[cod]
 
-# Audit related files
-/docs/audits
+# Rust build outputs at any workspace depth
+target/
 
-# Editor specific files
-.vscode/
+plans/
+reviews/
 
-# AI Agent files and directories
-.claude/
-.cursor/
-.opencode/
-.aider/
-.cody/
-.continue/
-.github-copilot/
-Plans/
-/reviews/
-
-# Android build artifacts
-**/jniLibs/
+# Local Docker relay state.
+dev/data/

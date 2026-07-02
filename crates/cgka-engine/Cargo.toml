@@ -1,0 +1,41 @@
+[package]
+name = "cgka-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "OpenMLS-backed CGKA engine implementation."
+
+[dependencies]
+cgka-traits.workspace = true
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_memory_storage.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+tls_codec = { workspace = true, features = ["derive", "std"] }
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+hex.workspace = true
+marmot-forensics.workspace = true
+rand.workspace = true
+sha2.workspace = true
+# Pure-Rust secp256k1 used only to validate that a Marmot credential identity
+# is a well-formed BIP-340 x-only public key (foundation/identity.md). Already
+# resolved transitively via openmls_rust_crypto -> hpke-rs-rust-crypto -> k256;
+# enabling the `schnorr` feature here pulls in BIP-340 x-only point validation.
+k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+
+[dev-dependencies]
+storage-sqlite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+test-log.workspace = true
+insta.workspace = true
+tempfile.workspace = true
+# Integration tests derive deterministic, spec-valid x-only secp256k1 identities
+# from ergonomic seed labels (see the `pad32` helper in tests/).
+k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+sha2.workspace = true

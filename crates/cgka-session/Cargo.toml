@@ -1,0 +1,26 @@
+[package]
+name = "cgka-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+cgka-engine.workspace = true
+cgka-traits.workspace = true
+marmot-forensics.workspace = true
+storage-sqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+hex.workspace = true
+nostr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+transport-nostr-adapter.workspace = true
+transport-nostr-peeler.workspace = true

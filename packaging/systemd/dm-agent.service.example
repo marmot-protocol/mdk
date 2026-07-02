@@ -1,0 +1,34 @@
+[Unit]
+Description=Marmot dm-agent connector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=marmot-agent
+Group=marmot-agent
+EnvironmentFile=/etc/marmot-agent/hermes-marmot.env
+WorkingDirectory=/var/lib/marmot-agent
+ExecStart=/usr/local/bin/dm-agent \
+  --home ${MARMOT_HOME} \
+  --socket ${MARMOT_AGENT_SOCKET} \
+  --auth-token-file ${MARMOT_AGENT_AUTH_TOKEN_FILE} \
+  --socket-dir-mode ${MARMOT_AGENT_SOCKET_DIR_MODE} \
+  --socket-mode ${MARMOT_AGENT_SOCKET_MODE} \
+  --relay ${MARMOT_RELAY_EU} \
+  --relay ${MARMOT_RELAY_US}
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=marmot-agent
+RuntimeDirectoryMode=0770
+StateDirectory=marmot-agent
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/marmot-agent /run/marmot-agent
+
+[Install]
+WantedBy=multi-user.target

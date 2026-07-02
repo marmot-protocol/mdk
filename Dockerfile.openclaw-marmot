@@ -1,0 +1,47 @@
+FROM rust:1.90-bookworm
+
+ARG OPENCLAW_VERSION=2026.6.8
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        libssl-dev \
+        pkg-config \
+        qrencode \
+        tini \
+        xxd \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable \
+    && npm install -g "openclaw@${OPENCLAW_VERSION}"
+
+# Pin pnpm to match the committed pnpm-lock.yaml (lockfileVersion 9.0, generated
+# by pnpm 10.x). Without this, corepack downloads an unpinned pnpm on every
+# build; `.npmrc` (manage-package-manager-versions=false) keeps this pin from
+# being hijacked by openclaw's own packageManager field.
+RUN corepack prepare pnpm@10.13.1 --activate
+
+WORKDIR /work/darkmatter
+COPY . .
+
+RUN cargo build --locked --release -p agent-connector --bin dm-agent \
+    && install -m 0755 target/release/dm-agent /usr/local/bin/dm-agent \
+    && install -m 0755 scripts/openclaw_marmot_container_entrypoint.sh /usr/local/bin/openclaw-marmot-entrypoint \
+    && ( cd integrations/openclaw/marmot && pnpm install && pnpm build )
+
+ENV MARMOT_HOME=/data/marmot-agent \
+    OPENCLAW_HOME=/data/openclaw-home \
+    MARMOT_AGENT_SOCKET=/run/marmot-agent/dm-agent.sock \
+    MARMOT_AGENT_AUTH_TOKEN_FILE=/data/marmot-agent/control.token \
+    MARMOT_AGENT_SOCKET_DIR_MODE=0770 \
+    MARMOT_AGENT_SOCKET_MODE=0660 \
+    MARMOT_AGENT_ALLOW_ANY=1 \
+    MARMOT_RELAYS=wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat \
+    MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450 \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/openclaw-marmot-entrypoint"]

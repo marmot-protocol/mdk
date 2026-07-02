@@ -1,0 +1,18 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "Member { id: mem_id(), credential: vec![1, 2, 3], }"
+---
+{
+  "id": [
+    97,
+    108,
+    105,
+    99,
+    101
+  ],
+  "credential": [
+    1,
+    2,
+    3
+  ]
+}

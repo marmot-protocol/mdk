@@ -1,0 +1,22 @@
+[package]
+name = "cgka-traits"
+# Workspace dep key is `cgka-traits`; code uses `cgka_traits::...`.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared traits and cross-boundary value types for the CGKA engine, TransportAdapter, TransportPeeler, and storage backends."
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+hex.workspace = true
+url.workspace = true
+openmls_traits.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

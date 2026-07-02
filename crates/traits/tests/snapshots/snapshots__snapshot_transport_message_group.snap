@@ -1,0 +1,37 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: msg
+---
+{
+  "id": [
+    187,
+    187,
+    187,
+    187
+  ],
+  "payload": [
+    1,
+    2,
+    3
+  ],
+  "timestamp": 1717171717,
+  "causal_deps": [
+    [
+      187,
+      187,
+      187,
+      187
+    ]
+  ],
+  "source": "nostr",
+  "envelope": {
+    "GroupMessage": {
+      "transport_group_id": [
+        204,
+        204,
+        204,
+        204
+      ]
+    }
+  }
+}

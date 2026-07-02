@@ -1,0 +1,26 @@
+[Unit]
+Description=Hermes gateway with Marmot platform plugin
+Wants=network-online.target dm-agent.service
+After=network-online.target dm-agent.service
+
+[Service]
+Type=simple
+User=hermes-agent
+Group=hermes-agent
+SupplementaryGroups=marmot-agent
+EnvironmentFile=/etc/marmot-agent/hermes-marmot.env
+WorkingDirectory=/opt/hermes-agent
+ExecStart=/opt/hermes-agent/.venv/bin/hermes gateway run
+Restart=on-failure
+RestartSec=5s
+StateDirectory=hermes-agent
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hermes-agent /run/marmot-agent
+
+[Install]
+WantedBy=multi-user.target

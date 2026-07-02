@@ -1,0 +1,9 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "IngestOutcome::Stale { reason: StaleReason::UnknownGroup }"
+---
+{
+  "Stale": {
+    "reason": "UnknownGroup"
+  }
+}

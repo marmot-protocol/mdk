@@ -1,0 +1,130 @@
+{
+  "scenario_name": "group-data-fork-recovery/v1",
+  "vector_version": "1",
+  "conformance_version": "0.2.0",
+  "seed": null,
+  "scenario": {
+    "name": "group-data-fork-recovery/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "fork",
+        "invitees": [
+          "bob"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "alice",
+        "name": "alice branch",
+        "pending": "alice-update"
+      },
+      {
+        "type": "update_group_data",
+        "client": "bob",
+        "name": "bob branch",
+        "pending": "bob-update"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "alice-update"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "bob-update"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 7,
+      "client": "alice",
+      "pending": "alice-update",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "bob",
+      "pending": "bob-update",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 2,
+      "member_count": 2,
+      "received_payloads": []
+    },
+    {
+      "type": "client_state",
+      "client": "bob",
+      "epoch": 2,
+      "member_count": 2,
+      "received_payloads": []
+    },
+    {
+      "type": "recovery_summary",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    }
+  ]
+}

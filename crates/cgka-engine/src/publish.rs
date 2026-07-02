@@ -1,0 +1,339 @@
+//! Publish-confirm and publish-failed paths for `CgkaEngine`.
+//!
+//! Together with `EpochManager::confirm_publish` / `rollback_publish`,
+//! these implement publish-before-apply: the staged commit only lands on
+//! local MLS state once the application reports the transport succeeded.
+//!
+//! ### Confirm flow
+//! 1. Load `MlsGroup`. The pending commit is still attached.
+//! 2. If a pending commit exists: cache invitee capabilities from the
+//!    staged commit's `add_proposals`, then `merge_pending_commit`.
+//! 3. Refresh own-leaf capability cache + Marmot record (epoch + members
+//!    + RequiredCapabilities derived from post-merge group context).
+//! 4. Hand off to `EpochManager::confirm_publish` for the state-machine
+//!    bookkeeping. Emit the event.
+//!
+//! ### Fail flow
+//! 1. Load `MlsGroup`. The pending commit is still attached.
+//! 2. If a pending commit exists: `clear_pending_commit` discards it.
+//! 3. Marmot record + capability cache: nothing to rewind, because the
+//!    send paths defer all such writes to confirm.
+//! 4. Hand off to `EpochManager::rollback_publish` for the state-machine
+//!    bookkeeping.
+//!
+//! ### Solo `create_group`
+//! Solo create has no pending commit (no `add_members` was called). Both
+//! confirm + fail are state-machine-only — confirm transitions to Stable
+//! at epoch 0, fail rewinds to Stable at epoch 0 (no-op MLS-side, but the
+//! group record stays around).
+
+use crate::engine::Engine;
+use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::engine::GroupEvent;
+use cgka_traits::engine_state::PendingStateRef;
+use cgka_traits::error::EngineError;
+use cgka_traits::message::MessageState;
+use cgka_traits::storage::StorageProvider;
+use cgka_traits::types::EpochId;
+use openmls::group::MlsGroup;
+use openmls_traits::OpenMlsProvider as _;
+
+impl<S: StorageProvider> Engine<S> {
+    pub(crate) async fn do_confirm_published(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Result<GroupEvent, EngineError> {
+        // Look up which group this pending belongs to without consuming the
+        // entry — we need the MlsGroup load to succeed before we burn the
+        // state-machine slot.
+        let group_id = self
+            .epoch_manager
+            .group_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+
+        // Read the bookkeeping a successful confirm needs BEFORE any mutation,
+        // so the durable transaction below can do every storage write while the
+        // in-memory state-machine transition stays strictly afterwards. `kind`
+        // and `audit_context` are reads; `origin_commit_id` is a non-consuming
+        // peek (promotion happens post-commit).
+        let kind = self
+            .epoch_manager
+            .kind_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
+        // The originating operation's context, captured at `begin_pending`. The
+        // engine's ambient context has cleared by now (this is a later
+        // publish-confirm call), so re-attach it explicitly.
+        let audit_context = self.epoch_manager.audit_context_for_pending(pending);
+        let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
+
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+            .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let has_pending_commit = mls_group.pending_commit().is_some();
+
+        // Snapshot the pre-commit epoch as a fork-recovery anchor. Done outside
+        // the durable transaction below because snapshot capture opens its own
+        // backend transaction (it cannot nest) — but the write is keyed by epoch
+        // and idempotent (`INSERT OR REPLACE`), so a retried confirm re-running
+        // it is harmless.
+        if has_pending_commit {
+            self.retain_current_epoch_snapshot_for_group(&group_id)?;
+        }
+
+        // One durable transaction for the plain-row writes this confirm performs
+        // — merge the staged commit, mirror the Marmot record, refresh the
+        // capability caches, and mark the origin commit `Processed`. If the
+        // backend is locked (`SQLITE_BUSY`) anywhere in here, the whole unit
+        // rolls back and the typed transient error propagates *before* the
+        // in-memory state-machine transition below. The pending entry is left
+        // intact, so a retried `confirm_published` re-runs cleanly: the merge is
+        // guarded by the still-attached staged commit, and every other write is
+        // idempotent. This is the fix for the prior orphan, where the
+        // `Processed` write ran AFTER the slot was consumed and a lock there
+        // left an unrecoverable `UnknownPending` on retry.
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                if has_pending_commit {
+                    // `staged` borrows `mls_group`; scope it so the subsequent
+                    // `merge_pending_commit` can take `&mut mls_group`.
+                    {
+                        let staged = mls_group
+                            .pending_commit()
+                            .expect("pending commit presence checked above");
+                        crate::capability_manager::cache_from_staged_commit(
+                            storage,
+                            &group_id,
+                            staged,
+                            self.ciphersuite,
+                        )?;
+                    }
+                    let tx_provider =
+                        EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                    mls_group
+                        .merge_pending_commit(&tx_provider)
+                        .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
+                }
+
+                // Now the MLS group is at the new epoch. Mirror the Marmot
+                // record (epoch + members + RequiredCapabilities + app-component
+                // state) and refresh the self-cache (commits can rotate own leaf
+                // via force_self_update). The record is always written at create
+                // time (group_lifecycle::do_create_group), so propagate a read
+                // failure here rather than swallowing it: a transient backend
+                // error must roll back the whole transaction and stay retryable,
+                // never commit the merge + `Processed` write with a stale record.
+                let mut g = storage.get_group(&group_id)?;
+                g.epoch = EpochId(mls_group.epoch().as_u64());
+                g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                g.required_capabilities = required_capabilities_from_group(&mls_group);
+                crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
+                storage.put_group(&g)?;
+                crate::capability_manager::cache_self_capabilities(
+                    storage,
+                    &group_id,
+                    &mls_group,
+                    self.identity.self_id(),
+                    self.ciphersuite,
+                )?;
+                if let Some(message_id) = origin_commit_id.as_ref() {
+                    storage.update_message_state(message_id, MessageState::Processed)?;
+                }
+                Ok(())
+            })?;
+
+        // Post-merge fork-recovery anchor (idempotent, own transaction).
+        self.retain_current_epoch_snapshot_for_group(&group_id)?;
+
+        // #740 rotation: a confirmed local UpdateAppComponents commit may have
+        // changed this group's Nostr routing component; additively refresh the
+        // transport-id index so the new nostr_group_id resolves on the inbound
+        // path (the prior id stays mapped for the overlap window).
+        self.reindex_transport_group_id(&group_id);
+
+        // Durable state has committed. From here on the steps are in-memory
+        // state-machine transitions (idempotent-unsafe but infallible w.r.t. the
+        // backend) plus best-effort cleanup. Kind discriminates create (always
+        // `GroupCreated`) from evolution (always `EpochChanged`).
+        let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context.clone(),
+            crate::audit_helpers::epoch_confirmed_event(
+                EpochId(new_epoch.0.saturating_sub(1)),
+                new_epoch,
+                crate::audit_helpers::pending_kind_str(kind),
+            ),
+        );
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context.clone(),
+            crate::audit_helpers::epoch_state_changed_event(
+                Some("pending_publish"),
+                "stable",
+                new_epoch,
+                "publish_confirmed",
+                Some(pending),
+                Some(crate::audit_helpers::pending_kind_str(kind)),
+            ),
+        );
+        // The transport id of the commit we just confirmed. It identifies the
+        // rows the upcoming `GroupStateChanged` events synthesize, so they can be
+        // invalidated by origin commit if this commit later loses a fork. The
+        // `Processed` state write already landed in the durable transaction
+        // above; here we only move the recovery record pending → incumbent
+        // (in-memory) and emit the audit line.
+        let origin_commit_id = self.promote_pending_commit_for_recovery(pending);
+        if let Some(message_id) = origin_commit_id.as_ref() {
+            self.audit_with_context(
+                Some(&group_id),
+                audit_context.clone(),
+                crate::audit_helpers::message_state_changed_event(
+                    hex::encode(message_id.as_slice()),
+                    MessageState::Processed,
+                    "publish_confirmed",
+                ),
+            );
+        }
+        // Best-effort post-commit cleanup: pruning stale fork-recovery snapshots
+        // is re-runnable on the next confirm/advance, so a transient lock here
+        // must not fail (and thereby orphan) an already-durable confirm.
+        if let Err(e) = self.prune_fork_recovery_for_group(&group_id) {
+            tracing::warn!(
+                target: "cgka_engine::publish",
+                method = "do_confirm_published",
+                transient = e.is_transient(),
+                "deferred fork-recovery prune after confirm; will retry on next pass"
+            );
+        }
+        let event = match kind {
+            crate::epoch_manager::PendingKind::CreateGroup => GroupEvent::GroupCreated { group_id },
+            crate::epoch_manager::PendingKind::GroupEvolution => GroupEvent::EpochChanged {
+                group_id,
+                from: EpochId(new_epoch.0.saturating_sub(1)),
+                to: new_epoch,
+            },
+        };
+        let replay_group_id = match &event {
+            GroupEvent::GroupCreated { group_id } | GroupEvent::EpochChanged { group_id, .. } => {
+                group_id.clone()
+            }
+            _ => unreachable!("confirm only emits create/evolution events"),
+        };
+        self.events_buf.push_back(event.clone());
+        if let Some(changes) = self.pending_state_changes.remove(&pending) {
+            for pending_change in changes {
+                self.push_group_state_change(
+                    &replay_group_id,
+                    new_epoch,
+                    pending_change.actor,
+                    pending_change.change,
+                    origin_commit_id.clone(),
+                );
+            }
+        }
+        self.replay_buffered_messages(&replay_group_id).await?;
+        Ok(event)
+    }
+
+    pub(crate) async fn do_publish_failed(
+        &mut self,
+        pending: PendingStateRef,
+    ) -> Result<(), EngineError> {
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+
+        let group_id = self
+            .epoch_manager
+            .group_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
+
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+            .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+
+        if mls_group.pending_commit().is_some() {
+            self.storage.with_transaction(|storage| {
+                let tx_provider =
+                    EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                mls_group
+                    .clear_pending_commit(tx_provider.storage())
+                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
+            })?;
+        }
+
+        // Roll back the Marmot record's projected fields. The send paths
+        // wrote a projected `members` list (+ for upgrade, projected
+        // `required_capabilities`); after `clear_pending_commit` the MLS
+        // group is back to its pre-stage shape, so re-deriving from MLS
+        // restores the prior projection. The capability cache for newly-
+        // invited members stays — it's not visible via `members()` once
+        // we drop them from the Marmot record, and the next successful
+        // invite simply overwrites.
+        if let Ok(mut g) = self.storage.get_group(&group_id) {
+            g.epoch = EpochId(mls_group.epoch().as_u64());
+            g.members = crate::group_lifecycle::marmot_members(&mls_group);
+            g.required_capabilities = required_capabilities_from_group(&mls_group);
+            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
+            self.storage.put_group(&g)?;
+        }
+
+        let kind = self
+            .epoch_manager
+            .kind_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)?;
+        let pending_epoch_pre = EpochId(mls_group.epoch().as_u64());
+        let audit_context = self.epoch_manager.audit_context_for_pending(pending);
+        let (group_id, prior_epoch) = self.epoch_manager.rollback_publish(pending)?;
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context.clone(),
+            crate::audit_helpers::epoch_rolled_back_event(
+                pending_epoch_pre,
+                prior_epoch,
+                crate::audit_helpers::pending_kind_str(kind),
+            ),
+        );
+        self.audit_with_context(
+            Some(&group_id),
+            audit_context,
+            crate::audit_helpers::epoch_state_changed_event(
+                Some("pending_publish"),
+                "stable",
+                prior_epoch,
+                "publish_failed",
+                Some(pending),
+                Some(crate::audit_helpers::pending_kind_str(kind)),
+            ),
+        );
+        self.pending_state_changes.remove(&pending);
+        self.forget_pending_commit_for_recovery(pending)?;
+        self.replay_buffered_messages(&group_id).await?;
+        Ok(())
+    }
+}
+
+/// Read the `RequiredCapabilities` extension off the (post-merge) MLS
+/// group context and translate it into the Marmot-side
+/// `GroupCapabilities` shape used in the `Group` record.
+fn required_capabilities_from_group(
+    mls_group: &MlsGroup,
+) -> cgka_traits::capabilities::GroupCapabilities {
+    use openmls::extensions::Extension;
+    let mut caps = cgka_traits::capabilities::GroupCapabilities::default();
+    for ext in mls_group.extensions().iter() {
+        if let Extension::RequiredCapabilities(rc) = ext {
+            for t in rc.extension_types() {
+                caps.extensions.insert(u16::from(*t));
+            }
+            for t in rc.proposal_types() {
+                caps.proposals.insert(u16::from(*t));
+            }
+        }
+    }
+    if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
+        caps.app_components = components;
+    }
+    caps
+}

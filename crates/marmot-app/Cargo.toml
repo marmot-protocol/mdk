@@ -1,0 +1,51 @@
+[package]
+name = "marmot-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
+# privacy-critical mapping and opt-in gate stay in the default build; this
+# feature only adds the OTLP protobuf dependencies and the push transport.
+otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
+
+[dependencies]
+async-trait.workspace = true
+cgka-engine.workspace = true
+cgka-session.workspace = true
+cgka-traits.workspace = true
+chacha20poly1305.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+marmot-account.workspace = true
+marmot-forensics.workspace = true
+marmot-markdown.workspace = true
+nostr.workspace = true
+nostr-sdk.workspace = true
+opentelemetry-proto = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+psl.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+storage-sqlite.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "net"] }
+tokio-util.workspace = true
+tracing.workspace = true
+transport-nostr-adapter = { workspace = true, features = ["sdk"] }
+transport-nostr-peeler.workspace = true
+transport-quic-broker.workspace = true
+transport-quic-stream.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+nostr-relay-builder.workspace = true
+tempfile.workspace = true

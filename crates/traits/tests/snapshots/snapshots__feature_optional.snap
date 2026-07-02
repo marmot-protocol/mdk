@@ -1,0 +1,11 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "CapabilityRequirement\n{\n    requires: Capability::Proposal(0xFF01), level: RequirementLevel::Optional,\n    description: \"reactions\",\n}"
+---
+{
+  "requires": {
+    "Proposal": 65281
+  },
+  "level": "Optional",
+  "description": "reactions"
+}

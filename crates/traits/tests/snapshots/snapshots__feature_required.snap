@@ -1,0 +1,11 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "CapabilityRequirement\n{\n    requires: Capability::Proposal(10), level: RequirementLevel::Required,\n    description: \"MIP-03\",\n}"
+---
+{
+  "requires": {
+    "Proposal": 10
+  },
+  "level": "Required",
+  "description": "MIP-03"
+}

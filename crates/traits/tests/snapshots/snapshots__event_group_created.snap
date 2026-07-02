@@ -1,0 +1,14 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::GroupCreated { group_id: gid() }"
+---
+{
+  "GroupCreated": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ]
+  }
+}

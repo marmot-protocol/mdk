@@ -1,0 +1,39 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::GroupStateChanged\n{\n    group_id: gid(), epoch: EpochId(2), actor: Some(mem_id()), change:\n    GroupStateChange::MemberAdded { member: mem_id() }, origin_commit_id:\n    Some(mid()),\n}"
+---
+{
+  "GroupStateChanged": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "epoch": 2,
+    "actor": [
+      97,
+      108,
+      105,
+      99,
+      101
+    ],
+    "change": {
+      "MemberAdded": {
+        "member": [
+          97,
+          108,
+          105,
+          99,
+          101
+        ]
+      }
+    },
+    "origin_commit_id": [
+      187,
+      187,
+      187,
+      187
+    ]
+  }
+}

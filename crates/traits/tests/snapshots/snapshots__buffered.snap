@@ -1,0 +1,16 @@
+---
+source: crates/traits/tests/snapshots.rs
+assertion_line: 75
+expression: "IngestOutcome::Buffered { group_id: gid(), epoch: EpochId(1), }"
+---
+{
+  "Buffered": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "epoch": 1
+  }
+}

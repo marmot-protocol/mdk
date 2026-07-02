@@ -1,0 +1,236 @@
+{
+  "scenario_name": "admin-policy-update/v1",
+  "vector_version": "1",
+  "conformance_version": "0.2.0",
+  "seed": null,
+  "scenario": {
+    "name": "admin-policy-update/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "admin-policy",
+        "invitees": [
+          "bob"
+        ],
+        "required_features": [],
+        "initial_admins": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "expect_update_admin_policy_error",
+        "client": "bob",
+        "admins": [
+          "alice",
+          "bob"
+        ],
+        "error": "not_group_admin"
+      },
+      {
+        "type": "expect_update_admin_policy_error",
+        "client": "alice",
+        "admins": [],
+        "error": "invalid_admin_policy"
+      },
+      {
+        "type": "update_admin_policy",
+        "client": "alice",
+        "admins": [
+          "alice",
+          "bob"
+        ],
+        "pending": "promote-bob"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "promote-bob"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "observe_admin_policy",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "bob",
+        "name": "bob-renamed",
+        "pending": "bob-rename"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "bob-rename"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice"
+        ]
+      },
+      {
+        "type": "update_admin_policy",
+        "client": "bob",
+        "admins": [
+          "alice"
+        ],
+        "pending": "self-demote-bob"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "self-demote-bob"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice"
+        ]
+      },
+      {
+        "type": "expect_update_admin_policy_error",
+        "client": "bob",
+        "admins": [
+          "bob"
+        ],
+        "error": "not_group_admin"
+      },
+      {
+        "type": "observe_admin_policy",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "expected_error",
+      "step_index": 5,
+      "client": "bob",
+      "operation": "update_admin_policy",
+      "error": "not_group_admin"
+    },
+    {
+      "type": "expected_error",
+      "step_index": 6,
+      "client": "alice",
+      "operation": "update_admin_policy",
+      "error": "invalid_admin_policy"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "alice",
+      "pending": "promote-bob",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 13,
+      "client": "bob",
+      "pending": "bob-rename",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 17,
+      "client": "bob",
+      "pending": "self-demote-bob",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "expected_error",
+      "step_index": 20,
+      "client": "bob",
+      "operation": "update_admin_policy",
+      "error": "not_group_admin"
+    },
+    {
+      "type": "admin_policy",
+      "client": "alice",
+      "admins": [
+        "alice"
+      ]
+    },
+    {
+      "type": "admin_policy",
+      "client": "bob",
+      "admins": [
+        "alice"
+      ]
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 4,
+      "member_count": 2,
+      "received_payloads": []
+    },
+    {
+      "type": "client_state",
+      "client": "bob",
+      "epoch": 4,
+      "member_count": 2,
+      "received_payloads": []
+    }
+  ]
+}

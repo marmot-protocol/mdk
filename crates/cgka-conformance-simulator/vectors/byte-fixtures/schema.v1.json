@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Marmot byte-level vector fixture v1",
+  "type": "object",
+  "required": [
+    "fixture_name",
+    "fixture_version",
+    "vector_type",
+    "component",
+    "encoding",
+    "bytes",
+    "expected"
+  ],
+  "properties": {
+    "fixture_name": {
+      "type": "string"
+    },
+    "fixture_version": {
+      "const": "1"
+    },
+    "vector_type": {
+      "enum": [
+        "app_component_state",
+        "app_component_update",
+        "wire_format"
+      ]
+    },
+    "component": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "document"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^0x[0-9a-fA-F]{4}$"
+        },
+        "name": {
+          "type": "string"
+        },
+        "document": {
+          "type": "string"
+        }
+      }
+    },
+    "encoding": {
+      "type": "object",
+      "required": [
+        "format",
+        "notes"
+      ],
+      "properties": {
+        "format": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "bytes": {
+      "type": "object",
+      "required": [
+        "hex"
+      ],
+      "properties": {
+        "hex": {
+          "type": "string",
+          "pattern": "^([0-9a-fA-F]{2})*$"
+        },
+        "component_data_hex": {
+          "type": "string",
+          "pattern": "^([0-9a-fA-F]{2})*$"
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "required": [
+        "valid"
+      ],
+      "properties": {
+        "valid": {
+          "type": "boolean"
+        },
+        "fields": {
+          "type": "object"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

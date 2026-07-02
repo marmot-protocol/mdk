@@ -1,227 +1,327 @@
 name: CI
 
 on:
-  push:
-    branches: [ master ]
   pull_request:
-    branches: [ master ]
+  push:
+    branches:
+      - master
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  # ── Change Detection ────────────────────────────────────────────────
-  changes:
-    name: Detect Changed Paths
+  rust-format:
+    name: Rust format
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      ci: ${{ steps.filter.outputs.ci }}
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          fetch-depth: 2
+          persist-credentials: false
 
-      - name: Detect changes
-        id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  rust-check:
+    name: Rust check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          filters: |
-            rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - 'Cargo.lock'
-              - 'rustfmt.toml'
-              - 'justfile'
-              - 'scripts/**'
-            ci:
-              - '.github/workflows/**'
-              - 'scripts/check-github-actions-pinned.sh'
-              - 'scripts/check-workflow-policy.sh'
+          persist-credentials: false
 
-  # ── Workflow policy ─────────────────────────────────────────────────
-  workflow-policy:
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Check workspace
+        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --locked
+
+      - name: Check all features
+        run: RUSTFLAGS='-D warnings' cargo check --workspace --all-targets --all-features --locked
+
+  rust-clippy:
+    name: Rust clippy
     runs-on: ubuntu-latest
-    name: Workflow Policy
-    needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.ci == 'true'
+    timeout-minutes: 45
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
-    - name: Check GitHub workflow policy
-      run: bash scripts/check-workflow-policy.sh
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
 
-  # ── Quick checks that fail fast ─────────────────────────────────────
-  format:
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run clippy with all features
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  rust-test:
+    name: Rust tests (${{ matrix.partition }}/4)
     runs-on: ubuntu-latest
-    name: Format
-    needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-    - name: Setup Rust (stable)
-      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
-      with:
-        toolchain: stable
-        components: rustfmt
-
-    - name: Check formatting
-      run: cargo fmt --all -- --check
-
-  # ── Clippy ──────────────────────────────────────────────────────────
-  # Both stable and MSRV on all events (matches `just precommit` contract)
-  lint:
-    needs: [format, changes]
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.90.0", "stable"]
-        features:
-          - name: "all-features"
-            flags: "--all-features"
-          - name: "no-features"
-            flags: "--no-default-features"
-          - name: "mip04-only"
-            flags: "--no-default-features --features mip04"
-
-    runs-on: ubuntu-latest
-    name: Lint (${{ matrix.rust }}, ${{ matrix.features.name }})
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+        partition: [1, 2, 3, 4]
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
-    - name: Setup Rust (${{ matrix.rust }})
-      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
-      with:
-        toolchain: ${{ matrix.rust }}
-        components: clippy
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        key: ${{ matrix.rust }}-${{ matrix.features.name }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
 
-    - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y pkg-config
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-    - name: Run clippy
-      run: cargo +${{ matrix.rust }} clippy --all-targets ${{ matrix.features.flags }} --no-deps -- -D warnings
+      - name: Run workspace tests
+        # The subprocess-heavy `darkmatter-cli::cli` suite runs in its own
+        # `cli-e2e` job so its fan-out never starves these fast unit tests
+        # (issue #103). `relay_runtime` keeps its own serial job.
+        run: cargo nextest run --workspace --exclude cgka-conformance-simulator --locked --profile ci --partition count:${{ matrix.partition }}/4 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(darkmatter-cli) & binary(cli))'
 
-  # ── Documentation ───────────────────────────────────────────────────
-  # Both stable and MSRV on all events (matches `just precommit` contract)
-  docs:
-    needs: [format, changes]
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ["1.90.0", "stable"]
+      - name: Run doctests
+        if: matrix.partition == 1
+        run: cargo test --workspace --exclude cgka-conformance-simulator --doc --locked
 
+  cli-e2e:
+    name: CLI e2e (mock relay)
     runs-on: ubuntu-latest
-    name: Documentation (${{ matrix.rust }})
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    timeout-minutes: 30
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
-    - name: Setup Rust (${{ matrix.rust }})
-      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
-      with:
-        toolchain: ${{ matrix.rust }}
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        key: ${{ matrix.rust }}-docs
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
 
-    - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y pkg-config
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-    - name: Check documentation
-      run: cargo +${{ matrix.rust }} doc --all-features --no-deps --document-private-items
-      env:
-        RUSTDOCFLAGS: "-D warnings"
+      - name: Run CLI end-to-end tests
+        # Dedicated job: this subprocess-heavy suite is capped by the `cli-e2e`
+        # test-group and the `ci` profile adds retries + a hung-test backstop.
+        # The real-relay test self-skips here; it has its own `Relay CLI E2E`
+        # job with a docker relay stack.
+        run: cargo nextest run -p darkmatter-cli --test cli --locked --profile ci
 
-  # ── Fast test lane ──────────────────────────────────────────────────
-  # Runs all 3 feature combos with cargo-nextest for parallel execution
-  test:
-    needs: [format, changes]
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-          - name: "all-features"
-            flags: "--all-features"
-          - name: "no-features"
-            flags: "--no-default-features"
-          - name: "mip04-only"
-            flags: "--no-default-features --features mip04"
-
+  relay-runtime:
+    name: Relay runtime tests
     runs-on: ubuntu-latest
-    name: Test (${{ matrix.features.name }})
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    timeout-minutes: 30
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
-    - name: Setup Rust (stable)
-      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # pinned from master
-      with:
-        toolchain: stable
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
 
-    - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        key: test-${{ matrix.features.name }}
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
-      with:
-        tool: cargo-nextest
+      - name: Run relay runtime tests serially
+        run: cargo test -p marmot-app --test relay_runtime --locked -- --test-threads=1
 
-    - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y pkg-config
-
-    - name: Run tests
-      run: cargo nextest run --all-targets ${{ matrix.features.flags }}
-
-    - name: Doc tests
-      if: matrix.features.name == 'all-features'
-      run: cargo test --all-features --doc
-
-  # ── Security Audit ──────────────────────────────────────────────────
-  audit:
-    needs: [changes]
+  relay-e2e:
+    name: Relay CLI E2E
     runs-on: ubuntu-latest
-    name: Security Audit
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    timeout-minutes: 30
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
-    - name: Install cargo-audit
-      uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
-      with:
-        tool: cargo-audit
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
 
-    - name: Run cargo audit
-      run: cargo audit --ignore RUSTSEC-2026-0124
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Start local relay stack
+        run: docker compose up -d setup nostr-rs-relay strfry-nostr-relay
+
+      - name: Wait for local relays
+        run: |
+          docker compose ps
+          ./scripts/wait_for_relays.sh
+
+      - name: Run real relay CLI E2E
+        env:
+          DARKMATTER_E2E_REQUIRE_RELAYS: "1"
+        run: cargo nextest run -p darkmatter-cli --test cli --locked --profile ci -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
+
+      - name: Dump local relay logs
+        if: failure()
+        run: docker compose logs nostr-rs-relay strfry-nostr-relay || true
+
+      - name: Stop local relay stack
+        if: always()
+        run: docker compose down -v
+
+  conformance:
+    name: Simulator and vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run simulator tests
+        run: cargo nextest run -p cgka-conformance-simulator --locked --profile ci
+
+      - name: Run simulator doctests
+        run: cargo test -p cgka-conformance-simulator --doc --locked
+
+      - name: Run vector report
+        run: |
+          cargo run -p cgka-conformance-simulator --bin cgka-conformance-simulator-report --locked -- \
+            --vectors crates/cgka-conformance-simulator/vectors \
+            --out target/cgka-conformance-simulator-reports \
+            --strict-oracle
+
+      - name: Upload vector report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cgka-conformance-simulator-reports
+          path: target/cgka-conformance-simulator-reports
+          if-no-files-found: error
+
+  formal:
+    name: Tamarin proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Tamarin dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends graphviz maude
+
+      - name: Install Tamarin
+        env:
+          TAMARIN_VERSION: 1.12.0
+        run: |
+          set -euo pipefail
+          curl -L --fail --show-error --silent \
+            "https://github.com/tamarin-prover/tamarin-prover/releases/download/${TAMARIN_VERSION}/tamarin-prover-${TAMARIN_VERSION}-linux64-ubuntu.tar.gz" \
+            -o /tmp/tamarin-prover.tar.gz
+          tar -xzf /tmp/tamarin-prover.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/tamarin-prover /usr/local/bin/tamarin-prover
+          tamarin-prover --version
+
+      - name: Run Tamarin proofs
+        run: make -C formal/tamarin prove

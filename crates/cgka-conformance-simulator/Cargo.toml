@@ -1,0 +1,39 @@
+[package]
+name = "cgka-conformance-simulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-process multi-client simulator and fixtures for the CGKA engine. Lives outside cgka-engine to keep production crates lean."
+
+[features]
+# Long-running property-based tests (1000+ iterations). Quick CI runs the
+# default profile; nightly CI runs with this feature enabled.
+conformance-slow = []
+
+[dependencies]
+cgka-traits.workspace = true
+cgka-engine.workspace = true
+storage-sqlite.workspace = true
+transport-nostr-peeler.workspace = true
+openmls.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+tls_codec.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tracing.workspace = true
+rand.workspace = true
+nostr.workspace = true
+proptest.workspace = true
+hex.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+# Byte-level conformance vectors for the agent text stream QUIC feature pin
+# the transport crates' key derivation, AAD, and broker control bytes.
+transport-quic-stream.workspace = true
+transport-quic-broker.workspace = true

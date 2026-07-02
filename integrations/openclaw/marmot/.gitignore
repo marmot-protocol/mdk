@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.vitest/
+# Generated at release time by the packaging CI job.
+manifest.json

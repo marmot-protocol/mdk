@@ -1,0 +1,5 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "FeatureStatus::Upgradeable"
+---
+"Upgradeable"

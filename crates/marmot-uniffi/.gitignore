@@ -1,0 +1,6 @@
+# Generated/derived build artifacts. The xcframework.sh script writes into
+# these directories. The Vendored copies in darkmatter-ios are what consumers
+# actually use; nothing in here is the source of truth.
+/build/
+/generated/
+/output/

@@ -1,0 +1,21 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::AppMessage { group_id: gid(), payload: b\"hello\".to_vec(), }"
+---
+{
+  "AppMessage": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "payload": [
+      104,
+      101,
+      108,
+      108,
+      111
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e3304ae59ff9acb78f24be3db5ae83681baa0f6438ef247d817c249de3b55b07 # shrinks to intents = [Send { sender_idx: 0, payload: [0] }]
+cc e1e97d71802675f774bf75ad50528975e3cb74488e66682d53d5260e41744fde # shrinks to seed = 0

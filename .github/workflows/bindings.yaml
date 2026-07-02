@@ -1,0 +1,294 @@
+name: MarmotKit Bindings
+
+on:
+  push:
+    tags:
+      - marmotkit-v*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marmotkit-bindings-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  OTLP_EXPORT: "1"
+
+jobs:
+  ios-bindings:
+    name: Build iOS bindings
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^marmotkit-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: binding releases must use a version tag like marmotkit-v0.1.0" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build MarmotKit XCFramework
+        run: ./crates/marmot-uniffi/xcframework.sh
+
+      - name: Package iOS bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#marmotkit-v}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          stage_parent="$RUNNER_TEMP/marmotkit-ios-stage"
+          bundle_dir="$stage_parent/marmotkit-ios-$version"
+          asset="$RUNNER_TEMP/marmotkit-ios-$version.zip"
+
+          rm -rf "$stage_parent" "$asset" "$asset.sha256"
+          mkdir -p "$bundle_dir"
+          cp -R crates/marmot-uniffi/output/MarmotKit.xcframework "$bundle_dir/"
+          cp crates/marmot-uniffi/output/MarmotKit.swift "$bundle_dir/"
+
+          cat > "$bundle_dir/manifest.json" <<EOF
+          {
+            "name": "marmotkit-ios",
+            "version": "$version",
+            "tag": "$tag",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version",
+            "cargo_lock_sha256": "$lock_sha",
+            "rustc": "$(rustc --version)",
+            "cargo": "$(cargo --version)",
+            "contents": [
+              "MarmotKit.xcframework",
+              "MarmotKit.swift"
+            ]
+          }
+          EOF
+
+          (
+            cd "$stage_parent"
+            zip -r "$asset" "marmotkit-ios-$version"
+          )
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p dist
+          cp "$asset" "$asset.sha256" dist/
+
+      - name: Upload iOS bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-ios
+          path: dist/*
+          if-no-files-found: error
+
+  android-bindings:
+    name: Build Android bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^marmotkit-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: binding releases must use a version tag like marmotkit-v0.1.0" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            i686-linux-android \
+            x86_64-linux-android
+          rustc --version
+          cargo --version
+
+      - name: Install Android NDK
+        shell: bash
+        env:
+          ANDROID_NDK_VERSION: 27.2.12479018
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$sdk_root" ]]; then
+            echo "error: ANDROID_SDK_ROOT or ANDROID_HOME must be set on the runner" >&2
+            exit 1
+          fi
+          sdkmanager_bin=""
+          for candidate in \
+            "$sdk_root/cmdline-tools/latest/bin/sdkmanager" \
+            "$sdk_root/cmdline-tools/bin/sdkmanager" \
+            "$sdk_root/tools/bin/sdkmanager"; do
+            if [[ -x "$candidate" ]]; then
+              sdkmanager_bin="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$sdkmanager_bin" ]] && command -v sdkmanager >/dev/null 2>&1; then
+            sdkmanager_bin="$(command -v sdkmanager)"
+          fi
+          if [[ -z "$sdkmanager_bin" ]]; then
+            echo "error: sdkmanager not found under $sdk_root" >&2
+            find "$sdk_root" -maxdepth 4 -type f -name sdkmanager -print >&2 || true
+            exit 1
+          fi
+          set +o pipefail
+          yes | "$sdkmanager_bin" --licenses >/dev/null
+          set -o pipefail
+          "$sdkmanager_bin" "ndk;$ANDROID_NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$sdk_root/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build MarmotKit Kotlin and JNI bindings
+        run: ./crates/marmot-uniffi/kotlin-bindings.sh
+
+      - name: Package Android bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#marmotkit-v}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          stage_parent="$RUNNER_TEMP/marmotkit-android-stage"
+          bundle_dir="$stage_parent/marmotkit-android-$version"
+          asset="$RUNNER_TEMP/marmotkit-android-$version.zip"
+
+          rm -rf "$stage_parent" "$asset" "$asset.sha256"
+          mkdir -p "$bundle_dir"
+          cp -R crates/marmot-uniffi/output/android/kotlin "$bundle_dir/"
+          cp -R crates/marmot-uniffi/output/android/jniLibs "$bundle_dir/"
+
+          cat > "$bundle_dir/manifest.json" <<EOF
+          {
+            "name": "marmotkit-android",
+            "version": "$version",
+            "tag": "$tag",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version",
+            "cargo_lock_sha256": "$lock_sha",
+            "rustc": "$(rustc --version)",
+            "cargo": "$(cargo --version)",
+            "android_ndk_home": "${ANDROID_NDK_HOME:-}",
+            "android_api": "${ANDROID_API:-26}",
+            "contents": [
+              "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt",
+              "jniLibs/arm64-v8a/libmarmot_uniffi.so",
+              "jniLibs/armeabi-v7a/libmarmot_uniffi.so",
+              "jniLibs/x86/libmarmot_uniffi.so",
+              "jniLibs/x86_64/libmarmot_uniffi.so"
+            ]
+          }
+          EOF
+
+          (
+            cd "$stage_parent"
+            zip -r "$asset" "marmotkit-android-$version"
+          )
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p dist
+          cp "$asset" "$asset.sha256" dist/
+
+      - name: Upload Android bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: marmotkit-android
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - ios-bindings
+      - android-bindings
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download binding artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ios dist/android
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name marmotkit-ios --dir dist/ios
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name marmotkit-android --dir dist/android
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#marmotkit-v}"
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          MarmotKit bindings generated from Darkmatter commit \`$GITHUB_SHA\`.
+
+          Assets:
+          - \`marmotkit-ios-$version.zip\`: \`MarmotKit.xcframework\` and generated Swift bindings.
+          - \`marmotkit-android-$version.zip\`: generated Kotlin bindings and Android JNI libraries.
+
+          Verify downloads with the accompanying \`.sha256\` files.
+          EOF
+
+          assets=(
+            "dist/ios/marmotkit-ios-$version.zip"
+            "dist/ios/marmotkit-ios-$version.zip.sha256"
+            "dist/android/marmotkit-android-$version.zip"
+            "dist/android/marmotkit-android-$version.zip.sha256"
+          )
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "MarmotKit $version" --notes-file "$notes"
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "MarmotKit $version" \
+              --notes-file "$notes"
+          fi

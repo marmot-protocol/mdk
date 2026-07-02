@@ -1,0 +1,16 @@
+---
+source: crates/traits/tests/snapshots.rs
+assertion_line: 465
+expression: caps
+---
+{
+  "proposals": [
+    10
+  ],
+  "extensions": [
+    62187
+  ],
+  "app_components": {
+    "ids": []
+  }
+}

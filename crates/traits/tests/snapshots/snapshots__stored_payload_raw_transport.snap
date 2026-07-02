@@ -1,0 +1,33 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: raw_payload
+---
+{
+  "kind": "raw_transport",
+  "message": {
+    "id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "payload": [
+      1,
+      2,
+      3
+    ],
+    "timestamp": 1717171717,
+    "causal_deps": [],
+    "source": "nostr",
+    "envelope": {
+      "GroupMessage": {
+        "transport_group_id": [
+          204,
+          204,
+          204,
+          204
+        ]
+      }
+    }
+  }
+}

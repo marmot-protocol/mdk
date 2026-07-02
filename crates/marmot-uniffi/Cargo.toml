@@ -1,0 +1,39 @@
+[package]
+name = "marmot-uniffi"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "marmot_uniffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[features]
+default = []
+cli = ["uniffi/cli"]
+otlp-export = ["marmot-app/otlp-export"]
+
+[dependencies]
+marmot-app.workspace = true
+marmot-account.workspace = true
+marmot-markdown.workspace = true
+cgka-traits.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uniffi = { version = "0.28", features = ["tokio"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
+keyring-core.workspace = true
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]

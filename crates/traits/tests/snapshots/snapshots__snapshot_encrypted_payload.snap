@@ -1,0 +1,22 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "EncryptedPayload { ciphertext: vec![0xCA; 8], aad: vec![0xFE; 4], }"
+---
+{
+  "ciphertext": [
+    202,
+    202,
+    202,
+    202,
+    202,
+    202,
+    202,
+    202
+  ],
+  "aad": [
+    254,
+    254,
+    254,
+    254
+  ]
+}

@@ -1,0 +1,16 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::UpdateGroupData\n{ group_id: gid(), name: Some(\"new-name\".into()), description: None, }"
+---
+{
+  "UpdateGroupData": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "name": "new-name",
+    "description": null
+  }
+}

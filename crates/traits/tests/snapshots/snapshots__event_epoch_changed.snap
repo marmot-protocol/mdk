@@ -1,0 +1,16 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::EpochChanged\n{ group_id: gid(), from: EpochId(1), to: EpochId(2), }"
+---
+{
+  "EpochChanged": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "from": 1,
+    "to": 2
+  }
+}

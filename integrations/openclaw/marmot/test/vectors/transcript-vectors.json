@@ -1,0 +1,75 @@
+{
+  "_comment": "Authoritative transcript-hash vectors generated from the Rust AgentTextStreamTranscriptV1 (crates/traits/src/agent_text_stream.rs) + split_text_deltas (crates/transport-quic-stream/src/send.rs). Regenerate by temporarily emitting from a Rust test if the Rust hashing ever changes. recordType: 1=text_delta, 3=status.",
+  "vectors": [
+    {
+      "name": "empty_text",
+      "streamIdHex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "startEventIdHex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "chunkBytes": 1024,
+      "records": [{ "recordType": 1, "text": "" }],
+      "transcriptHashHex": "5f0e25dc0a0d9cb3d9b7ce1a1a30cc2f7af349e0d2326c470ae4646b618f3ea1",
+      "chunkCount": 0
+    },
+    {
+      "name": "single_text",
+      "streamIdHex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "startEventIdHex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "chunkBytes": 1024,
+      "records": [{ "recordType": 1, "text": "hello world" }],
+      "transcriptHashHex": "7484dc0c66dd50ac2fb0dbb11e59d65e9d967eee2c4b73b01e172ed4c5bd218a",
+      "chunkCount": 1
+    },
+    {
+      "name": "ascii_chunk4",
+      "streamIdHex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "startEventIdHex": "0202020202020202020202020202020202020202020202020202020202020202",
+      "chunkBytes": 4,
+      "records": [{ "recordType": 1, "text": "hello world" }],
+      "transcriptHashHex": "4b259c33a441db80aeddf1c6bdcdc45520bf5d5d23299d41ad8176fac9d343b8",
+      "chunkCount": 3
+    },
+    {
+      "name": "multibyte_chunk2",
+      "streamIdHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "startEventIdHex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "chunkBytes": 2,
+      "records": [{ "recordType": 1, "text": "héllo" }],
+      "transcriptHashHex": "32c2b5a0a3b2e75d994bf8116993aea53a5261be0d570fefa02bcae3f338f3e0",
+      "chunkCount": 4
+    },
+    {
+      "name": "oversized_char1",
+      "streamIdHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "startEventIdHex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "chunkBytes": 1,
+      "records": [{ "recordType": 1, "text": "éa" }],
+      "transcriptHashHex": "5d2edae07cc6fb4c3ec12890e06f050d8595d5d23b87f3d8d4827a0c3248c72d",
+      "chunkCount": 2
+    },
+    {
+      "name": "text_then_status",
+      "streamIdHex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "startEventIdHex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "chunkBytes": 1024,
+      "records": [
+        { "recordType": 1, "text": "answer" },
+        { "recordType": 3, "text": "thinking" }
+      ],
+      "transcriptHashHex": "cc50f6364c451af673ff72cf4edd0b80fa8fe51c9918efec407d185b8607aa8e",
+      "chunkCount": 2
+    },
+    {
+      "name": "incremental",
+      "streamIdHex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "startEventIdHex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "chunkBytes": 1024,
+      "records": [
+        { "recordType": 1, "text": "hel" },
+        { "recordType": 1, "text": "lo" },
+        { "recordType": 1, "text": " world" }
+      ],
+      "transcriptHashHex": "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb730d5c5a81",
+      "chunkCount": 3
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "TransportDelivery\n{\n    account_id: mem_id(), group_id_hint: Some(gid()), message:\n    TransportMessage\n    {\n        id: mid(), payload: vec![1, 2, 3], timestamp: Timestamp(1717171717),\n        causal_deps: vec![], source: TransportSource(\"nostr\".into()),\n        envelope: TransportEnvelope::GroupMessage\n        { transport_group_id: vec![0xCC; 4], },\n    }, received_at: Timestamp(1717171720), source: TransportDeliverySource\n    {\n        transport: TransportSource(\"nostr\".into()), plane:\n        TransportDeliveryPlane::Group, endpoint:\n        Some(TransportEndpoint(\"wss://group.example\".into())),\n        subscription_id: Some(\"sub-1\".into()),\n    },\n}"
+---
+{
+  "account_id": [
+    97,
+    108,
+    105,
+    99,
+    101
+  ],
+  "group_id_hint": [
+    170,
+    170,
+    170,
+    170
+  ],
+  "message": {
+    "id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "payload": [
+      1,
+      2,
+      3
+    ],
+    "timestamp": 1717171717,
+    "causal_deps": [],
+    "source": "nostr",
+    "envelope": {
+      "GroupMessage": {
+        "transport_group_id": [
+          204,
+          204,
+          204,
+          204
+        ]
+      }
+    }
+  },
+  "received_at": 1717171720,
+  "source": {
+    "transport": "nostr",
+    "plane": "Group",
+    "endpoint": "wss://group.example",
+    "subscription_id": "sub-1"
+  }
+}

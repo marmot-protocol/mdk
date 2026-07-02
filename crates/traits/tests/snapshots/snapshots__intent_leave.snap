@@ -1,0 +1,14 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::Leave { group_id: gid() }"
+---
+{
+  "Leave": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ]
+  }
+}

@@ -1,0 +1,145 @@
+{
+  "scenario_name": "concurrent-invite-fork-recovery/v1",
+  "vector_version": "1",
+  "conformance_version": "0.2.0",
+  "seed": null,
+  "scenario": {
+    "name": "concurrent-invite-fork-recovery/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob",
+      "david",
+      "eve"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "fork",
+        "invitees": [
+          "bob"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob",
+          "david",
+          "eve"
+        ]
+      },
+      {
+        "type": "set_partition",
+        "allow": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "invite_members",
+        "inviter": "alice",
+        "invitees": [
+          "david"
+        ],
+        "pending": "alice-invite"
+      },
+      {
+        "type": "invite_members",
+        "inviter": "bob",
+        "invitees": [
+          "eve"
+        ],
+        "pending": "bob-invite"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "alice-invite"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "bob-invite"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "alice",
+      "pending": "alice-invite",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 9,
+      "client": "bob",
+      "pending": "bob-invite",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 2,
+      "member_count": 3,
+      "received_payloads": []
+    },
+    {
+      "type": "client_state",
+      "client": "bob",
+      "epoch": 2,
+      "member_count": 3,
+      "received_payloads": []
+    },
+    {
+      "type": "recovery_summary",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    }
+  ]
+}

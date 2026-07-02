@@ -1,0 +1,26 @@
+[Unit]
+Description=OpenClaw gateway with Marmot channel plugin
+Wants=network-online.target dm-agent.service
+After=network-online.target dm-agent.service
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+SupplementaryGroups=marmot-agent
+EnvironmentFile=/etc/marmot-agent/openclaw-marmot.env
+WorkingDirectory=/opt/openclaw
+ExecStart=/usr/bin/env openclaw gateway run
+Restart=on-failure
+RestartSec=5s
+StateDirectory=openclaw
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/openclaw /run/marmot-agent
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: msg
+---
+{
+  "id": [
+    187,
+    187,
+    187,
+    187
+  ],
+  "payload": [
+    222,
+    173
+  ],
+  "timestamp": 0,
+  "causal_deps": [],
+  "source": "nostr",
+  "envelope": {
+    "Welcome": {
+      "recipient": [
+        97,
+        108,
+        105,
+        99,
+        101
+      ]
+    }
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "id": "marmot",
+  "name": "Marmot",
+  "description": "OpenClaw channel plugin for Marmot through the local dm-agent control socket.",
+  "activation": { "onStartup": true, "onChannels": ["marmot"] },
+  "channels": ["marmot"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "marmot": {
+      "label": "Marmot",
+      "description": "End-to-end encrypted Marmot groups through the local dm-agent connector.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "description": "Whether this Marmot channel instance is active." },
+          "home": { "type": "string", "description": "dm-agent home directory (default ~/.marmot)." },
+          "socketPath": { "type": "string", "description": "dm-agent control socket path." },
+          "accountIdHex": {
+            "type": "string",
+            "description": "Marmot agent account id hex; required when dm-agent has more than one account."
+          },
+          "authToken": { "type": "string", "description": "Bearer token for a token-gated control socket." },
+          "authTokenFile": { "type": "string", "description": "Path to a bearer token file." },
+          "groupIdHex": { "type": "string", "description": "Optional inbound Marmot group id filter." },
+          "quicCandidates": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "quic:// preview broker candidates for live previews."
+          },
+          "streaming": {
+            "type": ["object", "boolean"],
+            "description": "Live QUIC preview streaming: { mode: off|partial|block|progress } (boolean for legacy on/off). block is the safest preview mode; partial/progress recover durable finals from the OpenClaw transcript."
+          },
+          "blockStreaming": {
+            "type": "boolean",
+            "description": "Enable OpenClaw completed-block delivery into Marmot's live preview sink. Defaults on when QUIC candidates are configured and Marmot streaming is not off."
+          },
+          "profileNameOnboarding": { "type": "boolean" },
+          "dm": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "policy": { "type": "string", "enum": ["open", "allowlist", "pairing", "disabled"] },
+              "allowFrom": { "type": "array", "items": { "type": ["string", "number"] } }
+            }
+          },
+          "accounts": {
+            "type": "object",
+            "description": "Per-account configs for multi-account mode, keyed by account id.",
+            "additionalProperties": { "type": "object" }
+          }
+        }
+      },
+      "uiHints": {
+        "authToken": { "label": "dm-agent control auth token", "sensitive": true }
+      }
+    }
+  }
+}

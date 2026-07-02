@@ -1,0 +1,25 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendResult::Proposal\n{\n    msg: TransportMessage\n    {\n        id: mid(), payload: vec![], timestamp: Timestamp(0), causal_deps:\n        vec![], source: TransportSource(\"t\".into()), envelope:\n        TransportEnvelope::GroupMessage { transport_group_id: vec![], },\n    },\n}"
+---
+{
+  "Proposal": {
+    "msg": {
+      "id": [
+        187,
+        187,
+        187,
+        187
+      ],
+      "payload": [],
+      "timestamp": 0,
+      "causal_deps": [],
+      "source": "t",
+      "envelope": {
+        "GroupMessage": {
+          "transport_group_id": []
+        }
+      }
+    }
+  }
+}
