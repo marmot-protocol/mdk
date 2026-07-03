@@ -154,11 +154,31 @@ impl From<AuditLogUploadSource> for AuditLogUploadSourceFfi {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+/// Tracker upload config supplied by the host app. Write-only across FFI:
+/// `authorization_bearer_token` is accepted here but never returned back to
+/// the host — [`redacted`](Self::redacted) strips it — and the hand-written
+/// `Debug` impl below never prints it.
+#[derive(Clone, uniffi::Record)]
 pub struct AuditLogTrackerConfigFfi {
     pub endpoint: Option<String>,
     pub authorization_bearer_token: Option<String>,
     pub source: AuditLogUploadSourceFfi,
+}
+
+impl std::fmt::Debug for AuditLogTrackerConfigFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogTrackerConfigFfi")
+            .field("endpoint", &self.endpoint)
+            .field(
+                "authorization_bearer_token",
+                &self
+                    .authorization_bearer_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 impl From<AuditLogTrackerConfigFfi> for AuditLogTrackerConfig {
@@ -171,12 +191,53 @@ impl From<AuditLogTrackerConfigFfi> for AuditLogTrackerConfig {
     }
 }
 
-impl From<AuditLogTrackerConfig> for AuditLogTrackerConfigFfi {
-    fn from(value: AuditLogTrackerConfig) -> Self {
+impl AuditLogTrackerConfigFfi {
+    /// The stored config with the bearer token stripped, for returning across
+    /// FFI: secrets flow in through setters but are never handed back out.
+    pub(crate) fn redacted(value: AuditLogTrackerConfig) -> Self {
         Self {
             endpoint: value.endpoint,
-            authorization_bearer_token: value.authorization_bearer_token,
+            authorization_bearer_token: None,
             source: value.source.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "super-secret-bearer-token";
+
+    fn config_with_token() -> AuditLogTrackerConfigFfi {
+        AuditLogTrackerConfigFfi {
+            endpoint: Some("https://goggles.example/upload".to_owned()),
+            authorization_bearer_token: Some(TOKEN.to_owned()),
+            source: AuditLogUploadSourceFfi {
+                device_label: Some("test-device".to_owned()),
+                platform: None,
+                app_version: None,
+            },
+        }
+    }
+
+    #[test]
+    fn audit_tracker_config_debug_redacts_bearer_token() {
+        let rendered = format!("{:?}", config_with_token());
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(rendered.contains("goggles.example"), "{rendered}");
+    }
+
+    #[test]
+    fn audit_tracker_config_redacted_strips_bearer_token() {
+        let stored: AuditLogTrackerConfig = config_with_token().into();
+        let returned = AuditLogTrackerConfigFfi::redacted(stored);
+        assert_eq!(returned.authorization_bearer_token, None);
+        assert_eq!(
+            returned.endpoint.as_deref(),
+            Some("https://goggles.example/upload")
+        );
     }
 }
