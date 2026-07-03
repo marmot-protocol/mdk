@@ -808,6 +808,33 @@ async fn broker_retains_finished_rooms_and_closes_live_subscribers() {
 }
 
 #[tokio::test]
+async fn broker_frees_backlog_accounting_when_publisher_reuses_finished_room() {
+    let state = Arc::new(test_state(DEFAULT_BROKER_BACKLOG_DEPTH));
+    let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
+    let record = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
+
+    state.publish(&key, record).await.unwrap();
+    state.finish_room(&key).await;
+    assert!(state.backlog_bytes_for_test().await > 0);
+
+    // A new publisher reusing the finished key resets the room in place,
+    // discarding its retained backlog; the discarded bytes must leave the
+    // global accounting with it instead of lingering as phantom budget until
+    // the next state-touching op happens to recompute the total.
+    let waiter = {
+        let state = Arc::clone(&state);
+        let key = key.clone();
+        tokio::spawn(async move { state.wait_for_subscriber(&key).await })
+    };
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(state.backlog_bytes_for_test().await, 0);
+
+    let (_subscriber_id, _backlog, _rx) = state.subscribe(key).await.unwrap();
+    waiter.await.unwrap().unwrap();
+    assert_eq!(state.backlog_bytes_for_test().await, 0);
+}
+
+#[tokio::test]
 async fn broker_drops_finished_rooms_after_ttl() {
     let state = Arc::new(test_state(DEFAULT_BROKER_BACKLOG_DEPTH));
     let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));

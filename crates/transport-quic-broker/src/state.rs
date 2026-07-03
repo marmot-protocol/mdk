@@ -258,13 +258,23 @@ impl BrokerState {
                         });
                     }
                     let room = inner.rooms.entry(key.clone()).or_default();
+                    // A publisher reusing a finished room resets it in place,
+                    // discarding its retained backlog without going through
+                    // `remove_room`; free those bytes from the global budget
+                    // so `total_backlog_bytes` cannot drift above the real
+                    // retained total.
+                    let mut freed = 0;
                     if room.finished_at.is_some() {
+                        freed = room.backlog_bytes;
                         *room = BrokerRoom::default();
                     }
-                    if !room.subscribers.is_empty() {
+                    let has_subscribers = !room.subscribers.is_empty();
+                    let notify = room.subscriber_notify.clone();
+                    inner.total_backlog_bytes = inner.total_backlog_bytes.saturating_sub(freed);
+                    if has_subscribers {
                         return Ok(());
                     }
-                    room.subscriber_notify.clone()
+                    notify
                 };
                 notify.notified().await;
             }
