@@ -2585,6 +2585,22 @@ fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
 }
 
 #[test]
+fn media_download_subdir_is_stable_and_content_derived() {
+    use crate::messaging::media_download_subdir;
+
+    let a = media_download_subdir(b"plaintext-a");
+    let b = media_download_subdir(b"plaintext-b");
+    assert_eq!(a, media_download_subdir(b"plaintext-a"), "stable per blob");
+    assert_ne!(a, b, "distinct content must not share a subdir");
+    // Lowercase hex: always a single safe path component.
+    assert_eq!(a.len(), 64);
+    assert!(
+        a.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+}
+
+#[test]
 fn safe_media_filename_strips_path_traversal() {
     use crate::messaging::safe_media_filename;
     assert_eq!(safe_media_filename("a.png"), "a.png");
