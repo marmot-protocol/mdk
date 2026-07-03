@@ -95,6 +95,7 @@ impl<S: StorageProvider> Engine<S> {
         // left an unrecoverable `UnknownPending` on retry.
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
+                let mut own_commit_stamp = None;
                 if has_pending_commit {
                     // `staged` borrows `mls_group`; scope it so the subsequent
                     // `merge_pending_commit` can take `&mut mls_group`.
@@ -108,6 +109,15 @@ impl<S: StorageProvider> Engine<S> {
                             staged,
                             self.ciphersuite,
                         )?;
+                        // Capture the convergence ordering stamp while the
+                        // staged commit is still attached: stored convergence
+                        // cannot re-derive priority or consumed proposal refs
+                        // from the wire bytes later (MLS refuses to process
+                        // own commits), so this is the only durable source.
+                        own_commit_stamp = Some(crate::openmls_projection::own_commit_stamp(
+                            staged,
+                            self.identity.self_id().clone(),
+                        )?);
                     }
                     let tx_provider =
                         EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
@@ -138,7 +148,16 @@ impl<S: StorageProvider> Engine<S> {
                     self.ciphersuite,
                 )?;
                 if let Some(message_id) = origin_commit_id.as_ref() {
-                    storage.update_message_state(message_id, MessageState::Processed)?;
+                    // Enrich the stored wire record with the convergence stamp
+                    // (when one was captured above) in the same write that marks
+                    // it `Processed`, so a post-restart stored-convergence pass
+                    // can rebuild this commit's branch as a pre-validated
+                    // candidate instead of silently pruning it.
+                    crate::openmls_projection::stamp_processed_own_commit_record(
+                        storage,
+                        message_id,
+                        own_commit_stamp.take(),
+                    )?;
                 }
                 Ok(())
             })?;

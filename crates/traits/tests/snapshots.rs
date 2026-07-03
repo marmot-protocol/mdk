@@ -268,6 +268,38 @@ fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
 }
 
 #[test]
+fn stored_message_payload_own_commit_wire_round_trips_with_stamp() {
+    use cgka_traits::engine::CommitOrderingPriority;
+    use cgka_traits::message::OwnCommitConvergenceStamp;
+
+    let message = TransportMessage {
+        id: mid(),
+        payload: vec![0xAB, 0xCD],
+        timestamp: Timestamp(1717171717),
+        causal_deps: vec![],
+        source: TransportSource("nostr".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: vec![0xCC; 4],
+        },
+    };
+    let stamp = OwnCommitConvergenceStamp {
+        committer: MemberId::new(vec![0xEE; 32]),
+        priority: CommitOrderingPriority::Privileged,
+        consumed_proposal_refs: vec!["0a0b".into()],
+    };
+    let payload = StoredMessagePayload::own_commit_wire(message.clone(), stamp.clone());
+
+    insta::assert_json_snapshot!("stored_payload_own_commit_wire", payload);
+
+    let decoded = StoredMessagePayload::decode(&payload.encode().unwrap()).unwrap();
+    // Convergence replay reads the same wire message as a plain OpenMlsWire row;
+    // the stamp rides alongside for own-branch materialization.
+    assert_eq!(decoded.as_openmls_wire().unwrap(), &message);
+    assert_eq!(decoded.own_commit_stamp().unwrap(), &stamp);
+    assert!(decoded.as_raw_transport().is_none());
+}
+
+#[test]
 fn stored_message_payload_decodes_legacy_transport_message_as_openmls_wire() {
     let legacy = TransportMessage {
         id: mid(),

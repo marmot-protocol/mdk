@@ -1,0 +1,75 @@
+---
+source: crates/traits/tests/snapshots.rs
+assertion_line: 292
+expression: payload
+---
+{
+  "kind": "own_commit_wire",
+  "message": {
+    "message": {
+      "id": [
+        187,
+        187,
+        187,
+        187
+      ],
+      "payload": [
+        171,
+        205
+      ],
+      "timestamp": 1717171717,
+      "causal_deps": [],
+      "source": "nostr",
+      "envelope": {
+        "GroupMessage": {
+          "transport_group_id": [
+            204,
+            204,
+            204,
+            204
+          ]
+        }
+      }
+    },
+    "stamp": {
+      "committer": [
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238,
+        238
+      ],
+      "priority": "privileged",
+      "consumed_proposal_refs": [
+        "0a0b"
+      ]
+    }
+  }
+}

@@ -213,6 +213,7 @@ struct StoredOpenMlsCanonicalizationWork {
     policy: CanonicalizationPolicy,
     now_ms: u64,
     replay_start_epoch: u64,
+    own_commits: PrevalidatedOwnCommits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,6 +310,107 @@ impl From<StorageError> for OpenMlsProjectionError {
     }
 }
 
+/// Own published-and-confirmed commits usable as pre-validated candidate-path
+/// segments during stored-convergence materialization.
+///
+/// MLS cannot process a device's own commit through `process_message`, so a
+/// candidate path containing one cannot be materialized by replay alone: after
+/// a restart clears the in-memory `committed_from` guard, the own commit's
+/// branch would silently drop out of branch selection and the device could be
+/// reorged onto a losing sibling (or, with two restarted committers, the group
+/// could fork permanently). Instead, an own `Processed` commit whose ordering
+/// stamp was persisted at confirm time is realized by rolling the group
+/// forward to the retained anchor snapshot at its resulting epoch — the exact
+/// post-merge state the commit produced — and synthesizing its
+/// `CommitStaged` observation from the stamp.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PrevalidatedOwnCommits {
+    /// Confirm-stamped own `Processed` commits, keyed by wire-bytes digest.
+    by_digest: BTreeMap<[u8; 32], cgka_traits::message::OwnCommitConvergenceStamp>,
+    /// Digests of every `Processed` commit (own and others') — the canonical
+    /// chain. An own commit is pre-validated only while the replayed path
+    /// prefix stays canonical: it was created from the canonical state at its
+    /// source epoch, so on any diverging prefix it must NOT apply.
+    canonical_digests: BTreeSet<[u8; 32]>,
+}
+
+impl PrevalidatedOwnCommits {
+    fn insert_canonical(&mut self, digest: [u8; 32]) {
+        self.canonical_digests.insert(digest);
+    }
+
+    fn insert_stamped(
+        &mut self,
+        digest: [u8; 32],
+        stamp: cgka_traits::message::OwnCommitConvergenceStamp,
+    ) {
+        self.by_digest.insert(digest, stamp);
+    }
+
+    fn stamp(&self, digest: &[u8; 32]) -> Option<&cgka_traits::message::OwnCommitConvergenceStamp> {
+        self.by_digest.get(digest)
+    }
+
+    fn is_canonical(&self, digest: &[u8; 32]) -> bool {
+        self.canonical_digests.contains(digest)
+    }
+}
+
+/// Build the convergence ordering stamp for a staged local commit, captured
+/// while the staged commit is still attached (confirm time). See
+/// [`cgka_traits::message::OwnCommitConvergenceStamp`].
+pub(crate) fn own_commit_stamp(
+    staged: &openmls::group::StagedCommit,
+    committer: MemberId,
+) -> Result<cgka_traits::message::OwnCommitConvergenceStamp, cgka_traits::error::EngineError> {
+    let priority = crate::app_components::commit_ordering_priority_for_staged(staged);
+    let mut consumed_proposal_refs = staged
+        .queued_proposals()
+        .map(|proposal| tls_hex(proposal.proposal_reference_ref()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| cgka_traits::error::EngineError::Serialize(format!("{e}")))?;
+    consumed_proposal_refs.sort();
+    consumed_proposal_refs.dedup();
+    Ok(cgka_traits::message::OwnCommitConvergenceStamp {
+        committer,
+        priority,
+        consumed_proposal_refs,
+    })
+}
+
+/// Mark the origin commit record `Processed` and, when a confirm-time stamp is
+/// available, enrich its stored wire payload to `OwnCommitWire` in the same
+/// write, so stored convergence can later rebuild this commit's branch as a
+/// pre-validated candidate.
+pub(crate) fn stamp_processed_own_commit_record<S: StorageProvider>(
+    storage: &S,
+    message_id: &MessageId,
+    stamp: Option<cgka_traits::message::OwnCommitConvergenceStamp>,
+) -> Result<(), cgka_traits::error::EngineError> {
+    let Some(stamp) = stamp else {
+        storage.update_message_state(message_id, MessageState::Processed)?;
+        return Ok(());
+    };
+    let mut record = storage.get_message(message_id)?;
+    let payload = StoredMessagePayload::decode(&record.payload)
+        .map_err(|e| cgka_traits::error::EngineError::Serialize(format!("{e:?}")))?;
+    let payload = match payload {
+        StoredMessagePayload::OpenMlsWire(message)
+        | StoredMessagePayload::OwnCommitWire { message, .. } => {
+            StoredMessagePayload::own_commit_wire(message, stamp)
+        }
+        // Raw-transport rows never enter the OpenMLS candidate graph; a plain
+        // state update preserves their shape.
+        other @ StoredMessagePayload::RawTransport(_) => other,
+    };
+    record.state = MessageState::Processed;
+    record.payload = payload
+        .encode()
+        .map_err(|e| cgka_traits::error::EngineError::Serialize(format!("{e:?}")))?;
+    storage.put_message(&record)?;
+    Ok(())
+}
+
 pub fn project_mls_message(
     bytes: &[u8],
 ) -> Result<OpenMlsMessageProjection, OpenMlsProjectionError> {
@@ -335,16 +437,32 @@ pub fn replay_openmls_messages<S: StorageProvider>(
     group_id: &GroupId,
     messages: &[TransportMessage],
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+    replay_openmls_messages_prevalidated(
+        storage,
+        group_id,
+        messages,
+        &PrevalidatedOwnCommits::default(),
+    )
+}
+
+fn replay_openmls_messages_prevalidated<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
+) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
     let snapshot = replay_snapshot_name(group_id, messages);
     // RAII: on any unwind path (panic during replay, early error)
     // Drop rolls back + releases. On the happy path we explicitly
-    // commit at the end.
+    // commit at the end. Pre-validated own-commit rollforwards inside the
+    // replay land within this guard, so they are unwound with everything
+    // else.
     let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
-    let result =
-        process_openmls_messages_inner(storage, group_id, messages).map(|out| out.observations);
+    let result = process_openmls_messages_inner(storage, group_id, messages, own_commits)
+        .map(|out| out.observations);
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
@@ -360,6 +478,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
         storage,
         group_id,
         paths,
+        &PrevalidatedOwnCommits::default(),
         &mut ReplayBudget::unlimited(),
     )
 }
@@ -368,6 +487,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     paths: &[OpenMlsCandidatePath],
+    own_commits: &PrevalidatedOwnCommits,
     budget: &mut ReplayBudget,
 ) -> Result<Vec<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
     let mut candidates = Vec::with_capacity(paths.len());
@@ -378,7 +498,8 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
             ));
         }
         budget.consume()?;
-        let observations = replay_openmls_messages(storage, group_id, &path.messages)?;
+        let observations =
+            replay_openmls_messages_prevalidated(storage, group_id, &path.messages, own_commits)?;
         let mut fork_epoch: Option<u64> = None;
         let mut tip_epoch: Option<u64> = None;
         let mut tip_digest: Option<[u8; 32]> = None;
@@ -445,11 +566,31 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
     group_id: &GroupId,
     batch: OpenMlsCanonicalizationBatch,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+    canonicalize_openmls_batch_prevalidated(
+        storage,
+        group_id,
+        batch,
+        &PrevalidatedOwnCommits::default(),
+    )
+}
+
+fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    batch: OpenMlsCanonicalizationBatch,
+    own_commits: &PrevalidatedOwnCommits,
+) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let candidate_paths = candidate_paths_with_pending_replay_messages(
         &batch.candidate_paths,
         &batch.pending_messages,
     )?;
-    let materialized = materialize_openmls_candidate_paths(storage, group_id, &candidate_paths)?;
+    let materialized = materialize_openmls_candidate_paths_budgeted(
+        storage,
+        group_id,
+        &candidate_paths,
+        own_commits,
+        &mut ReplayBudget::unlimited(),
+    )?;
     canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)
 }
 
@@ -512,12 +653,16 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
     let mut commit_messages = Vec::new();
     let mut pending_messages = Vec::new();
     let mut stale_commit_drops = Vec::new();
+    let mut own_commits = PrevalidatedOwnCommits::default();
 
     for record in records {
         if !record_state_can_contribute_to_openmls_graph(record.state) {
             continue;
         }
-        let Some(message) = openmls_wire_message_from_record(&record)? else {
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
+        let own_commit_stamp = payload.own_commit_stamp().cloned();
+        let Some(message) = payload.as_openmls_wire().cloned() else {
             continue;
         };
         if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
@@ -539,6 +684,12 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                         });
                     }
                     continue;
+                }
+                if record.state == MessageState::Processed {
+                    own_commits.insert_canonical(projection.message_digest);
+                    if let Some(stamp) = own_commit_stamp {
+                        own_commits.insert_stamped(projection.message_digest, stamp);
+                    }
                 }
                 commit_messages.push(StoredCommitMessage {
                     message,
@@ -581,6 +732,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                 policy,
                 now_ms,
                 replay_start_epoch,
+                own_commits,
             },
         )?;
         append_dropped_messages(&mut result, stale_commit_drops);
@@ -598,6 +750,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
             policy,
             now_ms,
             replay_start_epoch,
+            own_commits,
         },
     )?;
     append_dropped_messages(&mut result, stale_commit_drops);
@@ -667,6 +820,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         &work.pending_messages,
         work.replay_start_epoch,
         work.policy.convergence.max_rewind_commits,
+        &work.own_commits,
     )?;
 
     // Reuse the candidates the BFS already materialized instead of replaying every completed
@@ -691,7 +845,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         materialized.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
         canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)?
     } else {
-        canonicalize_openmls_batch(storage, group_id, batch)?
+        canonicalize_openmls_batch_prevalidated(storage, group_id, batch, &work.own_commits)?
     };
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
     Ok(result)
@@ -743,6 +897,9 @@ fn missing_retained_anchor_result(
     }
 }
 
+// The last two arguments carry independent replay context; folding them into a
+// struct would just relocate the same fields.
+#[allow(clippy::too_many_arguments)]
 fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -750,6 +907,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     pending_messages: &[TransportMessage],
     starting_epoch: u64,
     max_rewind_commits: u64,
+    own_commits: &PrevalidatedOwnCommits,
 ) -> Result<StoredOpenMlsCandidatePathResult, OpenMlsProjectionError> {
     commits.sort_by(|a, b| {
         a.source_epoch
@@ -794,6 +952,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                     messages.clone(),
                     &digests,
                     &pending_proposals,
+                    own_commits,
                     &mut budget,
                 )? {
                     CandidatePathProbeResult::Materialized(Some(candidate)) => candidate,
@@ -881,12 +1040,15 @@ fn pending_proposal_messages(
     Ok(proposals)
 }
 
+// See `build_stored_openmls_candidate_paths` — same shared-context argument set.
+#[allow(clippy::too_many_arguments)]
 fn probe_candidate_path<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     messages: Vec<TransportMessage>,
     digests: &[[u8; 32]],
     pending_proposals: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
     budget: &mut ReplayBudget,
 ) -> Result<CandidatePathProbeResult, OpenMlsProjectionError> {
     let path = OpenMlsCandidatePath {
@@ -894,7 +1056,13 @@ fn probe_candidate_path<S: StorageProvider>(
         messages,
     };
     let replay_paths = candidate_paths_with_pending_replay_messages(&[path], pending_proposals)?;
-    match materialize_openmls_candidate_paths_budgeted(storage, group_id, &replay_paths, budget) {
+    match materialize_openmls_candidate_paths_budgeted(
+        storage,
+        group_id,
+        &replay_paths,
+        own_commits,
+        budget,
+    ) {
         Ok(mut candidates) => Ok(CandidatePathProbeResult::Materialized(candidates.pop())),
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
             Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
@@ -914,12 +1082,20 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     result: &CanonicalizationResult,
     max_retained_anchor_rewind: u64,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
-    let replay_messages = replay_messages_for_canonicalization_result(storage, result)?;
     let current_epoch = storage
         .get_group(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
         .epoch
         .0;
+    // The selected branch's already-applied prefix — leading `Processed`
+    // commits below the live tip — IS the live canonical chain: skip it and
+    // start state reconstruction from the first genuinely new commit. This is
+    // also what lets a branch containing this device's OWN confirmed commit
+    // apply at all (MLS cannot re-process own commits), and it avoids
+    // re-replaying history the live state already reflects.
+    let applied_prefix = already_applied_commit_prefix(storage, result, current_epoch)?;
+    let replay_messages =
+        replay_messages_for_canonicalization_result(storage, result, &applied_prefix)?;
     let live_message_records = storage
         .list_messages(group_id, EpochId(0))
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
@@ -927,30 +1103,31 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
         .list_queued_outbound_intents(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     let apply_start_epoch =
-        apply_start_epoch_for_canonicalization_result(storage, result)?.unwrap_or(current_epoch);
+        apply_start_epoch_for_canonicalization_result(storage, result, &applied_prefix)?
+            .unwrap_or(current_epoch);
+    let has_new_commits = result.accepted_commits.len() > applied_prefix.len();
     let snapshot = apply_snapshot_name(group_id, result);
     storage
         .create_group_snapshot(group_id, &snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
-    let prepare_result =
-        if !result.accepted_commits.is_empty() && apply_start_epoch == current_epoch {
-            retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
-        } else if apply_start_epoch < current_epoch {
-            let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
-            storage
-                .rollback_group_to_snapshot(group_id, &anchor_snapshot)
-                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))
-                .and_then(|()| {
-                    restore_live_message_and_queue_records(
-                        storage,
-                        &live_message_records,
-                        &live_queued_outbound,
-                    )
-                })
-        } else {
-            Ok(())
-        };
+    let prepare_result = if has_new_commits && apply_start_epoch == current_epoch {
+        retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
+    } else if apply_start_epoch < current_epoch {
+        let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
+        storage
+            .rollback_group_to_snapshot(group_id, &anchor_snapshot)
+            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))
+            .and_then(|()| {
+                restore_live_message_and_queue_records(
+                    storage,
+                    &live_message_records,
+                    &live_queued_outbound,
+                )
+            })
+    } else {
+        Ok(())
+    };
     if let Err(err) = prepare_result {
         rollback_and_release_group_snapshot(storage, group_id, &snapshot)?;
         return Err(err);
@@ -1020,11 +1197,43 @@ pub fn persist_openmls_canonicalization_dispositions<S: StorageProvider>(
     Ok(())
 }
 
+/// The longest leading run of accepted commits already applied on the live
+/// canonical state: `Processed` records whose source epoch sits below the live
+/// tip. `Processed` means "applied on this device's canonical chain" (there is
+/// at most one per epoch), so the prefix needs no re-replay — and an OWN
+/// confirmed commit in it CANNOT be re-replayed (`process_message` refuses own
+/// commits).
+fn already_applied_commit_prefix<S: StorageProvider>(
+    storage: &S,
+    result: &CanonicalizationResult,
+    current_epoch: u64,
+) -> Result<BTreeSet<String>, OpenMlsProjectionError> {
+    let mut prefix = BTreeSet::new();
+    for commit_id in &result.accepted_commits {
+        let message_id = message_id_from_hex(commit_id)?;
+        let record = match storage.get_message(&message_id) {
+            Ok(record) => record,
+            Err(StorageError::NotFound) => break,
+            Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
+        };
+        if record.state != MessageState::Processed || record.epoch.0 >= current_epoch {
+            break;
+        }
+        prefix.insert(commit_id.clone());
+    }
+    Ok(prefix)
+}
+
 fn apply_start_epoch_for_canonicalization_result<S: StorageProvider>(
     storage: &S,
     result: &CanonicalizationResult,
+    applied_prefix: &BTreeSet<String>,
 ) -> Result<Option<u64>, OpenMlsProjectionError> {
-    let Some(first_commit_id) = result.accepted_commits.first() else {
+    let Some(first_commit_id) = result
+        .accepted_commits
+        .iter()
+        .find(|commit_id| !applied_prefix.contains(*commit_id))
+    else {
         return Ok(None);
     };
     let message_id = message_id_from_hex(first_commit_id)?;
@@ -1128,7 +1337,16 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     // inside an open one. The snapshot guards in-process error returns; this
     // transaction guards hard crashes mid-merge.
     storage.with_transaction(|storage| {
-        let output = process_openmls_messages_inner(storage, group_id, replay_messages)?;
+        // No pre-validated own commits here: snapshot rollforward cannot nest
+        // inside this transaction, and the already-applied prefix (which is
+        // where own commits can appear on an accepted branch) was excluded
+        // from `replay_messages` before this call.
+        let output = process_openmls_messages_inner(
+            storage,
+            group_id,
+            replay_messages,
+            &PrevalidatedOwnCommits::default(),
+        )?;
         update_group_record_from_replay(storage, group_id, &output)?;
         persist_openmls_canonicalization_dispositions(storage, result)?;
         Ok(output.observations)
@@ -1138,13 +1356,19 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
 fn replay_messages_for_canonicalization_result<S: StorageProvider>(
     storage: &S,
     result: &CanonicalizationResult,
+    applied_prefix: &BTreeSet<String>,
 ) -> Result<Vec<TransportMessage>, OpenMlsProjectionError> {
     let mut replay_messages = Vec::new();
     let mut seen = BTreeSet::new();
     for hex_message_id in result
         .accepted_proposals
         .iter()
-        .chain(&result.accepted_commits)
+        .chain(
+            result
+                .accepted_commits
+                .iter()
+                .filter(|commit_id| !applied_prefix.contains(*commit_id)),
+        )
         .chain(&result.accepted_app_messages)
     {
         if !seen.insert(hex_message_id.clone()) {
@@ -1474,6 +1698,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     messages: &[TransportMessage],
+    own_commits: &PrevalidatedOwnCommits,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
@@ -1483,6 +1708,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         .ok_or(OpenMlsProjectionError::MissingGroup)?;
 
     let mut observations = Vec::new();
+    // An own commit is pre-validated only while every commit replayed before
+    // it was canonical (`Processed`): it was created from the canonical state
+    // at its source epoch, so on a diverging prefix its anchor state would
+    // not be the state the commit actually produces there.
+    let mut prefix_canonical = true;
     for message in messages {
         let projection = project_mls_message(&message.payload)?;
         let message_id = hex::encode(message.id.as_slice());
@@ -1499,6 +1729,54 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 .ok_or(OpenMlsProjectionError::UnsupportedMessageKind(
                     projection.kind,
                 ))?;
+        if projection.kind == OpenMlsContentKind::Commit
+            && prefix_canonical
+            && let Some(stamp) = own_commits.stamp(&projection.message_digest)
+        {
+            // MLS cannot process this device's own commit; realize its
+            // pre-validated result by rolling the group forward to the
+            // retained anchor snapshot the confirm path captured at its
+            // resulting epoch, and synthesize the CommitStaged observation
+            // from the confirm-time stamp. Any failure prunes this branch
+            // (the pre-fix behavior) rather than failing the pass.
+            let group_epoch = mls_group.epoch().as_u64();
+            if group_epoch != source_epoch {
+                return Err(OpenMlsProjectionError::Replay(format!(
+                    "own commit source epoch {source_epoch} does not match replay state {group_epoch}"
+                )));
+            }
+            let resulting_epoch = source_epoch.saturating_add(1);
+            match storage.rollback_group_to_snapshot(
+                group_id,
+                &retained_anchor_snapshot_name(resulting_epoch),
+            ) {
+                Ok(()) => {}
+                Err(StorageError::SnapshotMissing(_)) => {
+                    return Err(OpenMlsProjectionError::Replay(format!(
+                        "own commit anchor snapshot missing at epoch {resulting_epoch}"
+                    )));
+                }
+                Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
+            }
+            mls_group = MlsGroup::load(provider.storage(), &mls_group_id)
+                .map_err(|e| OpenMlsProjectionError::Replay(format!("anchor reload: {e:?}")))?
+                .ok_or(OpenMlsProjectionError::MissingGroup)?;
+            let anchor_epoch = mls_group.epoch().as_u64();
+            if anchor_epoch != resulting_epoch {
+                return Err(OpenMlsProjectionError::Replay(format!(
+                    "own commit anchor epoch {anchor_epoch} does not match resulting epoch {resulting_epoch}"
+                )));
+            }
+            observations.push(OpenMlsReplayObservation::CommitStaged {
+                message_id,
+                source_epoch,
+                resulting_epoch,
+                priority: stamp.priority,
+                committer: stamp.committer.as_slice().to_vec(),
+                consumed_proposal_refs: stamp.consumed_proposal_refs.clone(),
+            });
+            continue;
+        }
         let processed = match if projection.kind == OpenMlsContentKind::Commit {
             process_commit_with_app_data_updates(&mut mls_group, &provider, protocol)
         } else {
@@ -1629,6 +1907,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
                     })?;
+                prefix_canonical =
+                    prefix_canonical && own_commits.is_canonical(&projection.message_digest);
             }
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let payload = bytes.into_bytes();

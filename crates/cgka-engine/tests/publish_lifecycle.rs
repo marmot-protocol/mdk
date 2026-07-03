@@ -778,8 +778,10 @@ async fn welcome_wrapped_pre_merge_lands_recipient_at_post_stage_epoch() {
 // lock there advanced the epoch durably yet made a retry fail with
 // `UnknownPending` — a half-applied, unrecoverable confirm.
 
-/// Shared, arm-able fault switch: while armed, the next `update_message_state`
-/// to `Processed` returns `StorageError::Busy` once, then disarms.
+/// Shared, arm-able fault switch: while armed, the next write that marks a
+/// message `Processed` (`update_message_state`, or the `put_message` the
+/// confirm path uses to stamp own-commit convergence metadata in the same
+/// write) returns `StorageError::Busy` once, then disarms.
 #[derive(Clone, Default)]
 struct ProcessedFault(Arc<AtomicUsize>);
 
@@ -822,6 +824,9 @@ impl GroupStorage for FaultStorage {
 
 impl MessageStorage for FaultStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
+        if record.state == MessageState::Processed && self.fault.should_fail() {
+            return Err(StorageError::Busy("injected confirm-path lock".into()));
+        }
         self.inner.put_message(record)
     }
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {

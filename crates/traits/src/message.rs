@@ -5,9 +5,31 @@
 //! progresses. Kept here (and not inside the engine) so the storage backend
 //! can query "what's retryable?" without cracking engine internals.
 
+use crate::engine::CommitOrderingPriority;
 use crate::transport::TransportMessage;
-use crate::types::{EpochId, GroupId, MessageId};
+use crate::types::{EpochId, GroupId, MemberId, MessageId};
 use serde::{Deserialize, Serialize};
+
+/// Convergence-relevant ordering metadata for a commit this device published
+/// and confirmed, captured at confirm time (while the staged commit is still
+/// attached) and persisted alongside the stored wire bytes.
+///
+/// MLS cannot process a device's own commit through `process_message`, so
+/// after an engine restart the stored wire record is the ONLY source from
+/// which stored convergence can rebuild the own commit's branch-selection
+/// ordering key (priority + authenticated committer; the digest is recomputed
+/// from the stored bytes) and its consumed proposal references.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnCommitConvergenceStamp {
+    /// This device's member identity — the authenticated committer of the
+    /// stored commit.
+    pub committer: MemberId,
+    /// Authorization-aware ordering priority derived from the staged commit's
+    /// shape at confirm time.
+    pub priority: CommitOrderingPriority,
+    /// Hex-encoded proposal references the commit consumed, in sorted order.
+    pub consumed_proposal_refs: Vec<String>,
+}
 
 /// Typed envelope for the opaque bytes stored in [`MessageRecord::payload`].
 ///
@@ -18,13 +40,21 @@ use serde::{Deserialize, Serialize};
 /// - `RawTransport`: original transport-wrapped message. Used when peeling is
 ///   deferred or the engine needs to retry with a different epoch context.
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
-///   wire bytes. Only this variant is eligible for OpenMLS projection and
-///   convergence replay.
+///   wire bytes. Only this variant and `OwnCommitWire` are eligible for
+///   OpenMLS projection and convergence replay.
+/// - `OwnCommitWire`: an `OpenMlsWire` commit this device published and
+///   confirmed, enriched with its [`OwnCommitConvergenceStamp`] so stored
+///   convergence can treat it as a pre-validated candidate branch after a
+///   restart.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum StoredMessagePayload {
     RawTransport(TransportMessage),
     OpenMlsWire(TransportMessage),
+    OwnCommitWire {
+        message: TransportMessage,
+        stamp: OwnCommitConvergenceStamp,
+    },
 }
 
 impl StoredMessagePayload {
@@ -34,6 +64,10 @@ impl StoredMessagePayload {
 
     pub fn openmls_wire(message: TransportMessage) -> Self {
         Self::OpenMlsWire(message)
+    }
+
+    pub fn own_commit_wire(message: TransportMessage, stamp: OwnCommitConvergenceStamp) -> Self {
+        Self::OwnCommitWire { message, stamp }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
@@ -53,20 +87,31 @@ impl StoredMessagePayload {
     pub fn as_raw_transport(&self) -> Option<&TransportMessage> {
         match self {
             Self::RawTransport(message) => Some(message),
-            Self::OpenMlsWire(_) => None,
+            Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
         }
     }
 
     pub fn as_openmls_wire(&self) -> Option<&TransportMessage> {
         match self {
             Self::RawTransport(_) => None,
-            Self::OpenMlsWire(message) => Some(message),
+            Self::OpenMlsWire(message) | Self::OwnCommitWire { message, .. } => Some(message),
+        }
+    }
+
+    /// The confirm-time convergence stamp, when this payload is an own
+    /// published-and-confirmed commit.
+    pub fn own_commit_stamp(&self) -> Option<&OwnCommitConvergenceStamp> {
+        match self {
+            Self::RawTransport(_) | Self::OpenMlsWire(_) => None,
+            Self::OwnCommitWire { stamp, .. } => Some(stamp),
         }
     }
 
     pub fn into_message(self) -> TransportMessage {
         match self {
-            Self::RawTransport(message) | Self::OpenMlsWire(message) => message,
+            Self::RawTransport(message)
+            | Self::OpenMlsWire(message)
+            | Self::OwnCommitWire { message, .. } => message,
         }
     }
 }
