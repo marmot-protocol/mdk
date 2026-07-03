@@ -12,9 +12,12 @@ use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, Requ
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
+use cgka_traits::storage::{
+    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, OutboundIntentStorage,
+    StorageProvider,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -615,16 +618,484 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
     );
 }
 
+/// Shared setup for the self-eviction realization tests (#376): alice (admin)
+/// creates a group with bob, bob joins, alice removes bob and confirms the
+/// publish. Returns the engines, bob's storage handle, the group id, and the
+/// removal commit routed for group ingestion (NOT yet delivered to bob).
+async fn setup_removed_member(
+    tag: &[u8],
+) -> (
+    Engine<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+    GroupId,
+    TransportMessage,
+) {
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: String::from_utf8_lossy(tag).into_owned(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let remove = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match remove {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    alice.drain_events();
+
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    (alice, bob, bob_storage, group_id, routed_commit)
+}
+
+/// Send a post-eviction application message from `alice` and route it for
+/// group ingestion.
+async fn post_eviction_app_message(
+    alice: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    payload: &[u8],
+) -> TransportMessage {
+    let payload = app_payload_for(alice, payload);
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .unwrap();
+    let msg = match sent {
+        SendResult::ApplicationMessage { msg } => msg,
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+    TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    }
+}
+
+/// #376 realization marker: when the removed member applies the removal
+/// commit, the local group copy is marked removed alongside the self-removed
+/// notification, so later `SelfEvicted` input does not re-notify.
 #[tokio::test]
-async fn remove_co_admin_without_admin_policy_update_is_rejected() {
+async fn removed_member_applying_removal_commit_marks_local_copy_removed() {
+    let (_alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-marks-removed").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "removal commit enters convergence; got {outcome:?}"
+    );
+    converge_buffered_commit(&mut bob, &group_id);
+
+    let bob_events = bob.drain_events();
+    assert!(
+        emits_departure_of(&bob_events, &bob.self_id()),
+        "bob should observe his own removal; got {bob_events:?}"
+    );
+    let record = bob_storage.get_group(&group_id).unwrap();
+    assert!(
+        record.removed,
+        "applying the removal commit must mark the local group copy removed"
+    );
+}
+
+/// #376 regression (silent eviction): later group input for a group whose
+/// retained canonical state records our own removal classifies as
+/// `Stale {{ SelfEvicted }}` and performs "realizing removal"
+/// (member-departure.md) when the local copy is not yet marked removed —
+/// emitting the self-removed notification and marking the copy removed —
+/// instead of failing silently as generic `PeelFailed` stale traffic.
+#[tokio::test]
+async fn post_eviction_message_realizes_self_removal_and_returns_self_evicted() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-realize").await;
+
+    // Bob's MLS state records the eviction (the removal commit applied)...
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // ...but simulate the silent-eviction client state the issue describes: a
+    // local copy that never realized the removal (no notification observed,
+    // record not marked removed, self still presented as a member). This is
+    // the persisted state of a pre-fix client — or one whose removal
+    // notification was lost — that only ever sees post-eviction traffic.
+    let mut record = bob_storage.get_group(&group_id).unwrap();
+    record.removed = false;
+    record.members = vec![cgka_traits::group::Member {
+        id: bob.self_id(),
+        credential: bob.self_id().as_slice().to_vec(),
+    }];
+    bob_storage.put_group(&record).unwrap();
+
+    // A later post-eviction message must surface the removal, not vanish.
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"post-eviction").await;
+    let outcome = bob.ingest(routed_app).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::SelfEvicted
+            }
+        ),
+        "post-eviction input must classify SelfEvicted; got {outcome:?}"
+    );
+    let bob_events = bob.drain_events();
+    assert!(
+        emits_removed_of(&bob_events, &bob.self_id()),
+        "realization must emit the self-removed notification; got {bob_events:?}"
+    );
+    let record = bob_storage.get_group(&group_id).unwrap();
+    assert!(
+        record.removed,
+        "realization must mark the local group copy removed"
+    );
+    assert!(
+        !record.members.iter().any(|m| m.id == bob.self_id()),
+        "realization must reconcile the roster: a removed copy must not keep \
+         presenting self as a member; got {:?}",
+        record.members
+    );
+}
+
+/// #376 attribution: OpenMLS's Inactive state does not record WHY the local
+/// leaf left the tree, but a durable leave request is authenticated local
+/// intent to leave. When one is pending, realization attributes the departure
+/// as `MemberLeft` (actor = self) — "you left" — instead of an involuntary
+/// `MemberRemoved` with an unknown actor.
+#[tokio::test]
+async fn realization_with_pending_leave_request_attributes_member_left() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-left").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // Silent-eviction copy again, but this time the durable state also holds
+    // a leave request: the member had asked to leave before the eviction was
+    // realized.
+    let mut record = bob_storage.get_group(&group_id).unwrap();
+    record.removed = false;
+    record.members = vec![cgka_traits::group::Member {
+        id: bob.self_id(),
+        credential: bob.self_id().as_slice().to_vec(),
+    }];
+    bob_storage.put_group(&record).unwrap();
+    bob_storage
+        .put_leave_request(&cgka_traits::storage::LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 1,
+            last_proposed_epoch: None,
+        })
+        .unwrap();
+
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"after-leave").await;
+    let outcome = bob.ingest(routed_app).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::SelfEvicted
+        }
+    ));
+    let bob_events = bob.drain_events();
+    let bob_id = bob.self_id();
+    assert!(
+        bob_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::MemberLeft { member },
+                actor: Some(actor),
+                ..
+            } if member == &bob_id && actor == &bob_id
+        )),
+        "a pending leave request must attribute realization as MemberLeft by self; got {bob_events:?}"
+    );
+    assert!(
+        !emits_removed_of(&bob_events, &bob_id),
+        "no involuntary MemberRemoved when the departure was our own leave; got {bob_events:?}"
+    );
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+    assert!(
+        bob_storage.leave_request(&group_id).unwrap().is_none(),
+        "realization consumes the leave request"
+    );
+}
+
+/// #376 outbound terminal semantics: a copy marked removed must not prepare
+/// or publish anything (member-departure.md). Sends fail with a deterministic
+/// terminal `InvalidTransition` — not an opaque backend error from OpenMLS's
+/// `UseAfterEviction`.
+#[tokio::test]
+async fn send_after_realized_eviction_is_rejected_terminally() {
+    let (_alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-send-gate").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+
+    let payload = app_payload_for(&bob, b"after eviction");
+    let blocked = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await;
+    assert!(
+        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        "send on a removed copy must fail terminally, got {blocked:?}"
+    );
+
+    // Leave is equally pointless on a removed copy: same terminal error.
+    let blocked = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await;
+    assert!(
+        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        "leave on a removed copy must fail terminally, got {blocked:?}"
+    );
+}
+
+/// Durably queue an app-message intent for `group_id`, simulating a send the
+/// engine accepted mid-convergence (`SendResult::Queued`) that has not been
+/// drained yet.
+fn queue_app_message_intent(
+    storage: &SqliteAccountStorage,
+    engine: &Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    tag: u8,
+) -> MessageId {
+    let id = MessageId::new(vec![tag; 32]);
+    storage
+        .put_queued_outbound_intent(&cgka_traits::storage::QueuedOutboundIntent {
+            id: id.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(engine, b"queued before removal"),
+            },
+            created_at_ms: 1,
+        })
+        .expect("queue outbound intent");
+    id
+}
+
+/// #376 review follow-up: an outbound intent durably queued before the
+/// removal is applied must be discarded when the copy becomes removed —
+/// applying the removal commit purges the queue, so later drains have nothing
+/// to perpetually re-fail against the removed-copy send gate.
+#[tokio::test]
+async fn applying_removal_commit_purges_queued_outbound_intents() {
+    let (_alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-purge-queue").await;
+
+    queue_app_message_intent(&bob_storage, &bob, &group_id, 0x51);
+    assert_eq!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "marking the copy removed must discard queued outbound intents"
+    );
+}
+
+/// #376 review follow-up: realization itself purges queued intents, and the
+/// drain path treats a removed copy as terminal — it discards any remaining
+/// queued records and reports nothing to drain instead of returning the
+/// removed-copy send error forever (which the app-layer scheduler would
+/// retry for the lifetime of the account).
+#[tokio::test]
+async fn drain_on_removed_copy_discards_queued_intents_without_error() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-drain-queue").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // Realization-side purge: recreate the silent copy with an undrained
+    // queued intent, then let a post-eviction message trigger realization.
+    let mut record = bob_storage.get_group(&group_id).unwrap();
+    record.removed = false;
+    bob_storage.put_group(&record).unwrap();
+    queue_app_message_intent(&bob_storage, &bob, &group_id, 0x52);
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"trigger realize").await;
+    let outcome = bob.ingest(routed_app).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::SelfEvicted
+        }
+    ));
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "realization must discard queued outbound intents"
+    );
+
+    // Drain-side defense in depth: an intent queued after the copy is already
+    // marked removed (any ordering the marker-site purges missed) is
+    // discarded by the drain itself — no error, nothing drained, queue empty.
+    queue_app_message_intent(&bob_storage, &bob, &group_id, 0x53);
+    let drained = bob
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .expect("drain on a removed copy must not error");
+    assert!(
+        drained.is_empty(),
+        "nothing may be published for a removed copy; got {drained:?}"
+    );
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "drain must discard queued intents for a removed copy"
+    );
+}
+
+/// #376 idempotence: realization is a state-derived obligation. A second
+/// post-eviction message still classifies `SelfEvicted`, but the already-
+/// marked-removed copy suppresses a duplicate self-removed notification.
+#[tokio::test]
+async fn second_post_eviction_message_is_self_evicted_without_duplicate_notification() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-idempotent").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert!(
+        bob_storage.get_group(&group_id).unwrap().removed,
+        "precondition: the copy is already marked removed"
+    );
+
+    for round in 0..2u8 {
+        let routed_app =
+            post_eviction_app_message(&mut alice, &group_id, format!("again-{round}").as_bytes())
+                .await;
+        let outcome = bob.ingest(routed_app).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::Stale {
+                    reason: StaleReason::SelfEvicted
+                }
+            ),
+            "round {round}: post-eviction input stays SelfEvicted; got {outcome:?}"
+        );
+        let bob_events = bob.drain_events();
+        assert!(
+            !emits_departure_of(&bob_events, &bob.self_id()),
+            "round {round}: an already-realized removal must not re-notify; got {bob_events:?}"
+        );
+    }
+}
+
+/// #376 guard: failure to decrypt alone is NOT evidence of removal
+/// (member-departure.md). A member that merely missed the removal commit has
+/// no authenticated evidence, so post-eviction traffic stays a
+/// missing-history/repair condition (buffered) — it must NOT map to
+/// `SelfEvicted` and must NOT fabricate a removal notification.
+#[tokio::test]
+async fn missed_removal_commit_without_evidence_is_not_self_evicted() {
+    let (mut alice, mut bob, bob_storage, group_id, _undelivered_commit) =
+        setup_removed_member(b"evict-no-evidence").await;
+
+    // Bob never sees the removal commit; only later traffic arrives.
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"future-epoch").await;
+    let outcome = bob.ingest(routed_app).await.unwrap();
+    assert!(
+        !matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::SelfEvicted
+            }
+        ),
+        "undecryptable input without authenticated evidence must not be SelfEvicted; got {outcome:?}"
+    );
+    let bob_events = bob.drain_events();
+    assert!(
+        !emits_departure_of(&bob_events, &bob.self_id()),
+        "no removal notification without authenticated evidence; got {bob_events:?}"
+    );
+    assert!(
+        !bob_storage.get_group(&group_id).unwrap().removed,
+        "the local copy must not be marked removed without authenticated evidence"
+    );
+}
+
+#[tokio::test]
+async fn remove_co_admin_couples_admin_policy_update_in_same_commit() {
     // admin-policy-v1.md: a commit that removes an account's last member leaf
     // MUST also remove that account's key from `admins` in the same resulting
-    // epoch. The public RemoveMembers path cannot currently carry that
-    // admin-policy rewrite, so removing a listed co-admin must be rejected
-    // before staging a local commit.
+    // epoch. The public RemoveMembers path builds that coupled
+    // Remove + AppDataUpdate commit itself, so removing a listed co-admin
+    // succeeds, the commit publishes, and the resulting admin set no longer
+    // lists the removed account — locally and for a member ingesting it.
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
     let mut carol = build_client(b"carol");
+    let alice_id = alice.self_id();
     let bob_id = bob.self_id();
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -640,37 +1111,99 @@ async fn remove_co_admin_without_admin_policy_update_is_rejected() {
         })
         .await
         .unwrap();
-    match create {
-        SendResult::GroupCreated { pending, .. } => {
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
             alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
         }
         other => panic!("expected GroupCreated, got {other:?}"),
-    }
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
 
-    let result = alice
+    let alice_admin: [u8; 32] = alice_id.as_slice().try_into().unwrap();
+    let bob_admin: [u8; 32] = bob_id.as_slice().try_into().unwrap();
+    let mut initial_admins = vec![alice_admin, bob_admin];
+    initial_admins.sort();
+    assert_eq!(alice.admin_pubkeys(&group_id).unwrap(), initial_admins);
+
+    let remove = alice
         .send(SendIntent::RemoveMembers {
             group_id: group_id.clone(),
             members: vec![bob_id.clone()],
         })
-        .await;
+        .await
+        .expect("removing a co-admin stages a coupled Remove+AppDataUpdate commit");
+    let (commit, pending) = match remove {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
 
-    match result {
-        Err(EngineError::Other(message)) => assert!(
-            message.contains("admin key has no member leaf"),
-            "unexpected error text: {message}"
-        ),
-        Err(other) => panic!("expected admin/leaf coupling error, got {other:?}"),
-        Ok(_) => panic!("removing a listed co-admin without updating admin policy must fail"),
-    }
-
-    assert_eq!(alice.epoch(&group_id).unwrap().0, 1);
+    // The author's confirm-published events must carry BOTH the membership
+    // change and the coupled admin revocation, matching what receivers derive
+    // from their before/after admin snapshot.
+    let alice_events = alice.drain_events();
     assert!(
-        alice
-            .members(&group_id)
-            .unwrap()
-            .iter()
-            .any(|member| member.id == bob_id),
-        "failed remove must leave bob in the local member projection"
+        emits_removed_of(&alice_events, &bob_id),
+        "alice should emit MemberRemoved for bob after confirm; got {alice_events:?}"
+    );
+    assert!(
+        alice_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::AdminRemoved { member },
+                ..
+            } if member == &bob_id
+        )),
+        "alice should emit AdminRemoved for bob after confirm; got {alice_events:?}"
+    );
+
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
+    let alice_members = alice.members(&group_id).unwrap();
+    assert_eq!(alice_members.len(), 2);
+    assert!(
+        !alice_members.iter().any(|member| member.id == bob_id),
+        "bob must be removed from alice's membership; got {alice_members:?}"
+    );
+    assert_eq!(
+        alice.admin_pubkeys(&group_id).unwrap(),
+        vec![alice_admin],
+        "the same commit must drop bob from the admin set"
+    );
+
+    // A second member ingesting the commit accepts it and sees the same
+    // membership and admin-set change.
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = carol.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut carol, &group_id);
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
+    let carol_members = carol.members(&group_id).unwrap();
+    assert_eq!(carol_members.len(), 2);
+    assert!(
+        !carol_members.iter().any(|member| member.id == bob_id),
+        "carol must converge to a group without bob; got {carol_members:?}"
+    );
+    assert_eq!(
+        carol.admin_pubkeys(&group_id).unwrap(),
+        vec![alice_admin],
+        "carol's admin view must drop bob after ingesting the commit"
     );
 }
 

@@ -77,6 +77,7 @@ pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
         StaleReason::UnknownGroup => "unknown_group",
         StaleReason::OwnEcho => "own_echo",
         StaleReason::PeelFailed => "peel_failed",
+        StaleReason::SelfEvicted => "self_evicted",
     }
 }
 

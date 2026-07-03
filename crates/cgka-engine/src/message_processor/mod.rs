@@ -85,6 +85,19 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = send_intent_group_id(&intent).clone();
+        // Terminal gate before queueing: a local copy marked removed (realized
+        // self-eviction) must never accept or queue outbound work. Checked
+        // again in `do_send_ready` so queued-intent drains for a copy removed
+        // after queueing hit the same deterministic error.
+        if self.group_record_is_removed(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Removed",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "local group copy is marked removed (self-evicted)",
+                },
+            ));
+        }
         if !matches!(intent, SendIntent::Leave { .. }) && self.has_leave_send_gate(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {
@@ -106,6 +119,16 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<Vec<SendResult>, EngineError> {
+        // Terminal: a removed copy must never publish, and the removed-copy
+        // gate in `do_send_ready` would turn every queued record into a
+        // permanent drain error that the app retries forever. Discard the
+        // queue and report nothing to drain. This is the defense-in-depth
+        // side; the marker sites (realization, commit-apply seam, convergence
+        // reorg) also purge at the moment the copy becomes removed.
+        if self.group_record_is_removed(group_id)? {
+            self.discard_queued_outbound_intents_for_removed_group(group_id)?;
+            return Ok(Vec::new());
+        }
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
         {
@@ -386,6 +409,45 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(progressed)
+    }
+
+    /// Discard every queued outbound intent for a group whose local copy is
+    /// marked removed. A removed copy must never prepare or publish anything
+    /// (member-departure.md, "Realizing removal"), so a durably queued intent
+    /// — e.g. one accepted mid-convergence just before the removal was
+    /// realized — is terminally unsendable: leaving it queued would make every
+    /// later drain re-fail it through the removed-copy send gate forever. The
+    /// discard is silent toward the app (the self-removed notification already
+    /// carries the user-facing signal); each dropped intent leaves a forensic
+    /// `Rejection` audit row plus an aggregate trace line. Returns the number
+    /// discarded.
+    pub(crate) fn discard_queued_outbound_intents_for_removed_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<usize, EngineError> {
+        let queued = self.storage.list_queued_outbound_intents(group_id)?;
+        if queued.is_empty() {
+            return Ok(0);
+        }
+        for record in &queued {
+            self.storage.delete_queued_outbound_intent(&record.id)?;
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::Rejection {
+                    msg_id: hex::encode(record.id.as_slice()),
+                    reason: "queued_outbound_intent_discarded_group_removed".to_string(),
+                },
+            );
+        }
+        // Privacy-safe: aggregate count only, no group ids or intent contents
+        // (observability.md).
+        tracing::info!(
+            target: "cgka_engine::message_processor",
+            method = "discard_queued_outbound_intents_for_removed_group",
+            discarded = queued.len(),
+            "discarded queued outbound intents for a removed group copy"
+        );
+        Ok(queued.len())
     }
 
     fn queue_outbound_intent(

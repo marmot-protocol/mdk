@@ -128,14 +128,23 @@ impl<S: StorageProvider> Engine<S> {
             // group returns to Stable.
             let current_epoch = EpochId(mls_group.epoch().as_u64());
             if !mls_group.is_active() {
+                // The persisted OpenMLS group state is `Inactive`: retained
+                // canonical state records our own removal. This is
+                // authenticated evidence (a merged commit removed our leaf),
+                // not a decrypt failure, so later input for this group is
+                // `SelfEvicted` and must perform "realizing removal" when not
+                // already done (member-departure.md), instead of classifying
+                // as ordinary stale traffic while the group still presents as
+                // active.
                 self.persist_transport_message(
                     msg,
                     &group_id,
                     current_epoch,
                     MessageState::Failed,
                 )?;
+                self.realize_self_eviction(&group_id, current_epoch)?;
                 return Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed,
+                    reason: StaleReason::SelfEvicted,
                 });
             }
             if !self.epoch_manager.can_ingest(&group_id) {
@@ -559,9 +568,19 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
                 Err(ProcessMessageError::GroupStateError(MlsGroupStateError::UseAfterEviction)) => {
+                    // OpenMLS states authoritatively that our own leaf was
+                    // removed (the group state records eviction). Surface the
+                    // removal instead of silently dropping the message: this
+                    // is the `SelfEvicted` outcome, and processing it must
+                    // perform "realizing removal" when not already done
+                    // (member-departure.md). Normally the `is_active` gate
+                    // above classifies this first; this arm keeps the
+                    // realization obligation attached to the authenticated
+                    // OpenMLS signal itself.
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                    self.realize_self_eviction(&group_id, current_epoch)?;
                     return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
+                        reason: StaleReason::SelfEvicted,
                     });
                 }
                 Err(e) => {
@@ -767,6 +786,19 @@ impl<S: StorageProvider> Engine<S> {
                         crate::group_lifecycle::mirror_app_components_into_record(
                             &mls_group, &mut g,
                         );
+                        // This commit removed our own leaf: mark the local
+                        // copy removed (member-departure.md, "Realizing
+                        // removal") in the same record write. The departure
+                        // notification for self is emitted with the roster
+                        // diff below, so the marker and the notification stay
+                        // coupled and later `SelfEvicted` input does not
+                        // re-emit it.
+                        if removed
+                            .iter()
+                            .any(|member| member == self.identity.self_id())
+                        {
+                            g.removed = true;
+                        }
                         self.storage.put_group(&g)?;
                     }
                     // #740 rotation: a peer's applied commit may have changed the
@@ -836,6 +868,10 @@ impl<S: StorageProvider> Engine<S> {
                         .any(|member| member == self.identity.self_id())
                     {
                         self.clear_leave_request_state(&group_id)?;
+                        // The copy just became removed: purge queued outbound
+                        // intents so later drains do not re-fail them forever
+                        // against the removed-copy send gate.
+                        self.discard_queued_outbound_intents_for_removed_group(&group_id)?;
                     } else if after_ids.contains(self.identity.self_id()) {
                         if self.load_leave_request_state(&group_id)?.is_some() {
                             // A SelfRemove proposal is valid only in its
@@ -1275,6 +1311,94 @@ impl<S: StorageProvider> Engine<S> {
         });
         pending_commit_guard.disarm();
         Ok(true)
+    }
+
+    /// Realize our own removal from `group_id` (member-departure.md,
+    /// "Realizing removal"): emit the self-removed state notification and mark
+    /// the local group copy removed. State-derived and idempotent — when the
+    /// copy is already marked removed the notification was already surfaced,
+    /// so this is a no-op. The record and its history are retained (the copy
+    /// is kept inactive, never deleted). Callers must only invoke this on
+    /// authenticated evidence of eviction (the local MLS group state records
+    /// our removal), never on a bare decrypt failure.
+    ///
+    /// Ordering: the notification is enqueued BEFORE the durable marker write,
+    /// so a crash between the two re-runs realization on the next
+    /// `SelfEvicted` input (at worst a duplicate notification, absorbed by the
+    /// app's canonical-row-id upsert) instead of leaving a durable marker that
+    /// suppresses a notification nobody observed. A window this ordering
+    /// cannot close remains: `events_buf` is in-memory, so a process death
+    /// after the marker write but before the caller drains and persists the
+    /// event still loses it. That at-most-once property is shared by every
+    /// `GroupStateChanged` emission in the engine today (the commit-apply seam
+    /// has the same shape for all roster/admin/profile rows); making the event
+    /// channel durable — or reconciling on session open from `Group::removed`
+    /// at the app layer — is a systemic follow-up, not realization-specific.
+    pub(crate) fn realize_self_eviction(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        let mut group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            Err(StorageError::NotFound) => return Ok(()),
+            Err(err) => return Err(EngineError::Storage(err)),
+        };
+        if group.removed {
+            return Ok(());
+        }
+        // OpenMLS's `Inactive` state does not record WHY our leaf left the
+        // tree. The durable leave request is local, authenticated intent to
+        // leave, so when one is pending the departure being realized is our
+        // own leave: attribute it as `MemberLeft` (actor = self), matching the
+        // direct seam's SelfRemove classification. Without one the removal is
+        // attributed as involuntary with an unknown actor — the accepted
+        // degradation when the removing commit itself was never applied.
+        let had_leave_request = self.load_leave_request_state(group_id)?.is_some();
+        // Privacy-safe breadcrumb: aggregate signal only, no group/member ids
+        // (observability.md).
+        tracing::info!(
+            target: "cgka_engine::message_processor",
+            method = "realize_self_eviction",
+            "realized own removal for a group whose canonical state records eviction"
+        );
+        let member = self.identity.self_id().clone();
+        let (actor, change) = if had_leave_request {
+            (
+                Some(member.clone()),
+                GroupStateChange::MemberLeft { member },
+            )
+        } else {
+            (None, GroupStateChange::MemberRemoved { member })
+        };
+        self.push_group_state_change(group_id, epoch, actor, change, None);
+        // Marker + roster reconciliation in one durable write: a removed copy
+        // must not keep presenting self as a member, so roster-gated callers
+        // (`members()`, hydrate restore checks, backfill) cannot disagree with
+        // the terminal marker. The seam and convergence paths already write
+        // the post-removal roster; this reconciles the pathological copy whose
+        // roster was never mirrored.
+        group.removed = true;
+        let self_id = self.identity.self_id().clone();
+        group.members.retain(|member| member.id != self_id);
+        self.storage.put_group(&group)?;
+        // A removed copy must never publish: drop any outbound intents that
+        // were durably queued before the removal was realized, instead of
+        // leaving them to re-fail through the removed-copy send gate on every
+        // later drain.
+        self.discard_queued_outbound_intents_for_removed_group(group_id)?;
+        // Deliberately LAST, after the marker write — not before it like the
+        // convergence path (which has no attribution read). The notification
+        // is already enqueued above, so a failure here cannot lose it; it only
+        // leaves a stale leave-request row, which the removed-copy send gate
+        // supersedes and re-join cleans up. Clearing BEFORE the marker write
+        // would be worse: a failed marker write would then retry against
+        // already-cleared leave state and emit a differently-attributed
+        // duplicate (`MemberRemoved` after an original `MemberLeft`), i.e. a
+        // second visible row. With this order any retry duplicate is
+        // byte-identical and collapses in the app's canonical-row-id upsert.
+        self.clear_leave_request_state(group_id)?;
+        Ok(())
     }
 
     fn mark_raw_transport_message_failed_if_deferred(

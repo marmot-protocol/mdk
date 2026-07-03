@@ -18,6 +18,7 @@ use cgka_traits::types::{EpochId, GroupId};
 use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::prelude::{LeafNodeIndex, MlsMessageOut};
 use std::collections::BTreeSet;
 use tls_codec::Serialize as _;
 
@@ -224,38 +225,13 @@ impl<S: StorageProvider> Engine<S> {
                 )))
             })
             .collect::<Vec<_>>();
-        let mut builder = mls_group
-            .commit_builder()
-            .add_proposals(proposals)
-            .load_psks(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                    &provider,
-                ),
-            )
-            .map_err(|e| EngineError::Backend(format!("load_psks: {e:?}")))?;
-        let mut app_data = builder.app_data_dictionary_updater();
-        for proposal in builder.app_data_update_proposals() {
-            if let AppDataUpdateOperation::Update(data) = proposal.operation() {
-                app_data.set(ComponentData::from_parts(
-                    proposal.component_id(),
-                    data.clone(),
-                ));
-            }
-        }
-        builder.with_app_data_dictionary_updates(app_data.changes());
-        let commit_bundle = builder
-            .build(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(&provider),
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
-                    &provider,
-                ),
-                &self.identity.signer,
-                |_| true,
-            )
-            .map_err(|e| EngineError::Backend(format!("app_data_update build: {e:?}")))?
-            .stage_commit(&provider)
-            .map_err(|e| EngineError::Backend(format!("app_data_update stage: {e:?}")))?;
-        let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
+        let commit_out = self.stage_commit_with_app_data_updates(
+            &mut mls_group,
+            &provider,
+            Vec::new(),
+            proposals,
+            "app_data_update",
+        )?;
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -356,5 +332,77 @@ impl<S: StorageProvider> Engine<S> {
             welcomes: vec![],
             pending: pending_ref,
         })
+    }
+
+    /// Stage (don't merge) a commit that carries `AppDataUpdate` proposals,
+    /// optionally alongside member removals, through the OpenMLS commit
+    /// builder. Every `Update` and `Remove` proposal is mirrored into the
+    /// resulting `app_data_dictionary` via the builder's dictionary updater,
+    /// matching what recipients compute in
+    /// [`crate::openmls_projection::process_commit_with_app_data_updates`].
+    /// Shared by the `UpdateAppComponents` path and the coupled admin-policy
+    /// removal path in `do_send_remove_members`. `context` prefixes error
+    /// messages so failures stay attributable to the calling intent.
+    pub(crate) fn stage_commit_with_app_data_updates(
+        &self,
+        mls_group: &mut MlsGroup,
+        provider: &EngineOpenMlsProvider<'_, S>,
+        removals: Vec<LeafNodeIndex>,
+        proposals: Vec<Proposal>,
+        context: &str,
+    ) -> Result<MlsMessageOut, EngineError> {
+        // Mirror the receiver-side guard: a Remove of the negotiation
+        // component or a group-required component must fail at staging, not
+        // surface as a recipient-side rejection. Checked before the builder
+        // takes its mutable borrow of `mls_group`. No current caller produces
+        // a Remove (all send intents carry Update bytes); this keeps the
+        // shared helper in parity with the projection for future callers.
+        for proposal in &proposals {
+            if let Proposal::AppDataUpdate(update) = proposal
+                && matches!(update.operation(), AppDataUpdateOperation::Remove)
+            {
+                crate::app_components::validate_app_component_remove(
+                    mls_group,
+                    update.component_id(),
+                )?;
+            }
+        }
+        let mut builder = mls_group
+            .commit_builder()
+            .propose_removals(removals)
+            .add_proposals(proposals)
+            .load_psks(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    provider,
+                ),
+            )
+            .map_err(|e| EngineError::Backend(format!("{context} load_psks: {e:?}")))?;
+        let mut app_data = builder.app_data_dictionary_updater();
+        for proposal in builder.app_data_update_proposals() {
+            match proposal.operation() {
+                AppDataUpdateOperation::Update(data) => {
+                    app_data.set(ComponentData::from_parts(
+                        proposal.component_id(),
+                        data.clone(),
+                    ));
+                }
+                AppDataUpdateOperation::Remove => {
+                    app_data.remove(&proposal.component_id());
+                }
+            }
+        }
+        builder.with_app_data_dictionary_updates(app_data.changes());
+        let commit_bundle = builder
+            .build(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(provider),
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(provider),
+                &self.identity.signer,
+                |_| true,
+            )
+            .map_err(|e| EngineError::Backend(format!("{context} build: {e:?}")))?
+            .stage_commit(provider)
+            .map_err(|e| EngineError::Backend(format!("{context} stage: {e:?}")))?;
+        let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
+        Ok(commit_out)
     }
 }

@@ -347,6 +347,12 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::PeelFailed
         }
     );
+    insta::assert_json_snapshot!(
+        "stale_self_evicted",
+        IngestOutcome::Stale {
+            reason: StaleReason::SelfEvicted
+        }
+    );
 }
 
 #[test]
@@ -618,6 +624,7 @@ fn snapshot_group_and_member() {
                 credential: vec![],
             }],
             required_capabilities: GroupCapabilities::default(),
+            removed: false,
         }
     );
 }

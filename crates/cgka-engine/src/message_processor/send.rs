@@ -8,6 +8,7 @@ use crate::engine::Engine;
 use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::engine::{CommitOrderingKey, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
@@ -16,6 +17,7 @@ use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use openmls::group::MlsGroup;
+use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
@@ -25,6 +27,22 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
+        // A local copy marked removed is terminal for outbound work: the spec
+        // forbids preparing/publishing anything for it (member-departure.md,
+        // "Realizing removal"), and the underlying OpenMLS state would only
+        // fail with an opaque `UseAfterEviction` backend error anyway. Gate
+        // here (not just `do_send`) so queued-intent drains hit the same
+        // deterministic terminal error. Every intent kind is blocked,
+        // including `Leave` — there is nothing left to leave.
+        if self.group_record_is_removed(super::send_intent_group_id(&intent))? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Removed",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "local group copy is marked removed (self-evicted)",
+                },
+            ));
+        }
         match intent {
             SendIntent::AppMessage { group_id, payload } => {
                 self.do_send_app_message(group_id, payload).await
@@ -383,9 +401,53 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
-        let (commit_out, _welcome_opt, _gi) = mls_group
-            .remove_members(&provider, &self.identity.signer, &leaf_indices)
-            .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+        // Admin/leaf coupling (admin-policy-v1.md "Validation"): the resulting
+        // epoch must not list an admin key without a member leaf. Derive the
+        // resulting admin set from the same membership delta the validator
+        // (`validate_admin_leaf_coupling_for_staged_commit`) uses — current
+        // leaves minus the leaves this commit removes — so an admin key is
+        // dropped exactly when none of its account's leaves survives,
+        // independent of how targets were expanded to leaf indices above.
+        let removed_leaves: HashSet<u32> = leaf_indices.iter().map(|idx| idx.u32()).collect();
+        let mut surviving_accounts: HashSet<[u8; 32]> = HashSet::new();
+        for member in mls_group.members() {
+            if removed_leaves.contains(&member.index.u32()) {
+                continue;
+            }
+            if let Ok(basic) = BasicCredential::try_from(member.credential)
+                && let Ok(pk) = <[u8; 32]>::try_from(basic.identity())
+            {
+                surviving_accounts.insert(pk);
+            }
+        }
+        let resulting_admins: Vec<[u8; 32]> = admins
+            .iter()
+            .filter(|admin| surviving_accounts.contains(*admin))
+            .copied()
+            .collect();
+        let commit_out = if resulting_admins.len() == admins.len() {
+            // No admin loses their last leaf: a plain Remove commit carries
+            // the admin set forward unchanged.
+            let (commit_out, _welcome_opt, _gi) = mls_group
+                .remove_members(&provider, &self.identity.signer, &leaf_indices)
+                .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+            commit_out
+        } else {
+            // Couple an admin-policy update dropping the de-leafed admin keys
+            // into the same commit. The AdminDepletion guard above ensures
+            // `resulting_admins` is non-empty here.
+            let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                crate::app_components::encode_admin_policy(&resulting_admins)?,
+            )));
+            self.stage_commit_with_app_data_updates(
+                &mut mls_group,
+                &provider,
+                leaf_indices,
+                vec![admin_update],
+                "remove_members",
+            )?
+        };
 
         let staged_commit = mls_group
             .pending_commit()
@@ -468,7 +530,7 @@ impl<S: StorageProvider> Engine<S> {
             ),
             recovery_snapshot,
         );
-        let removed_changes = unique_targets
+        let mut removed_changes: Vec<crate::engine::PendingGroupStateChange> = unique_targets
             .iter()
             .cloned()
             .map(|member| crate::engine::PendingGroupStateChange {
@@ -476,6 +538,16 @@ impl<S: StorageProvider> Engine<S> {
                 change: GroupStateChange::MemberRemoved { member },
             })
             .collect();
+        // Mirror what receivers derive from their before/after admin snapshot:
+        // the coupled admin-policy update also revokes admin status, so the
+        // author's confirm-published events must carry the same AdminRemoved
+        // rows (attributed to self, as UpdateAppComponents does).
+        for change in crate::group_state_changes::admin_changes(&admins, &resulting_admins) {
+            removed_changes.push(crate::engine::PendingGroupStateChange {
+                actor: Some(self.identity.self_id().clone()),
+                change,
+            });
+        }
         self.pending_state_changes
             .insert(pending_ref, removed_changes);
         pending_commit_guard.disarm();

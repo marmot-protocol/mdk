@@ -5632,7 +5632,16 @@ fn three_user_message_lifecycle_covers_invite_remove_and_later_delivery() {
             "sender",
         ],
     );
-    assert_eq!(bob_send_error["code"], "engine_error");
+    // A copy whose canonical state records our own removal is terminal for
+    // outbound work: the engine rejects the send with a deterministic
+    // InvalidTransition (from: "Removed") instead of an opaque backend error
+    // (#376 realization semantics).
+    assert_eq!(bob_send_error["code"], "invalid_transition");
+    let message = bob_send_error["message"].as_str().expect("error message");
+    assert!(
+        message.contains("marked removed"),
+        "removed-copy send should explain the terminal state; got {message}"
+    );
 }
 
 #[test]

@@ -19,6 +19,18 @@ pub struct Group {
     pub epoch: EpochId,
     pub members: Vec<Member>,
     pub required_capabilities: GroupCapabilities,
+    /// The local copy of this group is marked removed: retained canonical
+    /// state records the local member's own removal (spec
+    /// `protocol-core/member-departure.md`, "Realizing removal"). The record
+    /// is retained inactive — history may be kept, but the group must not be
+    /// presented as active and nothing may be sent or published to it. This
+    /// flag is the idempotence marker for the realization obligation: it is
+    /// set together with the self-removed state notification, so later input
+    /// classified `SelfEvicted` does not re-emit the notification. Terminal
+    /// for the group on this client. Defaults to `false` for records
+    /// persisted before this field existed.
+    #[serde(default)]
+    pub removed: bool,
 }
 
 /// One member of a group, as storage sees it.

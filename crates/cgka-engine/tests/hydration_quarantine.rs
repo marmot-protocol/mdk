@@ -176,6 +176,7 @@ fn insert_marmot_group_without_openmls_state(
             members: Vec::new(),
             epoch: EpochId(epoch),
             required_capabilities: GroupCapabilities::default(),
+            removed: false,
         })
         .expect("insert marmot group record without openmls state");
 }

@@ -360,6 +360,83 @@ fn raw_remove_members_commit(
     }
 }
 
+/// Raw OpenMLS commit that removes `targets` and ALSO replaces the
+/// GroupContext extensions with a copy that drops the `app_data_dictionary`
+/// entirely, so the resulting epoch carries no admin-policy bytes at all.
+/// OpenMLS accepts this shape (its draft-08 dictionary guard only applies to
+/// commits that carry AppDataUpdate proposals), so the Marmot engine must
+/// evaluate the admin/leaf coupling against the carried-forward admin set
+/// (admin-policy-v1.md "Validation") instead of skipping the check.
+fn raw_remove_members_commit_dropping_app_data_dictionary(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    targets: &[MemberId],
+) -> TransportMessage {
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load sender MLS group")
+        .expect("sender joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+
+    let mut leaf_indices = Vec::new();
+    for member in mls_group.members() {
+        let credential =
+            BasicCredential::try_from(member.credential).expect("member uses BasicCredential");
+        if targets
+            .iter()
+            .any(|target| target.as_slice() == credential.identity())
+        {
+            leaf_indices.push(member.index);
+        }
+    }
+    assert_eq!(
+        leaf_indices.len(),
+        targets.len(),
+        "raw test commit must find every removal target"
+    );
+
+    let mut stripped_extensions = mls_group.extensions().clone();
+    stripped_extensions.remove(openmls::extensions::ExtensionType::AppDataDictionary);
+    let commit_bundle = mls_group
+        .commit_builder()
+        .propose_removals(leaf_indices)
+        .propose_group_context_extensions(stripped_extensions)
+        .expect("propose GCE without app_data_dictionary")
+        .load_psks(provider.storage())
+        .expect("load PSKs")
+        .build(provider.rand(), provider.crypto(), &signer, |_| true)
+        .expect("build raw remove+GCE commit")
+        .stage_commit(&provider)
+        .expect("stage raw remove+GCE commit");
+    let (commit, _welcome, _group_info) = commit_bundle.into_contents();
+    let payload = commit
+        .tls_serialize_detached()
+        .expect("serialize raw remove+GCE commit");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-remove-drop-dict".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
 fn raw_remove_members_commit_with_admin_policy(
     storage: &SqliteAccountStorage,
     sender: &MemberId,
@@ -668,6 +745,199 @@ async fn convergence_rejects_remove_that_leaves_orphan_admin_key() {
             "projected members should still contain {expected:?}: {projected_members:?}"
         );
     }
+    assert_message_state(
+        &carol_storage,
+        &invalid_remove,
+        MessageState::EpochInvalidated,
+    );
+}
+
+#[tokio::test]
+async fn convergence_rejects_remove_whose_context_carries_no_admin_policy_bytes() {
+    // darkmatter#393 / admin-policy-v1.md "Validation": the cross-component
+    // check runs on every commit that changes the member leaf set, whether or
+    // not the commit carries admin-policy bytes. Bob's raw commit removes
+    // Alice's last member leaf and swaps in GroupContext extensions with no
+    // app_data_dictionary, so the staged context has no admin-policy entry to
+    // read. The resulting epoch's admin set is the prior set carried forward
+    // ({Alice, Bob}), so the commit must be rejected instead of skipping the
+    // check on the missing bytes.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_id = bob.self_id();
+    let alice_id = alice.self_id();
+    let carol_id = carol.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "convergence-carried-forward-admins".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invalid_remove = route(
+        raw_remove_members_commit_dropping_app_data_dictionary(
+            &bob_storage,
+            &bob.self_id(),
+            &group_id,
+            std::slice::from_ref(&alice_id),
+        ),
+        &group_id,
+    );
+    carol
+        .buffer_openmls_convergence_message(&group_id, invalid_remove.clone(), 1_000)
+        .expect("invalid remove commit buffered");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "remove with no admin-policy bytes must not be accepted: {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.kind == MessageKind::Commit
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.message_id == content_hex(&invalid_remove)
+        }),
+        "expected invalid remove dropped as InvalidAgainstCandidateState, got {:?}",
+        result.dropped_messages
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    let stored_group = carol_storage.get_group(&group_id).expect("group stored");
+    assert_eq!(stored_group.epoch, EpochId(1));
+    assert_eq!(
+        stored_group.members.len(),
+        3,
+        "invalid convergence commit must not change stored member count"
+    );
+    let projected_members = carol.members(&group_id).expect("members projected");
+    assert_eq!(
+        projected_members.len(),
+        3,
+        "invalid convergence commit must not change projected member count"
+    );
+    for expected in [&alice_id, &bob_id, &carol_id] {
+        assert!(
+            projected_members
+                .iter()
+                .any(|member| member.id == *expected),
+            "projected members should still contain {expected:?}: {projected_members:?}"
+        );
+    }
+    assert_message_state(
+        &carol_storage,
+        &invalid_remove,
+        MessageState::EpochInvalidated,
+    );
+}
+
+#[tokio::test]
+async fn live_ingest_rejects_remove_whose_context_carries_no_admin_policy_bytes() {
+    // Sibling of the stored-convergence test above, pushed through the live
+    // `ingest` entry point instead of pre-buffering — pinning the hot path a
+    // relay-delivered commit takes. The invalid remove must never be applied:
+    // the outcome is terminal, and Carol's epoch, membership, and admin view
+    // stay untouched.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_id = bob.self_id();
+    let alice_id = alice.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "live-ingest-carried-forward-admins".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invalid_remove = route(
+        raw_remove_members_commit_dropping_app_data_dictionary(
+            &bob_storage,
+            &bob.self_id(),
+            &group_id,
+            std::slice::from_ref(&alice_id),
+        ),
+        &group_id,
+    );
+
+    let outcome = carol.ingest(invalid_remove.clone()).await.unwrap();
+    assert!(
+        !matches!(outcome, IngestOutcome::Processed),
+        "invalid remove must not be applied via live ingest, got {outcome:?}"
+    );
+    // Drive convergence to quiescence in case the inline pass left the commit
+    // pending; the commit must still never be accepted.
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, u64::MAX)
+        .expect("stored OpenMLS messages converge");
+    assert!(
+        result.accepted_commits.is_empty(),
+        "invalid remove must not be accepted after quiescence: {result:?}"
+    );
+
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    let stored_group = carol_storage.get_group(&group_id).expect("group stored");
+    assert_eq!(stored_group.epoch, EpochId(1));
+    assert_eq!(stored_group.members.len(), 3);
+    let projected_members = carol.members(&group_id).expect("members projected");
+    assert_eq!(projected_members.len(), 3);
+    assert!(
+        projected_members.iter().any(|member| member.id == alice_id),
+        "alice must remain a member on carol's view: {projected_members:?}"
+    );
+    let alice_admin: [u8; 32] = alice_id.as_slice().try_into().unwrap();
+    let bob_admin: [u8; 32] = bob_id.as_slice().try_into().unwrap();
+    let mut expected_admins = vec![alice_admin, bob_admin];
+    expected_admins.sort();
+    assert_eq!(
+        carol.admin_pubkeys(&group_id).unwrap(),
+        expected_admins,
+        "carol's admin view must be unchanged"
+    );
     assert_message_state(
         &carol_storage,
         &invalid_remove,

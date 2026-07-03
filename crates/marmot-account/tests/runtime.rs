@@ -1006,6 +1006,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
                 members: Vec::new(),
                 epoch: EpochId(9),
                 required_capabilities: GroupCapabilities::default(),
+                removed: false,
             })
             .unwrap();
     }

@@ -950,6 +950,20 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Whether the local copy of `group_id` is marked removed (realized
+    /// self-eviction; member-departure.md "Realizing removal"). A removed copy
+    /// is terminal for outbound work: nothing may be prepared or published for
+    /// it. Unknown groups report `false` — callers fail them with their own
+    /// unknown-group handling. The marker clears only through an authenticated
+    /// re-join (`do_join_welcome` rebuilds the record).
+    pub(crate) fn group_record_is_removed(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        match self.storage.get_group(group_id) {
+            Ok(group) => Ok(group.removed),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(err) => Err(EngineError::Storage(err)),
+        }
+    }
+
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every
     /// retained artifact in place.
     ///
