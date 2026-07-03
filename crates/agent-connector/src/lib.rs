@@ -130,6 +130,10 @@ pub struct AgentConnector {
     pub(crate) inbound_catch_up: InboundCatchUpDriver,
     relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
+    /// Connections closed at accept time because the concurrency cap was hit.
+    /// Kept separate from `connection_errors` so expected backpressure does
+    /// not muddy fault-rate diagnostics.
+    connections_refused: Arc<AtomicU64>,
 }
 
 impl AgentConnector {
@@ -160,6 +164,7 @@ impl AgentConnector {
             inbound_catch_up,
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
+            connections_refused: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -256,11 +261,14 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
         // cursors they hold), mirroring the broker's connection limiter:
         // beyond the cap the connection is closed instead of served.
         let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
-            let connection_error = connector.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            let connections_refused = connector
+                .connections_refused
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             tracing::warn!(
                 target: "agent_connector",
                 method = "serve_socket",
-                connection_error,
+                connections_refused,
                 error_code = "connection_limit_exceeded",
                 "refusing control connection beyond the concurrency cap"
             );

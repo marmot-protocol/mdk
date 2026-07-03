@@ -492,11 +492,11 @@ impl TransportAdapter for NostrTransportAdapter {
         }
 
         let mut issued = Vec::with_capacity(1 + activation.group_subscriptions.len());
-        issued.push(NostrSubscription::AccountInbox {
-            account_id: account_id.clone(),
-            endpoints: activation.inbox_endpoints.clone(),
-            since: inbox_since(activation.since),
-        });
+        issued.push(account_inbox_subscription(
+            &account_id,
+            activation.inbox_endpoints.clone(),
+            inbox_since(activation.since),
+        ));
         for group in &activation.group_subscriptions {
             issued.push(group_subscription(&account_id, group, activation.since));
         }
@@ -897,15 +897,15 @@ impl AdapterState {
         };
         let mut ids = Vec::with_capacity(1 + routes.groups.len());
         ids.push(
-            NostrSubscription::AccountInbox {
-                account_id: account_id.clone(),
-                endpoints: routes
+            account_inbox_subscription(
+                account_id,
+                routes
                     .inbox_endpoints
                     .iter()
                     .map(|endpoint| endpoint.verbatim.clone())
                     .collect(),
-                since: None,
-            }
+                None,
+            )
             .subscription_id(),
         );
         for group in &routes.groups {
@@ -1014,6 +1014,21 @@ pub const NIP59_TIMESTAMP_TWEAK_SECS: u64 = 172_800;
 
 fn inbox_since(since: Option<Timestamp>) -> Option<Timestamp> {
     since.map(|since| Timestamp(since.0.saturating_sub(NIP59_TIMESTAMP_TWEAK_SECS)))
+}
+
+/// Single construction point for the account-inbox subscription, shared by
+/// activation issuance and telemetry-eviction id reconstruction so the two
+/// can never derive different subscription ids.
+fn account_inbox_subscription(
+    account_id: &MemberId,
+    endpoints: Vec<TransportEndpoint>,
+    since: Option<Timestamp>,
+) -> NostrSubscription {
+    NostrSubscription::AccountInbox {
+        account_id: account_id.clone(),
+        endpoints,
+        since,
+    }
 }
 
 fn group_subscription(

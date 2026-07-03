@@ -826,8 +826,23 @@ async fn broker_frees_backlog_accounting_when_publisher_reuses_finished_room() {
         let key = key.clone();
         tokio::spawn(async move { state.wait_for_subscriber(&key).await })
     };
-    sleep(Duration::from_millis(100)).await;
-    assert_eq!(state.backlog_bytes_for_test().await, 0);
+    // The waiter's first lock iteration performs the reset; poll (bounded, and
+    // well under the publish grace period) rather than assume a fixed delay is
+    // enough under CI contention. The counter must drop to zero from the reset
+    // itself — `backlog_bytes_for_test` only reads, and no other
+    // state-touching op runs that could recompute the total.
+    let mut reset_freed_accounting = false;
+    for _ in 0..200 {
+        if state.backlog_bytes_for_test().await == 0 {
+            reset_freed_accounting = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        reset_freed_accounting,
+        "finished-room reset must free the discarded backlog accounting"
+    );
 
     let (_subscriber_id, _backlog, _rx) = state.subscribe(key).await.unwrap();
     waiter.await.unwrap().unwrap();

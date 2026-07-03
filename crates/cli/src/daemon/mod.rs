@@ -194,6 +194,12 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                 // broker accept loops: beyond the cap the connection is closed
                 // instead of served.
                 let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
+                    // dmd's stdout/stderr are redirected to its log file, so
+                    // this lands where `dm daemon status` points operators.
+                    eprintln!(
+                        "dmd: refusing connection beyond the concurrency cap \
+                         ({MAX_DAEMON_CONNECTIONS})"
+                    );
                     drop(stream);
                     continue;
                 };
