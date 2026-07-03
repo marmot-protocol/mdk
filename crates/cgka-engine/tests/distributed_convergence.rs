@@ -509,7 +509,7 @@ fn raw_group_context_extensions_strip_commit(
         payload,
         timestamp: Timestamp(0),
         causal_deps: vec![],
-        source: TransportSource("raw-openmls-gce-strip".into()),
+        source: TransportSource("raw-openmls-gce-strip".to_string()),
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
         },
