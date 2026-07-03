@@ -297,6 +297,54 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     Ok(())
 }
 
+/// Reject (pre-merge) a commit whose resulting GroupContext strips Marmot
+/// component state the group requires: the `app_data_dictionary` extension
+/// itself, its `app_components` entry, or the state of any component listed in
+/// the group's required `app_components`.
+///
+/// OpenMLS's draft-08 guard only validates the dictionary against a commit's
+/// `AppDataUpdate` proposals, and [`validate_app_component_remove`] only sees
+/// `AppDataUpdate::Remove` operations — so a `GroupContextExtensions`-only
+/// commit could otherwise replace the extensions with a set that omits
+/// required Marmot state. Such a strip cannot orphan an admin key (an absent
+/// admin-policy component is the empty admin set, handled in
+/// [`validate_admin_leaf_coupling_for_staged_commit`]), but it silently makes
+/// the group admin-less and freezes every admin-gated operation — a
+/// denial-of-service / consistency break that must be rejected pre-merge.
+pub(crate) fn validate_required_component_retention_for_staged_commit(
+    mls_group: &MlsGroup,
+    group_id: &GroupId,
+    staged: &StagedCommit,
+) -> Result<(), EngineError> {
+    let Some(current) = mls_group.extensions().app_data_dictionary() else {
+        // The group never carried Marmot component state; nothing to retain.
+        return Ok(());
+    };
+    let current = current.dictionary();
+    let Some(resulting) = staged.group_context().extensions().app_data_dictionary() else {
+        return Err(EngineError::Other(format!(
+            "commit is invalid: resulting GroupContext drops the app_data_dictionary (group {group_id:?})"
+        )));
+    };
+    let resulting = resulting.dictionary();
+    // The negotiated required-component list is engine-owned and can never be
+    // dropped (mirrors `validate_app_component_remove`); required components
+    // must keep whatever state entry the current epoch carries. A component
+    // becomes droppable only after a prior commit removes it from the required
+    // list via an `AppDataUpdate` to `app_components`.
+    let mut protected = required_app_components_of_group(mls_group)?.ids;
+    protected.insert(APP_COMPONENTS_COMPONENT_ID);
+    for component_id in protected {
+        if current.get(&component_id).is_some() && resulting.get(&component_id).is_none() {
+            return Err(EngineError::Other(format!(
+                "commit is invalid: resulting GroupContext drops required app component \
+                 {component_id:#06x} (group {group_id:?})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject an admin set that lists an admin with no member leaf in the CURRENT
 /// epoch (admin-policy-v1.md). Used on the outbound `UpdateAppComponents` path,
 /// where the commit changes only component bytes and not membership, so the

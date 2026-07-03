@@ -31,6 +31,7 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
+use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::BasicCredential;
@@ -443,6 +444,78 @@ fn raw_remove_members_commit_with_admin_policy(
     }
 }
 
+/// Build a raw OpenMLS GroupContextExtensions-only commit (no member changes)
+/// whose resulting GroupContext strips Marmot component state: either the
+/// whole `app_data_dictionary` extension (`strip_whole_dictionary`) or just
+/// the required admin-policy entry inside it. OpenMLS's draft-08 dictionary
+/// guard only runs when a commit carries `AppDataUpdate` proposals, so this
+/// commit builds and stages cleanly — only the engine's required-component
+/// retention check can reject it.
+fn raw_group_context_extensions_strip_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    strip_whole_dictionary: bool,
+) -> TransportMessage {
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load sender MLS group")
+        .expect("sender joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+
+    let mut new_extensions: Vec<Extension> = mls_group
+        .extensions()
+        .iter()
+        .filter(|ext| !matches!(ext, Extension::AppDataDictionary(_)))
+        .cloned()
+        .collect();
+    if !strip_whole_dictionary {
+        let current = mls_group
+            .extensions()
+            .app_data_dictionary()
+            .expect("group carries app_data_dictionary");
+        let mut dict = AppDataDictionary::new();
+        for entry in current.dictionary().entries() {
+            if entry.id() != GROUP_ADMIN_POLICY_COMPONENT_ID {
+                dict.insert(entry.id(), entry.data().to_vec());
+            }
+        }
+        new_extensions.push(Extension::AppDataDictionary(
+            AppDataDictionaryExtension::new(dict),
+        ));
+    }
+    let new_extensions = Extensions::from_vec(new_extensions).expect("stripped extensions build");
+
+    let (commit, _welcome, _group_info) = mls_group
+        .update_group_context_extensions(&provider, new_extensions, &signer)
+        .expect("raw OpenMLS GroupContextExtensions strip commit");
+    let payload = commit
+        .tls_serialize_detached()
+        .expect("serialize raw GCE strip commit");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-gce-strip".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
 #[tokio::test]
 async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     let (mut alice, _alice_storage) = build_client(b"alice");
@@ -760,6 +833,194 @@ async fn convergence_accepts_remove_when_admin_policy_drops_removed_admin() {
         .expect("test identities are 32-byte account keys");
     assert_eq!(carol.admin_pubkeys(&group_id).unwrap(), vec![bob_admin]);
     assert_message_state(&carol_storage, &valid_remove, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn ingest_rejects_group_context_commit_stripping_app_data_dictionary() {
+    // Regression: OpenMLS's draft-08 dictionary guard only validates the
+    // GroupContext against a commit's AppDataUpdate proposals, so an
+    // admin-authored GroupContextExtensions-only commit could replace the
+    // extensions with a set that omits the app_data_dictionary entirely.
+    // Merging it cannot orphan an admin key (the absent component is the empty
+    // admin set), but it silently makes the group admin-less and freezes every
+    // admin-gated operation. Inbound same-epoch commits route through
+    // convergence, so `ingest` must classify the strip commit invalid instead
+    // of materializing the admin-less epoch.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let alice_id = alice.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "ingest-gce-dictionary-strip".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let strip = route(
+        raw_group_context_extensions_strip_commit(&alice_storage, &alice_id, &group_id, true),
+        &group_id,
+    );
+    let outcome = bob.ingest(strip.clone()).await.expect("ingest completes");
+    assert!(
+        matches!(outcome, IngestOutcome::Stale { .. }),
+        "GCE commit stripping the app_data_dictionary must not be processed: {outcome:?}"
+    );
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
+    let alice_admin: [u8; 32] = alice_id
+        .as_slice()
+        .try_into()
+        .expect("test identities are 32-byte account keys");
+    assert_eq!(bob.admin_pubkeys(&group_id).unwrap(), vec![alice_admin]);
+    // The ingest-driven convergence pass runs inside the input window, so the
+    // terminal disposition may not be persisted yet — the pinned invariant is
+    // that the strip commit is never applied.
+    let record = bob_storage
+        .get_message(&content_id(&strip))
+        .expect("strip commit remains stored");
+    assert_ne!(record.state, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn ingest_rejects_group_context_commit_dropping_required_component_entry() {
+    // Entry-level variant of the dictionary strip: the GroupContextExtensions
+    // commit keeps the app_data_dictionary but replaces it with one that omits
+    // the required admin-policy component's state. validate_app_component_remove
+    // only sees AppDataUpdate::Remove operations, so without the staged-commit
+    // retention check this strip would also merge.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let alice_id = alice.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "ingest-gce-admin-policy-strip".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let strip = route(
+        raw_group_context_extensions_strip_commit(&alice_storage, &alice_id, &group_id, false),
+        &group_id,
+    );
+    let outcome = bob.ingest(strip.clone()).await.expect("ingest completes");
+    assert!(
+        matches!(outcome, IngestOutcome::Stale { .. }),
+        "GCE commit dropping the required admin-policy entry must not be processed: {outcome:?}"
+    );
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
+    let alice_admin: [u8; 32] = alice_id
+        .as_slice()
+        .try_into()
+        .expect("test identities are 32-byte account keys");
+    assert_eq!(bob.admin_pubkeys(&group_id).unwrap(), vec![alice_admin]);
+    // Same input-window caveat as the dictionary-strip ingest test above.
+    let record = bob_storage
+        .get_message(&content_id(&strip))
+        .expect("strip commit remains stored");
+    assert_ne!(record.state, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn convergence_rejects_group_context_commit_stripping_app_data_dictionary() {
+    // The same dictionary-strip commit through STORED CONVERGENCE. Before the
+    // required-component retention check, a GCE-only strip commit with no
+    // member removals was ACCEPTED here — convergence materialized the
+    // admin-less epoch. It must classify the commit as invalid instead.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let alice_id = alice.self_id();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "convergence-gce-dictionary-strip".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let strip = route(
+        raw_group_context_extensions_strip_commit(&alice_storage, &alice_id, &group_id, true),
+        &group_id,
+    );
+    carol
+        .buffer_openmls_convergence_message(&group_id, strip.clone(), 1_000)
+        .expect("GCE strip commit buffered");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "GCE dictionary-strip commit must not be accepted: {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.kind == MessageKind::Commit
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.message_id == content_hex(&strip)
+        }),
+        "expected GCE strip commit dropped as InvalidAgainstCandidateState, got {:?}",
+        result.dropped_messages
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        carol_storage
+            .get_group(&group_id)
+            .expect("group stored")
+            .epoch,
+        EpochId(1)
+    );
+    let alice_admin: [u8; 32] = alice_id
+        .as_slice()
+        .try_into()
+        .expect("test identities are 32-byte account keys");
+    assert_eq!(carol.admin_pubkeys(&group_id).unwrap(), vec![alice_admin]);
+    assert_message_state(&carol_storage, &strip, MessageState::EpochInvalidated);
 }
 
 /// darkmatter#286: a commit applied through STORED CONVERGENCE that later loses

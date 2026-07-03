@@ -653,6 +653,18 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(err);
                     }
+                    // Reject (pre-merge) a commit whose resulting GroupContext
+                    // strips the app_data_dictionary or a required component's
+                    // state — e.g. a GroupContextExtensions-only commit that
+                    // replaces the extensions without the dictionary.
+                    if let Err(err) =
+                        crate::app_components::validate_required_component_retention_for_staged_commit(
+                            &mls_group, &group_id, &staged,
+                        )
+                    {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(err);
+                    }
                     let Some(commit_committer) = sender_id.clone() else {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(EngineError::Backend(

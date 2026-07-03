@@ -1572,6 +1572,16 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         reason: format!("admin leaf coupling: {err}"),
                     });
                 }
+                if let Err(err) =
+                    crate::app_components::validate_required_component_retention_for_staged_commit(
+                        &mls_group, group_id, &staged,
+                    )
+                {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: format!("required component retention: {err}"),
+                    });
+                }
                 if sender_id.is_none() {
                     return Err(OpenMlsProjectionError::Replay(
                         "commit has no authenticated member sender".into(),
