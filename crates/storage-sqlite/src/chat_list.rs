@@ -37,13 +37,29 @@ impl AccountUnreadTotal {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `image_key_hex`/`image_upload_key_hex` are key material. They are
+/// intentionally serialized into the SQLCipher-protected projection, but the
+/// hand-written `Debug` impl below redacts them so a `{:?}` never prints key
+/// material into logs.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatListAvatar {
     pub image_hash_hex: String,
     pub image_key_hex: String,
     pub image_nonce_hex: String,
     pub image_upload_key_hex: String,
     pub media_type: Option<String>,
+}
+
+impl std::fmt::Debug for ChatListAvatar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatListAvatar")
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("image_upload_key_hex", &"<redacted>")
+            .field("media_type", &self.media_type)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

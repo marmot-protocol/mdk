@@ -129,11 +129,29 @@ pub struct RelayTelemetryResource {
     pub device_model_identifier: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Hand-written `Debug` below redacts `authorization_bearer_token` (the OTLP
+/// push credential) so a `{:?}` never prints it.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct RelayTelemetryRuntimeConfig {
     pub otlp_endpoint: Option<String>,
     pub authorization_bearer_token: Option<String>,
     pub resource: Option<RelayTelemetryResource>,
+}
+
+impl std::fmt::Debug for RelayTelemetryRuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayTelemetryRuntimeConfig")
+            .field("otlp_endpoint", &self.otlp_endpoint)
+            .field(
+                "authorization_bearer_token",
+                &self
+                    .authorization_bearer_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("resource", &self.resource)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -143,11 +161,29 @@ pub struct AuditLogUploadSource {
     pub app_version: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Hand-written `Debug` below redacts `authorization_bearer_token` (the audit
+/// upload credential) so a `{:?}` never prints it.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct AuditLogTrackerConfig {
     pub endpoint: Option<String>,
     pub authorization_bearer_token: Option<String>,
     pub source: AuditLogUploadSource,
+}
+
+impl std::fmt::Debug for AuditLogTrackerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditLogTrackerConfig")
+            .field("endpoint", &self.endpoint)
+            .field(
+                "authorization_bearer_token",
+                &self
+                    .authorization_bearer_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 impl RelayTelemetryResource {

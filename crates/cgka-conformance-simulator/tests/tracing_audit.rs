@@ -16,6 +16,23 @@ const TRACING_MACROS: &[&str] = &[
 
 const DIRECT_OUTPUT_MACROS: &[&str] = &["println!(", "eprintln!(", "dbg!("];
 
+/// Verbatim error interpolation in tracing calls. Error `Display` output can
+/// carry relay URLs (transport errors), file paths (io/sqlite errors), or
+/// attacker-controlled event content, so tracing must log a stable
+/// privacy-safe kind (`error_kind = err.privacy_safe_kind()`,
+/// `error_kind = %err.kind()`, an error-code enum) instead of the raw error
+/// value (darkmatter#340, darkmatter#399).
+const FORBIDDEN_ERROR_INTERPOLATIONS: &[&str] = &[
+    "error = %",
+    "error = ?",
+    "{err}",
+    "{err:",
+    "{e}",
+    "{e:",
+    "{error}",
+    "{error:",
+];
+
 const FORBIDDEN_TRACE_TOKENS: &[&str] = &[
     "account_id",
     "member_id",
@@ -75,6 +92,37 @@ fn production_tracing_calls_are_structured_and_privacy_safe() {
     assert!(
         failures.is_empty(),
         "tracing audit failed:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn production_tracing_calls_do_not_interpolate_raw_errors() {
+    let repo = workspace_root();
+    let mut failures = Vec::new();
+
+    for file in rust_source_files(&repo.join("crates")) {
+        let Ok(contents) = fs::read_to_string(&file) else {
+            continue;
+        };
+
+        for invocation in tracing_invocations(&contents) {
+            for token in FORBIDDEN_ERROR_INTERPOLATIONS {
+                if invocation.body.contains(token) {
+                    failures.push(format!(
+                        "{}:{} tracing call interpolates a raw error via `{token}`; \
+                         log a privacy-safe error kind instead",
+                        file.display(),
+                        invocation.line
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "raw-error tracing audit failed:\n{}",
         failures.join("\n")
     );
 }

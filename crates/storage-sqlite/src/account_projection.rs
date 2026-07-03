@@ -659,11 +659,20 @@ impl SqliteAccountStorage {
         if outcome.pruned_messages > 0 {
             let conn = self.lock()?;
             if let Err(error) = checkpoint_wal_truncate_after_secure_prune(&conn) {
+                // Log only the stable variant kind: storage error Display can
+                // embed SQL text or file paths.
                 tracing::warn!(
                     target: "storage_sqlite::retention",
                     method = "secure_prune_app_events_before",
                     pruned_messages = outcome.pruned_messages,
-                    error = %error,
+                    error_kind = match &error {
+                        StorageError::NotFound => "not_found",
+                        StorageError::AlreadyExists => "already_exists",
+                        StorageError::SnapshotMissing(_) => "snapshot_missing",
+                        StorageError::Busy(_) => "busy",
+                        StorageError::Backend(_) => "backend",
+                        StorageError::Serialization(_) => "serialization",
+                    },
                     "retention secure-delete WAL checkpoint failed after committed prune"
                 );
             }

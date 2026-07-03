@@ -170,7 +170,7 @@ impl SendIdempotencyStore {
                 target: "agent_connector",
                 method = "send_idempotency_persist",
                 error_code = "persist_failed",
-                error = %err,
+                error_kind = err.code(),
                 "failed to persist send idempotency record"
             );
         }
@@ -186,7 +186,7 @@ impl SendIdempotencyStore {
                     target: "agent_connector",
                     method = "send_idempotency_load",
                     error_code = "read_failed",
-                    error = %err,
+                    error_kind = %err.kind(),
                     "failed to read send idempotency file; starting empty"
                 );
                 return;
