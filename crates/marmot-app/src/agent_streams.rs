@@ -120,6 +120,10 @@ impl AgentStreamWatchManager {
         if let Ok(mut watches) = self.inner.watches.lock() {
             watches.insert(report.watch_id.clone(), report.clone());
         }
+        // Enforce the cap on start too: repeated start-without-finish (broker
+        // hang, dropped watch handle, crashed compose session) must not grow
+        // the map unbounded on the promise of a finish that never arrives.
+        self.prune_watch_reports();
         self.publish_update(AgentStreamUpdate::WatchUpdated(report.clone()));
         report
     }
@@ -144,7 +148,7 @@ impl AgentStreamWatchManager {
             report.result = completion.result;
             report.clone()
         };
-        self.prune_finished_reports();
+        self.prune_watch_reports();
         self.publish_update(AgentStreamUpdate::WatchUpdated(finished.clone()));
         Some(finished)
     }
@@ -220,31 +224,40 @@ impl AgentStreamWatchManager {
         let _ = self.inner.updates.send(update);
     }
 
-    fn prune_finished_reports(&self) {
+    /// Enforce the hard retained-watch cap. Finished watches are evicted
+    /// oldest-first before any running watch; when running watches alone
+    /// exceed the cap, the oldest running ones are evicted too so the map
+    /// stays bounded even if their finish never arrives.
+    fn prune_watch_reports(&self) {
         let Ok(mut watches) = self.inner.watches.lock() else {
             return;
         };
-        if watches.len() <= AGENT_STREAM_WATCH_RETAIN_LIMIT {
+        let excess = watches
+            .len()
+            .saturating_sub(AGENT_STREAM_WATCH_RETAIN_LIMIT);
+        if excess == 0 {
             return;
         }
 
-        let running_count = watches
+        let mut candidates = watches
             .values()
-            .filter(|watch| watch.status == "running")
-            .count();
-        let finished_retain_limit = AGENT_STREAM_WATCH_RETAIN_LIMIT.saturating_sub(running_count);
-        let mut finished = watches
-            .values()
-            .filter(|watch| watch.status != "running")
-            .map(|watch| (watch.started_at, watch.watch_id.clone()))
+            .map(|watch| {
+                (
+                    watch.status == "running",
+                    watch.started_at,
+                    watch.watch_id.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        if finished.len() <= finished_retain_limit {
-            return;
-        }
-
-        finished.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        let remove_count = finished.len() - finished_retain_limit;
-        for (_, watch_id) in finished.into_iter().take(remove_count) {
+        // Finished (`false`) sorts before running, each cohort oldest-first,
+        // so a running watch is evicted only once no finished watch remains.
+        candidates.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        for (_, _, watch_id) in candidates.into_iter().take(excess) {
             watches.remove(&watch_id);
         }
     }
@@ -384,6 +397,92 @@ mod tests {
         assert_eq!(
             reports.last().and_then(|report| report.text.as_deref()),
             Some(expected_last.as_str())
+        );
+    }
+
+    #[test]
+    fn stream_watch_manager_bounds_running_watches_that_never_finish() {
+        let manager = AgentStreamWatchManager::default();
+        let group_id = "aa".repeat(32);
+
+        for index in 0..(AGENT_STREAM_WATCH_RETAIN_LIMIT * 2) {
+            manager.start_watch(AgentStreamWatchStart {
+                account: Some("alice".to_owned()),
+                group_id: group_id.clone(),
+                stream_id: Some(format!("{index:064x}")),
+                started_at: 1_700_000_000 + index as u64,
+                started_at_millis: 1_700_000_000_000 + index as u128,
+            });
+        }
+
+        let reports = manager.reports();
+        assert_eq!(reports.len(), AGENT_STREAM_WATCH_RETAIN_LIMIT);
+        // Oldest running watches were evicted; the newest survive.
+        assert_eq!(
+            reports.first().map(|report| report.started_at),
+            Some(1_700_000_000 + AGENT_STREAM_WATCH_RETAIN_LIMIT as u64)
+        );
+    }
+
+    #[test]
+    fn stream_watch_manager_evicts_finished_watches_before_running_ones() {
+        let manager = AgentStreamWatchManager::default();
+        let group_id = "aa".repeat(32);
+
+        // Fill the map to the cap with finished watches, oldest-first.
+        for index in 0..AGENT_STREAM_WATCH_RETAIN_LIMIT {
+            let started = manager.start_watch(AgentStreamWatchStart {
+                account: Some("alice".to_owned()),
+                group_id: group_id.clone(),
+                stream_id: Some(format!("{index:064x}")),
+                started_at: 1_700_000_000 + index as u64,
+                started_at_millis: 1_700_000_000_000 + index as u128,
+            });
+            manager
+                .finish_watch(
+                    &started.watch_id,
+                    AgentStreamWatchCompletion {
+                        finished_at: 1_700_000_100 + index as u64,
+                        status: "completed".to_owned(),
+                        stream_id: started.stream_id,
+                        text: None,
+                        transcript_hash: None,
+                        chunk_count: Some(1),
+                        error: None,
+                        result: None,
+                    },
+                )
+                .expect("watch finishes");
+        }
+
+        // A newer running watch displaces the oldest finished watch, even
+        // though every finished watch started before it.
+        let running = manager.start_watch(AgentStreamWatchStart {
+            account: Some("alice".to_owned()),
+            group_id: group_id.clone(),
+            stream_id: Some("ff".repeat(32)),
+            started_at: 1_700_009_999,
+            started_at_millis: 1_700_009_999_000,
+        });
+
+        let reports = manager.reports();
+        assert_eq!(reports.len(), AGENT_STREAM_WATCH_RETAIN_LIMIT);
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.watch_id == running.watch_id)
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| report.status == "running")
+                .count(),
+            1
+        );
+        // The evicted entry is the oldest finished watch.
+        assert_eq!(
+            reports.first().map(|report| report.started_at),
+            Some(1_700_000_001)
         );
     }
 }
