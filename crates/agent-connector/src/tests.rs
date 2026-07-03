@@ -3098,6 +3098,59 @@ async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
 }
 
 #[tokio::test]
+async fn media_temp_sweeper_spares_dirs_with_recently_rewritten_files() {
+    use std::time::{Duration, SystemTime};
+
+    use crate::media_temp::sweep_media_dirs_modified_before;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blob_dir = tmp.path().join("blob");
+    tokio::fs::create_dir_all(&blob_dir).await.unwrap();
+    let file_path = blob_dir.join("media.bin");
+    tokio::fs::write(&file_path, b"first download")
+        .await
+        .unwrap();
+
+    // Pick a cutoff after the dir was created, then mimic a re-download of
+    // the same blob: an in-place truncating overwrite updates the file mtime
+    // but not the parent dir mtime.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cutoff = SystemTime::now();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&file_path)
+        .await
+        .unwrap();
+    use tokio::io::AsyncWriteExt as _;
+    file.write_all(b"second download").await.unwrap();
+    drop(file);
+
+    let swept = sweep_media_dirs_modified_before(tmp.path(), cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 0,
+        "a dir whose file was re-downloaded after the cutoff must not be swept"
+    );
+    assert!(
+        file_path.exists(),
+        "recently re-downloaded media must survive the sweep"
+    );
+
+    // Once nothing inside the dir is newer than the cutoff, it is reclaimed.
+    let late_cutoff = SystemTime::now() + Duration::from_secs(3600);
+    let swept = sweep_media_dirs_modified_before(tmp.path(), late_cutoff)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1, "fully stale dirs are still reclaimed");
+    assert!(!blob_dir.exists());
+}
+
+#[tokio::test]
 async fn create_media_download_dir_hardens_root_and_blob_dir_to_0700() {
     use std::os::unix::fs::PermissionsExt as _;
 
