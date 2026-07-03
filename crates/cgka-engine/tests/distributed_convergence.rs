@@ -852,27 +852,20 @@ async fn convergence_accepts_remove_when_admin_policy_drops_removed_admin() {
     assert_message_state(&carol_storage, &valid_remove, MessageState::Processed);
 }
 
-#[tokio::test]
-async fn ingest_rejects_group_context_commit_stripping_app_data_dictionary() {
-    // Regression: OpenMLS's draft-08 dictionary guard only validates the
-    // GroupContext against a commit's AppDataUpdate proposals, so an
-    // admin-authored GroupContextExtensions-only commit could replace the
-    // extensions with a set that omits the app_data_dictionary entirely.
-    // Merging it cannot orphan an admin key (the absent component is the empty
-    // admin set), but it silently makes the group admin-less and freezes every
-    // admin-gated operation. Inbound same-epoch commits route through
-    // convergence, so `ingest` must classify the strip commit invalid instead
-    // of materializing the admin-less epoch.
-    let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut bob, bob_storage) = build_client(b"bob");
-    let alice_id = alice.self_id();
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let (group_id, create) = alice
+/// Two-member bootstrap for the GCE tamper regressions: `creator` creates the
+/// group (sole admin), confirms, and `joiner` joins via welcome.
+async fn bootstrap_gce_tamper_group(
+    creator: &mut Engine<SqliteAccountStorage>,
+    joiner: &mut Engine<SqliteAccountStorage>,
+    joiner_name: &[u8],
+    group_name: &str,
+) -> GroupId {
+    let joiner_kp = joiner.fresh_key_package().await.unwrap();
+    let (group_id, create) = creator
         .create_group(CreateGroupRequest {
-            name: "ingest-gce-dictionary-strip".into(),
+            name: group_name.into(),
             description: "".into(),
-            members: vec![bob_kp],
+            members: vec![joiner_kp],
             required_features: vec![],
             app_components: vec![],
             initial_admins: vec![],
@@ -883,10 +876,118 @@ async fn ingest_rejects_group_context_commit_stripping_app_data_dictionary() {
         SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
         other => panic!("expected GroupCreated, got {other:?}"),
     };
-    alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+    creator.confirm_published(pending).await.unwrap();
+    joiner
+        .join_welcome(welcome_for(&welcomes, joiner_name))
         .await
         .unwrap();
+    group_id
+}
+
+fn admin_key(member: &MemberId) -> [u8; 32] {
+    member
+        .as_slice()
+        .try_into()
+        .expect("test identities are 32-byte account keys")
+}
+
+/// Ingest `tampered` on `recipient` and assert the GCE tamper commit is
+/// rejected: outcome `Stale`, epoch and sole admin unchanged, and the stored
+/// message never `Processed`. Inbound same-epoch commits route through
+/// convergence, and the ingest-driven pass runs inside the input window, so
+/// the terminal disposition may not be persisted yet — the pinned invariant is
+/// that the tamper commit is never applied.
+async fn assert_gce_tamper_rejected_by_ingest(
+    recipient: &mut Engine<SqliteAccountStorage>,
+    recipient_storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    tampered: &TransportMessage,
+    expected_admin: &MemberId,
+) {
+    let outcome = recipient
+        .ingest(tampered.clone())
+        .await
+        .expect("ingest completes");
+    assert!(
+        matches!(outcome, IngestOutcome::Stale { .. }),
+        "GCE tamper commit must not be processed: {outcome:?}"
+    );
+    assert_eq!(recipient.epoch(group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        recipient.admin_pubkeys(group_id).unwrap(),
+        vec![admin_key(expected_admin)],
+        "the tampered component state must not take effect"
+    );
+    let record = recipient_storage
+        .get_message(&content_id(tampered))
+        .expect("tamper commit remains stored");
+    assert_ne!(record.state, MessageState::Processed);
+}
+
+/// Buffer `tampered` into STORED CONVERGENCE on `recipient` and converge with
+/// a closed input window; assert the pass settles with the commit dropped as
+/// `InvalidAgainstCandidateState`, epoch and sole admin unchanged, and the
+/// message `EpochInvalidated`.
+fn assert_gce_tamper_rejected_by_convergence(
+    recipient: &mut Engine<SqliteAccountStorage>,
+    recipient_storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    tampered: &TransportMessage,
+    expected_admin: &MemberId,
+) {
+    recipient
+        .buffer_openmls_convergence_message(group_id, tampered.clone(), 1_000)
+        .expect("GCE tamper commit buffered");
+    let result = recipient
+        .converge_stored_openmls_messages(group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "GCE tamper commit must not be accepted: {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.kind == MessageKind::Commit
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.message_id == content_hex(tampered)
+        }),
+        "expected GCE tamper commit dropped as InvalidAgainstCandidateState, got {:?}",
+        result.dropped_messages
+    );
+    assert_eq!(recipient.epoch(group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        recipient_storage
+            .get_group(group_id)
+            .expect("group stored")
+            .epoch,
+        EpochId(1)
+    );
+    assert_eq!(
+        recipient.admin_pubkeys(group_id).unwrap(),
+        vec![admin_key(expected_admin)],
+        "the tampered component state must not take effect"
+    );
+    assert_message_state(recipient_storage, tampered, MessageState::EpochInvalidated);
+}
+
+#[tokio::test]
+async fn ingest_rejects_group_context_commit_stripping_app_data_dictionary() {
+    // Regression: OpenMLS's draft-08 dictionary guard only validates the
+    // GroupContext against a commit's AppDataUpdate proposals, so an
+    // admin-authored GroupContextExtensions-only commit could replace the
+    // extensions with a set that omits the app_data_dictionary entirely.
+    // Merging it cannot orphan an admin key (the absent component is the empty
+    // admin set), but it silently makes the group admin-less and freezes every
+    // admin-gated operation. `ingest` must classify the strip commit invalid
+    // instead of materializing the admin-less epoch.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let alice_id = alice.self_id();
+    let group_id =
+        bootstrap_gce_tamper_group(&mut alice, &mut bob, b"bob", "ingest-gce-dictionary-strip")
+            .await;
 
     let strip = route(
         raw_group_context_extensions_tamper_commit(
@@ -897,24 +998,8 @@ async fn ingest_rejects_group_context_commit_stripping_app_data_dictionary() {
         ),
         &group_id,
     );
-    let outcome = bob.ingest(strip.clone()).await.expect("ingest completes");
-    assert!(
-        matches!(outcome, IngestOutcome::Stale { .. }),
-        "GCE commit stripping the app_data_dictionary must not be processed: {outcome:?}"
-    );
-    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
-    let alice_admin: [u8; 32] = alice_id
-        .as_slice()
-        .try_into()
-        .expect("test identities are 32-byte account keys");
-    assert_eq!(bob.admin_pubkeys(&group_id).unwrap(), vec![alice_admin]);
-    // The ingest-driven convergence pass runs inside the input window, so the
-    // terminal disposition may not be persisted yet — the pinned invariant is
-    // that the strip commit is never applied.
-    let record = bob_storage
-        .get_message(&content_id(&strip))
-        .expect("strip commit remains stored");
-    assert_ne!(record.state, MessageState::Processed);
+    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &strip, &alice_id)
+        .await;
 }
 
 #[tokio::test]
@@ -923,31 +1008,17 @@ async fn ingest_rejects_group_context_commit_dropping_required_component_entry()
     // commit keeps the app_data_dictionary but replaces it with one that omits
     // the required admin-policy component's state. validate_app_component_remove
     // only sees AppDataUpdate::Remove operations, so without the staged-commit
-    // retention check this strip would also merge.
+    // integrity check this strip would also merge.
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, bob_storage) = build_client(b"bob");
     let alice_id = alice.self_id();
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "ingest-gce-admin-policy-strip".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
-        .await
-        .unwrap();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut bob,
+        b"bob",
+        "ingest-gce-admin-policy-strip",
+    )
+    .await;
 
     let strip = route(
         raw_group_context_extensions_tamper_commit(
@@ -958,55 +1029,26 @@ async fn ingest_rejects_group_context_commit_dropping_required_component_entry()
         ),
         &group_id,
     );
-    let outcome = bob.ingest(strip.clone()).await.expect("ingest completes");
-    assert!(
-        matches!(outcome, IngestOutcome::Stale { .. }),
-        "GCE commit dropping the required admin-policy entry must not be processed: {outcome:?}"
-    );
-    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
-    let alice_admin: [u8; 32] = alice_id
-        .as_slice()
-        .try_into()
-        .expect("test identities are 32-byte account keys");
-    assert_eq!(bob.admin_pubkeys(&group_id).unwrap(), vec![alice_admin]);
-    // Same input-window caveat as the dictionary-strip ingest test above.
-    let record = bob_storage
-        .get_message(&content_id(&strip))
-        .expect("strip commit remains stored");
-    assert_ne!(record.state, MessageState::Processed);
+    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &strip, &alice_id)
+        .await;
 }
 
 #[tokio::test]
 async fn convergence_rejects_group_context_commit_stripping_app_data_dictionary() {
     // The same dictionary-strip commit through STORED CONVERGENCE. Before the
-    // required-component retention check, a GCE-only strip commit with no
-    // member removals was ACCEPTED here — convergence materialized the
-    // admin-less epoch. It must classify the commit as invalid instead.
+    // integrity check, a GCE-only strip commit with no member removals was
+    // ACCEPTED here — convergence materialized the admin-less epoch. It must
+    // classify the commit as invalid instead.
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut carol, carol_storage) = build_client(b"carol");
     let alice_id = alice.self_id();
-    let carol_kp = carol.fresh_key_package().await.unwrap();
-
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "convergence-gce-dictionary-strip".into(),
-            description: "".into(),
-            members: vec![carol_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
-        .await
-        .unwrap();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut carol,
+        b"carol",
+        "convergence-gce-dictionary-strip",
+    )
+    .await;
 
     let strip = route(
         raw_group_context_extensions_tamper_commit(
@@ -1017,42 +1059,13 @@ async fn convergence_rejects_group_context_commit_stripping_app_data_dictionary(
         ),
         &group_id,
     );
-    carol
-        .buffer_openmls_convergence_message(&group_id, strip.clone(), 1_000)
-        .expect("GCE strip commit buffered");
-
-    let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
-        .expect("stored OpenMLS messages converge");
-
-    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert!(
-        result.accepted_commits.is_empty(),
-        "GCE dictionary-strip commit must not be accepted: {result:?}"
+    assert_gce_tamper_rejected_by_convergence(
+        &mut carol,
+        &carol_storage,
+        &group_id,
+        &strip,
+        &alice_id,
     );
-    assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.kind == MessageKind::Commit
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
-                && dropped.message_id == content_hex(&strip)
-        }),
-        "expected GCE strip commit dropped as InvalidAgainstCandidateState, got {:?}",
-        result.dropped_messages
-    );
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
-    assert_eq!(
-        carol_storage
-            .get_group(&group_id)
-            .expect("group stored")
-            .epoch,
-        EpochId(1)
-    );
-    let alice_admin: [u8; 32] = alice_id
-        .as_slice()
-        .try_into()
-        .expect("test identities are 32-byte account keys");
-    assert_eq!(carol.admin_pubkeys(&group_id).unwrap(), vec![alice_admin]);
-    assert_message_state(&carol_storage, &strip, MessageState::EpochInvalidated);
 }
 
 #[tokio::test]
@@ -1062,35 +1075,21 @@ async fn ingest_rejects_group_context_commit_rewriting_admin_policy_bytes() {
     // admin-policy bytes to a different (well-formed) admin set — with no
     // AppDataUpdate proposal carrying the change. The rewritten set names a
     // member with a leaf, so the admin-leaf coupling check passes, and the
-    // presence-only retention rule passes too; only the AppDataUpdate
-    // attribution rule can reject it. Without it, an admin could rewrite any
-    // required component's bytes (admin set, profile, routing, retention)
-    // bypassing the component validators entirely.
+    // presence rules pass too; only the AppDataUpdate attribution rule can
+    // reject it. Without it, an admin could rewrite any required component's
+    // bytes (admin set, profile, routing, retention) bypassing the component
+    // validators entirely.
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, bob_storage) = build_client(b"bob");
     let alice_id = alice.self_id();
     let bob_id = bob.self_id();
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "ingest-gce-admin-policy-rewrite".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
-        .await
-        .unwrap();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut bob,
+        b"bob",
+        "ingest-gce-admin-policy-rewrite",
+    )
+    .await;
 
     let rewrite = route(
         raw_group_context_extensions_tamper_commit(
@@ -1104,26 +1103,8 @@ async fn ingest_rejects_group_context_commit_rewriting_admin_policy_bytes() {
         ),
         &group_id,
     );
-    let outcome = bob.ingest(rewrite.clone()).await.expect("ingest completes");
-    assert!(
-        matches!(outcome, IngestOutcome::Stale { .. }),
-        "GCE commit rewriting admin-policy bytes must not be processed: {outcome:?}"
-    );
-    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
-    let alice_admin: [u8; 32] = alice_id
-        .as_slice()
-        .try_into()
-        .expect("test identities are 32-byte account keys");
-    assert_eq!(
-        bob.admin_pubkeys(&group_id).unwrap(),
-        vec![alice_admin],
-        "the GCE-rewritten admin set must not take effect"
-    );
-    // Same input-window caveat as the dictionary-strip ingest test above.
-    let record = bob_storage
-        .get_message(&content_id(&rewrite))
-        .expect("rewrite commit remains stored");
-    assert_ne!(record.state, MessageState::Processed);
+    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &rewrite, &alice_id)
+        .await;
 }
 
 #[tokio::test]
@@ -1135,28 +1116,13 @@ async fn convergence_rejects_group_context_commit_rewriting_admin_policy_bytes()
     let (mut carol, carol_storage) = build_client(b"carol");
     let alice_id = alice.self_id();
     let carol_id = carol.self_id();
-    let carol_kp = carol.fresh_key_package().await.unwrap();
-
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "convergence-gce-admin-policy-rewrite".into(),
-            description: "".into(),
-            members: vec![carol_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
-        .await
-        .unwrap();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut carol,
+        b"carol",
+        "convergence-gce-admin-policy-rewrite",
+    )
+    .await;
 
     let rewrite = route(
         raw_group_context_extensions_tamper_commit(
@@ -1170,39 +1136,13 @@ async fn convergence_rejects_group_context_commit_rewriting_admin_policy_bytes()
         ),
         &group_id,
     );
-    carol
-        .buffer_openmls_convergence_message(&group_id, rewrite.clone(), 1_000)
-        .expect("GCE rewrite commit buffered");
-
-    let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
-        .expect("stored OpenMLS messages converge");
-
-    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert!(
-        result.accepted_commits.is_empty(),
-        "GCE admin-policy rewrite commit must not be accepted: {result:?}"
+    assert_gce_tamper_rejected_by_convergence(
+        &mut carol,
+        &carol_storage,
+        &group_id,
+        &rewrite,
+        &alice_id,
     );
-    assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.kind == MessageKind::Commit
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
-                && dropped.message_id == content_hex(&rewrite)
-        }),
-        "expected GCE rewrite commit dropped as InvalidAgainstCandidateState, got {:?}",
-        result.dropped_messages
-    );
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
-    let alice_admin: [u8; 32] = alice_id
-        .as_slice()
-        .try_into()
-        .expect("test identities are 32-byte account keys");
-    assert_eq!(
-        carol.admin_pubkeys(&group_id).unwrap(),
-        vec![alice_admin],
-        "the GCE-rewritten admin set must not take effect"
-    );
-    assert_message_state(&carol_storage, &rewrite, MessageState::EpochInvalidated);
 }
 
 /// darkmatter#286: a commit applied through STORED CONVERGENCE that later loses
