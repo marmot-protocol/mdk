@@ -199,7 +199,7 @@ pub enum AppMessageInvalidationReason {
 /// (spec `protocol-core/convergence.md` "Applying the selected branch"). The
 /// state-notification counterpart of [`AppMessageInvalidationReason`], carried
 /// by [`GroupEvent::GroupStateInvalidated`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupStateInvalidationReason {
     /// Branch selection superseded a commit this client previously applied —
     /// including the client's own published and confirmed commit — so every

@@ -2633,6 +2633,47 @@ impl MarmotApp {
             .transpose()
     }
 
+    /// Timeline-invalidation dispatch for one engine [`GroupEvent`], shared by
+    /// the sync ingest loop and unit-testable without transport plumbing.
+    ///
+    /// - [`GroupEvent::AppMessageInvalidated`] withdraws the delivered app
+    ///   message row addressed by its source message id.
+    /// - [`GroupEvent::GroupStateInvalidated`] is the spec's explicit
+    ///   state-notification withdrawal (convergence.md "Applying the selected
+    ///   branch"): every kind-1210 system row stamped with the superseded
+    ///   commit's `origin_commit_id` is invalidated — including rows the
+    ///   account's own published-and-confirmed commit synthesized. The engine
+    ///   pairs this event with both commit-rollback seams (`ForkRecovered`,
+    ///   `CommitRolledBack`), so those commit-level events intentionally do
+    ///   NOT dispatch here: one rollback must tombstone once, with one reason.
+    ///
+    /// Every other event carries no timeline invalidation and returns `None`.
+    pub(crate) fn projection_update_for_invalidation_event(
+        &self,
+        label: &str,
+        event: &cgka_traits::engine::GroupEvent,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        match event {
+            cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+                message_id, reason, ..
+            } => self.invalidate_timeline_source_message(
+                label,
+                &hex::encode(message_id.as_slice()),
+                &format!("{reason:?}"),
+            ),
+            cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+                invalidated_commit_id,
+                reason,
+                ..
+            } => self.invalidate_timeline_origin_commit(
+                label,
+                &hex::encode(invalidated_commit_id.as_slice()),
+                &format!("{reason:?}"),
+            ),
+            _ => Ok(None),
+        }
+    }
+
     fn app_projection_update(
         &self,
         label: &str,

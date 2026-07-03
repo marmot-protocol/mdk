@@ -442,69 +442,18 @@ impl AppClient {
                 updated_group.as_ref(),
                 source_message_id_hex,
             );
-            if let cgka_traits::engine::GroupEvent::AppMessageInvalidated {
-                message_id, reason, ..
-            } = event
-                && let Some(projection_update) = self.app.invalidate_timeline_source_message(
-                    &self.state.label,
-                    &hex::encode(message_id.as_slice()),
-                    &format!("{reason:?}"),
-                )?
-            {
-                summary.projection_updates.push(projection_update);
-            }
-            // A rolled-back commit on a losing branch invalidates any kind-1210
-            // group system rows it synthesized (one commit → many rows). The
-            // winning branch's fresh rows are synthesized below from this
-            // current effect's `GroupStateChanged` events, so the timeline
-            // converges to the canonical branch without stale losing-branch rows.
-            if let cgka_traits::engine::GroupEvent::ForkRecovered {
-                invalidated_commit_id,
-                ..
-            } = event
-                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
-                    &self.state.label,
-                    &hex::encode(invalidated_commit_id.as_slice()),
-                    "LosingBranch",
-                )?
-            {
-                summary.projection_updates.push(projection_update);
-            }
-            // Convergence-path analog of `ForkRecovered`: a commit first applied
-            // through stored convergence (so its synthesized kind-1210 rows carry
-            // `origin_commit_id`) later lost a same-epoch fork and was rolled
-            // back. `ForkRecovered` only fires on the direct staged-commit seam,
-            // so without this the convergence-born losing rows would survive.
-            // Invalidate every row whose origin commit matches.
-            if let cgka_traits::engine::GroupEvent::CommitRolledBack {
-                invalidated_commit_id,
-                ..
-            } = event
-                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
-                    &self.state.label,
-                    &hex::encode(invalidated_commit_id.as_slice()),
-                    "LosingBranch",
-                )?
-            {
-                summary.projection_updates.push(projection_update);
-            }
-            // Explicit state-notification withdrawal (convergence.md "Applying
-            // the selected branch"): branch selection superseded a previously
-            // applied commit — including this account's own published-and-
-            // confirmed commit — so every kind-1210 system row stamped with its
-            // origin commit id is invalidated. Idempotent alongside the
-            // `ForkRecovered` / `CommitRolledBack` handlers above, which fire
-            // for the same commit on their respective seams.
-            if let cgka_traits::engine::GroupEvent::GroupStateInvalidated {
-                invalidated_commit_id,
-                reason,
-                ..
-            } = event
-                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
-                    &self.state.label,
-                    &hex::encode(invalidated_commit_id.as_slice()),
-                    &format!("{reason:?}"),
-                )?
+            // Timeline invalidation dispatch: `AppMessageInvalidated` withdraws
+            // the delivered source row; `GroupStateInvalidated` withdraws every
+            // kind-1210 system row stamped with the superseded commit's
+            // `origin_commit_id`. The engine pairs `GroupStateInvalidated` with
+            // both commit-rollback seams (`ForkRecovered` on the direct
+            // staged-commit seam, `CommitRolledBack` on the stored-convergence
+            // seam), so those events no longer trigger tombstoning here — the
+            // explicit withdrawal event is the single authoritative signal and
+            // one rollback produces exactly one projection update.
+            if let Some(projection_update) = self
+                .app
+                .projection_update_for_invalidation_event(&self.state.label, event)?
             {
                 summary.projection_updates.push(projection_update);
             }
