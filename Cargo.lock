@@ -2600,6 +2600,7 @@ dependencies = [
  "cgka-session",
  "cgka-traits",
  "chacha20poly1305",
+ "fs-private",
  "hex",
  "hkdf",
  "marmot-account",

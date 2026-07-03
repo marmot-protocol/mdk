@@ -1133,7 +1133,7 @@ impl MarmotApp {
         for account in accounts {
             remove_sqlite_file_set(&self.directory_cache_path(&account.label))?;
         }
-        fs::write(marker_path, b"done\n")?;
+        fs_private::write_private(&marker_path, b"done\n")?;
         Ok(())
     }
 

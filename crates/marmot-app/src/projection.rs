@@ -39,6 +39,9 @@ impl LegacyAccountProjectionDb {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Pre-create 0600 so SQLite's -wal/-shm sidecars (which copy the main
+        // file's mode) never appear at umask-default permissions.
+        fs_private::ensure_private_file(&path)?;
         let conn = Connection::open(path)?;
         // Harden this legacy migration source the same way as storage-sqlite:
         // pin cipher_compatibility and enable cipher_memory_security before

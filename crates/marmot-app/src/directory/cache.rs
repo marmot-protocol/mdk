@@ -25,6 +25,9 @@ impl DirectoryCache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Pre-create 0600 so SQLite's -wal/-shm sidecars (which copy the main
+        // file's mode) never appear at umask-default permissions.
+        fs_private::ensure_private_file(&path)?;
         let conn = Connection::open(path)?;
         // Mirror storage-sqlite's hardened open: pin cipher_compatibility and
         // enable cipher_memory_security before keying, and scrub deleted rows /
@@ -719,6 +722,22 @@ mod tests {
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_cache_db_is_owner_only_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let path = dir.path().join("directory.sqlite3");
+        let _cache = DirectoryCache::open(path.clone(), &key).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

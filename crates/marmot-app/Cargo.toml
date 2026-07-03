@@ -18,6 +18,7 @@ cgka-engine.workspace = true
 cgka-session.workspace = true
 cgka-traits.workspace = true
 chacha20poly1305.workspace = true
+fs-private.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 marmot-account.workspace = true

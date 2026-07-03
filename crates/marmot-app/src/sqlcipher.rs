@@ -185,11 +185,12 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AppError> {
     };
 
     {
-        let mut tmp = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        // Owner-only from creation: the salt is key-derivation material and
+        // the rename target inherits the temp file's mode.
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        fs_private::set_private_file_mode(&mut options);
+        let mut tmp = options.open(&tmp_path)?;
         tmp.write_all(contents)?;
         tmp.sync_all()?;
     }
@@ -370,6 +371,22 @@ mod tests {
         assert_ne!(session_key.as_secret_str(), projection_key.as_secret_str());
         assert!(sqlcipher_salt_path(&session_path).exists());
         assert!(sqlcipher_salt_path(&projection_path).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlcipher_salt_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let salt_path = dir.path().join("session.sqlite.salt");
+        write_sqlcipher_salt(&salt_path, &[0x5a; SQLCIPHER_SALT_LEN]).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&salt_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "salt is key-derivation material and must be owner-only"
+        );
     }
 
     #[test]
