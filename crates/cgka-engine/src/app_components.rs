@@ -251,6 +251,15 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
         Some(admin_bytes) => decode_admin_policy(admin_bytes)?,
         None => admins_of_group(mls_group)?,
     };
+    // An empty carried-forward set means the current epoch has no admin-policy
+    // state at all (component bytes cannot encode an empty list), so there is
+    // no admin key to orphan and the check is vacuously satisfied. This is not
+    // a bypass for admin-less groups: every commit shape that can remove
+    // ANOTHER member's leaf requires an authenticated admin sender
+    // (`require_admin_for_staged_commit`, enforced before this check on the
+    // send, ingest, and convergence-replay paths), which fail-closes when the
+    // admin set is empty; the only leaf-removing shape a non-admin may commit
+    // is SelfRemove-only, which cannot de-leaf a member of an empty admin set.
     if resulting_admins.is_empty() {
         return Ok(());
     }

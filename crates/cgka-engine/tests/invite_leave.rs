@@ -681,6 +681,25 @@ async fn remove_co_admin_couples_admin_policy_update_in_same_commit() {
     };
     alice.confirm_published(pending).await.unwrap();
 
+    // The author's confirm-published events must carry BOTH the membership
+    // change and the coupled admin revocation, matching what receivers derive
+    // from their before/after admin snapshot.
+    let alice_events = alice.drain_events();
+    assert!(
+        emits_removed_of(&alice_events, &bob_id),
+        "alice should emit MemberRemoved for bob after confirm; got {alice_events:?}"
+    );
+    assert!(
+        alice_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::AdminRemoved { member },
+                ..
+            } if member == &bob_id
+        )),
+        "alice should emit AdminRemoved for bob after confirm; got {alice_events:?}"
+    );
+
     assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
     let alice_members = alice.members(&group_id).unwrap();
     assert_eq!(alice_members.len(), 2);

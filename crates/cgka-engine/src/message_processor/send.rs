@@ -16,9 +16,8 @@ use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
-use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
-use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
@@ -386,65 +385,52 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
-        // Admin/leaf coupling (admin-policy-v1.md "Validation"): if any removed
-        // account is currently listed in `admins`, the same commit must also
-        // drop those keys from the admin-policy component — otherwise the
-        // resulting epoch lists an admin with no member leaf and is invalid.
+        // Admin/leaf coupling (admin-policy-v1.md "Validation"): the resulting
+        // epoch must not list an admin key without a member leaf. Derive the
+        // resulting admin set from the same membership delta the validator
+        // (`validate_admin_leaf_coupling_for_staged_commit`) uses — current
+        // leaves minus the leaves this commit removes — so an admin key is
+        // dropped exactly when none of its account's leaves survives,
+        // independent of how targets were expanded to leaf indices above.
+        let removed_leaves: HashSet<u32> = leaf_indices.iter().map(|idx| idx.u32()).collect();
+        let mut surviving_accounts: HashSet<[u8; 32]> = HashSet::new();
+        for member in mls_group.members() {
+            if removed_leaves.contains(&member.index.u32()) {
+                continue;
+            }
+            if let Ok(basic) = BasicCredential::try_from(member.credential)
+                && let Ok(pk) = <[u8; 32]>::try_from(basic.identity())
+            {
+                surviving_accounts.insert(pk);
+            }
+        }
         let resulting_admins: Vec<[u8; 32]> = admins
             .iter()
-            .filter(|admin| !target_admins.iter().any(|target| target == *admin))
+            .filter(|admin| surviving_accounts.contains(*admin))
             .copied()
             .collect();
         let commit_out = if resulting_admins.len() == admins.len() {
-            // No removed member is an admin: a plain Remove commit carries the
-            // admin set forward unchanged.
+            // No admin loses their last leaf: a plain Remove commit carries
+            // the admin set forward unchanged.
             let (commit_out, _welcome_opt, _gi) = mls_group
                 .remove_members(&provider, &self.identity.signer, &leaf_indices)
                 .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
             commit_out
         } else {
-            // The AdminDepletion guard above ensures resulting_admins is
-            // non-empty here.
+            // Couple an admin-policy update dropping the de-leafed admin keys
+            // into the same commit. The AdminDepletion guard above ensures
+            // `resulting_admins` is non-empty here.
             let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
                 GROUP_ADMIN_POLICY_COMPONENT_ID,
                 crate::app_components::encode_admin_policy(&resulting_admins)?,
             )));
-            let mut builder = mls_group
-                .commit_builder()
-                .propose_removals(leaf_indices)
-                .add_proposal(admin_update)
-                .load_psks(
-                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                        &provider,
-                    ),
-                )
-                .map_err(|e| EngineError::Backend(format!("load_psks: {e:?}")))?;
-            let mut app_data = builder.app_data_dictionary_updater();
-            for proposal in builder.app_data_update_proposals() {
-                if let AppDataUpdateOperation::Update(data) = proposal.operation() {
-                    app_data.set(ComponentData::from_parts(
-                        proposal.component_id(),
-                        data.clone(),
-                    ));
-                }
-            }
-            builder.with_app_data_dictionary_updates(app_data.changes());
-            let commit_bundle = builder
-                .build(
-                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(
-                        &provider,
-                    ),
-                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
-                        &provider,
-                    ),
-                    &self.identity.signer,
-                    |_| true,
-                )
-                .map_err(|e| EngineError::Backend(format!("remove_members build: {e:?}")))?
-                .stage_commit(&provider)
-                .map_err(|e| EngineError::Backend(format!("remove_members stage: {e:?}")))?;
-            let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
-            commit_out
+            self.stage_commit_with_app_data_updates(
+                &mut mls_group,
+                &provider,
+                leaf_indices,
+                vec![admin_update],
+                "remove_members",
+            )?
         };
 
         let staged_commit = mls_group
@@ -528,7 +514,7 @@ impl<S: StorageProvider> Engine<S> {
             ),
             recovery_snapshot,
         );
-        let removed_changes = unique_targets
+        let mut removed_changes: Vec<crate::engine::PendingGroupStateChange> = unique_targets
             .iter()
             .cloned()
             .map(|member| crate::engine::PendingGroupStateChange {
@@ -536,6 +522,16 @@ impl<S: StorageProvider> Engine<S> {
                 change: GroupStateChange::MemberRemoved { member },
             })
             .collect();
+        // Mirror what receivers derive from their before/after admin snapshot:
+        // the coupled admin-policy update also revokes admin status, so the
+        // author's confirm-published events must carry the same AdminRemoved
+        // rows (attributed to self, as UpdateAppComponents does).
+        for change in crate::group_state_changes::admin_changes(&admins, &resulting_admins) {
+            removed_changes.push(crate::engine::PendingGroupStateChange {
+                actor: Some(self.identity.self_id().clone()),
+                change,
+            });
+        }
         self.pending_state_changes
             .insert(pending_ref, removed_changes);
         pending_commit_guard.disarm();

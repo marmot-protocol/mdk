@@ -856,6 +856,96 @@ async fn convergence_rejects_remove_whose_context_carries_no_admin_policy_bytes(
 }
 
 #[tokio::test]
+async fn live_ingest_rejects_remove_whose_context_carries_no_admin_policy_bytes() {
+    // Sibling of the stored-convergence test above, pushed through the live
+    // `ingest` entry point instead of pre-buffering — pinning the hot path a
+    // relay-delivered commit takes. The invalid remove must never be applied:
+    // the outcome is terminal, and Carol's epoch, membership, and admin view
+    // stay untouched.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let bob_id = bob.self_id();
+    let alice_id = alice.self_id();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "live-ingest-carried-forward-admins".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invalid_remove = route(
+        raw_remove_members_commit_dropping_app_data_dictionary(
+            &bob_storage,
+            &bob.self_id(),
+            &group_id,
+            std::slice::from_ref(&alice_id),
+        ),
+        &group_id,
+    );
+
+    let outcome = carol.ingest(invalid_remove.clone()).await.unwrap();
+    assert!(
+        !matches!(outcome, IngestOutcome::Processed),
+        "invalid remove must not be applied via live ingest, got {outcome:?}"
+    );
+    // Drive convergence to quiescence in case the inline pass left the commit
+    // pending; the commit must still never be accepted.
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, u64::MAX)
+        .expect("stored OpenMLS messages converge");
+    assert!(
+        result.accepted_commits.is_empty(),
+        "invalid remove must not be accepted after quiescence: {result:?}"
+    );
+
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    let stored_group = carol_storage.get_group(&group_id).expect("group stored");
+    assert_eq!(stored_group.epoch, EpochId(1));
+    assert_eq!(stored_group.members.len(), 3);
+    let projected_members = carol.members(&group_id).expect("members projected");
+    assert_eq!(projected_members.len(), 3);
+    assert!(
+        projected_members.iter().any(|member| member.id == alice_id),
+        "alice must remain a member on carol's view: {projected_members:?}"
+    );
+    let alice_admin: [u8; 32] = alice_id.as_slice().try_into().unwrap();
+    let bob_admin: [u8; 32] = bob_id.as_slice().try_into().unwrap();
+    let mut expected_admins = vec![alice_admin, bob_admin];
+    expected_admins.sort();
+    assert_eq!(
+        carol.admin_pubkeys(&group_id).unwrap(),
+        expected_admins,
+        "carol's admin view must be unchanged"
+    );
+    assert_message_state(
+        &carol_storage,
+        &invalid_remove,
+        MessageState::EpochInvalidated,
+    );
+}
+
+#[tokio::test]
 async fn convergence_accepts_remove_when_admin_policy_drops_removed_admin() {
     // Positive control for the same invariant: a commit may remove an admin's
     // last member leaf if the same resulting epoch's signed admin-policy drops
