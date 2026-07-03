@@ -154,13 +154,32 @@ pub fn parse_octal_mode(value: &str) -> Result<u32, String> {
     Ok(mode)
 }
 
+/// The staging directory `bind_unix_listener_private` binds through for
+/// `final_path`. Exposed so callers and tests can assert staging cleanup
+/// without re-deriving the (otherwise private) naming scheme.
+#[cfg(unix)]
+pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
+    let parent = match final_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = final_path.file_name().unwrap_or_default();
+    // Keyed by pid for crash recovery and by target name so concurrent binds
+    // of different sockets in the same parent never share staging state.
+    parent.join(format!(
+        ".sock.{}.{}",
+        std::process::id(),
+        name.to_string_lossy()
+    ))
+}
+
 /// Bind a Unix listener so the socket is never reachable at default
 /// permissions: bind inside a fresh 0700 staging directory next to
 /// `final_path`, chmod the socket to `mode`, then hard-link it into place
 /// (failing with `AddrInUse` if `final_path` already exists, matching plain
 /// `bind` semantics so callers keep their stale-socket recovery).
 ///
-/// The staging directory name stays short (`.sock.<pid>`) to respect
+/// The staging directory name stays short (`.sock.<pid>.<name>`) to respect
 /// `sun_path` length limits.
 #[cfg(unix)]
 pub fn bind_unix_listener_private(
@@ -173,11 +192,7 @@ pub fn bind_unix_listener_private(
     let name = final_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "socket path has no file name")
     })?;
-    let parent = match final_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let staging_dir = parent.join(format!(".sock.{}", std::process::id()));
+    let staging_dir = socket_staging_dir(final_path);
     // A leftover staging dir can only be ours (pid-suffixed, 0700) from a
     // crashed previous run; clear it so the atomic 0700 create succeeds.
     if staging_dir.symlink_metadata().is_ok() {
@@ -313,8 +328,10 @@ mod unix_tests {
         let socket = dir.path().join("test.sock");
         let listener = bind_unix_listener_private(&socket, 0o600).unwrap();
         assert_eq!(mode_of(&socket), 0o600);
-        let staging = dir.path().join(format!(".sock.{}", std::process::id()));
-        assert!(!staging.exists(), "staging dir should be cleaned up");
+        assert!(
+            !socket_staging_dir(&socket).exists(),
+            "staging dir should be cleaned up"
+        );
         // The listener must still accept connections at the final path.
         let client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         let (_server, _addr) = listener.accept().unwrap();
@@ -333,12 +350,25 @@ mod unix_tests {
     #[test]
     fn bind_unix_listener_private_recovers_from_stale_staging_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let staging = dir.path().join(format!(".sock.{}", std::process::id()));
+        let socket = dir.path().join("test.sock");
+        let staging = socket_staging_dir(&socket);
         std::fs::create_dir(&staging).unwrap();
         std::fs::write(staging.join("leftover"), b"x").unwrap();
-        let socket = dir.path().join("test.sock");
         drop(bind_unix_listener_private(&socket, 0o600).unwrap());
         assert_eq!(mode_of(&socket), 0o600);
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn concurrent_binds_in_same_parent_use_distinct_staging_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sock");
+        let second = dir.path().join("second.sock");
+        assert_ne!(socket_staging_dir(&first), socket_staging_dir(&second));
+        let first_listener = bind_unix_listener_private(&first, 0o600).unwrap();
+        let second_listener = bind_unix_listener_private(&second, 0o600).unwrap();
+        assert_eq!(mode_of(&first), 0o600);
+        assert_eq!(mode_of(&second), 0o600);
+        drop((first_listener, second_listener));
     }
 }

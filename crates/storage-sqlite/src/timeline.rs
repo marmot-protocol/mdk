@@ -720,6 +720,12 @@ pub(crate) fn secure_prune_app_events_before_tx(
     group_id_hex: &str,
     cutoff_recorded_at: u64,
 ) -> StorageResult<SecurePruneAppEventsResult> {
+    debug_assert_eq!(
+        tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0),
+        1,
+        "secure_delete must be ON before the prune transaction is opened"
+    );
     let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
     if pruned_events.is_empty() {
         return Ok(SecurePruneAppEventsResult::default());

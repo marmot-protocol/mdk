@@ -97,12 +97,8 @@ async fn daemon_socket_is_owner_only_after_bind() {
             & 0o777,
         0o600
     );
-    let staging = socket
-        .parent()
-        .expect("socket parent")
-        .join(format!(".sock.{}", std::process::id()));
     assert!(
-        !staging.exists(),
+        !fs_private::socket_staging_dir(&socket).exists(),
         "staging dir should be removed after bind"
     );
 
