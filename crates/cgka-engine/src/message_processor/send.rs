@@ -8,6 +8,7 @@ use crate::engine::Engine;
 use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::engine::{CommitOrderingKey, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
@@ -15,7 +16,9 @@ use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
+use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
 use std::collections::HashSet;
 use tls_codec::Serialize as _;
@@ -383,9 +386,66 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
-        let (commit_out, _welcome_opt, _gi) = mls_group
-            .remove_members(&provider, &self.identity.signer, &leaf_indices)
-            .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+        // Admin/leaf coupling (admin-policy-v1.md "Validation"): if any removed
+        // account is currently listed in `admins`, the same commit must also
+        // drop those keys from the admin-policy component — otherwise the
+        // resulting epoch lists an admin with no member leaf and is invalid.
+        let resulting_admins: Vec<[u8; 32]> = admins
+            .iter()
+            .filter(|admin| !target_admins.iter().any(|target| target == *admin))
+            .copied()
+            .collect();
+        let commit_out = if resulting_admins.len() == admins.len() {
+            // No removed member is an admin: a plain Remove commit carries the
+            // admin set forward unchanged.
+            let (commit_out, _welcome_opt, _gi) = mls_group
+                .remove_members(&provider, &self.identity.signer, &leaf_indices)
+                .map_err(|e| EngineError::Backend(format!("remove_members: {e:?}")))?;
+            commit_out
+        } else {
+            // The AdminDepletion guard above ensures resulting_admins is
+            // non-empty here.
+            let admin_update = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                crate::app_components::encode_admin_policy(&resulting_admins)?,
+            )));
+            let mut builder = mls_group
+                .commit_builder()
+                .propose_removals(leaf_indices)
+                .add_proposal(admin_update)
+                .load_psks(
+                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                        &provider,
+                    ),
+                )
+                .map_err(|e| EngineError::Backend(format!("load_psks: {e:?}")))?;
+            let mut app_data = builder.app_data_dictionary_updater();
+            for proposal in builder.app_data_update_proposals() {
+                if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+                    app_data.set(ComponentData::from_parts(
+                        proposal.component_id(),
+                        data.clone(),
+                    ));
+                }
+            }
+            builder.with_app_data_dictionary_updates(app_data.changes());
+            let commit_bundle = builder
+                .build(
+                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(
+                        &provider,
+                    ),
+                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
+                        &provider,
+                    ),
+                    &self.identity.signer,
+                    |_| true,
+                )
+                .map_err(|e| EngineError::Backend(format!("remove_members build: {e:?}")))?
+                .stage_commit(&provider)
+                .map_err(|e| EngineError::Backend(format!("remove_members stage: {e:?}")))?;
+            let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
+            commit_out
+        };
 
         let staged_commit = mls_group
             .pending_commit()

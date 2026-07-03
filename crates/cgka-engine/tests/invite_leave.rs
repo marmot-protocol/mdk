@@ -616,15 +616,17 @@ async fn admin_remove_members_publishes_commit_and_updates_membership() {
 }
 
 #[tokio::test]
-async fn remove_co_admin_without_admin_policy_update_is_rejected() {
+async fn remove_co_admin_couples_admin_policy_update_in_same_commit() {
     // admin-policy-v1.md: a commit that removes an account's last member leaf
     // MUST also remove that account's key from `admins` in the same resulting
-    // epoch. The public RemoveMembers path cannot currently carry that
-    // admin-policy rewrite, so removing a listed co-admin must be rejected
-    // before staging a local commit.
+    // epoch. The public RemoveMembers path builds that coupled
+    // Remove + AppDataUpdate commit itself, so removing a listed co-admin
+    // succeeds, the commit publishes, and the resulting admin set no longer
+    // lists the removed account — locally and for a member ingesting it.
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
     let mut carol = build_client(b"carol");
+    let alice_id = alice.self_id();
     let bob_id = bob.self_id();
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let carol_kp = carol.fresh_key_package().await.unwrap();
@@ -640,37 +642,80 @@ async fn remove_co_admin_without_admin_policy_update_is_rejected() {
         })
         .await
         .unwrap();
-    match create {
-        SendResult::GroupCreated { pending, .. } => {
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
             alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
         }
         other => panic!("expected GroupCreated, got {other:?}"),
-    }
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
 
-    let result = alice
+    let alice_admin: [u8; 32] = alice_id.as_slice().try_into().unwrap();
+    let bob_admin: [u8; 32] = bob_id.as_slice().try_into().unwrap();
+    let mut initial_admins = vec![alice_admin, bob_admin];
+    initial_admins.sort();
+    assert_eq!(alice.admin_pubkeys(&group_id).unwrap(), initial_admins);
+
+    let remove = alice
         .send(SendIntent::RemoveMembers {
             group_id: group_id.clone(),
             members: vec![bob_id.clone()],
         })
-        .await;
+        .await
+        .expect("removing a co-admin stages a coupled Remove+AppDataUpdate commit");
+    let (commit, pending) = match remove {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
 
-    match result {
-        Err(EngineError::Other(message)) => assert!(
-            message.contains("admin key has no member leaf"),
-            "unexpected error text: {message}"
-        ),
-        Err(other) => panic!("expected admin/leaf coupling error, got {other:?}"),
-        Ok(_) => panic!("removing a listed co-admin without updating admin policy must fail"),
-    }
-
-    assert_eq!(alice.epoch(&group_id).unwrap().0, 1);
+    assert_eq!(alice.epoch(&group_id).unwrap().0, 2);
+    let alice_members = alice.members(&group_id).unwrap();
+    assert_eq!(alice_members.len(), 2);
     assert!(
-        alice
-            .members(&group_id)
-            .unwrap()
-            .iter()
-            .any(|member| member.id == bob_id),
-        "failed remove must leave bob in the local member projection"
+        !alice_members.iter().any(|member| member.id == bob_id),
+        "bob must be removed from alice's membership; got {alice_members:?}"
+    );
+    assert_eq!(
+        alice.admin_pubkeys(&group_id).unwrap(),
+        vec![alice_admin],
+        "the same commit must drop bob from the admin set"
+    );
+
+    // A second member ingesting the commit accepts it and sees the same
+    // membership and admin-set change.
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = carol.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut carol, &group_id);
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
+    let carol_members = carol.members(&group_id).unwrap();
+    assert_eq!(carol_members.len(), 2);
+    assert!(
+        !carol_members.iter().any(|member| member.id == bob_id),
+        "carol must converge to a group without bob; got {carol_members:?}"
+    );
+    assert_eq!(
+        carol.admin_pubkeys(&group_id).unwrap(),
+        vec![alice_admin],
+        "carol's admin view must drop bob after ingesting the commit"
     );
 }
 

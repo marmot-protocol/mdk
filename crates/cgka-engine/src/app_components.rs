@@ -237,14 +237,20 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
     // Resulting admins come from the staged (provisional) app_data_dictionary, so
-    // an admin-policy update in this same commit is already reflected.
-    let Some(dict) = staged.group_context().extensions().app_data_dictionary() else {
-        return Ok(());
+    // an admin-policy update in this same commit is already reflected. When the
+    // staged GroupContext carries no admin-policy bytes, the resulting epoch's
+    // admin set is the prior epoch's set carried forward
+    // (admin-policy-v1.md "Validation"), so evaluate against the current
+    // group's admin set instead of skipping the check.
+    let staged_admin_bytes = staged
+        .group_context()
+        .extensions()
+        .app_data_dictionary()
+        .and_then(|dict| dict.dictionary().get(&GROUP_ADMIN_POLICY_COMPONENT_ID));
+    let resulting_admins = match staged_admin_bytes {
+        Some(admin_bytes) => decode_admin_policy(admin_bytes)?,
+        None => admins_of_group(mls_group)?,
     };
-    let Some(admin_bytes) = dict.dictionary().get(&GROUP_ADMIN_POLICY_COMPONENT_ID) else {
-        return Ok(());
-    };
-    let resulting_admins = decode_admin_policy(admin_bytes)?;
     if resulting_admins.is_empty() {
         return Ok(());
     }
