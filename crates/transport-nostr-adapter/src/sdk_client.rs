@@ -331,11 +331,17 @@ impl NostrSdkRelayClient {
                     });
                 }
                 Ok(Ok(output)) => {
-                    last_error = output
-                        .failed
-                        .get(&endpoint)
-                        .cloned()
-                        .unwrap_or_else(|| "relay did not acknowledge event".to_owned());
+                    // The relay's rejection text is remote-controlled and can
+                    // embed the relay URL, event ids, or arbitrary content, so
+                    // it must not reach the display-bearing publish error
+                    // (`finish_publish_outcome` joins these reasons into
+                    // `TransportAdapterError::Publish`). Map to a stable
+                    // reason instead of echoing it.
+                    last_error = if output.failed.contains_key(&endpoint) {
+                        "relay rejected event".to_owned()
+                    } else {
+                        "relay did not acknowledge event".to_owned()
+                    };
                 }
                 Ok(Err(_)) => {
                     // No sdk error Display here either — it can carry the
