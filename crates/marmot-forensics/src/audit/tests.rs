@@ -1019,3 +1019,214 @@ fn sample_events_serialize_within_schema_property_names() {
     let value = serde_json::to_value(&event).unwrap();
     assert_keys_within_schema(&value, &schema, &defs, "event");
 }
+
+fn full_data_message_content_decoded() -> AuditEventKind {
+    AuditEventKind::MessageContentDecoded {
+        msg_id: "msg-1".into(),
+        artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
+        author: MessageAuthor {
+            member_ref: Some("member-ref-1".into()),
+            member_pubkey_hex: Some("aa".repeat(32)),
+            account_pubkey_hex: Some("bb".repeat(32)),
+            npub: Some("npub1exampleexample".into()),
+        },
+        decoded_payload: DecodedPayload {
+            content_type: "text".into(),
+            text: Some("secret plaintext".into()),
+            json: Some(serde_json::json!({"content": "secret plaintext"})),
+            bytes_b64: Some("c2VjcmV0".into()),
+        },
+        decoded_app_event: Some(DecodedApplicationEvent {
+            format: "nostr".into(),
+            content: Some("secret plaintext".into()),
+            pubkey_hex: Some("cc".repeat(32)),
+            ..DecodedApplicationEvent::default()
+        }),
+    }
+}
+
+#[test]
+fn obfuscated_mode_recorder_scrubs_full_data_only_fields_at_the_sink() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    // Default mode is ObfuscatedSensitiveData.
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+
+    // A buggy producer submits full-data-only material in obfuscated mode.
+    recorder.record(AuditRecord::new(
+        Some("group-1".into()),
+        full_data_message_content_decoded(),
+    ));
+    recorder.record(AuditRecord::new(
+        Some("group-1".into()),
+        AuditEventKind::RecipientExpectation {
+            msg_id: "msg-2".into(),
+            expectation: RecipientExpectation {
+                artifact_kind: MessageArtifactKind::ApplicationMessage,
+                recipient_scope: RecipientScope::AllOtherCurrentGroupMembers,
+                membership_epoch: Some(3),
+                basis_commit_id: None,
+                expected_member_refs: vec!["member-ref-1".into()],
+                expected_pubkeys_hex: vec!["dd".repeat(32)],
+                expected_count: Some(1),
+            },
+        },
+    ));
+    recorder.record(AuditRecord::new(
+        Some("group-1".into()),
+        AuditEventKind::GroupStateChanged {
+            epoch: 4,
+            change_kind: "profile_changed".into(),
+            membership_change_source: None,
+            actor_member_ref: Some("member-ref-1".into()),
+            actor_pubkey_hex: Some("ee".repeat(32)),
+            subject_member_ref: None,
+            subject_pubkey_hex: Some("ff".repeat(32)),
+            origin_commit_id: None,
+            fields: vec!["name".into()],
+            component_ids: Vec::new(),
+            value: Some(GroupStateValue {
+                digest: Some("ab".repeat(32)),
+                len: Some(11),
+                text: Some("secret group name".into()),
+                json: None,
+                pubkeys_hex: vec!["dd".repeat(32)],
+            }),
+        },
+    ));
+    recorder.record(
+        AuditRecord::new(
+            None,
+            AuditEventKind::SourceContext {
+                source: AuditSourceContext {
+                    account_label: Some("alice".into()),
+                    account_pubkey_hex: Some("aa".repeat(32)),
+                    account_npub: Some("npub1exampleexample".into()),
+                    ..AuditSourceContext::default()
+                },
+            },
+        )
+        .with_context(AuditEventContext {
+            source: Some(AuditSourceContext {
+                account_pubkey_hex: Some("aa".repeat(32)),
+                ..AuditSourceContext::default()
+            }),
+            ..AuditEventContext::default()
+        }),
+    );
+    drop(recorder);
+
+    let contents = fs::read_to_string(&path).unwrap();
+    for secret in [
+        "secret plaintext",
+        "secret group name",
+        "c2VjcmV0",
+        "npub1exampleexample",
+        &"aa".repeat(32),
+        &"bb".repeat(32),
+        &"cc".repeat(32),
+        &"dd".repeat(32),
+        &"ee".repeat(32),
+        &"ff".repeat(32),
+    ] {
+        assert!(
+            !contents.contains(secret),
+            "obfuscated-mode log leaked {secret:?}: {contents}"
+        );
+    }
+
+    // Obfuscated-safe siblings survive the scrub.
+    assert!(contents.contains("member-ref-1"), "{contents}");
+    assert!(contents.contains(&"ab".repeat(32)), "{contents}");
+    assert!(contents.contains("alice"), "{contents}");
+}
+
+#[test]
+fn full_data_mode_recorder_keeps_full_data_fields() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open_with_data_mode(
+        &path,
+        "engine-abc".to_string(),
+        None,
+        AuditDataMode::FullData,
+    )
+    .unwrap();
+    recorder.record(AuditRecord::new(
+        Some("group-1".into()),
+        full_data_message_content_decoded(),
+    ));
+    drop(recorder);
+
+    let contents = fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("secret plaintext"), "{contents}");
+    assert!(contents.contains(&"aa".repeat(32)), "{contents}");
+}
+
+#[test]
+fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.record(AuditRecord::new(
+        Some("group-1".into()),
+        AuditEventKind::SendOutcome {
+            intent_kind: "app_message".into(),
+            result_kind: "published".into(),
+            outbound_messages: vec![OutboundMessage {
+                msg_id: "msg-3".into(),
+                artifact_kind: MessageArtifactKind::ApplicationMessage,
+                transport: None,
+                recipient_expectation: Some(RecipientExpectation {
+                    artifact_kind: MessageArtifactKind::ApplicationMessage,
+                    recipient_scope: RecipientScope::AllOtherCurrentGroupMembers,
+                    membership_epoch: None,
+                    basis_commit_id: None,
+                    expected_member_refs: vec!["member-ref-1".into()],
+                    expected_pubkeys_hex: vec!["dd".repeat(32)],
+                    expected_count: Some(1),
+                }),
+            }],
+        },
+    ));
+    recorder.record(AuditRecord::new(
+        Some("group-1".into()),
+        AuditEventKind::ConvergenceDecision {
+            current_tip_epoch: 7,
+            max_rewind_commits: 5,
+            candidates: vec![ConvergenceCandidate {
+                branch_id: "branch-1".into(),
+                fork_epoch: 6,
+                tip_epoch: 7,
+                tip_committer_pubkey_hex: Some("ee".repeat(32)),
+                score: Some(ConvergenceScore {
+                    tip_committer_pubkey_hex: Some("ee".repeat(32)),
+                    ..ConvergenceScore::default()
+                }),
+                app_witnesses: vec![ConvergenceAppWitness {
+                    epoch: 7,
+                    sender_ref: Some("member-ref-1".into()),
+                    sender_pubkey_hex: Some("ff".repeat(32)),
+                }],
+                ..ConvergenceCandidate::default()
+            }],
+            rule_trace: Vec::new(),
+            selected_branch_id: Some("branch-1".into()),
+            selected_fork_epoch: None,
+            selected_tip_epoch: None,
+            losing_branch_ids: Vec::new(),
+            error_kinds: Vec::new(),
+        },
+    ));
+    drop(recorder);
+
+    let contents = fs::read_to_string(&path).unwrap();
+    for secret in [&"dd".repeat(32), &"ee".repeat(32), &"ff".repeat(32)] {
+        assert!(
+            !contents.contains(secret),
+            "obfuscated-mode log leaked {secret:?}: {contents}"
+        );
+    }
+    assert!(contents.contains("member-ref-1"), "{contents}");
+    assert!(contents.contains("branch-1"), "{contents}");
+}
