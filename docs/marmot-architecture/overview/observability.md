@@ -1,7 +1,7 @@
 ---
 title: "Observability & Privacy"
 created: 2026-05-09
-updated: 2026-06-06
+updated: 2026-07-02
 tags: [marmot, overview, observability, tracing, privacy]
 status: overview
 ---
@@ -42,13 +42,34 @@ tracing::debug!(
 Keep field names neutral. Prefer `endpoint_count` over a field or local name that contains a concrete relay URL. Prefer
 `delivered` over a message id.
 
+## Sensitive-value classification
+
+A sensitive value can escape through more than one exit. Each value class below lists the required posture per escape
+route, so "does not leak" holds by construction rather than by author vigilance at every call site (tracked in
+darkmatter#379).
+
+| Value class | Memory | `Debug`/`Display` | FFI | Tracing/logs | Forensic audit |
+| --- | --- | --- | --- | --- | --- |
+| Key material (account secret, SQLCipher keys, media/avatar keys, exporter secrets) | `Zeroizing` for raw buffers and copies | Redacted (hand-written `Debug`, never derive on the holding struct) | Setters accept, accessors never return | Never | Never, either mode |
+| Bearer/upload tokens (OTLP, audit tracker) | Short-lived; avoid long-lived copies | Redacted | Write-only: setters in, no read-back | Never | Never, either mode |
+| Plaintext / decoded content | n/a | Only on message DTOs that never reach tracing | Allowed (it is the product) | Never | Full-data mode only; scrubbed at the sink in obfuscated mode |
+| Full pubkeys / npubs | n/a | Allowed on DTOs | Allowed | Never | Full-data mode only; scrubbed at the sink; salted member refs are the obfuscated form |
+| Relay URLs / endpoints | n/a | Structured fields only (never inside error `reason` strings) | Allowed | Never — log `endpoint_count` or a privacy-safe error kind | Allowed (audit is local-only, explicit opt-in) |
+| Account/group/message ids | n/a | Allowed on DTOs | Allowed | Never | Allowed (hashed/truncated forms preferred) |
+| Errors wrapping any of the above | n/a | Constructors keep `Display` free of URLs/ids/values | n/a | Log `error_kind = privacy_safe_kind()` (or `io::ErrorKind`, variant names) — never `{err}`/`error = %err` | `error_kind` strings only |
+
 ## Current enforcement
 
 `crates/cgka-conformance-simulator/tests/tracing_audit.rs` scans production Rust source for qualified and imported
-tracing calls. It requires explicit `target` and `method` fields and rejects known-sensitive token names inside tracing
-macro bodies.
+tracing calls. It requires explicit `target` and `method` fields, rejects known-sensitive token names inside tracing
+macro bodies, and rejects raw-error interpolation (`error = %err`, `{err}`-style message formatting) so error `Display`
+values — which may carry relay URLs, paths, or attacker-controlled content — never reach logs verbatim.
 
 The same audit rejects direct `println!`, `eprintln!`, and `dbg!` output from production library source.
+
+Sink-side enforcement backs up the producer rules: the forensic recorder scrubs full-data-only fields in obfuscated
+mode (`marmot-forensics`), the Nostr adapter constructs operation-only error reasons, and `traits`/adapter tests pin
+that `TransportAdapterError` `Display` carries no relay URL.
 
 CLI output generators such as the conformance report writer and Tamarin policy-case generator may use `println!` /
 `eprintln!` for their explicit artifact output. That output is not runtime application logging.

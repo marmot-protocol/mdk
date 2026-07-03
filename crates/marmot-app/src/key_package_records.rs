@@ -412,8 +412,10 @@ pub(crate) fn require_key_package_tag(
     reject_duplicate_key_package_tag(event, name)?;
     match event.tag_value(name) {
         Some(value) if predicate(value) => Ok(()),
-        Some(value) => Err(AppError::InvalidKeyPackageEvent(format!(
-            "invalid {name} tag: {value}"
+        // Never echo the tag value: it is attacker-controlled kind:30443 event
+        // content, and this error's Display reaches tracing at upper layers.
+        Some(_) => Err(AppError::InvalidKeyPackageEvent(format!(
+            "invalid {name} tag"
         ))),
         None => Err(AppError::InvalidKeyPackageEvent(format!(
             "missing {name} tag"

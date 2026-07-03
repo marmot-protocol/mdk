@@ -35,14 +35,16 @@ impl Marmot {
     /// Supply non-persisted audit tracker upload metadata: optional Goggles
     /// upload URL override, bearer token from the host app, and optional human
     /// source labels.
+    ///
+    /// The returned config confirms what was stored but never echoes the
+    /// bearer token back across FFI: secrets flow in, not out.
     pub fn set_audit_log_tracker_config(
         &self,
         config: AuditLogTrackerConfigFfi,
     ) -> Result<AuditLogTrackerConfigFfi, MarmotKitError> {
-        Ok(self
-            .runtime
-            .set_audit_log_tracker_config(config.into())?
-            .into())
+        Ok(AuditLogTrackerConfigFfi::redacted(
+            self.runtime.set_audit_log_tracker_config(config.into())?,
+        ))
     }
 
     /// Local JSONL audit logs available for explicit forensic upload.

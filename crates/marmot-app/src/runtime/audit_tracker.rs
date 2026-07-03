@@ -92,7 +92,7 @@ impl AuditLogTrackerUploader {
                     tracing::debug!(
                         target: "marmot_app::audit_log",
                         method = "shutdown",
-                        error = %err,
+                        error_kind = if err.is_panic() { "panic" } else { "cancelled" },
                         "audit log tracker uploader exited during shutdown"
                     );
                 }

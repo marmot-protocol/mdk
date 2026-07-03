@@ -3,6 +3,7 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use super::DEFAULT_BLOSSOM_SERVER_URL;
 use super::blossom::{blossom_blob_url, fetch_blossom_blob, upload_blossom_blob};
@@ -16,6 +17,13 @@ const GROUP_IMAGE_VERSION: &str = "marmot-group-image-v1";
 /// content key travels in-band inside the (MLS-protected) component, so the
 /// image is self-contained and content-addressed by `image_hash_hex` — no URL
 /// or file name is stored.
+///
+/// `image_key_hex` (avatar decryption key) and `image_upload_key_hex` (Blossom
+/// upload secret) are key material. They deliberately flow onward into the
+/// MLS-protected component bytes and the SQLCipher-protected projections, but
+/// must never be logged or `Debug`-rendered — do not add a `Debug` derive
+/// here, and keep the raw key buffers in `upload_group_image`/
+/// `fetch_group_image` wrapped in `Zeroizing`.
 pub(crate) struct GroupImageUpload {
     pub(crate) image_hash_hex: String,
     pub(crate) image_key_hex: String,
@@ -52,12 +60,12 @@ pub(crate) async fn upload_group_image(
             "group image media type must be at most 128 bytes".into(),
         ));
     }
-    let mut content_key = [0_u8; 32];
-    OsRng.fill_bytes(&mut content_key);
+    let mut content_key = Zeroizing::new([0_u8; 32]);
+    OsRng.fill_bytes(content_key.as_mut());
     let mut nonce = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let aad = group_image_aad(&media_type);
-    let cipher = ChaCha20Poly1305::new_from_slice(&content_key)
+    let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid group image key length".into()))?;
     let encrypted = cipher
         .encrypt(
@@ -77,9 +85,13 @@ pub(crate) async fn upload_group_image(
     upload_blossom_blob(server, &encrypted, &encrypted_hash_hex, &upload_keys, false).await?;
     Ok(GroupImageUpload {
         image_hash_hex: encrypted_hash_hex,
-        image_key_hex: hex::encode(content_key),
+        image_key_hex: hex::encode(&content_key),
         image_nonce_hex: hex::encode(nonce),
-        image_upload_key_hex: hex::encode(upload_keys.secret_key().to_secret_bytes()),
+        // Wipe the copied upload-secret bytes on drop; the hex string moves
+        // into the (MLS-protected, in-band) component fields.
+        image_upload_key_hex: hex::encode(Zeroizing::new(
+            upload_keys.secret_key().to_secret_bytes(),
+        )),
         media_type,
     })
 }
@@ -94,9 +106,14 @@ pub(crate) async fn fetch_group_image(
     server: Option<&str>,
 ) -> Result<Vec<u8>, AppError> {
     let media_type = canonical_media_type(media_type)?;
-    let content_key: [u8; 32] = hex::decode(image_key_hex)?
-        .try_into()
-        .map_err(|_| AppError::InvalidEncryptedMedia("group image key must be 32 bytes".into()))?;
+    let content_key: Zeroizing<[u8; 32]> = Zeroizing::new(
+        Zeroizing::new(hex::decode(image_key_hex)?)
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                AppError::InvalidEncryptedMedia("group image key must be 32 bytes".to_owned())
+            })?,
+    );
     let nonce: [u8; 12] = hex::decode(image_nonce_hex)?.try_into().map_err(|_| {
         AppError::InvalidEncryptedMedia("group image nonce must be 12 bytes".into())
     })?;
@@ -113,7 +130,7 @@ pub(crate) async fn fetch_group_image(
         ));
     }
     let aad = group_image_aad(&media_type);
-    let cipher = ChaCha20Poly1305::new_from_slice(&content_key)
+    let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid group image key length".into()))?;
     cipher
         .decrypt(

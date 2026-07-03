@@ -179,7 +179,11 @@ pub struct AppGroupProfileComponent {
     pub data_hex: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `image_key_hex`/`image_upload_key_hex` are key material that travels
+/// in-band inside the MLS-protected component (`data_hex` carries the same
+/// bytes). Serialization is the component's design; the hand-written `Debug`
+/// impl below redacts the key fields so a `{:?}` never prints key material.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupImageComponent {
     pub component_id: u16,
     pub component: String,
@@ -190,6 +194,22 @@ pub struct AppGroupImageComponent {
     pub image_upload_key_hex: String,
     pub media_type: Option<String>,
     pub data_hex: String,
+}
+
+impl std::fmt::Debug for AppGroupImageComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupImageComponent")
+            .field("component_id", &self.component_id)
+            .field("component", &self.component)
+            .field("present", &self.present)
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("image_upload_key_hex", &"<redacted>")
+            .field("media_type", &self.media_type)
+            .field("data_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -721,13 +741,27 @@ impl AppGroupEncryptedMediaComponent {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `image_key_hex`/`image_upload_key_hex` are key material; the hand-written
+/// `Debug` impl below redacts them.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct AppGroupImageInput {
     pub(crate) image_hash_hex: String,
     pub(crate) image_key_hex: String,
     pub(crate) image_nonce_hex: String,
     pub(crate) image_upload_key_hex: String,
     pub(crate) media_type: Option<String>,
+}
+
+impl std::fmt::Debug for AppGroupImageInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupImageInput")
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("image_upload_key_hex", &"<redacted>")
+            .field("media_type", &self.media_type)
+            .finish()
+    }
 }
 
 impl AppGroupImageInput {

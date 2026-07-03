@@ -230,7 +230,11 @@ where
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "publish_fresh_key_package",
-                    error = %cleanup_err,
+                    error_kind = if cleanup_err.is_transient() {
+                        "engine_transient"
+                    } else {
+                        "engine"
+                    },
                     "failed to delete orphaned key package bundle after publish failure"
                 );
             }

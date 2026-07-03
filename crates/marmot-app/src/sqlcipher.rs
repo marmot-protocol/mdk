@@ -16,6 +16,7 @@ use rand::rngs::OsRng;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
+use zeroize::Zeroizing;
 
 use crate::{AppError, MarmotApp};
 
@@ -260,17 +261,20 @@ fn derive_sqlcipher_key_material(
     salt: &[u8; SQLCIPHER_SALT_LEN],
     kind: SqlcipherDatabaseKind,
 ) -> Result<String, AppError> {
-    let secret = keys.secret_key().to_secret_bytes();
-    let hkdf = Hkdf::<Sha256>::new(Some(salt), &secret);
+    // The account-secret copy and the raw derived key are wiped on drop; the
+    // returned hex string is moved straight into `SqlCipherKey`, which
+    // zeroizes it.
+    let secret = Zeroizing::new(keys.secret_key().to_secret_bytes());
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), secret.as_ref());
     let mut info = Vec::new();
     encode_hkdf_part(&mut info, b"marmot-app-sqlcipher-key");
     encode_hkdf_part(&mut info, kind.hkdf_info_label());
     encode_hkdf_part(&mut info, label.as_bytes());
     encode_hkdf_part(&mut info, keys.public_key().to_bytes().as_slice());
-    let mut output = [0_u8; SQLCIPHER_KEY_LEN];
-    hkdf.expand(&info, &mut output)
-        .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".into()))?;
-    Ok(hex::encode(output))
+    let mut output = Zeroizing::new([0_u8; SQLCIPHER_KEY_LEN]);
+    hkdf.expand(&info, output.as_mut())
+        .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".to_owned()))?;
+    Ok(hex::encode(&output))
 }
 
 fn legacy_sqlcipher_key_material(
@@ -278,12 +282,16 @@ fn legacy_sqlcipher_key_material(
     keys: &nostr::Keys,
     kind: SqlcipherDatabaseKind,
 ) -> String {
+    // Wipe the account-secret copy and the raw digest (the legacy DB key) on
+    // drop; the returned hex string is moved straight into `SqlCipherKey`,
+    // which zeroizes it.
     let mut hasher = Sha256::new();
     hasher.update(kind.legacy_hash_label());
     hasher.update(label.as_bytes());
     hasher.update(keys.public_key().to_bytes());
-    hasher.update(keys.secret_key().to_secret_bytes());
-    hex::encode(hasher.finalize())
+    hasher.update(Zeroizing::new(keys.secret_key().to_secret_bytes()));
+    let digest: Zeroizing<[u8; 32]> = Zeroizing::new(hasher.finalize().into());
+    hex::encode(&digest)
 }
 
 fn encode_hkdf_part(out: &mut Vec<u8>, bytes: &[u8]) {

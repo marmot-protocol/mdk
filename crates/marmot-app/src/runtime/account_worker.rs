@@ -57,7 +57,7 @@ impl ManagedAccountWorker {
                     tracing::debug!(
                         target: "marmot_app::runtime",
                         method = "shutdown",
-                        error = %err,
+                        error_kind = if err.is_panic() { "panic" } else { "cancelled" },
                         "managed account worker exited during shutdown",
                     );
                 }
@@ -326,7 +326,7 @@ async fn run_app_runtime_account_worker(
     } {
         Ok(client) => client,
         Err(err) => {
-            let message = format!("runtime startup failed: {err}");
+            let message = account_error_message("runtime startup failed", &err);
             publish_app_runtime_account_error(
                 &events,
                 &account_id_hex,
@@ -365,7 +365,7 @@ async fn run_app_runtime_account_worker(
                 &events,
                 &account_id_hex,
                 &account_label,
-                format!("runtime startup snapshot capture failed: {err}"),
+                account_error_message("runtime startup snapshot capture failed", &err),
             );
             None
         }
@@ -450,7 +450,7 @@ async fn run_app_runtime_account_worker(
         Err(err) => {
             // A failed initial catch-up surfaces as an account error but must not
             // fail worker readiness — readiness was already signalled above.
-            let message = format!("runtime startup receive failed: {err}");
+            let message = account_error_message("runtime startup receive failed", &err);
             publish_app_runtime_account_error(
                 &events,
                 &account_id_hex,
@@ -527,7 +527,7 @@ async fn run_app_runtime_account_worker(
                                         &events,
                                         &account_id_hex,
                                         &account_label,
-                                        format!("scheduled convergence failed: {err}"),
+                                        account_error_message("scheduled convergence failed", &err),
                                     );
                                 }
                             }
@@ -539,7 +539,7 @@ async fn run_app_runtime_account_worker(
                             &events,
                             &account_id_hex,
                             &account_label,
-                            format!("scheduled convergence sync failed: {err}"),
+                            account_error_message("scheduled convergence sync failed", &err),
                         );
                     }
                 }
@@ -576,7 +576,7 @@ async fn run_app_runtime_account_worker(
                             &events,
                             &account_id_hex,
                             &account_label,
-                            format!("runtime receive failed: {err}"),
+                            account_error_message("runtime receive failed", &err),
                         );
                         tokio::select! {
                             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
@@ -602,7 +602,7 @@ async fn run_app_runtime_account_worker(
                                     &events,
                                     &account_id_hex,
                                     &account_label,
-                                    format!("runtime restart failed: {setup_err}"),
+                                    account_error_message("runtime restart failed", &setup_err),
                                 );
                                 tokio::select! {
                                     _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
@@ -646,7 +646,7 @@ async fn handle_account_worker_command(
                     Ok(())
                 }
                 Err(err) => {
-                    let message = format!("runtime catch-up failed: {err}");
+                    let message = account_error_message("runtime catch-up failed", &err);
                     publish_app_runtime_account_error(
                         events,
                         account_id_hex,
@@ -722,7 +722,7 @@ async fn handle_account_worker_command(
                         events,
                         account_id_hex,
                         account_label,
-                        format!("retry recovery drain failed: {err}"),
+                        account_error_message("retry recovery drain failed", &err),
                     ),
                 }
                 publish_app_runtime_group_state_updated(
@@ -1489,6 +1489,15 @@ fn agent_stream_runtime_event(
     ))
 }
 
+/// Build a [`RuntimeAccountError`] message from a static prefix and the
+/// error's privacy-safe kind. These messages leave the runtime: the CLI daemon
+/// persists them into `dm daemon status --json` and the TUI, and host apps may
+/// log them. Never interpolate the raw error — `AppError::Transport` Display
+/// can embed relay URLs, which the privacy invariant forbids surfacing.
+fn account_error_message(prefix: &str, err: &AppError) -> String {
+    format!("{prefix}: {}", err.privacy_safe_kind())
+}
+
 fn publish_app_runtime_account_error(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -1508,6 +1517,20 @@ mod tests {
 
     fn test_group_id(byte: u8) -> GroupId {
         GroupId::new(vec![byte])
+    }
+
+    #[test]
+    fn account_error_message_never_carries_transport_error_detail() {
+        // Transport errors commonly embed relay URLs (nostr-sdk error strings,
+        // per-endpoint failure reasons). RuntimeAccountError messages are
+        // persisted into `dm daemon status --json` and host surfaces, so only
+        // the stable privacy-safe kind may appear.
+        let err = AppError::Transport(cgka_traits::TransportAdapterError::Publish(
+            "connect relay: wss://private-relay.example".to_owned(),
+        ));
+        let message = account_error_message("runtime receive failed", &err);
+        assert_eq!(message, "runtime receive failed: transport");
+        assert!(!message.contains("private-relay.example"), "{message}");
     }
 
     #[test]

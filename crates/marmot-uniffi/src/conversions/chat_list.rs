@@ -5,13 +5,34 @@ use marmot_app::{ChatListAvatar, ChatListMessagePreview, ChatListRow, RuntimeCha
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
 use crate::markdown::MarkdownDocumentFfi;
 
-#[derive(Clone, Debug, uniffi::Record)]
+/// Group avatar reference. `image_key_hex` is the symmetric key that decrypts
+/// the avatar blob and `image_upload_key_hex` is the Blossom upload secret;
+/// the hand-written `Debug` impl below redacts both so a Rust-side `{:?}`
+/// never prints key material.
+///
+/// Host-language stringification is NOT covered: uniffi 0.28 generates plain
+/// record types (e.g. Kotlin data classes) whose default `toString` prints
+/// all fields, and `#[uniffi::export(Debug)]` on records requires uniffi
+/// >= 0.29. Host apps must not log this record until that upgrade lands.
+#[derive(Clone, uniffi::Record)]
 pub struct ChatListAvatarFfi {
     pub image_hash_hex: String,
     pub image_key_hex: String,
     pub image_nonce_hex: String,
     pub image_upload_key_hex: String,
     pub media_type: Option<String>,
+}
+
+impl std::fmt::Debug for ChatListAvatarFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatListAvatarFfi")
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("image_upload_key_hex", &"<redacted>")
+            .field("media_type", &self.media_type)
+            .finish()
+    }
 }
 
 impl From<ChatListAvatar> for ChatListAvatarFfi {
@@ -160,5 +181,29 @@ impl From<marmot_app::ChatListUpdateTrigger> for ChatListUpdateTriggerFfi {
             marmot_app::ChatListUpdateTrigger::SnapshotRefresh => Self::SnapshotRefresh,
             marmot_app::ChatListUpdateTrigger::Removed => Self::Removed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_list_avatar_debug_redacts_key_material() {
+        let key_hex = "aa".repeat(32);
+        let upload_key_hex = "bb".repeat(32);
+        let avatar = ChatListAvatarFfi {
+            image_hash_hex: "cc".repeat(32),
+            image_key_hex: key_hex.clone(),
+            image_nonce_hex: "dd".repeat(12),
+            image_upload_key_hex: upload_key_hex.clone(),
+            media_type: Some("image/png".to_owned()),
+        };
+        let rendered = format!("{avatar:?}");
+        assert!(!rendered.contains(&key_hex), "{rendered}");
+        assert!(!rendered.contains(&upload_key_hex), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // Non-secret fields stay visible for diagnostics.
+        assert!(rendered.contains(&"cc".repeat(32)), "{rendered}");
     }
 }

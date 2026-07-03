@@ -34,6 +34,12 @@
 //! A recorder stamps its configured mode onto every event. Switching modes
 //! ([`ForensicRecorder::set_data_mode`]) rotates the backing store so each
 //! file has a single, unambiguous mode boundary.
+//!
+//! The obfuscated-mode contract is enforced at the sink, not just by producer
+//! convention: [`JsonlRecorder`]'s `record()` scrubs full-data-only fields
+//! (decoded payloads, full pubkeys/npubs) before serializing when the mode is
+//! [`AuditDataMode::ObfuscatedSensitiveData`], so a single producer bug cannot
+//! write them into a log that is expected to be safe to share.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -1199,6 +1205,86 @@ fn stamp_system_human_action(
     Some(context)
 }
 
+/// Enforce the obfuscated-mode redaction contract at the sink.
+///
+/// `record()` is the single chokepoint every producer writes through, so
+/// scrubbing here means one producer bug (or a future caller unaware of the
+/// contract) cannot write full-data-only material — decrypted content, full
+/// author/subject pubkeys, npubs — into an obfuscated-mode audit log that is
+/// expected to be safe to share. Obfuscated-safe siblings (salted member refs,
+/// digests, lengths, counts) are kept, so a scrubbed row stays useful and the
+/// producer bug stays visible to analyzers.
+fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditEventContext>) {
+    if let Some(context) = context.as_mut()
+        && let Some(source) = context.source.as_mut()
+    {
+        scrub_source_context(source);
+    }
+    match kind {
+        AuditEventKind::SourceContext { source } => scrub_source_context(source),
+        AuditEventKind::MessageContentDecoded {
+            author,
+            decoded_payload,
+            decoded_app_event,
+            ..
+        } => {
+            author.member_pubkey_hex = None;
+            author.account_pubkey_hex = None;
+            author.npub = None;
+            decoded_payload.text = None;
+            decoded_payload.json = None;
+            decoded_payload.bytes_b64 = None;
+            *decoded_app_event = None;
+        }
+        AuditEventKind::RecipientExpectation { expectation, .. } => {
+            expectation.expected_pubkeys_hex.clear();
+        }
+        AuditEventKind::SendOutcome {
+            outbound_messages, ..
+        }
+        | AuditEventKind::CreateGroupOutcome {
+            outbound_messages, ..
+        } => {
+            for message in outbound_messages {
+                if let Some(expectation) = message.recipient_expectation.as_mut() {
+                    expectation.expected_pubkeys_hex.clear();
+                }
+            }
+        }
+        AuditEventKind::GroupStateChanged {
+            actor_pubkey_hex,
+            subject_pubkey_hex,
+            value,
+            ..
+        } => {
+            *actor_pubkey_hex = None;
+            *subject_pubkey_hex = None;
+            if let Some(value) = value.as_mut() {
+                value.text = None;
+                value.json = None;
+                value.pubkeys_hex.clear();
+            }
+        }
+        AuditEventKind::ConvergenceDecision { candidates, .. } => {
+            for candidate in candidates {
+                candidate.tip_committer_pubkey_hex = None;
+                if let Some(score) = candidate.score.as_mut() {
+                    score.tip_committer_pubkey_hex = None;
+                }
+                for witness in &mut candidate.app_witnesses {
+                    witness.sender_pubkey_hex = None;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scrub_source_context(source: &mut AuditSourceContext) {
+    source.account_pubkey_hex = None;
+    source.account_npub = None;
+}
+
 impl ForensicRecorder for JsonlRecorder {
     fn record(&self, record: AuditRecord) {
         // Poisoning means a prior `record()` panicked while holding the lock.
@@ -1214,7 +1300,11 @@ impl ForensicRecorder for JsonlRecorder {
         };
         let seq = inner.seq;
         inner.seq = seq.wrapping_add(1);
-        let context = stamp_system_human_action(record.context, &record.kind);
+        let mut kind = record.kind;
+        let mut context = stamp_system_human_action(record.context, &kind);
+        if inner.data_mode == AuditDataMode::ObfuscatedSensitiveData {
+            scrub_full_data_fields(&mut kind, &mut context);
+        }
         let event = AuditEvent {
             schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),
             seq,
@@ -1228,7 +1318,7 @@ impl ForensicRecorder for JsonlRecorder {
             engine_id: inner.engine_id.clone(),
             group_ref: record.group_ref,
             context,
-            kind: record.kind,
+            kind,
         };
         if let Ok(line) = serde_json::to_string(&event) {
             if writeln!(inner.writer, "{line}").is_err() {
