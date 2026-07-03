@@ -46,6 +46,17 @@ pub enum StaleReason {
     /// retryable depending on whether the engine has evidence that another
     /// epoch context could later peel it.
     PeelFailed,
+    /// The local retained canonical state records our own removal from this
+    /// group, so later group input can never be processed here. Terminal for
+    /// the group on this client. Processing input that classifies as
+    /// `SelfEvicted` also performs "realizing removal" when not already done:
+    /// emit a self-removed state notification and mark the local group copy
+    /// removed (spec `protocol-core/member-departure.md`, registered as the
+    /// `SelfEvicted` outcome in `foundation/errors.md`). Only authenticated
+    /// evidence (the local MLS state records the eviction) maps here — a bare
+    /// decrypt failure is a missing-history/repair condition, never
+    /// `SelfEvicted`.
+    SelfEvicted,
 }
 
 /// Decrypted inbound message ready for engine processing.

@@ -597,6 +597,21 @@ impl<S: StorageProvider> Engine<S> {
             if member_id == self.identity.self_id() {
                 self.clear_leave_request_state(group_id)
                     .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                // The canonical branch removed our own leaf: mark the local
+                // copy removed (member-departure.md, "Realizing removal") in
+                // the same pass that emits the self-removed notification
+                // below, so the marker and the notification stay coupled and
+                // later `SelfEvicted` input does not re-emit it.
+                let mut group = self
+                    .storage
+                    .get_group(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                if !group.removed {
+                    group.removed = true;
+                    self.storage
+                        .put_group(&group)
+                        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                }
             }
             self.push_group_state_change(
                 group_id,

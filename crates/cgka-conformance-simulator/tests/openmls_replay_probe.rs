@@ -1431,6 +1431,7 @@ fn dummy_group(group_id: GroupId) -> Group {
             credential: vec![1],
         }],
         required_capabilities: GroupCapabilities::default(),
+        removed: false,
     }
 }
 
