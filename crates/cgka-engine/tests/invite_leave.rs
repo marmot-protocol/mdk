@@ -15,7 +15,8 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, StorageProvider,
+    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, OutboundIntentStorage,
+    StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -895,6 +896,119 @@ async fn send_after_realized_eviction_is_rejected_terminally() {
     assert!(
         matches!(blocked, Err(EngineError::InvalidTransition(_))),
         "leave on a removed copy must fail terminally, got {blocked:?}"
+    );
+}
+
+/// Durably queue an app-message intent for `group_id`, simulating a send the
+/// engine accepted mid-convergence (`SendResult::Queued`) that has not been
+/// drained yet.
+fn queue_app_message_intent(
+    storage: &SqliteAccountStorage,
+    engine: &Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    tag: u8,
+) -> MessageId {
+    let id = MessageId::new(vec![tag; 32]);
+    storage
+        .put_queued_outbound_intent(&cgka_traits::storage::QueuedOutboundIntent {
+            id: id.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(engine, b"queued before removal"),
+            },
+            created_at_ms: 1,
+        })
+        .expect("queue outbound intent");
+    id
+}
+
+/// #376 review follow-up: an outbound intent durably queued before the
+/// removal is applied must be discarded when the copy becomes removed —
+/// applying the removal commit purges the queue, so later drains have nothing
+/// to perpetually re-fail against the removed-copy send gate.
+#[tokio::test]
+async fn applying_removal_commit_purges_queued_outbound_intents() {
+    let (_alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-purge-queue").await;
+
+    queue_app_message_intent(&bob_storage, &bob, &group_id, 0x51);
+    assert_eq!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "marking the copy removed must discard queued outbound intents"
+    );
+}
+
+/// #376 review follow-up: realization itself purges queued intents, and the
+/// drain path treats a removed copy as terminal — it discards any remaining
+/// queued records and reports nothing to drain instead of returning the
+/// removed-copy send error forever (which the app-layer scheduler would
+/// retry for the lifetime of the account).
+#[tokio::test]
+async fn drain_on_removed_copy_discards_queued_intents_without_error() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-drain-queue").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // Realization-side purge: recreate the silent copy with an undrained
+    // queued intent, then let a post-eviction message trigger realization.
+    let mut record = bob_storage.get_group(&group_id).unwrap();
+    record.removed = false;
+    bob_storage.put_group(&record).unwrap();
+    queue_app_message_intent(&bob_storage, &bob, &group_id, 0x52);
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"trigger realize").await;
+    let outcome = bob.ingest(routed_app).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::SelfEvicted
+        }
+    ));
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "realization must discard queued outbound intents"
+    );
+
+    // Drain-side defense in depth: an intent queued after the copy is already
+    // marked removed (any ordering the marker-site purges missed) is
+    // discarded by the drain itself — no error, nothing drained, queue empty.
+    queue_app_message_intent(&bob_storage, &bob, &group_id, 0x53);
+    let drained = bob
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .expect("drain on a removed copy must not error");
+    assert!(
+        drained.is_empty(),
+        "nothing may be published for a removed copy; got {drained:?}"
+    );
+    assert!(
+        bob_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty(),
+        "drain must discard queued intents for a removed copy"
     );
 }
 

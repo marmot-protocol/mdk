@@ -612,6 +612,11 @@ impl<S: StorageProvider> Engine<S> {
                         .put_group(&group)
                         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
                 }
+                // The copy just became removed: purge queued outbound intents
+                // so later drains do not re-fail them forever against the
+                // removed-copy send gate.
+                self.discard_queued_outbound_intents_for_removed_group(group_id)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
             }
             self.push_group_state_change(
                 group_id,

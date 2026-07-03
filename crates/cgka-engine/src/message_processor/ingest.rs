@@ -854,6 +854,10 @@ impl<S: StorageProvider> Engine<S> {
                         .any(|member| member == self.identity.self_id())
                     {
                         self.clear_leave_request_state(&group_id)?;
+                        // The copy just became removed: purge queued outbound
+                        // intents so later drains do not re-fail them forever
+                        // against the removed-copy send gate.
+                        self.discard_queued_outbound_intents_for_removed_group(&group_id)?;
                     } else if after_ids.contains(self.identity.self_id()) {
                         if self.load_leave_request_state(&group_id)?.is_some() {
                             // A SelfRemove proposal is valid only in its
@@ -1364,6 +1368,11 @@ impl<S: StorageProvider> Engine<S> {
         let self_id = self.identity.self_id().clone();
         group.members.retain(|member| member.id != self_id);
         self.storage.put_group(&group)?;
+        // A removed copy must never publish: drop any outbound intents that
+        // were durably queued before the removal was realized, instead of
+        // leaving them to re-fail through the removed-copy send gate on every
+        // later drain.
+        self.discard_queued_outbound_intents_for_removed_group(group_id)?;
         // Deliberately LAST, after the marker write — not before it like the
         // convergence path (which has no attribution read). The notification
         // is already enqueued above, so a failure here cannot lose it; it only
