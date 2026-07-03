@@ -37,7 +37,7 @@ use agent_control::AgentControlEvent;
 use marmot_account::AccountHome;
 use marmot_app::{MarmotApp, MarmotAppRuntime};
 use tokio::net::UnixListener;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 
 // Re-exported at the crate root so `crate::AppMessageQuery` resolves for the white-box tests in
 // `src/tests.rs`; the crate's own modules import it from `marmot_app` directly.
@@ -74,6 +74,12 @@ pub(crate) const MEDIA_TEMP_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// (1024) so every message that could be re-queried after a single overflow is still tracked.
 pub(crate) const DELIVERED_INBOUND_CURSOR_CAPACITY: usize = 4096;
 pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
+/// Default maximum concurrently served control-socket connections. The
+/// control plane is local and authenticated, but the threat model includes a
+/// prompt-injected/compromised gateway; each connection holds a spawned task
+/// plus, for `SubscribeInbound`, runtime/debug subscriptions and a delivered
+/// cursor, so beyond the cap new connections are closed instead of accepted.
+pub const MAX_CONTROL_CONNECTIONS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct AgentConnectorConfig {
@@ -85,6 +91,9 @@ pub struct AgentConnectorConfig {
     pub allow_any: bool,
     pub debug_controls: bool,
     pub auth_token: Option<String>,
+    /// Cap on concurrently served control connections; connections beyond it
+    /// are closed at accept time. Must be nonzero.
+    pub max_connections: usize,
 }
 
 impl AgentConnectorConfig {
@@ -100,6 +109,7 @@ impl AgentConnectorConfig {
             allow_any: false,
             debug_controls: false,
             auth_token: None,
+            max_connections: MAX_CONTROL_CONNECTIONS,
         }
     }
 }
@@ -120,6 +130,10 @@ pub struct AgentConnector {
     pub(crate) inbound_catch_up: InboundCatchUpDriver,
     relays: Vec<String>,
     connection_errors: Arc<AtomicU64>,
+    /// Connections closed at accept time because the concurrency cap was hit.
+    /// Kept separate from `connection_errors` so expected backpressure does
+    /// not muddy fault-rate diagnostics.
+    connections_refused: Arc<AtomicU64>,
 }
 
 impl AgentConnector {
@@ -150,6 +164,7 @@ impl AgentConnector {
             inbound_catch_up,
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
+            connections_refused: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -220,8 +235,10 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
         config.socket_dir_mode,
         config.socket_mode,
     )?;
+    let max_connections = config.max_connections;
     let connector = AgentConnector::open(config)?;
     connector.start().await?;
+    let connection_limiter = Arc::new(Semaphore::new(max_connections));
     loop {
         let (stream, _peer_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -240,8 +257,27 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
                 continue;
             }
         };
+        // Bound concurrent per-connection tasks (and the subscriptions and
+        // cursors they hold), mirroring the broker's connection limiter:
+        // beyond the cap the connection is closed instead of served.
+        let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
+            let connections_refused = connector
+                .connections_refused
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            tracing::warn!(
+                target: "agent_connector",
+                method = "serve_socket",
+                connections_refused,
+                error_code = "connection_limit_exceeded",
+                "refusing control connection beyond the concurrency cap"
+            );
+            drop(stream);
+            continue;
+        };
         let connector = connector.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = connector.handle_connection(stream).await {
                 let connection_error =
                     connector.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;

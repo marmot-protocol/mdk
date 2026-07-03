@@ -195,13 +195,50 @@ pub(crate) async fn sweep_media_dirs_modified_before(
         if !is_dir {
             continue;
         }
-        let modified = match entry.metadata().await {
-            Ok(metadata) => metadata.modified().unwrap_or(SystemTime::now()),
-            Err(_) => continue,
+        let last_used = match newest_media_use_time(&entry.path()).await {
+            Some(last_used) => last_used,
+            None => continue,
         };
-        if modified < cutoff && tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
+        if last_used < cutoff && tokio::fs::remove_dir_all(entry.path()).await.is_ok() {
             swept += 1;
         }
     }
     Ok(swept)
+}
+
+/// Newest modification time observed on a per-blob dir or any entry directly
+/// inside it.
+///
+/// A repeat download of the same blob overwrites the existing file in place
+/// (`download_media_response` opens with `truncate(true)`), which updates the
+/// file's mtime but not the parent dir's, so the dir mtime alone
+/// under-reports how recently the blob was used and the sweeper would delete
+/// media the connector just handed the agent a path to. Files are written
+/// directly into the per-blob dir, so one level of children is sufficient.
+/// Returns `None` when the dir cannot be fully inspected; the caller skips
+/// such dirs rather than risk sweeping something still in use.
+async fn newest_media_use_time(dir: &Path) -> Option<SystemTime> {
+    let mut newest = tokio::fs::symlink_metadata(dir)
+        .await
+        .ok()?
+        .modified()
+        .ok()?;
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                // A child whose metadata cannot be read is an incomplete
+                // inspection, same as a read_dir failure: its mtime might be
+                // the newest (a just-re-downloaded file), so skip the dir this
+                // sweep rather than under-report and delete in-use media.
+                let modified = entry.metadata().await.ok()?.modified().ok()?;
+                if modified > newest {
+                    newest = modified;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    Some(newest)
 }

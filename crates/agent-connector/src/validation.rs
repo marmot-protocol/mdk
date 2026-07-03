@@ -140,6 +140,12 @@ pub(crate) fn validate_control_plane_config(
         ));
     }
 
+    if config.max_connections == 0 {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(
+            "max connections must be nonzero",
+        ));
+    }
+
     if config.auth_token.is_none()
         && (config.socket_dir_mode != AGENT_SOCKET_DIR_MODE
             || config.socket_mode != AGENT_SOCKET_MODE)

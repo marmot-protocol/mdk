@@ -125,6 +125,11 @@ These are longer working documents. Go here when you need depth, not orientation
   - **What it covers:** Current implementation inventory for opt-in forensic JSONL logs, file identity, every event
     kind and metadata field, upload/tracker behavior, and downstream tooling guidance.
 
+- **Doc:** [`runtime-state-bounds.md`](./runtime-state-bounds.md)
+  - **What it covers:** Inventory of long-lived daemon/broker runtime structures (maps, counters, handle sets, temp
+    artifacts) with their bounds and eviction/reclamation rules, plus the tracked-resource discipline for adding new
+    ones.
+
 - **Doc:** [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot)
   - **What it covers:** Marmot v2 protocol draft by stable protocol surface and app component.
 

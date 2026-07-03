@@ -549,6 +549,101 @@ async fn connector_socket_serves_account_list() {
 }
 
 #[tokio::test]
+async fn connector_socket_caps_concurrent_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let mut config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+    config.max_connections = 1;
+    let server = tokio::spawn(serve_socket(config));
+
+    // A long-lived subscription holds the only permit for its whole session;
+    // the ack proves it is accepted and served before the second connection.
+    let held = connect_with_retry(&socket).await;
+    let (held_read, mut held_write) = tokio::io::split(held);
+    let mut held_read = BufReader::new(held_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-held".to_owned()),
+        AgentControlRequest::SubscribeInbound {
+            account_id_hex: None,
+            group_id_hex: None,
+        },
+    );
+    write_frame(&mut held_write, &request).await.unwrap();
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut held_read))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-held"));
+    assert_eq!(response.payload, AgentControlResponse::Ack);
+
+    // A second concurrent connection is over the cap: the connector closes
+    // it at accept time without serving a response.
+    let refused = UnixStream::connect(&socket).await.unwrap();
+    let (refused_read, mut refused_write) = tokio::io::split(refused);
+    let mut refused_read = BufReader::new(refused_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-refused".to_owned()),
+        AgentControlRequest::AccountList,
+    );
+    // The write may race the server-side close; only the read matters.
+    let _ = write_frame(&mut refused_write, &request).await;
+    let refused_result: Result<Option<AgentControlEnvelope<AgentControlResponse>>, _> =
+        timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut refused_read))
+            .await
+            .unwrap();
+    assert!(
+        matches!(refused_result, Ok(None) | Err(_)),
+        "over-cap connection must be closed without a response"
+    );
+
+    // Dropping the held connection frees the permit for a new connection.
+    drop(held_read);
+    drop(held_write);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let client = connect_with_retry(&socket).await;
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        let request = AgentControlEnvelope::request(
+            Some("req-after-release".to_owned()),
+            AgentControlRequest::AccountList,
+        );
+        if write_frame(&mut client_write, &request).await.is_ok()
+            && let Ok(Ok(Some(response))) = timeout(
+                Duration::from_secs(2),
+                read_envelope::<_, AgentControlResponse>(&mut client_read),
+            )
+            .await
+        {
+            assert_eq!(response.id.as_deref(), Some("req-after-release"));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "released permit must allow a new connection to be served"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_control_plane_rejects_zero_connection_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
+    config.max_connections = 0;
+
+    let error = serve_socket(config).await.unwrap_err();
+
+    assert_eq!(error.code(), "unsafe_control_plane_config");
+}
+
+#[tokio::test]
 async fn connector_socket_requires_configured_auth_token() {
     let dir = tempfile::tempdir().unwrap();
     let account_home = AccountHome::open(dir.path());
@@ -3115,6 +3210,59 @@ async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
         "directories older than the cutoff must be removed"
     );
     assert!(!stale.exists(), "stale media dir must be deleted");
+}
+
+#[tokio::test]
+async fn media_temp_sweeper_spares_dirs_with_recently_rewritten_files() {
+    use std::time::{Duration, SystemTime};
+
+    use crate::media_temp::sweep_media_dirs_modified_before;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blob_dir = tmp.path().join("blob");
+    tokio::fs::create_dir_all(&blob_dir).await.unwrap();
+    let file_path = blob_dir.join("media.bin");
+    tokio::fs::write(&file_path, b"first download")
+        .await
+        .unwrap();
+
+    // Pick a cutoff after the dir was created, then mimic a re-download of
+    // the same blob: an in-place truncating overwrite updates the file mtime
+    // but not the parent dir mtime.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cutoff = SystemTime::now();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&file_path)
+        .await
+        .unwrap();
+    use tokio::io::AsyncWriteExt as _;
+    file.write_all(b"second download").await.unwrap();
+    drop(file);
+
+    let swept = sweep_media_dirs_modified_before(tmp.path(), cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 0,
+        "a dir whose file was re-downloaded after the cutoff must not be swept"
+    );
+    assert!(
+        file_path.exists(),
+        "recently re-downloaded media must survive the sweep"
+    );
+
+    // Once nothing inside the dir is newer than the cutoff, it is reclaimed.
+    let late_cutoff = SystemTime::now() + Duration::from_secs(3600);
+    let swept = sweep_media_dirs_modified_before(tmp.path(), late_cutoff)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1, "fully stale dirs are still reclaimed");
+    assert!(!blob_dir.exists());
 }
 
 #[tokio::test]

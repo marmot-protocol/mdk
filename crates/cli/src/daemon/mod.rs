@@ -61,6 +61,13 @@ const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
 const DAEMON_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
+/// Cap on concurrently served daemon connections. The socket is same-UID
+/// local control, but a runaway or looping client must not be able to grow
+/// the per-connection task set (and the subscriptions those tasks hold)
+/// without bound; over-cap connections are closed at accept time. Generous
+/// relative to real CLI/TUI use (a handful of subscriptions plus one-shot
+/// commands).
+const MAX_DAEMON_CONNECTIONS: usize = 256;
 
 type SharedDaemonWorkers = Arc<AsyncMutex<DaemonWorkers>>;
 
@@ -180,18 +187,32 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .await;
     }
     let mut worker_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let connection_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_CONNECTIONS));
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let shutdown_result = loop {
         worker_tasks.retain(|task| !task.is_finished());
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                // Bound concurrent per-connection tasks like the connector and
+                // broker accept loops: beyond the cap the connection is closed
+                // instead of served.
+                let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
+                    // Dropped without a log line: the repo-wide direct-output
+                    // audit forbids println!/eprintln! in library sources and
+                    // the daemon library is intentionally log-free at runtime.
+                    // The refused client observes its connection close without
+                    // a response.
+                    drop(stream);
+                    continue;
+                };
                 let defaults = defaults.clone();
                 let state = state.clone();
                 let events = events.clone();
                 let workers = workers.clone();
                 let shutdown_tx = shutdown_tx.clone();
                 worker_tasks.push(tokio::spawn(async move {
+                    let _permit = permit;
                     handle_daemon_connection(stream, defaults, state, events, workers, shutdown_tx).await;
                 }));
             }
