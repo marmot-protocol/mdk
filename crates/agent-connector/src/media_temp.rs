@@ -227,10 +227,12 @@ async fn newest_media_use_time(dir: &Path) -> Option<SystemTime> {
     loop {
         match entries.next_entry().await {
             Ok(Some(entry)) => {
-                if let Ok(metadata) = entry.metadata().await
-                    && let Ok(modified) = metadata.modified()
-                    && modified > newest
-                {
+                // A child whose metadata cannot be read is an incomplete
+                // inspection, same as a read_dir failure: its mtime might be
+                // the newest (a just-re-downloaded file), so skip the dir this
+                // sweep rather than under-report and delete in-use media.
+                let modified = entry.metadata().await.ok()?.modified().ok()?;
+                if modified > newest {
                     newest = modified;
                 }
             }
