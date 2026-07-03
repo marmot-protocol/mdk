@@ -710,83 +710,63 @@ pub(crate) fn rebuild_message_timeline_for_group_tx(
     Ok(())
 }
 
+/// Prune body. The caller must have set `PRAGMA secure_delete = ON` on the
+/// connection *before* opening this transaction: SQLite does not guarantee
+/// zero-on-free for pages freed in the same transaction that toggles the
+/// pragma, so an in-transaction toggle would silently degrade the prune's
+/// guarantee on connections configured with `secure_delete: false`.
 pub(crate) fn secure_prune_app_events_before_tx(
     tx: &Connection,
     group_id_hex: &str,
     cutoff_recorded_at: u64,
 ) -> StorageResult<SecurePruneAppEventsResult> {
-    with_secure_delete_enabled_tx(tx, || {
-        let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
-        if pruned_events.is_empty() {
-            return Ok(SecurePruneAppEventsResult::default());
-        }
-
-        let mut pruned_message_ids = BTreeSet::new();
-        let mut affected_message_ids = BTreeSet::new();
-        let mut media_ciphertext_sha256 = BTreeSet::new();
-        for event in &pruned_events {
-            pruned_message_ids.insert(event.message_id_hex.clone());
-            collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
-            affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
-                tx,
-                group_id_hex,
-                &event.message_id_hex,
-                event.kind,
-                &event.tags,
-            )?);
-        }
-
-        scrub_app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
-        // `message_timeline.plaintext` is indexed for search; overwriting it
-        // under `secure_delete` before DELETE also rewrites the old index key.
-        scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
-
-        // Deleting the owning app_events rows cascades to message_modifier_edges
-        // via its ON DELETE CASCADE foreign key.
-        let pruned = tx
-            .execute(
-                "DELETE FROM app_events
-                 WHERE group_id_hex = ?1
-                   AND recorded_at < ?2",
-                params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
-            )
-            .storage()?;
-
-        delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
-        affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
-        for message_id in affected_message_ids {
-            upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
-        }
-        refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
-
-        Ok(SecurePruneAppEventsResult {
-            pruned_messages: pruned,
-            media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
-        })
-    })
-}
-
-fn with_secure_delete_enabled_tx<T>(
-    tx: &Connection,
-    op: impl FnOnce() -> StorageResult<T>,
-) -> StorageResult<T> {
-    let original_secure_delete = tx
-        .query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
-        .storage()?;
-    tx.execute_batch("PRAGMA secure_delete = ON;").storage()?;
-    let outcome = op();
-    let restore = set_secure_delete_tx(tx, original_secure_delete);
-    match (outcome, restore) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(err), Ok(())) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(err), Err(_)) => Err(err),
+    let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+    if pruned_events.is_empty() {
+        return Ok(SecurePruneAppEventsResult::default());
     }
-}
 
-fn set_secure_delete_tx(tx: &Connection, value: i64) -> StorageResult<()> {
-    tx.execute_batch(&format!("PRAGMA secure_delete = {value};"))
-        .storage()
+    let mut pruned_message_ids = BTreeSet::new();
+    let mut affected_message_ids = BTreeSet::new();
+    let mut media_ciphertext_sha256 = BTreeSet::new();
+    for event in &pruned_events {
+        pruned_message_ids.insert(event.message_id_hex.clone());
+        collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
+        affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
+            tx,
+            group_id_hex,
+            &event.message_id_hex,
+            event.kind,
+            &event.tags,
+        )?);
+    }
+
+    scrub_app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+    // `message_timeline.plaintext` is indexed for search; overwriting it
+    // under `secure_delete` before DELETE also rewrites the old index key.
+    scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+
+    // Deleting the owning app_events rows cascades to message_modifier_edges
+    // via its ON DELETE CASCADE foreign key.
+    let pruned = tx
+        .execute(
+            "DELETE FROM app_events
+             WHERE group_id_hex = ?1
+               AND recorded_at < ?2",
+            params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
+        )
+        .storage()?;
+
+    delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
+    for message_id in affected_message_ids {
+        upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
+    }
+    refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
+
+    Ok(SecurePruneAppEventsResult {
+        pruned_messages: pruned,
+        media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
+    })
 }
 
 fn refresh_chat_list_last_message_after_secure_prune_tx(
