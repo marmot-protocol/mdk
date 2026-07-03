@@ -154,7 +154,7 @@ impl std::fmt::Debug for RelayTelemetryRuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditLogUploadSource {
     pub device_label: Option<String>,
     pub platform: Option<String>,

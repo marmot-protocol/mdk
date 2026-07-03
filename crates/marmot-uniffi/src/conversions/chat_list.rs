@@ -7,8 +7,13 @@ use crate::markdown::MarkdownDocumentFfi;
 
 /// Group avatar reference. `image_key_hex` is the symmetric key that decrypts
 /// the avatar blob and `image_upload_key_hex` is the Blossom upload secret;
-/// the hand-written `Debug` impl below redacts both so a `{:?}` (or a host's
-/// generated `description`/`toString`) never prints key material.
+/// the hand-written `Debug` impl below redacts both so a Rust-side `{:?}`
+/// never prints key material.
+///
+/// Host-language stringification is NOT covered: uniffi 0.28 generates plain
+/// record types (e.g. Kotlin data classes) whose default `toString` prints
+/// all fields, and `#[uniffi::export(Debug)]` on records requires uniffi
+/// >= 0.29. Host apps must not log this record until that upgrade lands.
 #[derive(Clone, uniffi::Record)]
 pub struct ChatListAvatarFfi {
     pub image_hash_hex: String,

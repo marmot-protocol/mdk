@@ -111,7 +111,7 @@ pub(crate) async fn fetch_group_image(
             .as_slice()
             .try_into()
             .map_err(|_| {
-                AppError::InvalidEncryptedMedia("group image key must be 32 bytes".into())
+                AppError::InvalidEncryptedMedia("group image key must be 32 bytes".to_owned())
             })?,
     );
     let nonce: [u8; 12] = hex::decode(image_nonce_hex)?.try_into().map_err(|_| {

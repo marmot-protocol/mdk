@@ -273,7 +273,7 @@ fn derive_sqlcipher_key_material(
     encode_hkdf_part(&mut info, keys.public_key().to_bytes().as_slice());
     let mut output = Zeroizing::new([0_u8; SQLCIPHER_KEY_LEN]);
     hkdf.expand(&info, output.as_mut())
-        .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".into()))?;
+        .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".to_owned()))?;
     Ok(hex::encode(&output))
 }
 

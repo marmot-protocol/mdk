@@ -22,9 +22,32 @@ const DIRECT_OUTPUT_MACROS: &[&str] = &["println!(", "eprintln!(", "dbg!("];
 /// privacy-safe kind (`error_kind = err.privacy_safe_kind()`,
 /// `error_kind = %err.kind()`, an error-code enum) instead of the raw error
 /// value (darkmatter#340, darkmatter#399).
+/// Matching is keyed to the interpolated *value* (`%err`, `?e`, ...) as well
+/// as the conventional `error` field name, so renaming the field (`cause =
+/// %err`, `reason = %e`) does not bypass the audit. Tokens are terminated by
+/// `,`, `)`, or end-of-line so projections of the error to a safe value
+/// (`error_kind = %err.kind()`) stay allowed.
 const FORBIDDEN_ERROR_INTERPOLATIONS: &[&str] = &[
     "error = %",
     "error = ?",
+    "%err,",
+    "%err)",
+    "%err\n",
+    "?err,",
+    "?err)",
+    "?err\n",
+    "%e,",
+    "%e)",
+    "%e\n",
+    "?e,",
+    "?e)",
+    "?e\n",
+    "%error,",
+    "%error)",
+    "%error\n",
+    "?error,",
+    "?error)",
+    "?error\n",
     "{err}",
     "{err:",
     "{e}",
