@@ -1071,6 +1071,77 @@ async fn welcome_event_routes_despite_trailing_slash_mismatch() {
     assert_eq!(delivery.source.endpoint, Some(inbound_inbox));
 }
 
+#[tokio::test]
+async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_for = |index: u8| TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![index; 32]),
+        transport_group_id: vec![index; 32],
+        endpoints: vec![TransportEndpoint(format!("wss://relay-{index}.example"))],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![group_for(1)],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 2);
+
+    // Group churn: every sync replaces the previous group with a new one
+    // (join/leave, endpoint rotation). The telemetry map must track only the
+    // live subscriptions, not one entry per historical subscription id.
+    for index in 2..30 {
+        adapter
+            .sync_account_groups(TransportGroupSync {
+                account_id: account_id.clone(),
+                group_subscriptions: vec![group_for(index)],
+                since: None,
+            })
+            .await
+            .expect("group sync succeeds");
+        assert_eq!(
+            adapter.relay_sync().await.tracked_subscriptions,
+            2,
+            "churned-away group subscriptions must be evicted"
+        );
+    }
+    let stale_group_id = NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: cgka_traits::GroupId::new(vec![1; 32]),
+        transport_group_id: vec![1; 32],
+        endpoints: vec![TransportEndpoint("wss://relay-1.example".into())],
+        since: None,
+    }
+    .subscription_id();
+    assert_eq!(adapter.subscription_synced(&stale_group_id).await, None);
+
+    // Reactivation with a rotated inbox endpoint set mints new subscription
+    // ids; the previous ids must not linger.
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox-rotated.example".into())],
+            group_subscriptions: vec![group_for(30)],
+            since: None,
+        })
+        .await
+        .expect("reactivation succeeds");
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 2);
+
+    // Deactivation drops the account's remaining subscriptions.
+    adapter
+        .deactivate_account(&account_id)
+        .await
+        .expect("deactivation succeeds");
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 0);
+}
+
 fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
     NostrTransportEvent {
         id: id_byte.repeat(32),

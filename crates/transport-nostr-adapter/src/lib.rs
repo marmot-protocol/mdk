@@ -510,6 +510,10 @@ impl TransportAdapter for NostrTransportAdapter {
 
         let now_ms = self.now_ms();
         let mut state = self.state.write().await;
+        // Reactivation replaces the account's routes; evict telemetry for the
+        // old subscription ids first (before recording the new starts, since
+        // unchanged endpoint sets reuse the same ids).
+        state.forget_account_subscription_starts(&account_id);
         state.record_subscription_starts(&issued, now_ms);
         state.activate(activation, replaced_count);
         Ok(())
@@ -563,6 +567,7 @@ impl TransportAdapter for NostrTransportAdapter {
         );
         let now_ms = self.now_ms();
         let mut state = self.state.write().await;
+        state.forget_subscription_starts(&to_remove);
         state.record_subscription_starts(&to_add, now_ms);
         state.sync_groups(sync, to_add.len(), to_remove.len());
         Ok(())
@@ -585,6 +590,7 @@ impl TransportAdapter for NostrTransportAdapter {
         );
         self.relay_client.unsubscribe_account(account_id).await?;
         let mut state = self.state.write().await;
+        state.forget_account_subscription_starts(account_id);
         state.deactivate(account_id, removed_count);
         Ok(())
     }
@@ -868,6 +874,45 @@ impl AdapterState {
                 .collect();
             self.sync
                 .record_subscription_start(&subscription.subscription_id(), &relays, now_ms);
+        }
+    }
+
+    /// Evict sync-telemetry progress for subscriptions being removed, so the
+    /// telemetry map tracks live subscriptions rather than historical churn.
+    fn forget_subscription_starts(&mut self, subscriptions: &[NostrSubscription]) {
+        for subscription in subscriptions {
+            self.sync
+                .forget_subscription(&subscription.subscription_id());
+        }
+    }
+
+    /// Evict sync-telemetry progress for every subscription implied by an
+    /// account's stored routes (its inbox plus each group). Called before the
+    /// routes are replaced (reactivate) or removed (deactivate); subscription
+    /// ids are derived from account/group/endpoint state, never `since`, so
+    /// the reconstructed ids match the ones recorded at subscribe time.
+    fn forget_account_subscription_starts(&mut self, account_id: &MemberId) {
+        let Some(routes) = self.accounts.get(account_id) else {
+            return;
+        };
+        let mut ids = Vec::with_capacity(1 + routes.groups.len());
+        ids.push(
+            NostrSubscription::AccountInbox {
+                account_id: account_id.clone(),
+                endpoints: routes
+                    .inbox_endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.verbatim.clone())
+                    .collect(),
+                since: None,
+            }
+            .subscription_id(),
+        );
+        for group in &routes.groups {
+            ids.push(group_subscription(account_id, group, None).subscription_id());
+        }
+        for id in ids {
+            self.sync.forget_subscription(&id);
         }
     }
 

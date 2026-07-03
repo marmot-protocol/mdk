@@ -525,6 +525,17 @@ impl RelaySyncTelemetry {
         }
     }
 
+    /// Forget the progress entry for `subscription_id`.
+    ///
+    /// Called when the subscription is unsubscribed, replaced by a rotation
+    /// (which mints a new id), or its account deactivates, so the map tracks
+    /// only live subscriptions instead of growing with historical churn. The
+    /// per-relay first-event/EOSE histograms are aggregates bounded by the
+    /// relay count and are intentionally retained.
+    pub fn forget_subscription(&mut self, subscription_id: &str) {
+        self.subscriptions.remove(subscription_id);
+    }
+
     /// Whether every relay of `subscription_id` has reached EOSE.
     ///
     /// Returns `None` for an unknown subscription, `Some(false)` while any
