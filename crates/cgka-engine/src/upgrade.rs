@@ -206,6 +206,20 @@ impl<S: StorageProvider> Engine<S> {
             .stage_commit(&provider)
             .map_err(|e| EngineError::Backend(format!("upgrade stage: {e:?}")))?;
         let (commit_out, _welcome_opt, _gi) = commit_bundle.into_contents();
+        // Self-check the staged GroupContextExtensions commit against the same
+        // integrity rule inbound processing enforces: the resulting
+        // GroupContext must keep the app_data_dictionary and may only change
+        // component state through this commit's AppDataUpdate proposals.
+        {
+            let staged_commit = mls_group
+                .pending_commit()
+                .ok_or_else(|| EngineError::Backend("upgrade produced no pending commit".into()))?;
+            crate::app_components::validate_app_component_integrity_for_staged_commit(
+                &mls_group,
+                group_id,
+                staged_commit,
+            )?;
+        }
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;

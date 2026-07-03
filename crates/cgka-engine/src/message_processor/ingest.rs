@@ -672,6 +672,20 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(err);
                     }
+                    // Reject (pre-merge) a commit whose resulting GroupContext
+                    // strips or rewrites app-component state outside the
+                    // validated AppDataUpdate channel — e.g. a
+                    // GroupContextExtensions-only commit that replaces the
+                    // extensions without the dictionary, or with tampered
+                    // component bytes.
+                    if let Err(err) =
+                        crate::app_components::validate_app_component_integrity_for_staged_commit(
+                            &mls_group, &group_id, &staged,
+                        )
+                    {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(err);
+                    }
                     let Some(commit_committer) = sender_id.clone() else {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         return Err(EngineError::Backend(

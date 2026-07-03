@@ -457,6 +457,11 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             staged_commit,
         )?;
+        crate::app_components::validate_app_component_integrity_for_staged_commit(
+            &mls_group,
+            &group_id,
+            staged_commit,
+        )?;
         let commit_priority =
             crate::app_components::commit_ordering_priority_for_staged(staged_commit);
         self.epoch_manager

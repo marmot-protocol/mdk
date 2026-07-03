@@ -10,7 +10,7 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsProjectionError, project_mls_message};
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
-use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
+use cgka_traits::app_components::{AppComponentId, GROUP_ADMIN_POLICY_COMPONENT_ID};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
@@ -31,6 +31,7 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
+use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::BasicCredential;
@@ -514,6 +515,95 @@ fn raw_remove_members_commit_with_admin_policy(
         timestamp: Timestamp(0),
         causal_deps: vec![],
         source: TransportSource("raw-openmls-remove-admin-policy".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+/// How a raw GroupContextExtensions commit tampers with the group's
+/// `app_data_dictionary` (see [`raw_group_context_extensions_tamper_commit`]).
+enum GceDictionaryTamper {
+    /// Replace the extensions with a set omitting the dictionary entirely.
+    StripDictionary,
+    /// Keep the dictionary but omit one component's entry.
+    DropEntry(AppComponentId),
+    /// Keep the dictionary and every entry present, but rewrite one
+    /// component's bytes — no `AppDataUpdate` proposal carries the change.
+    ReplaceEntry(AppComponentId, Vec<u8>),
+}
+
+/// Build a raw OpenMLS GroupContextExtensions-only commit (no member changes)
+/// that tampers with the Marmot component state in the resulting GroupContext.
+/// OpenMLS's draft-08 dictionary guard only runs when a commit carries
+/// `AppDataUpdate` proposals, so every tamper here builds and stages cleanly —
+/// only the engine's app-component integrity check can reject it.
+fn raw_group_context_extensions_tamper_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    tamper: GceDictionaryTamper,
+) -> TransportMessage {
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load sender MLS group")
+        .expect("sender joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+
+    let mut new_extensions: Vec<Extension> = mls_group
+        .extensions()
+        .iter()
+        .filter(|ext| !matches!(ext, Extension::AppDataDictionary(_)))
+        .cloned()
+        .collect();
+    match &tamper {
+        GceDictionaryTamper::StripDictionary => {}
+        GceDictionaryTamper::DropEntry(target) | GceDictionaryTamper::ReplaceEntry(target, _) => {
+            let current = mls_group
+                .extensions()
+                .app_data_dictionary()
+                .expect("group carries app_data_dictionary");
+            let mut dict = AppDataDictionary::new();
+            for entry in current.dictionary().entries() {
+                if entry.id() == *target {
+                    if let GceDictionaryTamper::ReplaceEntry(_, data) = &tamper {
+                        dict.insert(entry.id(), data.clone());
+                    }
+                    continue;
+                }
+                dict.insert(entry.id(), entry.data().to_vec());
+            }
+            new_extensions.push(Extension::AppDataDictionary(
+                AppDataDictionaryExtension::new(dict),
+            ));
+        }
+    }
+    let new_extensions = Extensions::from_vec(new_extensions).expect("tampered extensions build");
+
+    let (commit, _welcome, _group_info) = mls_group
+        .update_group_context_extensions(&provider, new_extensions, &signer)
+        .expect("raw OpenMLS GroupContextExtensions tamper commit");
+    let payload = commit
+        .tls_serialize_detached()
+        .expect("serialize raw GCE tamper commit");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-gce-tamper".to_string()),
         envelope: TransportEnvelope::GroupMessage {
             transport_group_id: group_id.as_slice().to_vec(),
         },
@@ -1030,6 +1120,299 @@ async fn convergence_accepts_remove_when_admin_policy_drops_removed_admin() {
         .expect("test identities are 32-byte account keys");
     assert_eq!(carol.admin_pubkeys(&group_id).unwrap(), vec![bob_admin]);
     assert_message_state(&carol_storage, &valid_remove, MessageState::Processed);
+}
+
+/// Two-member bootstrap for the GCE tamper regressions: `creator` creates the
+/// group (sole admin), confirms, and `joiner` joins via welcome.
+async fn bootstrap_gce_tamper_group(
+    creator: &mut Engine<SqliteAccountStorage>,
+    joiner: &mut Engine<SqliteAccountStorage>,
+    joiner_name: &[u8],
+    group_name: &str,
+) -> GroupId {
+    let joiner_kp = joiner.fresh_key_package().await.unwrap();
+    let (group_id, create) = creator
+        .create_group(CreateGroupRequest {
+            name: group_name.into(),
+            description: "".into(),
+            members: vec![joiner_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    creator.confirm_published(pending).await.unwrap();
+    joiner
+        .join_welcome(welcome_for(&welcomes, joiner_name))
+        .await
+        .unwrap();
+    group_id
+}
+
+fn admin_key(member: &MemberId) -> [u8; 32] {
+    member
+        .as_slice()
+        .try_into()
+        .expect("test identities are 32-byte account keys")
+}
+
+/// Ingest `tampered` on `recipient` and assert the GCE tamper commit is
+/// rejected: outcome `Stale`, epoch and sole admin unchanged, and the stored
+/// message never `Processed`. Inbound same-epoch commits route through
+/// convergence, and the ingest-driven pass runs inside the input window, so
+/// the terminal disposition may not be persisted yet — the pinned invariant is
+/// that the tamper commit is never applied.
+async fn assert_gce_tamper_rejected_by_ingest(
+    recipient: &mut Engine<SqliteAccountStorage>,
+    recipient_storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    tampered: &TransportMessage,
+    expected_admin: &MemberId,
+) {
+    let outcome = recipient
+        .ingest(tampered.clone())
+        .await
+        .expect("ingest completes");
+    assert!(
+        matches!(outcome, IngestOutcome::Stale { .. }),
+        "GCE tamper commit must not be processed: {outcome:?}"
+    );
+    assert_eq!(recipient.epoch(group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        recipient.admin_pubkeys(group_id).unwrap(),
+        vec![admin_key(expected_admin)],
+        "the tampered component state must not take effect"
+    );
+    let record = recipient_storage
+        .get_message(&content_id(tampered))
+        .expect("tamper commit remains stored");
+    assert_ne!(record.state, MessageState::Processed);
+}
+
+/// Buffer `tampered` into STORED CONVERGENCE on `recipient` and converge with
+/// a closed input window; assert the pass settles with the commit dropped as
+/// `InvalidAgainstCandidateState`, epoch and sole admin unchanged, and the
+/// message `EpochInvalidated`.
+fn assert_gce_tamper_rejected_by_convergence(
+    recipient: &mut Engine<SqliteAccountStorage>,
+    recipient_storage: &SqliteAccountStorage,
+    group_id: &GroupId,
+    tampered: &TransportMessage,
+    expected_admin: &MemberId,
+) {
+    recipient
+        .buffer_openmls_convergence_message(group_id, tampered.clone(), 1_000)
+        .expect("GCE tamper commit buffered");
+    let result = recipient
+        .converge_stored_openmls_messages(group_id, 1_000_000)
+        .expect("stored OpenMLS messages converge");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        result.accepted_commits.is_empty(),
+        "GCE tamper commit must not be accepted: {result:?}"
+    );
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.kind == MessageKind::Commit
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.message_id == content_hex(tampered)
+        }),
+        "expected GCE tamper commit dropped as InvalidAgainstCandidateState, got {:?}",
+        result.dropped_messages
+    );
+    assert_eq!(recipient.epoch(group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        recipient_storage
+            .get_group(group_id)
+            .expect("group stored")
+            .epoch,
+        EpochId(1)
+    );
+    assert_eq!(
+        recipient.admin_pubkeys(group_id).unwrap(),
+        vec![admin_key(expected_admin)],
+        "the tampered component state must not take effect"
+    );
+    assert_message_state(recipient_storage, tampered, MessageState::EpochInvalidated);
+}
+
+#[tokio::test]
+async fn ingest_rejects_group_context_commit_stripping_app_data_dictionary() {
+    // Regression: OpenMLS's draft-08 dictionary guard only validates the
+    // GroupContext against a commit's AppDataUpdate proposals, so an
+    // admin-authored GroupContextExtensions-only commit could replace the
+    // extensions with a set that omits the app_data_dictionary entirely.
+    // Merging it cannot orphan an admin key (the absent component is the empty
+    // admin set), but it silently makes the group admin-less and freezes every
+    // admin-gated operation. `ingest` must classify the strip commit invalid
+    // instead of materializing the admin-less epoch.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let alice_id = alice.self_id();
+    let group_id =
+        bootstrap_gce_tamper_group(&mut alice, &mut bob, b"bob", "ingest-gce-dictionary-strip")
+            .await;
+
+    let strip = route(
+        raw_group_context_extensions_tamper_commit(
+            &alice_storage,
+            &alice_id,
+            &group_id,
+            GceDictionaryTamper::StripDictionary,
+        ),
+        &group_id,
+    );
+    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &strip, &alice_id)
+        .await;
+}
+
+#[tokio::test]
+async fn ingest_rejects_group_context_commit_dropping_required_component_entry() {
+    // Entry-level variant of the dictionary strip: the GroupContextExtensions
+    // commit keeps the app_data_dictionary but replaces it with one that omits
+    // the required admin-policy component's state. validate_app_component_remove
+    // only sees AppDataUpdate::Remove operations, so without the staged-commit
+    // integrity check this strip would also merge.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let alice_id = alice.self_id();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut bob,
+        b"bob",
+        "ingest-gce-admin-policy-strip",
+    )
+    .await;
+
+    let strip = route(
+        raw_group_context_extensions_tamper_commit(
+            &alice_storage,
+            &alice_id,
+            &group_id,
+            GceDictionaryTamper::DropEntry(GROUP_ADMIN_POLICY_COMPONENT_ID),
+        ),
+        &group_id,
+    );
+    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &strip, &alice_id)
+        .await;
+}
+
+#[tokio::test]
+async fn convergence_rejects_group_context_commit_stripping_app_data_dictionary() {
+    // The same dictionary-strip commit through STORED CONVERGENCE. Before the
+    // integrity check, a GCE-only strip commit with no member removals was
+    // ACCEPTED here — convergence materialized the admin-less epoch. It must
+    // classify the commit as invalid instead.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let alice_id = alice.self_id();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut carol,
+        b"carol",
+        "convergence-gce-dictionary-strip",
+    )
+    .await;
+
+    let strip = route(
+        raw_group_context_extensions_tamper_commit(
+            &alice_storage,
+            &alice_id,
+            &group_id,
+            GceDictionaryTamper::StripDictionary,
+        ),
+        &group_id,
+    );
+    assert_gce_tamper_rejected_by_convergence(
+        &mut carol,
+        &carol_storage,
+        &group_id,
+        &strip,
+        &alice_id,
+    );
+}
+
+#[tokio::test]
+async fn ingest_rejects_group_context_commit_rewriting_admin_policy_bytes() {
+    // Content-integrity variant: the GroupContextExtensions commit keeps the
+    // app_data_dictionary and every required entry PRESENT, but rewrites the
+    // admin-policy bytes to a different (well-formed) admin set — with no
+    // AppDataUpdate proposal carrying the change. The rewritten set names a
+    // member with a leaf, so the admin-leaf coupling check passes, and the
+    // presence rules pass too; only the AppDataUpdate attribution rule can
+    // reject it. Without it, an admin could rewrite any required component's
+    // bytes (admin set, profile, routing, retention) bypassing the component
+    // validators entirely.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let alice_id = alice.self_id();
+    let bob_id = bob.self_id();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut bob,
+        b"bob",
+        "ingest-gce-admin-policy-rewrite",
+    )
+    .await;
+
+    let rewrite = route(
+        raw_group_context_extensions_tamper_commit(
+            &alice_storage,
+            &alice_id,
+            &group_id,
+            GceDictionaryTamper::ReplaceEntry(
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                encode_admin_policy_for_test(std::slice::from_ref(&bob_id)),
+            ),
+        ),
+        &group_id,
+    );
+    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &rewrite, &alice_id)
+        .await;
+}
+
+#[tokio::test]
+async fn convergence_rejects_group_context_commit_rewriting_admin_policy_bytes() {
+    // The same admin-policy byte rewrite through STORED CONVERGENCE with a
+    // closed input window: the commit must be classified invalid, not
+    // materialize an epoch whose admin set was swapped outside AppDataUpdate.
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let alice_id = alice.self_id();
+    let carol_id = carol.self_id();
+    let group_id = bootstrap_gce_tamper_group(
+        &mut alice,
+        &mut carol,
+        b"carol",
+        "convergence-gce-admin-policy-rewrite",
+    )
+    .await;
+
+    let rewrite = route(
+        raw_group_context_extensions_tamper_commit(
+            &alice_storage,
+            &alice_id,
+            &group_id,
+            GceDictionaryTamper::ReplaceEntry(
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                encode_admin_policy_for_test(std::slice::from_ref(&carol_id)),
+            ),
+        ),
+        &group_id,
+    );
+    assert_gce_tamper_rejected_by_convergence(
+        &mut carol,
+        &carol_storage,
+        &group_id,
+        &rewrite,
+        &alice_id,
+    );
 }
 
 /// darkmatter#286: a commit applied through STORED CONVERGENCE that later loses
