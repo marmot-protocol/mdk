@@ -31,6 +31,10 @@ Agent map for the Marmot architecture docs.
 - **Path:** `overview/whitenoise-integration-map.md`
   - **Role:** Current shim map and engine API friction list for whitenoise-rs integration.
 
+- **Path:** `overview/local-artifact-safety.md`
+  - **Role:** Restrictive-by-construction creation policy for local files, sockets, and databases; the
+    `crates/fs-private` helper contract.
+
 - **Path:** `further-context/`
   - **Role:** Older or deeper context. Check status and dates before relying on it.
 
