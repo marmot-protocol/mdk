@@ -24,6 +24,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `dmd` now buffers daemon request frames before scanning for the newline delimiter, avoiding one async `read()` call per
   byte for large `Execute` requests while preserving the existing 1 MiB request cap and stalled-client timeout.
 
+### Changed
+
+- `message send` (and every other group send) on a group whose local copy records your own removal now fails with the
+  deterministic JSON error code `invalid_transition` ("local group copy is marked removed (self-evicted)") instead of an
+  opaque `engine_error`, matching the engine's realized self-eviction semantics (#376).
+
 ## [0.2.0] - 2026-06-21
 
 ### Added

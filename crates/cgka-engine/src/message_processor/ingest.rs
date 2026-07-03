@@ -1364,6 +1364,16 @@ impl<S: StorageProvider> Engine<S> {
         let self_id = self.identity.self_id().clone();
         group.members.retain(|member| member.id != self_id);
         self.storage.put_group(&group)?;
+        // Deliberately LAST, after the marker write — not before it like the
+        // convergence path (which has no attribution read). The notification
+        // is already enqueued above, so a failure here cannot lose it; it only
+        // leaves a stale leave-request row, which the removed-copy send gate
+        // supersedes and re-join cleans up. Clearing BEFORE the marker write
+        // would be worse: a failed marker write would then retry against
+        // already-cleared leave state and emit a differently-attributed
+        // duplicate (`MemberRemoved` after an original `MemberLeft`), i.e. a
+        // second visible row. With this order any retry duplicate is
+        // byte-identical and collapses in the app's canonical-row-id upsert.
         self.clear_leave_request_state(group_id)?;
         Ok(())
     }
