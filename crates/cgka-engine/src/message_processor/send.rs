@@ -395,7 +395,7 @@ impl<S: StorageProvider> Engine<S> {
             &group_id,
             staged_commit,
         )?;
-        crate::app_components::validate_required_component_retention_for_staged_commit(
+        crate::app_components::validate_app_component_integrity_for_staged_commit(
             &mls_group,
             &group_id,
             staged_commit,

@@ -654,11 +654,13 @@ impl<S: StorageProvider> Engine<S> {
                         return Err(err);
                     }
                     // Reject (pre-merge) a commit whose resulting GroupContext
-                    // strips the app_data_dictionary or a required component's
-                    // state — e.g. a GroupContextExtensions-only commit that
-                    // replaces the extensions without the dictionary.
+                    // strips or rewrites app-component state outside the
+                    // validated AppDataUpdate channel — e.g. a
+                    // GroupContextExtensions-only commit that replaces the
+                    // extensions without the dictionary, or with tampered
+                    // component bytes.
                     if let Err(err) =
-                        crate::app_components::validate_required_component_retention_for_staged_commit(
+                        crate::app_components::validate_app_component_integrity_for_staged_commit(
                             &mls_group, &group_id, &staged,
                         )
                     {

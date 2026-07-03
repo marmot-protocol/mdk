@@ -16,9 +16,9 @@ use cgka_traits::error::EngineError;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
 use openmls::group::{MlsGroup, StagedCommit};
-use openmls::messages::proposals::Proposal;
+use openmls::messages::proposals::{AppDataUpdateOperation, Proposal};
 use openmls::prelude::{BasicCredential, LeafNode, Sender};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InitialComponentState {
@@ -297,48 +297,91 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     Ok(())
 }
 
-/// Reject (pre-merge) a commit whose resulting GroupContext strips Marmot
-/// component state the group requires: the `app_data_dictionary` extension
-/// itself, its `app_components` entry, or the state of any component listed in
-/// the group's required `app_components`.
+/// Reject (pre-merge) a commit whose resulting GroupContext strips or rewrites
+/// Marmot component state outside the validated `AppDataUpdate` channel.
 ///
-/// OpenMLS's draft-08 guard only validates the dictionary against a commit's
-/// `AppDataUpdate` proposals, and [`validate_app_component_remove`] only sees
-/// `AppDataUpdate::Remove` operations — so a `GroupContextExtensions`-only
-/// commit could otherwise replace the extensions with a set that omits
-/// required Marmot state. Such a strip cannot orphan an admin key (an absent
-/// admin-policy component is the empty admin set, handled in
-/// [`validate_admin_leaf_coupling_for_staged_commit`]), but it silently makes
-/// the group admin-less and freezes every admin-gated operation — a
-/// denial-of-service / consistency break that must be rejected pre-merge.
-pub(crate) fn validate_required_component_retention_for_staged_commit(
+/// OpenMLS's draft-08 guard only validates the resulting dictionary against a
+/// commit's `AppDataUpdate` proposals and returns early when there are none,
+/// and the engine's component validators ([`validate_app_component_update`] /
+/// [`validate_app_component_remove`]) likewise only run for `AppDataUpdate`
+/// operations — so a `GroupContextExtensions`-only commit could otherwise
+/// replace the extensions with a set that drops the `app_data_dictionary`
+/// (making the group admin-less and freezing every admin-gated operation), or
+/// keep every entry present while rewriting its bytes (swapping the admin set,
+/// or corrupting profile/routing/retention state with bytes that never passed
+/// the component validators).
+///
+/// Enforced rules, in order:
+/// 1. the `app_data_dictionary` extension itself may never be dropped;
+/// 2. the engine-owned `app_components` entry and the state entry of every
+///    component in the current epoch's required set may never be dropped
+///    (mirrors [`validate_app_component_remove`]: a component becomes
+///    droppable only after a prior commit removes it from the required list);
+/// 3. every dictionary entry that changes relative to the current epoch —
+///    added, rewritten, or removed — must match one of this commit's own
+///    `AppDataUpdate` operations, whose payloads passed the component
+///    validators before the commit was staged.
+pub(crate) fn validate_app_component_integrity_for_staged_commit(
     mls_group: &MlsGroup,
     group_id: &GroupId,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
-    let Some(current) = mls_group.extensions().app_data_dictionary() else {
-        // The group never carried Marmot component state; nothing to retain.
-        return Ok(());
-    };
-    let current = current.dictionary();
-    let Some(resulting) = staged.group_context().extensions().app_data_dictionary() else {
+    let current = mls_group.extensions().app_data_dictionary();
+    let resulting = staged.group_context().extensions().app_data_dictionary();
+    if current.is_some() && resulting.is_none() {
         return Err(EngineError::Other(format!(
             "commit is invalid: resulting GroupContext drops the app_data_dictionary (group {group_id:?})"
         )));
-    };
-    let resulting = resulting.dictionary();
-    // The negotiated required-component list is engine-owned and can never be
-    // dropped (mirrors `validate_app_component_remove`); required components
-    // must keep whatever state entry the current epoch carries. A component
-    // becomes droppable only after a prior commit removes it from the required
-    // list via an `AppDataUpdate` to `app_components`.
+    }
+    let current = current.map(|ext| ext.dictionary());
+    let resulting = resulting.map(|ext| ext.dictionary());
+
     let mut protected = required_app_components_of_group(mls_group)?.ids;
     protected.insert(APP_COMPONENTS_COMPONENT_ID);
-    for component_id in protected {
-        if current.get(&component_id).is_some() && resulting.get(&component_id).is_none() {
+    for component_id in &protected {
+        let currently_present = current.is_some_and(|dict| dict.contains(component_id));
+        let still_present = resulting.is_some_and(|dict| dict.contains(component_id));
+        if currently_present && !still_present {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext drops required app component \
                  {component_id:#06x} (group {group_id:?})"
+            )));
+        }
+    }
+
+    // This commit's AppDataUpdate operations by component id: the exact set of
+    // resulting values a changed entry is allowed to take. `None` is a Remove.
+    let mut update_ops: BTreeMap<AppComponentId, Vec<Option<&[u8]>>> = BTreeMap::new();
+    for queued in staged.queued_proposals() {
+        if let Proposal::AppDataUpdate(update) = queued.proposal() {
+            let op = match update.operation() {
+                AppDataUpdateOperation::Update(data) => Some(data.as_slice()),
+                AppDataUpdateOperation::Remove => None,
+            };
+            update_ops
+                .entry(update.component_id())
+                .or_default()
+                .push(op);
+        }
+    }
+    let component_ids: BTreeSet<AppComponentId> = current
+        .into_iter()
+        .chain(resulting)
+        .flat_map(|dict| dict.entries().map(|entry| entry.id()))
+        .collect();
+    for component_id in component_ids {
+        let before = current.and_then(|dict| dict.get(&component_id));
+        let after = resulting.and_then(|dict| dict.get(&component_id));
+        if before == after {
+            continue;
+        }
+        let update_backed = update_ops
+            .get(&component_id)
+            .is_some_and(|ops| ops.contains(&after));
+        if !update_backed {
+            return Err(EngineError::Other(format!(
+                "commit is invalid: resulting GroupContext changes app component \
+                 {component_id:#06x} outside an AppDataUpdate proposal (group {group_id:?})"
             )));
         }
     }
