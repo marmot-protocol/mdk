@@ -25,6 +25,22 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         intent: SendIntent,
     ) -> Result<SendResult, EngineError> {
+        // A local copy marked removed is terminal for outbound work: the spec
+        // forbids preparing/publishing anything for it (member-departure.md,
+        // "Realizing removal"), and the underlying OpenMLS state would only
+        // fail with an opaque `UseAfterEviction` backend error anyway. Gate
+        // here (not just `do_send`) so queued-intent drains hit the same
+        // deterministic terminal error. Every intent kind is blocked,
+        // including `Leave` — there is nothing left to leave.
+        if self.group_record_is_removed(super::send_intent_group_id(&intent))? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Removed",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "local group copy is marked removed (self-evicted)",
+                },
+            ));
+        }
         match intent {
             SendIntent::AppMessage { group_id, payload } => {
                 self.do_send_app_message(group_id, payload).await

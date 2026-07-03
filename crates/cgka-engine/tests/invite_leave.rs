@@ -14,7 +14,9 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{AccountDeviceSignerStorage, GroupStorage, StorageProvider};
+use cgka_traits::storage::{
+    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, StorageProvider,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -783,6 +785,116 @@ async fn post_eviction_message_realizes_self_removal_and_returns_self_evicted() 
     assert!(
         record.removed,
         "realization must mark the local group copy removed"
+    );
+    assert!(
+        !record.members.iter().any(|m| m.id == bob.self_id()),
+        "realization must reconcile the roster: a removed copy must not keep \
+         presenting self as a member; got {:?}",
+        record.members
+    );
+}
+
+/// #376 attribution: OpenMLS's Inactive state does not record WHY the local
+/// leaf left the tree, but a durable leave request is authenticated local
+/// intent to leave. When one is pending, realization attributes the departure
+/// as `MemberLeft` (actor = self) — "you left" — instead of an involuntary
+/// `MemberRemoved` with an unknown actor.
+#[tokio::test]
+async fn realization_with_pending_leave_request_attributes_member_left() {
+    let (mut alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-left").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+
+    // Silent-eviction copy again, but this time the durable state also holds
+    // a leave request: the member had asked to leave before the eviction was
+    // realized.
+    let mut record = bob_storage.get_group(&group_id).unwrap();
+    record.removed = false;
+    record.members = vec![cgka_traits::group::Member {
+        id: bob.self_id(),
+        credential: bob.self_id().as_slice().to_vec(),
+    }];
+    bob_storage.put_group(&record).unwrap();
+    bob_storage
+        .put_leave_request(&cgka_traits::storage::LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 1,
+            last_proposed_epoch: None,
+        })
+        .unwrap();
+
+    let routed_app = post_eviction_app_message(&mut alice, &group_id, b"after-leave").await;
+    let outcome = bob.ingest(routed_app).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::SelfEvicted
+        }
+    ));
+    let bob_events = bob.drain_events();
+    let bob_id = bob.self_id();
+    assert!(
+        bob_events.iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::MemberLeft { member },
+                actor: Some(actor),
+                ..
+            } if member == &bob_id && actor == &bob_id
+        )),
+        "a pending leave request must attribute realization as MemberLeft by self; got {bob_events:?}"
+    );
+    assert!(
+        !emits_removed_of(&bob_events, &bob_id),
+        "no involuntary MemberRemoved when the departure was our own leave; got {bob_events:?}"
+    );
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+    assert!(
+        bob_storage.leave_request(&group_id).unwrap().is_none(),
+        "realization consumes the leave request"
+    );
+}
+
+/// #376 outbound terminal semantics: a copy marked removed must not prepare
+/// or publish anything (member-departure.md). Sends fail with a deterministic
+/// terminal `InvalidTransition` — not an opaque backend error from OpenMLS's
+/// `UseAfterEviction`.
+#[tokio::test]
+async fn send_after_realized_eviction_is_rejected_terminally() {
+    let (_alice, mut bob, bob_storage, group_id, routed_commit) =
+        setup_removed_member(b"evict-send-gate").await;
+
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    converge_buffered_commit(&mut bob, &group_id);
+    bob.drain_events();
+    assert!(bob_storage.get_group(&group_id).unwrap().removed);
+
+    let payload = app_payload_for(&bob, b"after eviction");
+    let blocked = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await;
+    assert!(
+        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        "send on a removed copy must fail terminally, got {blocked:?}"
+    );
+
+    // Leave is equally pointless on a removed copy: same terminal error.
+    let blocked = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await;
+    assert!(
+        matches!(blocked, Err(EngineError::InvalidTransition(_))),
+        "leave on a removed copy must fail terminally, got {blocked:?}"
     );
 }
 

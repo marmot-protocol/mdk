@@ -85,6 +85,19 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = send_intent_group_id(&intent).clone();
+        // Terminal gate before queueing: a local copy marked removed (realized
+        // self-eviction) must never accept or queue outbound work. Checked
+        // again in `do_send_ready` so queued-intent drains for a copy removed
+        // after queueing hit the same deterministic error.
+        if self.group_record_is_removed(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Removed",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "local group copy is marked removed (self-evicted)",
+                },
+            ));
+        }
         if !matches!(intent, SendIntent::Leave { .. }) && self.has_leave_send_gate(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {

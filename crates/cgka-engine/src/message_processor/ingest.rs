@@ -1303,6 +1303,19 @@ impl<S: StorageProvider> Engine<S> {
     /// is kept inactive, never deleted). Callers must only invoke this on
     /// authenticated evidence of eviction (the local MLS group state records
     /// our removal), never on a bare decrypt failure.
+    ///
+    /// Ordering: the notification is enqueued BEFORE the durable marker write,
+    /// so a crash between the two re-runs realization on the next
+    /// `SelfEvicted` input (at worst a duplicate notification, absorbed by the
+    /// app's canonical-row-id upsert) instead of leaving a durable marker that
+    /// suppresses a notification nobody observed. A window this ordering
+    /// cannot close remains: `events_buf` is in-memory, so a process death
+    /// after the marker write but before the caller drains and persists the
+    /// event still loses it. That at-most-once property is shared by every
+    /// `GroupStateChanged` emission in the engine today (the commit-apply seam
+    /// has the same shape for all roster/admin/profile rows); making the event
+    /// channel durable — or reconciling on session open from `Group::removed`
+    /// at the app layer — is a systemic follow-up, not realization-specific.
     pub(crate) fn realize_self_eviction(
         &mut self,
         group_id: &GroupId,
@@ -1316,9 +1329,14 @@ impl<S: StorageProvider> Engine<S> {
         if group.removed {
             return Ok(());
         }
-        group.removed = true;
-        self.storage.put_group(&group)?;
-        self.clear_leave_request_state(group_id)?;
+        // OpenMLS's `Inactive` state does not record WHY our leaf left the
+        // tree. The durable leave request is local, authenticated intent to
+        // leave, so when one is pending the departure being realized is our
+        // own leave: attribute it as `MemberLeft` (actor = self), matching the
+        // direct seam's SelfRemove classification. Without one the removal is
+        // attributed as involuntary with an unknown actor — the accepted
+        // degradation when the removing commit itself was never applied.
+        let had_leave_request = self.load_leave_request_state(group_id)?.is_some();
         // Privacy-safe breadcrumb: aggregate signal only, no group/member ids
         // (observability.md).
         tracing::info!(
@@ -1326,18 +1344,27 @@ impl<S: StorageProvider> Engine<S> {
             method = "realize_self_eviction",
             "realized own removal for a group whose canonical state records eviction"
         );
-        // Actor unknown: the removing commit was not (or could not be)
-        // attributed here — realization derives from retained state, not from
-        // applying the specific removal commit.
-        self.push_group_state_change(
-            group_id,
-            epoch,
-            None,
-            GroupStateChange::MemberRemoved {
-                member: self.identity.self_id().clone(),
-            },
-            None,
-        );
+        let member = self.identity.self_id().clone();
+        let (actor, change) = if had_leave_request {
+            (
+                Some(member.clone()),
+                GroupStateChange::MemberLeft { member },
+            )
+        } else {
+            (None, GroupStateChange::MemberRemoved { member })
+        };
+        self.push_group_state_change(group_id, epoch, actor, change, None);
+        // Marker + roster reconciliation in one durable write: a removed copy
+        // must not keep presenting self as a member, so roster-gated callers
+        // (`members()`, hydrate restore checks, backfill) cannot disagree with
+        // the terminal marker. The seam and convergence paths already write
+        // the post-removal roster; this reconciles the pathological copy whose
+        // roster was never mirrored.
+        group.removed = true;
+        let self_id = self.identity.self_id().clone();
+        group.members.retain(|member| member.id != self_id);
+        self.storage.put_group(&group)?;
+        self.clear_leave_request_state(group_id)?;
         Ok(())
     }
 
