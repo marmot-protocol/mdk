@@ -336,9 +336,9 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Stage (don't merge) a commit that carries `AppDataUpdate` proposals,
     /// optionally alongside member removals, through the OpenMLS commit
-    /// builder. Every `Update` proposal is mirrored into the resulting
-    /// `app_data_dictionary` via the builder's dictionary updater, matching
-    /// what recipients compute in
+    /// builder. Every `Update` and `Remove` proposal is mirrored into the
+    /// resulting `app_data_dictionary` via the builder's dictionary updater,
+    /// matching what recipients compute in
     /// [`crate::openmls_projection::process_commit_with_app_data_updates`].
     /// Shared by the `UpdateAppComponents` path and the coupled admin-policy
     /// removal path in `do_send_remove_members`. `context` prefixes error
@@ -351,6 +351,22 @@ impl<S: StorageProvider> Engine<S> {
         proposals: Vec<Proposal>,
         context: &str,
     ) -> Result<MlsMessageOut, EngineError> {
+        // Mirror the receiver-side guard: a Remove of the negotiation
+        // component or a group-required component must fail at staging, not
+        // surface as a recipient-side rejection. Checked before the builder
+        // takes its mutable borrow of `mls_group`. No current caller produces
+        // a Remove (all send intents carry Update bytes); this keeps the
+        // shared helper in parity with the projection for future callers.
+        for proposal in &proposals {
+            if let Proposal::AppDataUpdate(update) = proposal
+                && matches!(update.operation(), AppDataUpdateOperation::Remove)
+            {
+                crate::app_components::validate_app_component_remove(
+                    mls_group,
+                    update.component_id(),
+                )?;
+            }
+        }
         let mut builder = mls_group
             .commit_builder()
             .propose_removals(removals)
@@ -363,11 +379,16 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("{context} load_psks: {e:?}")))?;
         let mut app_data = builder.app_data_dictionary_updater();
         for proposal in builder.app_data_update_proposals() {
-            if let AppDataUpdateOperation::Update(data) = proposal.operation() {
-                app_data.set(ComponentData::from_parts(
-                    proposal.component_id(),
-                    data.clone(),
-                ));
+            match proposal.operation() {
+                AppDataUpdateOperation::Update(data) => {
+                    app_data.set(ComponentData::from_parts(
+                        proposal.component_id(),
+                        data.clone(),
+                    ));
+                }
+                AppDataUpdateOperation::Remove => {
+                    app_data.remove(&proposal.component_id());
+                }
             }
         }
         builder.with_app_data_dictionary_updates(app_data.changes());
