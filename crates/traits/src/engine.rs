@@ -195,6 +195,19 @@ pub enum AppMessageInvalidationReason {
     UndecryptableInCanonicalState,
 }
 
+/// Why the state notifications attributed to a commit were withdrawn
+/// (spec `protocol-core/convergence.md` "Applying the selected branch"). The
+/// state-notification counterpart of [`AppMessageInvalidationReason`], carried
+/// by [`GroupEvent::GroupStateInvalidated`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupStateInvalidationReason {
+    /// Branch selection superseded a commit this client previously applied —
+    /// including the client's own published and confirmed commit — so every
+    /// state notification derived from that commit describes a change that,
+    /// canonically, never happened.
+    SupersededByBranchSelection,
+}
+
 /// Deterministic, content-derived ordering key used to resolve same-epoch
 /// commit races. Two replicas processing the same commit derive the same key
 /// from authenticated commit metadata and the same MLS wire bytes, independent
@@ -405,6 +418,35 @@ pub enum GroupEvent {
         group_id: GroupId,
         /// Transport-layer `MessageId` of the rolled-back (losing) commit.
         invalidated_commit_id: MessageId,
+    },
+    /// Every state notification attributed to `invalidated_commit_id` is
+    /// withdrawn: the application MUST treat the changes those
+    /// [`GroupEvent::GroupStateChanged`] events announced as not having
+    /// happened (spec `protocol-core/convergence.md` "Applying the selected
+    /// branch" and `protocol-core/inbound-processing.md` "Application-visible
+    /// output"). This is the state-notification counterpart of
+    /// [`GroupEvent::AppMessageInvalidated`], and it covers the client's own
+    /// published-and-confirmed commit when branch selection supersedes it —
+    /// e.g. a losing concurrent rename must not survive as a completed
+    /// "renamed the group" system row.
+    ///
+    /// The engine emits this alongside the commit-level rollback events
+    /// ([`GroupEvent::ForkRecovered`] on the direct staged-commit seam,
+    /// [`GroupEvent::CommitRolledBack`] on the stored-convergence seam), as the
+    /// explicit withdrawal signal for state notifications. `invalidated_commit_id`
+    /// is in the same identifier space as `origin_commit_id` on
+    /// [`GroupEvent::GroupStateChanged`], so withdrawal is an exact match over
+    /// previously synthesized notifications.
+    GroupStateInvalidated {
+        group_id: GroupId,
+        /// Source epoch the superseded commit branched from (the epoch of the
+        /// fork it lost).
+        epoch: EpochId,
+        /// Transport-layer `MessageId` of the superseded commit. Matches the
+        /// `origin_commit_id` stamped on every [`GroupEvent::GroupStateChanged`]
+        /// that commit produced.
+        invalidated_commit_id: MessageId,
+        reason: GroupStateInvalidationReason,
     },
     /// The group entered the `Unrecoverable` state: convergence reported a
     /// `MissingRetainedAnchor` inside the rollback horizon, so the client

@@ -488,6 +488,26 @@ impl AppClient {
             {
                 summary.projection_updates.push(projection_update);
             }
+            // Explicit state-notification withdrawal (convergence.md "Applying
+            // the selected branch"): branch selection superseded a previously
+            // applied commit — including this account's own published-and-
+            // confirmed commit — so every kind-1210 system row stamped with its
+            // origin commit id is invalidated. Idempotent alongside the
+            // `ForkRecovered` / `CommitRolledBack` handlers above, which fire
+            // for the same commit on their respective seams.
+            if let cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+                invalidated_commit_id,
+                reason,
+                ..
+            } = event
+                && let Some(projection_update) = self.app.invalidate_timeline_origin_commit(
+                    &self.state.label,
+                    &hex::encode(invalidated_commit_id.as_slice()),
+                    &format!("{reason:?}"),
+                )?
+            {
+                summary.projection_updates.push(projection_update);
+            }
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }

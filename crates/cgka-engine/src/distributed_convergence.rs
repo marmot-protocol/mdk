@@ -14,7 +14,9 @@ use crate::openmls_projection::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateChange};
+use cgka_traits::engine::{
+    AppMessageInvalidationReason, GroupEvent, GroupStateChange, GroupStateInvalidationReason,
+};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
@@ -693,6 +695,13 @@ impl<S: StorageProvider> Engine<S> {
     /// and the app-side tombstone is a no-op when no row carries the commit id,
     /// so emitting here is idempotent and safe even for commits this client
     /// never applied.
+    ///
+    /// Each rolled-back commit also gets a [`GroupEvent::GroupStateInvalidated`]:
+    /// the spec-required explicit withdrawal of every state notification
+    /// attributed to the superseded commit (convergence.md "Applying the
+    /// selected branch"). This covers the client's own published-and-confirmed
+    /// commit when it loses branch selection through the stored-convergence
+    /// seam, mirroring the direct seam's `ForkRecovered` pairing.
     fn emit_rolled_back_commits(
         &mut self,
         group_id: &GroupId,
@@ -707,10 +716,29 @@ impl<S: StorageProvider> Engine<S> {
             {
                 continue;
             }
+            let invalidated_commit_id = message_id_from_hex(&dropped.message_id)?;
+            // The stored record's epoch is the commit's source epoch (the fork
+            // it lost). Best-effort: fall back to the selected branch's fork
+            // epoch when the record is gone — the id-matched withdrawal is what
+            // conformance requires; the epoch is presentation metadata.
+            let epoch = self
+                .storage
+                .get_message(&invalidated_commit_id)
+                .map(|record| record.epoch)
+                .unwrap_or(EpochId(
+                    result.selected_fork_epoch.unwrap_or(result.previous_tip),
+                ));
             self.events_buf.push_back(GroupEvent::CommitRolledBack {
                 group_id: group_id.clone(),
-                invalidated_commit_id: message_id_from_hex(&dropped.message_id)?,
+                invalidated_commit_id: invalidated_commit_id.clone(),
             });
+            self.events_buf
+                .push_back(GroupEvent::GroupStateInvalidated {
+                    group_id: group_id.clone(),
+                    epoch,
+                    invalidated_commit_id,
+                    reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+                });
         }
         Ok(())
     }

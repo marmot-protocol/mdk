@@ -19,6 +19,7 @@ use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::SnapshotRollbackGuard;
 use cgka_traits::engine::{
     AutoPublish, CommitOrderingKey, CommitOrderingPriority, GroupEvent, GroupStateChange,
+    GroupStateInvalidationReason,
 };
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
@@ -793,8 +794,21 @@ impl<S: StorageProvider> Engine<S> {
                             recovered_epoch: after,
                             winner,
                             invalidated,
-                            invalidated_commit_id,
+                            invalidated_commit_id: invalidated_commit_id.clone(),
                         });
+                        // Branch selection superseded the previously applied
+                        // commit (including our own published-and-confirmed
+                        // commit), so every state notification attributed to it
+                        // is withdrawn before the winning commit's fresh
+                        // `GroupStateChanged` events are synthesized below
+                        // (convergence.md "Applying the selected branch").
+                        self.events_buf
+                            .push_back(GroupEvent::GroupStateInvalidated {
+                                group_id: group_id.clone(),
+                                epoch: source_epoch,
+                                invalidated_commit_id,
+                                reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+                            });
                     }
                     self.events_buf.push_back(GroupEvent::EpochChanged {
                         group_id: group_id.clone(),
