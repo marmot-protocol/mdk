@@ -114,6 +114,21 @@ pub fn tighten_existing_private_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Make a SQLite database owner-only before SQLite can create it at the
+/// process umask: pre-create the main file 0600 (SQLite then copies its mode
+/// onto the `-wal`/`-shm`/journal sidecars it creates) and tighten any
+/// sidecars left behind by earlier permissive builds — SQLite does not
+/// rewrite pre-existing sidecar modes when the main file's mode changes.
+pub fn ensure_private_db_files(path: &Path) -> io::Result<()> {
+    ensure_private_file(path)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        tighten_existing_private_file(Path::new(&sidecar))?;
+    }
+    Ok(())
+}
+
 fn set_handle_private(file: &std::fs::File) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -311,6 +326,26 @@ mod unix_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         tighten_existing_private_file(&path).unwrap();
         assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn ensure_private_db_files_tightens_main_db_and_stale_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cache.sqlite");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let path = dir.path().join(format!("cache.sqlite{suffix}"));
+            std::fs::write(&path, b"x").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        ensure_private_db_files(&db).unwrap();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let path = dir.path().join(format!("cache.sqlite{suffix}"));
+            assert_eq!(mode_of(&path), 0o600, "suffix {suffix:?}");
+        }
+        // Missing sidecars are fine.
+        let fresh = dir.path().join("fresh.sqlite");
+        ensure_private_db_files(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o600);
     }
 
     #[test]

@@ -469,18 +469,9 @@ impl SqliteAccountStorage {
 }
 
 /// Make a database file owner-only before SQLite can create it at the process
-/// umask: pre-create the main file 0600 (SQLite then copies its mode onto
-/// `-wal`/`-shm`/journal sidecars it creates) and tighten any sidecars left
-/// behind by earlier builds.
+/// umask; see `fs_private::ensure_private_db_files` for the sidecar rules.
 pub(crate) fn ensure_private_db_files(path: &Path) -> StorageResult<()> {
-    fs_private::ensure_private_file(path).map_err(|err| StorageError::Backend(err.to_string()))?;
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        fs_private::tighten_existing_private_file(Path::new(&sidecar))
-            .map_err(|err| StorageError::Backend(err.to_string()))?;
-    }
-    Ok(())
+    fs_private::ensure_private_db_files(path).map_err(|err| StorageError::Backend(err.to_string()))
 }
 
 fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) -> StorageResult<()> {
