@@ -14,6 +14,7 @@ agent-control.workspace = true
 agent-stream-compose.workspace = true
 cgka-traits.workspace = true
 clap.workspace = true
+fs-private.workspace = true
 hex.workspace = true
 sha2.workspace = true
 libc.workspace = true

@@ -164,14 +164,14 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let socket = args.socket.unwrap_or_else(|| default_socket_path(&home));
-    let socket_dir_mode = match parse_octal_mode(&args.socket_dir_mode) {
+    let socket_dir_mode = match fs_private::parse_octal_mode(&args.socket_dir_mode) {
         Ok(mode) => mode,
         Err(message) => {
             eprintln!("dm-agent: startup failed code=invalid_socket_mode detail={message}");
             return ExitCode::FAILURE;
         }
     };
-    let socket_mode = match parse_octal_mode(&args.socket_mode) {
+    let socket_mode = match fs_private::parse_octal_mode(&args.socket_mode) {
         Ok(mode) => mode,
         Err(message) => {
             eprintln!("dm-agent: startup failed code=invalid_socket_mode detail={message}");
@@ -313,16 +313,6 @@ fn which_qrencode() -> Option<String> {
 
 fn safe_error_message(err: &ConnectorError) -> String {
     format!("startup failed code={}", err.privacy_safe_code())
-}
-
-fn parse_octal_mode(value: &str) -> Result<u32, String> {
-    let value = value.trim();
-    let value = value.strip_prefix("0o").unwrap_or(value);
-    let value = value.strip_prefix('0').unwrap_or(value);
-    if value.is_empty() || value.len() > 3 || !value.chars().all(|ch| ('0'..='7').contains(&ch)) {
-        return Err(format!("expected three octal digits, got {value:?}"));
-    }
-    u32::from_str_radix(value, 8).map_err(|err| err.to_string())
 }
 
 fn read_auth_token(path: Option<&PathBuf>) -> Result<Option<String>, String> {

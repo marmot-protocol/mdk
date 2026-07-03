@@ -45,6 +45,7 @@ dependencies = [
  "agent-stream-compose",
  "cgka-traits",
  "clap",
+ "fs-private",
  "hex",
  "libc",
  "marmot-account",
