@@ -458,12 +458,15 @@ impl SqliteAccountStorage {
             // Fetch all rows the commit synthesized. They all share one group (a
             // commit belongs to a single group), so one rebuild + change set covers
             // them. `origin_commit_id` is non-unique by design (multi-row-per-commit).
+            // Already-invalidated rows are excluded so a replayed or duplicate
+            // withdrawal event is a no-op: it neither rewrites the recorded
+            // invalidation reason nor produces a redundant projection update.
             let rows: Vec<(String, String, u64, Vec<Vec<String>>)> = {
                 let mut stmt = conn
                     .prepare(
                         "SELECT group_id_hex, message_id_hex, kind, tags_json
                          FROM app_events
-                         WHERE origin_commit_id = ?1",
+                         WHERE origin_commit_id = ?1 AND invalidated = 0",
                     )
                     .storage()?;
                 stmt.query_map(params![origin_commit_id], |row| {
@@ -502,7 +505,7 @@ impl SqliteAccountStorage {
             conn.execute(
                 "UPDATE app_events
                  SET invalidated = 1, invalidation_reason = ?2
-                 WHERE origin_commit_id = ?1",
+                 WHERE origin_commit_id = ?1 AND invalidated = 0",
                 params![origin_commit_id, reason],
             )
             .storage()?;

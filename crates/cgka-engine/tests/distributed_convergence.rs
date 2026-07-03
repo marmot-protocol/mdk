@@ -1553,6 +1553,33 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
         )),
         "expected CommitRolledBack for the losing commit, got {events:?}"
     );
+    // (b') Issue #363 / spec convergence.md "Applying the selected branch": the
+    // stored-convergence seam must also emit the explicit state-notification
+    // withdrawal naming the superseded commit, so every `GroupStateChanged`
+    // attributed to it is treated as not having happened.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateInvalidated {
+                group_id: g,
+                epoch,
+                invalidated_commit_id,
+                reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+            } if g == &group_id
+                && *invalidated_commit_id == losing_commit_id
+                && epoch.0 == 1
+        )),
+        "expected GroupStateInvalidated for the losing commit, got {events:?}"
+    );
+    // The winning (accepted) commit's notifications are never withdrawn.
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateInvalidated { invalidated_commit_id, .. }
+                if *invalidated_commit_id == winning_commit_id
+        )),
+        "the accepted commit must not be named by a withdrawal, got {events:?}"
+    );
     // No ForkRecovered fires here: this is the convergence path, not the direct
     // staged-commit seam.
     assert!(

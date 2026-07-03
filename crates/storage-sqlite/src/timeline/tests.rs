@@ -229,6 +229,46 @@ fn invalidate_by_origin_commit_tombstones_all_rows_from_one_commit() {
 }
 
 #[test]
+fn invalidate_by_origin_commit_is_a_noop_for_already_invalidated_rows() {
+    // The engine can name the same superseded commit more than once (e.g. a
+    // replayed withdrawal event). The second invalidation must be a no-op: it
+    // returns no projection update and does not overwrite the recorded reason.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&group_system_from_commit(
+            "losing-added",
+            "member_added",
+            10,
+            "commit-losing",
+        ))
+        .unwrap();
+
+    assert!(
+        store
+            .invalidate_app_events_by_origin_commit("commit-losing", "SupersededByBranchSelection",)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .invalidate_app_events_by_origin_commit("commit-losing", "LosingBranch")
+            .unwrap()
+            .is_none(),
+        "re-invalidating the same commit must be a no-op"
+    );
+    let rows = list(&store);
+    let status = rows
+        .iter()
+        .find(|row| row.message_id_hex == "losing-added")
+        .map(|row| row.invalidation_status.clone());
+    assert_eq!(
+        status,
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "the first recorded reason must survive a duplicate withdrawal"
+    );
+}
+
+#[test]
 fn invalidate_by_origin_commit_returns_none_when_no_rows_match() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store

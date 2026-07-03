@@ -1,7 +1,9 @@
 //! Top-level event firehose FFI conversion.
 
 use cgka_traits::GroupId;
-use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateChange};
+use cgka_traits::engine::{
+    AppMessageInvalidationReason, GroupEvent, GroupStateChange, GroupStateInvalidationReason,
+};
 use marmot_app::{AppGroupHydrationQuarantineReason, MarmotAppEvent};
 
 use super::group::AppGroupHydrationQuarantineReasonFfi;
@@ -20,6 +22,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
         | GroupEvent::EpochChanged { group_id, .. }
         | GroupEvent::ForkRecovered { group_id, .. }
         | GroupEvent::CommitRolledBack { group_id, .. }
+        | GroupEvent::GroupStateInvalidated { group_id, .. }
         | GroupEvent::GroupUnrecoverable { group_id, .. }
         | GroupEvent::PendingCommitRecovered { group_id, .. }
         | GroupEvent::GroupHydrationQuarantined { group_id, .. }
@@ -117,6 +120,16 @@ pub enum GroupEventKindFfi {
     CommitRolledBack {
         invalidated_commit_id_hex: String,
     },
+    /// Explicit withdrawal of every `GroupStateChanged` notification whose
+    /// `origin_commit_id_hex` matches `invalidated_commit_id_hex`: branch
+    /// selection superseded that commit, so the changes it announced never
+    /// canonically happened. `reason` is a stable low-cardinality tag
+    /// (`superseded_by_branch_selection`).
+    GroupStateInvalidated {
+        epoch: u64,
+        invalidated_commit_id_hex: String,
+        reason: String,
+    },
     GroupUnrecoverable,
     PendingCommitRecovered {
         recovered_epoch: u64,
@@ -140,6 +153,15 @@ fn group_state_change_tag(change: &GroupStateChange) -> &'static str {
         GroupStateChange::GroupRenamed { .. } => "group_renamed",
         GroupStateChange::GroupAvatarChanged => "group_avatar_changed",
         GroupStateChange::MessageRetentionChanged { .. } => "disappearing_timer_changed",
+    }
+}
+
+/// Stable, low-cardinality tag for a [`GroupStateInvalidationReason`].
+fn group_state_invalidation_reason_tag(reason: &GroupStateInvalidationReason) -> &'static str {
+    match reason {
+        GroupStateInvalidationReason::SupersededByBranchSelection => {
+            "superseded_by_branch_selection"
+        }
     }
 }
 
@@ -219,6 +241,16 @@ impl From<GroupEvent> for GroupEventKindFfi {
                 ..
             } => Self::CommitRolledBack {
                 invalidated_commit_id_hex: hex::encode(invalidated_commit_id.as_slice()),
+            },
+            GroupEvent::GroupStateInvalidated {
+                epoch,
+                invalidated_commit_id,
+                reason,
+                ..
+            } => Self::GroupStateInvalidated {
+                epoch: epoch.0,
+                invalidated_commit_id_hex: hex::encode(invalidated_commit_id.as_slice()),
+                reason: group_state_invalidation_reason_tag(&reason).to_string(),
             },
             GroupEvent::GroupUnrecoverable { .. } => Self::GroupUnrecoverable,
             GroupEvent::PendingCommitRecovered {

@@ -2064,6 +2064,129 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
     );
 }
 
+/// Issue #363 app-layer regression: a `GroupStateInvalidated` event flowing
+/// through the sync loop's invalidation dispatch must tombstone every
+/// persisted kind-1210 system row stamped with the superseded commit's
+/// `origin_commit_id` — and only those rows. A duplicate withdrawal must be a
+/// projection no-op.
+#[test]
+fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: None,
+        groups: vec![AppGroupRecord::new(
+            "aa".to_owned(),
+            AppGroupNostrRoutingComponent::new(
+                NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+            )
+            .unwrap(),
+            "alpha".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )],
+    })
+    .unwrap();
+
+    let losing_commit_id = cgka_traits::types::MessageId::new(vec![0xBE; 32]);
+    let system_row =
+        |message_id_hex: &str, origin_commit_id: Option<String>| AppMessageProjection {
+            message_id_hex: message_id_hex.to_owned(),
+            // Synthesized system rows carry no source id (see
+            // build_group_system_projection); origin_commit_id is the 1:N link.
+            source_message_id_hex: None,
+            direction: "system".to_owned(),
+            group_id_hex: "aa".to_owned(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "renamed the group".to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+            tags: Vec::new(),
+            source_epoch: Some(2),
+            recorded_at: Some(10),
+            origin_commit_id,
+        };
+    // The losing commit synthesized this row (the "B renamed the group" lie).
+    app.record_account_app_event(
+        "alice",
+        &system_row(
+            "losing-rename",
+            Some(hex::encode(losing_commit_id.as_slice())),
+        ),
+    )
+    .unwrap();
+    // A different (winning) commit's row must survive the withdrawal.
+    app.record_account_app_event(
+        "alice",
+        &system_row("winning-rename", Some("cf".repeat(32))),
+    )
+    .unwrap();
+
+    let withdrawal = cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+        group_id: GroupId::new(vec![0xAA]),
+        epoch: cgka_traits::EpochId(1),
+        invalidated_commit_id: losing_commit_id,
+        reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+    };
+    let update = app
+        .projection_update_for_invalidation_event("alice", &withdrawal)
+        .unwrap()
+        .expect("withdrawal must invalidate the stamped system row");
+    assert_eq!(update.group_id_hex, "aa");
+
+    let rows = app
+        .timeline_messages_with_query(
+            "alice",
+            storage_sqlite::TimelineMessageQuery {
+                group_id_hex: Some("aa".to_owned()),
+                ..storage_sqlite::TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    let status = |id: &str| {
+        rows.iter()
+            .find(|row| row.message_id_hex == id)
+            .map(|row| row.invalidation_status.clone())
+    };
+    assert_eq!(
+        status("losing-rename"),
+        Some(Some("SupersededByBranchSelection".to_owned())),
+        "the superseded commit's row must be tombstoned with the withdrawal reason"
+    );
+    assert_eq!(
+        status("winning-rename"),
+        Some(None),
+        "rows attributed to other commits must stay live"
+    );
+
+    // Duplicate withdrawal (replayed event): projection no-op, reason kept.
+    assert!(
+        app.projection_update_for_invalidation_event("alice", &withdrawal)
+            .unwrap()
+            .is_none(),
+        "a replayed withdrawal must not produce another projection update"
+    );
+    // Events that carry no timeline invalidation dispatch to None.
+    assert!(
+        app.projection_update_for_invalidation_event(
+            "alice",
+            &cgka_traits::engine::GroupEvent::CommitRolledBack {
+                group_id: GroupId::new(vec![0xAA]),
+                invalidated_commit_id: cgka_traits::types::MessageId::new(vec![0xCF; 32]),
+            },
+        )
+        .unwrap()
+        .is_none(),
+        "commit-level rollback events must not tombstone; GroupStateInvalidated is authoritative"
+    );
+}
+
 // Finding 2: an in-place nostr_group_id / relay rotation on an existing group
 // must switch the transport subscription. `add_group` previously early-returned
 // on a duplicate group_id, so a rotated route never took effect; it now replaces

@@ -14,7 +14,9 @@ use crate::openmls_projection::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateChange};
+use cgka_traits::engine::{
+    AppMessageInvalidationReason, GroupEvent, GroupStateChange, GroupStateInvalidationReason,
+};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::TransportMessage;
@@ -433,6 +435,7 @@ impl<S: StorageProvider> Engine<S> {
         self.emit_application_replay_events(group_id, &observations);
         self.emit_invalidated_app_events(group_id, &result)?;
         self.emit_rolled_back_commits(group_id, &result)?;
+        self.emit_superseded_processed_commits(group_id, &result)?;
 
         // A selected branch reached the canonical state (Settled): the run is
         // applied/stable. With no selected branch the pass simply settled with
@@ -713,6 +716,13 @@ impl<S: StorageProvider> Engine<S> {
     /// and the app-side tombstone is a no-op when no row carries the commit id,
     /// so emitting here is idempotent and safe even for commits this client
     /// never applied.
+    ///
+    /// Each rolled-back commit also gets a [`GroupEvent::GroupStateInvalidated`]:
+    /// the spec-required explicit withdrawal of every state notification
+    /// attributed to the superseded commit (convergence.md "Applying the
+    /// selected branch"). This covers the client's own published-and-confirmed
+    /// commit when it loses branch selection through the stored-convergence
+    /// seam, mirroring the direct seam's `ForkRecovered` pairing.
     fn emit_rolled_back_commits(
         &mut self,
         group_id: &GroupId,
@@ -727,10 +737,125 @@ impl<S: StorageProvider> Engine<S> {
             {
                 continue;
             }
+            let invalidated_commit_id = message_id_from_hex(&dropped.message_id)?;
+            // The stored record's epoch is the commit's source epoch (the fork
+            // it lost). A missing record falls back to the selected branch's
+            // fork epoch — the id-matched withdrawal is what conformance
+            // requires; the epoch is presentation metadata. Any other storage
+            // failure propagates: masking a locked/corrupt backend here would
+            // emit a fabricated epoch and hide the failure from the caller.
+            let epoch = match self.storage.get_message(&invalidated_commit_id) {
+                Ok(record) => record.epoch,
+                Err(StorageError::NotFound) => {
+                    EpochId(result.selected_fork_epoch.unwrap_or(result.previous_tip))
+                }
+                Err(e) => return Err(OpenMlsProjectionError::Storage(format!("{e:?}"))),
+            };
             self.events_buf.push_back(GroupEvent::CommitRolledBack {
                 group_id: group_id.clone(),
-                invalidated_commit_id: message_id_from_hex(&dropped.message_id)?,
+                invalidated_commit_id: invalidated_commit_id.clone(),
             });
+            self.events_buf
+                .push_back(GroupEvent::GroupStateInvalidated {
+                    group_id: group_id.clone(),
+                    epoch,
+                    invalidated_commit_id,
+                    reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+                });
+        }
+        Ok(())
+    }
+
+    /// Withdraw every commit this device PREVIOUSLY APPLIED (stored state
+    /// `Processed`) that a convergence apply left off the selected branch.
+    ///
+    /// The canonicalization drop set only covers commits the candidate BFS
+    /// could materialize. A device's OWN published-and-confirmed commit is not
+    /// replayable through `process_message` (MLS cannot process own messages),
+    /// so when a reorg supersedes it — e.g. after a restart cleared the
+    /// in-memory `committed_from` guard and routed a same-epoch sibling into
+    /// stored convergence — the own commit gets no disposition at all: no
+    /// `CommitRolledBack`, no withdrawal, and the confirm-time
+    /// `GroupStateChanged` rows survive as the issue #363 lie.
+    ///
+    /// Spec (convergence.md "Applying the selected branch"): branch selection
+    /// superseding "a commit the client previously applied — including the
+    /// client's own published and confirmed commit" MUST withdraw the state
+    /// notifications attributed to it. `Processed` is exactly "previously
+    /// applied"; not on the accepted path at or above the selected fork epoch
+    /// is exactly "superseded". Commits the drop set already covered are
+    /// skipped so each supersession is reported once.
+    fn emit_superseded_processed_commits(
+        &mut self,
+        group_id: &GroupId,
+        result: &CanonicalizationResult,
+    ) -> Result<(), OpenMlsProjectionError> {
+        if result.selected_tip.is_none() {
+            return Ok(());
+        }
+        let Some(fork_epoch) = result.selected_fork_epoch else {
+            return Ok(());
+        };
+        let accepted: std::collections::BTreeSet<&str> =
+            result.accepted_commits.iter().map(String::as_str).collect();
+        let records = self
+            .storage
+            .list_messages(group_id, EpochId(0))
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        for record in records {
+            if record.state != MessageState::Processed || record.epoch.0 < fork_epoch {
+                continue;
+            }
+            let payload = StoredMessagePayload::decode(&record.payload)
+                .map_err(|e| OpenMlsProjectionError::Serialize(format!("{e:?}")))?;
+            let Some(message) = payload.as_openmls_wire() else {
+                continue;
+            };
+            if project_mls_message(&message.payload)?.kind != OpenMlsContentKind::Commit {
+                continue;
+            }
+            let record_id_hex = hex::encode(record.id.as_slice());
+            // The same MLS bytes can be keyed by the wrap-time transport id
+            // (own sent commits) or the content dedup id (inbound commits), so
+            // acceptance is checked under both aliases before declaring the
+            // record superseded.
+            let content_id_hex = hex::encode(
+                crate::message_processor::content_dedup_id(&message.payload).as_slice(),
+            );
+            if accepted.contains(record_id_hex.as_str())
+                || accepted.contains(content_id_hex.as_str())
+            {
+                continue;
+            }
+            if result
+                .dropped_messages
+                .iter()
+                .any(|dropped| dropped.message_id == record_id_hex)
+            {
+                continue;
+            }
+            self.storage
+                .update_message_state(&record.id, MessageState::EpochInvalidated)
+                .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+            self.audit_group(
+                group_id,
+                crate::audit_helpers::message_state_changed_event(
+                    record_id_hex,
+                    MessageState::EpochInvalidated,
+                    "superseded_processed_commit",
+                ),
+            );
+            self.events_buf.push_back(GroupEvent::CommitRolledBack {
+                group_id: group_id.clone(),
+                invalidated_commit_id: record.id.clone(),
+            });
+            self.events_buf
+                .push_back(GroupEvent::GroupStateInvalidated {
+                    group_id: group_id.clone(),
+                    epoch: record.epoch,
+                    invalidated_commit_id: record.id,
+                    reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+                });
         }
         Ok(())
     }

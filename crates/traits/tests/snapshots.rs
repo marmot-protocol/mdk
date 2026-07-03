@@ -14,8 +14,8 @@ use cgka_traits::capabilities::{
 };
 use cgka_traits::engine::{
     AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    GroupEvent, GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent,
-    SendResult,
+    GroupEvent, GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason,
+    KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
@@ -528,6 +528,15 @@ fn snapshot_group_events() {
         GroupEvent::CommitRolledBack {
             group_id: gid(),
             invalidated_commit_id: mid(),
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_group_state_invalidated",
+        GroupEvent::GroupStateInvalidated {
+            group_id: gid(),
+            epoch: EpochId(1),
+            invalidated_commit_id: mid(),
+            reason: GroupStateInvalidationReason::SupersededByBranchSelection,
         }
     );
     insta::assert_json_snapshot!(

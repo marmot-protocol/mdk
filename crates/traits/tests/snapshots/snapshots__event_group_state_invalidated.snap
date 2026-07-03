@@ -1,0 +1,22 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::GroupStateInvalidated\n{\n    group_id: gid(), epoch: EpochId(1), invalidated_commit_id: mid(), reason:\n    GroupStateInvalidationReason::SupersededByBranchSelection,\n}"
+---
+{
+  "GroupStateInvalidated": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "epoch": 1,
+    "invalidated_commit_id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "reason": "SupersededByBranchSelection"
+  }
+}
