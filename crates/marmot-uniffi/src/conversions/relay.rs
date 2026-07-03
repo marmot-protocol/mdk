@@ -54,11 +54,30 @@ impl From<RelayTelemetryResourceFfi> for RelayTelemetryResource {
     }
 }
 
-#[derive(Clone, Debug, uniffi::Record)]
+/// Relay-telemetry runtime config supplied by the host app. The hand-written
+/// `Debug` impl below redacts `authorization_bearer_token` (the OTLP push
+/// credential) so a `{:?}` never prints it.
+#[derive(Clone, uniffi::Record)]
 pub struct RelayTelemetryRuntimeConfigFfi {
     pub otlp_endpoint: Option<String>,
     pub authorization_bearer_token: Option<String>,
     pub resource: Option<RelayTelemetryResourceFfi>,
+}
+
+impl std::fmt::Debug for RelayTelemetryRuntimeConfigFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayTelemetryRuntimeConfigFfi")
+            .field("otlp_endpoint", &self.otlp_endpoint)
+            .field(
+                "authorization_bearer_token",
+                &self
+                    .authorization_bearer_token
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("resource", &self.resource)
+            .finish()
+    }
 }
 
 impl From<RelayTelemetryRuntimeConfigFfi> for RelayTelemetryRuntimeConfig {
@@ -161,5 +180,23 @@ impl From<RelayPlaneHealth> for RelayHealthFfi {
             connection_attempts: value.connection_attempts as u32,
             connection_successes: value.connection_successes as u32,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_telemetry_config_debug_redacts_bearer_token() {
+        let config = RelayTelemetryRuntimeConfigFfi {
+            otlp_endpoint: Some("https://otlp.example/v1/metrics".to_owned()),
+            authorization_bearer_token: Some("super-secret-otlp-token".to_owned()),
+            resource: None,
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("super-secret-otlp-token"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("otlp.example"), "{rendered}");
     }
 }
