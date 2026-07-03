@@ -55,6 +55,9 @@ Agent map for the Marmot architecture docs.
 - **Path:** `audit-logging.md`
   - **Role:** Current implementation inventory for opt-in forensic JSONL logs: file identity, event kinds/metadata, and upload/tracker behavior.
 
+- **Path:** `runtime-state-bounds.md`
+  - **Role:** Inventory of long-lived daemon/broker runtime structures with their bounds and eviction/reclamation rules; the tracked-resource discipline for new long-lived state.
+
 - **Path:** `hermes-agent-production-runbook.md`
   - **Role:** Draft operational runbook for the Hermes agent deployment. Check status and dates before relying on it.
 
