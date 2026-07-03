@@ -2635,6 +2635,7 @@ dependencies = [
 name = "marmot-forensics"
 version = "0.2.0"
 dependencies = [
+ "fs-private",
  "serde",
  "serde_json",
  "tempfile",

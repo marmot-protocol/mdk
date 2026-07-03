@@ -35,7 +35,7 @@
 //! ([`ForensicRecorder::set_data_mode`]) rotates the backing store so each
 //! file has a single, unambiguous mode boundary.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -1131,7 +1131,11 @@ impl JsonlRecorder {
             validate_account_ref_hex(account_ref)?;
         }
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Owner-only from creation: in FullData mode this file carries
+        // decrypted content and full identifiers, so it must never exist at
+        // umask-default permissions. Pre-existing permissive files are
+        // tightened by the helper.
+        let file = fs_private::open_private_append(&path)?;
         let recorder_session_id = generate_recorder_session_id();
         let recorder = Self {
             path,
@@ -1333,13 +1337,10 @@ impl JsonlRecorder {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        // Open a brand-new file at the same path and swap it in. Assigning to
-        // `inner.writer` drops the old `BufWriter`, closing the stale (unlinked)
-        // fd.
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        // Open a brand-new owner-only file at the same path and swap it in.
+        // Assigning to `inner.writer` drops the old `BufWriter`, closing the
+        // stale (unlinked) fd.
+        let file = fs_private::open_private_append(&self.path)?;
         inner.writer = BufWriter::new(file);
         inner.seq = 0;
         inner.recorder_session_id = generate_recorder_session_id();
