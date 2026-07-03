@@ -1088,6 +1088,7 @@ dependencies = [
  "cgka-traits",
  "clap",
  "crossterm",
+ "fs-private",
  "hex",
  "libc",
  "marmot-account",

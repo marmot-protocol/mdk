@@ -23,6 +23,7 @@ cgka-traits.workspace = true
 cgka-session.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+fs-private.workspace = true
 hex.workspace = true
 libc.workspace = true
 marmot-account.workspace = true

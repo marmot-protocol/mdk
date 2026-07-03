@@ -461,6 +461,14 @@ async fn connector_socket_bind_applies_configured_group_modes() {
         socket.metadata().unwrap().permissions().mode() & 0o777,
         0o660
     );
+    let staging = socket
+        .parent()
+        .unwrap()
+        .join(format!(".sock.{}", std::process::id()));
+    assert!(
+        !staging.exists(),
+        "staging dir should be removed after bind"
+    );
 }
 
 #[tokio::test]

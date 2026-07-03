@@ -61,6 +61,67 @@ fn daemon_pid_and_log_writers_create_private_files() {
     );
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn daemon_socket_is_owner_only_after_bind() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("dmd.sock");
+    let relay = MockRelay::run().await.expect("start mock relay");
+    let relay_url = relay.url().await.to_string();
+    let args = DaemonArgs {
+        home: Some(home.path().to_path_buf()),
+        data_dir: None,
+        logs_dir: None,
+        socket: Some(socket.clone()),
+        relay: Some(relay_url),
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: Some(crate::SecretStoreKind::File),
+        keychain_service: Some("dm-test-keychain".to_owned()),
+    };
+    let server = tokio::spawn(run_server(args));
+    for _ in 0..50 {
+        if socket.try_exists().expect("socket existence check") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.try_exists().expect("socket existence check"));
+
+    assert_eq!(
+        socket
+            .metadata()
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let staging = socket
+        .parent()
+        .expect("socket parent")
+        .join(format!(".sock.{}", std::process::id()));
+    assert!(
+        !staging.exists(),
+        "staging dir should be removed after bind"
+    );
+
+    let shutdown_output = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_request(&socket, &DaemonRequest::Shutdown),
+    )
+    .await
+    .expect("shutdown request should not time out")
+    .expect("shutdown request should succeed");
+    assert_eq!(shutdown_output.code, 0);
+
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server task should not time out")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+}
+
 #[test]
 fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
     let defaults = DaemonDefaults {

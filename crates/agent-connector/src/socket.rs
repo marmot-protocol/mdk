@@ -26,16 +26,23 @@ pub fn bind_connector_socket_with_mode(
     if let Some(parent) = socket.parent() {
         prepare_socket_dir(parent, socket_dir_mode)?;
     }
-    let listener = match UnixListener::bind(socket) {
+    let listener = match bind_private(socket, socket_mode) {
         Ok(listener) => listener,
         Err(error) if error.kind() == ErrorKind::AddrInUse => {
             remove_stale_socket(socket, &error)?;
-            UnixListener::bind(socket)?
+            bind_private(socket, socket_mode)?
         }
         Err(error) => return Err(error.into()),
     };
-    harden_socket_permissions(socket, socket_mode)?;
     Ok(listener)
+}
+
+/// Bind through a 0700 staging dir so the socket never exists at
+/// umask-default permissions, even when `socket_dir_mode` is group-accessible.
+fn bind_private(socket: &Path, socket_mode: u32) -> std::io::Result<UnixListener> {
+    let listener = fs_private::bind_unix_listener_private(socket, socket_mode)?;
+    listener.set_nonblocking(true)?;
+    UnixListener::from_std(listener)
 }
 
 fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::Result<()> {
@@ -74,10 +81,6 @@ fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::R
 fn prepare_socket_dir(parent: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(parent)?;
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode))
-}
-
-fn harden_socket_permissions(socket: &Path, mode: u32) -> std::io::Result<()> {
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(mode))
 }
 
 pub(crate) fn current_effective_uid() -> libc::uid_t {
