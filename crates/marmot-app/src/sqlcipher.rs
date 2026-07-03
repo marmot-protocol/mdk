@@ -6,8 +6,7 @@
 //! crash-safe salt-write/rekey sequence, and recovery for interrupted or
 //! pre-fix bricked migrations.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use hkdf::Hkdf;
@@ -185,15 +184,11 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AppError> {
         path.with_file_name(tmp_name)
     };
 
-    {
-        let mut tmp = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        tmp.write_all(contents)?;
-        tmp.sync_all()?;
-    }
+    // Owner-only from creation: the salt is key-derivation material and the
+    // rename target inherits the temp file's mode. write_private also
+    // tightens the inode before writing, so a leftover permissive temp file
+    // from an older build (or pid reuse) cannot smuggle its mode into place.
+    fs_private::write_private(&tmp_path, contents)?;
 
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
@@ -378,6 +373,47 @@ mod tests {
         assert_ne!(session_key.as_secret_str(), projection_key.as_secret_str());
         assert!(sqlcipher_salt_path(&session_path).exists());
         assert!(sqlcipher_salt_path(&projection_path).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sqlcipher_salt_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let salt_path = dir.path().join("session.sqlite.salt");
+        write_sqlcipher_salt(&salt_path, &[0x5a; SQLCIPHER_SALT_LEN]).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&salt_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "salt is key-derivation material and must be owner-only"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn leftover_permissive_salt_temp_file_does_not_leak_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let salt_path = dir.path().join("session.sqlite.salt");
+        // A crashed older build (or pid reuse) left the temp file behind at
+        // umask-default permissions; the rewrite must not rename that mode
+        // into the final salt path.
+        let tmp_path = dir
+            .path()
+            .join(format!("session.sqlite.salt.tmp.{}", std::process::id()));
+        std::fs::write(&tmp_path, b"stale").unwrap();
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_sqlcipher_salt(&salt_path, &[0x5a; SQLCIPHER_SALT_LEN]).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&salt_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "final salt must be owner-only even when the temp inode pre-existed"
+        );
     }
 
     #[test]

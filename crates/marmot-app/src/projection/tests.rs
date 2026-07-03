@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+#[cfg(unix)]
+fn legacy_projection_db_is_owner_only_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("test-key").unwrap();
+    let path = dir.path().join("app.sqlite3");
+    let _db = LegacyAccountProjectionDb::open(path.clone(), &key).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn save_state_rolls_back_all_tables_when_component_write_fails() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("test-key").unwrap();

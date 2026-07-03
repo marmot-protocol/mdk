@@ -9,6 +9,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Security
 
+- The `dmd` daemon control socket (and the `dm-agent` connector socket) is now created owner-only (0600)
+  atomically — bound inside a private 0700 staging directory and linked into place — instead of being chmod-ed
+  after `bind`, removing the brief window where the socket was reachable at umask-default permissions (for
+  example under a caller-supplied `--socket` in a pre-existing shared directory).
 - Daemon auto-watch of inbound agent stream starts (kind:1200) no longer derives no-cert-verification
   (`insecure_local`) trust from the sender-controlled `quic://` candidate, and QUIC candidate resolution now rejects
   sender-provided candidates that resolve to loopback, RFC1918/private, link-local (including `169.254.169.254`),

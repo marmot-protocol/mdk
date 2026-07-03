@@ -138,10 +138,6 @@ pub(crate) fn is_daemon_owned_socket_dir(parent: &Path, home: &Path) -> bool {
     parent == dev_dir || parent.starts_with(dev_dir)
 }
 
-pub(crate) fn harden_socket_permissions(socket: &Path) -> std::io::Result<()> {
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(DAEMON_SOCKET_MODE))
-}
-
 pub(crate) fn authorize_daemon_peer(stream: &UnixStream) -> std::io::Result<()> {
     let peer_uid = stream.peer_cred()?.uid();
     let server_uid = current_effective_uid();

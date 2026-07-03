@@ -37,6 +37,7 @@ The canonical protocol specification lives in
 | App runtime bridge | `crates/marmot-app/AGENTS.md` |
 | App message Markdown display parsing | `crates/marmot-markdown/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
+| Private file/dir/socket creation helpers | `crates/fs-private/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |
@@ -63,6 +64,8 @@ The canonical protocol specification lives in
 - Keep tracing/logging privacy-safe: explicit crate/module `target` and `method` fields, aggregate values only, and no
   account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material. See
   `docs/marmot-architecture/overview/observability.md`.
+- Create local files, sockets, and databases restrictive-by-construction via `crates/fs-private` (or equivalent
+  posture with an on-disk mode test); see `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
 
 ## Verification

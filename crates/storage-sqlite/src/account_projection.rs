@@ -648,14 +648,37 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         cutoff_recorded_at: u64,
     ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
-        let outcome = self.connection.with_transaction(|| {
+        // `secure_delete` must be ON *before* the prune transaction begins:
+        // SQLite does not guarantee zero-on-free for pages freed in the same
+        // transaction that toggles the pragma, so setting it inside the
+        // transaction (the previous shape) silently weakened the prune on
+        // connections opened with `secure_delete: false`.
+        let original_secure_delete = {
+            let conn = self.lock()?;
+            let original = conn
+                .query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+                .storage()?;
+            conn.execute_batch("PRAGMA secure_delete = ON;").storage()?;
+            original
+        };
+        let prune_outcome = self.connection.with_transaction(|| {
             let conn = self.lock()?;
             crate::timeline::secure_prune_app_events_before_tx(
                 &conn,
                 group_id_hex,
                 cutoff_recorded_at,
             )
-        })?;
+        });
+        let restore = self.lock().and_then(|conn| {
+            conn.execute_batch(&format!("PRAGMA secure_delete = {original_secure_delete};"))
+                .storage()
+        });
+        let outcome = match (prune_outcome, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), Err(_)) => Err(err),
+        }?;
         if outcome.pruned_messages > 0 {
             let conn = self.lock()?;
             if let Err(error) = checkpoint_wal_truncate_after_secure_prune(&conn) {

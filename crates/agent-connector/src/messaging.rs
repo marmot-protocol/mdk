@@ -40,6 +40,20 @@ pub(crate) fn send_final_fingerprint(
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Per-blob temp subdir name for a downloaded media attachment: the SHA-256 of
+/// the decrypted bytes the connector actually holds. Computing it locally (as
+/// opposed to trusting the sender-supplied `ciphertext_sha256` field) makes the
+/// directory layout attacker-independent — two references can only share a
+/// subdir when their plaintext is byte-identical, in which case the overwrite
+/// is a no-op — while keeping repeat downloads of the same content stable. The
+/// runtime independently verifies `ciphertext_sha256` against the fetched blob;
+/// this just keeps that cross-crate invariant out of the filesystem layout.
+pub(crate) fn media_download_subdir(plaintext: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(plaintext))
+}
+
 /// Map a control-plane media reference (the non-secret mirror) back into the
 /// app-runtime `MediaAttachmentReference`. Field-for-field; the content key is
 /// never part of either type, so this is a pure structural reshape.
@@ -412,14 +426,16 @@ impl AgentConnector {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id = GroupId::new(hex::decode(group_id_hex)?);
         let reference = media_ref_to_reference(media);
-        // Derive a unique, stable-per-blob subdir from the ciphertext hash so
-        // repeat downloads land in the same place and distinct blobs do not
-        // collide. The hash is opaque ciphertext metadata, not an id we log.
-        let subdir = normalize_hex(&reference.ciphertext_sha256)?;
         let result = self
             .runtime
             .download_media(&account.label, &group_id, reference)
             .await?;
+        // Derive a unique, stable-per-blob subdir from the connector-computed
+        // hash of the decrypted bytes (never the sender-supplied
+        // `ciphertext_sha256` field) so repeat downloads land in the same place
+        // and distinct blobs cannot be steered into colliding/overwriting each
+        // other. The hash is an opaque dir name, not an id we log.
+        let subdir = media_download_subdir(&result.plaintext);
         let dir = crate::media_temp::create_media_download_dir(&subdir).await?;
         // The file name comes from the (decrypted) sender-controlled media
         // reference, so write under a sanitized basename: a crafted value like

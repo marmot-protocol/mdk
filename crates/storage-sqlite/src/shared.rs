@@ -65,6 +65,9 @@ impl SqliteSharedStorage {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| StorageError::Backend(err.to_string()))?;
         }
+        // The shared cache is unencrypted, so file-level 0600 (including
+        // sidecars) is the only thing keeping it from other local users.
+        crate::connection::ensure_private_db_files(path)?;
         let conn = rusqlite::Connection::open(path).storage()?;
         Self::from_connection(conn)
     }
@@ -587,6 +590,24 @@ mod tests {
         assert!(!user_columns.contains(&"local_account_json".to_owned()));
         assert!(!user_columns.contains(&"private_discovery_reason".to_owned()));
         assert!(!user_columns.contains(&"local_fetch_timestamp".to_owned()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shared_cache_db_is_owner_only_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared").join("directory.sqlite");
+        drop(SqliteSharedStorage::open(&path).unwrap());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+
+        // A pre-existing permissive cache (from builds that created it at the
+        // umask) is tightened on reopen.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(SqliteSharedStorage::open(&path).unwrap());
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/fs-private",
     "crates/traits",
     "crates/cgka-engine",
     "crates/cgka-session",
@@ -93,6 +94,7 @@ insta = { version = "1", features = ["json"] }
 test-log = { version = "0.2", features = ["trace"] }
 
 # workspace-internal
+fs-private = { path = "crates/fs-private" }
 cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
 cgka-session = { path = "crates/cgka-session" }

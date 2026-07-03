@@ -123,8 +123,12 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     remove_stale_socket(&socket).await?;
     remove_stale_pid(&pid_path).await?;
 
-    let listener = UnixListener::bind(&socket)?;
-    harden_socket_permissions(&socket)?;
+    // Bind via a 0700 staging dir so the socket is never reachable at
+    // umask-default permissions, even under a caller-supplied `--socket`
+    // whose parent dir the daemon does not own.
+    let listener = fs_private::bind_unix_listener_private(&socket, DAEMON_SOCKET_MODE)?;
+    listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(listener)?;
     write_pid_file(&pid_path)?;
     let hidden_relay = crate::resolve_relay(args.relay)?;
     let mut discovery_relays = normalize_relay_list(args.discovery_relays)?;

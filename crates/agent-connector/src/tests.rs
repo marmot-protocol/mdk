@@ -461,6 +461,10 @@ async fn connector_socket_bind_applies_configured_group_modes() {
         socket.metadata().unwrap().permissions().mode() & 0o777,
         0o660
     );
+    assert!(
+        !fs_private::socket_staging_dir(&socket).exists(),
+        "staging dir should be removed after bind"
+    );
 }
 
 #[tokio::test]
@@ -2573,6 +2577,22 @@ fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
     assert!(
         mentions_self,
         "p-tag mention should be detected without inline text"
+    );
+}
+
+#[test]
+fn media_download_subdir_is_stable_and_content_derived() {
+    use crate::messaging::media_download_subdir;
+
+    let a = media_download_subdir(b"plaintext-a");
+    let b = media_download_subdir(b"plaintext-b");
+    assert_eq!(a, media_download_subdir(b"plaintext-a"), "stable per blob");
+    assert_ne!(a, b, "distinct content must not share a subdir");
+    // Lowercase hex: always a single safe path component.
+    assert_eq!(a.len(), 64);
+    assert!(
+        a.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     );
 }
 

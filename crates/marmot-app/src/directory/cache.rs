@@ -25,6 +25,10 @@ impl DirectoryCache {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Pre-create 0600 so SQLite's -wal/-shm sidecars (which copy the main
+        // file's mode) never appear at umask-default permissions, and tighten
+        // sidecars left behind by earlier permissive builds.
+        fs_private::ensure_private_db_files(&path)?;
         let conn = Connection::open(path)?;
         // Mirror storage-sqlite's hardened open: pin cipher_compatibility and
         // enable cipher_memory_security before keying, and scrub deleted rows /
@@ -38,6 +42,9 @@ impl DirectoryCache {
             return Ok(None);
         }
         record_directory_cache_open();
+        // Legacy plaintext caches (and their sidecars) predate the owner-only
+        // creation policy; tighten them before reading.
+        fs_private::ensure_private_db_files(&path)?;
         let conn = Connection::open(path)?;
         let _: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
         Self::from_connection(conn).map(Some)
@@ -718,6 +725,56 @@ mod tests {
             follow_source_relays: vec!["wss://follows.example".to_owned()],
             relay_lists: AccountRelayListStatus::empty(),
             key_package: None,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_cache_db_is_owner_only_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let path = dir.path().join("directory.sqlite3");
+        let _cache = DirectoryCache::open(path.clone(), &key).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_permissive_cache_db_and_sidecars_are_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("test-key").unwrap();
+        let path = dir.path().join("directory.sqlite3");
+        drop(DirectoryCache::open(path.clone(), &key).unwrap());
+
+        // Simulate artifacts from a permissive build: loosen the main DB and
+        // plant loose-mode sidecars. SQLite does not rewrite pre-existing
+        // sidecar modes just because the main file is tightened.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = dir.path().join(format!("directory.sqlite3{suffix}"));
+            std::fs::write(&sidecar, b"stale").unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        drop(DirectoryCache::open(path.clone(), &key).unwrap());
+
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let file = dir.path().join(format!("directory.sqlite3{suffix}"));
+            if let Ok(metadata) = std::fs::metadata(&file) {
+                assert_eq!(
+                    metadata.permissions().mode() & 0o777,
+                    0o600,
+                    "suffix {suffix:?} must be owner-only after reopen"
+                );
+            }
         }
     }
 

@@ -7,7 +7,7 @@
 //! client, and the `MarmotApp` methods that drive recording, enumeration,
 //! validation, and upload.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -146,13 +146,18 @@ fn generate_audit_device_id_hex() -> String {
 fn audit_device_id_hex(account_dir: &Path) -> Result<String, AppError> {
     let path = account_dir.join(AUDIT_DEVICE_ID_FILE);
     match fs::read_to_string(&path) {
-        Ok(value) => return parse_audit_device_id_hex(&value),
+        Ok(value) => {
+            // Remediate ids written by older builds at umask-default modes;
+            // new ids below are created 0600 from the start.
+            fs_private::tighten_existing_private_file(&path)?;
+            return parse_audit_device_id_hex(&value);
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
 
     let device_id = generate_audit_device_id_hex();
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
+    match fs_private::create_new_private(&path) {
         Ok(mut file) => {
             file.write_all(device_id.as_bytes())?;
             file.write_all(b"\n")?;
@@ -666,7 +671,7 @@ impl MarmotApp {
         let path = self.account_dir(&account.label).join(KEY_REVEAL_AUDIT_FILE);
         let mut bytes = serde_json::to_vec(&entry)?;
         bytes.push(b'\n');
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = fs_private::open_private_append(&path)?;
         file.write_all(&bytes)?;
         Ok(())
     }
@@ -1012,6 +1017,50 @@ mod tests {
         assert!(contents.contains("\"caller_context\":\"test::reveal_caller\""));
         assert!(!contents.contains(revealed.as_str()));
         assert!(!contents.contains(&account.account_id_hex));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "key-reveal audit file must be owner-only"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_device_id_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let device_id = audit_device_id_hex(dir.path()).unwrap();
+        let path = dir.path().join(AUDIT_DEVICE_ID_FILE);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Re-read path returns the same id.
+        assert_eq!(audit_device_id_hex(dir.path()).unwrap(), device_id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_existing_permissive_audit_device_id_is_tightened_on_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUDIT_DEVICE_ID_FILE);
+        let existing_id = generate_audit_device_id_hex();
+        std::fs::write(&path, format!("{existing_id}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(audit_device_id_hex(dir.path()).unwrap(), existing_id);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "ids from permissive builds must be tightened on read"
+        );
     }
 
     #[test]

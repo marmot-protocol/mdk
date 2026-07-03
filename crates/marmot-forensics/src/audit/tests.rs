@@ -59,6 +59,42 @@ fn jsonl_recorder_appends_events_with_monotonic_seq() {
 }
 
 #[test]
+#[cfg(unix)]
+fn audit_file_is_owner_only_on_open_and_rotation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    assert_eq!(mode(&path), 0o600);
+
+    // Rotation unlinks and recreates the file; the fresh file must be
+    // owner-only too.
+    recorder.rotate().unwrap();
+    assert_eq!(mode(&path), 0o600);
+}
+
+#[test]
+#[cfg(unix)]
+fn pre_existing_permissive_audit_file_is_tightened_on_open() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    fs::write(&path, b"").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let _recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn jsonl_recorder_rotate_discards_old_lines_and_keeps_recording() {
     let dir = TempDir::new().unwrap();
     let path = default_jsonl_path(dir.path(), "engine-abc");

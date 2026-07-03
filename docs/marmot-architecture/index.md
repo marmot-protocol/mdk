@@ -76,6 +76,10 @@ Written to be readable in 5 minutes each, shareable as a package.
 - **Doc:** [`overview/observability.md`](./overview/observability.md)
   - **What it covers:** Privacy-safe tracing/logging rules and the repo-wide tracing audit guardrail.
 
+- **Doc:** [`overview/local-artifact-safety.md`](./overview/local-artifact-safety.md)
+  - **What it covers:** Restrictive-by-construction creation of local files, sockets, and databases: the
+    `fs-private` helpers, the one octal-mode parser, and the DB sidecar/PRAGMA-at-open rules.
+
 - **Doc:** [`overview/current-state.md`](./overview/current-state.md)
   - **What it covers:** Implementations, merged MIPs, the current CGKA engine workspace, and known gaps.
 

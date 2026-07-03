@@ -45,6 +45,7 @@ dependencies = [
  "agent-stream-compose",
  "cgka-traits",
  "clap",
+ "fs-private",
  "hex",
  "libc",
  "marmot-account",
@@ -1087,6 +1088,7 @@ dependencies = [
  "cgka-traits",
  "clap",
  "crossterm",
+ "fs-private",
  "hex",
  "libc",
  "marmot-account",
@@ -1428,6 +1430,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88a41f105fe1d5b6b34b2055e3dc59bb79b46b48b2040b9e6c7b4b5de097aa41"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "fs-private"
+version = "0.2.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -2591,6 +2600,7 @@ dependencies = [
  "cgka-session",
  "cgka-traits",
  "chacha20poly1305",
+ "fs-private",
  "hex",
  "hkdf",
  "marmot-account",
@@ -2626,6 +2636,7 @@ dependencies = [
 name = "marmot-forensics"
 version = "0.2.0"
 dependencies = [
+ "fs-private",
  "serde",
  "serde_json",
  "tempfile",
@@ -4406,6 +4417,7 @@ name = "storage-sqlite"
 version = "0.2.0"
 dependencies = [
  "cgka-traits",
+ "fs-private",
  "hex",
  "openmls",
  "openmls_traits",

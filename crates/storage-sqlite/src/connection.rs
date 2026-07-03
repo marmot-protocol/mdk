@@ -433,6 +433,8 @@ impl SqliteAccountStorage {
         key: &SqlCipherKey,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
+        let path = path.as_ref();
+        ensure_private_db_files(path)?;
         let connection = rusqlite::Connection::open(path).storage()?;
         Self::from_unkeyed_encrypted_connection_with_options(connection, key, options)
     }
@@ -464,6 +466,12 @@ impl SqliteAccountStorage {
     pub(crate) fn lock(&self) -> StorageResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
         self.connection.lock()
     }
+}
+
+/// Make a database file owner-only before SQLite can create it at the process
+/// umask; see `fs_private::ensure_private_db_files` for the sidecar rules.
+pub(crate) fn ensure_private_db_files(path: &Path) -> StorageResult<()> {
+    fs_private::ensure_private_db_files(path).map_err(|err| StorageError::Backend(err.to_string()))
 }
 
 fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) -> StorageResult<()> {
@@ -839,6 +847,60 @@ mod tests {
         assert_eq!(pragma_i64(&conn, "trusted_schema"), 0);
         assert_eq!(pragma_i64(&conn, "synchronous"), 2);
         assert_eq!(pragma_string(&conn, "journal_mode"), "wal");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn account_db_and_sidecars_are_owner_only_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("on-disk mode key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        // Force a WAL write so the -wal/-shm sidecars exist.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE mode_probe (id INTEGER); INSERT INTO mode_probe VALUES (1);",
+            )
+            .unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(sidecar.exists(), "expected {suffix} sidecar to exist");
+            assert_eq!(mode(&sidecar), 0o600, "sidecar {suffix} should be 0600");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_existing_db_and_sidecar_modes_are_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("tighten mode key").unwrap();
+        drop(SqliteAccountStorage::open_encrypted(&path, &key).unwrap());
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        // Simulate files left behind by builds that created them at the umask.
+        for p in [&path, &wal] {
+            if !p.exists() {
+                std::fs::write(p, b"").unwrap();
+            }
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        // Assert while the store is open: the -wal sidecar is checkpointed
+        // away on clean close.
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&wal), 0o600);
+        drop(store);
     }
 
     #[test]
