@@ -408,7 +408,7 @@ impl MarmotApp {
                 tracing::warn!(
                     target: "marmot_app",
                     method = "open_audit_recorder",
-                    error = %e,
+                    error_kind = e.privacy_safe_kind(),
                     "failed to prepare forensic audit identity; continuing without it"
                 );
                 return None;
@@ -463,7 +463,7 @@ impl MarmotApp {
                 tracing::warn!(
                     target: "marmot_app",
                     method = "open_audit_recorder",
-                    error = %e,
+                    error_kind = %e.kind(),
                     "failed to open forensic audit log; continuing without it"
                 );
                 None
@@ -491,7 +491,7 @@ impl MarmotApp {
                 tracing::warn!(
                     target: "marmot_app",
                     method = "build_audit_recorder",
-                    error = %e,
+                    error_kind = e.privacy_safe_kind(),
                     "failed to resolve account identity for audit logging; continuing without it"
                 );
                 return Box::new(marmot_forensics::NoopRecorder);

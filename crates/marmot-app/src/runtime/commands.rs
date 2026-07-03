@@ -146,7 +146,7 @@ impl AccountManager {
                 tracing::warn!(
                     target: "marmot_app::runtime",
                     method = "retry_hydrate_quarantined_group",
-                    error = %error,
+                    error_kind = error.privacy_safe_kind(),
                     "group recovered from quarantine but post-recovery catch-up failed; \
                      group is live and will sync on the next cycle"
                 );

@@ -1872,7 +1872,7 @@ impl MarmotApp {
                 tracing::warn!(
                     target: "marmot_app",
                     method = "open_account",
-                    error = %e,
+                    error_kind = e.privacy_safe_kind(),
                     "failed to read forensic audit log settings; continuing without audit logging"
                 );
                 false
@@ -2033,7 +2033,7 @@ impl MarmotApp {
                         tracing::warn!(
                             target: "marmot_app::key_packages",
                             method = "account_key_package_records",
-                            error = %err,
+                            error_kind = err.privacy_safe_kind(),
                             "skipping invalid key package event while listing account packages"
                         );
                     }

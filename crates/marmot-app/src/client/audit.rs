@@ -150,7 +150,7 @@ impl AppClient {
             tracing::warn!(
                 target: "marmot_app",
                 method = "set_audit_data_mode",
-                error = %e,
+                error_kind = %e.kind(),
                 "failed to switch audit data mode on live session; continuing"
             );
         }

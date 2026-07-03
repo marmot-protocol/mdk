@@ -57,7 +57,7 @@ impl ManagedAccountWorker {
                     tracing::debug!(
                         target: "marmot_app::runtime",
                         method = "shutdown",
-                        error = %err,
+                        error_kind = if err.is_panic() { "panic" } else { "cancelled" },
                         "managed account worker exited during shutdown",
                     );
                 }
