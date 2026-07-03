@@ -297,10 +297,15 @@ impl NostrSdkRelayClient {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            // Failure reasons never embed the nostr-sdk error Display: it
+            // commonly carries the relay URL, and these reasons flow into
+            // `TransportAdapterError::Publish` Display (see
+            // `finish_publish_outcome`), which upper layers may log. The
+            // endpoint stays available on the structured failure record.
+            Ok(Err(_)) => {
                 return Err(TransportEndpointFailure {
                     endpoint: transport_endpoint,
-                    reason: format!("connect relay: {e}"),
+                    reason: "connect relay failed".to_owned(),
                 });
             }
             Err(_) => {
@@ -332,8 +337,10 @@ impl NostrSdkRelayClient {
                         .cloned()
                         .unwrap_or_else(|| "relay did not acknowledge event".to_owned());
                 }
-                Ok(Err(e)) => {
-                    last_error = format!("send event: {e}");
+                Ok(Err(_)) => {
+                    // No sdk error Display here either — it can carry the
+                    // relay URL.
+                    last_error = "send event failed".to_owned();
                 }
                 Err(_) => {
                     last_error = "send event timed out".to_owned();
@@ -358,7 +365,9 @@ impl NostrSdkRelayClient {
         self.client
             .add_relay(endpoint)
             .await
-            .map_err(|e| TransportAdapterError::Subscription(format!("add relay: {e}")))?;
+            // The sdk error Display can carry the relay URL; keep the error
+            // operation-only so `TransportAdapterError` Display stays URL-free.
+            .map_err(|_| TransportAdapterError::Subscription("add relay failed".to_owned()))?;
         Ok(())
     }
 
@@ -387,9 +396,9 @@ impl NostrSdkRelayClient {
                 Ok(true)
             }
             Ok(false) => Ok(false),
-            Err(e) => Err(TransportEndpointFailure {
+            Err(_) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
-                reason: format!("add publish relay: {e}"),
+                reason: "add publish relay failed".to_owned(),
             }),
         }
     }
@@ -504,7 +513,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 None,
             )
             .await
-            .map_err(|e| TransportAdapterError::Subscription(format!("subscribe: {e}")))?;
+            .map_err(|_| TransportAdapterError::Subscription("subscribe failed".to_owned()))?;
 
         if output.success.is_empty() {
             return Err(TransportAdapterError::Subscription(format!(
@@ -723,10 +732,10 @@ fn parse_endpoints(
     endpoints
         .iter()
         .map(|endpoint| {
-            RelayUrl::parse(endpoint.as_str()).map_err(|e| {
-                TransportAdapterError::Subscription(format!(
-                    "{context}: invalid endpoint {endpoint}: {e}"
-                ))
+            // Neither the endpoint nor the parse error (which echoes its
+            // input) may appear here: this Display reaches upper-layer logs.
+            RelayUrl::parse(endpoint.as_str()).map_err(|_| {
+                TransportAdapterError::Subscription(format!("{context}: invalid relay endpoint"))
             })
         })
         .collect()
@@ -793,6 +802,30 @@ mod tests {
             .sign_with_keys(&ephemeral)
             .expect("sign ephemeral 445");
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
+    }
+
+    #[test]
+    fn publish_failure_error_display_carries_no_relay_url() {
+        // Per-endpoint failure reasons are joined into
+        // `TransportAdapterError::Publish` Display, which upper layers may
+        // log; the privacy invariant forbids relay URLs there. The endpoint
+        // stays available on the structured failure record only.
+        let endpoint = TransportEndpoint("wss://private-relay.example".into());
+        let err = NostrSdkRelayClient::finish_publish_outcome(
+            cgka_traits::MessageId::new(vec![0xD4; 32]),
+            Vec::new(),
+            vec![TransportEndpointFailure {
+                endpoint: endpoint.clone(),
+                reason: "connect relay failed".to_owned(),
+            }],
+            1,
+            false,
+        )
+        .unwrap_err();
+
+        let rendered = err.to_string();
+        assert!(!rendered.contains("private-relay.example"), "{rendered}");
+        assert!(rendered.contains("connect relay failed"), "{rendered}");
     }
 
     #[test]
@@ -1146,7 +1179,11 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(err.to_string().contains("invalid endpoint"));
+        let rendered = err.to_string();
+        assert!(rendered.contains("invalid relay endpoint"), "{rendered}");
+        // The privacy invariant forbids relay URLs in error Display: the bad
+        // endpoint itself must not be echoed back.
+        assert!(!rendered.contains("not a relay url"), "{rendered}");
     }
 
     async fn silent_relay_url() -> String {

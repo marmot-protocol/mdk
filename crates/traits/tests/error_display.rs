@@ -47,6 +47,20 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
 }
 
 #[test]
+fn transport_adapter_error_display_passes_reasons_through_verbatim() {
+    // Reason strings appear verbatim in Display, and Display reaches upper
+    // layers that log or persist errors. Constructors must therefore never
+    // embed relay URLs or endpoint values in reasons; the Nostr adapter
+    // builds operation-only reasons (asserted in transport-nostr-adapter's
+    // sdk_client tests). This test pins the passthrough behavior that
+    // contract rests on.
+    let err = TransportAdapterError::Publish("connect relay failed".to_owned());
+    assert_eq!(err.to_string(), "publish failed: connect relay failed");
+    let err = TransportAdapterError::Subscription("add relay failed".to_owned());
+    assert_eq!(err.to_string(), "subscription failed: add relay failed");
+}
+
+#[test]
 fn transport_and_app_event_error_display_do_not_expose_pubkeys() {
     let pubkey = "cc".repeat(32);
 

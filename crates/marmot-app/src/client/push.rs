@@ -47,7 +47,8 @@ impl AppClient {
                     tracing::warn!(
                         target: "marmot_app::notifications",
                         method = "share_push_registration",
-                        "push token gossip publish failed: {err}",
+                        error_kind = err.privacy_safe_kind(),
+                        "push token gossip publish failed",
                     );
                 }
             }
@@ -94,7 +95,8 @@ impl AppClient {
                     tracing::warn!(
                         target: "marmot_app::notifications",
                         method = "remove_push_registration",
-                        "push token removal gossip publish failed: {err}",
+                        error_kind = err.privacy_safe_kind(),
+                        "push token removal gossip publish failed",
                     );
                 }
             }
@@ -119,7 +121,8 @@ impl AppClient {
             tracing::warn!(
                 target: "marmot_app::notifications",
                 method = "publish_notification_trigger_best_effort",
-                "notification trigger publish failed: {err}",
+                error_kind = err.privacy_safe_kind(),
+                "notification trigger publish failed",
             );
         }
     }

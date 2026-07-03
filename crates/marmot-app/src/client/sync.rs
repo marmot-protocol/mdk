@@ -390,7 +390,8 @@ impl AppClient {
                         tracing::warn!(
                             target: "marmot_app::notifications",
                             method = "ingest_delivery",
-                            "ignoring malformed push token gossip: {err}",
+                            error_kind = err.privacy_safe_kind(),
+                            "ignoring malformed push token gossip",
                         );
                     }
                     gossip_message_ids.insert(message.message_id_hex.clone());
