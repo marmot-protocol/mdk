@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use agent_connector::{
     AgentConnectorConfig, BootstrapOptions, BootstrapResult, ConnectorError,
-    DEFAULT_BOOTSTRAP_LABEL, default_socket_path, read_bootstrap_auth_token,
-    resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
-    resolve_bootstrap_socket, run_bootstrap, serve_socket,
+    DEFAULT_BOOTSTRAP_LABEL, MAX_CONTROL_CONNECTIONS, default_socket_path,
+    read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
+    resolve_bootstrap_relays, resolve_bootstrap_socket, run_bootstrap, serve_socket,
 };
 use clap::{Args, Parser, Subcommand};
 
@@ -69,6 +69,13 @@ struct ServeArgs {
     socket_mode: String,
     #[arg(long, hide = true, help = "Enable debug-only local control requests")]
     debug_controls: bool,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = MAX_CONTROL_CONNECTIONS,
+        help = "Maximum concurrently served control connections"
+    )]
+    max_connections: usize,
 }
 
 #[derive(Debug, Args)]
@@ -194,6 +201,7 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         allow_any: args.allow_any,
         debug_controls: args.debug_controls,
         auth_token,
+        max_connections: args.max_connections,
     };
     match serve_socket(config).await {
         Ok(()) => ExitCode::SUCCESS,
