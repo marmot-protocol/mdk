@@ -60,3 +60,6 @@ local signer.
 ```sh
 cargo test -p transport-nostr-peeler
 ```
+
+See [`AGENTS.md`](AGENTS.md) for strict tag validation rules and the external Nostr transport spec in
+[marmot-protocol/marmot](https://github.com/marmot-protocol/marmot).

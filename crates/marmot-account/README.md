@@ -67,3 +67,5 @@ relay-plane format, or a future non-Nostr transport.
 ```sh
 cargo test -p marmot-account
 ```
+
+See [`AGENTS.md`](AGENTS.md) for scope and invariants.

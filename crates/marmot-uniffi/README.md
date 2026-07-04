@@ -79,3 +79,5 @@ framework already initialized `ndk-context`, do not call `initialize` again.
 
 The output directories are ignored because generated bindings and packaged native libraries are derived artifacts.
 Regenerate them from this crate before vendoring into an app repository.
+
+See [`AGENTS.md`](AGENTS.md) for scope, invariants, and verification commands.

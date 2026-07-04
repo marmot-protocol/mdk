@@ -73,3 +73,5 @@ KeyPackage event kind; do not substitute deprecated NIP-104 key package kinds fo
 cargo test -p transport-nostr-adapter
 cargo test -p transport-nostr-adapter --features sdk
 ```
+
+See [`AGENTS.md`](AGENTS.md) for scope, the `sdk` feature, and privacy-safe telemetry rules.

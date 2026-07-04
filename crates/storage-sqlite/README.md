@@ -80,3 +80,5 @@ Run:
 ```sh
 cargo test -p storage-sqlite
 ```
+
+See [`AGENTS.md`](AGENTS.md) for module layout and migration rules.

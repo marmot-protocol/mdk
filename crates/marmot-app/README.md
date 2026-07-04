@@ -54,3 +54,12 @@ The crate root now keeps app construction, shared state, storage/projector wirin
 list helpers, and public re-exports. Runtime orchestration lives in the `src/runtime/` module, app-client commands and queries
 live in the `src/client/` module, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media
 DTOs plus Blossom upload/download helpers live in the `src/media/` module.
+
+## Run the tests
+
+```sh
+cargo test -p marmot-app
+cargo test -p marmot-app --features otlp-export
+```
+
+See [`AGENTS.md`](AGENTS.md) for the module map and privacy-safe telemetry rules.

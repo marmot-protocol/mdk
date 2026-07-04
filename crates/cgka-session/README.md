@@ -59,3 +59,5 @@ Run:
 ```sh
 cargo test -p cgka-session
 ```
+
+See [`AGENTS.md`](AGENTS.md) and [`tests/AGENTS.md`](tests/AGENTS.md) for scope and test placement rules.

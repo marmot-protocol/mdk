@@ -3,7 +3,7 @@ title: "Marmot — Executive Summary"
 created: 2026-04-19
 tags: [marmot, overview, executive-summary]
 status: overview
-updated: 2026-05-13
+updated: 2026-07-04
 ---
 
 # Marmot — Executive Summary
