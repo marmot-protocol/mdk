@@ -271,8 +271,12 @@ impl AgentConnector {
         // Validation passed and the compose task has now exited. Freeze the
         // transcript on the still-registered session so a durable-finish
         // failure below leaves a retryable finalize (the compose task can no
-        // longer be consulted).
-        self.streams.mark_finalized(
+        // longer be consulted). If the freeze does not land — the session was
+        // superseded by a same-stream-id replacement between our `get` and now
+        // — this clone is stale: proceeding would publish under a lost retry
+        // handle, so bail and let the agent re-finalize against the live
+        // session instead.
+        if !self.streams.mark_finalized(
             &stream_id_hex,
             &session,
             FinalizedStream {
@@ -280,7 +284,11 @@ impl AgentConnector {
                 transcript_hash,
                 chunk_count,
             },
-        );
+        ) {
+            return Err(ConnectorError::Stream(
+                "stream session was superseded during finalize".into(),
+            ));
+        }
         self.finish_finalized_stream(
             &stream_id_hex,
             &session,

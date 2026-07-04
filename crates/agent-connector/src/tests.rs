@@ -414,6 +414,54 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
     active_handle.abort();
 }
 
+/// A finalized-but-unpublished session must survive the idle sweep even when
+/// its last activity is well past the timeout: its compose task has exited and
+/// the frozen transcript is the only handle for retrying a failed durable
+/// finish. Sweeping it would recreate the #366 failure mode.
+#[tokio::test]
+async fn stream_session_sweep_spares_finalized_session_despite_idle() {
+    use crate::stream_session::{ActiveStreamSession, FinalizedStream, StreamSessionStore};
+    use agent_stream_compose::StreamComposeCommand;
+    use cgka_traits::GroupId;
+    use std::time::{Duration, Instant};
+
+    let store = StreamSessionStore::default();
+
+    // The compose task has already exited after a validated Finish; model that
+    // with an immediately-finished task so its Sender is closed like the real
+    // post-finalize session.
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
+    drop(rx);
+    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let handle = tokio::spawn(async {});
+    store.insert(
+        "aa".to_owned(),
+        ActiveStreamSession {
+            account_label: "agent".to_owned(),
+            group_id: GroupId::new(vec![1]),
+            stream_id: vec![0xaa],
+            start_message_id_hex: "00".to_owned(),
+            tx,
+            cancel_tx,
+            abort: handle.abort_handle(),
+            // Idle far beyond the timeout, but finalized: must be spared.
+            last_activity: Instant::now() - Duration::from_secs(3600),
+            finalized: Some(FinalizedStream {
+                final_text: "frozen".to_owned(),
+                transcript_hash: [0x22; 32],
+                chunk_count: 1,
+            }),
+        },
+    );
+
+    let swept = store.sweep_idle(Duration::from_secs(300));
+    assert_eq!(swept, 0, "a finalized session must never be swept");
+    assert!(
+        store.get("aa").is_ok(),
+        "the finalized session (and its retry handle) must survive the sweep"
+    );
+}
+
 #[tokio::test]
 async fn connector_socket_bind_removes_stale_socket() {
     let dir = tempfile::tempdir().unwrap();
@@ -2180,14 +2228,17 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let session = connector.streams.get(&stream_id_norm).unwrap();
     session.abort.abort();
     let transcript_hash = [0x11u8; 32];
-    connector.streams.mark_finalized(
-        &stream_id_norm,
-        &session,
-        FinalizedStream {
-            final_text: "frozen final".to_owned(),
-            transcript_hash,
-            chunk_count: 1,
-        },
+    assert!(
+        connector.streams.mark_finalized(
+            &stream_id_norm,
+            &session,
+            FinalizedStream {
+                final_text: "frozen final".to_owned(),
+                transcript_hash,
+                chunk_count: 1,
+            },
+        ),
+        "freeze must land on the still-current session"
     );
 
     // A retry that disagrees with the frozen transcript is rejected and leaves

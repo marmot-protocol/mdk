@@ -391,22 +391,30 @@ impl StreamSessionStore {
         }
     }
 
-    /// Freeze the finalize inputs on the stored entry (only when it is still the
-    /// same session) so a durable-finish failure can be retried without the
-    /// compose task, which has exited by this point. Also refreshes activity so
-    /// the idle sweep does not reclaim a session mid-finalize.
+    /// Freeze the finalize inputs on the stored entry so a durable-finish failure
+    /// can be retried without the compose task, which has exited by this point.
+    ///
+    /// Returns `true` only when the freeze landed on the still-current session
+    /// (matched by command-channel identity). It returns `false` when the entry
+    /// was removed or replaced by a same-stream-id session between the caller's
+    /// `get` and this call: in that case the caller's session is stale and must
+    /// NOT proceed to the durable publish, or a failure there would leave no
+    /// retry handle (`finalized` unset) and strand the stream (#366).
+    #[must_use]
     pub(crate) fn mark_finalized(
         &self,
         stream_id_hex: &str,
         session: &ActiveStreamSession,
         finalized: FinalizedStream,
-    ) {
+    ) -> bool {
         let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
-        if let Some(entry) = sessions.get_mut(stream_id_hex)
-            && entry.tx.same_channel(&session.tx)
-        {
-            entry.finalized = Some(finalized);
-            entry.last_activity = Instant::now();
+        match sessions.get_mut(stream_id_hex) {
+            Some(entry) if entry.tx.same_channel(&session.tx) => {
+                entry.finalized = Some(finalized);
+                entry.last_activity = Instant::now();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -431,12 +439,21 @@ impl StreamSessionStore {
     /// session otherwise keeps the compose task, its `mpsc::Sender`, the accumulated
     /// transcript, and (when broker connect succeeded) a dedicated quinn `Endpoint`
     /// UDP socket plus a live keep-alive'd QUIC connection alive forever.
+    ///
+    /// A session whose transcript has been finalized is NEVER swept: its compose
+    /// task has already exited and the frozen transcript is the only handle for
+    /// retrying a durable finish that failed. Sweeping it would recreate the
+    /// exact #366 failure mode (a published live preview with no durable final
+    /// and no way to retry), so a finalized session lives until its durable
+    /// finish succeeds or the connector restarts.
     pub(crate) fn sweep_idle(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
         let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
         let stale: Vec<String> = sessions
             .iter()
-            .filter(|(_, session)| now.duration_since(session.last_activity) >= max_idle)
+            .filter(|(_, session)| {
+                session.finalized.is_none() && now.duration_since(session.last_activity) >= max_idle
+            })
             .map(|(stream_id_hex, _)| stream_id_hex.clone())
             .collect();
         for stream_id_hex in &stale {
