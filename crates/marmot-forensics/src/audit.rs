@@ -1392,11 +1392,13 @@ impl ForensicRecorder for JsonlRecorder {
             if previous_mode == new_mode {
                 return Ok(());
             }
-            // Apply the mode before swapping so the fresh file is stamped
-            // entirely with `new_mode`, then rotate so the old mode's lines
-            // never share a file with the new mode's.
-            inner.data_mode = new_mode;
+            // Swap before applying the mode: a failed swap must leave the
+            // recorder in its previous mode, still appending to the original
+            // file, so no records are lost and the call is retryable. The
+            // fresh file is still stamped entirely with `new_mode` because
+            // both steps happen under the lock, before any row lands on it.
             self.swap_to_fresh_file(&mut inner)?;
+            inner.data_mode = new_mode;
             previous_mode
         };
         // Boundary rows on the fresh file: the `recorder_started` marker
@@ -1416,35 +1418,55 @@ impl ForensicRecorder for JsonlRecorder {
 }
 
 impl JsonlRecorder {
-    /// Discard the current backing file and reopen an empty one at the same
+    /// Atomically replace the backing file with a fresh empty one at the same
     /// path, resetting the sequence, recorder session id, and health counters.
-    /// The caller must hold the inner lock; the data mode is left untouched so
-    /// both [`rotate`](ForensicRecorder::rotate) and
+    /// The fresh file is staged as an owner-only sibling and renamed over the
+    /// live path, so any failure leaves the original file, writer fd, seq,
+    /// session id, and data mode untouched and still recording. The caller
+    /// must hold the inner lock; the data mode is left untouched so both
+    /// [`rotate`](ForensicRecorder::rotate) and
     /// [`set_data_mode`](ForensicRecorder::set_data_mode) can reuse it.
     fn swap_to_fresh_file(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
         // Best-effort flush of whatever is buffered into the file we are about
         // to discard.
         let _ = inner.writer.flush();
-        // Unlink the current file. The fd still held by `inner.writer` keeps
-        // pointing at the now-unlinked inode until it is replaced below; on
-        // Unix that is harmless and the writer is discarded immediately. A
-        // missing file is fine — the goal state is "no old file, fresh file
-        // recording".
-        match std::fs::remove_file(&self.path) {
+        // Stage the fresh file as a 0600 sibling. `create_new` refuses to
+        // adopt a leftover staged file (whose contents would leak into the
+        // fresh log), so clear one from an interrupted earlier swap first.
+        let staged = staged_swap_path(&self.path);
+        match std::fs::remove_file(&staged) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        // Open a brand-new owner-only file at the same path and swap it in.
+        // The handle is write-only rather than append — equivalent for a
+        // brand-new empty file with a single `BufWriter`.
+        let file = fs_private::create_new_private(&staged)?;
+        // Atomic replace: the live path always names either the old complete
+        // file or the fresh empty one, and rename preserves the staged 0600
+        // mode. Recorder state advances only after the rename succeeds.
+        if let Err(err) = std::fs::rename(&staged, &self.path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(err);
+        }
         // Assigning to `inner.writer` drops the old `BufWriter`, closing the
-        // stale (unlinked) fd.
-        let file = fs_private::open_private_append(&self.path)?;
+        // fd of the replaced (now unlinked) file.
         inner.writer = BufWriter::new(file);
         inner.seq = 0;
         inner.recorder_session_id = generate_recorder_session_id();
         inner.health = AuditRecorderHealthSnapshot::default();
         Ok(())
     }
+}
+
+/// Staging sibling for [`JsonlRecorder::swap_to_fresh_file`]: the audit path
+/// with `.tmp` appended to the whole file name. Appending (rather than
+/// `with_extension`) keeps dotless paths from colliding with each other's
+/// staged files.
+fn staged_swap_path(path: &Path) -> PathBuf {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".tmp");
+    PathBuf::from(staged)
 }
 
 /// Filename convention for the engine-scoped audit log.
