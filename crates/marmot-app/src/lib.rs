@@ -805,6 +805,9 @@ struct OpenAppAccount {
 }
 
 impl MarmotApp {
+    /// Dev/test convenience constructor — see [`MarmotApp::with_relays`]. Not a
+    /// production entry point; hidden from the public API docs.
+    #[doc(hidden)]
     pub fn with_relay(root: impl AsRef<Path>, relay_url: impl Into<String>) -> Self {
         Self::with_relays(root, vec![relay_url.into()])
     }
@@ -872,12 +875,17 @@ impl MarmotApp {
         Self::with_relays_and_config(root, vec![relay_url.into()], config)
     }
 
-    /// Dev/test convenience constructor. Not a production entry point
-    /// (production opens through `with_relays_and_account_home*`); these
-    /// relay-only constructors back the crate's own tests, which drive
-    /// in-process `MockRelay`s at loopback, so they default the relay-safety
-    /// gate to admit loopback endpoints. Callers that need a specific posture
-    /// pass an explicit config through `with_relays_and_config`.
+    /// Dev/test-only convenience constructor. **Not a production entry point**
+    /// and hidden from the public API docs: production opens through
+    /// `with_relays_and_account_home*`, which default the relay-safety gate to
+    /// production posture (loopback rejected). This helper backs the crate's own
+    /// tests, which drive in-process `MockRelay`s at loopback, so it opts the
+    /// relay-safety gate into admitting loopback endpoints. It cannot be
+    /// `#[cfg(test)]`-gated because the crate's integration tests
+    /// (`crates/marmot-app/tests/*`) consume it through the public API. Callers
+    /// that need an explicit posture pass a config through
+    /// `with_relays_and_config`.
+    #[doc(hidden)]
     pub fn with_relays(root: impl AsRef<Path>, relay_urls: Vec<String>) -> Self {
         Self::with_relays_and_config(
             root,

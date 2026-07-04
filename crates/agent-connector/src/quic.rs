@@ -1,8 +1,8 @@
 //! QUIC broker candidate parsing, address resolution, and trust selection.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
-use cgka_traits::app_components::reject_non_public_socket_addr;
+use cgka_traits::app_components::{is_loopback_candidate_host, reject_non_public_socket_addr};
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::error::ConnectorError;
@@ -29,7 +29,11 @@ pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidat
             "invalid QUIC candidate: {trimmed}"
         )));
     };
-    let authority = rest.split('/').next().unwrap_or(rest);
+    // Per transports/quic.md a receiver MUST ignore any path, query, or
+    // fragment after the authority; the authority ends at the first of '/',
+    // '?', or '#'. Mirror the app/CLI parsers so this connector accepts the
+    // same candidates the rest of the stack does.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     if authority.is_empty() {
         return Err(ConnectorError::Stream(format!(
             "invalid QUIC candidate: {trimmed}"
@@ -107,18 +111,9 @@ pub(crate) fn broker_trust_for_candidate(
     candidate_host: &str,
     allow_insecure_local: bool,
 ) -> BrokerServerTrust {
-    if allow_insecure_local && candidate_host_is_loopback(candidate_host) {
+    if allow_insecure_local && is_loopback_candidate_host(candidate_host) {
         BrokerServerTrust::InsecureLocal
     } else {
         BrokerServerTrust::Platform
     }
-}
-
-fn candidate_host_is_loopback(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
 }

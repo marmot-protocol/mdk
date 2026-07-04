@@ -1,13 +1,13 @@
 //! Agent-text-stream discovery and the brokered-QUIC watch machinery, plus
 //! the [`MarmotAppRuntime`] entry points that drive them.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamKeyContextV1,
 };
-use cgka_traits::app_components::reject_non_public_socket_addr;
+use cgka_traits::app_components::{is_loopback_candidate_host, reject_non_public_socket_addr};
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_BROKER_TAG, STREAM_ROUTE_TAG, STREAM_TAG,
 };
@@ -482,19 +482,10 @@ pub(crate) fn broker_trust_for_candidate(
     server_cert_der: Option<Vec<u8>>,
     insecure_local: bool,
 ) -> BrokerServerTrust {
-    if insecure_local && candidate_host_is_loopback(candidate_host) {
+    if insecure_local && is_loopback_candidate_host(candidate_host) {
         return BrokerServerTrust::InsecureLocal;
     }
     server_cert_der
         .map(BrokerServerTrust::CertificateDer)
         .unwrap_or(BrokerServerTrust::Platform)
-}
-
-fn candidate_host_is_loopback(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
 }

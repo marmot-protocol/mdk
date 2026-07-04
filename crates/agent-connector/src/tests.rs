@@ -3468,6 +3468,41 @@ async fn create_media_download_dir_rejects_non_directory_per_blob_child() {
 }
 
 #[test]
+fn quic_candidate_parser_ignores_path_query_and_fragment() {
+    use crate::quic::parse_quic_candidate;
+
+    // Per transports/quic.md the authority ends at the first of '/', '?', '#';
+    // the connector must accept the same candidates the app/CLI parsers do
+    // (regression: it previously only split on '/').
+    for (candidate, expected_authority, expected_server_name) in [
+        (
+            "quic://broker.example:4450",
+            "broker.example:4450",
+            "broker.example",
+        ),
+        (
+            "quic://broker.example:4450?x=1",
+            "broker.example:4450",
+            "broker.example",
+        ),
+        (
+            "quic://broker.example:4450/path?x=1#frag",
+            "broker.example:4450",
+            "broker.example",
+        ),
+        (
+            "quic://broker.example:4450#frag",
+            "broker.example:4450",
+            "broker.example",
+        ),
+    ] {
+        let parsed = parse_quic_candidate(candidate).expect("candidate parses");
+        assert_eq!(parsed.authority, expected_authority, "{candidate}");
+        assert_eq!(parsed.server_name, expected_server_name, "{candidate}");
+    }
+}
+
+#[test]
 fn broker_trust_requires_explicit_opt_in_and_a_literal_loopback_host() {
     use transport_quic_broker::BrokerServerTrust;
 

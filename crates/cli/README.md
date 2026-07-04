@@ -60,6 +60,11 @@ Common options can be passed as flags or environment variables:
 For local development against a loopback Blossom server, set `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1`. By default `wn`
 refuses to upload to or download from `http://127.0.0.1`-style blob endpoints; production installs leave this unset.
 
+Likewise, to talk to a loopback relay (the local Compose stack, or an in-process relay), set `WN_ALLOW_LOOPBACK_RELAYS=1`.
+By default `wn`/`wnd` refuse to open a socket to a `ws://127.0.0.1`-style (or any non-public) relay host, so the
+loopback-relay examples below assume this is exported; production installs leave it unset. This admits loopback only —
+private/link-local/CGNAT relay hosts stay rejected either way.
+
 The default home is `WN_HOME` when set. Without `WN_HOME`, `wn` uses the platform user data directory:
 
 - macOS: `~/Library/Application Support/whitenoise`
@@ -76,6 +81,7 @@ just relay-up
 
 export WN_HOME="$PWD/dev/data/quickstart"
 export WN_SECRET_STORE=file
+export WN_ALLOW_LOOPBACK_RELAYS=1   # loopback relays are dev/test only; unset in production
 unset WN_SOCKET
 rm -rf "$WN_HOME"
 
@@ -332,6 +338,7 @@ and stream mutations.
 ```sh
 export WN_HOME="$PWD/dev/data/daemon-demo"
 export WN_SECRET_STORE=file
+export WN_ALLOW_LOOPBACK_RELAYS=1   # loopback relays are dev/test only; unset in production
 unset WN_SOCKET
 wn daemon start \
   --discovery-relays ws://127.0.0.1:27777 \
@@ -374,6 +381,7 @@ just relay-up
 
 export WN_HOME="$PWD/dev/data/stream-demo"
 export WN_SECRET_STORE=file
+export WN_ALLOW_LOOPBACK_RELAYS=1   # loopback relays are dev/test only; unset in production
 unset WN_SOCKET
 rm -rf "$WN_HOME"
 
@@ -390,6 +398,7 @@ Terminal 2 creates Alice/Bob, starts the durable stream, and sends live broker c
 ```sh
 export WN_HOME="$PWD/dev/data/stream-demo"
 export WN_SECRET_STORE=file
+export WN_ALLOW_LOOPBACK_RELAYS=1   # loopback relays are dev/test only; unset in production
 unset WN_SOCKET
 
 ALICE=$(wn --json create-identity | jq -r '.result.account_id')

@@ -88,7 +88,7 @@ struct ServeArgs {
     insecure_local_broker: bool,
     #[arg(
         long,
-        help = "Dev/test only: allow relay connections to loopback/private endpoints"
+        help = "Dev/test only: allow relay connections to loopback endpoints (loopback only; private/link-local/CGNAT stay rejected)"
     )]
     allow_loopback_relays: bool,
 }

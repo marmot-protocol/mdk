@@ -103,10 +103,12 @@ pub struct AgentConnectorConfig {
     /// cannot steer the connector at local services (SSRF) or downgrade TLS
     /// trust through DNS. See `docs/marmot-architecture/overview/dial-safety.md`.
     pub allow_insecure_local_broker: bool,
-    /// Dev/test gate for loopback/private relay endpoints (e.g. an in-process
-    /// `MockRelay` or a local `nostr-rs-relay`). Off by default: production
-    /// rejects non-public relay hosts at the relay-safety chokepoint. Threaded
-    /// into the connector's `MarmotAppConfig::allow_loopback_relay_endpoints`.
+    /// Dev/test gate for loopback relay endpoints (e.g. an in-process
+    /// `MockRelay` or a local `nostr-rs-relay`). Admits loopback only;
+    /// private/link-local/CGNAT relay hosts stay rejected. Off by default:
+    /// production rejects non-public relay hosts at the relay-safety chokepoint.
+    /// Threaded into the connector's
+    /// `MarmotAppConfig::allow_loopback_relay_endpoints`.
     pub allow_loopback_relays: bool,
 }
 

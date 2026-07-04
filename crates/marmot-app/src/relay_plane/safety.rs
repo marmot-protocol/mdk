@@ -151,6 +151,10 @@ mod tests {
             "ws://[::1]:8080",
             "ws://[fc00::1]",
             "ws://localhost:7777",
+            // Rooted localhost names still resolve to loopback and must be
+            // rejected too (they parse as `Host::Domain("localhost.")`).
+            "ws://localhost.:7777",
+            "ws://dev.localhost.:7777",
         ] {
             assert!(
                 policy

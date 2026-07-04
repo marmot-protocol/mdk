@@ -10,16 +10,39 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use url::Host;
 
 /// Whether `host` is `localhost`, a subdomain of `.localhost`, or an IP
-/// loopback literal.
+/// loopback literal. A rooted (fully-qualified) name keeps a trailing dot
+/// (`localhost.`, `dev.localhost.`), which system resolution still maps to
+/// loopback, so a single trailing dot is stripped before matching.
 pub fn is_loopback_host(host: Host<&str>) -> bool {
     match host {
-        Host::Domain(domain) => {
-            let lowered = domain.to_ascii_lowercase();
-            lowered == "localhost" || lowered.ends_with(".localhost")
-        }
+        Host::Domain(domain) => is_loopback_domain(domain),
         Host::Ipv4(addr) => addr.is_loopback(),
         Host::Ipv6(addr) => addr.is_loopback(),
     }
+}
+
+fn is_loopback_domain(domain: &str) -> bool {
+    let lowered = domain.to_ascii_lowercase();
+    let unrooted = lowered.strip_suffix('.').unwrap_or(&lowered);
+    unrooted == "localhost" || unrooted.ends_with(".localhost")
+}
+
+/// Whether a `quic://` broker candidate host is a literal loopback: exactly
+/// `localhost` (rooted or not) or a loopback IP literal. Deliberately narrower
+/// than [`is_loopback_host`] — it does not match `*.localhost` subdomains —
+/// because it gates the no-cert-verification `InsecureLocal` trust, which must
+/// only be reachable for an unambiguous local endpoint plus an explicit dev
+/// flag. Shared by the agent-stream watch and agent-connector dial sites so the
+/// two cannot drift.
+pub fn is_loopback_candidate_host(host: &str) -> bool {
+    let unrooted = host.strip_suffix('.').unwrap_or(host);
+    if unrooted.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    unrooted
+        .parse::<IpAddr>()
+        .map(is_loopback_ip)
+        .unwrap_or(false)
 }
 
 /// Whether `addr` is an IPv4 or IPv6 loopback address.
