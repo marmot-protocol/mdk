@@ -44,6 +44,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Naming gate (retired legacy tokens)
+        run: ./scripts/check_legacy_naming.sh
+
   rust-check:
     name: Rust check
     runs-on: ubuntu-latest
