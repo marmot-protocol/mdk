@@ -12,6 +12,7 @@ mod connection;
 mod encrypted_media_secrets;
 mod migrations;
 mod openmls_storage;
+mod pending_welcome_delivery;
 mod shared;
 mod storage;
 mod timeline;
@@ -31,6 +32,7 @@ pub use connection::{
     SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
 };
 pub use openmls_storage::SqliteOpenMlsStorageError;
+pub use pending_welcome_delivery::PendingWelcomeDeliveryRecord;
 pub use shared::{
     PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
     StoredRelayTelemetrySettings,

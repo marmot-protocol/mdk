@@ -23,7 +23,7 @@ use marmot_forensics::AuditEventContext;
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
     EventGroupProjection, GroupConfirmationProjection, add_group, fail_if_publish_failed,
-    send_summary_from_effects, validate_group_profile,
+    publish_failure_error, send_summary_from_effects, validate_group_profile,
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
@@ -40,7 +40,7 @@ use crate::{
     AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    PendingWelcomeDelivery, SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -261,6 +261,7 @@ impl AppClient {
             )
             .await?;
         fail_if_publish_failed(&effects)?;
+        self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.add_group(&group_id)?;
@@ -539,6 +540,7 @@ impl AppClient {
 
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
+            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
             self.record_human_action_succeeded(group_id, &audit_context, &effects);
             self.remember_published_reports(&effects);
             self.refresh_group(group_id);
@@ -1985,6 +1987,69 @@ impl AppClient {
             let event_id = hex::encode(report.message_id.as_slice());
             remember_seen_event(&mut seen, &mut self.state, event_id);
         }
+    }
+
+    /// Durably record welcomes a confirmed create/invite could not deliver, so
+    /// the repair handle is not lost when the call returns (mdk#352). The commit
+    /// is already confirmed and externally visible, so the added member stays in
+    /// the roster but cannot join until the welcome is re-delivered.
+    fn record_welcome_delivery_failures(
+        &self,
+        group_id_hex: &str,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        if effects.welcome_failures.is_empty() {
+            return Ok(());
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        let recorded_at = unix_now_seconds();
+        for failure in &effects.welcome_failures {
+            storage.record_pending_welcome_delivery(
+                &hex::encode(failure.message_id.as_slice()),
+                group_id_hex,
+                &hex::encode(failure.recipient.as_slice()),
+                recorded_at,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Welcomes still awaiting re-delivery for this account (mdk#352), oldest
+    /// first. Each entry's `message_id_hex` is the handle for
+    /// [`AppClient::redeliver_welcome`].
+    pub fn pending_welcome_deliveries(&self) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .list_pending_welcome_deliveries()?
+            .into_iter()
+            .map(|record| PendingWelcomeDelivery {
+                group_id_hex: record.group_id_hex,
+                message_id_hex: record.message_id_hex,
+                recipient_hex: record.recipient_hex,
+                recorded_at: record.recorded_at,
+            })
+            .collect())
+    }
+
+    /// Re-publish a welcome that a confirmed create/invite failed to deliver,
+    /// from the copy the engine stored at wrap time — no re-commit (mdk#352).
+    /// Clears the pending record only once the welcome is accepted; a repeated
+    /// failure leaves it queued for a later retry.
+    pub async fn redeliver_welcome(
+        &mut self,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
+        let effects = self.runtime.redeliver_welcome(&message_id).await?;
+        if !effects.failures.is_empty() {
+            // Still undelivered: keep the pending record so it can be retried.
+            return Err(publish_failure_error(&effects.failures));
+        }
+        self.app
+            .account_storage(&self.state.label)?
+            .clear_pending_welcome_delivery(message_id_hex)?;
+        Ok(send_summary_from_effects(&effects))
     }
 }
 

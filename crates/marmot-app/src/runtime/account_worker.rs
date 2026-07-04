@@ -26,8 +26,8 @@ use crate::{
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppError, AppGroupMemberRecord,
     AppGroupMlsState, AppGroupRecord, AppProjectionUpdate, AppQuarantinedGroup,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PushRegistration, ReceivedMessage,
-    SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
+    PushRegistration, ReceivedMessage, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -236,6 +236,13 @@ pub(crate) enum AccountWorkerCommand {
     },
     RetryGroupConvergence {
         group_id: GroupId,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    PendingWelcomeDeliveries {
+        respond: oneshot::Sender<Result<Vec<PendingWelcomeDelivery>, AppError>>,
+    },
+    RedeliverWelcome {
+        message_id_hex: String,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     PublishKeyPackage {
@@ -1158,6 +1165,17 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => {
             let result = client.retry_group_convergence(&group_id).await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
+            let result = client.pending_welcome_deliveries();
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::RedeliverWelcome {
+            message_id_hex,
+            respond,
+        } => {
+            let result = client.redeliver_welcome(&message_id_hex).await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::PublishKeyPackage { respond } => {

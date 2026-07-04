@@ -661,6 +661,20 @@ pub struct SendSummary {
     pub message_ids: Vec<String>,
 }
 
+/// A welcome that a confirmed group create/invite could not deliver to its
+/// recipient (mdk#352). The commit is already durable, so the member is added
+/// but unjoinable until the welcome reaches them. Persisted so the repair
+/// handle survives the call return and a restart; re-deliver it with
+/// [`AppClient::redeliver_welcome`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingWelcomeDelivery {
+    pub group_id_hex: String,
+    /// The stored welcome's MLS message id — the key for re-delivery.
+    pub message_id_hex: String,
+    pub recipient_hex: String,
+    pub recorded_at: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecureDeleteExpiredResult {
     /// Number of expired raw app-event rows securely scrubbed and pruned.

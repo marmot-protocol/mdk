@@ -1109,7 +1109,7 @@ pub(crate) fn fail_if_publish_failed(
     Err(publish_failure_error(&effects.failures))
 }
 
-fn publish_failure_error(failures: &[marmot_account::PublishFailure]) -> AppError {
+pub(crate) fn publish_failure_error(failures: &[marmot_account::PublishFailure]) -> AppError {
     AppError::Publish(
         failures
             .iter()

@@ -44,6 +44,8 @@ mod migration_0021_push_token_owner_signatures;
 mod migration_0022_chat_list_self_membership;
 #[path = "migrations/0023_chat_list_projection_version.rs"]
 mod migration_0023_chat_list_projection_version;
+#[path = "migrations/0024_pending_welcome_delivery.rs"]
+mod migration_0024_pending_welcome_delivery;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -170,6 +172,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 23,
         name: "0023_chat_list_projection_version",
         apply: migration_0023_chat_list_projection_version::apply,
+    },
+    Migration {
+        version: 24,
+        name: "0024_pending_welcome_delivery",
+        apply: migration_0024_pending_welcome_delivery::apply,
     },
 ];
 

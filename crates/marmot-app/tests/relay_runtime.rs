@@ -5165,3 +5165,56 @@ async fn runtime_data_mode_toggle_rotates_live_recorder_with_boundary() {
 
     runtime.shutdown().await;
 }
+
+/// mdk#352 review follow-up: the welcome re-delivery surface is reachable end
+/// to end through the runtime worker. A create whose welcome delivered leaves
+/// nothing pending, and re-delivering an unknown welcome id is a clean error
+/// (the failure-record + successful-redeliver paths are covered by the
+/// storage-sqlite round-trip and marmot-account runtime tests).
+#[tokio::test]
+async fn app_runtime_exposes_welcome_redelivery_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup.clone()).await.unwrap();
+    let bob = runtime.create_identity(setup).await.unwrap();
+
+    let _group = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "welcome redelivery surface",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The welcome delivered over the live relay, so nothing is queued.
+    assert!(
+        runtime
+            .pending_welcome_deliveries(&alice.account.account_id_hex)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a delivered welcome must not queue a pending re-delivery"
+    );
+
+    // No welcome is stored under this id, so re-delivery is a clean error routed
+    // through the worker command (not a panic or a lost request).
+    let unknown_welcome_id = "ab".repeat(32);
+    assert!(
+        runtime
+            .redeliver_welcome(&alice.account.account_id_hex, &unknown_welcome_id)
+            .await
+            .is_err(),
+        "re-delivering an unknown welcome id must error cleanly"
+    );
+
+    runtime.shutdown().await;
+}
