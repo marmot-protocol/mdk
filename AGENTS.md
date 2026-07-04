@@ -47,7 +47,7 @@ The canonical protocol specification lives in
 | Agent stream composition | `crates/agent-stream-compose/AGENTS.md` |
 | `wn-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
-| App runtime UniFFI bindings | `crates/marmot-uniffi/README.md` |
+| App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |

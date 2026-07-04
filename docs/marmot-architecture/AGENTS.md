@@ -68,6 +68,9 @@ Agent map for the Marmot architecture docs.
 - **Path:** `hermes-openclaw-agent-integration-plan.md`
   - **Role:** Working plan for the Hermes/OpenClaw agent integration. Check status and dates before relying on it.
 
+- **Path:** `../integrations/hermes/marmot/AGENTS.md` and `../integrations/openclaw/marmot/AGENTS.md`
+  - **Role:** Agent plugin scope, key files, and verification for the control-plane-only Hermes/OpenClaw integrations.
+
 - **Repo:** `github.com/marmot-protocol/marmot`
   - **Role:** Marmot protocol specification by stable surface and app component.
 
