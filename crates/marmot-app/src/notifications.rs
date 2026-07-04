@@ -1010,6 +1010,7 @@ pub(crate) fn notification_update_from_event_cached(
         | MarmotAppEvent::ProjectionUpdated(_)
         | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::GroupEvent(_)
+        | MarmotAppEvent::WelcomeDeliveryPending { .. }
         | MarmotAppEvent::AccountError(_) => Ok(None),
     }
 }

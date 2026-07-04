@@ -66,6 +66,11 @@ pub struct AppClient {
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+    /// Welcomes queued for re-delivery during the most recent create/invite.
+    /// The runtime account worker drains this after the command and broadcasts a
+    /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
+    /// without polling (mdk#352).
+    pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
 }
 
 /// A point-in-time copy of the live session's read-only group projections
@@ -1994,7 +1999,7 @@ impl AppClient {
     /// is already confirmed and externally visible, so the added member stays in
     /// the roster but cannot join until the welcome is re-delivered.
     fn record_welcome_delivery_failures(
-        &self,
+        &mut self,
         group_id_hex: &str,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
@@ -2004,14 +2009,32 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?;
         let recorded_at = unix_now_seconds();
         for failure in &effects.welcome_failures {
+            let message_id_hex = hex::encode(failure.message_id.as_slice());
+            let recipient_hex = hex::encode(failure.recipient.as_slice());
             storage.record_pending_welcome_delivery(
-                &hex::encode(failure.message_id.as_slice()),
+                &message_id_hex,
                 group_id_hex,
-                &hex::encode(failure.recipient.as_slice()),
+                &recipient_hex,
                 recorded_at,
             )?;
+            // Queue a runtime event so subscribers (UI/CLI/UniFFI) learn the
+            // member is unjoinable without polling the durable queue.
+            self.pending_welcome_delivery_events
+                .push(PendingWelcomeDelivery {
+                    group_id_hex: group_id_hex.to_owned(),
+                    message_id_hex,
+                    recipient_hex,
+                    recorded_at,
+                });
         }
         Ok(())
+    }
+
+    /// Drain the welcomes queued for re-delivery during the last create/invite,
+    /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
+    /// (mdk#352).
+    pub(crate) fn take_pending_welcome_delivery_events(&mut self) -> Vec<PendingWelcomeDelivery> {
+        std::mem::take(&mut self.pending_welcome_delivery_events)
     }
 
     /// Welcomes still awaiting re-delivery for this account (mdk#352), oldest
@@ -2042,9 +2065,24 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
         let effects = self.runtime.redeliver_welcome(&message_id).await?;
-        if !effects.failures.is_empty() {
-            // Still undelivered: keep the pending record so it can be retried.
-            return Err(publish_failure_error(&effects.failures));
+        // Only clear the durable pending record once every "still undelivered"
+        // signal agrees the welcome landed: no PublishFailure, no structured
+        // WelcomeDeliveryFailure, and a report that met its ack threshold.
+        // These are kept in lockstep by `publish_one` today, but asserting all
+        // three means a future refactor cannot drift one signal and clear the
+        // queue while the welcome is still unreachable (the #375 class of bug).
+        let delivered = effects.failures.is_empty()
+            && effects.welcome_failures.is_empty()
+            && effects
+                .reports
+                .last()
+                .is_some_and(|report| report.met_required_acks());
+        if !delivered {
+            return Err(if effects.failures.is_empty() {
+                AppError::Publish("welcome re-delivery did not reach the recipient".into())
+            } else {
+                publish_failure_error(&effects.failures)
+            });
         }
         self.app
             .account_storage(&self.state.label)?

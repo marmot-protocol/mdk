@@ -5185,6 +5185,7 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
     let alice = runtime.create_identity(setup.clone()).await.unwrap();
     let bob = runtime.create_identity(setup).await.unwrap();
 
+    let mut events = runtime.subscribe();
     let _group = runtime
         .create_group(
             &alice.account.account_id_hex,
@@ -5195,7 +5196,7 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
         .await
         .unwrap();
 
-    // The welcome delivered over the live relay, so nothing is queued.
+    // The welcome delivered over the live relay, so nothing is queued...
     assert!(
         runtime
             .pending_welcome_deliveries(&alice.account.account_id_hex)
@@ -5204,6 +5205,14 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
             .is_empty(),
         "a delivered welcome must not queue a pending re-delivery"
     );
+    // ...and no WelcomeDeliveryPending event is emitted on the happy path (the
+    // worker still drained the empty queue without spuriously signaling).
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, MarmotAppEvent::WelcomeDeliveryPending { .. }),
+            "a delivered welcome must not emit WelcomeDeliveryPending"
+        );
+    }
 
     // No welcome is stored under this id, so re-delivery is a clean error routed
     // through the worker command (not a panic or a lost request).

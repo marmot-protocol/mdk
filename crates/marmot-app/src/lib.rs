@@ -1065,6 +1065,7 @@ impl MarmotApp {
             state: open.state,
             pending_projection_updates: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
+            pending_welcome_delivery_events: Vec::new(),
         };
         // One-time upgrade backfill: derive `self_membership` for pre-0018 rows
         // from current engine state so groups the local account already left /
