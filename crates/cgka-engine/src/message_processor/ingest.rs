@@ -1405,37 +1405,42 @@ impl<S: StorageProvider> Engine<S> {
         // dropped while MLS and the state machine stay at N) permanently
         // strands auto-commit replay, which bails on any epoch mismatch
         // (mdk#333).
-        if let Ok(mut g) = self.storage.get_group(group_id) {
+        // Read-then-project as one fallible unit: a failed read is no more
+        // recoverable than a failed write here (both leave the state machine
+        // pending at N+1 with no matching durable record), so both funnel
+        // through the same compensation.
+        let projection = self.storage.get_group(group_id).and_then(|mut g| {
             g.epoch = new_epoch;
             g.members
                 .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
-            if let Err(err) = self.storage.put_group(&g) {
-                // The pending slot was never handed off to a caller, so
-                // `publish_failed` can never reach it — rewind the state
-                // machine here (in-memory, so the storage pressure that
-                // failed the write cannot also defeat the compensation); the
-                // still-armed guard clears the staged OpenMLS commit on the
-                // early return.
-                if self.epoch_manager.rollback_publish(pending_ref).is_err() {
-                    tracing::warn!(
-                        target: "cgka_engine::message_processor",
-                        method = "stage_auto_commit_for_queued_proposal",
-                        "state-machine rollback failed after group record write failure"
-                    );
-                }
-                self.audit_group(
-                    group_id,
-                    crate::audit_helpers::epoch_state_changed_event(
-                        Some("pending_publish"),
-                        "stable",
-                        pre_commit_epoch,
-                        "auto_commit_stage_failed",
-                        Some(pending_ref),
-                        Some("group_evolution"),
-                    ),
+            self.storage.put_group(&g)
+        });
+        if let Err(err) = projection {
+            // The pending slot was never handed off to a caller, so
+            // `publish_failed` can never reach it — rewind the state
+            // machine here (in-memory, so the storage pressure that
+            // failed the read/write cannot also defeat the compensation);
+            // the still-armed guard clears the staged OpenMLS commit on the
+            // early return.
+            if self.epoch_manager.rollback_publish(pending_ref).is_err() {
+                tracing::warn!(
+                    target: "cgka_engine::message_processor",
+                    method = "stage_auto_commit_for_queued_proposal",
+                    "state-machine rollback failed after group record projection failure"
                 );
-                return Err(err.into());
             }
+            self.audit_group(
+                group_id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    Some("pending_publish"),
+                    "stable",
+                    pre_commit_epoch,
+                    "auto_commit_stage_failed",
+                    Some(pending_ref),
+                    Some("group_evolution"),
+                ),
+            );
+            return Err(err.into());
         }
         self.track_pending_commit_for_recovery(
             pending_ref,
