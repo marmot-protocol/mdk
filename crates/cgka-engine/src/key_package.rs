@@ -1,8 +1,9 @@
 //! KeyPackage generation + validation.
 //!
 //! Scope for 0.1.0: produce a fresh KeyPackage whose leaf capabilities are
-//! derived from the [`crate::FeatureRegistry`]. Expiry and refresh scheduling
-//! are handled above the engine.
+//! derived from the [`crate::FeatureRegistry`]. Transported KeyPackages are
+//! validated for OpenMLS lifetime validity and Marmot lifetime range policy;
+//! refresh scheduling is handled above the engine.
 
 use crate::capabilities::leaf_capabilities;
 use crate::engine::Engine;
@@ -41,6 +42,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     let key_package = kp_in
         .validate(&crypto, ProtocolVersion::Mls10)
         .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+    validate_key_package_lifetime_policy(&key_package)?;
     let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
@@ -72,6 +74,7 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
     let key_package = kp_in
         .validate(&crypto, ProtocolVersion::Mls10)
         .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+    validate_key_package_lifetime_policy(&key_package)?;
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
@@ -172,6 +175,7 @@ impl<S: StorageProvider> Engine<S> {
         let key_package = kp_in
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+        validate_key_package_lifetime_policy(&key_package)?;
         // foundation/key-packages.md: reject a KeyPackage whose credential
         // identity is not a valid Marmot account identity. This single gate
         // covers both the create-group and invite invitee paths.
@@ -182,4 +186,16 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         Ok(key_package)
     }
+}
+
+fn validate_key_package_lifetime_policy(key_package: &MlsKeyPackage) -> Result<(), EngineError> {
+    let lifetime = key_package.life_time();
+    if !lifetime.has_acceptable_range() {
+        return Err(EngineError::Backend(format!(
+            "key_package lifetime range exceeds Marmot maximum: not_before={} not_after={}",
+            lifetime.not_before(),
+            lifetime.not_after()
+        )));
+    }
+    Ok(())
 }

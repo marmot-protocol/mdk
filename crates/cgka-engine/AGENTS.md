@@ -63,7 +63,8 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** `feature_status`, `upgradeable_capabilities`, write-through cache population
 
 - **Module:** `key_package.rs`
-  - **Owns:** `fresh_key_package` (no expiry; that's a higher-layer concern)
+  - **Owns:** `fresh_key_package` and KeyPackage parse-time lifetime/range acceptance policy; refresh scheduling remains
+    a higher-layer concern.
 
 - **Module:** `group_lifecycle.rs`
   - **Owns:** `do_create_group`, `do_join_welcome`
