@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# NOTE: requires a published wn-agent-v* release. Pre-rename dm-agent-v*
+# releases ship differently-named assets and cannot be installed by this
+# script; cut the first wn-agent-v* release before pointing installs here.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace_version_default="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/../Cargo.toml" 2>/dev/null | head -n 1)"
 workspace_version_default="${workspace_version_default:-latest}"

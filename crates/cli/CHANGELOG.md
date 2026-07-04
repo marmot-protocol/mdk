@@ -37,9 +37,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   `WN_DEV_SETTLEMENT_QUIESCENCE_MS`), the default data directory moved from `darkmatter` to `whitenoise` (dev fallback
   `.whitenoise`), the default keychain service is `com.marmot.whitenoise`, daemon sockets are `wnd.sock` /
   `wn-agent.sock`, the profile deep-link scheme is `marmot://`, release tags follow `wn-agent-v*`, and the Homebrew
-  formula is `marmot-protocol/tap/wn`. There is no automatic compatibility fallback: move the data directory (for example
+  formula is `marmot-protocol/tap/wn`. There is no automatic compatibility fallback: stop any still-running legacy
+  daemon **before** the first `wnd` start (`dm daemon stop` with the old binary, or kill the pid recorded in the old
+  data directory's `dev/dmd.pid`) — the renamed socket/pid files make an old `dmd` invisible to `wn daemon status`.
+  Then move the data directory (for example
   `mv ~/Library/Application\ Support/darkmatter ~/Library/Application\ Support/whitenoise`), update `DM_*` env vars in
-  shell profiles and service units, and reinstall from the new formula. Keychain entries stored under the old
+  shell profiles and service units, and reinstall from the new formula. If the data directory is not moved, `wn` starts
+  with an empty account list rather than a targeted error. Keychain entries stored under the old
   `com.marmot.darkmatter` service can still be read manually by setting `WN_KEYCHAIN_SERVICE=com.marmot.darkmatter`, or
   re-import the account to write them under the new service.
 
