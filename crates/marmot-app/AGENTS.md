@@ -61,7 +61,11 @@ App runtime bridge for the first real Marmot app surfaces.
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
-  connections, but must not rewrite signed routing state.
+  connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
+  host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through
+  `src/runtime/agent_stream_watch.rs`, before any connect; both follow the one dial discipline in
+  `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
+  dev flag). Do not add an outbound relay/broker path that bypasses them.
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.

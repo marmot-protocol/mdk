@@ -15,6 +15,16 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Security
 
+- Every outbound relay connection now passes through one host-safety chokepoint: relay endpoints whose literal host is
+  loopback, RFC1918/private, link-local (including `169.254.169.254`), CGNAT, multicast, or IPv6 ULA are rejected before
+  a socket is opened, so a poisoned routing record or relay-list event can no longer steer the relay pool at internal
+  services (SSRF). Local relays (e.g. an in-process `MockRelay` or a dev `nostr-rs-relay`) are reachable only when
+  `WN_ALLOW_LOOPBACK_RELAYS=1` is set, mirroring `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`; production installs leave it unset.
+- The `wn-agent` connector no longer connects to an agent-supplied `quic://` broker candidate that resolves to a
+  non-public address, and no longer derives no-cert-verification (`insecure_local`) trust from a candidate that merely
+  resolves to loopback. Loopback brokers are reachable, without certificate verification, only when `wn-agent serve` is
+  started with the new `--insecure-local-broker` dev flag and the candidate host is a literal loopback (SSRF + trust
+  downgrade hardening).
 - The `wnd` daemon control socket (and the `wn-agent` connector socket) is now created owner-only (0600)
   atomically — bound inside a private 0700 staging directory and linked into place — instead of being chmod-ed
   after `bind`, removing the brief window where the socket was reachable at umask-default permissions (for

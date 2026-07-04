@@ -805,6 +805,9 @@ struct OpenAppAccount {
 }
 
 impl MarmotApp {
+    /// Dev/test convenience constructor — see [`MarmotApp::with_relays`]. Not a
+    /// production entry point; hidden from the public API docs.
+    #[doc(hidden)]
     pub fn with_relay(root: impl AsRef<Path>, relay_url: impl Into<String>) -> Self {
         Self::with_relays(root, vec![relay_url.into()])
     }
@@ -872,8 +875,23 @@ impl MarmotApp {
         Self::with_relays_and_config(root, vec![relay_url.into()], config)
     }
 
+    /// Dev/test-only convenience constructor. **Not a production entry point**
+    /// and hidden from the public API docs: production opens through
+    /// `with_relays_and_account_home*`, which default the relay-safety gate to
+    /// production posture (loopback rejected). This helper backs the crate's own
+    /// tests, which drive in-process `MockRelay`s at loopback, so it opts the
+    /// relay-safety gate into admitting loopback endpoints. It cannot be
+    /// `#[cfg(test)]`-gated because the crate's integration tests
+    /// (`crates/marmot-app/tests/*`) consume it through the public API. Callers
+    /// that need an explicit posture pass a config through
+    /// `with_relays_and_config`.
+    #[doc(hidden)]
     pub fn with_relays(root: impl AsRef<Path>, relay_urls: Vec<String>) -> Self {
-        Self::with_relays_and_config(root, relay_urls, MarmotAppConfig::default())
+        Self::with_relays_and_config(
+            root,
+            relay_urls,
+            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        )
     }
 
     pub fn with_relays_and_config(
@@ -890,11 +908,15 @@ impl MarmotApp {
             config.dev_settlement_quiescence_ms = Some(0);
         }
         let root = root.as_ref().to_path_buf();
+        let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
+            APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
+            config.allow_loopback_relay_endpoints,
+        );
         Self {
             account_home: AccountHome::open(&root),
             root,
             relay_urls,
-            relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
+            relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
@@ -929,11 +951,15 @@ impl MarmotApp {
         account_home: AccountHome,
         config: MarmotAppConfig,
     ) -> Self {
+        let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
+            APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
+            config.allow_loopback_relay_endpoints,
+        );
         Self {
             root: root.as_ref().to_path_buf(),
             relay_urls,
             account_home,
-            relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
+            relay_plane,
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
@@ -962,7 +988,10 @@ impl MarmotApp {
     }
 
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
-        self.client_with_relay_plane(label, &MarmotRelayPlane::full_history(), None)
+        let relay_plane = MarmotRelayPlane::full_history_with_loopback(
+            self.config.allow_loopback_relay_endpoints,
+        );
+        self.client_with_relay_plane(label, &relay_plane, None)
             .await
     }
 

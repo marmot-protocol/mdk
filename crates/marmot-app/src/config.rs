@@ -22,6 +22,16 @@ pub struct MarmotAppConfig {
     /// requests to the local host. This does not affect component validity
     /// (decode still accepts loopback endpoints).
     pub allow_loopback_blob_endpoints: bool,
+    /// Dev/test gate for loopback relay endpoints (e.g. `ws://127.0.0.1:PORT`,
+    /// an in-process `MockRelay`). A loopback relay URL is VALID
+    /// routing/relay-list state, but production MUST NOT open a socket to one;
+    /// the relay-safety chokepoint rejects non-public relay hosts before they
+    /// reach the pool. This gate admits loopback only — private/link-local/CGNAT
+    /// relay hosts stay rejected even when it is set. Defaults to `false`; test
+    /// harnesses set `true`. Mirrors `allow_loopback_blob_endpoints`; does not
+    /// affect routing-component validity (decode still accepts loopback
+    /// endpoints).
+    pub allow_loopback_relay_endpoints: bool,
     /// Dev/test override for the convergence settlement quiescence window, in
     /// milliseconds. `None` (the default) uses the protocol-pinned value
     /// (`settlement_quiescence_ms = 1000`); a client MUST NOT ship a non-default
@@ -51,6 +61,7 @@ impl Default for MarmotAppConfig {
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             service_endpoints: MarmotServiceEndpoints::compiled(),
             allow_loopback_blob_endpoints: false,
+            allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
         }
     }
@@ -71,6 +82,15 @@ impl MarmotAppConfig {
     /// default; production builds must leave this unset.
     pub fn with_allow_loopback_blob_endpoints(mut self, allow: bool) -> Self {
         self.allow_loopback_blob_endpoints = allow;
+        self
+    }
+
+    /// Enable opening relay connections to loopback endpoints for dev/test
+    /// (e.g. an in-process `MockRelay`). Admits loopback only; private/
+    /// link-local/CGNAT hosts stay rejected. Off by default; production builds
+    /// must leave this unset.
+    pub fn with_allow_loopback_relay_endpoints(mut self, allow: bool) -> Self {
+        self.allow_loopback_relay_endpoints = allow;
         self
     }
 

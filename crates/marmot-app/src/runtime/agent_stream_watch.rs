@@ -7,6 +7,7 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamKeyContextV1,
 };
+use cgka_traits::app_components::{is_loopback_candidate_host, reject_non_public_socket_addr};
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_BROKER_TAG, STREAM_ROUTE_TAG, STREAM_TAG,
 };
@@ -359,14 +360,14 @@ async fn watch_broker_candidates(
     }
     let mut last_error = None;
     for candidate in watch.candidates {
-        match resolve_broker_addr(&candidate.authority).await {
+        match resolve_broker_addr(&candidate.authority, watch.insecure_local).await {
             Ok(broker_addr) => {
                 let resolved = ResolvedQuicCandidate {
                     broker_addr,
                     server_name: candidate.server_name,
                 };
-                let trust = broker_trust_for_addr(
-                    resolved.broker_addr,
+                let trust = broker_trust_for_candidate(
+                    &resolved.server_name,
                     watch.server_cert_der.clone(),
                     watch.insecure_local,
                 );
@@ -444,21 +445,44 @@ async fn watch_broker_candidates(
     }
 }
 
-async fn resolve_broker_addr(authority: &str) -> Result<SocketAddr, AppError> {
+/// Resolve a sender-controlled broker authority to a socket address, running
+/// every resolved address through the shared dial-safety gate. Broker
+/// candidates come from another member's Start event, so without the explicit
+/// `allow_local_endpoint` dev opt-in a candidate that resolves to loopback,
+/// private, link-local, CGNAT, or any other non-public range is rejected before
+/// any QUIC handshake (SSRF hardening; see
+/// `docs/marmot-architecture/overview/dial-safety.md`). The returned address is
+/// the one the QUIC endpoint connects to, so the validated address and the
+/// dialed address cannot diverge.
+pub(crate) async fn resolve_broker_addr(
+    authority: &str,
+    allow_local_endpoint: bool,
+) -> Result<SocketAddr, AppError> {
     let mut addrs = tokio::net::lookup_host(authority)
         .await
         .map_err(|_| AppError::AgentStreamInvalidCandidate(authority.to_owned()))?;
-    addrs
+    let addr = addrs
         .next()
-        .ok_or_else(|| AppError::AgentStreamInvalidCandidate(authority.to_owned()))
+        .ok_or_else(|| AppError::AgentStreamInvalidCandidate(authority.to_owned()))?;
+    reject_non_public_socket_addr(addr, allow_local_endpoint)
+        .map_err(|_| AppError::AgentStreamInvalidCandidate(authority.to_owned()))?;
+    Ok(addr)
 }
 
-pub(crate) fn broker_trust_for_addr(
-    broker_addr: SocketAddr,
+/// Select TLS trust for a broker candidate from configuration and the LITERAL
+/// candidate host, never from a resolved address. `InsecureLocal` (skip cert
+/// verification) requires both the explicit `insecure_local` dev opt-in and a
+/// candidate whose host is a literal loopback (`localhost` or a loopback IP
+/// literal); a hostname that merely RESOLVES to loopback keeps normal
+/// verification, so DNS answers can never downgrade trust. The broker client's
+/// `InsecureLocalRequiresLoopback` check remains as the resolved-address
+/// backstop behind this gate.
+pub(crate) fn broker_trust_for_candidate(
+    candidate_host: &str,
     server_cert_der: Option<Vec<u8>>,
     insecure_local: bool,
 ) -> BrokerServerTrust {
-    if insecure_local && broker_addr.ip().is_loopback() {
+    if insecure_local && is_loopback_candidate_host(candidate_host) {
         return BrokerServerTrust::InsecureLocal;
     }
     server_cert_der

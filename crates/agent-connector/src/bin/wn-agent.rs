@@ -80,6 +80,17 @@ struct ServeArgs {
         help = "Maximum concurrently served control connections"
     )]
     max_connections: usize,
+    #[arg(
+        long,
+        help = "Dev/test only: allow literal-loopback quic:// broker candidates \
+                without certificate verification"
+    )]
+    insecure_local_broker: bool,
+    #[arg(
+        long,
+        help = "Dev/test only: allow relay connections to loopback endpoints (loopback only; private/link-local/CGNAT stay rejected)"
+    )]
+    allow_loopback_relays: bool,
 }
 
 #[derive(Debug, Args)]
@@ -206,6 +217,8 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         debug_controls: args.debug_controls,
         auth_token,
         max_connections: args.max_connections,
+        allow_insecure_local_broker: args.insecure_local_broker,
+        allow_loopback_relays: args.allow_loopback_relays,
     };
     match serve_socket(config).await {
         Ok(()) => ExitCode::SUCCESS,

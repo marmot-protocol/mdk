@@ -964,7 +964,8 @@ fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> M
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
     // installs leave it unset.
     let mut config = MarmotAppConfig::default()
-        .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints());
+        .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
+        .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays());
     // Dev/test only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the pinned
     // convergence settlement window (e.g. `0` for instant settlement in
     // integration tests). Production installs leave it unset and use the pinned
@@ -983,6 +984,18 @@ fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> M
 fn wn_allow_loopback_blob_endpoints() -> bool {
     matches!(
         std::env::var("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Dev/test opt-in for opening relay connections to loopback/private endpoints
+/// (e.g. a local `nostr-rs-relay` or an in-process `MockRelay`). Production
+/// installs leave `WN_ALLOW_LOOPBACK_RELAYS` unset, so the relay-safety
+/// chokepoint rejects non-public relay hosts. Mirrors
+/// `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`.
+fn wn_allow_loopback_relays() -> bool {
+    matches!(
+        std::env::var("WN_ALLOW_LOOPBACK_RELAYS").as_deref(),
         Ok("1") | Ok("true")
     )
 }

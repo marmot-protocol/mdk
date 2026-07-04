@@ -1,9 +1,7 @@
 use std::net::IpAddr;
 
-pub(crate) use cgka_traits::app_components::is_loopback_host;
-use cgka_traits::app_components::{
-    BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN, is_loopback_ip, is_public_ip,
-};
+use cgka_traits::app_components::{BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN};
+pub(crate) use cgka_traits::app_components::{is_loopback_host, reject_non_public_ip};
 use url::{Host, Url};
 
 use super::MediaLocator;
@@ -87,13 +85,6 @@ fn validate_public_or_allowed_loopback_host(
         Host::Ipv4(addr) => reject_non_public_ip(IpAddr::V4(addr), allow_loopback),
         Host::Ipv6(addr) => reject_non_public_ip(IpAddr::V6(addr), allow_loopback),
     }
-}
-
-pub(crate) fn reject_non_public_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
-    if (allow_loopback && is_loopback_ip(addr)) || is_public_ip(addr) {
-        return Ok(());
-    }
-    Err("URL must not point at a non-public address".into())
 }
 
 /// Whether `url` is a loopback-HTTP blob endpoint: scheme `http` (cleartext)

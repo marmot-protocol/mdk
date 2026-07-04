@@ -41,7 +41,8 @@ pub use encrypted_media::{
     encode_encrypted_media_policy_v1, validate_and_normalize_blob_endpoint_url,
 };
 pub use host_safety::{
-    is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4, is_public_ipv6,
+    is_loopback_candidate_host, is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4,
+    is_public_ipv6, reject_non_public_ip, reject_non_public_socket_addr,
 };
 pub use routing::{NostrRoutingV1, decode_nostr_routing_v1, encode_nostr_routing_v1};
 

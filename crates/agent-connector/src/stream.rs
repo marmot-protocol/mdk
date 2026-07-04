@@ -12,7 +12,8 @@ use transport_quic_broker::OpenBrokerTextPublisher;
 
 use crate::error::ConnectorError;
 use crate::quic::{
-    broker_trust_for_addr, first_quic_candidate, parse_quic_candidate, resolve_quic_candidate_addr,
+    broker_trust_for_candidate, first_quic_candidate, parse_quic_candidate,
+    resolve_quic_candidate_addr,
 };
 use crate::stream_session::ActiveStreamSession;
 use crate::validation::{normalize_hex, transcript_hash_from_hex, unix_now_seconds};
@@ -41,8 +42,13 @@ impl AgentConnector {
         let stream_id_hex = hex::encode(&stream_id);
         let candidate = first_quic_candidate(&quic_candidates)?;
         let parsed_candidate = parse_quic_candidate(&candidate)?;
-        let broker_addr = resolve_quic_candidate_addr(&parsed_candidate).await?;
-        let trust = broker_trust_for_addr(broker_addr);
+        let broker_addr =
+            resolve_quic_candidate_addr(&parsed_candidate, self.allow_insecure_local_broker)
+                .await?;
+        let trust = broker_trust_for_candidate(
+            &parsed_candidate.server_name,
+            self.allow_insecure_local_broker,
+        );
         let (_payload, summary) = self
             .runtime
             .start_agent_text_stream(

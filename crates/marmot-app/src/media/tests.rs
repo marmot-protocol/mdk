@@ -543,7 +543,7 @@ fn imeta_parser_rejects_private_ip_media_locator() {
     let tag = tag_with_locator(format!("https://10.0.0.5/{}.bin", valid_hash()));
     let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
-    assert!(err.to_string().contains("non-public"));
+    assert!(err.to_string().contains("public unicast"));
     assert!(!media_imeta_tags_are_valid(&[tag], false));
 }
 
@@ -561,7 +561,7 @@ fn imeta_parser_rejects_ipv6_transition_prefix_media_locators() {
         let tag = tag_with_locator(locator);
         let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
-        assert!(err.to_string().contains("non-public"));
+        assert!(err.to_string().contains("public unicast"));
         assert!(!media_imeta_tags_are_valid(&[tag], false));
     }
 }
@@ -573,7 +573,7 @@ fn imeta_parser_rejects_ipv6_documentation_3fff_media_locator() {
     let tag = tag_with_locator(format!("https://[3fff::1]/{}.bin", valid_hash()));
     let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
 
-    assert!(err.to_string().contains("non-public"));
+    assert!(err.to_string().contains("public unicast"));
     assert!(!media_imeta_tags_are_valid(&[tag], false));
 }
 
@@ -637,7 +637,7 @@ fn blossom_redirect_validation_rejects_cross_scheme_private_ip_and_cross_domain(
         ),
         (
             format!("https://10.0.0.5/{}.bin", valid_hash()),
-            "non-public",
+            "public unicast",
         ),
         (
             format!("https://cdn.attacker.net/{}.bin", valid_hash()),

@@ -114,15 +114,32 @@ pub struct RelayPlaneHealth {
 
 impl MarmotRelayPlane {
     pub fn runtime_default(subscription_rebuild_lookback: Duration) -> Self {
-        Self::from_sdk(Some(subscription_rebuild_lookback))
+        Self::from_sdk(Some(subscription_rebuild_lookback), false)
+    }
+
+    /// Production runtime plane whose relay-safety chokepoint admits loopback
+    /// endpoints only when `allow_loopback` is set
+    /// (`MarmotAppConfig::allow_loopback_relay_endpoints`, off by default).
+    pub fn runtime_default_with_loopback(
+        subscription_rebuild_lookback: Duration,
+        allow_loopback: bool,
+    ) -> Self {
+        Self::from_sdk(Some(subscription_rebuild_lookback), allow_loopback)
     }
 
     pub fn full_history() -> Self {
-        Self::from_sdk(None)
+        Self::from_sdk(None, false)
+    }
+
+    /// Full-history plane whose relay-safety chokepoint admits loopback
+    /// endpoints only when `allow_loopback` is set
+    /// (`MarmotAppConfig::allow_loopback_relay_endpoints`, off by default).
+    pub fn full_history_with_loopback(allow_loopback: bool) -> Self {
+        Self::from_sdk(None, allow_loopback)
     }
 
     pub fn with_subscription_rebuild_lookback(lookback: Duration) -> Self {
-        Self::from_sdk(Some(lookback))
+        Self::from_sdk(Some(lookback), false)
     }
 
     pub fn new(
@@ -136,10 +153,11 @@ impl MarmotRelayPlane {
             None,
             None,
             Arc::new(NostrSdkDirectoryRelayFetcher::standalone()),
+            false,
         )
     }
 
-    fn from_sdk(subscription_rebuild_lookback: Option<Duration>) -> Self {
+    fn from_sdk(subscription_rebuild_lookback: Option<Duration>, allow_loopback: bool) -> Self {
         let client = NostrSdkClient::builder().build();
         let relay_client = NostrSdkRelayClient::new(client.clone());
         let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
@@ -149,6 +167,7 @@ impl MarmotRelayPlane {
             Some(relay_client),
             None,
             Arc::new(NostrSdkDirectoryRelayFetcher::new(client)),
+            allow_loopback,
         )
     }
 
@@ -158,6 +177,7 @@ impl MarmotRelayPlane {
         sdk_relay_client: Option<NostrSdkRelayClient>,
         notification_forwarder: Option<JoinHandle<()>>,
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
+        allow_loopback: bool,
     ) -> Self {
         let transport = Arc::new(RelayPlaneTransport {
             adapter,
@@ -170,7 +190,7 @@ impl MarmotRelayPlane {
         let this = Self {
             inner: Arc::new(MarmotRelayPlaneInner {
                 subscription_rebuild_lookback,
-                relay_safety: RelaySafetyPolicy::default(),
+                relay_safety: RelaySafetyPolicy::with_allow_loopback(allow_loopback),
                 transport,
                 directory: DirectoryRelayPlane::new(directory_fetcher),
             }),

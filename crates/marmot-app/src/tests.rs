@@ -1357,20 +1357,46 @@ fn agent_stream_candidate_parser_skips_malformed_quic_candidates() {
 
 #[test]
 fn agent_stream_insecure_local_only_applies_to_loopback_brokers() {
-    let loopback = "127.0.0.1:4450".parse().unwrap();
-    let remote = "203.0.113.10:4450".parse().unwrap();
-
     assert!(matches!(
-        runtime::broker_trust_for_addr(loopback, None, true),
+        runtime::broker_trust_for_candidate("127.0.0.1", None, true),
         BrokerServerTrust::InsecureLocal
     ));
     assert!(matches!(
-        runtime::broker_trust_for_addr(remote, None, true),
+        runtime::broker_trust_for_candidate("localhost", None, true),
+        BrokerServerTrust::InsecureLocal
+    ));
+    assert!(matches!(
+        runtime::broker_trust_for_candidate("::1", None, true),
+        BrokerServerTrust::InsecureLocal
+    ));
+    assert!(matches!(
+        runtime::broker_trust_for_candidate("203.0.113.10", None, true),
         BrokerServerTrust::Platform
     ));
     assert!(matches!(
-        runtime::broker_trust_for_addr(remote, Some(vec![1, 2, 3]), true),
+        runtime::broker_trust_for_candidate("203.0.113.10", Some(vec![1, 2, 3]), true),
         BrokerServerTrust::CertificateDer(der) if der == vec![1, 2, 3]
+    ));
+    // Without the explicit dev opt-in even a literal loopback candidate keeps
+    // certificate verification.
+    assert!(matches!(
+        runtime::broker_trust_for_candidate("127.0.0.1", None, false),
+        BrokerServerTrust::Platform
+    ));
+}
+
+#[test]
+fn agent_stream_trust_is_keyed_on_the_literal_candidate_host_not_resolution() {
+    // A DOMAIN candidate never selects the no-cert-verification trust, even
+    // with the dev opt-in set: a hostname that merely resolves to 127.0.0.1
+    // must not downgrade trust (resolution-dependent downgrade, issue #356).
+    assert!(matches!(
+        runtime::broker_trust_for_candidate("broker.example", None, true),
+        BrokerServerTrust::Platform
+    ));
+    assert!(matches!(
+        runtime::broker_trust_for_candidate("broker.example", Some(vec![7]), true),
+        BrokerServerTrust::CertificateDer(der) if der == vec![7]
     ));
 }
 
