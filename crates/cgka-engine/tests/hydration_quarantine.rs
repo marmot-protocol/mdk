@@ -177,6 +177,7 @@ fn insert_marmot_group_without_openmls_state(
             epoch: EpochId(epoch),
             required_capabilities: GroupCapabilities::default(),
             removed: false,
+            join_epoch: EpochId(0),
         })
         .expect("insert marmot group record without openmls state");
 }

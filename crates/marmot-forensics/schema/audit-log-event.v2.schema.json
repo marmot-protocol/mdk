@@ -1558,6 +1558,12 @@
             },
             "reason": {
               "type": "string"
+            },
+            "retry_count": {
+              "$ref": "#/$defs/u64"
+            },
+            "sweeps_waited": {
+              "$ref": "#/$defs/u64"
             }
           }
         },

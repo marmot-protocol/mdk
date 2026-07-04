@@ -223,6 +223,7 @@ impl<S: StorageProvider> Engine<S> {
             members: projected_members,
             required_capabilities: required_caps,
             removed: false,
+            join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         self.storage.put_group(&group_record)?;
         // #740: index this group's transport routing id for O(1) inbound
@@ -541,6 +542,7 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_group,
             ),
             removed: false,
+            join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         mirror_app_components_into_record(&mls_group, &mut group_record);
         self.storage.put_group(&group_record)?;

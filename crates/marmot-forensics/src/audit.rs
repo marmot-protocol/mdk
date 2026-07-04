@@ -934,6 +934,14 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         epoch: Option<u64>,
         reason: String,
+        /// How many re-peel attempts a deferred row consumed before this
+        /// transition (deferred-peel lifecycle rows only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_count: Option<u64>,
+        /// How many retry sweeps elapsed between the row's first attempt and
+        /// this transition — the queue-wait clock for deferred rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sweeps_waited: Option<u64>,
     },
     /// A message or intent was rejected with a structured reason.
     Rejection {

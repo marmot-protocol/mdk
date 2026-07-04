@@ -663,6 +663,7 @@ fn snapshot_group_and_member() {
             }],
             required_capabilities: GroupCapabilities::default(),
             removed: false,
+            join_epoch: EpochId(2),
         }
     );
 }

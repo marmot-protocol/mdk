@@ -406,6 +406,7 @@ mod tests {
                 members: vec![],
                 required_capabilities: Default::default(),
                 removed: false,
+                join_epoch: EpochId(0),
             })
             .unwrap();
         let msg = transport_message(b"colliding-id", b"wire-bytes");

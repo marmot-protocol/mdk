@@ -211,6 +211,19 @@ pub struct Engine<S: StorageProvider> {
     /// previously re-hex-encoded the whole (up to 100k-entry) set every pass;
     /// this rebuilds only when the set actually changed. `None` until first use.
     pub(crate) seen_message_ids_hex_cache: Option<(u64, std::collections::BTreeSet<String>)>,
+
+    /// Per-group deferred-peel retry lifecycle state (mdk#339):
+    /// context-fingerprint sweep gate, per-row attempt/first-seen bookkeeping,
+    /// bounded-sweep cursor, and the cached `PeelDeferred` row count backing
+    /// the per-group flood cap. In-memory by design — a restart costs one free
+    /// re-sweep and a count rescan; terminal decisions are durable via
+    /// `MessageState::Failed`.
+    pub(crate) deferred_peel: HashMap<GroupId, crate::message_processor::DeferredPeelGroupState>,
+
+    /// Retry budget before a `PeelDeferred` row transitions to terminal
+    /// `Failed` (`permanently_undecryptable`). Field (not a const) so tests
+    /// can exhaust it quickly via [`Self::set_deferred_peel_retry_budget`].
+    pub(crate) deferred_peel_retry_budget: u32,
 }
 
 // ── Builder ─────────────────────────────────────────────────────────────────
@@ -351,6 +364,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             quarantined_groups: HashMap::new(),
             transport_group_id_index: HashMap::new(),
             seen_message_ids_hex_cache: None,
+            deferred_peel: HashMap::new(),
+            deferred_peel_retry_budget: crate::message_processor::MAX_DEFERRED_PEEL_ATTEMPTS,
         })
     }
 }
@@ -1351,6 +1366,14 @@ impl<S: StorageProvider> Engine<S> {
     /// prior recorder flushes and closes any file it held. Used to start or
     /// stop audit logging in place when the audit switch is toggled, without
     /// rebuilding the engine. Pass [`NoopRecorder`] to stop recording.
+    /// Override the deferred-peel retry budget (mdk#339). Rows that
+    /// exceed it without ever peeling transition to terminal `Failed`
+    /// (`permanently_undecryptable`). Exposed so tests can exhaust the budget
+    /// quickly; production uses the default.
+    pub fn set_deferred_peel_retry_budget(&mut self, budget: u32) {
+        self.deferred_peel_retry_budget = budget.max(1);
+    }
+
     pub fn set_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) {
         self.recorder = recorder;
     }
