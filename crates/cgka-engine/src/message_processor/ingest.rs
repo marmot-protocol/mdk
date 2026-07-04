@@ -466,36 +466,27 @@ impl<S: StorageProvider> Engine<S> {
                                 mls_bytes.as_slice(),
                             )? {
                                 ForkResolution::MissingSnapshot => {
-                                    let previous_state =
-                                        self.epoch_manager.state(&group_id).map(|state| {
-                                            crate::audit_helpers::epoch_state_name_str(state.name())
-                                                .to_string()
-                                        });
-                                    self.epoch_manager.detect_fork(&group_id, vec![]);
-                                    self.audit_group(
-                                        &group_id,
-                                        crate::audit_helpers::epoch_state_changed_event(
-                                            previous_state.as_deref(),
-                                            "recovering",
-                                            msg_epoch,
-                                            "fork_detected",
-                                            None,
-                                            None,
-                                        ),
-                                    );
-                                    self.update_stored_message_state(
-                                        &msg.id,
-                                        MessageState::EpochInvalidated,
-                                    )?;
-                                    return Err(EngineError::ForkedEpoch {
-                                        group_id: group_id.clone(),
-                                        last_stable: msg_epoch,
-                                        conflicting_epoch: current,
-                                    });
+                                    return Err(self.forked_epoch_fail_closed(
+                                        &group_id, &msg.id, msg_epoch, current,
+                                    ));
                                 }
                                 ForkResolution::IncumbentWins
                                 | ForkResolution::CandidateWins { .. } => {
-                                    unreachable!("missing snapshot cannot resolve a fork candidate")
+                                    // recovery_snapshot_name_for_fork and
+                                    // resolve_fork_candidate read the same
+                                    // incumbents map, so a resolution without
+                                    // a snapshot means that coupling broke.
+                                    // This path is reachable from inbound
+                                    // same-epoch fork commits — fail closed
+                                    // instead of panicking (#394).
+                                    tracing::warn!(
+                                        target: "cgka_engine::message_processor",
+                                        method = "ingest_group_message",
+                                        "fork candidate resolved without a recovery snapshot; failing closed"
+                                    );
+                                    return Err(self.forked_epoch_fail_closed(
+                                        &group_id, &msg.id, msg_epoch, current,
+                                    ));
                                 }
                             }
                         };
@@ -532,32 +523,9 @@ impl<S: StorageProvider> Engine<S> {
                                 });
                             }
                             ForkResolution::MissingSnapshot => {
-                                let previous_state =
-                                    self.epoch_manager.state(&group_id).map(|state| {
-                                        crate::audit_helpers::epoch_state_name_str(state.name())
-                                            .to_string()
-                                    });
-                                self.epoch_manager.detect_fork(&group_id, vec![]);
-                                self.audit_group(
-                                    &group_id,
-                                    crate::audit_helpers::epoch_state_changed_event(
-                                        previous_state.as_deref(),
-                                        "recovering",
-                                        msg_epoch,
-                                        "fork_detected",
-                                        None,
-                                        None,
-                                    ),
-                                );
-                                self.update_stored_message_state(
-                                    &msg.id,
-                                    MessageState::EpochInvalidated,
-                                )?;
-                                return Err(EngineError::ForkedEpoch {
-                                    group_id: group_id.clone(),
-                                    last_stable: msg_epoch,
-                                    conflicting_epoch: current,
-                                });
+                                return Err(self.forked_epoch_fail_closed(
+                                    &group_id, &msg.id, msg_epoch, current,
+                                ));
                             }
                         }
                     }
@@ -1438,6 +1406,46 @@ impl<S: StorageProvider> Engine<S> {
             }
             Ok(_) | Err(StorageError::NotFound) => Ok(()),
             Err(err) => Err(EngineError::Storage(err)),
+        }
+    }
+
+    /// Fail-closed terminal handling for a same-epoch fork commit with no
+    /// replayable winner: mark the group recovering, record the fork in the
+    /// audit log, invalidate the stored message, and hand back the typed
+    /// `ForkedEpoch` error for the caller to return. Every arm of the
+    /// fork-recovery seam that ends without a recovery snapshot goes through
+    /// this — including the invariant-break arm that previously panicked via
+    /// `unreachable!` on attacker-delivered input (#394).
+    fn forked_epoch_fail_closed(
+        &mut self,
+        group_id: &GroupId,
+        msg_id: &MessageId,
+        msg_epoch: EpochId,
+        current: EpochId,
+    ) -> EngineError {
+        let previous_state = self
+            .epoch_manager
+            .state(group_id)
+            .map(|state| crate::audit_helpers::epoch_state_name_str(state.name()).to_string());
+        self.epoch_manager.detect_fork(group_id, vec![]);
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                previous_state.as_deref(),
+                "recovering",
+                msg_epoch,
+                "fork_detected",
+                None,
+                None,
+            ),
+        );
+        if let Err(err) = self.update_stored_message_state(msg_id, MessageState::EpochInvalidated) {
+            return err;
+        }
+        EngineError::ForkedEpoch {
+            group_id: group_id.clone(),
+            last_stable: msg_epoch,
+            conflicting_epoch: current,
         }
     }
 
