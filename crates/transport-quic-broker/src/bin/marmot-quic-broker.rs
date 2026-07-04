@@ -21,6 +21,13 @@ struct Args {
     /// subscribers. 0 retains no replay; the hard cap is 300.
     #[arg(long, default_value_t = transport_quic_broker::DEFAULT_BROKER_REPLAY_TTL.as_secs())]
     replay_ttl_secs: u64,
+    /// Max records forwarded per publish stream (forward-role abuse bound;
+    /// subscribers still enforce their own receive limits).
+    #[arg(long, default_value_t = transport_quic_broker::DEFAULT_BROKER_PUBLISH_MAX_RECORDS)]
+    publish_max_records: u64,
+    /// Max cumulative plaintext bytes forwarded per publish stream.
+    #[arg(long, default_value_t = transport_quic_broker::DEFAULT_BROKER_PUBLISH_MAX_PLAINTEXT_BYTES)]
+    publish_max_plaintext_bytes: usize,
     #[arg(long, value_name = "PATH", requires = "key_pem")]
     cert_pem: Option<PathBuf>,
     #[arg(long, value_name = "PATH", requires = "cert_pem")]
@@ -51,6 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         per_subscriber_queue: args.per_subscriber_queue,
         max_backlog: args.max_backlog,
         replay_ttl: Duration::from_secs(args.replay_ttl_secs),
+        publish_max_records: args.publish_max_records,
+        publish_max_plaintext_bytes: args.publish_max_plaintext_bytes,
         tls,
         ..QuicBrokerConfig::default()
     })?;
@@ -70,6 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "per_subscriber_queue": args.per_subscriber_queue,
                     "max_backlog": args.max_backlog,
                     "replay_ttl_secs": args.replay_ttl_secs,
+                    "publish_max_records": args.publish_max_records,
+                    "publish_max_plaintext_bytes": args.publish_max_plaintext_bytes,
                 }
             }))?
         );
@@ -80,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("persistence=none");
         eprintln!("max_backlog={}", args.max_backlog);
         eprintln!("replay_ttl_secs={}", args.replay_ttl_secs);
+        eprintln!("publish_max_records={}", args.publish_max_records);
+        eprintln!(
+            "publish_max_plaintext_bytes={}",
+            args.publish_max_plaintext_bytes
+        );
     }
 
     server

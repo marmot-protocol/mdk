@@ -1,10 +1,10 @@
 //! The crate's single error type spanning QUIC, TLS, record, and crypto faults.
 
 use std::net::SocketAddr;
-use std::str;
 
 use cgka_traits::agent_text_stream::AgentTextStreamRecordError;
 
+use crate::hardening::QuicConnectFault;
 use crate::limits::AgentTextStreamReceiveLimitError;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,8 +35,6 @@ pub enum QuicTextStreamError {
     Record(#[from] AgentTextStreamRecordError),
     #[error(transparent)]
     ReceiveLimit(#[from] AgentTextStreamReceiveLimitError),
-    #[error(transparent)]
-    Utf8(#[from] str::Utf8Error),
     #[error("certificate setup failed: {0}")]
     Certificate(String),
     #[error("QUIC client config failed: {0}")]
@@ -55,6 +53,10 @@ pub enum QuicTextStreamError {
     FrameTooLarge(usize),
     #[error("agent text stream frame read timed out")]
     ReadTimeout,
+    #[error("QUIC preview connect timed out")]
+    ConnectTimeout,
+    #[error("timed out waiting for a sender to dial the receive endpoint")]
+    AcceptTimeout,
     #[error("agent text stream chunk size cannot be zero")]
     EmptyChunkSize,
     #[error("agent text stream chunk size exceeds app profile max: {0}")]
@@ -71,4 +73,14 @@ pub enum QuicTextStreamError {
     UnexpectedSequence { expected: u64, actual: u64 },
     #[error("agent text stream crypto failed: {0}")]
     Crypto(String),
+}
+
+impl From<QuicConnectFault> for QuicTextStreamError {
+    fn from(fault: QuicConnectFault) -> Self {
+        match fault {
+            QuicConnectFault::Connect(err) => Self::Connect(err),
+            QuicConnectFault::Connection(err) => Self::Connection(err),
+            QuicConnectFault::Timeout => Self::ConnectTimeout,
+        }
+    }
 }

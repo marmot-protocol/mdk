@@ -15,12 +15,14 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
-use transport_quic_stream::{AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits};
+use transport_quic_stream::{
+    AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits, stream_record_text,
+};
 
 use crate::client::{
     BrokerServerTrust, BrokerTextPublisher, OpenBrokerTextPublisher, PublishTextToBroker,
-    SubscribeTextFromBroker, publish_text_to_broker, stream_record_text,
-    subscribe_text_from_broker, subscribe_text_from_broker_with_limits,
+    SubscribeTextFromBroker, publish_text_to_broker, subscribe_text_from_broker,
+    subscribe_text_from_broker_with_limits,
 };
 use crate::config::{QuicBrokerConfig, QuicBrokerTlsConfig};
 use crate::control::BrokerStreamKey;
@@ -112,16 +114,15 @@ async fn broker_forwards_live_records_to_subscriber_with_same_transcript() {
 }
 
 #[tokio::test]
-async fn broker_does_not_apply_per_record_deadline_to_authenticated_publisher() {
+async fn broker_applies_quiet_gap_not_handshake_deadline_to_authenticated_publisher() {
     // Regression for the live-preview latch: an agent that goes quiet between
     // records (e.g. a long tool call with no progress events) must not have
-    // its publish stream errored by a per-record read deadline. Before the
-    // fix, `read_timeout` was enforced on every record-frame read after the
-    // handshake, so an idle gap longer than the deadline killed the stream;
-    // the composer then latched `live_error` and the preview was dead for the
-    // rest of the response. Here we use a tiny read_timeout and idle well past
-    // it between two records, and assert both records still arrive. The QUIC
-    // idle timeout (kept long here) is what reaps a genuinely dead publisher.
+    // its publish stream errored by the short handshake `read_timeout`. That
+    // deadline only bounds the pre-auth control frame; post-handshake record
+    // reads fall under the far more generous shared 120s quiet-gap deadline
+    // (`RECORD_QUIET_GAP_DEADLINE`), matching the direct path and the
+    // subscriber loop. Here we use a tiny read_timeout and idle well past it
+    // between two records, and assert both records still arrive.
     let server = QuicBrokerServer::bind(QuicBrokerConfig {
         bind_addr: LOCAL_SERVER_BIND,
         per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
@@ -1054,6 +1055,22 @@ fn broker_config_rejects_zero_resource_limits() {
         }),
         Err(QuicBrokerError::EmptyReadTimeout)
     ));
+    assert!(matches!(
+        QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            publish_max_records: 0,
+            ..QuicBrokerConfig::default()
+        }),
+        Err(QuicBrokerError::EmptyPublishRecordLimit)
+    ));
+    assert!(matches!(
+        QuicBrokerServer::bind(QuicBrokerConfig {
+            bind_addr: LOCAL_SERVER_BIND,
+            publish_max_plaintext_bytes: 0,
+            ..QuicBrokerConfig::default()
+        }),
+        Err(QuicBrokerError::EmptyPublishByteLimit)
+    ));
 }
 
 #[test]
@@ -1084,7 +1101,7 @@ fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empt
         (AGENT_TEXT_STREAM_RECORD_CHECKPOINT, "hello world"),
     ] {
         assert_eq!(
-            stream_record_text(&record(record_type, plaintext)).unwrap(),
+            stream_record_text(&record(record_type, plaintext)),
             plaintext
         );
     }
@@ -1095,10 +1112,7 @@ fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empt
         AGENT_TEXT_STREAM_RECORD_ABORT,
         AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
     ] {
-        assert_eq!(
-            stream_record_text(&record(record_type, "ignored")).unwrap(),
-            ""
-        );
+        assert_eq!(stream_record_text(&record(record_type, "ignored")), "");
     }
 }
 
@@ -1684,4 +1698,426 @@ async fn broker_rejects_subscribe_envelope_on_unidirectional_stream() {
         Ok(joined) => joined,
     };
     panic!("subscriber should still be waiting, got {subscriber:?}");
+}
+
+#[test]
+fn broker_and_direct_transports_share_hardening_profile() {
+    use transport_quic_stream::{
+        QUIC_PREVIEW_KEEP_ALIVE_INTERVAL, QUIC_PREVIEW_MAX_FRAME_LEN, QUIC_PREVIEW_MAX_IDLE_TIMEOUT,
+    };
+
+    use crate::protocol::{DEFAULT_BROKER_KEEP_ALIVE_INTERVAL, DEFAULT_BROKER_MAX_IDLE_TIMEOUT};
+    use crate::tls::broker_transport_config;
+
+    // One hardening profile drives both transports: the broker's public
+    // defaults are aliases of the shared constants, and its frame cap is the
+    // shared cap. Paired with the direct-path liveness test in
+    // `transport-quic-stream`, this pins both servers to equivalent bounds.
+    assert_eq!(
+        DEFAULT_BROKER_MAX_IDLE_TIMEOUT,
+        QUIC_PREVIEW_MAX_IDLE_TIMEOUT
+    );
+    assert_eq!(
+        DEFAULT_BROKER_KEEP_ALIVE_INTERVAL,
+        QUIC_PREVIEW_KEEP_ALIVE_INTERVAL
+    );
+    assert_eq!(MAX_FRAME_SIZE, QUIC_PREVIEW_MAX_FRAME_LEN);
+
+    // Same Debug-based check as the direct path, since quinn exposes no
+    // transport-config getters.
+    let transport = format!(
+        "{:?}",
+        broker_transport_config(&QuicBrokerConfig::default()).unwrap()
+    );
+    assert!(
+        transport.contains("max_idle_timeout: Some(30000)"),
+        "{transport}"
+    );
+    assert!(
+        transport.contains("keep_alive_interval: Some(10s)"),
+        "{transport}"
+    );
+    assert!(
+        transport.contains("max_concurrent_uni_streams: 64,"),
+        "{transport}"
+    );
+    assert!(
+        transport.contains("max_concurrent_bidi_streams: 64,"),
+        "{transport}"
+    );
+}
+
+#[test]
+fn broker_server_and_client_configs_disable_early_data() {
+    use crate::tls::{broker_rustls_client_config, broker_rustls_server_config};
+
+    // Pin the shared early-data policy: TLS 0-RTT stays off on the broker
+    // because it has no app-layer anti-replay, so replayable early data would
+    // let a passive attacker replay publish control frames to create/feed
+    // rooms without a fresh handshake.
+    let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_der = rustls::pki_types::CertificateDer::from(certified_key.cert);
+    let key_der =
+        rustls::pki_types::PrivatePkcs8KeyDer::from(certified_key.signing_key.serialize_der());
+    let server = broker_rustls_server_config(vec![cert_der], key_der.into()).unwrap();
+    assert_eq!(server.max_early_data_size, 0);
+
+    let client = broker_rustls_client_config(
+        BrokerServerTrust::InsecureLocal,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
+    )
+    .unwrap();
+    assert!(!client.enable_early_data);
+}
+
+#[tokio::test]
+async fn broker_applies_one_deadline_across_dribbled_length_prefix() {
+    // One deadline must span the whole control-frame read: with the old
+    // per-`recv.read()` deadline, every delivered byte restarted the window,
+    // so a peer dribbling one length-prefix byte per window stretched the
+    // pre-auth read to FRAME_LEN_BYTES x read_timeout. Dribble bytes slower
+    // than the whole-frame deadline and assert the broker stops the stream.
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        read_timeout: Duration::from_millis(300),
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let endpoint =
+        client_endpoint(BrokerServerTrust::CertificateDer(server_cert), broker_addr).unwrap();
+    let connection = endpoint
+        .connect(broker_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut send = connection.open_uni().await.unwrap();
+
+    // Declare a valid (sub-cap) control frame length so only the deadline,
+    // never the length check, can end the read. One byte per 200ms lands
+    // every write inside a fresh 300ms per-read window, but the whole prefix
+    // takes ~600ms: only a whole-frame deadline stops the stream before the
+    // 4-byte length prefix completes.
+    let mut accepted_bytes = 0;
+    for byte in 100_u32.to_be_bytes() {
+        if send.write_all(&[byte]).await.is_err() {
+            break;
+        }
+        accepted_bytes += 1;
+        sleep(Duration::from_millis(200)).await;
+    }
+    timeout(Duration::from_secs(5), send.stopped())
+        .await
+        .expect("broker stops the dribbled stream")
+        .unwrap();
+    assert!(
+        accepted_bytes < 4,
+        "whole-frame deadline must fire before the dribbled length prefix \
+         completes; {accepted_bytes} bytes were accepted"
+    );
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[test]
+fn max_control_frame_len_covers_maximal_valid_envelope() {
+    use crate::protocol::MAX_CONTROL_FRAME_LEN;
+
+    // A maximal valid envelope (64-byte stream id, 64-byte start event id)
+    // encodes to 155 bytes: 1+21 protocol string, 1 type, and 2+64 for each
+    // id (a QUIC varint needs 2 bytes for lengths above 63). The pre-auth cap
+    // keeps headroom above it while forbidding the previous ~66 KB pre-auth
+    // allocation.
+    let envelope =
+        QuicBrokerControlEnvelopeV1::publish(vec![0x42; 64], &MessageId::new(vec![0x24; 64]));
+    let encoded = envelope.encode().unwrap();
+    assert_eq!(encoded.len(), 155);
+    assert!(encoded.len() <= MAX_CONTROL_FRAME_LEN);
+
+    assert!(validate_frame_len(155, MAX_CONTROL_FRAME_LEN).is_ok());
+    assert!(matches!(
+        validate_frame_len(MAX_CONTROL_FRAME_LEN + 1, MAX_CONTROL_FRAME_LEN),
+        Err(QuicBrokerError::FrameTooLarge(_))
+    ));
+}
+
+#[tokio::test]
+async fn broker_rejects_control_frames_above_control_cap() {
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let endpoint =
+        client_endpoint(BrokerServerTrust::CertificateDer(server_cert), broker_addr).unwrap();
+    let connection = endpoint
+        .connect(broker_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut send = connection.open_uni().await.unwrap();
+    // Declare a 1 KiB control frame: valid as a record-sized frame, but far
+    // above the 256-byte control cap, so the broker rejects it at the length
+    // check without reading or allocating the payload.
+    send.write_all(&1024_u32.to_be_bytes()).await.unwrap();
+    send.write_all(&[0_u8; 64]).await.unwrap();
+
+    timeout(Duration::from_secs(5), send.stopped())
+        .await
+        .expect("broker stops oversized control frames")
+        .unwrap();
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn broker_forwards_long_publish_past_receive_defaults_without_closing_room() {
+    // Forward-role limits come from broker config, not the subscriber-sized
+    // receive defaults (4096 records / 1 MiB): a legitimate long preview must
+    // pass through the broker without the room closing mid-stream.
+    let record_count = 4097_usize;
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        // Big enough that the subscriber's live queue never backpressure-drops
+        // it while the publisher streams the whole preview.
+        per_subscriber_queue: 2 * record_count,
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let stream_id = vec![0xc4; 32];
+    let start_event_id = MessageId::new(vec![0x91; 32]);
+    let subscriber_limits = AgentTextStreamReceiveLimits {
+        max_records: 2 * record_count as u64,
+        max_plaintext_bytes: 16 * 1024 * 1024,
+        ..AgentTextStreamReceiveLimits::default()
+    };
+    let subscriber_config = SubscribeTextFromBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+        stream_id: stream_id.clone(),
+        start_event_id: start_event_id.clone(),
+        crypto: None,
+    };
+    let subscriber = tokio::spawn(subscribe_text_from_broker_with_limits(
+        subscriber_config,
+        subscriber_limits,
+        |_| {},
+    ));
+    sleep(Duration::from_millis(100)).await;
+
+    // One byte per record pushes the record count past the receiver default.
+    let sent = publish_text_to_broker(PublishTextToBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert),
+        stream_id: stream_id.clone(),
+        start_event_id,
+        text: "a".repeat(record_count),
+        max_chunk_bytes: 1,
+        chunk_delay: Duration::ZERO,
+        crypto: None,
+        max_plaintext_frame_len: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(sent.chunk_count, record_count as u64);
+
+    let received = timeout(Duration::from_secs(30), subscriber)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.chunk_count, record_count as u64);
+    assert_eq!(received.text.len(), record_count);
+    assert_eq!(sent.transcript_hash, received.transcript_hash);
+
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn broker_publish_forward_limits_come_from_config() {
+    // An operator-tuned publish cap ends the room after exactly that many
+    // forwarded records: the subscriber sees a clean end of stream with the
+    // records forwarded before the limit tripped.
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        publish_max_records: 8,
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let stream_id = vec![0xd7; 32];
+    let start_event_id = MessageId::new(vec![0x3c; 32]);
+    let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+        stream_id: stream_id.clone(),
+        start_event_id: start_event_id.clone(),
+        crypto: None,
+    }));
+    sleep(Duration::from_millis(100)).await;
+
+    let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert),
+        stream_id: stream_id.clone(),
+        start_event_id,
+        crypto: None,
+        max_plaintext_frame_len: None,
+    })
+    .await
+    .unwrap();
+    publisher
+        .append_text("abcdefghi", 1, Duration::ZERO)
+        .await
+        .unwrap();
+    // The broker kills the publish stream on record 9; the publisher's close
+    // handshake may surface that asynchronously, so its result is not the
+    // assertion here.
+    let _ = publisher.finish().await;
+
+    let received = timeout(Duration::from_secs(5), subscriber)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.chunk_count, 8);
+    assert_eq!(received.text, "abcdefgh");
+
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn subscriber_replaces_invalid_utf8_frame_instead_of_aborting_stream() {
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let stream_id = vec![0xe8; 32];
+    let start_event_id = MessageId::new(vec![0x55; 32]);
+    let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+        stream_id: stream_id.clone(),
+        start_event_id: start_event_id.clone(),
+        crypto: None,
+    }));
+    sleep(Duration::from_millis(100)).await;
+
+    // Raw publisher so the middle frame can carry authentic-but-non-UTF-8
+    // bytes; the broker forwards records without decoding their text.
+    let endpoint =
+        client_endpoint(BrokerServerTrust::CertificateDer(server_cert), broker_addr).unwrap();
+    let connection = endpoint
+        .connect(broker_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut send = connection.open_uni().await.unwrap();
+    write_control_frame(
+        &mut send,
+        &QuicBrokerControlEnvelopeV1::publish(stream_id.clone(), &start_event_id),
+    )
+    .await
+    .unwrap();
+    let records = vec![
+        AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"ok".to_vec()),
+        AgentTextStreamRecordV1::text_delta(stream_id.clone(), 2, vec![0xff, 0xfe]),
+        AgentTextStreamRecordV1::text_delta(stream_id.clone(), 3, b"done".to_vec()),
+    ];
+    for record in &records {
+        write_record_frame(&mut send, record).await.unwrap();
+    }
+    send.finish().unwrap();
+    let _ = timeout(SEND_STOP_WAIT, send.stopped()).await;
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    let received = timeout(Duration::from_secs(5), subscriber)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    // The non-UTF-8 frame renders as replacement characters instead of
+    // tearing down the preview; transcript hashing covers the raw bytes, so
+    // the transcripts still match a sender-side transcript over them.
+    assert_eq!(received.chunk_count, 3);
+    assert_eq!(received.chunks[1].text, "\u{FFFD}\u{FFFD}");
+    assert_eq!(received.text, "ok\u{FFFD}\u{FFFD}done");
+    let mut expected_transcript = AgentTextStreamTranscriptV1::new(stream_id, start_event_id);
+    for record in &records {
+        expected_transcript.append(record.seq, record.record_type, &record.plaintext_frame);
+    }
+    assert_eq!(received.transcript_hash, expected_transcript.hash());
+
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn broker_subscribe_snapshots_backlog_by_reference() {
+    // The backlog snapshot handed to a subscriber must be Arc clones of the
+    // retained records, not deep copies: serving even a full backlog under
+    // the single global broker mutex then costs pointer-sized clones only.
+    let state = test_state(DEFAULT_BROKER_BACKLOG_DEPTH);
+    let key = BrokerStreamKey {
+        stream_id: vec![0xaa; 32],
+        start_event_id: MessageId::new(vec![0x77; 32]),
+    };
+    let record =
+        AgentTextStreamRecordV1::text_delta(key.stream_id.clone(), 1, b"retained".to_vec());
+    state.publish(&key, record).await.unwrap();
+
+    let (first_id, first_backlog, _first_rx) = state.subscribe(key.clone()).await.unwrap();
+    let (_second_id, second_backlog, _second_rx) = state.subscribe(key.clone()).await.unwrap();
+    assert_eq!(first_backlog.len(), 1);
+    assert_eq!(second_backlog.len(), 1);
+    assert!(Arc::ptr_eq(&first_backlog[0], &second_backlog[0]));
+    state.unsubscribe(&key, first_id).await;
 }

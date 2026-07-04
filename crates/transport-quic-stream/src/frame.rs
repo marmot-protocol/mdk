@@ -8,7 +8,8 @@ use cgka_traits::agent_text_stream::AgentTextStreamRecordV1;
 use tokio::time::timeout;
 
 use crate::error::QuicTextStreamError;
-use crate::protocol::{FRAME_LEN_BYTES, MAX_FRAME_SIZE};
+use crate::hardening::QUIC_PREVIEW_MAX_FRAME_LEN;
+use crate::protocol::FRAME_LEN_BYTES;
 
 pub(crate) async fn write_record(
     send: &mut quinn::SendStream,
@@ -68,6 +69,24 @@ where
         .map_err(Into::into)
 }
 
+/// `read_deadline` with the rendezvous-specific timeout error, so callers can
+/// tell "nobody ever dialed" apart from a mid-stream read stall.
+pub(crate) async fn accept_deadline<T, E>(
+    accept_timeout: Duration,
+    accept: impl Future<Output = Result<T, E>>,
+) -> Result<T, QuicTextStreamError>
+where
+    QuicTextStreamError: From<E>,
+{
+    if accept_timeout.is_zero() {
+        return accept.await.map_err(Into::into);
+    }
+    timeout(accept_timeout, accept)
+        .await
+        .map_err(|_| QuicTextStreamError::AcceptTimeout)?
+        .map_err(Into::into)
+}
+
 pub(crate) fn validate_frame_len(
     len: usize,
     max_frame_len: usize,
@@ -75,7 +94,7 @@ pub(crate) fn validate_frame_len(
     if len == 0 {
         return Err(QuicTextStreamError::EmptyFrame);
     }
-    if len > max_frame_len.min(MAX_FRAME_SIZE) {
+    if len > max_frame_len.min(QUIC_PREVIEW_MAX_FRAME_LEN) {
         return Err(QuicTextStreamError::FrameTooLarge(len));
     }
     Ok(())

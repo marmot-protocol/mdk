@@ -2,7 +2,6 @@
 //! and limits, decode/decrypt records, and assemble the received transcript.
 
 use std::net::SocketAddr;
-use std::str;
 
 use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
@@ -14,7 +13,7 @@ use quinn::Endpoint;
 
 use crate::crypto::{AgentTextStreamCrypto, decrypt_record};
 use crate::error::QuicTextStreamError;
-use crate::frame::{read_deadline, read_record};
+use crate::frame::{accept_deadline, read_deadline, read_record};
 use crate::limits::{AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimits};
 use crate::protocol::frame_len_cap;
 use crate::tls::configure_server;
@@ -61,12 +60,18 @@ impl QuicTextStreamReceiver {
         crypto: Option<AgentTextStreamCrypto>,
         limits: AgentTextStreamReceiveLimits,
     ) -> Result<ReceivedTextStream, QuicTextStreamError> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or(QuicTextStreamError::EndpointClosed)?;
-        let connection = incoming.await?;
+        // Rendezvous deadline: waiting for the sender to dial is bounded by
+        // the generous `accept_timeout`; once a connection attempt arrives,
+        // the TLS handshake and stream setup fall under the short setup
+        // `read_timeout` so a stalling peer cannot pin the receive task.
+        let incoming = accept_deadline(limits.accept_timeout, async {
+            self.endpoint
+                .accept()
+                .await
+                .ok_or(QuicTextStreamError::EndpointClosed)
+        })
+        .await?;
+        let connection = read_deadline(limits.read_timeout, async { incoming.await }).await?;
         let mut recv = read_deadline(limits.read_timeout, connection.accept_uni()).await?;
         let mut stream_id = None;
         // Last-accepted seq high-water mark per the QUIC transport binding:
@@ -117,7 +122,7 @@ impl QuicTextStreamReceiver {
                 stream_id = Some(record.stream_id.clone());
             }
 
-            let frame_text = stream_record_text(&record)?;
+            let frame_text = stream_record_text(&record);
             if record.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA {
                 text.push_str(&frame_text);
             }
@@ -160,17 +165,21 @@ impl QuicTextStreamReceiver {
 /// unknown future type, so they decode to an empty string. Note this only
 /// decodes one record's frame; accumulation into the provisional answer text is
 /// the caller's job and stays `TextDelta`-only.
-pub(crate) fn stream_record_text(
-    record: &AgentTextStreamRecordV1,
-) -> Result<String, QuicTextStreamError> {
+///
+/// Decoding is lossy by policy on both transport paths: previews are advisory,
+/// so a non-UTF-8 frame renders as replacement characters instead of tearing
+/// down the whole stream and discarding every accumulated chunk. Transcript
+/// hashing covers the raw frame bytes, not this decoded text, so lossy display
+/// never desyncs sender and receiver transcripts.
+pub fn stream_record_text(record: &AgentTextStreamRecordV1) -> String {
     match record.record_type {
         AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
         | AGENT_TEXT_STREAM_RECORD_STATUS
         | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA
         | AGENT_TEXT_STREAM_RECORD_CHECKPOINT => {
-            Ok(str::from_utf8(&record.plaintext_frame)?.to_owned())
+            String::from_utf8_lossy(&record.plaintext_frame).into_owned()
         }
-        _ => Ok(String::new()),
+        _ => String::new(),
     }
 }
 

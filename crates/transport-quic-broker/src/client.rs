@@ -2,28 +2,26 @@
 //! [`BrokerTextPublisher`], and the one-shot publish/subscribe helpers.
 
 use std::net::SocketAddr;
-use std::str;
 use std::time::Duration;
 
 use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_ABORT,
-    AGENT_TEXT_STREAM_RECORD_CHECKPOINT, AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA,
-    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamRecordV1,
-    AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamRecordV1, AgentTextStreamTranscriptV1,
 };
 use quinn::Endpoint;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
     AgentTextStreamCrypto, AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimitError,
-    AgentTextStreamReceiveLimits, ReceivedTextChunk, ReceivedTextStream, SentTextStream,
-    decrypt_record, effective_plaintext_cap, encrypt_record, frame_len_cap,
+    AgentTextStreamReceiveLimits, QUIC_PREVIEW_CONNECT_TIMEOUT, ReceivedTextChunk,
+    ReceivedTextStream, SentTextStream, connect_with_timeout, decrypt_record,
+    effective_plaintext_cap, encrypt_record, frame_len_cap, stream_record_text,
 };
 
 use crate::control::QuicBrokerControlEnvelopeV1;
 use crate::error::QuicBrokerError;
 use crate::frame::{read_record_frame, write_control_frame, write_record_frame};
-use crate::protocol::{SEND_STOP_WAIT, SUBSCRIBER_RECORD_READ_DEADLINE};
+use crate::protocol::{RECORD_QUIET_GAP_DEADLINE, SEND_STOP_WAIT};
 use crate::tls::client_endpoint;
 
 #[derive(Clone, Debug)]
@@ -87,9 +85,13 @@ pub struct BrokerTextPublisher {
 impl BrokerTextPublisher {
     pub async fn connect(config: OpenBrokerTextPublisher) -> Result<Self, QuicBrokerError> {
         let endpoint = client_endpoint(config.trust, config.broker_addr)?;
-        let connection = endpoint
-            .connect(config.broker_addr, &config.server_name)?
-            .await?;
+        let connection = connect_with_timeout(
+            &endpoint,
+            config.broker_addr,
+            &config.server_name,
+            QUIC_PREVIEW_CONNECT_TIMEOUT,
+        )
+        .await?;
         let mut send = connection.open_uni().await?;
         write_control_frame(
             &mut send,
@@ -258,9 +260,13 @@ where
     F: FnMut(&ReceivedTextChunk),
 {
     let endpoint = client_endpoint(config.trust, config.broker_addr)?;
-    let connection = endpoint
-        .connect(config.broker_addr, &config.server_name)?
-        .await?;
+    let connection = connect_with_timeout(
+        &endpoint,
+        config.broker_addr,
+        &config.server_name,
+        QUIC_PREVIEW_CONNECT_TIMEOUT,
+    )
+    .await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     write_control_frame(
         &mut send,
@@ -287,12 +293,8 @@ where
     // breaks a starved read so a malicious broker cannot wedge the loop.
     let mut frames_read = 0_u64;
 
-    while let Some(record) = read_record_frame(
-        &mut recv,
-        Some(SUBSCRIBER_RECORD_READ_DEADLINE),
-        max_frame_len,
-    )
-    .await?
+    while let Some(record) =
+        read_record_frame(&mut recv, Some(RECORD_QUIET_GAP_DEADLINE), max_frame_len).await?
     {
         frames_read = frames_read.saturating_add(1);
         if frames_read > limits.max_records {
@@ -323,7 +325,7 @@ where
         }
         high_water = record.seq;
 
-        let frame_text = stream_record_text(&record)?;
+        let frame_text = stream_record_text(&record);
         if record.record_type == AGENT_TEXT_STREAM_RECORD_TEXT_DELTA {
             text.push_str(&frame_text);
         }
@@ -349,28 +351,4 @@ where
         transcript_hash: transcript.hash(),
         chunk_count: transcript.chunk_count(),
     })
-}
-
-/// Decode the per-record text a subscriber can surface for a single stream record.
-///
-/// `TextDelta`, `Status`, `ProgressDelta`, and `Checkpoint` carry UTF-8 the
-/// consumer renders: deltas build the provisional preview, status/progress feed
-/// non-chat agent chrome, and a `Checkpoint` is a full preview snapshot the
-/// consumer swaps in for its live preview. `Abort` and `FinalNotice` are
-/// advisory (the consumer acts on the record type, not its bytes), as is any
-/// unknown future type, so they decode to an empty string. Note this only
-/// decodes one record's frame; accumulation into the provisional answer text is
-/// the caller's job and stays `TextDelta`-only.
-pub(crate) fn stream_record_text(
-    record: &AgentTextStreamRecordV1,
-) -> Result<String, QuicBrokerError> {
-    match record.record_type {
-        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
-        | AGENT_TEXT_STREAM_RECORD_STATUS
-        | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA
-        | AGENT_TEXT_STREAM_RECORD_CHECKPOINT => {
-            Ok(str::from_utf8(&record.plaintext_frame)?.to_owned())
-        }
-        _ => Ok(String::new()),
-    }
 }

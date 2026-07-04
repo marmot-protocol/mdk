@@ -4,15 +4,15 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use quinn::Endpoint;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tokio::time::timeout;
 
 use crate::config::QuicBrokerConfig;
 use crate::error::QuicBrokerError;
-use crate::handlers::handle_connection;
+use crate::handlers::{BrokerStreamPolicy, PublishForwardLimits, handle_connection};
 use crate::protocol::MAX_BROKER_REPLAY_TTL;
 use crate::state::BrokerState;
 use crate::tls::{broker_transport_config, configure_server};
@@ -22,8 +22,7 @@ pub struct QuicBrokerServer {
     server_cert_der: Vec<u8>,
     state: Arc<BrokerState>,
     connection_limiter: Arc<Semaphore>,
-    max_streams_per_connection: usize,
-    read_timeout: Duration,
+    policy: BrokerStreamPolicy,
 }
 
 impl QuicBrokerServer {
@@ -55,6 +54,12 @@ impl QuicBrokerServer {
         if config.keep_alive_interval.is_zero() {
             return Err(QuicBrokerError::EmptyKeepAliveInterval);
         }
+        if config.publish_max_records == 0 {
+            return Err(QuicBrokerError::EmptyPublishRecordLimit);
+        }
+        if config.publish_max_plaintext_bytes == 0 {
+            return Err(QuicBrokerError::EmptyPublishByteLimit);
+        }
         if config.replay_ttl > MAX_BROKER_REPLAY_TTL {
             return Err(QuicBrokerError::ReplayTtlTooLarge {
                 requested_secs: config.replay_ttl.as_secs(),
@@ -75,8 +80,14 @@ impl QuicBrokerServer {
                 config.replay_ttl,
             )),
             connection_limiter: Arc::new(Semaphore::new(config.max_connections)),
-            max_streams_per_connection: config.max_streams_per_connection,
-            read_timeout: config.read_timeout,
+            policy: BrokerStreamPolicy {
+                max_streams_per_connection: config.max_streams_per_connection,
+                read_timeout: config.read_timeout,
+                publish_limits: PublishForwardLimits {
+                    max_records: config.publish_max_records,
+                    max_plaintext_bytes: config.publish_max_plaintext_bytes,
+                },
+            },
         })
     }
 
@@ -113,19 +124,18 @@ impl QuicBrokerServer {
                         continue;
                     };
                     let state = Arc::clone(&self.state);
-                    let max_streams_per_connection = self.max_streams_per_connection;
-                    let read_timeout = self.read_timeout;
+                    let policy = self.policy;
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let Ok(connection) = incoming.await else {
+                        // Bound the TLS handshake so a stalling peer cannot
+                        // pin this task (and its connection permit) past the
+                        // handshake deadline; the accept loop itself stays
+                        // unbounded, as a server's should.
+                        let Ok(Ok(connection)) = timeout(policy.read_timeout, incoming).await
+                        else {
                             return;
                         };
-                        let _ = handle_connection(
-                            state,
-                            connection,
-                            max_streams_per_connection,
-                            read_timeout,
-                        ).await;
+                        let _ = handle_connection(state, connection, policy).await;
                     });
                 }
             }

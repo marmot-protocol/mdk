@@ -16,14 +16,17 @@ use cgka_traits::{EpochId, GroupId, MemberId, SecretBytes};
 use crate::crypto::{AgentTextStreamCrypto, decrypt_record, encrypt_record};
 use crate::error::QuicTextStreamError;
 use crate::frame::{validate_frame_len, write_record};
+use crate::hardening::{
+    QUIC_PREVIEW_KEEP_ALIVE_INTERVAL, QUIC_PREVIEW_MAX_FRAME_LEN, QUIC_PREVIEW_MAX_IDLE_TIMEOUT,
+    QuicPreviewTransportProfile,
+};
 use crate::limits::{
     AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimitError,
     AgentTextStreamReceiveLimits,
 };
 use crate::protocol::{
-    AGENT_TEXT_STREAM_FRAME_ALLOWANCE, DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL,
-    DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT, LOCAL_BIND, MAX_FRAME_SIZE, QUIC_STREAM_ALPN_V1,
-    QUIC_STREAM_PROTOCOL_V1, SEND_CLOSE_WAIT, frame_len_cap,
+    AGENT_TEXT_STREAM_FRAME_ALLOWANCE, LOCAL_BIND, QUIC_STREAM_ALPN_V1, QUIC_STREAM_PROTOCOL_V1,
+    SEND_CLOSE_WAIT, frame_len_cap,
 };
 use crate::receive::{QuicTextStreamReceiver, ServerTrust, stream_record_text};
 use crate::send::{SendTextStream, send_text_stream, split_text_deltas};
@@ -41,15 +44,9 @@ fn direct_path_alpn_is_the_pinned_wire_value() {
 fn direct_server_config_sets_quic_liveness_backstop() {
     let (server_config, _cert_der) = configure_server().unwrap();
 
-    assert_eq!(
-        DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT,
-        Duration::from_secs(30)
-    );
-    assert_eq!(
-        DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL,
-        Duration::from_secs(10)
-    );
-    assert!(DEFAULT_QUIC_STREAM_KEEP_ALIVE_INTERVAL < DEFAULT_QUIC_STREAM_MAX_IDLE_TIMEOUT);
+    assert_eq!(QUIC_PREVIEW_MAX_IDLE_TIMEOUT, Duration::from_secs(30));
+    assert_eq!(QUIC_PREVIEW_KEEP_ALIVE_INTERVAL, Duration::from_secs(10));
+    assert!(QUIC_PREVIEW_KEEP_ALIVE_INTERVAL < QUIC_PREVIEW_MAX_IDLE_TIMEOUT);
 
     let default_transport = format!("{:?}", quinn::TransportConfig::default());
     assert!(
@@ -73,6 +70,14 @@ fn direct_server_config_sets_quic_liveness_backstop() {
     );
     assert!(
         transport.contains("keep_alive_interval: Some(10s)"),
+        "{transport}"
+    );
+    assert!(
+        transport.contains("max_concurrent_uni_streams: 1,"),
+        "{transport}"
+    );
+    assert!(
+        transport.contains("max_concurrent_bidi_streams: 0,"),
         "{transport}"
     );
 }
@@ -104,7 +109,7 @@ fn text_delta_splitter_keeps_oversized_multibyte_characters_whole() {
 #[test]
 fn oversized_frames_are_rejected_before_allocation() {
     assert!(matches!(
-        validate_frame_len(MAX_FRAME_SIZE + 1, MAX_FRAME_SIZE),
+        validate_frame_len(QUIC_PREVIEW_MAX_FRAME_LEN + 1, QUIC_PREVIEW_MAX_FRAME_LEN),
         Err(QuicTextStreamError::FrameTooLarge(_))
     ));
 }
@@ -112,15 +117,15 @@ fn oversized_frames_are_rejected_before_allocation() {
 #[test]
 fn policy_frame_cap_is_policy_plus_fixed_allowance_with_app_ceiling() {
     assert_eq!(AGENT_TEXT_STREAM_FRAME_ALLOWANCE, 1024);
-    assert_eq!(frame_len_cap(None), MAX_FRAME_SIZE);
+    assert_eq!(frame_len_cap(None), QUIC_PREVIEW_MAX_FRAME_LEN);
     assert_eq!(
         frame_len_cap(Some(4096)),
         4096 + AGENT_TEXT_STREAM_FRAME_ALLOWANCE
     );
     // A policy above the app-profile ceiling is clamped to the ceiling, and
     // a zero policy falls back to the ceiling.
-    assert_eq!(frame_len_cap(Some(u32::MAX)), MAX_FRAME_SIZE);
-    assert_eq!(frame_len_cap(Some(0)), MAX_FRAME_SIZE);
+    assert_eq!(frame_len_cap(Some(u32::MAX)), QUIC_PREVIEW_MAX_FRAME_LEN);
+    assert_eq!(frame_len_cap(Some(0)), QUIC_PREVIEW_MAX_FRAME_LEN);
     assert!(matches!(
         validate_frame_len(
             4096 + AGENT_TEXT_STREAM_FRAME_ALLOWANCE + 1,
@@ -157,7 +162,7 @@ fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empt
         (AGENT_TEXT_STREAM_RECORD_CHECKPOINT, "hello world"),
     ] {
         assert_eq!(
-            stream_record_text(&record(record_type, plaintext)).unwrap(),
+            stream_record_text(&record(record_type, plaintext)),
             plaintext
         );
     }
@@ -168,10 +173,7 @@ fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empt
         AGENT_TEXT_STREAM_RECORD_ABORT,
         AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
     ] {
-        assert_eq!(
-            stream_record_text(&record(record_type, "ignored")).unwrap(),
-            ""
-        );
+        assert_eq!(stream_record_text(&record(record_type, "ignored")), "");
     }
 }
 
@@ -620,4 +622,183 @@ async fn receiver_reports_gap_when_record_is_ahead_of_high_water() {
             actual: 3
         }
     ));
+}
+
+#[test]
+fn shared_transport_profiles_pin_liveness_and_stream_bounds() {
+    // The direct server accepts exactly one sender-opened uni stream; clients
+    // never accept peer-opened streams at all. Same Debug-based check as the
+    // liveness test above, since quinn exposes no transport-config getters.
+    let direct_server = format!(
+        "{:?}",
+        QuicPreviewTransportProfile::direct_server()
+            .transport_config()
+            .unwrap()
+    );
+    assert!(
+        direct_server.contains("max_idle_timeout: Some(30000)"),
+        "{direct_server}"
+    );
+    assert!(
+        direct_server.contains("keep_alive_interval: Some(10s)"),
+        "{direct_server}"
+    );
+    assert!(
+        direct_server.contains("max_concurrent_uni_streams: 1,"),
+        "{direct_server}"
+    );
+    assert!(
+        direct_server.contains("max_concurrent_bidi_streams: 0,"),
+        "{direct_server}"
+    );
+
+    let client = format!(
+        "{:?}",
+        QuicPreviewTransportProfile::client()
+            .transport_config()
+            .unwrap()
+    );
+    assert!(client.contains("max_idle_timeout: Some(30000)"), "{client}");
+    assert!(
+        client.contains("keep_alive_interval: Some(10s)"),
+        "{client}"
+    );
+    assert!(
+        client.contains("max_concurrent_uni_streams: 0,"),
+        "{client}"
+    );
+    assert!(
+        client.contains("max_concurrent_bidi_streams: 0,"),
+        "{client}"
+    );
+}
+
+#[test]
+fn direct_server_and_client_configs_disable_early_data() {
+    // Pin the shared early-data policy: 0-RTT stays off on every preview
+    // endpoint because no app-layer anti-replay exists (see hardening.rs).
+    let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_der = rustls::pki_types::CertificateDer::from(certified_key.cert);
+    let key_der =
+        rustls::pki_types::PrivatePkcs8KeyDer::from(certified_key.signing_key.serialize_der());
+    let server = crate::tls::direct_rustls_server_config(cert_der, key_der).unwrap();
+    assert_eq!(server.max_early_data_size, 0);
+
+    let client = crate::tls::direct_rustls_client_config(
+        ServerTrust::InsecureLocal,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4450),
+    )
+    .unwrap();
+    assert!(!client.enable_early_data);
+}
+
+#[tokio::test]
+async fn connect_with_timeout_bounds_dial_to_unresponsive_peer() {
+    use crate::hardening::{QuicConnectFault, connect_with_timeout};
+
+    // A bound-but-silent UDP socket: the QUIC handshake gets no reply, so
+    // only the connect deadline ends the dial.
+    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = blackhole.local_addr().unwrap();
+    let endpoint = client_endpoint(ServerTrust::InsecureLocal, server_addr).unwrap();
+
+    let err = connect_with_timeout(
+        &endpoint,
+        server_addr,
+        "localhost",
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, QuicConnectFault::Timeout));
+    assert!(matches!(
+        QuicTextStreamError::from(err),
+        QuicTextStreamError::ConnectTimeout
+    ));
+}
+
+#[tokio::test]
+async fn receiver_times_out_when_no_sender_dials() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let limits = AgentTextStreamReceiveLimits {
+        accept_timeout: Duration::from_millis(50),
+        ..AgentTextStreamReceiveLimits::default()
+    };
+
+    let err = receiver
+        .receive_once_with_limits(start_event_id, None, limits)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, QuicTextStreamError::AcceptTimeout));
+}
+
+#[tokio::test]
+async fn receiver_disables_accept_deadline_at_zero() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let stream_id = vec![0x42; 32];
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let limits = AgentTextStreamReceiveLimits {
+        accept_timeout: Duration::ZERO,
+        ..AgentTextStreamReceiveLimits::default()
+    };
+    let receive = tokio::spawn(receiver.receive_once_with_limits(start_event_id, None, limits));
+
+    // With the deadline disabled the receiver waits indefinitely; dial after
+    // a pause and confirm the stream still completes.
+    sleep(Duration::from_millis(100)).await;
+    raw_record_sender(
+        server_addr,
+        server_cert,
+        vec![AgentTextStreamRecordV1::text_delta(
+            stream_id,
+            1,
+            b"hi".to_vec(),
+        )],
+    )
+    .await;
+
+    let received = receive.await.unwrap().unwrap();
+    assert_eq!(received.text, "hi");
+}
+
+#[tokio::test]
+async fn receiver_replaces_invalid_utf8_frame_instead_of_aborting_stream() {
+    let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();
+    let server_addr = receiver.local_addr().unwrap();
+    let server_cert = receiver.server_cert_der().to_vec();
+    let stream_id = vec![0x42; 32];
+    let start_event_id = MessageId::new(vec![0x24; 32]);
+    let receive = tokio::spawn(receiver.receive_once(start_event_id.clone(), None));
+
+    // The middle frame is authentic but not UTF-8. Per the lossy decode
+    // policy it renders as replacement characters instead of tearing down the
+    // stream and discarding the accumulated preview.
+    let records = vec![
+        AgentTextStreamRecordV1::text_delta(stream_id.clone(), 1, b"ok".to_vec()),
+        AgentTextStreamRecordV1::text_delta(stream_id.clone(), 2, vec![0xff, 0xfe]),
+        AgentTextStreamRecordV1::text_delta(stream_id.clone(), 3, b"done".to_vec()),
+    ];
+    let mut expected_transcript =
+        AgentTextStreamTranscriptV1::new(stream_id.clone(), start_event_id);
+    for record in &records {
+        expected_transcript.append(record.seq, record.record_type, &record.plaintext_frame);
+    }
+    raw_record_sender(server_addr, server_cert, records).await;
+
+    let received = receive.await.unwrap().unwrap();
+    assert_eq!(received.chunk_count, 3);
+    assert_eq!(received.chunks[1].text, "\u{FFFD}\u{FFFD}");
+    assert_eq!(received.text, "ok\u{FFFD}\u{FFFD}done");
+    // Transcript hashing covers the raw frame bytes, so the lossy display
+    // never desyncs the receiver transcript from the sender's.
+    assert_eq!(received.transcript_hash, expected_transcript.hash());
+}
+
+#[test]
+fn non_utf8_frame_decodes_lossily_per_record() {
+    let record = AgentTextStreamRecordV1::text_delta(vec![0x11; 32], 1, vec![0xff, 0xfe]);
+    assert_eq!(stream_record_text(&record), "\u{FFFD}\u{FFFD}");
 }

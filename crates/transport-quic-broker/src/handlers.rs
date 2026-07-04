@@ -5,21 +5,46 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
-use transport_quic_stream::AgentTextStreamReceiveAccumulator;
+use transport_quic_stream::{AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimits};
 
 use crate::control::QuicBrokerControlTypeV1;
 use crate::error::QuicBrokerError;
 use crate::frame::{read_control_frame, read_record_frame, write_record_frame};
-use crate::protocol::MAX_FRAME_SIZE;
+use crate::protocol::{MAX_FRAME_SIZE, RECORD_QUIET_GAP_DEADLINE};
 use crate::state::BrokerState;
+
+/// Per-stream knobs the server hands every connection handler.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BrokerStreamPolicy {
+    pub(crate) max_streams_per_connection: usize,
+    pub(crate) read_timeout: Duration,
+    pub(crate) publish_limits: PublishForwardLimits,
+}
+
+/// Forward-role bounds for a publish stream, from `QuicBrokerConfig` — never
+/// the subscriber-sized receive defaults.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PublishForwardLimits {
+    pub(crate) max_records: u64,
+    pub(crate) max_plaintext_bytes: usize,
+}
+
+impl PublishForwardLimits {
+    fn accumulator(self) -> AgentTextStreamReceiveAccumulator {
+        AgentTextStreamReceiveAccumulator::new(AgentTextStreamReceiveLimits {
+            max_records: self.max_records,
+            max_plaintext_bytes: self.max_plaintext_bytes,
+            ..AgentTextStreamReceiveLimits::default()
+        })
+    }
+}
 
 pub(crate) async fn handle_connection(
     state: Arc<BrokerState>,
     connection: quinn::Connection,
-    max_streams_per_connection: usize,
-    read_timeout: Duration,
+    policy: BrokerStreamPolicy,
 ) -> Result<(), QuicBrokerError> {
-    let stream_limiter = Arc::new(Semaphore::new(max_streams_per_connection));
+    let stream_limiter = Arc::new(Semaphore::new(policy.max_streams_per_connection));
     loop {
         tokio::select! {
             uni = connection.accept_uni() => {
@@ -33,7 +58,7 @@ pub(crate) async fn handle_connection(
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = handle_publish_stream(state, recv, read_timeout).await;
+                    let _ = handle_publish_stream(state, recv, policy).await;
                 });
             }
             bi = connection.accept_bi() => {
@@ -48,7 +73,7 @@ pub(crate) async fn handle_connection(
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = handle_subscribe_stream(state, send, recv, read_timeout).await;
+                    let _ = handle_subscribe_stream(state, send, recv, policy.read_timeout).await;
                 });
             }
         }
@@ -58,9 +83,9 @@ pub(crate) async fn handle_connection(
 async fn handle_publish_stream(
     state: Arc<BrokerState>,
     mut recv: quinn::RecvStream,
-    read_timeout: Duration,
+    policy: BrokerStreamPolicy,
 ) -> Result<(), QuicBrokerError> {
-    let control = read_control_frame(&mut recv, read_timeout).await?;
+    let control = read_control_frame(&mut recv, policy.read_timeout).await?;
     // Spec-mandated directionality: a subscribe envelope on a client-opened
     // unidirectional stream is rejected.
     if control.control_type != QuicBrokerControlTypeV1::Publish {
@@ -69,21 +94,23 @@ async fn handle_publish_stream(
     }
     let key = control.key();
     state.wait_for_subscriber(&key).await?;
-    let mut limit_state = AgentTextStreamReceiveAccumulator::default();
+    // Forward-role limits come from the broker config: the subscriber-sized
+    // receive defaults would truncate a legitimate long preview mid-stream and
+    // close the room. Each subscriber still enforces its own receive limits.
+    let mut limit_state = policy.publish_limits.accumulator();
 
-    // The `read_timeout` is a handshake deadline only: it bounds how long an
-    // unauthenticated peer may stall before sending its publish control frame.
-    // Once a publisher has authenticated a room we must NOT apply a per-record
-    // deadline. Agents legitimately go quiet between records (e.g. a long tool
-    // call with no progress events); a per-frame deadline would error the
-    // publish stream on that silence, which latches the composer's `live_error`
-    // and kills the live preview for the rest of the response with no recovery.
-    // QUIC liveness (max_idle_timeout + keep_alive_interval) still reaps a
-    // genuinely dead publisher, and the resource caps (max_connections /
-    // max_rooms / backlog budgets) still bound an idle-but-alive one, so reads
-    // here are intentionally unbounded by the application-level deadline.
+    // The short `read_timeout` is a handshake deadline only: it bounds how
+    // long an unauthenticated peer may stall before sending its publish
+    // control frame. Record reads then fall under the shared 120s quiet-gap
+    // deadline, matching the direct path's `record_read_timeout` and the
+    // subscriber loop: agents legitimately go quiet between records (e.g. a
+    // long tool call), but QUIC keepalives would sustain an alive-but-wedged
+    // publisher forever, pinning its room. On a quiet-gap timeout the room is
+    // finished, so subscribers observe a clean end of stream.
     let result = async {
-        while let Some(record) = read_record_frame(&mut recv, None, MAX_FRAME_SIZE).await? {
+        while let Some(record) =
+            read_record_frame(&mut recv, Some(RECORD_QUIET_GAP_DEADLINE), MAX_FRAME_SIZE).await?
+        {
             if record.stream_id != key.stream_id {
                 return Err(QuicBrokerError::MixedStreamIds);
             }

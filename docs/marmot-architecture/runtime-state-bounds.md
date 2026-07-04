@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-07-02
+updated: 2026-07-04
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -32,7 +32,8 @@ Tracking issue: marmot-protocol/mdk#381.
 | Per-room `backlog` | `max_backlog` records (default 1024) per room, `max_backlog_bytes` (default 64 MiB) global, `replay_ttl` (default 0 = retain nothing) | Expired entries purged on subscribe/publish/purge; oldest dropped when over depth or byte budget. |
 | `total_backlog_bytes` | Derived from room backlogs | Adjusted symmetrically on every backlog mutation, including the finished-room in-place reset (mdk#372); recomputed wholesale by `purge_expired_rooms`. |
 | Per-subscriber queue | `per_subscriber_queue` records (default 32) | A lagging subscriber is dropped rather than buffered. |
-| Connections | `max_connections` semaphore (default 256), `max_streams_per_connection` (default 64) | Over-cap connections are refused at accept; permits release on disconnect. |
+| Per-publish-stream forwarding | `publish_max_records` (default 65536) records, `publish_max_plaintext_bytes` (default 64 MiB) cumulative | Forward-role bounds from broker config (never the subscriber-sized receive defaults, mdk#391); on breach the room is finished so subscribers see a clean end. Record reads also carry the shared 120 s quiet-gap deadline, so an alive-but-wedged publisher cannot pin a room via QUIC keepalives. |
+| Connections | `max_connections` semaphore (default 256), `max_streams_per_connection` (default 64) | Over-cap connections are refused at accept; permits release on disconnect. TLS handshakes are bounded by `read_timeout`, so a stalling peer cannot pin a connection permit pre-handshake. |
 
 ### `agent-connector` / `wn-agent` (`src/lib.rs` and modules)
 

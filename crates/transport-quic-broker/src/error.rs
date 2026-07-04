@@ -1,10 +1,9 @@
 //! Broker error type shared across the client, server, and broker-state paths.
 
 use std::net::SocketAddr;
-use std::str;
 
 use cgka_traits::agent_text_stream::AgentTextStreamRecordError;
-use transport_quic_stream::AgentTextStreamReceiveLimitError;
+use transport_quic_stream::{AgentTextStreamReceiveLimitError, QuicConnectFault};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuicBrokerError {
@@ -32,8 +31,6 @@ pub enum QuicBrokerError {
     Stopped(#[from] quinn::StoppedError),
     #[error(transparent)]
     Record(#[from] AgentTextStreamRecordError),
-    #[error(transparent)]
-    Utf8(#[from] str::Utf8Error),
     #[error(transparent)]
     StreamCrypto(#[from] transport_quic_stream::QuicTextStreamError),
     #[error(transparent)]
@@ -66,6 +63,10 @@ pub enum QuicBrokerError {
     EmptyIdleTimeout,
     #[error("broker keep-alive interval cannot be zero")]
     EmptyKeepAliveInterval,
+    #[error("broker publish record limit cannot be zero")]
+    EmptyPublishRecordLimit,
+    #[error("broker publish plaintext byte limit cannot be zero")]
+    EmptyPublishByteLimit,
     #[error(
         "broker replay ttl exceeds the application profile cap: {requested_secs}s > {cap_secs}s"
     )]
@@ -76,6 +77,8 @@ pub enum QuicBrokerError {
     BacklogRecordTooLarge { record_bytes: usize, limit: usize },
     #[error("broker frame read timed out")]
     ReadTimeout,
+    #[error("broker QUIC connect timed out")]
+    ConnectTimeout,
     #[error("broker control frame is missing")]
     MissingControlFrame,
     #[error("wrong broker control protocol: {0}")]
@@ -118,4 +121,14 @@ pub enum QuicBrokerError {
     /// never raise this error.
     #[error("agent text stream sequence gap: expected {expected}, got {actual}")]
     UnexpectedSequence { expected: u64, actual: u64 },
+}
+
+impl From<QuicConnectFault> for QuicBrokerError {
+    fn from(fault: QuicConnectFault) -> Self {
+        match fault {
+            QuicConnectFault::Connect(err) => Self::Connect(err),
+            QuicConnectFault::Connection(err) => Self::Connection(err),
+            QuicConnectFault::Timeout => Self::ConnectTimeout,
+        }
+    }
 }

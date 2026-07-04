@@ -16,6 +16,12 @@ pub struct AgentTextStreamReceiveLimits {
     /// reject wire frames above this value plus the spec-pinned 1024-byte
     /// allowance; the app-profile constant is the ceiling and default.
     pub max_plaintext_frame_len: u32,
+    /// Rendezvous bound on waiting for a sender to dial the receive endpoint
+    /// (`endpoint.accept()`). Deliberately generous: the sender may first have
+    /// to learn the receiver's address out-of-band (e.g. via the anchor
+    /// event), so this only reaps a receiver nobody ever dials. `0` disables
+    /// the deadline for tests or specialized callers.
+    pub accept_timeout: Duration,
     /// Short setup deadline for accepting the peer's inbound stream and first
     /// record. `0` disables the deadline for tests or specialized callers.
     pub read_timeout: Duration,
@@ -31,6 +37,7 @@ impl Default for AgentTextStreamReceiveLimits {
             max_records: AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS,
             max_plaintext_bytes: AGENT_TEXT_STREAM_DEFAULT_MAX_PLAINTEXT_BYTES,
             max_plaintext_frame_len: AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN,
+            accept_timeout: Duration::from_secs(300),
             read_timeout: Duration::from_secs(15),
             record_read_timeout: Duration::from_secs(120),
         }

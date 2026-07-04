@@ -15,6 +15,8 @@ Raw QUIC transport binding for transient Marmot agent text stream previews.
 ## Key files
 
 - `src/lib.rs` — crate docs, module wiring, and the public re-export facade.
+- `src/hardening.rs` — the shared QUIC preview hardening profile (transport config, connect deadline, absolute frame
+  cap, early-data policy) consumed by this crate and `transport-quic-broker`.
 - `src/protocol.rs` — ALPN/protocol identifiers, frame-size constants, and the plaintext/frame-length cap helpers.
 - `src/crypto.rs` — `AgentTextStreamCrypto`, record seal/open, and the HKDF key/nonce and AAD derivations.
 - `src/frame.rs` — length-prefixed wire framing: write/read a record and `frame_len` validation.

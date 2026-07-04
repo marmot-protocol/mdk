@@ -9,7 +9,7 @@ use tokio::time::timeout;
 
 use crate::control::QuicBrokerControlEnvelopeV1;
 use crate::error::QuicBrokerError;
-use crate::protocol::{FRAME_LEN_BYTES, MAX_FRAME_SIZE};
+use crate::protocol::{FRAME_LEN_BYTES, MAX_CONTROL_FRAME_LEN, MAX_FRAME_SIZE};
 
 pub(crate) async fn write_control_frame(
     send: &mut quinn::SendStream,
@@ -23,7 +23,10 @@ pub(crate) async fn read_control_frame(
     recv: &mut quinn::RecvStream,
     read_timeout: Duration,
 ) -> Result<QuicBrokerControlEnvelopeV1, QuicBrokerError> {
-    let bytes = read_bytes_frame(recv, Some(read_timeout), MAX_FRAME_SIZE)
+    // Control frames are the pre-auth first read on every broker stream, so
+    // they get the dedicated ~256-byte cap instead of the record-frame cap:
+    // a declared length above it is rejected before allocation.
+    let bytes = read_bytes_frame(recv, Some(read_timeout), MAX_CONTROL_FRAME_LEN)
         .await?
         .ok_or(QuicBrokerError::MissingControlFrame)?;
     QuicBrokerControlEnvelopeV1::decode(&bytes)
@@ -64,16 +67,30 @@ pub(crate) async fn read_bytes_frame(
     read_timeout: Option<Duration>,
     max_frame_len: usize,
 ) -> Result<Option<Vec<u8>>, QuicBrokerError> {
+    // One deadline spans the whole frame (length prefix and body), mirroring
+    // the direct path's `read_record`: a per-`read()` window would restart on
+    // every delivered byte, letting a peer dribble one byte per window and
+    // stretch a single frame read far past the configured deadline.
+    match read_timeout {
+        Some(read_timeout) => {
+            broker_read_deadline(
+                read_timeout,
+                read_bytes_frame_unbounded(recv, max_frame_len),
+            )
+            .await
+        }
+        None => read_bytes_frame_unbounded(recv, max_frame_len).await,
+    }
+}
+
+async fn read_bytes_frame_unbounded(
+    recv: &mut quinn::RecvStream,
+    max_frame_len: usize,
+) -> Result<Option<Vec<u8>>, QuicBrokerError> {
     let mut len_bytes = [0_u8; FRAME_LEN_BYTES];
     let mut read = 0;
     while read < FRAME_LEN_BYTES {
-        let chunk = match read_timeout {
-            Some(read_timeout) => {
-                broker_read_deadline(read_timeout, recv.read(&mut len_bytes[read..])).await?
-            }
-            None => recv.read(&mut len_bytes[read..]).await?,
-        };
-        match chunk {
+        match recv.read(&mut len_bytes[read..]).await? {
             Some(0) => return Err(QuicBrokerError::TruncatedFrameLength),
             Some(n) => read += n,
             None if read == 0 => return Ok(None),
@@ -84,12 +101,7 @@ pub(crate) async fn read_bytes_frame(
     let len = u32::from_be_bytes(len_bytes) as usize;
     validate_frame_len(len, max_frame_len)?;
     let mut bytes = vec![0_u8; len];
-    match read_timeout {
-        Some(read_timeout) => {
-            broker_read_deadline(read_timeout, recv.read_exact(&mut bytes)).await?;
-        }
-        None => recv.read_exact(&mut bytes).await?,
-    }
+    recv.read_exact(&mut bytes).await?;
     Ok(Some(bytes))
 }
 

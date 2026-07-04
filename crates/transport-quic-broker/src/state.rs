@@ -55,7 +55,10 @@ impl Default for BrokerRoom {
 
 #[derive(Debug)]
 struct BacklogRecord {
-    record: AgentTextStreamRecordV1,
+    /// Shared with subscriber snapshots and live queues: cloning an `Arc` is
+    /// pointer-sized, so serving a full backlog under the global broker lock
+    /// never copies record payloads.
+    record: Arc<AgentTextStreamRecordV1>,
     bytes: usize,
     /// Append timestamp used to purge entries older than the broker replay
     /// TTL before serving backlog to a new subscriber.
@@ -81,7 +84,7 @@ fn purge_expired_backlog(room: &mut BrokerRoom, replay_ttl: Duration) -> usize {
 #[derive(Debug)]
 struct Subscriber {
     id: u64,
-    tx: mpsc::Sender<AgentTextStreamRecordV1>,
+    tx: mpsc::Sender<Arc<AgentTextStreamRecordV1>>,
 }
 
 impl BrokerState {
@@ -108,8 +111,8 @@ impl BrokerState {
     ) -> Result<
         (
             u64,
-            Vec<AgentTextStreamRecordV1>,
-            mpsc::Receiver<AgentTextStreamRecordV1>,
+            Vec<Arc<AgentTextStreamRecordV1>>,
+            mpsc::Receiver<Arc<AgentTextStreamRecordV1>>,
         ),
         QuicBrokerError,
     > {
@@ -130,12 +133,14 @@ impl BrokerState {
             }
             // Purge entries past the replay window before serving backlog: a
             // late subscriber only sees records the replay TTL still covers,
-            // and the default TTL of zero serves no backlog at all.
+            // and the default TTL of zero serves no backlog at all. The
+            // snapshot clones `Arc`s, not payloads, so even a full 64 MiB
+            // backlog is served without copying bytes under the global lock.
             let freed = purge_expired_backlog(room, self.replay_ttl);
             let backlog: Vec<_> = room
                 .backlog
                 .iter()
-                .map(|entry| entry.record.clone())
+                .map(|entry| Arc::clone(&entry.record))
                 .collect();
             if room.finished_at.is_none() {
                 room.subscribers.push(Subscriber { id, tx });
@@ -187,6 +192,10 @@ impl BrokerState {
         } else {
             None
         };
+        // Wrap once before taking the lock; backlog retention and subscriber
+        // fan-out below share this allocation instead of deep-cloning the
+        // record per destination.
+        let record = Arc::new(record);
         let mut inner = self.inner.lock().await;
         self.purge_expired_rooms(&mut inner);
         if inner
@@ -210,7 +219,7 @@ impl BrokerState {
             let freed = purge_expired_backlog(room, self.replay_ttl);
             total_backlog_bytes = total_backlog_bytes.saturating_sub(freed);
             room.backlog.push_back(BacklogRecord {
-                record: record.clone(),
+                record: Arc::clone(&record),
                 bytes: record_bytes,
                 appended_at: Instant::now(),
             });
@@ -227,7 +236,7 @@ impl BrokerState {
             }
         }
         room.subscribers.retain(|subscriber| {
-            if subscriber.tx.try_send(record.clone()).is_ok() {
+            if subscriber.tx.try_send(Arc::clone(&record)).is_ok() {
                 delivered += 1;
                 true
             } else {

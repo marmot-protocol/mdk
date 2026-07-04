@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls_platform_verifier::BuilderVerifierExt;
+use transport_quic_stream::QuicPreviewTransportProfile;
 
 use crate::client::BrokerServerTrust;
 use crate::config::{QuicBrokerConfig, QuicBrokerTlsConfig};
@@ -20,14 +21,12 @@ use crate::protocol::QUIC_BROKER_ALPN_V1;
 pub(crate) fn broker_transport_config(
     config: &QuicBrokerConfig,
 ) -> Result<TransportConfig, QuicBrokerError> {
-    let mut transport = TransportConfig::default();
-    let streams = VarInt::try_from(config.max_streams_per_connection as u64)?;
-    transport
-        .max_concurrent_bidi_streams(streams)
-        .max_concurrent_uni_streams(streams)
-        .max_idle_timeout(Some(config.max_idle_timeout.try_into()?))
-        .keep_alive_interval(Some(config.keep_alive_interval));
-    Ok(transport)
+    Ok(QuicPreviewTransportProfile::broker_server(
+        config.max_streams_per_connection as u64,
+        config.max_idle_timeout,
+        config.keep_alive_interval,
+    )
+    .transport_config()?)
 }
 
 pub(crate) fn configure_server(
@@ -64,13 +63,18 @@ pub(crate) fn configure_server(
     }
 }
 
-/// Build the broker QUIC server config with the spec-mandated ALPN
+/// Build the broker rustls server config with the spec-mandated ALPN
 /// `marmot.quic_broker.v1` so broker connections negotiate the broker control
 /// protocol during the TLS handshake.
-fn broker_server_config(
+///
+/// TLS 0-RTT stays disabled (`max_early_data_size` keeps its default of 0),
+/// per the shared preview hardening profile: the broker has no app-layer
+/// anti-replay, so replayable early data would let a passive attacker replay
+/// publish control frames to create/feed rooms without a fresh handshake.
+pub(crate) fn broker_rustls_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
-) -> Result<ServerConfig, QuicBrokerError> {
+) -> Result<rustls::ServerConfig, QuicBrokerError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -79,7 +83,14 @@ fn broker_server_config(
         .with_single_cert(certs, key)
         .map_err(|err| QuicBrokerError::Certificate(err.to_string()))?;
     crypto.alpn_protocols = vec![QUIC_BROKER_ALPN_V1.to_vec()];
-    crypto.max_early_data_size = u32::MAX;
+    Ok(crypto)
+}
+
+fn broker_server_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, QuicBrokerError> {
+    let crypto = broker_rustls_server_config(certs, key)?;
     Ok(ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(crypto)
             .map_err(|err| QuicBrokerError::Certificate(err.to_string()))?,
@@ -104,10 +115,16 @@ fn load_private_key(path: &PathBuf) -> Result<PrivateKeyDer<'static>, QuicBroker
         .ok_or(QuicBrokerError::MissingPrivateKey)
 }
 
-pub(crate) fn client_endpoint(
+/// Build the broker rustls client config for a trust mode with the
+/// spec-mandated ALPN `marmot.quic_broker.v1`.
+///
+/// TLS 0-RTT stays disabled (`enable_early_data` keeps its default of false),
+/// per the shared preview hardening profile — see
+/// [`broker_rustls_server_config`].
+pub(crate) fn broker_rustls_client_config(
     trust: BrokerServerTrust,
     broker_addr: SocketAddr,
-) -> Result<Endpoint, QuicBrokerError> {
+) -> Result<rustls::ClientConfig, QuicBrokerError> {
     // Every broker-path client config negotiates the spec-mandated ALPN
     // `marmot.quic_broker.v1`, so the rustls config is built here instead of
     // through the quinn convenience constructors (which set no ALPN).
@@ -138,10 +155,20 @@ pub(crate) fn client_endpoint(
         }
     };
     crypto.alpn_protocols = vec![QUIC_BROKER_ALPN_V1.to_vec()];
-    crypto.enable_early_data = true;
-    let client_config = ClientConfig::new(Arc::new(
+    Ok(crypto)
+}
+
+pub(crate) fn client_endpoint(
+    trust: BrokerServerTrust,
+    broker_addr: SocketAddr,
+) -> Result<Endpoint, QuicBrokerError> {
+    let crypto = broker_rustls_client_config(trust, broker_addr)?;
+    let mut client_config = ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto)
             .map_err(|err| QuicBrokerError::ClientConfig(err.to_string()))?,
+    ));
+    client_config.transport_config(Arc::new(
+        QuicPreviewTransportProfile::client().transport_config()?,
     ));
     let mut endpoint = Endpoint::client(client_bind_addr_for_broker(broker_addr))?;
     endpoint.set_default_client_config(client_config);

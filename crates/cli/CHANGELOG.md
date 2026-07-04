@@ -18,11 +18,29 @@ versioning through the workspace version in the root `Cargo.toml`.
   sender-provided candidates that resolve to loopback, RFC1918/private, link-local (including `169.254.169.254`),
   multicast, unspecified, broadcast, IPv6 unique-local (ULA), or IPv6 unicast link-local endpoints. Local endpoints are
   only reachable when the local user explicitly passes `--insecure-local` (SSRF + trust downgrade hardening).
+- The direct and broker QUIC preview transports now share one hardening profile: the `marmot-quic-broker` no longer
+  enables replayable TLS 0-RTT early data (an off-path attacker could replay captured publish control frames to
+  create/feed rooms); every preview dial (`wn stream send/watch`, broker publish/subscribe) is bounded by a 15 s
+  connect timeout and a client-side idle/keepalive transport config; `wn stream receive` bounds its wait for a sender
+  to dial (300 s) and the TLS handshake; broker control frames are capped at 256 bytes pre-auth (previously a peer
+  could demand a ~66 KB allocation per stream before validation); and broker frame reads apply one deadline across the
+  whole frame, so a peer dribbling one byte per timeout window can no longer stretch pre-auth reads.
 
 ### Fixed
 
 - `wnd` now buffers daemon request frames before scanning for the newline delimiter, avoiding one async `read()` call per
   byte for large `Execute` requests while preserving the existing 1 MiB request cap and stalled-client timeout.
+- A legitimate long agent preview (more than 4096 records or 1 MiB of cumulative deltas) is no longer silently
+  terminated mid-stream by the QUIC broker: the broker's publish path previously enforced the subscriber-sized receive
+  defaults on the publisher and closed the room when they tripped. Forward-role limits now come from broker
+  configuration (see the new `--publish-max-records` / `--publish-max-plaintext-bytes` flags) with defaults far above
+  the receive defaults; subscribers still enforce their own receive limits.
+- A single non-UTF-8 frame on a text-bearing preview record no longer tears down the whole received preview (direct
+  receive and broker subscribe): the frame renders as replacement characters and the stream continues. Transcript
+  hashing covers the raw bytes, so sender/receiver transcript verification is unaffected.
+- A subscriber joining a broker room with a large retained backlog no longer copies the backlog while holding the
+  broker-wide lock (records are now reference-shared), so one subscribe cannot head-of-line-block publish/forward
+  across every other room.
 - A group copy that realized your own removal no longer stays self-quarantined when the removing commit later loses
   branch selection: the convergence apply clears the removed marker whenever the selected canonical branch records your
   membership, so `message send` works again on that group instead of failing `invalid_transition` ("local group copy is
@@ -30,6 +48,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   Welcome is only required while the removal remains canonical.
 
 ### Changed
+
+- `marmot-quic-broker` gained `--publish-max-records` (default 65536) and `--publish-max-plaintext-bytes` (default
+  64 MiB) flags bounding what the broker forwards per publish stream; both appear in the startup output. The broker's
+  publish path also now applies the same generous 120 s quiet-gap deadline to record reads that the direct path and
+  the subscriber loop already used, so an alive-but-wedged publisher (kept alive by QUIC keepalives) can no longer pin
+  a room indefinitely; agents quiet for under two minutes between records are unaffected.
 
 - **Breaking:** retired the experimental "darkmatter" naming. The crate is now `wn-cli` and installs the `wn` CLI and
   `wnd` daemon; the connector daemon is `wn-agent`. Env vars moved from `DM_*` to `WN_*` (`WN_ACCOUNT`, `WN_RELAY`,

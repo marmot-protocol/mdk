@@ -9,6 +9,7 @@
 mod crypto;
 mod error;
 mod frame;
+mod hardening;
 mod limits;
 mod protocol;
 mod receive;
@@ -23,6 +24,11 @@ pub use crypto::{
     record_aad,
 };
 pub use error::QuicTextStreamError;
+pub use hardening::{
+    QUIC_PREVIEW_CONNECT_TIMEOUT, QUIC_PREVIEW_KEEP_ALIVE_INTERVAL, QUIC_PREVIEW_MAX_FRAME_LEN,
+    QUIC_PREVIEW_MAX_IDLE_TIMEOUT, QuicConnectFault, QuicPreviewTransportProfile,
+    connect_with_timeout,
+};
 pub use limits::{
     AgentTextStreamReceiveAccumulator, AgentTextStreamReceiveLimitError,
     AgentTextStreamReceiveLimits,
@@ -31,7 +37,9 @@ pub use protocol::{
     AGENT_TEXT_STREAM_FRAME_ALLOWANCE, QUIC_STREAM_ALPN_V1, QUIC_STREAM_PROTOCOL_V1,
     effective_plaintext_cap, frame_len_cap,
 };
-pub use receive::{QuicTextStreamReceiver, ReceivedTextChunk, ReceivedTextStream, ServerTrust};
+pub use receive::{
+    QuicTextStreamReceiver, ReceivedTextChunk, ReceivedTextStream, ServerTrust, stream_record_text,
+};
 pub use send::{
     SendTextStream, SentTextStream, random_stream_id, send_text_stream, split_text_deltas,
 };

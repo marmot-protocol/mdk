@@ -14,6 +14,7 @@ use tokio::time::{sleep, timeout};
 use crate::crypto::{AgentTextStreamCrypto, encrypt_record};
 use crate::error::QuicTextStreamError;
 use crate::frame::write_record;
+use crate::hardening::{QUIC_PREVIEW_CONNECT_TIMEOUT, connect_with_timeout};
 use crate::protocol::{SEND_CLOSE_WAIT, effective_plaintext_cap};
 use crate::receive::ServerTrust;
 use crate::tls::client_endpoint;
@@ -61,9 +62,13 @@ pub async fn send_text_stream(
         .min(effective_plaintext_cap(config.max_plaintext_frame_len));
 
     let endpoint = client_endpoint(config.trust, config.server_addr)?;
-    let connection = endpoint
-        .connect(config.server_addr, &config.server_name)?
-        .await?;
+    let connection = connect_with_timeout(
+        &endpoint,
+        config.server_addr,
+        &config.server_name,
+        QUIC_PREVIEW_CONNECT_TIMEOUT,
+    )
+    .await?;
     let mut send = connection.open_uni().await?;
     let mut transcript =
         AgentTextStreamTranscriptV1::new(config.stream_id.clone(), config.start_event_id);
