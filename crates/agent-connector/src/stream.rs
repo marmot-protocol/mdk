@@ -3,7 +3,9 @@
 use std::time::Instant;
 
 use agent_control::AgentControlResponse;
-use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
+use agent_stream_compose::{
+    StreamComposeCommand, StreamComposeReport, StreamFinishExpectation, run_stream_compose_session,
+};
 use cgka_traits::{GroupId, MessageId};
 use marmot_app::AgentTextStreamFinishRequest;
 use tokio::sync::mpsc::error::TrySendError;
@@ -15,7 +17,7 @@ use crate::quic::{
     broker_trust_for_candidate, first_quic_candidate, parse_quic_candidate,
     resolve_quic_candidate_addr,
 };
-use crate::stream_session::ActiveStreamSession;
+use crate::stream_session::{ActiveStreamSession, FinalizedStream};
 use crate::validation::{normalize_hex, transcript_hash_from_hex, unix_now_seconds};
 use crate::{
     AgentConnector, STREAM_COMPOSE_CHANNEL_DEPTH, STREAM_COMPOSE_CHUNK_BYTES,
@@ -118,6 +120,7 @@ impl AgentConnector {
                 cancel_tx,
                 abort: handle.abort_handle(),
                 last_activity: Instant::now(),
+                finalized: None,
             },
         );
         Ok(AgentControlResponse::StreamBegun {
@@ -196,53 +199,126 @@ impl AgentConnector {
         chunk_count: u64,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
-        let session = self.streams.remove(&stream_id_hex)?;
+        let transcript_hash = transcript_hash_from_hex(transcript_hash_hex)?;
+        // Clone (not remove) the session: the final text/hash/chunk-count
+        // expectation is validated inside the compose task, atomically with
+        // its teardown. On mismatch the session stays registered and the
+        // compose task keeps running, so finalize is retryable (#366).
+        let session = self.streams.get(&stream_id_hex)?;
+
+        // Retry fast-path: a prior finalize already validated the transcript and
+        // the compose task exited, but the durable finish below failed. The
+        // compose task is gone, so re-attempt the durable finish directly from
+        // the retained transcript, rejecting a retry that disagrees with what
+        // was frozen (a finalize cannot change after the transcript is sealed).
+        if let Some(finalized) = &session.finalized {
+            if finalized.final_text != final_text
+                || finalized.transcript_hash != transcript_hash
+                || finalized.chunk_count != chunk_count
+            {
+                return Err(ConnectorError::Stream(
+                    "stream finalize does not match the already-finalized transcript".into(),
+                ));
+            }
+            return self
+                .finish_finalized_stream(
+                    &stream_id_hex,
+                    &session,
+                    final_text,
+                    transcript_hash,
+                    chunk_count,
+                )
+                .await;
+        }
+
         let (respond, response) = oneshot::channel();
         if session
             .tx
-            .send(StreamComposeCommand::Finish { respond })
+            .send(StreamComposeCommand::Finish {
+                expected: Some(StreamFinishExpectation {
+                    final_text: final_text.clone(),
+                    transcript_hash_hex: hex::encode(transcript_hash),
+                    chunk_count,
+                }),
+                respond,
+            })
             .await
             .is_err()
         {
+            // The compose task is gone: drop the dead registration (only if
+            // it is still this session) and reclaim the task, preserving the
+            // previous remove-then-abort cleanup semantics.
+            let _ = self.streams.remove_if_same(&stream_id_hex, &session);
             session.abort.abort();
             return Err(ConnectorError::Stream(
                 "stream compose session is closed".into(),
             ));
         }
-        let report = response
-            .await
-            .map_err(|err| ConnectorError::Stream(err.to_string()))?
-            .map_err(ConnectorError::Stream)?;
-        if report.text != final_text {
+        let report = match response.await {
+            Ok(report) => report,
+            Err(err) => {
+                // The compose task died mid-command: same cleanup as the
+                // send failure above.
+                let _ = self.streams.remove_if_same(&stream_id_hex, &session);
+                session.abort.abort();
+                return Err(ConnectorError::Stream(err.to_string()));
+            }
+        };
+        // An `Err` report is a validation mismatch: the compose task is still
+        // running and the session stays registered, so do nothing else here
+        // and the agent can append again and/or retry the finalize.
+        report.map_err(ConnectorError::Stream)?;
+        // Validation passed and the compose task has now exited. Freeze the
+        // transcript on the still-registered session so a durable-finish
+        // failure below leaves a retryable finalize (the compose task can no
+        // longer be consulted). If the freeze does not land — the session was
+        // superseded by a same-stream-id replacement between our `get` and now
+        // — this clone is stale: proceeding would publish under a lost retry
+        // handle, so bail and let the agent re-finalize against the live
+        // session instead.
+        if !self.streams.mark_finalized(
+            &stream_id_hex,
+            &session,
+            FinalizedStream {
+                final_text: final_text.clone(),
+                transcript_hash,
+                chunk_count,
+            },
+        ) {
             return Err(ConnectorError::Stream(
-                "stream final text does not match appended transcript".into(),
+                "stream session was superseded during finalize".into(),
             ));
         }
-        let transcript_hash = transcript_hash_from_hex(transcript_hash_hex)?;
-        let expected_transcript_hash_hex = hex::encode(transcript_hash);
-        let actual_transcript_hash_hex = report
-            .transcript_hash
-            .as_deref()
-            .map(normalize_hex)
-            .transpose()?;
-        if actual_transcript_hash_hex.as_deref() != Some(expected_transcript_hash_hex.as_str()) {
-            return Err(ConnectorError::Stream(
-                "stream final transcript hash does not match appended transcript".into(),
-            ));
-        }
-        if report.chunk_count != chunk_count {
-            return Err(ConnectorError::Stream(
-                "stream final chunk count does not match appended transcript".into(),
-            ));
-        }
+        self.finish_finalized_stream(
+            &stream_id_hex,
+            &session,
+            final_text,
+            transcript_hash,
+            chunk_count,
+        )
+        .await
+    }
+
+    /// Publish the durable stream final for an already-validated finalize, and
+    /// remove the session only once that publish succeeds. On failure the
+    /// session stays registered with its frozen transcript so a re-issued
+    /// `StreamFinalize` retries this step (#366).
+    async fn finish_finalized_stream(
+        &self,
+        stream_id_hex: &str,
+        session: &ActiveStreamSession,
+        final_text: String,
+        transcript_hash: [u8; 32],
+        chunk_count: u64,
+    ) -> Result<AgentControlResponse, ConnectorError> {
         let (_payload, summary) = self
             .runtime
             .finish_agent_text_stream(
                 &session.account_label,
                 &session.group_id,
                 AgentTextStreamFinishRequest {
-                    stream_id: session.stream_id,
-                    start_event_id: session.start_message_id_hex,
+                    stream_id: session.stream_id.clone(),
+                    start_event_id: session.start_message_id_hex.clone(),
                     final_text_or_reference: final_text,
                     transcript_hash,
                     chunk_count,
@@ -250,8 +326,10 @@ impl AgentConnector {
                 },
             )
             .await?;
+        // Durable final published: it is now safe to drop the session.
+        let _ = self.streams.remove_if_same(stream_id_hex, session);
         Ok(AgentControlResponse::StreamFinalized {
-            stream_id_hex,
+            stream_id_hex: stream_id_hex.to_owned(),
             message_ids_hex: summary.message_ids,
         })
     }

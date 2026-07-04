@@ -35,10 +35,10 @@ use crate::{
     MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
     NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary,
-    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelinePage,
+    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -771,6 +771,18 @@ pub enum MarmotAppEvent {
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
+    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
+    /// the member is in the group but unjoinable until the welcome is
+    /// re-delivered (mdk#352). Emitted so a UI/CLI/UniFFI subscriber learns a
+    /// member needs repair without polling `pending_welcome_deliveries`. The
+    /// durable record backs a later `redeliver_welcome(message_id_hex)`.
+    WelcomeDeliveryPending {
+        account_id_hex: String,
+        account_label: String,
+        group_id: GroupId,
+        message_id_hex: String,
+        recipient_hex: String,
+    },
 }
 
 impl MarmotAppRuntime {
@@ -1733,6 +1745,28 @@ impl MarmotAppRuntime {
     ) -> Result<SendSummary, AppError> {
         self.accounts
             .retry_group_convergence(account_ref, group_id)
+            .await
+    }
+
+    /// Welcomes a confirmed create/invite could not deliver and that still await
+    /// re-delivery for `account_ref` (mdk#352), oldest first.
+    pub async fn pending_welcome_deliveries(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
+        self.accounts.pending_welcome_deliveries(account_ref).await
+    }
+
+    /// Re-publish a previously undelivered welcome (identified by its stored MLS
+    /// message id) without re-committing (mdk#352). Clears the pending record on
+    /// success; a repeated failure leaves it queued.
+    pub async fn redeliver_welcome(
+        &self,
+        account_ref: &str,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .redeliver_welcome(account_ref, message_id_hex)
             .await
     }
 

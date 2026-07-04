@@ -106,6 +106,12 @@ pub enum AgentControlRequest {
         stream_id_hex: String,
         text: String,
     },
+    /// Finalize an active preview stream into the durable final message.
+    ///
+    /// If `final_text`, `transcript_hash_hex`, or `chunk_count` do not match
+    /// the transcript composed from the preceding appends, the request fails
+    /// WITHOUT tearing down the stream session: the agent may append again
+    /// and/or re-issue `StreamFinalize`, or cancel the stream.
     StreamFinalize {
         stream_id_hex: String,
         final_text: String,

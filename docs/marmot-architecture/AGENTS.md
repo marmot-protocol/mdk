@@ -39,6 +39,10 @@ Agent map for the Marmot architecture docs.
   - **Role:** One host-safety discipline for every outbound connection (validate resolved addresses, pin, trust from
     config, connect timeout); the `cgka_traits::app_components::host_safety` classifier and per-transport chokepoints.
 
+- **Path:** `overview/multi-step-state-changes.md`
+  - **Role:** No-torn-writes convention for multi-step state changes: validation/mutation ordering, compensation,
+    intent-first reconciliation, and reality-reflecting confirmation.
+
 - **Path:** `further-context/`
   - **Role:** Older or deeper context. Check status and dates before relying on it.
 

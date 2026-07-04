@@ -81,6 +81,12 @@ pub(crate) struct StreamComposeSession {
     pub(crate) tx: mpsc::Sender<StreamComposeCommand>,
     pub(crate) cancel_tx: mpsc::Sender<()>,
     pub(crate) handle: JoinHandle<()>,
+    /// Set once the compose task has produced its final report and exited via
+    /// `Finish`. The compose task is then gone, but the durable finish-marker
+    /// publish that follows can still fail; the retained report lets a re-issued
+    /// `stream finish` retry that publish without the (dead) compose task, so a
+    /// transient error never strands the transcript (#366).
+    pub(crate) finalized: Option<StreamComposeReport>,
 }
 
 pub(crate) async fn start_stream_watch(
@@ -522,6 +528,7 @@ pub(crate) async fn open_stream_compose(
             tx,
             cancel_tx,
             handle,
+            finalized: None,
         },
     );
     daemon_output(
@@ -589,9 +596,28 @@ pub(crate) async fn finish_stream_compose(
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
     let key = stream_compose_key(cli.account.as_deref(), &stream_id);
-    // Keep the session in the workers map until the MLS finish marker is durably
-    // published below. Borrow only the command sender (clonable) so the session
-    // entry stays intact and the transcript stays retryable if the marker fails.
+
+    // Retry fast-path: a prior finish already produced and froze the final
+    // report, but the durable marker publish below failed. The compose task has
+    // exited, so re-run the marker publish directly from the retained report
+    // instead of sending `Finish` to a closed channel.
+    if let Some(report) = workers
+        .get(&key)
+        .and_then(|session| session.finalized.clone())
+    {
+        return finish_stream_marker_from_report(
+            cli,
+            defaults,
+            state,
+            events,
+            runtime_host,
+            workers,
+            &key,
+            report,
+        )
+        .await;
+    }
+
     let Some(tx) = workers.get(&key).map(|session| session.tx.clone()) else {
         return daemon_error(
             cli.json,
@@ -599,9 +625,20 @@ pub(crate) async fn finish_stream_compose(
             format!("no active stream compose session for {stream_id}"),
         );
     };
+    // `expected: None` deliberately skips the transcript cross-check the
+    // connector performs. The connector validates because a remote agent
+    // supplies its own final_text/hash/chunk over the control protocol, which
+    // can disagree with the compose task's accumulated transcript. The daemon
+    // has no such independent claim: `finish_stream_compose` derives the final
+    // marker entirely from the compose task's own report below, so there is
+    // nothing to validate it against — the compose task is the single source of
+    // truth for the transcript here.
     let (respond, response) = oneshot::channel();
     if tx
-        .send(StreamComposeCommand::Finish { respond })
+        .send(StreamComposeCommand::Finish {
+            expected: None,
+            respond,
+        })
         .await
         .is_err()
     {
@@ -623,6 +660,48 @@ pub(crate) async fn finish_stream_compose(
             "stream compose text is empty".to_owned(),
         );
     }
+    if report.transcript_hash.is_none() {
+        return daemon_error(
+            cli.json,
+            "stream_compose_failed",
+            "stream compose did not return a transcript hash".to_owned(),
+        );
+    }
+
+    // The compose task has now exited. Freeze the final report on the still
+    // registered session so a marker-publish failure below leaves a retryable
+    // finish that no longer needs the (dead) compose task.
+    if let Some(session) = workers.sessions.get_mut(&key) {
+        session.finalized = Some(report.clone());
+    }
+    finish_stream_marker_from_report(
+        cli,
+        defaults,
+        state,
+        events,
+        runtime_host,
+        workers,
+        &key,
+        report,
+    )
+    .await
+}
+
+/// Publish the durable MLS finish marker for an already-composed final report,
+/// and drop the session only once that publish succeeds. On failure the session
+/// stays in the map with its frozen report so a re-issued `stream finish`
+/// retries this step without the exited compose task (#366).
+#[allow(clippy::too_many_arguments)]
+async fn finish_stream_marker_from_report(
+    cli: &Cli,
+    defaults: &DaemonDefaults,
+    state: Arc<Mutex<DaemonState>>,
+    events: DaemonEventHub,
+    runtime_host: &mut AppRuntimeHost,
+    workers: &mut StreamComposeWorkers,
+    key: &str,
+    report: StreamComposeReport,
+) -> CliOutput {
     let Some(transcript_hash) = report.transcript_hash.clone() else {
         return daemon_error(
             cli.json,
@@ -646,12 +725,12 @@ pub(crate) async fn finish_stream_compose(
     if let Err(err) =
         run_hosted_stream_marker_cli_json(&finish_cli, defaults, state, events, runtime_host).await
     {
-        // The finish marker did not publish: leave the session in the workers
-        // map so the transcript can be retried instead of being lost.
+        // The finish marker did not publish: leave the (now finalized) session
+        // in the workers map so the transcript can be retried instead of lost.
         return daemon_error(cli.json, "stream_compose_failed", err);
     }
     // Marker published: now it is safe to drop the session.
-    workers.remove(&key);
+    workers.remove(key);
     daemon_output(
         cli.json,
         &format!("finished stream {}", short_id(&report.stream_id)),

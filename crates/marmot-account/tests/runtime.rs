@@ -671,6 +671,58 @@ async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
 }
 
+// A "best effort" routing policy (`required_acks == 0`) must still fail a
+// publish that no endpoint accepted: confirming it would advance the local
+// epoch/membership past a welcome that reached no relay (#375).
+#[tokio::test]
+async fn create_group_with_best_effort_acks_rolls_back_when_nothing_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot best effort key").unwrap();
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+    let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_next(0);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .required_acks(0)
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let (group_id, effects) = runtime
+        .create_group(CreateGroupRequest {
+            name: "runtime best effort".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(effects.pending.len(), 1);
+    assert!(matches!(
+        effects.pending[0],
+        PendingResolution::RolledBack { .. }
+    ));
+    assert_eq!(effects.failures.len(), 1);
+    assert_eq!(effects.reports.len(), 1);
+    assert_eq!(effects.reports[0].accepted_count(), 0);
+    assert!(!effects.reports[0].met_required_acks());
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 0);
+    assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn create_group_stops_welcome_publish_after_unexposed_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -740,7 +792,7 @@ async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(2)
             .with_inbox_route(
-                bob_id,
+                bob_id.clone(),
                 vec![
                     TransportEndpoint("wss://bob-inbox-a.example".into()),
                     TransportEndpoint("wss://bob-inbox-b.example".into()),
@@ -774,6 +826,16 @@ async fn create_group_confirms_pending_when_welcome_was_partially_exposed() {
     assert_eq!(effects.reports.len(), 1);
     assert_eq!(effects.reports[0].accepted_count(), 1);
     assert!(!effects.reports[0].met_required_acks());
+    // The confirmed create left bob's welcome under-acked: the structured
+    // record pairs the failure with its recipient and group for re-delivery
+    // (mdk#352).
+    assert_eq!(effects.welcome_failures.len(), 1);
+    assert_eq!(effects.welcome_failures[0].recipient, bob_id);
+    assert_eq!(
+        effects.welcome_failures[0].message_id,
+        effects.failures[0].message_id
+    );
+    assert_eq!(effects.welcome_failures[0].group_id, Some(group_id.clone()));
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 2);
 
@@ -827,7 +889,7 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
                 vec![TransportEndpoint("wss://group.example".into())],
             )
             .with_inbox_route(
-                carol_id,
+                carol_id.clone(),
                 vec![TransportEndpoint("wss://carol-inbox.example".into())],
             );
     let mut runtime = AccountDeviceRuntime::new(
@@ -851,6 +913,19 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
         PendingResolution::Confirmed { .. }
     ));
     assert_eq!(effects.failures.len(), 1);
+    // The commit is confirmed, so carol's undelivered welcome surfaces as a
+    // structured re-delivery handle rather than only a flat failure string
+    // (mdk#352).
+    assert_eq!(effects.welcome_failures.len(), 1);
+    assert_eq!(effects.welcome_failures[0].recipient, carol_id);
+    assert_eq!(
+        effects.welcome_failures[0].message_id,
+        effects.failures[0].message_id
+    );
+    assert_eq!(
+        effects.welcome_failures[0].group_id,
+        Some(created.group_id.clone())
+    );
     assert_eq!(runtime.session().epoch(&created.group_id).unwrap().0, 2);
     assert_eq!(
         runtime.session().members(&created.group_id).unwrap().len(),
@@ -867,6 +942,34 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
         publishes[1].message.envelope,
         TransportEnvelope::Welcome { .. }
     ));
+
+    // Re-delivery repairs carol's join from the stored welcome: the adapter
+    // (now accepting) receives the same welcome id again and the epoch does
+    // not advance — no re-commit.
+    let redelivered = runtime
+        .redeliver_welcome(&effects.welcome_failures[0].message_id)
+        .await
+        .unwrap();
+    assert_eq!(redelivered.reports.len(), 1);
+    assert!(redelivered.reports[0].met_required_acks());
+    assert!(redelivered.failures.is_empty());
+    assert!(redelivered.welcome_failures.is_empty());
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 3);
+    assert!(matches!(
+        publishes[2].message.envelope,
+        TransportEnvelope::Welcome { .. }
+    ));
+    assert_eq!(
+        publishes[2].message.id,
+        effects.welcome_failures[0].message_id
+    );
+    assert_eq!(runtime.session().epoch(&created.group_id).unwrap().0, 2);
+
+    // A non-welcome message id is rejected without publishing anything.
+    let commit_id = publishes[0].message.id.clone();
+    assert!(runtime.redeliver_welcome(&commit_id).await.is_err());
+    assert_eq!(adapter.publishes().len(), 3);
 }
 
 // mdk#499 regression: an explicit group-evolution commit that a relay
@@ -952,6 +1055,10 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
     assert!(!effects.reports[0].met_required_acks());
     assert_eq!(effects.reports[1].accepted_count(), 2);
     assert!(effects.reports[1].met_required_acks());
+    // The under-acked message here is the commit, not the welcome — the
+    // commit's ack-miss must not be misclassified as a welcome-delivery
+    // failure.
+    assert!(effects.welcome_failures.is_empty());
     assert_eq!(runtime.session().epoch(&created.group_id).unwrap().0, 2);
     assert_eq!(
         runtime.session().members(&created.group_id).unwrap().len(),

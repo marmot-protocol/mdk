@@ -30,7 +30,8 @@
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::types::GroupId;
-use openmls::group::MlsGroup;
+use openmls::ciphersuite::hash_ref::ProposalRef;
+use openmls::group::{MlsGroup, RemoveProposalError};
 use openmls_traits::OpenMlsProvider as _;
 
 const TRACE_TARGET: &str = "cgka_engine::pending_commit_guard";
@@ -53,6 +54,10 @@ pub(crate) struct PendingCommitCleanupGuard<S: StorageProvider> {
     // caller created one. `None` for paths that stage a commit without a
     // snapshot (e.g. group creation).
     snapshot_name: Option<String>,
+    // Proposal this staging attempt stored via `store_pending_proposal`, to
+    // remove from the OpenMLS proposal store on Drop. `None` for the send
+    // paths, which commit proposals they did not store themselves.
+    stored_proposal_ref: Option<ProposalRef>,
     armed: bool,
 }
 
@@ -72,6 +77,7 @@ impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
             mls_storage: provider.storage() as *const S::Mls,
             group_id,
             snapshot_name: None,
+            stored_proposal_ref: None,
             armed: true,
         }
     }
@@ -81,6 +87,15 @@ impl<S: StorageProvider> PendingCommitCleanupGuard<S> {
     /// immediately after `ForkRecoveryManager::create_snapshot` succeeds.
     pub(crate) fn set_snapshot(&mut self, snapshot_name: String) {
         self.snapshot_name = Some(snapshot_name);
+    }
+
+    /// Attach the reference of a proposal the guarded path stored via
+    /// `store_pending_proposal`, so `Drop` restores the proposal store to its
+    /// pre-attempt state. A stale stored proposal is not benign residue:
+    /// OpenMLS 0.8.1 panics when a later `remove_members` commit filters a
+    /// leftover SelfRemove proposal against a Remove for the same leaf.
+    pub(crate) fn set_stored_proposal_ref(&mut self, proposal_ref: ProposalRef) {
+        self.stored_proposal_ref = Some(proposal_ref);
     }
 
     /// The staged commit (and its snapshot) is now tracked by `EpochManager`
@@ -111,8 +126,30 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
         // is still orphaned would strand that commit with no recovery path —
         // strictly worse than the bounded leak this guard exists to prevent.
         let mls_gid = openmls::group::GroupId::from_slice(self.group_id.as_slice());
-        let pending_commit_cleared = match MlsGroup::load(mls_storage, &mls_gid) {
-            Ok(Some(mut mls_group)) => {
+        let mut loaded_group = match MlsGroup::load(mls_storage, &mls_gid) {
+            Ok(Some(mls_group)) => Some(mls_group),
+            Ok(None) => {
+                // No group to clear a pending commit from. We cannot confirm
+                // the staged commit is gone, so treat cleanup as unconfirmed
+                // and retain the snapshot.
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "drop",
+                    "pending commit guard found no group for cleanup"
+                );
+                None
+            }
+            Err(_e) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "drop",
+                    "pending commit guard could not load group for cleanup"
+                );
+                None
+            }
+        };
+        let pending_commit_cleared = match loaded_group.as_mut() {
+            Some(mls_group) => {
                 if mls_group.pending_commit().is_none() {
                     true
                 } else {
@@ -135,26 +172,28 @@ impl<S: StorageProvider> Drop for PendingCommitCleanupGuard<S> {
                     }
                 }
             }
-            Ok(None) => {
-                // No group to clear a pending commit from. We cannot confirm
-                // the staged commit is gone, so treat cleanup as unconfirmed
-                // and retain the snapshot.
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "drop",
-                    "pending commit guard found no group for cleanup"
-                );
-                false
-            }
-            Err(_e) => {
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "drop",
-                    "pending commit guard could not load group for cleanup"
-                );
-                false
-            }
+            None => false,
         };
+
+        // Restore the proposal store to its pre-attempt state when this path
+        // stored the proposal itself. Best-effort and independent of the
+        // snapshot decision below: a proposal that is already gone is benign
+        // (`clear_pending_commit` does not remove stored proposals, but a
+        // concurrent merge would have consumed it).
+        if let (Some(mls_group), Some(proposal_ref)) =
+            (loaded_group.as_mut(), self.stored_proposal_ref.as_ref())
+        {
+            match mls_group.remove_pending_proposal(mls_storage, proposal_ref) {
+                Ok(()) | Err(RemoveProposalError::ProposalNotFound) => {}
+                Err(_e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        method = "drop",
+                        "pending commit guard could not remove stored proposal"
+                    );
+                }
+            }
+        }
 
         // Release the pre-commit fork-recovery snapshot only after confirming
         // the staged pending commit is gone, mirroring

@@ -69,6 +69,16 @@ pub enum MarmotEventFfi {
         account_id_hex: String,
         account_label: String,
     },
+    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
+    /// that member is in the group but unjoinable until the welcome is
+    /// re-delivered via `redeliver_welcome(message_id_hex)` (mdk#352).
+    WelcomeDeliveryPending {
+        account_id_hex: String,
+        account_label: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        recipient_hex: String,
+    },
 }
 
 /// FFI projection of [`cgka_traits::engine::GroupEvent`]. The previous FFI
@@ -309,6 +319,19 @@ impl From<MarmotAppEvent> for MarmotEventFfi {
             MarmotAppEvent::AgentStreamStarted(m) => Self::AgentStreamActivity {
                 account_id_hex: m.account_id_hex,
                 account_label: m.account_label,
+            },
+            MarmotAppEvent::WelcomeDeliveryPending {
+                account_id_hex,
+                account_label,
+                group_id,
+                message_id_hex,
+                recipient_hex,
+            } => Self::WelcomeDeliveryPending {
+                account_id_hex,
+                account_label,
+                group_id_hex: hex::encode(group_id.as_slice()),
+                message_id_hex,
+                recipient_hex,
             },
         }
     }

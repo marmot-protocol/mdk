@@ -20,8 +20,8 @@ use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppQuarantinedGroup,
     GroupInviteDeclineResult, GroupPushDebugInfo, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, PushRegistration, SecureDeleteExpiredResult,
-    SendSummary,
+    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, PushRegistration,
+    SecureDeleteExpiredResult, SendSummary,
 };
 
 impl AccountManager {
@@ -934,6 +934,38 @@ impl AccountManager {
         let summary = account_worker_response(response).await?;
         self.catch_up_accounts().await?;
         self.schedule_audit_log_tracker_update("retry_group_convergence");
+        Ok(summary)
+    }
+
+    pub async fn pending_welcome_deliveries(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PendingWelcomeDeliveries { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn redeliver_welcome(
+        &self,
+        account_ref: &str,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RedeliverWelcome {
+                message_id_hex: message_id_hex.to_owned(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let summary = account_worker_response(response).await?;
+        self.schedule_audit_log_tracker_update("redeliver_welcome");
         Ok(summary)
     }
 

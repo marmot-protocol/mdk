@@ -26,7 +26,7 @@ use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::MessageId;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 use marmot_forensics::{
@@ -1464,6 +1464,36 @@ impl<S: StorageProvider> Engine<S> {
     pub fn group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
         self.ensure_group_live(group_id)?;
         Ok(self.storage.get_group(group_id)?)
+    }
+
+    /// Return the stored outbound welcome for `id` along with its group.
+    ///
+    /// Wrapped welcomes are persisted at wrap time as `Sent` raw-transport
+    /// records, so a welcome whose publish failed after the commit was already
+    /// confirmed can be re-delivered from storage without re-committing
+    /// (mdk#352). Errors if the id does not resolve to a sent raw-transport
+    /// welcome record.
+    pub fn stored_sent_welcome(
+        &self,
+        id: &MessageId,
+    ) -> Result<(GroupId, TransportMessage), EngineError> {
+        let record = self.storage.get_message(id)?;
+        if record.state != MessageState::Sent {
+            return Err(EngineError::Backend(
+                "stored message is not an outbound sent record".into(),
+            ));
+        }
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
+        let message = payload.as_raw_transport().ok_or_else(|| {
+            EngineError::Backend("stored message is not a raw transport record".into())
+        })?;
+        if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+            return Err(EngineError::Backend(
+                "stored message is not a welcome".into(),
+            ));
+        }
+        Ok((record.group_id.clone(), message.clone()))
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS

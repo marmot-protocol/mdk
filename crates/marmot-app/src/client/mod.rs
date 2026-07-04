@@ -23,7 +23,7 @@ use marmot_forensics::AuditEventContext;
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::groups::{
     EventGroupProjection, GroupConfirmationProjection, add_group, fail_if_publish_failed,
-    send_summary_from_effects, validate_group_profile,
+    publish_failure_error, send_summary_from_effects, validate_group_profile,
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
@@ -40,7 +40,7 @@ use crate::{
     AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    PendingWelcomeDelivery, SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -66,6 +66,11 @@ pub struct AppClient {
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.
     pub(crate) pending_projection_updates: Vec<crate::AppProjectionUpdate>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+    /// Welcomes queued for re-delivery during the most recent create/invite.
+    /// The runtime account worker drains this after the command and broadcasts a
+    /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
+    /// without polling (mdk#352).
+    pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
 }
 
 /// A point-in-time copy of the live session's read-only group projections
@@ -261,6 +266,7 @@ impl AppClient {
             )
             .await?;
         fail_if_publish_failed(&effects)?;
+        self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.add_group(&group_id)?;
@@ -539,6 +545,7 @@ impl AppClient {
 
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
+            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
             self.record_human_action_succeeded(group_id, &audit_context, &effects);
             self.remember_published_reports(&effects);
             self.refresh_group(group_id);
@@ -1109,6 +1116,7 @@ impl AppClient {
                 &event,
                 None,
                 source_epoch,
+                false,
             )?;
             on_local_projection(update);
         }
@@ -1137,6 +1145,8 @@ impl AppClient {
             Ok(effects) => effects,
             Err(err) => {
                 if should_project_locally {
+                    // No read-marker rollback needed: the marker only advances
+                    // in the post-publish success projection below.
                     match self.app.invalidate_timeline_app_event(
                         &self.state.label,
                         &group_id_hex,
@@ -1173,6 +1183,7 @@ impl AppClient {
                 &event,
                 source_message_id_hex,
                 source_epoch,
+                true,
             )?;
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;
@@ -1981,6 +1992,102 @@ impl AppClient {
             let event_id = hex::encode(report.message_id.as_slice());
             remember_seen_event(&mut seen, &mut self.state, event_id);
         }
+    }
+
+    /// Durably record welcomes a confirmed create/invite could not deliver, so
+    /// the repair handle is not lost when the call returns (mdk#352). The commit
+    /// is already confirmed and externally visible, so the added member stays in
+    /// the roster but cannot join until the welcome is re-delivered.
+    fn record_welcome_delivery_failures(
+        &mut self,
+        group_id_hex: &str,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        if effects.welcome_failures.is_empty() {
+            return Ok(());
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        let recorded_at = unix_now_seconds();
+        for failure in &effects.welcome_failures {
+            let message_id_hex = hex::encode(failure.message_id.as_slice());
+            let recipient_hex = hex::encode(failure.recipient.as_slice());
+            storage.record_pending_welcome_delivery(
+                &message_id_hex,
+                group_id_hex,
+                &recipient_hex,
+                recorded_at,
+            )?;
+            // Queue a runtime event so subscribers (UI/CLI/UniFFI) learn the
+            // member is unjoinable without polling the durable queue.
+            self.pending_welcome_delivery_events
+                .push(PendingWelcomeDelivery {
+                    group_id_hex: group_id_hex.to_owned(),
+                    message_id_hex,
+                    recipient_hex,
+                    recorded_at,
+                });
+        }
+        Ok(())
+    }
+
+    /// Drain the welcomes queued for re-delivery during the last create/invite,
+    /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
+    /// (mdk#352).
+    pub(crate) fn take_pending_welcome_delivery_events(&mut self) -> Vec<PendingWelcomeDelivery> {
+        std::mem::take(&mut self.pending_welcome_delivery_events)
+    }
+
+    /// Welcomes still awaiting re-delivery for this account (mdk#352), oldest
+    /// first. Each entry's `message_id_hex` is the handle for
+    /// [`AppClient::redeliver_welcome`].
+    pub fn pending_welcome_deliveries(&self) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .list_pending_welcome_deliveries()?
+            .into_iter()
+            .map(|record| PendingWelcomeDelivery {
+                group_id_hex: record.group_id_hex,
+                message_id_hex: record.message_id_hex,
+                recipient_hex: record.recipient_hex,
+                recorded_at: record.recorded_at,
+            })
+            .collect())
+    }
+
+    /// Re-publish a welcome that a confirmed create/invite failed to deliver,
+    /// from the copy the engine stored at wrap time — no re-commit (mdk#352).
+    /// Clears the pending record only once the welcome is accepted; a repeated
+    /// failure leaves it queued for a later retry.
+    pub async fn redeliver_welcome(
+        &mut self,
+        message_id_hex: &str,
+    ) -> Result<SendSummary, AppError> {
+        let message_id = cgka_traits::MessageId::new(hex::decode(message_id_hex)?);
+        let effects = self.runtime.redeliver_welcome(&message_id).await?;
+        // Only clear the durable pending record once every "still undelivered"
+        // signal agrees the welcome landed: no PublishFailure, no structured
+        // WelcomeDeliveryFailure, and a report that met its ack threshold.
+        // These are kept in lockstep by `publish_one` today, but asserting all
+        // three means a future refactor cannot drift one signal and clear the
+        // queue while the welcome is still unreachable (the #375 class of bug).
+        let delivered = effects.failures.is_empty()
+            && effects.welcome_failures.is_empty()
+            && effects
+                .reports
+                .last()
+                .is_some_and(|report| report.met_required_acks());
+        if !delivered {
+            return Err(if effects.failures.is_empty() {
+                AppError::Publish("welcome re-delivery did not reach the recipient".into())
+            } else {
+                publish_failure_error(&effects.failures)
+            });
+        }
+        self.app
+            .account_storage(&self.state.label)?
+            .clear_pending_welcome_delivery(message_id_hex)?;
+        Ok(send_summary_from_effects(&effects))
     }
 }
 

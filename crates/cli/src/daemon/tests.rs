@@ -317,9 +317,12 @@ async fn stream_compose_returns_local_transcript_when_broker_connect_is_pending(
     assert_eq!(appended.chunk_count, 1);
 
     let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond: finish_tx })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
         .await
         .expect("finish should use local transcript fallback")
@@ -363,9 +366,12 @@ async fn stream_compose_final_report_contains_full_transcript_text() {
     }
 
     let (respond, response) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), response)
         .await
         .expect("finish should complete")
@@ -865,7 +871,7 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
         // Minimal stand-in for the compose worker: answer a single Finish with a
         // completed report, then exit like the real session does.
         while let Some(command) = rx.recv().await {
-            if let StreamComposeCommand::Finish { respond } = command {
+            if let StreamComposeCommand::Finish { respond, .. } = command {
                 let _ = respond.send(Ok(report.clone()));
                 return;
             }
@@ -875,6 +881,7 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
         tx,
         cancel_tx,
         handle,
+        finalized: None,
     }
 }
 
@@ -913,8 +920,8 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
     let output = finish_stream_compose(
         &cli,
         &defaults,
-        state,
-        events,
+        state.clone(),
+        events.clone(),
         &mut runtime_host,
         &mut workers,
         stream_id,
@@ -928,6 +935,44 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
     assert!(
         workers.get(&key).is_some(),
         "the compose session must be retained so the transcript stays retryable"
+    );
+    // The final report must be frozen on the session so a retry no longer needs
+    // the compose task (which exits after answering `Finish`).
+    assert!(
+        workers
+            .get(&key)
+            .and_then(|session| session.finalized.as_ref())
+            .is_some(),
+        "the finalized report must be retained for a marker retry"
+    );
+
+    // Retry `stream finish`: the compose task has exited, so the previous code
+    // would send `Finish` to a closed channel and fail with
+    // "stream compose session is closed". With the frozen report, the retry
+    // re-runs the marker publish directly — it still fails here (no runtime),
+    // but with the marker error, proving the dead compose task was not touched.
+    let retry = finish_stream_compose(
+        &cli,
+        &defaults,
+        state,
+        events,
+        &mut runtime_host,
+        &mut workers,
+        stream_id,
+    )
+    .await;
+    assert_ne!(
+        retry.code, 0,
+        "the marker still cannot publish without a runtime"
+    );
+    assert!(
+        !retry.stdout.contains("stream compose session is closed"),
+        "the retry must use the frozen report, not the exited compose task: {}",
+        retry.stdout
+    );
+    assert!(
+        workers.get(&key).is_some(),
+        "a failed marker retry must keep the session for a further retry"
     );
 }
 

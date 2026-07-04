@@ -80,6 +80,10 @@ Written to be readable in 5 minutes each, shareable as a package.
   - **What it covers:** Restrictive-by-construction creation of local files, sockets, and databases: the
     `fs-private` helpers, the one octal-mode parser, and the DB sidecar/PRAGMA-at-open rules.
 
+- **Doc:** [`overview/multi-step-state-changes.md`](./overview/multi-step-state-changes.md)
+  - **What it covers:** The no-torn-writes convention for multi-step operations: validate-before-mutate, full
+    compensation on error paths, intent-before-side-effects, and confirmation that reflects reality (mdk#711).
+
 - **Doc:** [`overview/current-state.md`](./overview/current-state.md)
   - **What it covers:** Implementations, merged MIPs, the current CGKA engine workspace, and known gaps.
 

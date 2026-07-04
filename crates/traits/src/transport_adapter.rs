@@ -123,7 +123,10 @@ pub struct TransportPublishRequest {
     pub message: TransportMessage,
     pub target: TransportPublishTarget,
     /// Minimum endpoint acknowledgements the adapter should try to obtain
-    /// before reporting success. A value of `0` means best effort.
+    /// before reporting success. A value of `0` means best effort: the adapter
+    /// does not wait for a specific ack count, but a publish that no endpoint
+    /// accepted still fails — [`TransportPublishReport::met_required_acks`]
+    /// always requires at least one acceptance.
     pub required_acks: usize,
 }
 
@@ -181,6 +184,10 @@ pub struct TransportPublishReport {
     pub message_id: MessageId,
     pub accepted: Vec<TransportEndpointReceipt>,
     pub failed: Vec<TransportEndpointFailure>,
+    /// Threshold copied from the request; `0` relaxes the threshold but never
+    /// the at-least-one-acceptance requirement (see [`met_required_acks`]).
+    ///
+    /// [`met_required_acks`]: Self::met_required_acks
     pub required_acks: usize,
 }
 
@@ -189,8 +196,14 @@ impl TransportPublishReport {
         self.accepted.len()
     }
 
+    /// Whether the publish reached enough endpoints to count as published.
+    ///
+    /// At least one acceptance is always required: a "best effort"
+    /// (`required_acks == 0`) publish that no endpoint accepted reached no
+    /// one, and confirming it would advance local state (epoch, membership)
+    /// past a message that was never exposed.
     pub fn met_required_acks(&self) -> bool {
-        self.accepted_count() >= self.required_acks
+        self.accepted_count() >= self.required_acks.max(1)
     }
 }
 
@@ -281,6 +294,12 @@ pub trait TransportAdapter: Send + Sync {
     ) -> Result<(), TransportAdapterError>;
 
     /// Refresh only the group subscription plane for an active account.
+    ///
+    /// Subscribe failures for added groups fail fast and leave adapter state
+    /// untouched. Unsubscribe failures for removed groups are absorbed: the
+    /// removal takes effect in the adapter's routing state immediately, the
+    /// relay-side unsubscribe is retried on subsequent syncs, and such
+    /// failures never fail the call.
     async fn sync_account_groups(
         &self,
         sync: TransportGroupSync,
@@ -305,5 +324,49 @@ fn envelope_label(envelope: &TransportEnvelope) -> &'static str {
     match envelope {
         TransportEnvelope::GroupMessage { .. } => "group",
         TransportEnvelope::Welcome { .. } => "welcome",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(accepted: usize, failed: usize, required_acks: usize) -> TransportPublishReport {
+        TransportPublishReport {
+            message_id: MessageId::new(*b"m1"),
+            accepted: (0..accepted)
+                .map(|i| TransportEndpointReceipt {
+                    endpoint: TransportEndpoint(format!("wss://accepted-{i}.example")),
+                    accepted_at: None,
+                })
+                .collect(),
+            failed: (0..failed)
+                .map(|i| TransportEndpointFailure {
+                    endpoint: TransportEndpoint(format!("wss://failed-{i}.example")),
+                    reason: "unreachable".into(),
+                })
+                .collect(),
+            required_acks,
+        }
+    }
+
+    #[test]
+    fn met_required_acks_zero_required_fails_with_zero_accepted() {
+        assert!(!report(0, 0, 0).met_required_acks());
+        assert!(!report(0, 2, 0).met_required_acks());
+    }
+
+    #[test]
+    fn met_required_acks_zero_required_passes_with_one_accepted() {
+        assert!(report(1, 0, 0).met_required_acks());
+        assert!(report(1, 3, 0).met_required_acks());
+    }
+
+    #[test]
+    fn met_required_acks_nonzero_threshold_unchanged() {
+        assert!(!report(0, 0, 1).met_required_acks());
+        assert!(report(1, 0, 1).met_required_acks());
+        assert!(!report(1, 1, 2).met_required_acks());
+        assert!(report(2, 0, 2).met_required_acks());
     }
 }

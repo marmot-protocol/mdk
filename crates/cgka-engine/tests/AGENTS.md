@@ -61,6 +61,10 @@ backend on the same rail.
   - **Owns:** Crash-during-publish recovery at session open — `hydrate_stable_groups_from_storage` detects a surviving
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
+- **File:** `auto_commit_atomicity.rs`
+  - **Owns:** Auto-commit staging atomicity (mdk#333) — an injected `put_group` failure during staging leaves no torn
+    group record, no orphaned pending publish, no leaked snapshot, and no stale stored proposal; the group stays usable
+
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
 

@@ -26,8 +26,8 @@ use crate::{
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppError, AppGroupMemberRecord,
     AppGroupMlsState, AppGroupRecord, AppProjectionUpdate, AppQuarantinedGroup,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PushRegistration, ReceivedMessage,
-    SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
+    PushRegistration, ReceivedMessage, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -236,6 +236,13 @@ pub(crate) enum AccountWorkerCommand {
     },
     RetryGroupConvergence {
         group_id: GroupId,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
+    PendingWelcomeDeliveries {
+        respond: oneshot::Sender<Result<Vec<PendingWelcomeDelivery>, AppError>>,
+    },
+    RedeliverWelcome {
+        message_id_hex: String,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
     PublishKeyPackage {
@@ -688,6 +695,7 @@ async fn handle_account_worker_command(
                     group_id,
                 );
             }
+            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::Members { group_id, respond } => {
@@ -836,6 +844,7 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
+            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
             let _ = respond.send(result);
         }
         AccountWorkerCommand::RemoveMembers {
@@ -1160,6 +1169,17 @@ async fn handle_account_worker_command(
             let result = client.retry_group_convergence(&group_id).await;
             let _ = respond.send(result);
         }
+        AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
+            let result = client.pending_welcome_deliveries();
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::RedeliverWelcome {
+            message_id_hex,
+            respond,
+        } => {
+            let result = client.redeliver_welcome(&message_id_hex).await;
+            let _ = respond.send(result);
+        }
         AccountWorkerCommand::PublishKeyPackage { respond } => {
             let result = async {
                 let key_package = client.publish_key_package().await?;
@@ -1468,6 +1488,29 @@ pub(crate) fn publish_app_runtime_group_state_updated(
         account_label: account_label.to_owned(),
         group_id: group_id.clone(),
     });
+}
+
+/// Broadcast a `WelcomeDeliveryPending` event for each welcome a just-completed
+/// create/invite queued for re-delivery (mdk#352), so subscribers learn a member
+/// is unjoinable without polling the durable queue.
+fn publish_pending_welcome_delivery_events(
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    client: &mut AppClient,
+) {
+    for pending in client.take_pending_welcome_delivery_events() {
+        let Ok(group_id_bytes) = hex::decode(&pending.group_id_hex) else {
+            continue;
+        };
+        let _ = events.send(MarmotAppEvent::WelcomeDeliveryPending {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            group_id: GroupId::new(group_id_bytes),
+            message_id_hex: pending.message_id_hex,
+            recipient_hex: pending.recipient_hex,
+        });
+    }
 }
 
 /// Emit a runtime `AgentStreamStarted` for a kind-1200 start event. Kind-9

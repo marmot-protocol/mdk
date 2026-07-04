@@ -372,6 +372,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
             cancel_tx: idle_cancel_tx,
             abort: idle_handle.abort_handle(),
             last_activity: Instant::now() - Duration::from_secs(3600),
+            finalized: None,
         },
     );
 
@@ -390,6 +391,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
             cancel_tx: active_cancel_tx,
             abort: active_handle.abort_handle(),
             last_activity: Instant::now(),
+            finalized: None,
         },
     );
 
@@ -410,6 +412,54 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
     // Active session is untouched and still usable.
     assert!(store.get("bb").is_ok(), "active session should remain");
     active_handle.abort();
+}
+
+/// A finalized-but-unpublished session must survive the idle sweep even when
+/// its last activity is well past the timeout: its compose task has exited and
+/// the frozen transcript is the only handle for retrying a failed durable
+/// finish. Sweeping it would recreate the #366 failure mode.
+#[tokio::test]
+async fn stream_session_sweep_spares_finalized_session_despite_idle() {
+    use crate::stream_session::{ActiveStreamSession, FinalizedStream, StreamSessionStore};
+    use agent_stream_compose::StreamComposeCommand;
+    use cgka_traits::GroupId;
+    use std::time::{Duration, Instant};
+
+    let store = StreamSessionStore::default();
+
+    // The compose task has already exited after a validated Finish; model that
+    // with an immediately-finished task so its Sender is closed like the real
+    // post-finalize session.
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamComposeCommand>(4);
+    drop(rx);
+    let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let handle = tokio::spawn(async {});
+    store.insert(
+        "aa".to_owned(),
+        ActiveStreamSession {
+            account_label: "agent".to_owned(),
+            group_id: GroupId::new(vec![1]),
+            stream_id: vec![0xaa],
+            start_message_id_hex: "00".to_owned(),
+            tx,
+            cancel_tx,
+            abort: handle.abort_handle(),
+            // Idle far beyond the timeout, but finalized: must be spared.
+            last_activity: Instant::now() - Duration::from_secs(3600),
+            finalized: Some(FinalizedStream {
+                final_text: "frozen".to_owned(),
+                transcript_hash: [0x22; 32],
+                chunk_count: 1,
+            }),
+        },
+    );
+
+    let swept = store.sweep_idle(Duration::from_secs(300));
+    assert_eq!(swept, 0, "a finalized session must never be swept");
+    assert!(
+        store.get("aa").is_ok(),
+        "the finalized session (and its retry handle) must survive the sweep"
+    );
 }
 
 #[tokio::test]
@@ -1215,6 +1265,7 @@ async fn stream_session_store_resolves_non_canonical_stream_id() {
             cancel_tx,
             abort: handle.abort_handle(),
             last_activity: Instant::now(),
+            finalized: None,
         },
     );
 
@@ -1269,6 +1320,7 @@ async fn stream_session_sweep_does_not_force_abort_when_cancel_already_queued() 
             cancel_tx,
             abort,
             last_activity: Instant::now() - Duration::from_secs(3600),
+            finalized: None,
         },
     );
 
@@ -1947,6 +1999,291 @@ async fn connector_socket_composes_and_finalizes_stream() {
     assert_eq!(finalized_stream_id_hex, stream_id_hex);
     assert_eq!(message_ids_hex.len(), 1);
     assert!(!message_ids_hex[0].is_empty());
+}
+
+/// Regression for #366: a finalize whose expectation does not match the
+/// composed transcript must not tear down the stream session. The compose
+/// task keeps running, further appends succeed, and a corrected finalize
+/// completes the stream.
+#[tokio::test]
+async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent retryable finalize",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode([0x99; 32]);
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-begin",
+        AgentControlRequest::StreamBegin {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            stream_id_hex: Some(stream_id_hex.clone()),
+            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamBegun {
+        start_message_id_hex,
+        ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+
+    let appended = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-append",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex: stream_id_hex.clone(),
+            append_text: "hello stream".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(appended.payload, AgentControlResponse::Ack);
+
+    // Correct text and hash, wrong chunk count: the finalize must fail
+    // without tearing down the compose session.
+    let first_hash = expected_stream_transcript_hash(
+        &stream_id_hex,
+        &start_message_id_hex,
+        &[(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream")],
+    );
+    let mismatched = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-finalize-mismatch",
+        AgentControlRequest::StreamFinalize {
+            stream_id_hex: stream_id_hex.clone(),
+            final_text: "hello stream".to_owned(),
+            transcript_hash_hex: first_hash,
+            chunk_count: 7,
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = mismatched.payload else {
+        panic!("expected finalize mismatch error");
+    };
+    assert_eq!(code, "stream_error");
+
+    // The compose session must have survived the mismatch: a further append
+    // still succeeds.
+    let appended_again = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-append-again",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex: stream_id_hex.clone(),
+            append_text: " again".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(appended_again.payload, AgentControlResponse::Ack);
+
+    // A corrected finalize over the full transcript succeeds.
+    let corrected_hash = expected_stream_transcript_hash(
+        &stream_id_hex,
+        &start_message_id_hex,
+        &[
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream"),
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, " again"),
+        ],
+    );
+    let finalized = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-finalize",
+        AgentControlRequest::StreamFinalize {
+            stream_id_hex: stream_id_hex.clone(),
+            final_text: "hello stream again".to_owned(),
+            transcript_hash_hex: corrected_hash,
+            chunk_count: 2,
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamFinalized {
+        stream_id_hex: finalized_stream_id_hex,
+        message_ids_hex,
+    } = finalized.payload
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(finalized_stream_id_hex, stream_id_hex);
+    assert_eq!(message_ids_hex.len(), 1);
+    assert!(!message_ids_hex[0].is_empty());
+}
+
+/// Regression for #366 (review follow-up): once the compose task has validated
+/// and exited, the durable `finish_agent_text_stream` publish can still fail.
+/// The frozen transcript on the still-registered session must let a re-issued
+/// finalize complete that publish WITHOUT the (now-dead) compose task, and a
+/// retry that disagrees with the frozen transcript must be rejected.
+#[tokio::test]
+async fn connector_finalize_retries_durable_finish_without_compose_task() {
+    use crate::error::ConnectorError;
+    use crate::stream_session::FinalizedStream;
+    use crate::validation::normalize_hex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent durable finalize retry",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode([0x5a; 32]);
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    // Begin (and start the runtime) so the durable finish below has a real
+    // account, group, and stream-start event to reference.
+    let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-durable-begin",
+        AgentControlRequest::StreamBegin {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex,
+            stream_id_hex: Some(stream_id_hex.clone()),
+            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        begun.payload,
+        AgentControlResponse::StreamBegun { .. }
+    ));
+
+    // Reconstruct the exact state left after a validated finalize whose durable
+    // publish then failed: the compose task has exited (abort it here to prove
+    // the retry never talks to it) and the transcript is frozen on the still
+    // registered session.
+    let stream_id_norm = normalize_hex(&stream_id_hex).unwrap();
+    let session = connector.streams.get(&stream_id_norm).unwrap();
+    session.abort.abort();
+    let transcript_hash = [0x11u8; 32];
+    assert!(
+        connector.streams.mark_finalized(
+            &stream_id_norm,
+            &session,
+            FinalizedStream {
+                final_text: "frozen final".to_owned(),
+                transcript_hash,
+                chunk_count: 1,
+            },
+        ),
+        "freeze must land on the still-current session"
+    );
+
+    // A retry that disagrees with the frozen transcript is rejected and leaves
+    // the session registered.
+    let mismatch = connector
+        .stream_finalize_response(
+            &stream_id_hex,
+            "different final".to_owned(),
+            &hex::encode(transcript_hash),
+            1,
+        )
+        .await;
+    assert!(
+        matches!(mismatch, Err(ConnectorError::Stream(_))),
+        "a retry disagreeing with the frozen transcript must be rejected"
+    );
+    assert!(
+        connector.streams.get(&stream_id_norm).is_ok(),
+        "a rejected retry must not drop the session"
+    );
+
+    // A matching retry completes the durable publish from the frozen transcript
+    // — the compose task was aborted above, so this proves it is not consulted —
+    // and only then removes the session.
+    let finalized = connector
+        .stream_finalize_response(
+            &stream_id_hex,
+            "frozen final".to_owned(),
+            &hex::encode(transcript_hash),
+            1,
+        )
+        .await
+        .expect("frozen-transcript retry finalizes without the compose task");
+    let AgentControlResponse::StreamFinalized {
+        message_ids_hex, ..
+    } = finalized
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(message_ids_hex.len(), 1);
+    assert!(!message_ids_hex[0].is_empty());
+    assert!(
+        connector.streams.get(&stream_id_norm).is_err(),
+        "a successful durable finish must remove the session"
+    );
 }
 
 #[tokio::test]

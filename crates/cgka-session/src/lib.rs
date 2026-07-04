@@ -270,6 +270,16 @@ impl AccountDeviceSession {
         Ok(self.engine.group_record(group_id)?)
     }
 
+    /// The stored outbound welcome for `id` along with its group, for
+    /// re-delivering a welcome whose publish failed after the commit was
+    /// already confirmed (mdk#352).
+    pub fn stored_sent_welcome(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<(GroupId, TransportMessage)> {
+        Ok(self.engine.stored_sent_welcome(id)?)
+    }
+
     /// Stored groups that failed session-open hydration and were skipped
     /// (mdk#151 / #417), paired with their coarse quarantine reason.
     /// Backs the application's per-group recovery surface (mdk#426).

@@ -108,9 +108,12 @@ async fn compose_session_finalizes_local_transcript_when_broker_connect_is_pendi
     assert_eq!(appended.chunk_count, 1);
 
     let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond: finish_tx })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
         .await
         .expect("finish should use local transcript fallback")
@@ -176,9 +179,12 @@ async fn compose_session_clamps_local_transcript_to_group_policy_cap() {
     );
 
     let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond: finish_tx })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
         .await
         .expect("finish should use policy-clamped local transcript")
@@ -215,9 +221,12 @@ async fn compose_session_final_report_contains_full_transcript_text() {
     }
 
     let (respond, response) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), response)
         .await
         .expect("finish should complete")
@@ -297,6 +306,7 @@ async fn compose_session_status_updates_transcript_without_changing_text() {
 
     let (finish_respond, finish_response) = oneshot::channel();
     tx.send(StreamComposeCommand::Finish {
+        expected: None,
         respond: finish_respond,
     })
     .await
@@ -372,6 +382,7 @@ async fn compose_session_progress_updates_transcript_without_changing_text() {
 
     let (finish_respond, finish_response) = oneshot::channel();
     tx.send(StreamComposeCommand::Finish {
+        expected: None,
         respond: finish_respond,
     })
     .await
@@ -645,6 +656,7 @@ async fn compose_session_drops_late_connect_after_pending_overflow_disables_live
 
     let (finish_respond, finish_response) = oneshot::channel();
     tx.send(StreamComposeCommand::Finish {
+        expected: None,
         respond: finish_respond,
     })
     .await
@@ -799,9 +811,12 @@ async fn compose_session_times_out_stalled_live_flush_and_still_finishes() {
         .unwrap();
 
     let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond: finish_tx })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
         .await
         .expect("finish should not wait indefinitely behind the stalled live flush")
@@ -896,9 +911,12 @@ async fn compose_session_times_out_pending_broker_connect_and_disables_live_prev
     );
 
     let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond: finish_tx })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
         .await
         .expect("finish should complete after broker connect timeout")
@@ -1060,6 +1078,247 @@ async fn compose_session_cancel_completes_when_broker_unreachable() {
         .await
         .expect("cancel must not hang when the broker is unreachable")
         .unwrap();
+}
+
+#[tokio::test]
+async fn finish_with_matching_expectation_finishes_session() {
+    let stream_id = vec![0x7a; 32];
+    let start_event_id = MessageId::new(vec![0x7b; 32]);
+    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+    let report = test_stream_compose_report(&stream_id);
+    let (tx, rx) = mpsc::channel(4);
+    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+    let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
+
+    let (append_tx, append_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Append {
+        text: "hello ".to_owned(),
+        respond: append_tx,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(250), append_rx)
+        .await
+        .expect("append should complete")
+        .unwrap()
+        .unwrap();
+
+    let expected_hash =
+        expected_stream_transcript_hash_for_appends(&stream_id, &start_event_id, &["hello "], 8);
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish {
+        expected: Some(StreamFinishExpectation {
+            final_text: "hello ".to_owned(),
+            transcript_hash_hex: expected_hash.clone(),
+            chunk_count: 1,
+        }),
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
+    let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+        .await
+        .expect("finish with a matching expectation should complete")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(finished.status, "finished");
+    assert_eq!(finished.text, "hello ");
+    assert_eq!(finished.chunk_count, 1);
+    assert_eq!(
+        finished.transcript_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+
+    session.await.unwrap();
+}
+
+/// Regression for #366: a finish whose expectation does not match the composed
+/// transcript must not tear the session down. The session responds `Err`,
+/// keeps running, still accepts appends, and a corrected finish succeeds.
+#[tokio::test]
+async fn finish_with_mismatched_expectation_keeps_session_alive_and_retryable() {
+    let stream_id = vec![0x8a; 32];
+    let start_event_id = MessageId::new(vec![0x8b; 32]);
+    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+    let report = test_stream_compose_report(&stream_id);
+    let (tx, rx) = mpsc::channel(4);
+    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+    let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
+
+    let (append_tx, append_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Append {
+        text: "hello ".to_owned(),
+        respond: append_tx,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(250), append_rx)
+        .await
+        .expect("append should complete")
+        .unwrap()
+        .unwrap();
+
+    let first_hash =
+        expected_stream_transcript_hash_for_appends(&stream_id, &start_event_id, &["hello "], 8);
+
+    // Wrong chunk count (text and hash correct).
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish {
+        expected: Some(StreamFinishExpectation {
+            final_text: "hello ".to_owned(),
+            transcript_hash_hex: first_hash.clone(),
+            chunk_count: 7,
+        }),
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
+    let mismatch = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+        .await
+        .expect("mismatched finish should respond promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        mismatch.contains("chunk count"),
+        "expected chunk count mismatch: {mismatch}"
+    );
+
+    // Wrong transcript hash (text and count correct).
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish {
+        expected: Some(StreamFinishExpectation {
+            final_text: "hello ".to_owned(),
+            transcript_hash_hex: hex::encode([0u8; 32]),
+            chunk_count: 1,
+        }),
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
+    let mismatch = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+        .await
+        .expect("mismatched finish should respond promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        mismatch.contains("transcript hash"),
+        "expected transcript hash mismatch: {mismatch}"
+    );
+
+    // Wrong final text (hash and count correct).
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish {
+        expected: Some(StreamFinishExpectation {
+            final_text: "goodbye".to_owned(),
+            transcript_hash_hex: first_hash,
+            chunk_count: 1,
+        }),
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
+    let mismatch = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+        .await
+        .expect("mismatched finish should respond promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        mismatch.contains("final text"),
+        "expected final text mismatch: {mismatch}"
+    );
+
+    // The session must still accept appends after the mismatches.
+    let (append_tx, append_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Append {
+        text: "world".to_owned(),
+        respond: append_tx,
+    })
+    .await
+    .unwrap();
+    let appended = tokio::time::timeout(Duration::from_millis(250), append_rx)
+        .await
+        .expect("append after mismatched finish should complete")
+        .unwrap()
+        .unwrap();
+    assert_eq!(appended.text, "hello world");
+    assert_eq!(appended.chunk_count, 2);
+
+    // A corrected finish over the full transcript succeeds.
+    let corrected_hash = expected_stream_transcript_hash_for_appends(
+        &stream_id,
+        &start_event_id,
+        &["hello ", "world"],
+        8,
+    );
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish {
+        expected: Some(StreamFinishExpectation {
+            final_text: "hello world".to_owned(),
+            transcript_hash_hex: corrected_hash.clone(),
+            chunk_count: 2,
+        }),
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
+    let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+        .await
+        .expect("corrected finish should complete")
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.status, "finished");
+    assert_eq!(finished.text, "hello world");
+    assert_eq!(finished.chunk_count, 2);
+    assert_eq!(
+        finished.transcript_hash.as_deref(),
+        Some(corrected_hash.as_str())
+    );
+
+    session.await.unwrap();
+}
+
+/// An empty-transcript finalize must validate against the empty transcript's
+/// actual hash (the report's `transcript_hash` is still `None` before the
+/// first append, so validation has to use the transcript accessors).
+#[tokio::test]
+async fn finish_with_expectation_on_empty_transcript_validates_empty_hash() {
+    let stream_id = vec![0x9c; 32];
+    let start_event_id = MessageId::new(vec![0x9d; 32]);
+    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
+    let report = test_stream_compose_report(&stream_id);
+    let (tx, rx) = mpsc::channel(4);
+    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+    let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
+
+    let empty_hash =
+        expected_stream_transcript_hash_for_appends(&stream_id, &start_event_id, &[], 8);
+    let (finish_tx, finish_rx) = oneshot::channel();
+    tx.send(StreamComposeCommand::Finish {
+        expected: Some(StreamFinishExpectation {
+            final_text: String::new(),
+            transcript_hash_hex: empty_hash.clone(),
+            chunk_count: 0,
+        }),
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
+    let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
+        .await
+        .expect("empty-transcript finish should complete")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(finished.status, "finished");
+    assert_eq!(finished.text, "");
+    assert_eq!(finished.chunk_count, 0);
+    assert_eq!(
+        finished.transcript_hash.as_deref(),
+        Some(empty_hash.as_str())
+    );
+
+    session.await.unwrap();
 }
 
 /// Regression for the cancel-starvation bug: a full command queue must not

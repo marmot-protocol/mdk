@@ -70,8 +70,8 @@ fn audit_file_is_owner_only_on_open_and_rotation() {
     let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
     assert_eq!(mode(&path), 0o600);
 
-    // Rotation unlinks and recreates the file; the fresh file must be
-    // owner-only too.
+    // Rotation stages a fresh file and renames it over the live path; the
+    // fresh file must be owner-only too.
     recorder.rotate().unwrap();
     assert_eq!(mode(&path), 0o600);
 }
@@ -892,6 +892,182 @@ fn set_data_mode_is_a_no_op_when_mode_is_unchanged() {
 
     assert_eq!(fs::read_to_string(&path).unwrap(), before);
     assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
+}
+
+#[test]
+#[cfg(unix)]
+fn set_data_mode_failure_leaves_mode_file_and_recording_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    // A dedicated subdir takes the chmod fault so TempDir cleanup of the root
+    // is never blocked if an assertion fails before the mode is restored.
+    let logs = dir.path().join("logs");
+    fs::create_dir(&logs).unwrap();
+    let path = default_jsonl_path(&logs, "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    let before = fs::read_to_string(&path).unwrap();
+
+    // Injected fault: a read-only directory rejects creating the staged swap
+    // file. Root bypasses directory modes, so probe and skip silently in that
+    // case (the repo-wide tracing audit bans direct output under src/).
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o500)).unwrap();
+    if fs::write(logs.join("probe.tmp"), b"").is_ok() {
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+
+    let err = recorder
+        .set_data_mode(AuditDataMode::FullData, "settings_changed")
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    // The failed swap must not advance the mode nor touch the live file.
+    assert_eq!(recorder.data_mode(), AuditDataMode::ObfuscatedSensitiveData);
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Recording continues into the original file: old mode, continuing seq,
+    // no recorder-session reset.
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    let events: Vec<AuditEvent> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[2].seq, 2);
+    assert_eq!(
+        events[2].audit_data_mode,
+        AuditDataMode::ObfuscatedSensitiveData
+    );
+    assert_eq!(events[2].recorder_session_id, events[0].recorder_session_id);
+
+    // With the fault cleared the mode change is retryable: a fresh file holds
+    // exactly the two boundary rows, both stamped with the new mode.
+    recorder
+        .set_data_mode(AuditDataMode::FullData, "settings_changed")
+        .unwrap();
+    assert_eq!(recorder.data_mode(), AuditDataMode::FullData);
+    let events: Vec<AuditEvent> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0].kind,
+        AuditEventKind::RecorderStarted { .. }
+    ));
+    assert!(matches!(
+        events[1].kind,
+        AuditEventKind::AuditDataModeChanged { .. }
+    ));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.audit_data_mode == AuditDataMode::FullData)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn rotate_failure_keeps_recording_to_original_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    // A dedicated subdir takes the chmod fault so TempDir cleanup of the root
+    // is never blocked if an assertion fails before the mode is restored.
+    let logs = dir.path().join("logs");
+    fs::create_dir(&logs).unwrap();
+    let path = default_jsonl_path(&logs, "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    let before = fs::read_to_string(&path).unwrap();
+
+    // Injected fault: a read-only directory rejects creating the staged swap
+    // file. Root bypasses directory modes, so probe and skip silently in that
+    // case (the repo-wide tracing audit bans direct output under src/).
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o500)).unwrap();
+    if fs::write(logs.join("probe.tmp"), b"").is_ok() {
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+
+    let err = recorder.rotate().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+
+    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // The failed rotation must leave the recorder appending to the original
+    // file with a continuing sequence.
+    recorder.record(AuditRecord::new(
+        None,
+        AuditEventKind::SendEntry {
+            intent_kind: "app_message".into(),
+        },
+    ));
+    let events: Vec<AuditEvent> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[2].seq, 2);
+}
+
+#[test]
+fn set_data_mode_recovers_from_stale_staged_swap_file() {
+    let dir = TempDir::new().unwrap();
+    let path = default_jsonl_path(dir.path(), "engine-abc");
+    let recorder = JsonlRecorder::open(&path, "engine-abc".to_string()).unwrap();
+
+    // A staged file left behind by an interrupted earlier swap must be
+    // discarded, never adopted into the fresh log.
+    let staged = staged_swap_path(&path);
+    fs::write(&staged, b"stale staged junk\n").unwrap();
+
+    recorder
+        .set_data_mode(AuditDataMode::FullData, "settings_changed")
+        .unwrap();
+
+    assert!(!staged.exists());
+    let events: Vec<AuditEvent> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0].kind,
+        AuditEventKind::RecorderStarted { .. }
+    ));
+    assert!(matches!(
+        events[1].kind,
+        AuditEventKind::AuditDataModeChanged { .. }
+    ));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.audit_data_mode == AuditDataMode::FullData)
+    );
 }
 
 #[test]

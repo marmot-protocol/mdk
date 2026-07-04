@@ -1332,6 +1332,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let stored_proposal_ref = queued.proposal_reference_ref().clone();
         mls_group
             .store_pending_proposal(
                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
@@ -1344,6 +1345,7 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let mut pending_commit_guard =
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        pending_commit_guard.set_stored_proposal_ref(stored_proposal_ref);
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, group_id, pre_commit_epoch)?;
@@ -1381,13 +1383,6 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        if let Ok(mut g) = self.storage.get_group(group_id) {
-            g.epoch = new_epoch;
-            g.members
-                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
-            self.storage.put_group(&g)?;
-        }
-
         let commit_priority = mls_group
             .pending_commit()
             .map(crate::app_components::commit_ordering_priority_for_staged)
@@ -1404,6 +1399,49 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+
+        // Project the post-merge record only after every other fallible
+        // staging step has succeeded: a torn record (epoch N+1 with members
+        // dropped while MLS and the state machine stay at N) permanently
+        // strands auto-commit replay, which bails on any epoch mismatch
+        // (mdk#333).
+        // Read-then-project as one fallible unit: a failed read is no more
+        // recoverable than a failed write here (both leave the state machine
+        // pending at N+1 with no matching durable record), so both funnel
+        // through the same compensation.
+        let projection = self.storage.get_group(group_id).and_then(|mut g| {
+            g.epoch = new_epoch;
+            g.members
+                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
+            self.storage.put_group(&g)
+        });
+        if let Err(err) = projection {
+            // The pending slot was never handed off to a caller, so
+            // `publish_failed` can never reach it — rewind the state
+            // machine here (in-memory, so the storage pressure that
+            // failed the read/write cannot also defeat the compensation);
+            // the still-armed guard clears the staged OpenMLS commit on the
+            // early return.
+            if self.epoch_manager.rollback_publish(pending_ref).is_err() {
+                tracing::warn!(
+                    target: "cgka_engine::message_processor",
+                    method = "stage_auto_commit_for_queued_proposal",
+                    "state-machine rollback failed after group record projection failure"
+                );
+            }
+            self.audit_group(
+                group_id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    Some("pending_publish"),
+                    "stable",
+                    pre_commit_epoch,
+                    "auto_commit_stage_failed",
+                    Some(pending_ref),
+                    Some("group_evolution"),
+                ),
+            );
+            return Err(err.into());
+        }
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),

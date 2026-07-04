@@ -322,6 +322,23 @@ pub(crate) struct ActiveStreamSession {
     pub(crate) cancel_tx: mpsc::Sender<()>,
     pub(crate) abort: tokio::task::AbortHandle,
     pub(crate) last_activity: Instant,
+    /// Set once the compose task has validated the finalize expectation and
+    /// exited. The compose task is then gone, but the durable
+    /// `finish_agent_text_stream` publish that follows can still fail; the
+    /// retained transcript lets a re-issued `StreamFinalize` retry that publish
+    /// without the (dead) compose task, so a transient error never strands the
+    /// stream with a live preview and no durable final (#366).
+    pub(crate) finalized: Option<FinalizedStream>,
+}
+
+/// Frozen finalize inputs retained after the compose task exits, so the durable
+/// finish step is retryable and a retry that disagrees with the frozen
+/// transcript is rejected.
+#[derive(Clone)]
+pub(crate) struct FinalizedStream {
+    pub(crate) final_text: String,
+    pub(crate) transcript_hash: [u8; 32],
+    pub(crate) chunk_count: u64,
 }
 
 impl StreamSessionStore {
@@ -355,6 +372,52 @@ impl StreamSessionStore {
         Ok(session.clone())
     }
 
+    /// Remove the entry for `stream_id_hex` only when it is still the same
+    /// session as `session` (identified by command-channel identity).
+    ///
+    /// With a get-first finalize flow, an unconditional removal could tear
+    /// down a same-stream-id replacement session inserted concurrently
+    /// between the `get` and the removal; the channel-identity check makes
+    /// the removal a no-op in that case.
+    pub(crate) fn remove_if_same(
+        &self,
+        stream_id_hex: &str,
+        session: &ActiveStreamSession,
+    ) -> Option<ActiveStreamSession> {
+        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        match sessions.get(stream_id_hex) {
+            Some(entry) if entry.tx.same_channel(&session.tx) => sessions.remove(stream_id_hex),
+            _ => None,
+        }
+    }
+
+    /// Freeze the finalize inputs on the stored entry so a durable-finish failure
+    /// can be retried without the compose task, which has exited by this point.
+    ///
+    /// Returns `true` only when the freeze landed on the still-current session
+    /// (matched by command-channel identity). It returns `false` when the entry
+    /// was removed or replaced by a same-stream-id session between the caller's
+    /// `get` and this call: in that case the caller's session is stale and must
+    /// NOT proceed to the durable publish, or a failure there would leave no
+    /// retry handle (`finalized` unset) and strand the stream (#366).
+    #[must_use]
+    pub(crate) fn mark_finalized(
+        &self,
+        stream_id_hex: &str,
+        session: &ActiveStreamSession,
+        finalized: FinalizedStream,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        match sessions.get_mut(stream_id_hex) {
+            Some(entry) if entry.tx.same_channel(&session.tx) => {
+                entry.finalized = Some(finalized);
+                entry.last_activity = Instant::now();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn remove(
         &self,
         stream_id_hex: &str,
@@ -376,12 +439,21 @@ impl StreamSessionStore {
     /// session otherwise keeps the compose task, its `mpsc::Sender`, the accumulated
     /// transcript, and (when broker connect succeeded) a dedicated quinn `Endpoint`
     /// UDP socket plus a live keep-alive'd QUIC connection alive forever.
+    ///
+    /// A session whose transcript has been finalized is NEVER swept: its compose
+    /// task has already exited and the frozen transcript is the only handle for
+    /// retrying a durable finish that failed. Sweeping it would recreate the
+    /// exact #366 failure mode (a published live preview with no durable final
+    /// and no way to retry), so a finalized session lives until its durable
+    /// finish succeeds or the connector restarts.
     pub(crate) fn sweep_idle(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
         let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
         let stale: Vec<String> = sessions
             .iter()
-            .filter(|(_, session)| now.duration_since(session.last_activity) >= max_idle)
+            .filter(|(_, session)| {
+                session.finalized.is_none() && now.duration_since(session.last_activity) >= max_idle
+            })
             .map(|(stream_id_hex, _)| stream_id_hex.clone())
             .collect();
         for stream_id_hex in &stale {
