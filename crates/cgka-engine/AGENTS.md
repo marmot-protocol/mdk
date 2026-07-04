@@ -212,8 +212,12 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
 - **Item:** **S3** Unattributable application messages
   - **What changed:** `message_processor::ingest_group_message` no longer emits `MessageReceived` with an empty
     `MemberId` for senders whose leaf credential cannot be resolved. The message is marked `Failed`; a typed sender
-    variant on `GroupEvent` would be a larger API change deferred to v0.2.
-  - **Test:** implicit (no event leak — covered by existing tests)
+    variant on `GroupEvent` would be a larger API change deferred to v0.2. Mirrored on the stored-convergence/replay
+    seam (mdk#383): the replay ApplicationMessage arm pushes `Ignored` for an unresolvable sender, both seams share
+    `app_payload::validate_app_payload_for_sender` (which rejects an empty `MemberId` outright), and
+    `emit_application_replay_events` skips empty-sender observations as a backstop.
+  - **Test:** `app_payload::tests` (empty-sender and pubkey-mismatch rejection);
+    `tests/distributed_convergence.rs::convergence_app_message_with_unresolvable_sender_emits_no_event_and_lands_terminal`
 
 - **Item:** **Sm1** Atomic state-machine transitions
   - **What changed:** `EpochManager::confirm_publish` / `rollback_publish` / `begin_pending` clone the prior
@@ -315,6 +319,19 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
 
 ## Conventions in this crate
 
+- **Mirror every ingest invariant on every inbound seam.** An inbound MLS message reaches application-visible state
+  through three seams — **direct ingest** (`message_processor/ingest.rs::ingest_group_message`),
+  **stored-convergence/replay** (`openmls_projection.rs::process_openmls_messages_inner`, materialization and apply),
+  and **fork recovery** (the `WrongEpoch` branch in `message_processor/ingest.rs` + `fork_recovery.rs`). Every
+  sender-authentication, admin/identity-proof, app-payload, and component-retention check MUST run identically on all
+  of them, through the *same* shared helper — never a seam-local re-implementation. Shared chokepoints:
+  `identity::member_id_of_sender` (MLS `Sender` → validated `MemberId`) and
+  `app_payload::validate_app_payload_for_sender` (payload + `&MemberId` → validated `MarmotAppEvent`; rejects an empty
+  id). An application message whose sender cannot resolve to a validated member id is never surfaced as
+  `MessageReceived` and never accepted into canonical state on any seam (direct: `Failed`; replay: `Ignored` →
+  terminal disposition). Fork-recovery paths fail closed with typed errors (`EngineError::ForkedEpoch` / `Backend`) —
+  never `unreachable!`/`panic!` — on attacker-influenced input. When you add a guard to one seam, add it to the shared
+  helper (or all seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They

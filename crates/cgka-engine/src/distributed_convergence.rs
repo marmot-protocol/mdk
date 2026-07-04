@@ -749,6 +749,18 @@ impl<S: StorageProvider> Engine<S> {
             else {
                 continue;
             };
+            if sender.is_empty() {
+                // Backstop for the mirror-on-all-seams contract (#383): the
+                // replay arm never produces an empty-sender observation, but
+                // an unattributable application message must not surface as
+                // MessageReceived from any seam.
+                tracing::warn!(
+                    target: "cgka_engine::distributed_convergence",
+                    method = "emit_application_replay_events",
+                    "skipping replayed application message with unattributable sender"
+                );
+                continue;
+            }
             self.events_buf.push_back(GroupEvent::MessageReceived {
                 group_id: group_id.clone(),
                 epoch: cgka_traits::EpochId(*source_epoch),
