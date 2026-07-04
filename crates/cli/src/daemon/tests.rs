@@ -13,8 +13,8 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 fn daemon_pid_and_log_writers_create_private_files() {
     let home = tempfile::tempdir().expect("tempdir");
-    let pid_path = home.path().join("dev").join("dmd.pid");
-    let log_path = home.path().join("logs").join("dmd.log");
+    let pid_path = home.path().join("dev").join("wnd.pid");
+    let log_path = home.path().join("logs").join("wnd.log");
 
     write_pid_file(&pid_path).expect("write pid file");
     drop(open_daemon_log(&log_path).expect("open daemon log"));
@@ -65,7 +65,7 @@ fn daemon_pid_and_log_writers_create_private_files() {
 #[cfg(unix)]
 async fn daemon_socket_is_owner_only_after_bind() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let relay = MockRelay::run().await.expect("start mock relay");
     let relay_url = relay.url().await.to_string();
     let args = DaemonArgs {
@@ -77,7 +77,7 @@ async fn daemon_socket_is_owner_only_after_bind() {
         discovery_relays: Vec::new(),
         default_account_relays: Vec::new(),
         secret_store: Some(crate::SecretStoreKind::File),
-        keychain_service: Some("dm-test-keychain".to_owned()),
+        keychain_service: Some("wn-test-keychain".to_owned()),
     };
     let server = tokio::spawn(run_server(args));
     for _ in 0..50 {
@@ -121,10 +121,10 @@ async fn daemon_socket_is_owner_only_after_bind() {
 #[test]
 fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
     let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/dm-daemon-home"),
-        socket: PathBuf::from("/tmp/dm-daemon.sock"),
-        pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
-        log_path: PathBuf::from("/tmp/dm-daemon.log"),
+        home: PathBuf::from("/tmp/wn-daemon-home"),
+        socket: PathBuf::from("/tmp/wn-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon.log"),
         relay: Some("wss://daemon.example".to_owned()),
         discovery_relays: vec!["wss://discovery.example".to_owned()],
         default_account_relays: vec!["wss://account.example".to_owned()],
@@ -153,10 +153,10 @@ fn apply_defaults_overwrites_forwarded_cli_relay_with_daemon_relay() {
 #[test]
 fn apply_defaults_overwrites_client_storage_scope_with_daemon_defaults() {
     let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/dm-daemon-home"),
-        socket: PathBuf::from("/tmp/dm-daemon.sock"),
-        pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
-        log_path: PathBuf::from("/tmp/dm-daemon.log"),
+        home: PathBuf::from("/tmp/wn-daemon-home"),
+        socket: PathBuf::from("/tmp/wn-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon.log"),
         relay: Some("wss://daemon.example".to_owned()),
         discovery_relays: Vec::new(),
         default_account_relays: Vec::new(),
@@ -186,10 +186,10 @@ fn apply_defaults_overwrites_client_storage_scope_with_daemon_defaults() {
 #[test]
 fn apply_defaults_adds_daemon_account_relays_to_account_create() {
     let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/dm-daemon-home"),
-        socket: PathBuf::from("/tmp/dm-daemon.sock"),
-        pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
-        log_path: PathBuf::from("/tmp/dm-daemon.log"),
+        home: PathBuf::from("/tmp/wn-daemon-home"),
+        socket: PathBuf::from("/tmp/wn-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon.log"),
         relay: Some("wss://daemon.example".to_owned()),
         discovery_relays: vec!["wss://discovery.example".to_owned()],
         default_account_relays: vec!["wss://account.example".to_owned()],
@@ -572,7 +572,7 @@ async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
     // frame and then stalls must not keep the accept loop from serving another
     // client's Ping/Status/Shutdown request.
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let relay = MockRelay::run().await.expect("start mock relay");
     let relay_url = relay.url().await.to_string();
     let args = DaemonArgs {
@@ -584,7 +584,7 @@ async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
         discovery_relays: Vec::new(),
         default_account_relays: Vec::new(),
         secret_store: Some(crate::SecretStoreKind::File),
-        keychain_service: Some("dm-test-keychain".to_owned()),
+        keychain_service: Some("wn-test-keychain".to_owned()),
     };
     let server = tokio::spawn(run_server(args));
     for _ in 0..50 {
@@ -638,10 +638,10 @@ async fn daemon_status_response_does_not_wait_for_busy_workers() {
     // best-effort worker snapshot instead of waiting on that mutex; otherwise a
     // long Execute still starves daemon status/stop at the next request.
     let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/dm-daemon-home"),
-        socket: PathBuf::from("/tmp/dm-daemon.sock"),
-        pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
-        log_path: PathBuf::from("/tmp/dm-daemon.log"),
+        home: PathBuf::from("/tmp/wn-daemon-home"),
+        socket: PathBuf::from("/tmp/wn-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon.log"),
         relay: None,
         discovery_relays: Vec::new(),
         default_account_relays: Vec::new(),
@@ -677,10 +677,10 @@ async fn daemon_execute_local_command_runs_without_holding_worker_lock() {
     // slow relay) cannot head-of-line block it (#633). We hold the workers lock for the entire
     // call: if the handler tried to lock it, this would deadlock and hit the timeout.
     let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/dm-daemon-home-hol"),
-        socket: PathBuf::from("/tmp/dm-daemon-hol.sock"),
-        pid_path: PathBuf::from("/tmp/dm-daemon-hol.pid"),
-        log_path: PathBuf::from("/tmp/dm-daemon-hol.log"),
+        home: PathBuf::from("/tmp/wn-daemon-home-hol"),
+        socket: PathBuf::from("/tmp/wn-daemon-hol.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon-hol.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon-hol.log"),
         relay: None,
         discovery_relays: Vec::new(),
         default_account_relays: Vec::new(),
@@ -888,10 +888,10 @@ async fn finish_stream_compose_keeps_session_when_marker_publish_fails() {
     // returns an error without any live runtime — the deterministic stand-in for
     // a marker publish failure.
     let defaults = DaemonDefaults {
-        home: PathBuf::from("/tmp/dm-daemon-home"),
-        socket: PathBuf::from("/tmp/dm-daemon.sock"),
-        pid_path: PathBuf::from("/tmp/dm-daemon.pid"),
-        log_path: PathBuf::from("/tmp/dm-daemon.log"),
+        home: PathBuf::from("/tmp/wn-daemon-home"),
+        socket: PathBuf::from("/tmp/wn-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon.log"),
         relay: None,
         discovery_relays: Vec::new(),
         default_account_relays: Vec::new(),
@@ -1032,7 +1032,7 @@ fn account_error_activity_message_excludes_account_identity() {
     );
 
     // The recorded string is stored verbatim into the report exposed via
-    // `dm daemon status --json` / the TUI, so the privacy guarantee carries
+    // `wn daemon status --json` / the TUI, so the privacy guarantee carries
     // through to the surfaced `errors` field.
     let state = Arc::new(Mutex::new(DaemonState {
         pid: 0,

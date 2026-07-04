@@ -76,7 +76,7 @@ pub enum MarmotEventFfi {
 /// `account_label`, discarding the group id, event kind, and the typed
 /// recovery details (quarantine reason, recovered epoch) — so native clients
 /// could not react to the typed events the recovery feature surfaces
-/// (darkmatter#441 finding 1). This enum mirrors each `GroupEvent` variant and
+/// (mdk#441 finding 1). This enum mirrors each `GroupEvent` variant and
 /// carries its privacy-safe scalar fields: ids are hex-encoded, epochs are
 /// `u64`, and the two deeply-nested inner enums (`GroupStateChange`,
 /// `AppMessageInvalidationReason`) are surfaced as stable low-cardinality tag

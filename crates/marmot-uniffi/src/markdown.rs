@@ -518,14 +518,14 @@ mod tests {
     }
 
     #[test]
-    fn bridges_darkmatter_autolink() {
-        let document = parse_markdown_document("open darkmatter://profile/npub1abc");
+    fn bridges_marmot_autolink() {
+        let document = parse_markdown_document("open marmot://profile/npub1abc");
         let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
             panic!("expected paragraph");
         };
         assert!(matches!(
             inlines[1],
-            MarkdownInlineFfi::Autolink { ref url, .. } if url == "darkmatter://profile/npub1abc"
+            MarkdownInlineFfi::Autolink { ref url, .. } if url == "marmot://profile/npub1abc"
         ));
     }
 

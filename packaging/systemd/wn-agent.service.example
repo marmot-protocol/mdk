@@ -1,5 +1,5 @@
 [Unit]
-Description=Marmot dm-agent connector
+Description=Marmot wn-agent connector
 Wants=network-online.target
 After=network-online.target
 
@@ -9,7 +9,7 @@ User=marmot-agent
 Group=marmot-agent
 EnvironmentFile=/etc/marmot-agent/hermes-marmot.env
 WorkingDirectory=/var/lib/marmot-agent
-ExecStart=/usr/local/bin/dm-agent \
+ExecStart=/usr/local/bin/wn-agent \
   --home ${MARMOT_HOME} \
   --socket ${MARMOT_AGENT_SOCKET} \
   --auth-token-file ${MARMOT_AGENT_AUTH_TOKEN_FILE} \

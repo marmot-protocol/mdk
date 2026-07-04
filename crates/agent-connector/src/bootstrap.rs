@@ -1,4 +1,4 @@
-//! Bootstrap a local Marmot agent account through a running `dm-agent` control socket.
+//! Bootstrap a local Marmot agent account through a running `wn-agent` control socket.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -64,7 +64,7 @@ pub enum BootstrapError {
     AuthTokenFileNotFound(PathBuf),
     #[error("{0} is empty")]
     EmptyAuthToken(String),
-    #[error("dm-agent socket not found: {0}")]
+    #[error("wn-agent socket not found: {0}")]
     SocketNotFound(PathBuf),
     #[error("no local signing agent account found")]
     NoLocalSigningAccount,
@@ -547,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_creates_agent_account_when_none_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("dm-agent.sock");
+        let socket_path = dir.path().join("wn-agent.sock");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server =
             spawn_mock_server(
@@ -599,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_reuses_existing_account_and_repairs_key_package() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("dm-agent.sock");
+        let socket_path = dir.path().join("wn-agent.sock");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server =
             spawn_mock_server(
@@ -642,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_honors_repeated_and_csv_quic_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("dm-agent.sock");
+        let socket_path = dir.path().join("wn-agent.sock");
         let server = spawn_mock_server(
             socket_path.clone(),
             Arc::new(Mutex::new(Vec::new())),
@@ -691,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_rejects_invalid_relay_before_account_ops() {
         let dir = tempfile::tempdir().unwrap();
-        let mut options = test_options(dir.path().join("dm-agent.sock"));
+        let mut options = test_options(dir.path().join("wn-agent.sock"));
         options.relays = vec!["not-a-relay-url".to_owned()];
 
         let err = run_bootstrap(options).await.unwrap_err();
@@ -706,7 +706,7 @@ mod tests {
         const OTHER_ACCOUNT: &str =
             "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b5";
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("dm-agent.sock");
+        let socket_path = dir.path().join("wn-agent.sock");
         let server = spawn_mock_server(
             socket_path.clone(),
             Arc::new(Mutex::new(Vec::new())),

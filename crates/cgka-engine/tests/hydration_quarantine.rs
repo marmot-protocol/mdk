@@ -287,7 +287,7 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
     );
 }
 
-// ── Re-hydration retry (darkmatter#426) ─────────────────────────────────────
+// ── Re-hydration retry (mdk#426) ─────────────────────────────────────
 
 /// Storage wrapper that delegates everything to an inner
 /// [`SqliteAccountStorage`] but can be told to fail `get_group` once, to
@@ -541,7 +541,7 @@ async fn retry_recovers_a_transiently_quarantined_group() {
 
     let events = reopened.drain_events();
     // The recovery event must carry the real recovered epoch — not 0. Finding 3
-    // (darkmatter#441): the engine previously re-read storage.get_group() and
+    // (mdk#441): the engine previously re-read storage.get_group() and
     // unwrap_or_default()'d the epoch on error, which could silently emit
     // epoch 0. It now uses the epoch hydration established.
     assert!(
@@ -599,7 +599,7 @@ async fn retry_for_unknown_group_errors() {
     ));
 }
 
-// darkmatter#152: session open must not re-verify an unchanged group's
+// mdk#152: session open must not re-verify an unchanged group's
 // account-identity proofs on every open. After a successful hydration the
 // engine persists a content-bound validation marker; reopening an unchanged
 // group finds the marker already set so the per-leaf schnorr re-verification is

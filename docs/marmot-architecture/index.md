@@ -50,7 +50,7 @@ Written to be readable in 5 minutes each, shareable as a package.
     safety policy.
 
 - **Doc:** [`overview/app-core-boundary.md`](./overview/app-core-boundary.md)
-  - **What it covers:** The boundary between `dm`, `marmot-app`, `marmot-account`, sessions, and future Swift/TUI
+  - **What it covers:** The boundary between `wn`, `marmot-app`, `marmot-account`, sessions, and future Swift/TUI
     bindings.
 
 - **Doc:** [`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md)
@@ -59,10 +59,10 @@ Written to be readable in 5 minutes each, shareable as a package.
 
 - **Doc:** [`hermes-openclaw-agent-integration-plan.md`](./hermes-openclaw-agent-integration-plan.md)
   - **What it covers:** Working plan for hosting Hermes Agent and OpenClaw as server-side Marmot members with a
-    `dm-agent` connector, local gateway shims, invite allowlists, and QUIC previews.
+    `wn-agent` connector, local gateway shims, invite allowlists, and QUIC previews.
 
 - **Doc:** [`hermes-agent-production-runbook.md`](./hermes-agent-production-runbook.md)
-  - **What it covers:** Supervised deployment path for Hermes Agent with `dm-agent`, token-gated local control sockets,
+  - **What it covers:** Supervised deployment path for Hermes Agent with `wn-agent`, token-gated local control sockets,
     systemd templates, and a Docker-to-phone manual test.
 
 - **Doc:** [`overview/cgka-engine-quality-and-vectors.md`](./overview/cgka-engine-quality-and-vectors.md)

@@ -436,7 +436,7 @@ impl<S: StorageProvider> Engine<S> {
         // live OpenMLS group first: otherwise `into_staged_welcome` fails with
         // `GroupAlreadyExists`, and even if it didn't the re-join would stack on
         // stale epoch keypairs / message-secrets / own-leaf index
-        // (darkmatter#557).
+        // (mdk#557).
         //
         // The clear is scoped to the live OpenMLS rows only: it does NOT delete
         // the Marmot record, retained-anchor snapshots, stored message history,

@@ -231,7 +231,7 @@ fn canonical_member_ref_input(member_ref: &str) -> String {
     let trimmed = member_ref.trim();
     let without_nostr = trimmed.strip_prefix("nostr:").unwrap_or(trimmed);
     let without_profile = without_nostr
-        .strip_prefix("darkmatter://profile/")
+        .strip_prefix("marmot://profile/")
         .unwrap_or(without_nostr);
     without_profile
         .split(['?', '#'])
@@ -340,7 +340,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
 }
 
 /// Coarse, privacy-safe reason a stored group failed session-open hydration and
-/// was quarantined (darkmatter#151 / #417). Carries no group/member ids,
+/// was quarantined (mdk#151 / #417). Carries no group/member ids,
 /// payloads, or key material — only a category the client can map to per-reason
 /// recovery guidance.
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
@@ -375,8 +375,8 @@ impl From<AppGroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReas
 }
 
 /// A stored group that failed session-open hydration and was skipped so the
-/// rest of the account could open (darkmatter#151 / #417). Surfaced so the app
-/// can present a per-group recovery flow (darkmatter#426) distinct from healthy
+/// rest of the account could open (mdk#151 / #417). Surfaced so the app
+/// can present a per-group recovery flow (mdk#426) distinct from healthy
 /// and archived groups, and offer a non-destructive re-hydration retry.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppQuarantinedGroupFfi {

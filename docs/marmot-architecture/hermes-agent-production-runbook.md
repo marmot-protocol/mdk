@@ -16,8 +16,8 @@ breaking final replies.
 
 This setup is ready for dogfood or a supervised production pilot when all of these are true:
 
-- `dm-agent` runs under a dedicated service user with a persistent `MARMOT_HOME`.
-- Hermes runs under its own service user and talks to `dm-agent` through the local Unix control socket.
+- `wn-agent` runs under a dedicated service user with a persistent `MARMOT_HOME`.
+- Hermes runs under its own service user and talks to `wn-agent` through the local Unix control socket.
 - The control socket is either same-UID only (`0700` parent, `0600` socket) or token-gated for group sharing.
 - The token file is not checked into source, is group-readable only when two service users need it, and is rotated on host
   compromise.
@@ -30,7 +30,7 @@ Do not run this as an unattended production service until the manual phone test 
 
 ## Components
 
-- `dm-agent`: Rust connector. Owns Marmot account state, MLS state, relay IO, final sends, allowlists, and stream previews.
+- `wn-agent`: Rust connector. Owns Marmot account state, MLS state, relay IO, final sends, allowlists, and stream previews.
 - Hermes gateway: model and tool runtime. Uses the Marmot platform plugin in `integrations/hermes/marmot`.
 - Public Nostr relays: durable Marmot transport. A normal deployment does not host its own relay.
 - QUIC broker: optional memory-only live-preview transport.
@@ -48,16 +48,16 @@ MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450
 Default same-user mode:
 
 ```sh
-dm-agent \
+wn-agent \
   --home /var/lib/marmot-agent \
-  --socket /run/marmot-agent/dm-agent.sock \
+  --socket /run/marmot-agent/wn-agent.sock \
   --socket-dir-mode 0700 \
   --socket-mode 0600 \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 ```
 
-Use this when Hermes and `dm-agent` run as the same Unix user. The connector also checks peer credentials on the Unix
+Use this when Hermes and `wn-agent` run as the same Unix user. The connector also checks peer credentials on the Unix
 socket.
 
 Group-shared token mode:
@@ -68,9 +68,9 @@ openssl rand -hex 32 | sudo tee /etc/marmot-agent/control.token >/dev/null
 sudo chown root:marmot-agent /etc/marmot-agent/control.token
 sudo chmod 0640 /etc/marmot-agent/control.token
 
-dm-agent \
+wn-agent \
   --home /var/lib/marmot-agent \
-  --socket /run/marmot-agent/dm-agent.sock \
+  --socket /run/marmot-agent/wn-agent.sock \
   --auth-token-file /etc/marmot-agent/control.token \
   --socket-dir-mode 0770 \
   --socket-mode 0660 \
@@ -80,7 +80,7 @@ dm-agent \
 export MARMOT_AGENT_AUTH_TOKEN_FILE=/etc/marmot-agent/control.token
 ```
 
-Use this when Hermes and `dm-agent` run as separate local users in the same Unix group. World-readable or world-writable
+Use this when Hermes and `wn-agent` run as separate local users in the same Unix group. World-readable or world-writable
 control socket modes are rejected at startup. Remote control-plane access is out of scope for this v1 path; keep the
 gateway and connector on the same host, VM, or container boundary.
 
@@ -88,7 +88,7 @@ gateway and connector on the same host, VM, or container boundary.
 
 Example units live in:
 
-- `packaging/systemd/dm-agent.service.example`
+- `packaging/systemd/wn-agent.service.example`
 - `packaging/systemd/hermes-gateway.service.example`
 - `packaging/systemd/hermes-marmot.env.example`
 
@@ -105,7 +105,7 @@ sudo install -d -m 0770 -o marmot-agent -g marmot-agent /run/marmot-agent
 
 sudo install -m 0640 -o root -g marmot-agent \
   packaging/systemd/hermes-marmot.env.example /etc/marmot-agent/hermes-marmot.env
-sudo install -m 0644 packaging/systemd/dm-agent.service.example /etc/systemd/system/dm-agent.service
+sudo install -m 0644 packaging/systemd/wn-agent.service.example /etc/systemd/system/wn-agent.service
 sudo install -m 0644 packaging/systemd/hermes-gateway.service.example /etc/systemd/system/hermes-gateway.service
 ```
 
@@ -116,10 +116,10 @@ Start and inspect:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now dm-agent.service
+sudo systemctl enable --now wn-agent.service
 sudo systemctl enable --now hermes-gateway.service
-sudo systemctl status dm-agent.service hermes-gateway.service
-journalctl -u dm-agent.service -u hermes-gateway.service -f
+sudo systemctl status wn-agent.service hermes-gateway.service
+journalctl -u wn-agent.service -u hermes-gateway.service -f
 ```
 
 Logs must stay privacy-safe: no account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext,
@@ -127,7 +127,7 @@ or key material.
 
 ## Bootstrap Checklist
 
-1. Start `dm-agent` with the same public relay set the phone uses.
+1. Start `wn-agent` with the same public relay set the phone uses.
 2. Create or import the agent account.
 3. Publish or repair the agent KeyPackage.
 4. Add the phone user's account id to the agent allowlist.
@@ -163,7 +163,7 @@ Compose service passes through common provider variables when they are set in yo
 `just hermes-phone-test-bootstrap` runs this inside the container:
 
 ```sh
-docker compose exec hermes-marmot-phone-test dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
+docker compose exec hermes-marmot-phone-test wn-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/wn-agent.sock --auth-token-file /data/marmot-agent/control.token
 ```
 
 The command creates or reuses the `hermes-agent` account, publishes or repairs its KeyPackage, then prints the agent
@@ -177,7 +177,7 @@ just hermes-phone-test-logs
 ```
 
 The Compose phone-test profile sets `MARMOT_AGENT_ALLOW_ANY=1` so the phone can invite the agent before you know the
-phone account id. For a real deployment, disable allow-any and add the phone account id to the `dm-agent` allowlist.
+phone account id. For a real deployment, disable allow-any and add the phone account id to the `wn-agent` allowlist.
 
 From the phone:
 
@@ -185,12 +185,12 @@ From the phone:
 2. Invite the agent account into a new chat or test group. Scan the QR code if the phone build supports the
    `marmot-agent:v1` payload; otherwise copy the printed `npub` or account hex.
 3. Send a short prompt.
-4. Watch `dm-agent` and Hermes logs for the inbound event and final send.
+4. Watch `wn-agent` and Hermes logs for the inbound event and final send.
 5. Confirm the phone shows the final reply.
 6. If preview is enabled, confirm the preview candidate uses an address the phone can reach. Docker `127.0.0.1` and host
    loopback addresses are not reachable from the phone.
 
-Record the exact public relay URLs, container image or base OS, `dm-agent` commit, Hermes commit, phone app build, and
+Record the exact public relay URLs, container image or base OS, `wn-agent` commit, Hermes commit, phone app build, and
 whether the test used QUIC previews. Keep message contents out of the notes.
 
 Stop the container while preserving the named volume:
@@ -207,11 +207,11 @@ just hermes-phone-test-reset
 
 ## Rollback
 
-Stop Hermes first, then `dm-agent`:
+Stop Hermes first, then `wn-agent`:
 
 ```sh
 sudo systemctl stop hermes-gateway.service
-sudo systemctl stop dm-agent.service
+sudo systemctl stop wn-agent.service
 ```
 
 Rotate the token after a failed or suspicious run:
@@ -220,5 +220,5 @@ Rotate the token after a failed or suspicious run:
 openssl rand -hex 32 | sudo tee /etc/marmot-agent/control.token >/dev/null
 sudo chown root:marmot-agent /etc/marmot-agent/control.token
 sudo chmod 0640 /etc/marmot-agent/control.token
-sudo systemctl restart dm-agent.service hermes-gateway.service
+sudo systemctl restart wn-agent.service hermes-gateway.service
 ```

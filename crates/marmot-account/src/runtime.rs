@@ -73,8 +73,8 @@ where
     }
 
     /// Stored groups that failed session-open hydration and were skipped
-    /// (darkmatter#151 / #417), paired with their coarse quarantine reason.
-    /// Backs the application's per-group recovery surface (darkmatter#426).
+    /// (mdk#151 / #417), paired with their coarse quarantine reason.
+    /// Backs the application's per-group recovery surface (mdk#426).
     pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
         self.session.quarantined_groups()
     }
@@ -195,7 +195,7 @@ where
         // fails *before any external exposure*, we must prune that orphaned
         // private bundle; otherwise an app retrying on a schedule against a
         // failing publisher accumulates unused private key material indefinitely
-        // (darkmatter#160).
+        // (mdk#160).
         //
         // But pruning is only safe when the publisher guarantees the KeyPackage
         // was never externally exposed. A publisher may publish to a relay first
@@ -310,7 +310,7 @@ where
     /// `open()` hydration, or `GroupHydrationRecovered` queued by a successful
     /// `retry_hydrate_quarantined_group`). Without this, those events only
     /// reach app/runtime subscribers when an unrelated relay delivery happens
-    /// to trigger a drain (darkmatter#426). Publishes any incidental transport
+    /// to trigger a drain (mdk#426). Publishes any incidental transport
     /// work the same way `ingest_delivery` does.
     pub async fn drain(&mut self) -> AccountResult<AccountDeviceEffects> {
         let effects = self.session.drain();
@@ -436,7 +436,7 @@ where
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
         // Mirror `publish_group_created`'s exposure-aware resolution
-        // (darkmatter#483): a message that any endpoint accepted has already
+        // (mdk#483): a message that any endpoint accepted has already
         // propagated to peers, so rolling it back here would leave the sender's
         // row falsely `local_publish_failed` while recipients have the message —
         // a resend then produces a real in-group duplicate, and convergence

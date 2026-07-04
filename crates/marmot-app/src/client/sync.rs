@@ -61,7 +61,7 @@ impl AppClient {
         let mut summary = self.sync_sdk_relay().await?;
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
-        // `open()` hydration (darkmatter#426). If no relay delivery arrived
+        // `open()` hydration (mdk#426). If no relay delivery arrived
         // above, `sync_sdk_relay` never drained the engine, so these would stay
         // buffered and invisible to runtime subscribers until some later
         // unrelated send/ingest. Fold any pending events into this summary.
@@ -79,7 +79,7 @@ impl AppClient {
     /// `retry_hydrate_quarantined_group` queues `GroupHydrationRecovered`. Both
     /// rely on a drain to reach app/runtime subscribers; without an explicit
     /// path they only surface when unrelated relay traffic happens to trigger
-    /// one (darkmatter#426). There is no source delivery here, so events that
+    /// one (mdk#426). There is no source delivery here, so events that
     /// reference a not-yet-live (quarantined) group must not abort the drain —
     /// projection lookups are best-effort.
     pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
@@ -534,7 +534,7 @@ impl AppClient {
     /// monotonic-max, persisted value that becomes a relay-level `since` filter
     /// on subscription rebuild and account open, so an unbounded far-future
     /// value would push `since` into the future and silently halt all message
-    /// reception across restarts (darkmatter#182). Clamp the advance to local
+    /// reception across restarts (mdk#182). Clamp the advance to local
     /// wall-clock plus a bounded skew so a hostile or clock-skewed sender can
     /// move the cursor no further than `now + TRANSPORT_CURSOR_MAX_FUTURE_SKEW`.
     fn remember_transport_cursor(&mut self, timestamp: u64) {
@@ -567,7 +567,7 @@ pub(crate) fn is_own_relay_echo(
 /// `candidate` is the sender-controlled Nostr `created_at` and is untrusted. It
 /// is first clamped to `now + max_future_skew_secs` so a far-future value
 /// cannot poison the cursor (which would push the relay `since` filter into the
-/// future and silently halt message reception — darkmatter#182), then folded
+/// future and silently halt message reception — mdk#182), then folded
 /// into the existing monotonic-max cursor. The existing `current` is clamped
 /// the same way before the max, so a cursor that was already poisoned before
 /// this guard existed is *healed* back down to `now + max_future_skew_secs`
@@ -665,7 +665,7 @@ mod transport_cursor_tests {
     fn far_future_timestamp_is_clamped_to_now_plus_skew() {
         // A malicious far-future created_at must not move the cursor past
         // now + skew, so the relay `since` filter can never jump into the
-        // future and halt reception (darkmatter#182).
+        // future and halt reception (mdk#182).
         let poisoned = NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
         assert_eq!(
             clamped_transport_cursor(Some(NOW - 100), poisoned, NOW, SKEW),
@@ -702,7 +702,7 @@ mod transport_cursor_tests {
         // the monotonic max. When a present-dated message arrives, the stored
         // cursor is clamped back to now + skew and then folded in, so the
         // account recovers to wall-clock instead of staying degraded
-        // (darkmatter#182 — blocking adversarial finding).
+        // (mdk#182 — blocking adversarial finding).
         let poisoned = NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
         assert_eq!(
             clamped_transport_cursor(Some(poisoned), NOW, NOW, SKEW),

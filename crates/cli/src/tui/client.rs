@@ -1,9 +1,9 @@
-//! `dm` subprocess client, subscription readers, and the runtime/command glue on `TuiApp`.
+//! `wn` subprocess client, subscription readers, and the runtime/command glue on `TuiApp`.
 
 use super::*;
 
 #[derive(Clone, Debug)]
-pub(crate) struct DmClient {
+pub(crate) struct WnClient {
     pub(crate) exe: PathBuf,
     pub(crate) home: Option<PathBuf>,
     pub(crate) socket: Option<PathBuf>,
@@ -12,7 +12,7 @@ pub(crate) struct DmClient {
     pub(crate) keychain_service: Option<String>,
 }
 
-impl DmClient {
+impl WnClient {
     pub(crate) fn from_cli(cli: &Cli) -> TuiResult<Self> {
         Ok(Self {
             exe: std::env::current_exe()?,
@@ -51,7 +51,7 @@ impl DmClient {
         child
             .stdin
             .take()
-            .ok_or_else(|| TuiError::Cli("dm stdin pipe was not available".to_owned()))?
+            .ok_or_else(|| TuiError::Cli("wn stdin pipe was not available".to_owned()))?
             .write_all(stdin.as_bytes())?;
         parse_json_output(child.wait_with_output()?)
     }
@@ -100,7 +100,7 @@ pub(crate) fn parse_json_output(output: Output) -> TuiResult<Value> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let envelope: Value = serde_json::from_str(stdout.trim()).map_err(|err| {
-        let mut message = format!("dm returned invalid JSON: {err}");
+        let mut message = format!("wn returned invalid JSON: {err}");
         if !stderr.trim().is_empty() {
             message.push_str(&format!("; stderr: {}", stderr.trim()));
         }
@@ -769,7 +769,7 @@ impl TuiApp {
             self.message_subscription = None;
             self.group_state_subscription = None;
             self.group_diagnostics = None;
-            self.status = "no identities yet; create one with dm create-identity".to_owned();
+            self.status = "no identities yet; create one with wn create-identity".to_owned();
             return Ok(());
         }
         self.refresh_chats()

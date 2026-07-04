@@ -15,7 +15,7 @@ pub struct AccountSummaryFfi {
 }
 
 /// Per-account unread aggregate for the account-switcher badge
-/// (darkmatter#461). Computed from each account's materialized chat-list
+/// (mdk#461). Computed from each account's materialized chat-list
 /// projection without loading a full session/timeline, so accounts that are
 /// not the active/running one are reported too.
 #[derive(Clone, Debug, uniffi::Record)]

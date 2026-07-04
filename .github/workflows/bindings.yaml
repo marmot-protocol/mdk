@@ -267,7 +267,7 @@ jobs:
           version="${tag#marmotkit-v}"
           notes="$RUNNER_TEMP/release-notes.md"
           cat > "$notes" <<EOF
-          MarmotKit bindings generated from Darkmatter commit \`$GITHUB_SHA\`.
+          MarmotKit bindings generated from MDK commit \`$GITHUB_SHA\`.
 
           Assets:
           - \`marmotkit-ios-$version.zip\`: \`MarmotKit.xcframework\` and generated Swift bindings.

@@ -8,7 +8,7 @@ status: working-plan
 
 # Hermes And OpenClaw Agent Integration Plan
 
-This note describes how Darkmatter/Marmot can host a server-side agent account that appears in the iOS, Android, CLI,
+This note describes how MDK/Marmot can host a server-side agent account that appears in the iOS, Android, CLI,
 daemon, and TUI surfaces as a normal Marmot member.
 
 The first target is NousResearch Hermes Agent. The second target is OpenClaw. The shared shape is a headless Rust
@@ -45,7 +45,7 @@ OpenClaw channel shim
         |
         | local JSON control socket
         v
-dm-agent connector
+wn-agent connector
   - MarmotAppRuntime host
   - agent account home and SQLCipher session DB
   - KeyPackage publish and relay setup
@@ -123,7 +123,7 @@ already exists in `cgka-traits`; the missing pieces are:
 - runtime and app update types that expose record type and payload where needed;
 - UI policy for showing or ignoring status records.
 
-Keep the current text-only path working for `dm stream compose`.
+Keep the current text-only path working for `wn stream compose`.
 
 ## Workstream 2: Connector Control Protocol
 
@@ -164,7 +164,7 @@ Do not fake replacement output by appending a complete rewritten draft.
 Create a new binary crate:
 
 - `crates/agent-connector`
-- binary name: `dm-agent`
+- binary name: `wn-agent`
 
 Responsibilities:
 
@@ -177,7 +177,7 @@ Responsibilities:
 - keep an allowlist per agent account;
 - map gateway output to final Marmot sends and QUIC previews.
 
-The connector should reuse code patterns from `dmd`, but shared helpers must move into a library crate before another
+The connector should reuse code patterns from `wnd`, but shared helpers must move into a library crate before another
 crate can use them. Useful candidates:
 
 - Unix socket permission hardening;
@@ -194,7 +194,7 @@ Default auth mode:
 
 Deployment constraint:
 
-- Hermes/OpenClaw and `dm-agent` must run as the same Unix user with mode `0600`, or as local users in a shared Unix group
+- Hermes/OpenClaw and `wn-agent` must run as the same Unix user with mode `0600`, or as local users in a shared Unix group
   with a configured auth token, mode `0660`, and a non-world-accessible parent directory.
 - No TCP control listener exists in v1. Split-host gateways require a later TLS-authenticated control plane.
 
@@ -255,7 +255,7 @@ joined event.
 
 Hermes supports gateway platform adapters through `BasePlatformAdapter` and `ctx.register_platform`. Current Hermes
 loads third-party platform plugins as user-installed plugin directories under `~/.hermes/plugins/<name>/`, each
-containing `plugin.yaml`, `__init__.py`, and adapter implementation files. The Darkmatter source copy lives at
+containing `plugin.yaml`, `__init__.py`, and adapter implementation files. The MDK source copy lives at
 `integrations/hermes/marmot/` and can be copied or symlinked to `~/.hermes/plugins/marmot/`.
 
 Shim responsibilities:
@@ -349,7 +349,7 @@ Do not silently start a stream in a group that cannot derive the stream exporter
 
 1. Add welcomer threading from `PeeledMessage.sender` to `GroupEvent::GroupJoined` and app projection.
 2. Extract stream compose and stream crypto into reusable crates/helpers.
-3. Add `agent-control` and a minimal `dm-agent` with account list, KeyPackage publish, inbound subscription, and final
+3. Add `agent-control` and a minimal `wn-agent` with account list, KeyPackage publish, inbound subscription, and final
    send.
 4. Add connector allowlist and post-join auto-accept/auto-decline.
 5. Wire stream begin, append, status, finalize, and cancel.
@@ -366,7 +366,7 @@ cargo test -p cgka-traits
 cargo test -p cgka-engine
 cargo test -p marmot-app
 cargo test -p transport-quic-broker
-cargo test -p darkmatter-cli
+cargo test -p wn-cli
 ```
 
 Connector checks:
@@ -393,11 +393,11 @@ End-to-end check:
 
 1. Start local Nostr relays.
 2. Start `marmot-quic-broker` with TLS config.
-3. Start `dm-agent`.
+3. Start `wn-agent`.
 4. Start Hermes with the Marmot platform shim.
 5. Invite the agent account by pubkey.
 6. Confirm the connector accepts only the allowed welcomer.
-7. Send a user message from a Darkmatter client.
+7. Send a user message from a MDK client.
 8. Confirm live preview records arrive and the final encrypted message lands in history.
 
 ## Main Risks

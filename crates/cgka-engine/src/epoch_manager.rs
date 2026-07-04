@@ -128,7 +128,7 @@ impl EpochManager {
         // a non-Stable prev → InvalidTransition) must leave every map untouched
         // so the group's EpochState entry is never orphaned. Previously the
         // entry was removed before the transition and never re-inserted on
-        // error, dropping the group to UnknownGroup (darkmatter#146).
+        // error, dropping the group to UnknownGroup (mdk#146).
         let prev = self
             .states
             .get(&group_id)
@@ -314,7 +314,7 @@ mod tests {
         StagedCommitHandle::from_bytes(vec![0xCD; 4])
     }
 
-    /// Regression for darkmatter#146: `begin_pending` from a non-Stable state
+    /// Regression for mdk#146: `begin_pending` from a non-Stable state
     /// must be atomic. A failing inner transition (Recovering →
     /// InvalidTransition) must leave `states`, `committed_from`, and `pending`
     /// untouched so the group is never orphaned to UnknownGroup.

@@ -6,7 +6,7 @@ use marmot_app::{AccountRelayListBootstrap, MarmotApp, MarmotAppRuntime};
 use serde_json::json;
 
 use crate::{
-    CommandOutput, DmError, ProfileCommand, ensure_local_signing, npub_for_account_id,
+    CommandOutput, ProfileCommand, WnError, ensure_local_signing, npub_for_account_id,
     resolve_account, unix_now_seconds, validate_relay_url,
 };
 
@@ -16,7 +16,7 @@ pub(crate) async fn profile_command(
     command: ProfileCommand,
     account_flag: Option<String>,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     profile_command_with_runtime(account_home, app, &runtime, command, account_flag, relay).await
 }
@@ -28,7 +28,7 @@ pub(crate) async fn profile_command_with_runtime(
     command: ProfileCommand,
     account_flag: Option<String>,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, account_flag)?;
     ensure_local_signing(&account)?;
     match command {
@@ -69,9 +69,9 @@ pub(crate) async fn profile_command_with_runtime(
                 && nip05.is_none()
                 && lud16.is_none()
             {
-                return Err(DmError::EmptyProfileUpdate);
+                return Err(WnError::EmptyProfileUpdate);
             }
-            let relay = relay.ok_or(DmError::MissingRelay)?;
+            let relay = relay.ok_or(WnError::MissingRelay)?;
             let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
             let mut profile = app
                 .fetch_current_user_profile_for_account_id(
@@ -79,7 +79,7 @@ pub(crate) async fn profile_command_with_runtime(
                     vec![endpoint.clone()],
                 )
                 .await?
-                .ok_or_else(|| DmError::ProfileUpdateInconclusive {
+                .ok_or_else(|| WnError::ProfileUpdateInconclusive {
                     account_id: account.account_id_hex.clone(),
                     source_relays: vec![endpoint.0.clone()],
                 })?;

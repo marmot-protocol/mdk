@@ -907,7 +907,7 @@ fn noop_recorder_reports_default_mode_and_ignores_mode_change() {
 /// uses ($ref, properties, additionalProperties:false, items, and oneOf
 /// discriminated by a `type` const). It does not validate value patterns; its
 /// job is to prove every key we serialize is a key the schema allows — i.e. that
-/// darkmatter never emits a field that Goggles' `additionalProperties: false`
+/// mdk never emits a field that Goggles' `additionalProperties: false`
 /// would reject.
 fn resolve_ref<'a>(
     schema: &'a serde_json::Value,

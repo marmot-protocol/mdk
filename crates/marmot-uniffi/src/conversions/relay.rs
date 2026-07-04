@@ -106,7 +106,7 @@ impl From<AccountRelayListState> for RelayListFfi {
 }
 
 /// A relay list the account is missing, as a stable typed variant clients
-/// localize without parsing strings (darkmatter#565).
+/// localize without parsing strings (mdk#565).
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum MissingRelayListKindFfi {
     /// NIP-65 relay list — where this account publishes (outbox/write-side).

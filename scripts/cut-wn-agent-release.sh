@@ -3,11 +3,11 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: cut-dm-agent-release.sh [--dry-run] [--no-push] <version>
+Usage: cut-wn-agent-release.sh [--dry-run] [--no-push] <version>
 
-Create and push the annotated dm-agent release tag for the current workspace
+Create and push the annotated wn-agent release tag for the current workspace
 version. The tag is cut from origin/master so the GitHub release workflow can
-publish immutable dm-agent-v<version> assets.
+publish immutable wn-agent-v<version> assets.
 
 Options:
   --dry-run   Print the release action without creating or pushing a tag
@@ -15,7 +15,7 @@ Options:
   -h, --help  Show this help
 
 Example:
-  ./scripts/cut-dm-agent-release.sh 0.1.0
+  ./scripts/cut-wn-agent-release.sh 0.1.0
 USAGE
 }
 
@@ -95,14 +95,14 @@ if [ "$head_sha" != "$origin_master_sha" ]; then
         echo "         origin/master: $origin_master_sha" >&2
         release_sha="$origin_master_sha"
     else
-        echo "error: HEAD must match origin/master before cutting a dm-agent release" >&2
+        echo "error: HEAD must match origin/master before cutting a wn-agent release" >&2
         echo "       HEAD:          $head_sha" >&2
         echo "       origin/master: $origin_master_sha" >&2
         exit 1
     fi
 fi
 
-tag="dm-agent-v$version"
+tag="wn-agent-v$version"
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
     echo "error: local tag already exists: $tag" >&2
     exit 1
@@ -113,24 +113,24 @@ if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; the
     exit 1
 fi
 
-echo "dm-agent release:"
+echo "wn-agent release:"
 echo "  tag:     $tag"
 echo "  commit:  $release_sha"
 echo "  version: $version"
 
 if [ "$dry_run" -eq 1 ]; then
-    echo "[dry-run] git tag -a $tag -m \"DM Agent v$version\" $release_sha"
+    echo "[dry-run] git tag -a $tag -m \"WN Agent v$version\" $release_sha"
     if [ "$push" -eq 1 ]; then
         echo "[dry-run] git push origin $tag"
     fi
     exit 0
 fi
 
-git tag -a "$tag" -m "DM Agent v$version" "$release_sha"
+git tag -a "$tag" -m "WN Agent v$version" "$release_sha"
 
 if [ "$push" -eq 1 ]; then
     git push origin "$tag"
-    echo "pushed $tag; GitHub Actions will publish the DM Agent release"
+    echo "pushed $tag; GitHub Actions will publish the WN Agent release"
 else
     echo "created local tag $tag; push with: git push origin $tag"
 fi

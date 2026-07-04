@@ -1,11 +1,11 @@
-# Darkmatter Release Guide
+# MDK Release Guide
 
-This file is the release checklist for Darkmatter itself, generated MarmotKit bindings used by app repos, and
-repository-built binaries such as DM Agent.
+This file is the release checklist for MDK itself, generated MarmotKit bindings used by app repos, and
+repository-built binaries such as WN Agent.
 
 ## Release Tracks
 
-Darkmatter uses one workspace version as the compatibility cohort and separate tag prefixes for each artifact track.
+MDK uses one workspace version as the compatibility cohort and separate tag prefixes for each artifact track.
 That keeps tightly coupled crates, bindings, and binaries easy to reason about while still letting us publish only the
 artifact that changed.
 
@@ -13,21 +13,21 @@ Current tracks:
 
 - Whole-workspace releases use tags like `v0.1.0`. These identify a versioned source snapshot of the protocol draft,
   Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate.
-- DM Agent releases use tags like `dm-agent-v0.2.0`. These publish the `dm-agent` connector binary plus adapter
+- WN Agent releases use tags like `wn-agent-v0.2.0`. These publish the `wn-agent` connector binary plus adapter
   install assets, starting with the Hermes Marmot plugin and installer.
 - MarmotKit binding releases use tags like `marmotkit-v0.1.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
 
-Future binary or package tracks should follow the same shape, for example `quic-broker-v0.1.0` or `dm-cli-v0.1.0`, only
+Future binary or package tracks should follow the same shape, for example `quic-broker-v0.1.0` or `wn-cli-v0.1.0`, only
 when those artifacts become independently consumed release surfaces.
 
 When multiple tracks correspond to the same source snapshot, create the tags on the same commit:
 
 ```sh
-git tag -a v0.2.0 -m "darkmatter v0.2.0"
-git tag -a dm-agent-v0.2.0 -m "DM Agent v0.2.0"
+git tag -a v0.2.0 -m "mdk v0.2.0"
+git tag -a wn-agent-v0.2.0 -m "WN Agent v0.2.0"
 git tag -a marmotkit-v0.2.0 -m "MarmotKit v0.2.0"
-git push origin v0.2.0 dm-agent-v0.2.0 marmotkit-v0.2.0
+git push origin v0.2.0 wn-agent-v0.2.0 marmotkit-v0.2.0
 ```
 
 The workspace is not published to crates.io today. The root `Cargo.toml` has `publish = false`, and the crates depend
@@ -35,7 +35,7 @@ on each other through workspace paths. Treat Git tags and GitHub Releases as the
 
 ## Version Rules
 
-Use the root `Cargo.toml` workspace version as the release version for the Rust workspace, DM Agent, CLI, daemon, TUI,
+Use the root `Cargo.toml` workspace version as the release version for the Rust workspace, WN Agent, CLI, daemon, TUI,
 app runtime, and generated bindings:
 
 ```toml
@@ -46,7 +46,7 @@ version = "0.2.0"
 Use the same version number in:
 
 - `v<version>` for the whole workspace;
-- `dm-agent-v<version>` for DM Agent binary and adapter-install releases;
+- `wn-agent-v<version>` for WN Agent binary and adapter-install releases;
 - `marmotkit-v<version>` for generated app binding bundles;
 - `crates/cli/CHANGELOG.md` for CLI-visible changes.
 
@@ -57,7 +57,7 @@ Use a new version when public behavior changes. That includes:
 
 - UniFFI records, enums, object methods, async methods, or error variants;
 - app runtime behavior that iOS or Android depends on;
-- DM Agent, CLI, daemon, or TUI commands and JSON output;
+- WN Agent, CLI, daemon, or TUI commands and JSON output;
 - agent-control protocol, adapter/plugin contract, installer, or config behavior;
 - protocol, transport, storage, or vector changes that downstream users need to pin.
 
@@ -122,7 +122,7 @@ The GitHub workflow repeats the release builds on clean runners. Local builds ca
 
 ## Whole-Workspace Release
 
-Use this for a versioned Darkmatter source/library release.
+Use this for a versioned MDK source/library release.
 
 1. Update the workspace version in `Cargo.toml`.
 2. Move relevant `crates/cli/CHANGELOG.md` entries out of `Unreleased`.
@@ -131,33 +131,33 @@ Use this for a versioned Darkmatter source/library release.
 5. Create an annotated tag:
 
    ```sh
-   git tag -a v0.2.0 -m "darkmatter v0.2.0"
+   git tag -a v0.2.0 -m "mdk v0.2.0"
    git push origin v0.2.0
    ```
 
-6. Create or update the GitHub Release for `v0.2.0` on the Darkmatter repo releases page.
+6. Create or update the GitHub Release for `v0.2.0` on the MDK repo releases page.
 7. Include release notes that name the source commit, major user-visible changes, and any migration notes.
 
 Until a dedicated whole-workspace release workflow exists, the whole-workspace GitHub Release is a source release. The
 GitHub-generated source archives are the downloadable artifacts.
 
-## DM Agent Release
+## WN Agent Release
 
-Use this for the Dark Matter agent connector entry point. The release publishes `dm-agent` binaries for supported
+Use this for the Dark Matter agent connector entry point. The release publishes `wn-agent` binaries for supported
 platforms plus adapter install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, and the OpenClaw Marmot
 channel plugin + `install-openclaw-marmot.sh`. The track can grow other agent-system assets later.
 
 The workflow lives at:
 
 ```text
-.github/workflows/dm-agent-binaries.yml
+.github/workflows/wn-agent-binaries.yml
 ```
 
 Pull requests, master pushes, and manual workflow runs build validation artifacts only. Publishing happens only when a
-tag matching `dm-agent-v*` is pushed. The workflow validates version-like tags such as `dm-agent-v0.2.0` and requires
+tag matching `wn-agent-v*` is pushed. The workflow validates version-like tags such as `wn-agent-v0.2.0` and requires
 the tag version to match the root workspace version in `Cargo.toml`.
 
-Before a DM Agent release, run the normal preflight plus:
+Before a WN Agent release, run the normal preflight plus:
 
 ```sh
 cargo test -p agent-connector
@@ -168,28 +168,28 @@ bash scripts/install-openclaw-marmot.sh --dry-run
 Cut the release tag from the current `origin/master` commit:
 
 ```sh
-just release-dm-agent 0.2.0
+just release-wn-agent 0.2.0
 ```
 
 For a dry run:
 
 ```sh
-just release-dm-agent-dry-run 0.2.0
+just release-wn-agent-dry-run 0.2.0
 ```
 
 The helper checks that the workspace version matches, the working tree is clean, `HEAD` matches `origin/master`, and the
-`dm-agent-v<version>` tag does not already exist locally or remotely. Pushing the tag starts the GitHub release workflow.
+`wn-agent-v<version>` tag does not already exist locally or remotely. Pushing the tag starts the GitHub release workflow.
 
 The release job creates these assets:
 
-- `dm-agent-linux-x86_64-<version>.tar.gz`
-- `dm-agent-linux-x86_64-<version>.tar.gz.sha256`
-- `dm-agent-linux-aarch64-<version>.tar.gz`
-- `dm-agent-linux-aarch64-<version>.tar.gz.sha256`
-- `dm-agent-darwin-aarch64-<version>.tar.gz`
-- `dm-agent-darwin-aarch64-<version>.tar.gz.sha256`
-- `dm-agent-darwin-x86_64-<version>.tar.gz`
-- `dm-agent-darwin-x86_64-<version>.tar.gz.sha256`
+- `wn-agent-linux-x86_64-<version>.tar.gz`
+- `wn-agent-linux-x86_64-<version>.tar.gz.sha256`
+- `wn-agent-linux-aarch64-<version>.tar.gz`
+- `wn-agent-linux-aarch64-<version>.tar.gz.sha256`
+- `wn-agent-darwin-aarch64-<version>.tar.gz`
+- `wn-agent-darwin-aarch64-<version>.tar.gz.sha256`
+- `wn-agent-darwin-x86_64-<version>.tar.gz`
+- `wn-agent-darwin-x86_64-<version>.tar.gz.sha256`
 - `hermes-marmot-plugin-<version>.tar.gz`
 - `hermes-marmot-plugin-<version>.tar.gz.sha256`
 - `openclaw-marmot-plugin-<version>.tgz`
@@ -200,19 +200,19 @@ The release job creates these assets:
 Each plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and workspace
 version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
 
-The installer assets are generated during the release and default to their own `dm-agent-v<version>` release tag and
+The installer assets are generated during the release and default to their own `wn-agent-v<version>` release tag and
 `<version>` asset suffix. A release install looks like:
 
 ```sh
 # Hermes gateway
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.2.0/install-hermes-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.2.0/install-hermes-marmot.sh | bash
 # OpenClaw gateway
-curl -fsSL https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v0.2.0/install-openclaw-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.2.0/install-openclaw-marmot.sh | bash
 ```
 
 ## MarmotKit Binding Release
 
-Use this when app repos need pinned generated bindings instead of a local Darkmatter checkout.
+Use this when app repos need pinned generated bindings instead of a local MDK checkout.
 
 The workflow lives at:
 
@@ -271,20 +271,20 @@ app/src/main/java/dev/ipf/marmotkit/marmot_uniffi.kt
 app/src/main/jniLibs/<abi>/libmarmot_uniffi.so
 ```
 
-After updating an app repo, run that app's normal compile and smoke checks. Binding generation passing in Darkmatter
+After updating an app repo, run that app's normal compile and smoke checks. Binding generation passing in MDK
 does not prove the app has adapted to every public API change.
 
 ## CLI And Homebrew Release
 
-The CLI package is `darkmatter-cli`; the installed binaries are:
+The CLI package is `wn-cli`; the installed binaries are:
 
-- `dm`
-- `dmd`
+- `wn`
+- `wnd`
 
 Before a CLI release, run:
 
 ```sh
-cargo test -p darkmatter-cli
+cargo test -p wn-cli
 cargo test -p marmot-app
 ```
 
@@ -293,15 +293,15 @@ Then smoke-test installed binaries from the release commit:
 ```sh
 install_root="$(mktemp -d)"
 cargo install --path crates/cli --locked --bins --root "$install_root" --force
-"$install_root/bin/dm" --help
-"$install_root/bin/dmd" --help
-DM_HOME="$(mktemp -d)" DM_SECRET_STORE=file "$install_root/bin/dm" account create
+"$install_root/bin/wn" --help
+"$install_root/bin/wnd" --help
+WN_HOME="$(mktemp -d)" WN_SECRET_STORE=file "$install_root/bin/wn" account create
 ```
 
 Homebrew release notes live in:
 
 ```text
-docs/release/dm-homebrew.md
+docs/release/wn-homebrew.md
 ```
 
 Use that checklist when updating `marmot-protocol/homebrew-tap`.
@@ -312,10 +312,10 @@ If a tag points at the wrong commit and nobody should consume it, delete and rec
 testers pin it:
 
 ```sh
-git tag -d dm-agent-v0.2.0
-git push origin :refs/tags/dm-agent-v0.2.0
-git tag -a dm-agent-v0.2.0 -m "DM Agent v0.2.0"
-git push origin dm-agent-v0.2.0
+git tag -d wn-agent-v0.2.0
+git push origin :refs/tags/wn-agent-v0.2.0
+git tag -a wn-agent-v0.2.0 -m "WN Agent v0.2.0"
+git push origin wn-agent-v0.2.0
 ```
 
 If a release has already been consumed, create a new patch version instead.

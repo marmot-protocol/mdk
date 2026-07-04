@@ -162,7 +162,7 @@ fn inline_math_open_followed_by_space_does_not_disable_later_span() {
 
 #[test]
 fn many_unclosed_inline_math_candidates_stay_literal() {
-    // Regression for darkmatter#590: a valid-looking `$` opener with no valid
+    // Regression for mdk#590: a valid-looking `$` opener with no valid
     // closer used to rescan the full remaining suffix. Repeating `$x ` made
     // parse time quadratic in the number of dollars.
     let input = "$x ".repeat(16_000);
@@ -171,7 +171,7 @@ fn many_unclosed_inline_math_candidates_stay_literal() {
 
 #[test]
 fn many_emphasis_pairs_stay_bounded_and_preserve_structure() {
-    // Regression guard for the second darkmatter#590 DoS path. This keeps a
+    // Regression guard for the second mdk#590 DoS path. This keeps a
     // frame-sized run of short emphasis pairs in the normal unit suite so a
     // future `process_emphasis` change that reintroduces repeated Vec shifting
     // or delimiter rescans is caught by the test timeout rather than the UI.

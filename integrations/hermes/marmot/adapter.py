@@ -1,7 +1,7 @@
 """Hermes platform plugin for the local Marmot agent connector.
 
 The adapter is intentionally thin: Hermes owns agent execution and tools, while
-``dm-agent`` owns Marmot account state, MLS group state, durable sends, and QUIC
+``wn-agent`` owns Marmot account state, MLS group state, durable sends, and QUIC
 preview streams.
 """
 
@@ -104,7 +104,7 @@ LEGACY_TOOL_PROGRESS_RE = re.compile(
 
 
 class AgentControlError(RuntimeError):
-    """Raised when the local ``dm-agent`` control socket rejects a request."""
+    """Raised when the local ``wn-agent`` control socket rejects a request."""
 
     def __init__(self, message: str, *, code: str = "agent_control_error", retryable: bool = False):
         super().__init__(message)
@@ -423,7 +423,7 @@ async def sync_allowlist(
     account_id_hex: str,
     desired: Iterable[str | int],
 ) -> Dict[str, list[str]]:
-    """Reconcile dm-agent's welcomer allowlist to exactly ``desired`` hex ids."""
+    """Reconcile wn-agent's welcomer allowlist to exactly ``desired`` hex ids."""
     want = {
         normalize_welcomer_id(entry)
         for entry in desired
@@ -1236,7 +1236,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
         self._tool_progress_replies: Dict[str, Optional[str]] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Client-side inbound dedupe: dm-agent can re-emit the same inbound
+        # Client-side inbound dedupe: wn-agent can re-emit the same inbound
         # message (rapid catch-up after subscribe, or across a reconnect); drop
         # ids already seen so the same user message is not dispatched twice.
         self._recent_inbound_ids = _RecentKeys(DEFAULT_INBOUND_DEDUPE_WINDOW)
@@ -2044,11 +2044,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return self.account_id_hex
         if not signing_accounts:
             raise AgentControlError(
-                "dm-agent has no local-signing Marmot account; run `dm-agent bootstrap` first",
+                "wn-agent has no local-signing Marmot account; run `wn-agent bootstrap` first",
                 code="no_accounts",
             )
         raise AgentControlError(
-            "dm-agent hosts multiple local-signing accounts; set MARMOT_ACCOUNT_ID_HEX",
+            "wn-agent hosts multiple local-signing accounts; set MARMOT_ACCOUNT_ID_HEX",
             code="ambiguous_account",
         )
 
@@ -2737,7 +2737,7 @@ def resolve_socket_path(extra: Dict[str, Any]) -> str:
         return str(Path(str(configured)).expanduser())
 
     home = _first_config_value(extra, "home", "marmot_home", env="MARMOT_HOME") or DEFAULT_SOCKET_HOME
-    return str(Path(str(home)).expanduser() / "dev" / "dm-agent.sock")
+    return str(Path(str(home)).expanduser() / "dev" / "wn-agent.sock")
 
 
 def resolve_auth_token(extra: Dict[str, Any]) -> Optional[str]:

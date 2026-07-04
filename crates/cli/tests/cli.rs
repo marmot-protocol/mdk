@@ -246,28 +246,28 @@ fn relay_pair_json(first: &TestRelay, second: &TestRelay) -> Value {
     serde_json::json!([first.url(), second.url()])
 }
 
-fn dm(home: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_dm"));
+fn wn(home: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
     command.arg("--home").arg(home).arg("--json");
-    command.env("DM_SECRET_STORE", "file");
-    command.env("DM_RELAY", test_relay_url());
+    command.env("WN_SECRET_STORE", "file");
+    command.env("WN_RELAY", test_relay_url());
     // CLI tests exercise encrypted media against a loopback Blossom server,
     // which is the dev/test scenario the loopback-HTTP gate is for.
-    command.env("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1");
+    command.env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1");
     // Instant convergence settlement so multi-client tests do not wait on the
     // pinned 1000 ms quiescence window (dev/test only).
-    command.env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
+    command.env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
     command
 }
 
-fn dm_without_relay(home: &std::path::Path) -> Command {
-    let mut command = dm(home);
-    command.env_remove("DM_RELAY");
+fn wn_without_relay(home: &std::path::Path) -> Command {
+    let mut command = wn(home);
+    command.env_remove("WN_RELAY");
     command
 }
 
-fn dm_with_relay(home: &std::path::Path, relay: &str) -> Command {
-    let mut command = dm(home);
+fn wn_with_relay(home: &std::path::Path, relay: &str) -> Command {
+    let mut command = wn(home);
     command.arg("--relay").arg(relay);
     command
 }
@@ -304,15 +304,15 @@ fn assert_two_word_pseudonym(value: &str) {
 }
 
 fn run_json(home: &std::path::Path, args: &[&str]) -> Value {
-    try_run_json(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
+    try_run_json(home, args).unwrap_or_else(|failure| panic!("wn failed\n{failure}"))
 }
 
 fn run_json_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
-    run_json_with_stdin_command(dm(home), args, stdin)
+    run_json_with_stdin_command(wn(home), args, stdin)
 }
 
 fn run_json_with_stdin_without_relay(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
-    run_json_with_stdin_command(dm_without_relay(home), args, stdin)
+    run_json_with_stdin_command(wn_without_relay(home), args, stdin)
 }
 
 fn run_json_with_stdin_command(mut command: Command, args: &[&str], stdin: &str) -> Value {
@@ -322,17 +322,17 @@ fn run_json_with_stdin_command(mut command: Command, args: &[&str], stdin: &str)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dm command should start");
+        .expect("wn command should start");
     child
         .stdin
         .take()
         .expect("stdin should be piped")
         .write_all(stdin.as_bytes())
         .expect("stdin should accept nsec input");
-    let output = child.wait_with_output().expect("dm command should finish");
+    let output = child.wait_with_output().expect("wn command should finish");
     assert!(
         output.status.success(),
-        "dm failed\nargs={args:?}\n{}",
+        "wn failed\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -341,17 +341,17 @@ fn run_json_with_stdin_command(mut command: Command, args: &[&str], stdin: &str)
 }
 
 fn run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Value {
-    try_run_json_without_relay(home, args).unwrap_or_else(|failure| panic!("dm failed\n{failure}"))
+    try_run_json_without_relay(home, args).unwrap_or_else(|failure| panic!("wn failed\n{failure}"))
 }
 
 fn try_run_json(home: &std::path::Path, args: &[&str]) -> Result<Value, String> {
-    let output = dm(home)
+    let output = wn(home)
         .args(args)
         .output()
-        .expect("dm command should start");
+        .expect("wn command should start");
     if !output.status.success() {
         return Err(format!(
-            "dm failed\nargs={args:?}\n{}",
+            "wn failed\nargs={args:?}\n{}",
             command_output_summary(&output)
         ));
     }
@@ -363,13 +363,13 @@ fn try_run_json(home: &std::path::Path, args: &[&str]) -> Result<Value, String> 
 }
 
 fn try_run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Result<Value, String> {
-    let output = dm_without_relay(home)
+    let output = wn_without_relay(home)
         .args(args)
         .output()
-        .expect("dm command should start");
+        .expect("wn command should start");
     if !output.status.success() {
         return Err(format!(
-            "dm failed\nargs={args:?}\n{}",
+            "wn failed\nargs={args:?}\n{}",
             command_output_summary(&output)
         ));
     }
@@ -381,13 +381,13 @@ fn try_run_json_without_relay(home: &std::path::Path, args: &[&str]) -> Result<V
 }
 
 fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
-    let output = dm_with_relay(home, relay)
+    let output = wn_with_relay(home, relay)
         .args(args)
         .output()
-        .expect("dm command should start");
+        .expect("wn command should start");
     assert!(
         output.status.success(),
-        "dm failed\nrelay=<REDACTED_RELAY>\nargs={args:?}\n{}",
+        "wn failed\nrelay=<REDACTED_RELAY>\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -396,13 +396,13 @@ fn run_json_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Va
 }
 
 fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
-    let output = dm(home)
+    let output = wn(home)
         .args(args)
         .output()
-        .expect("dm command should start");
+        .expect("wn command should start");
     assert!(
         !output.status.success(),
-        "dm unexpectedly succeeded\nargs={args:?}\n{}",
+        "wn unexpectedly succeeded\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -411,13 +411,13 @@ fn run_json_error(home: &std::path::Path, args: &[&str]) -> Value {
 }
 
 fn run_json_error_with_relay(home: &std::path::Path, relay: &str, args: &[&str]) -> Value {
-    let output = dm_with_relay(home, relay)
+    let output = wn_with_relay(home, relay)
         .args(args)
         .output()
-        .expect("dm command should start");
+        .expect("wn command should start");
     assert!(
         !output.status.success(),
-        "dm unexpectedly succeeded\nrelay=<REDACTED_RELAY>\nargs={args:?}\n{}",
+        "wn unexpectedly succeeded\nrelay=<REDACTED_RELAY>\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -426,23 +426,23 @@ fn run_json_error_with_relay(home: &std::path::Path, relay: &str, args: &[&str])
 }
 
 fn run_json_error_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str) -> Value {
-    let mut child = dm(home)
+    let mut child = wn(home)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dm command should start");
+        .expect("wn command should start");
     child
         .stdin
         .take()
         .expect("stdin should be piped")
         .write_all(stdin.as_bytes())
         .expect("stdin should accept nsec input");
-    let output = child.wait_with_output().expect("dm command should finish");
+    let output = child.wait_with_output().expect("wn command should finish");
     assert!(
         !output.status.success(),
-        "dm unexpectedly succeeded\nargs={args:?}\n{}",
+        "wn unexpectedly succeeded\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -451,15 +451,15 @@ fn run_json_error_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str)
 }
 
 fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Value {
-    let mut command = dm(home);
+    let mut command = wn(home);
     command.args(args);
     for (key, value) in envs {
         command.env(key, value);
     }
-    let output = command.output().expect("dm command should start");
+    let output = command.output().expect("wn command should start");
     assert!(
         output.status.success(),
-        "dm failed\nargs={args:?}\n{}",
+        "wn failed\nargs={args:?}\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -469,19 +469,19 @@ fn run_json_with_env(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)
 
 #[test]
 fn whitenoise_command_surface_names_are_present() {
-    let dm_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let wn_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--help")
         .output()
-        .expect("dm help should run");
+        .expect("wn help should run");
     assert!(
-        dm_help.status.success(),
+        wn_help.status.success(),
         "{}",
-        command_output_summary(&dm_help)
+        command_output_summary(&wn_help)
     );
-    let dm_help = format!(
+    let wn_help = format!(
         "{}{}",
-        String::from_utf8_lossy(&dm_help.stdout),
-        String::from_utf8_lossy(&dm_help.stderr)
+        String::from_utf8_lossy(&wn_help.stdout),
+        String::from_utf8_lossy(&wn_help.stderr)
     );
     for (command, description) in [
         ("daemon", "Start, stop, and inspect"),
@@ -503,27 +503,27 @@ fn whitenoise_command_surface_names_are_present() {
         ("users", "Look up known Nostr users"),
         ("keys", "Inspect and repair MLS KeyPackage"),
         ("stream", "Start, watch, finish"),
-        ("reset", "Delete all local Darkmatter CLI data"),
+        ("reset", "Delete all local White Noise CLI data"),
     ] {
-        assert!(dm_help.contains(command), "dm --help missing {command}");
+        assert!(wn_help.contains(command), "wn --help missing {command}");
         assert!(
-            dm_help.contains(description),
-            "dm --help missing description for {command}: {description}"
+            wn_help.contains(description),
+            "wn --help missing description for {command}: {description}"
         );
     }
     assert!(
-        !dm_help.contains("--relay"),
-        "dm --help should not expose a global relay flag"
+        !wn_help.contains("--relay"),
+        "wn --help should not expose a global relay flag"
     );
     assert!(
-        !dm_help.contains("notifications"),
-        "dm --help should not expose placeholder notification commands"
+        !wn_help.contains("notifications"),
+        "wn --help should not expose placeholder notification commands"
     );
 
-    let login_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let login_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["login", "--help"])
         .output()
-        .expect("dm login help should run");
+        .expect("wn login help should run");
     assert!(
         login_help.status.success(),
         "{}",
@@ -536,17 +536,17 @@ fn whitenoise_command_surface_names_are_present() {
     );
     assert!(
         login_help.contains("--relay"),
-        "dm login --help should expose the command-local relay override"
+        "wn login --help should expose the command-local relay override"
     );
     assert!(
         login_help.contains("--nsec-stdin"),
-        "dm login --help should expose stdin-based nsec import"
+        "wn login --help should expose stdin-based nsec import"
     );
 
-    let dmd_help = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let dmd_help = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--help")
         .output()
-        .expect("dmd help should run");
+        .expect("wnd help should run");
     assert!(
         dmd_help.status.success(),
         "{}",
@@ -563,17 +563,17 @@ fn whitenoise_command_surface_names_are_present() {
         "--discovery-relays",
         "--default-account-relays",
     ] {
-        assert!(dmd_help.contains(flag), "dmd --help missing {flag}");
+        assert!(dmd_help.contains(flag), "wnd --help missing {flag}");
     }
     assert!(
         !dmd_help.contains("--relay"),
-        "dmd --help should match wnd-style relay defaults instead of singular --relay"
+        "wnd --help should match wnd-style relay defaults instead of singular --relay"
     );
 
-    let daemon_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let daemon_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["daemon", "--help"])
         .output()
-        .expect("dm daemon help should run");
+        .expect("wn daemon help should run");
     assert!(
         daemon_help.status.success(),
         "{}",
@@ -589,10 +589,10 @@ fn whitenoise_command_surface_names_are_present() {
         "daemon sync-now should not be a user-facing command"
     );
 
-    let daemon_start_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let daemon_start_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["daemon", "start", "--help"])
         .output()
-        .expect("dm daemon start help should run");
+        .expect("wn daemon start help should run");
     assert!(
         daemon_start_help.status.success(),
         "{}",
@@ -611,11 +611,11 @@ fn whitenoise_command_surface_names_are_present() {
     ] {
         assert!(
             daemon_start_help.contains(flag),
-            "dm daemon start --help missing {flag}"
+            "wn daemon start --help missing {flag}"
         );
     }
 
-    let messages_list_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let messages_list_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["messages", "list", "--help"])
         .output()
         .expect("messages list help should run");
@@ -637,11 +637,11 @@ fn whitenoise_command_surface_names_are_present() {
     ] {
         assert!(
             messages_list_help.contains(flag),
-            "dm messages list --help missing {flag}"
+            "wn messages list --help missing {flag}"
         );
     }
 
-    let keys_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let keys_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["keys", "--help"])
         .output()
         .expect("keys help should run");
@@ -663,17 +663,17 @@ fn whitenoise_command_surface_names_are_present() {
     ] {
         assert!(
             keys_help.contains(expected),
-            "dm keys --help missing {expected}"
+            "wn keys --help missing {expected}"
         );
     }
     for stale in ["delete", "delete-all"] {
         assert!(
             !keys_help.contains(stale),
-            "dm keys --help should not expose stale {stale}"
+            "wn keys --help should not expose stale {stale}"
         );
     }
 
-    let groups_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let groups_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["groups", "--help"])
         .output()
         .expect("groups help should run");
@@ -690,7 +690,7 @@ fn whitenoise_command_surface_names_are_present() {
     for stale in ["invites", "accept", "decline"] {
         assert!(
             !groups_help.contains(stale),
-            "dm groups --help should not expose stale {stale}"
+            "wn groups --help should not expose stale {stale}"
         );
     }
 
@@ -698,7 +698,7 @@ fn whitenoise_command_surface_names_are_present() {
         (vec!["debug", "--help"], "ratchet-tree"),
         (vec!["chats", "--help"], "mute"),
     ] {
-        let help = Command::new(env!("CARGO_BIN_EXE_dm"))
+        let help = Command::new(env!("CARGO_BIN_EXE_wn"))
             .args(args)
             .output()
             .expect("nested help should run");
@@ -714,7 +714,7 @@ fn whitenoise_command_surface_names_are_present() {
         );
     }
 
-    let media_help = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let media_help = Command::new(env!("CARGO_BIN_EXE_wn"))
         .args(["media", "--help"])
         .output()
         .expect("media help should run");
@@ -1057,7 +1057,7 @@ fn run_json_until_success(home: &std::path::Path, args: &[&str], timeout: Durati
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
-        "dm did not succeed after retries\nlast_command_error={}",
+        "wn did not succeed after retries\nlast_command_error={}",
         last_error.as_deref().unwrap_or("<none>")
     );
 }
@@ -1080,7 +1080,7 @@ fn poll_json_until(
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
-        "dm did not reach expected JSON state\nlast_value={}\nlast_error={}",
+        "wn did not reach expected JSON state\nlast_value={}\nlast_error={}",
         last_value
             .map(|value| value.to_string())
             .unwrap_or_else(|| "<none>".to_owned()),
@@ -1106,7 +1106,7 @@ fn poll_json_without_relay_until(
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
-        "dm did not reach expected JSON state\nlast_value={}\nlast_error={}",
+        "wn did not reach expected JSON state\nlast_value={}\nlast_error={}",
         last_value
             .map(|value| value.to_string())
             .unwrap_or_else(|| "<none>".to_owned()),
@@ -1187,7 +1187,7 @@ fn wait_child_output(mut child: Child, timeout: Duration) -> Output {
 }
 
 fn real_relay_urls() -> Vec<String> {
-    env::var("DARKMATTER_E2E_RELAYS")
+    env::var("MDK_E2E_RELAYS")
         .ok()
         .map(|relays| {
             relays
@@ -1202,7 +1202,7 @@ fn real_relay_urls() -> Vec<String> {
 }
 
 fn require_real_relays() -> bool {
-    env::var("DARKMATTER_E2E_REQUIRE_RELAYS")
+    env::var("MDK_E2E_REQUIRE_RELAYS")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
@@ -1563,13 +1563,13 @@ fn wait_until_projected_agent_stream_message(
 fn wait_for_daemon(socket: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
             .arg("--socket")
             .arg(socket)
             .arg("--json")
             .args(["daemon", "status"])
             .output()
-            .expect("dm daemon status should start");
+            .expect("wn daemon status should start");
         if output.status.success() {
             let value: Value =
                 serde_json::from_slice(&output.stdout).expect("status stdout should be JSON");
@@ -1583,7 +1583,7 @@ fn wait_for_daemon(socket: &std::path::Path) {
 }
 
 fn stop_daemon(socket: &std::path::Path, child: &mut Child) {
-    let _ = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let _ = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(socket)
         .arg("--json")
@@ -1665,14 +1665,14 @@ impl Drop for JsonLineSubscription {
 }
 
 fn spawn_json_subscription(home: &std::path::Path, args: &[&str]) -> JsonLineSubscription {
-    spawn_json_subscription_with_command(dm(home), args)
+    spawn_json_subscription_with_command(wn(home), args)
 }
 
 fn spawn_json_subscription_without_relay(
     home: &std::path::Path,
     args: &[&str],
 ) -> JsonLineSubscription {
-    spawn_json_subscription_with_command(dm_without_relay(home), args)
+    spawn_json_subscription_with_command(wn_without_relay(home), args)
 }
 
 fn spawn_json_subscription_with_command(
@@ -1849,7 +1849,7 @@ fn whitenoise_identity_commands_create_login_and_show_accounts() {
     assert!(!positional_error.to_string().contains(nsec));
 
     let logged_in = run_json_with_stdin_command(
-        dm_with_relay(home.path(), relay),
+        wn_with_relay(home.path(), relay),
         &["login", "--nsec-stdin", "--relay", relay],
         &format!("{nsec}\n"),
     );
@@ -2093,7 +2093,7 @@ fn account_create_uses_global_relay_for_required_relay_lists() {
 #[test]
 fn account_create_requires_relay_setup() {
     let home = tempfile::tempdir().expect("tempdir");
-    let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--json")
@@ -2101,11 +2101,11 @@ fn account_create_requires_relay_setup() {
         .arg("file")
         .args(["account", "create"])
         .output()
-        .expect("dm command should start");
+        .expect("wn command should start");
 
     assert!(
         !output.status.success(),
-        "dm unexpectedly succeeded\n{}",
+        "wn unexpectedly succeeded\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -2807,7 +2807,7 @@ fn account_resolution_errors_are_stable_json_contracts() {
 
     let multiple = run_json_error(home.path(), &["keys", "publish"]);
     assert_eq!(multiple["code"], "multiple_accounts");
-    assert_eq!(multiple["repair"]["env"], "DM_ACCOUNT");
+    assert_eq!(multiple["repair"]["env"], "WN_ACCOUNT");
 
     let unknown = run_json_error(
         home.path(),
@@ -2830,9 +2830,9 @@ fn positional_group_and_message_commands_use_global_or_env_account() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let bob_join = run_json_with_env(home.path(), &["sync"], &[("DM_ACCOUNT", &bob)]);
+    let bob_join = run_json_with_env(home.path(), &["sync"], &[("WN_ACCOUNT", &bob)]);
     if bob_join["joined_groups"][0].is_null() {
-        let chats = run_json_with_env(home.path(), &["chats", "list"], &[("DM_ACCOUNT", &bob)]);
+        let chats = run_json_with_env(home.path(), &["chats", "list"], &[("WN_ACCOUNT", &bob)]);
         assert!(
             chats["chats"]
                 .as_array()
@@ -2854,10 +2854,10 @@ fn positional_group_and_message_commands_use_global_or_env_account() {
         ],
     );
 
-    let bob_sync = run_json_with_env(home.path(), &["sync"], &[("DM_ACCOUNT", &bob)]);
+    let bob_sync = run_json_with_env(home.path(), &["sync"], &[("WN_ACCOUNT", &bob)]);
     if bob_sync["messages"][0]["plaintext"].is_null() {
         let messages =
-            run_json_with_env(home.path(), &["message", "list"], &[("DM_ACCOUNT", &bob)]);
+            run_json_with_env(home.path(), &["message", "list"], &[("WN_ACCOUNT", &bob)]);
         assert!(
             message_plaintexts(&messages)
                 .iter()
@@ -2905,7 +2905,7 @@ fn group_create_includes_agent_text_streams_by_default() {
 fn stream_send_and_receive_show_quic_text_content() {
     let home = tempfile::tempdir().expect("tempdir");
     let bind = free_udp_addr();
-    let mut receiver = dm(home.path());
+    let mut receiver = wn(home.path());
     receiver
         .args(["stream", "receive", "--bind", &bind])
         .stdout(Stdio::piped())
@@ -3031,7 +3031,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         serde_json::json!([broker_candidate])
     );
 
-    let mut watcher = dm(home.path());
+    let mut watcher = wn(home.path());
     watcher
         .args([
             "--account",
@@ -3152,7 +3152,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
 #[test]
 fn daemon_background_stream_watch_records_brokered_preview() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let broker = spawn_quic_broker();
 
     let alice = create_account(home.path());
@@ -3186,7 +3186,7 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         .expect("start message id");
     run_json(home.path(), &["--account", &bob, "sync"]);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -3199,11 +3199,11 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         .arg("file")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
-        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
     wait_for_daemon(&socket);
 
     let watch = run_json(
@@ -3272,7 +3272,7 @@ fn daemon_background_stream_watch_records_brokered_preview() {
 #[test]
 fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let broker = spawn_quic_broker();
 
     let alice = create_account(home.path());
@@ -3299,7 +3299,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
     );
     run_json(home.path(), &["--account", &bob, "sync"]);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -3312,11 +3312,11 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
         .arg("file")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
-        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
     wait_for_daemon(&socket);
 
     let subscription = spawn_json_subscription(
@@ -3438,7 +3438,7 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
 #[test]
 fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_message() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let broker = spawn_quic_broker();
 
     let alice = create_account(home.path());
@@ -3451,7 +3451,7 @@ fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_messa
     let group_id = created_group["group_id"].as_str().expect("group id");
     run_json(home.path(), &["--account", &bob, "sync"]);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -3464,11 +3464,11 @@ fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_messa
         .arg("file")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
-        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
     wait_for_daemon(&socket);
 
     let subscription = spawn_json_subscription(
@@ -3600,10 +3600,10 @@ fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_messa
 fn daemon_defaults_create_identities_and_block_loopback_auto_watch_without_manual_sync_or_relay_env()
  {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let broker = spawn_quic_broker();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -3616,11 +3616,11 @@ fn daemon_defaults_create_identities_and_block_loopback_auto_watch_without_manua
         .arg("file")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
-        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
     wait_for_daemon(&socket);
 
     let alice_created = run_json_without_relay(home.path(), &["create-identity"]);
@@ -4152,7 +4152,7 @@ fn groups_leave_publishes_self_remove() {
 #[test]
 fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
 
     let alice = create_account(home.path());
     let bob = create_account(home.path());
@@ -4164,7 +4164,7 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
     let group_id = created_group["group_id"].as_str().expect("group id");
     sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4177,11 +4177,11 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
         .arg("file")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
-        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
     wait_for_daemon(&socket);
 
     let subscription =
@@ -4219,7 +4219,7 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
 #[test]
 fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
 
     let alice = create_account(home.path());
     let bob = create_account(home.path());
@@ -4230,7 +4230,7 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4243,11 +4243,11 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
         .arg("file")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
-        .env("DM_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
+        .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
     wait_for_daemon(&socket);
 
     let subscription = spawn_json_subscription(
@@ -4311,8 +4311,8 @@ fn chats_list_exposes_visible_groups() {
 #[test]
 fn daemon_executes_cli_commands_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let socket = home.path().join("dev").join("wnd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4324,20 +4324,20 @@ fn daemon_executes_cli_commands_over_socket() {
         .arg("--secret-store")
         .arg("file")
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
 
     wait_for_daemon(&socket);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
         .args(["account", "create"])
         .output()
-        .expect("dm should start");
+        .expect("wn should start");
     assert!(
         output.status.success(),
-        "dm failed\n{}",
+        "wn failed\n{}",
         command_output_summary(&output)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -4356,8 +4356,8 @@ fn daemon_executes_cli_commands_over_socket() {
 #[cfg(unix)]
 fn daemon_socket_path_is_private() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let socket = home.path().join("dev").join("wnd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4369,7 +4369,7 @@ fn daemon_socket_path_is_private() {
         .arg("--secret-store")
         .arg("file")
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
 
     wait_for_daemon(&socket);
 
@@ -4390,7 +4390,7 @@ fn daemon_socket_path_is_private() {
     let pid_mode = home
         .path()
         .join("dev")
-        .join("dmd.pid")
+        .join("wnd.pid")
         .metadata()
         .expect("daemon pid metadata")
         .permissions()
@@ -4407,8 +4407,8 @@ fn daemon_socket_path_is_private() {
 #[test]
 fn daemon_refuses_reset_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let socket = home.path().join("dev").join("wnd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4420,17 +4420,17 @@ fn daemon_refuses_reset_over_socket() {
         .arg("--secret-store")
         .arg("file")
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
 
     wait_for_daemon(&socket);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
         .args(["reset", "--confirm"])
         .output()
-        .expect("dm reset should start");
+        .expect("wn reset should start");
     assert!(
         !output.status.success(),
         "daemon reset unexpectedly succeeded\n{}",
@@ -4447,9 +4447,9 @@ fn daemon_refuses_reset_over_socket() {
 #[test]
 fn daemon_running_does_not_auto_forward_logout() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let account = create_local_account_id(home.path());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4461,16 +4461,16 @@ fn daemon_running_does_not_auto_forward_logout() {
         .arg("--secret-store")
         .arg("file")
         .spawn()
-        .expect("dmd should start");
+        .expect("wnd should start");
 
     wait_for_daemon(&socket);
 
-    let mut logout_command = dm_without_relay(home.path());
-    logout_command.env_remove("DM_SOCKET");
+    let mut logout_command = wn_without_relay(home.path());
+    logout_command.env_remove("WN_SOCKET");
     let logout = logout_command
         .args(["logout", &account])
         .output()
-        .expect("dm logout should start");
+        .expect("wn logout should start");
 
     stop_daemon(&socket, &mut child);
 
@@ -4490,9 +4490,9 @@ fn daemon_running_does_not_auto_forward_logout() {
 #[test]
 fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
 
-    let start = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let start = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4509,20 +4509,20 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
             test_relay_url(),
         ])
         .output()
-        .expect("dm daemon start should run");
+        .expect("wn daemon start should run");
     assert!(
         start.status.success(),
         "daemon start failed\n{}",
         command_output_summary(&start)
     );
 
-    let status = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let status = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
         .args(["daemon", "status"])
         .output()
-        .expect("dm daemon status should run");
+        .expect("wn daemon status should run");
     assert!(
         status.status.success(),
         "daemon status failed\n{}",
@@ -4537,13 +4537,13 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
     assert!(status_json["result"].get("last_sync").is_none());
     assert!(status_json["result"].get("last_runtime_activity").is_some());
 
-    let alice_created = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let alice_created = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
         .args(["create-identity"])
         .output()
-        .expect("dm create-identity should run through daemon");
+        .expect("wn create-identity should run through daemon");
     assert!(
         alice_created.status.success(),
         "daemon execute failed\n{}",
@@ -4557,13 +4557,13 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .as_str()
         .expect("alice account id");
 
-    let bob_created = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let bob_created = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
         .args(["create-identity"])
         .output()
-        .expect("dm second create-identity should run through daemon");
+        .expect("wn second create-identity should run through daemon");
     assert!(
         bob_created.status.success(),
         "daemon second create failed\n{}",
@@ -4575,7 +4575,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .as_str()
         .expect("bob account id");
 
-    let group_created = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let group_created = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--account")
@@ -4583,20 +4583,20 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .arg("--json")
         .args(["groups", "create", "agent", bob])
         .output()
-        .expect("dm groups create should run through daemon");
+        .expect("wn groups create should run through daemon");
     assert!(
         group_created.status.success(),
         "daemon group create failed\n{}",
         command_output_summary(&group_created)
     );
 
-    let whoami = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let whoami = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
         .args(["whoami"])
         .output()
-        .expect("dm whoami should run through daemon");
+        .expect("wn whoami should run through daemon");
     assert!(
         whoami.status.success(),
         "daemon whoami failed\n{}",
@@ -4611,13 +4611,13 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         2
     );
 
-    let stop = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let stop = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
         .args(["daemon", "stop"])
         .output()
-        .expect("dm daemon stop should run");
+        .expect("wn daemon stop should run");
     assert!(
         stop.status.success(),
         "daemon stop failed\n{}",
@@ -4628,7 +4628,7 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
 #[test]
 fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
     let alice = create_account(home.path());
     let bob = create_account(home.path());
     run_json(home.path(), &["--account", &bob, "keys", "publish"]);
@@ -4638,7 +4638,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
 
-    let start = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let start = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--home")
         .arg(home.path())
         .arg("--socket")
@@ -4655,7 +4655,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
             test_relay_url(),
         ])
         .output()
-        .expect("dm daemon start should run");
+        .expect("wn daemon start should run");
     assert!(
         start.status.success(),
         "daemon start failed\n{}",
@@ -4665,7 +4665,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut saw_group = false;
     while Instant::now() < deadline {
-        let output = Command::new(env!("CARGO_BIN_EXE_dm"))
+        let output = Command::new(env!("CARGO_BIN_EXE_wn"))
             .arg("--socket")
             .arg(&socket)
             .arg("--account")
@@ -4673,7 +4673,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
             .arg("--json")
             .args(["chats", "list"])
             .output()
-            .expect("dm chats list should run through daemon");
+            .expect("wn chats list should run through daemon");
         if output.status.success() {
             let value: Value =
                 serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
@@ -4688,7 +4688,7 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = Command::new(env!("CARGO_BIN_EXE_dm"))
+    let _ = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--socket")
         .arg(&socket)
         .arg("--json")
@@ -4717,11 +4717,11 @@ fn missing_key_package_errors_include_repair_guidance() {
     assert_eq!(error["account_id"], bob);
     assert_eq!(
         error["repair"]["local"],
-        format!("dm --account {bob} keys publish")
+        format!("wn --account {bob} keys publish")
     );
     assert_eq!(
         error["repair"]["remote"],
-        "dm keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+        "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
     );
 }
 
@@ -5238,10 +5238,10 @@ fn groups_set_avatar_url_round_trips_through_sync_and_show() {
 
     // Omitting both --url and --clear is a usage error (no silent clear).
     assert!(
-        !dm(home.path())
+        !wn(home.path())
             .args(["--account", &alice, "groups", "set-avatar-url", group_id])
             .output()
-            .expect("dm command should start")
+            .expect("wn command should start")
             .status
             .success(),
         "set-avatar-url without --url/--clear should fail"
@@ -5249,7 +5249,7 @@ fn groups_set_avatar_url_round_trips_through_sync_and_show() {
 
     // --dim without --url is a usage error.
     assert!(
-        !dm(home.path())
+        !wn(home.path())
             .args([
                 "--account",
                 &alice,
@@ -5260,7 +5260,7 @@ fn groups_set_avatar_url_round_trips_through_sync_and_show() {
                 "512x512",
             ])
             .output()
-            .expect("dm command should start")
+            .expect("wn command should start")
             .status
             .success(),
         "set-avatar-url --dim without --url should fail"
@@ -5720,16 +5720,16 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     };
     let relay = relay.as_str();
     let home = tempfile::tempdir().expect("tempdir");
-    let socket = home.path().join("dev").join("dmd.sock");
+    let socket = home.path().join("dev").join("wnd.sock");
 
     let alice = create_account_with_real_relay(home.path(), relay);
     let bob = create_account_with_real_relay(home.path(), relay);
     run_json_with_relay(home.path(), relay, &["--account", &bob, "keys", "publish"]);
 
-    let start = dm_with_relay(home.path(), relay)
+    let start = wn_with_relay(home.path(), relay)
         .args(["daemon", "start"])
         .output()
-        .expect("dm daemon start should run");
+        .expect("wn daemon start should run");
     assert!(
         start.status.success(),
         "daemon start failed\n{}",
@@ -5768,5 +5768,5 @@ fn daemon_real_relay_keeps_live_subscriptions_without_polling_knobs() {
     let messages = wait_until_projected_message(home.path(), relay, &bob, group_id, &body);
     assert_message_plaintexts(&messages, &[&body]);
 
-    let _ = dm(home.path()).args(["daemon", "stop"]).output();
+    let _ = wn(home.path()).args(["daemon", "stop"]).output();
 }

@@ -326,7 +326,7 @@ fn duplicate_directory_entry_save_skips_cache_writes() {
 
 #[test]
 fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
-    // Regression for darkmatter#206: Nostr `created_at` is second-resolution,
+    // Regression for mdk#206: Nostr `created_at` is second-resolution,
     // so a rapid profile republish can carry the same timestamp as the
     // previous pre-edit kind-0. A lagging relay can then serve that stale
     // same-second copy back during a directory refresh. The cache must be
@@ -502,7 +502,7 @@ fn warm_directory_storage_opens_shared_and_local_directory_handles() {
 
 #[test]
 fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
-    // Regression for darkmatter#220: removing an account (or rolling back a
+    // Regression for mdk#220: removing an account (or rolling back a
     // failed setup) must evict the cached account-storage connection and
     // directory-cache handle before the account directory is deleted.
     // Otherwise the stale handle keeps pointing at the unlinked inode and a
@@ -791,7 +791,7 @@ fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
 
     // A non-local known user (e.g. a message sender) is admitted to the
     // directory but must never have its kind-3 contact list subscribed: doing
-    // so feeds the unbounded transitive social-graph crawl (darkmatter#687).
+    // so feeds the unbounded transitive social-graph crawl (mdk#687).
     app.remember_directory_user_with_reason(&sender, "message")
         .unwrap();
 

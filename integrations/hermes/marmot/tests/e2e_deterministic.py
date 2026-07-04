@@ -5,7 +5,7 @@ This test uses a real Hermes checkout and the real Marmot Hermes plugin, but it
 replaces both sides that would otherwise require a full Marmot account and an
 LLM:
 
-* a fake ``dm-agent`` Unix socket speaks the agent-control protocol;
+* a fake ``wn-agent`` Unix socket speaks the agent-control protocol;
 * a deterministic Hermes message handler returns a fixed response string.
 
 That still exercises Hermes' BasePlatformAdapter intake/delivery pipeline and
@@ -193,7 +193,7 @@ async def run() -> None:
         )
 
     with tempfile.TemporaryDirectory(prefix="marmot-hermes-e2e-") as tmp:
-        fake_server = FakeAgentControlServer(Path(tmp) / "dm-agent.sock")
+        fake_server = FakeAgentControlServer(Path(tmp) / "wn-agent.sock")
         await fake_server.start()
         prior_socket = os.environ.get("MARMOT_AGENT_SOCKET")
         os.environ["MARMOT_AGENT_SOCKET"] = str(fake_server.socket_path)

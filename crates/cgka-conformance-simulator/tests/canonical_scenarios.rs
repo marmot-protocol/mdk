@@ -823,7 +823,7 @@ async fn convergence_chaos_family_generates_specs_with_semantic_expectations() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn convergence_chaos_family_seed_changes_scenarios() {
-    // Regression for darkmatter#166: distinct seeds must produce distinct
+    // Regression for mdk#166: distinct seeds must produce distinct
     // chaos scenarios. Before the fix, every shape except the rollback case was
     // a pure function of case_index, so seeded batches silently re-ran the same
     // fixed scenarios and coverage did not grow with seeds.
@@ -846,7 +846,7 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
     // Arm 2 (rollback queue faults) must vary a real behavioral dimension, not
     // just the app payload string: the seed-driven delivery schedule (the
     // ReorderQueued permutation) must differ across seeds. This is the
-    // regression guard for darkmatter#166's blocking review finding — before
+    // regression guard for mdk#166's blocking review finding — before
     // the fix, arm 2's only rng use was a random u16 appended to a payload, so
     // normalizing the payload made both seeds' scenarios identical.
     let reorder_order = |case: &GeneratedScenarioCase| -> Vec<usize> {
@@ -884,7 +884,7 @@ async fn convergence_chaos_family_seed_changes_scenarios() {
 
 #[tokio::test]
 async fn convergence_chaos_rollback_fault_duplicates_post_rollback_app_message() {
-    // Regression for darkmatter#163: the rollback arm must duplicate and delay
+    // Regression for mdk#163: the rollback arm must duplicate and delay
     // a Bob app message that Alice actually ticks, not the rolled-back commit
     // pinned at queue index 0 and addressed to Bob.
     let cases = generate_convergence_chaos_family(123, 3);

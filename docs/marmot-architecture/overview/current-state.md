@@ -117,10 +117,10 @@ variants.
   retained-anchor pruning, and privacy-oriented SQLite defaults. `cgka-session` opens one encrypted database per
   account-device identity. App key-management integration, packaging, and longer-term rekey/vacuum/checkpoint policy
   still need production wiring.
-- **App-core hardening** — `marmot-app` and `dm` now exercise real account setup, key storage, relay-list repair,
+- **App-core hardening** — `marmot-app` and `wn` now exercise real account setup, key storage, relay-list repair,
   KeyPackage publication/fetch, directory cache, group membership, group profile projection, message projection, local
   archive state, and sync. The next hardening pass should keep app policy in `marmot-app`/`marmot-account` and keep
-  `dm` focused on command presentation and stable JSON output. The current boundary is summarized in
+  `wn` focused on command presentation and stable JSON output. The current boundary is summarized in
   [`app-core-boundary.md`](./app-core-boundary.md).
 - **Production transport adapters** — `transport-nostr-adapter` now implements the Nostr adapter core over an injectable
   relay-client boundary, with an optional `nostr-sdk` relay client, exact stale group subscription cleanup,
@@ -131,7 +131,7 @@ variants.
   invite commit/welcome order variants, and terminal stale-epoch invite commits through the real session, adapter, and
   peeler stack. Production relay auth, relay safety policy, full KeyPackage metadata derivation through the transport
   layer, and account key-management wiring still need integration. The opt-in relay-telemetry export pipeline is built:
-local visibility via `dm relay-stats`, an opt-in index→identity resolution boundary, a relay-plane rollup, and an
+local visibility via `wn relay-stats`, an opt-in index→identity resolution boundary, a relay-plane rollup, and an
 opt-in OTLP exporter (wire encoding behind the `marmot-app` `otlp-export` feature) — all aggregate, off by default, and
 carrying relay identity as the sole label. Wiring its periodic push into a long-running host against the production
 first-party endpoint remains ops work; see [`../relay-observability.md`](../relay-observability.md).

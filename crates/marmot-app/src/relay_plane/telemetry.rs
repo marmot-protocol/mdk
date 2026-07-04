@@ -7,7 +7,7 @@ use super::RelayPlaneHealth;
 
 /// Device-local relay telemetry bundled for local inspection.
 ///
-/// This is the read model behind `dm relay-stats`: it surfaces the adapter's
+/// This is the read model behind `wn relay-stats`: it surfaces the adapter's
 /// existing aggregate, privacy-safe snapshots (lifecycle counters, cross-relay
 /// arrival spread, subscription sync timing) alongside redacted relay health.
 ///

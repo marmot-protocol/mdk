@@ -25,18 +25,18 @@ RUN git clone --depth 1 "$HERMES_AGENT_REPO_URL" /opt/hermes-agent \
     && /opt/hermes-agent/.venv/bin/python -m pip install --upgrade pip \
     && /opt/hermes-agent/.venv/bin/python -m pip install -e "/opt/hermes-agent[all,dev]"
 
-WORKDIR /work/darkmatter
+WORKDIR /work/mdk
 COPY . .
 
-RUN cargo build --locked --release -p agent-connector --bin dm-agent \
-    && install -m 0755 target/release/dm-agent /usr/local/bin/dm-agent \
+RUN cargo build --locked --release -p agent-connector --bin wn-agent \
+    && install -m 0755 target/release/wn-agent /usr/local/bin/wn-agent \
     && install -m 0755 scripts/hermes_marmot_configure_gateway.py /usr/local/bin/marmot-configure-hermes-gateway \
     && install -m 0755 scripts/hermes_marmot_container_entrypoint.sh /usr/local/bin/hermes-marmot-entrypoint \
     && ln -sfn /opt/hermes-agent/.venv/bin/hermes /usr/local/bin/hermes
 
 ENV MARMOT_HOME=/data/marmot-agent \
     HERMES_HOME=/data/hermes-home \
-    MARMOT_AGENT_SOCKET=/run/marmot-agent/dm-agent.sock \
+    MARMOT_AGENT_SOCKET=/run/marmot-agent/wn-agent.sock \
     MARMOT_AGENT_AUTH_TOKEN_FILE=/data/marmot-agent/control.token \
     MARMOT_AGENT_SOCKET_DIR_MODE=0770 \
     MARMOT_AGENT_SOCKET_MODE=0660 \

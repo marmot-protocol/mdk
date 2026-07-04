@@ -22,14 +22,14 @@ use transport_quic_stream::{
 };
 
 use crate::{
-    AgentStreamDelta, CommandOutput, DmError, StreamCommand, agent_text_stream_payload_value,
+    AgentStreamDelta, CommandOutput, StreamCommand, WnError, agent_text_stream_payload_value,
     ensure_local_signing, normalize_group_id_hex, npub_for_account_id, resolve_account,
     resolve_account_ref, stream_route_label, unix_now_seconds, unsupported_command,
 };
 
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
 
-pub(crate) async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, DmError> {
+pub(crate) async fn stream_command_local(command: StreamCommand) -> Result<CommandOutput, WnError> {
     match command {
         StreamCommand::Receive {
             bind,
@@ -78,7 +78,7 @@ pub(crate) async fn stream_command_local(command: StreamCommand) -> Result<Comma
             text,
         } => {
             if text.is_empty() {
-                return Err(DmError::EmptyStreamText);
+                return Err(WnError::EmptyStreamText);
             }
             let text = text.join(" ");
             let stream_id = stream_id
@@ -89,7 +89,7 @@ pub(crate) async fn stream_command_local(command: StreamCommand) -> Result<Comma
             if broker {
                 let trust = broker_trust(connect, server_cert_der_hex, insecure_local)?;
                 if !anchored {
-                    return Err(DmError::MissingStreamStart);
+                    return Err(WnError::MissingStreamStart);
                 }
                 let sent = publish_text_to_broker(PublishTextToBroker {
                     broker_addr: connect,
@@ -174,7 +174,7 @@ pub(crate) async fn stream_command_app(
     app: &MarmotApp,
     command: StreamCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     stream_command_app_with_runtime(account_home, app, &runtime, command, account_flag).await
 }
@@ -185,7 +185,7 @@ pub(crate) async fn stream_command_app_with_runtime(
     runtime: &MarmotAppRuntime,
     command: StreamCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         StreamCommand::Start {
             group,
@@ -264,7 +264,7 @@ pub(crate) async fn stream_command_app_with_runtime(
             text,
         } => {
             if text.is_empty() {
-                return Err(DmError::EmptyStreamText);
+                return Err(WnError::EmptyStreamText);
             }
             let text = text.join(" ");
             let selected_account = resolve_selected_account(account_home, account_flag)?;
@@ -274,7 +274,7 @@ pub(crate) async fn stream_command_app_with_runtime(
             let selected_account_id_hex = selected_account
                 .as_ref()
                 .map(|account| account.account_id_hex.as_str());
-            let start_event_id_hex = start_event_id.ok_or(DmError::MissingStreamStart)?;
+            let start_event_id_hex = start_event_id.ok_or(WnError::MissingStreamStart)?;
             let expected_stream_id_hex =
                 stream_id.map(|value| normalize_hex(&value)).transpose()?;
             let (stream_id, crypto, policy_max_plaintext_frame_len) =
@@ -370,7 +370,7 @@ pub(crate) async fn stream_command_app_with_runtime(
             text,
         } => {
             if text.is_empty() {
-                return Err(DmError::EmptyStreamText);
+                return Err(WnError::EmptyStreamText);
             }
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -490,7 +490,7 @@ pub(crate) async fn stream_watch_command_app_with_runtime<F>(
     command: StreamCommand,
     account_flag: Option<String>,
     mut on_delta: F,
-) -> Result<CommandOutput, DmError>
+) -> Result<CommandOutput, WnError>
 where
     F: FnMut(AgentStreamDelta) + Send,
 {
@@ -519,10 +519,10 @@ where
     let (start_message_id_hex, start_payload, _start_sender_hex) =
         latest_stream_start(messages, expected_stream_id_hex.as_deref())?;
     if start_message_id_hex.is_empty() {
-        return Err(DmError::StreamStartNotConfirmed);
+        return Err(WnError::StreamStartNotConfirmed);
     }
     if start_payload.route != "quic" {
-        return Err(DmError::UnsupportedStreamRoute(
+        return Err(WnError::UnsupportedStreamRoute(
             stream_route_label(&start_payload.route).to_owned(),
         ));
     }
@@ -530,7 +530,7 @@ where
         .quic_candidates
         .iter()
         .find(|candidate| candidate.trim().starts_with("quic://"))
-        .ok_or(DmError::MissingQuicCandidate)?;
+        .ok_or(WnError::MissingQuicCandidate)?;
     let candidate = parse_quic_candidate(candidate)?;
     // Only an explicit local `--insecure-local` opt-in may resolve to a
     // local/private endpoint; otherwise reject unsafe sender-provided candidates.
@@ -608,7 +608,7 @@ where
     })
 }
 
-fn stream_start_event_id(start_event_id: Option<String>) -> Result<(MessageId, bool), DmError> {
+fn stream_start_event_id(start_event_id: Option<String>) -> Result<(MessageId, bool), WnError> {
     match start_event_id {
         Some(value) => Ok((MessageId::new(hex::decode(value)?), true)),
         None => Ok((MessageId::new(vec![0; 32]), false)),
@@ -618,7 +618,7 @@ fn stream_start_event_id(start_event_id: Option<String>) -> Result<(MessageId, b
 fn latest_stream_start(
     messages: Vec<AppMessageRecord>,
     stream_id_hex: Option<&str>,
-) -> Result<(String, StreamStartView, String), DmError> {
+) -> Result<(String, StreamStartView, String), WnError> {
     let stream_id_hex = stream_id_hex.map(normalize_hex).transpose()?;
     messages
         .into_iter()
@@ -635,7 +635,7 @@ fn latest_stream_start(
                 None
             }
         })
-        .ok_or(DmError::MissingStreamStart)
+        .ok_or(WnError::MissingStreamStart)
 }
 
 pub(crate) async fn stream_crypto_for_start_event(
@@ -650,7 +650,7 @@ pub(crate) async fn stream_crypto_for_start_event(
         transport_quic_stream::AgentTextStreamCrypto,
         Option<u32>,
     ),
-    DmError,
+    WnError,
 > {
     let context = runtime
         .agent_text_stream_crypto_for_start_event(
@@ -668,19 +668,19 @@ pub(crate) async fn stream_crypto_for_start_event(
     ))
 }
 
-fn map_agent_stream_crypto_error(err: AppError) -> DmError {
+fn map_agent_stream_crypto_error(err: AppError) -> WnError {
     match err {
-        AppError::AgentStreamMissingStart => DmError::MissingStreamStart,
-        AppError::AgentStreamStartNotConfirmed => DmError::StreamStartNotConfirmed,
+        AppError::AgentStreamMissingStart => WnError::MissingStreamStart,
+        AppError::AgentStreamStartNotConfirmed => WnError::StreamStartNotConfirmed,
         AppError::AgentStreamUnsupportedRoute => {
-            DmError::UnsupportedStreamRoute("non-quic".to_owned())
+            WnError::UnsupportedStreamRoute("non-quic".to_owned())
         }
-        AppError::AgentStreamMissingCandidate => DmError::MissingQuicCandidate,
+        AppError::AgentStreamMissingCandidate => WnError::MissingQuicCandidate,
         AppError::AgentStreamInvalidCandidate(candidate) => {
-            DmError::InvalidQuicCandidate(candidate)
+            WnError::InvalidQuicCandidate(candidate)
         }
-        AppError::Hex(err) => DmError::Hex(err),
-        other => DmError::App(other),
+        AppError::Hex(err) => WnError::Hex(err),
+        other => WnError::App(other),
     }
 }
 
@@ -699,14 +699,14 @@ fn quic_authority(rest: &str) -> &str {
     rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
-pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, DmError> {
+pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidate, WnError> {
     let trimmed = candidate.trim();
     let Some(rest) = trimmed.strip_prefix("quic://") else {
-        return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
+        return Err(WnError::InvalidQuicCandidate(trimmed.to_owned()));
     };
     let authority = quic_authority(rest);
     if authority.is_empty() {
-        return Err(DmError::InvalidQuicCandidate(trimmed.to_owned()));
+        return Err(WnError::InvalidQuicCandidate(trimmed.to_owned()));
     }
     let server_name = candidate_server_name(authority)?;
     Ok(ParsedQuicCandidate {
@@ -728,18 +728,18 @@ pub(crate) fn parse_quic_candidate(candidate: &str) -> Result<ParsedQuicCandidat
 pub(crate) async fn resolve_quic_candidate_addr(
     candidate: &ParsedQuicCandidate,
     allow_local_endpoint: bool,
-) -> Result<SocketAddr, DmError> {
+) -> Result<SocketAddr, WnError> {
     let mut addrs = tokio::net::lookup_host(&candidate.authority)
         .await
-        .map_err(|source| DmError::QuicCandidateResolve {
+        .map_err(|source| WnError::QuicCandidateResolve {
             candidate: candidate.original.clone(),
             source,
         })?;
     let addr = addrs
         .next()
-        .ok_or_else(|| DmError::InvalidQuicCandidate(candidate.original.clone()))?;
+        .ok_or_else(|| WnError::InvalidQuicCandidate(candidate.original.clone()))?;
     if !allow_local_endpoint && socket_addr_is_unsafe(addr) {
-        return Err(DmError::UnsafeQuicCandidateEndpoint {
+        return Err(WnError::UnsafeQuicCandidateEndpoint {
             candidate: candidate.original.clone(),
             addr,
         });
@@ -755,10 +755,10 @@ fn socket_addr_is_unsafe(addr: SocketAddr) -> bool {
     !is_public_ip(addr.ip())
 }
 
-fn candidate_server_name(authority: &str) -> Result<String, DmError> {
+fn candidate_server_name(authority: &str) -> Result<String, WnError> {
     if let Some(rest) = authority.strip_prefix('[') {
         let Some((host, _)) = rest.split_once(']') else {
-            return Err(DmError::InvalidQuicCandidate(authority.to_owned()));
+            return Err(WnError::InvalidQuicCandidate(authority.to_owned()));
         };
         return Ok(host.to_owned());
     }
@@ -766,7 +766,7 @@ fn candidate_server_name(authority: &str) -> Result<String, DmError> {
         .rsplit_once(':')
         .map(|(host, _)| host.to_owned())
         .filter(|host| !host.is_empty())
-        .ok_or_else(|| DmError::InvalidQuicCandidate(authority.to_owned()))
+        .ok_or_else(|| WnError::InvalidQuicCandidate(authority.to_owned()))
 }
 
 pub(crate) fn first_quic_candidate_is_loopback(candidates: &[String]) -> bool {
@@ -798,15 +798,15 @@ fn quic_host_is_loopback(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], DmError> {
+fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], WnError> {
     let bytes = hex::decode(value)?;
     let actual = bytes.len();
     bytes
         .try_into()
-        .map_err(|_| DmError::InvalidTranscriptHashLength(actual))
+        .map_err(|_| WnError::InvalidTranscriptHashLength(actual))
 }
 
-pub(crate) fn normalize_hex(value: &str) -> Result<String, DmError> {
+pub(crate) fn normalize_hex(value: &str) -> Result<String, WnError> {
     Ok(hex::encode(hex::decode(value)?))
 }
 
@@ -814,9 +814,9 @@ pub(crate) fn broker_trust(
     server_addr: SocketAddr,
     server_cert_der_hex: Option<String>,
     insecure_local: bool,
-) -> Result<BrokerServerTrust, DmError> {
+) -> Result<BrokerServerTrust, WnError> {
     if insecure_local && server_cert_der_hex.is_some() {
-        return Err(DmError::ConflictingStreamTrust);
+        return Err(WnError::ConflictingStreamTrust);
     }
     if insecure_local {
         ensure_insecure_local_endpoint(server_addr)?;
@@ -841,9 +841,9 @@ fn stream_trust(
     server_addr: SocketAddr,
     server_cert_der_hex: Option<String>,
     insecure_local: bool,
-) -> Result<ServerTrust, DmError> {
+) -> Result<ServerTrust, WnError> {
     if insecure_local && server_cert_der_hex.is_some() {
-        return Err(DmError::ConflictingStreamTrust);
+        return Err(WnError::ConflictingStreamTrust);
     }
     if insecure_local {
         ensure_insecure_local_endpoint(server_addr)?;
@@ -856,11 +856,11 @@ fn stream_trust(
         .map_err(Into::into)
 }
 
-fn ensure_insecure_local_endpoint(server_addr: SocketAddr) -> Result<(), DmError> {
+fn ensure_insecure_local_endpoint(server_addr: SocketAddr) -> Result<(), WnError> {
     if server_addr.ip().is_loopback() {
         return Ok(());
     }
-    Err(DmError::InsecureLocalRequiresLoopback(server_addr))
+    Err(WnError::InsecureLocalRequiresLoopback(server_addr))
 }
 
 fn stream_trust_name(trust: &ServerTrust) -> &'static str {
@@ -874,9 +874,9 @@ fn stream_trust_name(trust: &ServerTrust) -> &'static str {
 fn resolve_selected_account(
     account_home: &AccountHome,
     explicit: Option<String>,
-) -> Result<Option<marmot_account::AccountSummary>, DmError> {
+) -> Result<Option<marmot_account::AccountSummary>, WnError> {
     let Some(account) = explicit
-        .or_else(|| std::env::var("DM_ACCOUNT").ok())
+        .or_else(|| std::env::var("WN_ACCOUNT").ok())
         .filter(|account| !account.trim().is_empty())
     else {
         return Ok(None);

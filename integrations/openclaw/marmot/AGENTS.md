@@ -1,11 +1,11 @@
 # AGENTS.md - integrations/openclaw/marmot
 
-OpenClaw channel plugin for Marmot through the local `dm-agent` control socket.
+OpenClaw channel plugin for Marmot through the local `wn-agent` control socket.
 The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first.
 
 ## Scope
 
-- A thin, **control-plane-only** OpenClaw channel plugin. `dm-agent` owns the
+- A thin, **control-plane-only** OpenClaw channel plugin. `wn-agent` owns the
   Marmot account, MLS state, Nostr transport, and QUIC previews; this plugin
   only speaks `marmot.agent-control.v1` (NDJSON over a Unix socket).
 - Keep transcript hashing byte-for-byte with the authoritative Rust
@@ -27,7 +27,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - `src/messaging.ts` — `messaging` target-resolution adapter so the shared `message` tool can resolve a Marmot conversation (group id hex).
 - `src/config.ts` — channel config schema + `MARMOT_*` resolution.
 - `src/account.ts` — single agent-account resolution (`account_list`).
-- `src/security.ts` — OpenClaw `dm.allowFrom` → `dm-agent` welcomer allowlist sync.
+- `src/security.ts` — OpenClaw `dm.allowFrom` → `wn-agent` welcomer allowlist sync.
 - `src/channel.ts` — `createChatChannelPlugin` (meta, capabilities, config, message, security, threading).
 - `index.ts` / `setup-entry.ts` — plugin runtime + setup entries.
 - `test/` — Vitest unit + parity tests; `test/vectors/transcript-vectors.json` is generated from the Rust impl.

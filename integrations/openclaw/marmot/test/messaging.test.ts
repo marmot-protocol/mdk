@@ -69,7 +69,7 @@ describe("createMarmotMessagingAdapter", () => {
     expect(adapter.inferTargetChatType?.({ to: GID16 })).toBe("group");
   });
 
-  it("normalizes targets to the bare hex dm-agent expects", () => {
+  it("normalizes targets to the bare hex wn-agent expects", () => {
     expect(adapter.normalizeTarget?.(`${MARMOT_TARGET_PREFIX}:${GID16}`)).toBe(GID16);
     expect(adapter.normalizeTarget?.("nope")).toBeUndefined();
   });

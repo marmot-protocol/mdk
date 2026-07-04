@@ -1,6 +1,6 @@
-// Bridge OpenClaw's per-account allow-from list into dm-agent's welcomer
+// Bridge OpenClaw's per-account allow-from list into wn-agent's welcomer
 // allowlist, so the connector accepts group welcomes from accounts the operator
-// approved in OpenClaw. dm-agent still performs welcomer-based post-join
+// approved in OpenClaw. wn-agent still performs welcomer-based post-join
 // accept/decline; this only keeps the two allowlists in sync.
 //
 // Marmot welcomer ids are account pubkey hex; non-hex OpenClaw allow entries
@@ -26,7 +26,7 @@ export interface AllowlistSyncResult {
 }
 
 /**
- * Reconcile dm-agent's welcomer allowlist for `accountIdHex` to exactly the
+ * Reconcile wn-agent's welcomer allowlist for `accountIdHex` to exactly the
  * hex ids in `desired`. Returns the ids added and removed.
  */
 export async function syncAllowlist(

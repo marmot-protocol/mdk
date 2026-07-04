@@ -889,7 +889,7 @@ mod otlp {
 
     fn resource_attributes(resource: &RelayTelemetryResource) -> Vec<KeyValue> {
         let mut attributes = vec![
-            string_key_value("service.name", "darkmatter"),
+            string_key_value("service.name", "mdk"),
             string_key_value("service.namespace", "marmot"),
             string_key_value("service.version", resource.service_version.clone()),
             string_key_value("service.instance.id", resource.service_instance_id.clone()),
@@ -1081,7 +1081,7 @@ mod otlp {
                     service_version: "1.4.2".to_owned(),
                     service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
                     deployment_environment: "staging".to_owned(),
-                    tenant: "darkmatter-ios".to_owned(),
+                    tenant: "mdk-ios".to_owned(),
                     os_type: "ios".to_owned(),
                     os_version: "17.5".to_owned(),
                     device_model_identifier: Some("iPhone15,3".to_owned()),
@@ -1102,7 +1102,7 @@ mod otlp {
                         other => panic!("expected string resource attr, got {other:?}"),
                     })
             };
-            assert_eq!(resource_attr("service.name"), Some("darkmatter"));
+            assert_eq!(resource_attr("service.name"), Some("mdk"));
             assert_eq!(resource_attr("service.namespace"), Some("marmot"));
             assert_eq!(resource_attr("service.version"), Some("1.4.2"));
             assert_eq!(
@@ -1114,7 +1114,7 @@ mod otlp {
                 Some("staging")
             );
             assert_eq!(resource_attr("deployment.environment"), None);
-            assert_eq!(resource_attr("tenant"), Some("darkmatter-ios"));
+            assert_eq!(resource_attr("tenant"), Some("mdk-ios"));
             assert_eq!(resource_attr("os.type"), Some("ios"));
             assert_eq!(resource_attr("os.version"), Some("17.5"));
             assert_eq!(resource_attr("device.model.identifier"), Some("iPhone15,3"));

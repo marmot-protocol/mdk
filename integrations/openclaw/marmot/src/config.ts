@@ -1,5 +1,5 @@
 // Channel config schema + resolution. Mirrors the Hermes plugin's env knobs so
-// the same dm-agent deployment serves both gateways. Config can come from the
+// the same wn-agent deployment serves both gateways. Config can come from the
 // OpenClaw channel config block or from MARMOT_* environment variables.
 
 import { readFileSync } from "node:fs";
@@ -80,11 +80,11 @@ export interface ResolveDeps {
 
 /** Per-account config properties (shared by the root slice and `accounts.<id>`). */
 const MARMOT_ACCOUNT_PROPERTIES = {
-  home: { type: "string", description: "dm-agent home directory (default ~/.marmot)." },
-  socketPath: { type: "string", description: "dm-agent control socket path." },
+  home: { type: "string", description: "wn-agent home directory (default ~/.marmot)." },
+  socketPath: { type: "string", description: "wn-agent control socket path." },
   accountIdHex: {
     type: "string",
-    description: "Marmot agent account id hex; required when dm-agent has more than one account.",
+    description: "Marmot agent account id hex; required when wn-agent has more than one account.",
   },
   authToken: { type: "string", description: "Bearer token for a token-gated control socket." },
   authTokenFile: { type: "string", description: "Path to a bearer token file." },
@@ -285,7 +285,7 @@ function resolveBlockStreaming(
 }
 
 /**
- * Resolve the dm-agent connection + policy for an OpenClaw account, layering
+ * Resolve the wn-agent connection + policy for an OpenClaw account, layering
  * channel config over MARMOT_* environment variables (config wins).
  */
 export function resolveMarmotAccount(
@@ -303,7 +303,7 @@ export function resolveMarmotAccount(
     home,
   );
   const socketPath = expandHome(
-    firstNonEmpty(cfg.socketPath, env.MARMOT_AGENT_SOCKET) ?? `${marmotHome}/dev/dm-agent.sock`,
+    firstNonEmpty(cfg.socketPath, env.MARMOT_AGENT_SOCKET) ?? `${marmotHome}/dev/wn-agent.sock`,
     home,
   );
 

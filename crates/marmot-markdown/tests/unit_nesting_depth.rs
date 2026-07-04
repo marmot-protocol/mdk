@@ -1,4 +1,4 @@
-//! Regression tests for darkmatter#208 — unbounded inline emphasis nesting
+//! Regression tests for mdk#208 — unbounded inline emphasis nesting
 //! depth crashed the recipient via a stack-overflow abort.
 //!
 //! The block parser caps container nesting at `MAX_CONTAINER_DEPTH`, but inline
@@ -97,7 +97,7 @@ fn nested_stars(n: usize) -> String {
 }
 
 /// `"![" * n + "a" + "](x)" * n` — the nested-image attack shape from the
-/// adversarial review of darkmatter#208. Each `](x)` closes one image and
+/// adversarial review of mdk#208. Each `](x)` closes one image and
 /// wraps the prior content as its alt text, building image nesting of depth
 /// ~n+1 unless capped.
 fn nested_images(n: usize) -> String {
@@ -156,7 +156,7 @@ fn deeply_nested_strikethrough_does_not_overflow() {
 
 #[test]
 fn deeply_nested_images_do_not_overflow_parse() {
-    // Adversarial review of darkmatter#208: the emphasis-only cap left the
+    // Adversarial review of mdk#208: the emphasis-only cap left the
     // link/image wrapping path (`absorb_link`) unguarded, so `"![" * N + "a"
     // + "](x)" * N` still built image nesting of depth ~N and aborted in
     // parse()/serde/uniffi. Run on a deliberately small (1 MiB) stack so an

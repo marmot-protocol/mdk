@@ -4,11 +4,15 @@ use super::*;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "dmd",
-    about = "Darkmatter background runtime daemon for live subscriptions and stream previews"
+    name = "wnd",
+    about = "White Noise background runtime daemon for live subscriptions and stream previews"
 )]
 pub(crate) struct DaemonArgs {
-    #[arg(long, value_name = "PATH", help = "Use this Darkmatter data directory")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Use this White Noise data directory"
+    )]
     pub(crate) home: Option<PathBuf>,
     #[arg(long, value_name = "PATH", help = "Alias for --home")]
     pub(crate) data_dir: Option<PathBuf>,
@@ -65,15 +69,15 @@ pub(crate) struct DaemonDefaults {
 }
 
 pub fn default_socket_path(home: &Path) -> PathBuf {
-    home.join("dev").join("dmd.sock")
+    home.join("dev").join("wnd.sock")
 }
 
 pub fn default_pid_path(home: &Path) -> PathBuf {
-    home.join("dev").join("dmd.pid")
+    home.join("dev").join("wnd.pid")
 }
 
 pub fn default_log_path(home: &Path) -> PathBuf {
-    home.join("dev").join("dmd.log")
+    home.join("dev").join("wnd.log")
 }
 
 pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliOutput {
@@ -88,7 +92,7 @@ pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliO
             let socket = cli
                 .socket
                 .clone()
-                .or_else(|| std::env::var_os("DM_SOCKET").map(PathBuf::from))
+                .or_else(|| std::env::var_os("WN_SOCKET").map(PathBuf::from))
                 .unwrap_or_else(|| default_socket_path(&home));
             start_daemon(
                 &cli,
@@ -105,7 +109,7 @@ pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliO
             let socket = cli
                 .socket
                 .clone()
-                .or_else(|| std::env::var_os("DM_SOCKET").map(PathBuf::from))
+                .or_else(|| std::env::var_os("WN_SOCKET").map(PathBuf::from))
                 .unwrap_or_else(|| default_socket_path(&home));
             stop_daemon(cli.json, &socket).await
         }
@@ -114,7 +118,7 @@ pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliO
             let socket = cli
                 .socket
                 .clone()
-                .or_else(|| std::env::var_os("DM_SOCKET").map(PathBuf::from))
+                .or_else(|| std::env::var_os("WN_SOCKET").map(PathBuf::from))
                 .unwrap_or_else(|| default_socket_path(&home));
             status_daemon(cli.json, &socket).await
         }
@@ -160,7 +164,7 @@ pub(crate) fn daemon_peer_uid_authorized(peer_uid: libc::uid_t, server_uid: libc
 
 pub(crate) fn blocked_daemon_execute_output(cli: &Cli) -> Option<CliOutput> {
     let (command, reason) = blocked_daemon_execute_command(&cli.command)?;
-    let message = format!("{command} cannot be run through dmd: {reason}");
+    let message = format!("{command} cannot be run through wnd: {reason}");
     if cli.json {
         return Some(CliOutput {
             code: 1,
@@ -193,11 +197,11 @@ pub(crate) fn blocked_daemon_execute_command(
     match command {
         crate::Command::Reset { .. } => Some((
             "reset",
-            "it deletes the daemon home; run dm reset directly after stopping the daemon",
+            "it deletes the daemon home; run wn reset directly after stopping the daemon",
         )),
         crate::Command::Logout { .. } => Some((
             "logout",
-            "it removes a local account; run dm logout directly without --socket",
+            "it removes a local account; run wn logout directly without --socket",
         )),
         crate::Command::Stream { command } => crate::client_hosted_stream_command(command),
         _ => None,
@@ -249,7 +253,7 @@ pub(crate) async fn start_daemon(
         return daemon_error(
             cli.json,
             "missing_relay_url",
-            crate::DmError::MissingRelay.to_string(),
+            crate::WnError::MissingRelay.to_string(),
         );
     }
 
@@ -283,14 +287,14 @@ pub(crate) async fn start_daemon(
         command.arg("--logs-dir").arg(logs_dir);
     }
     detach_daemon_command(&mut command);
-    // Mirror dmd's run_server log-path derivation so the captured stdout/stderr
+    // Mirror wnd's run_server log-path derivation so the captured stdout/stderr
     // and the readiness hint point at the requested directory, not the default.
     let log_path = match &logs_dir {
         Some(dir) => {
             if let Err(err) = std::fs::create_dir_all(dir) {
                 return daemon_error(cli.json, "daemon_start_failed", err.to_string());
             }
-            dir.join("dmd.log")
+            dir.join("wnd.log")
         }
         None => default_log_path(home),
     };
@@ -485,7 +489,7 @@ pub(crate) fn daemon_error(json: bool, code: &str, message: String) -> CliOutput
     }
 }
 
-pub(crate) fn normalize_relay_list(relays: Vec<String>) -> Result<Vec<String>, crate::DmError> {
+pub(crate) fn normalize_relay_list(relays: Vec<String>) -> Result<Vec<String>, crate::WnError> {
     relays
         .into_iter()
         .map(crate::validate_relay_url)
@@ -518,7 +522,7 @@ pub(crate) async fn remove_stale_pid(pid_path: &Path) -> std::io::Result<()> {
 
 pub(crate) fn open_daemon_log(log_path: &Path) -> std::io::Result<std::fs::File> {
     let mut log = open_private_append_file(log_path)?;
-    writeln!(log, "dmd start requested at {}", unix_now())?;
+    writeln!(log, "wnd start requested at {}", unix_now())?;
     Ok(log)
 }
 
@@ -583,7 +587,7 @@ pub(crate) async fn remove_stale_socket(
         Err(err) => Err(std::io::Error::new(
             ErrorKind::AddrInUse,
             format!(
-                "socket already exists at {} but did not respond as dmd: {err}",
+                "socket already exists at {} but did not respond as wnd: {err}",
                 socket.display()
             ),
         )
@@ -591,10 +595,10 @@ pub(crate) async fn remove_stale_socket(
     }
 }
 
-pub(crate) fn relay_error_code(err: &crate::DmError) -> &'static str {
+pub(crate) fn relay_error_code(err: &crate::WnError) -> &'static str {
     match err {
-        crate::DmError::EmptyRelayUrl => "empty_relay_url",
-        crate::DmError::InvalidRelayUrl(_) => "invalid_relay_url",
+        crate::WnError::EmptyRelayUrl => "empty_relay_url",
+        crate::WnError::InvalidRelayUrl(_) => "invalid_relay_url",
         _ => "relay_url_error",
     }
 }
@@ -611,7 +615,7 @@ pub(crate) fn daemon_executable() -> Result<PathBuf, String> {
     if let Ok(current) = std::env::current_exe()
         && let Some(parent) = current.parent()
     {
-        let sibling = parent.join("dmd");
+        let sibling = parent.join("wnd");
         if sibling.is_file() {
             return Ok(sibling);
         }
@@ -620,9 +624,9 @@ pub(crate) fn daemon_executable() -> Result<PathBuf, String> {
     std::env::var_os("PATH")
         .and_then(|paths| {
             std::env::split_paths(&paths).find_map(|dir| {
-                let candidate = dir.join("dmd");
+                let candidate = dir.join("wnd");
                 candidate.is_file().then_some(candidate)
             })
         })
-        .ok_or_else(|| "dmd not found; ensure it is built and on PATH".to_owned())
+        .ok_or_else(|| "wnd not found; ensure it is built and on PATH".to_owned())
 }

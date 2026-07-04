@@ -88,7 +88,7 @@ pub(crate) async fn handle_app_runtime_account_setup_request(
     let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
-            Err(crate::DmError::MissingRelay),
+            Err(crate::WnError::MissingRelay),
         ));
     };
     // create_or_import_account drives relay I/O through the cloned runtime handle (internally
@@ -102,7 +102,7 @@ pub(crate) async fn handle_app_runtime_account_setup_request(
 }
 
 /// Execute-path entry: reconcile under the lock, then dispatch the hosted command off the lock
-/// against a cloned runtime handle (#633). This is the common `dm group|message|chats|…` path.
+/// against a cloned runtime handle (#633). This is the common `wn group|message|chats|…` path.
 pub(crate) async fn handle_app_runtime_command_request(
     cli: &Cli,
     defaults: &DaemonDefaults,
@@ -116,7 +116,7 @@ pub(crate) async fn handle_app_runtime_command_request(
     let Some(runtime) = reconcile_and_clone_runtime(defaults, state, events, workers).await else {
         return Some(crate::command_output_result(
             cli.json,
-            Err(crate::DmError::MissingRelay),
+            Err(crate::WnError::MissingRelay),
         ));
     };
     dispatch_hosted_runtime_command(cli, defaults, &runtime).await
@@ -139,7 +139,7 @@ pub(crate) async fn handle_hosted_runtime_command_with_host(
     let Some(runtime) = &host.runtime else {
         return Some(crate::command_output_result(
             cli.json,
-            Err(crate::DmError::MissingRelay),
+            Err(crate::WnError::MissingRelay),
         ));
     };
     dispatch_hosted_runtime_command(cli, defaults, runtime).await
@@ -313,11 +313,11 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
 
 pub(crate) fn app_runtime_account_setup_request(
     cli: &Cli,
-) -> Result<Option<marmot_app::AccountSetupRequest>, crate::DmError> {
+) -> Result<Option<marmot_app::AccountSetupRequest>, crate::WnError> {
     match &cli.command {
         crate::Command::CreateIdentity => {
             if cli.daemon_default_account_relays.is_empty() {
-                return Err(crate::DmError::MissingRelay);
+                return Err(crate::WnError::MissingRelay);
             }
             Ok(Some(marmot_app::AccountSetupRequest {
                 identity: None,
@@ -334,10 +334,10 @@ pub(crate) fn app_runtime_account_setup_request(
         } => {
             crate::validate_materialized_secret_identity("login", identity, *nsec_stdin)?;
             let Some(identity) = identity.clone() else {
-                return Err(crate::DmError::MissingLoginIdentity);
+                return Err(crate::WnError::MissingLoginIdentity);
             };
             if crate::is_nostr_secret(&identity) && cli.daemon_default_account_relays.is_empty() {
-                return Err(crate::DmError::MissingRelay);
+                return Err(crate::WnError::MissingRelay);
             }
             Ok(Some(marmot_app::AccountSetupRequest {
                 identity: Some(identity),
@@ -532,7 +532,7 @@ pub(crate) async fn reconcile_app_runtime(
 
 pub(crate) fn open_app_runtime(
     defaults: &DaemonDefaults,
-) -> Result<marmot_app::MarmotAppRuntime, crate::DmError> {
+) -> Result<marmot_app::MarmotAppRuntime, crate::WnError> {
     let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
     let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
     let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
@@ -769,7 +769,7 @@ pub(crate) fn runtime_activity_report_from_summary(
 /// Builds the diagnostic string recorded for a runtime account error.
 ///
 /// Privacy: the result is persisted into `DaemonRuntimeActivityReport.errors`
-/// and exposed via `dm daemon status --json` / the TUI, so it must never carry
+/// and exposed via `wn daemon status --json` / the TUI, so it must never carry
 /// the account id or label — only the upstream (already id-free) error message.
 pub(crate) fn account_error_activity_message(error: &marmot_app::RuntimeAccountError) -> String {
     format!("app runtime account error: {}", error.message)

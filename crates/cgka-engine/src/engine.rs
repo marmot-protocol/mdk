@@ -173,10 +173,10 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) current_audit_context: Option<AuditEventContext>,
 
     /// Stored groups that failed session-open hydration and were skipped so the
-    /// rest of the account could open (darkmatter#151 / #417). Keyed by group
+    /// rest of the account could open (mdk#151 / #417). Keyed by group
     /// id with the coarse recovery reason, this is the engine-side source of
     /// truth the application reads to surface a per-group recovery flow
-    /// (darkmatter#426) distinct from healthy or archived groups. Entries are
+    /// (mdk#426) distinct from healthy or archived groups. Entries are
     /// added by [`Self::quarantine_stored_group_on_hydrate`] and removed by a
     /// successful [`Self::retry_hydrate_quarantined_group`].
     pub(crate) quarantined_groups: HashMap<GroupId, GroupHydrationQuarantineReason>,
@@ -734,7 +734,7 @@ impl<S: StorageProvider> Engine<S> {
         // BIP-340 schnorr verification per leaf. All of this state was already
         // validated at join/invite/commit ingress and read back from this
         // device's own encrypted storage, so re-verifying every leaf of every
-        // group on every session open is pure repeated work (darkmatter#152:
+        // group on every session open is pure repeated work (mdk#152:
         // ~50 groups x ~50 members ≈ 2500 schnorr verifications per open, and
         // marmot-app opens a fresh session per client() call).
         //
@@ -978,7 +978,7 @@ impl<S: StorageProvider> Engine<S> {
     /// enough to stop a later re-add Welcome from failing with
     /// `GroupAlreadyExists` when OpenMLS stages the fresh join, and to keep
     /// OpenMLS from stacking the re-join on stale epoch keypairs / message
-    /// secrets / own-leaf index (darkmatter#557).
+    /// secrets / own-leaf index (mdk#557).
     ///
     /// Crucially it does NOT delete the Marmot `cgka_groups` record, the retained
     /// anchor snapshots, the stored commit/message history, or the convergence
@@ -1111,11 +1111,11 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     /// Stored groups that failed session-open hydration and were skipped so the
-    /// rest of the account could open (darkmatter#151 / #417), paired with the
+    /// rest of the account could open (mdk#151 / #417), paired with the
     /// coarse [`GroupHydrationQuarantineReason`] that classifies why.
     ///
     /// This is the engine-side source of truth for the application's per-group
-    /// recovery flow (darkmatter#426): a quarantined group is not in the live
+    /// recovery flow (mdk#426): a quarantined group is not in the live
     /// roster (`epoch`/`members` return `UnknownGroup`) and otherwise vanishes
     /// from the account with no explanation. The app reads this list to surface
     /// those groups distinctly from healthy/archived ones and to offer
@@ -1180,7 +1180,7 @@ impl<S: StorageProvider> Engine<S> {
                 // `recovered_epoch` is the epoch hydration just established and
                 // wrote through to storage + epoch_manager (set_stable). Use it
                 // directly rather than a second storage.get_group() that could
-                // fail and silently emit epoch 0 (darkmatter#441 finding 3).
+                // fail and silently emit epoch 0 (mdk#441 finding 3).
                 self.events_buf
                     .push_back(GroupEvent::GroupHydrationRecovered {
                         group_id: group_id.clone(),

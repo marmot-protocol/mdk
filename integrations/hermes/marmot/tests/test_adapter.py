@@ -139,7 +139,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.adapter = load_adapter_module()
         self.tempdir = tempfile.TemporaryDirectory()
-        self.socket_path = str(Path(self.tempdir.name) / "dm-agent.sock")
+        self.socket_path = str(Path(self.tempdir.name) / "wn-agent.sock")
         self.server = None
 
     async def asyncTearDown(self):
@@ -643,7 +643,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             adapter = self.adapter_module.MarmotPlatformAdapter(
                 self.config_cls(
                     extra={
-                        "socket_path": str(Path(tempdir) / "dm-agent.sock"),
+                        "socket_path": str(Path(tempdir) / "wn-agent.sock"),
                         "auth_token_file": str(token_file),
                     }
                 )
@@ -821,7 +821,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.source.user_id, "44" * 32)
 
     async def test_resync_required_event_raises_to_force_reconnect(self):
-        # Regression for darkmatter#210: a resync_required event (emitted when the connector
+        # Regression for mdk#210: a resync_required event (emitted when the connector
         # dropped inbound messages on broadcast lag and could not auto-replay them) must NOT be
         # silently ignored. It must raise so the consume loop reconnects, re-running the
         # connector's catch-up and storage-backed replay to recover the missed messages.
@@ -915,7 +915,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.events[0].text, "recovered after resync")
 
     async def test_slow_group_turn_does_not_block_dispatch_for_other_groups(self):
-        # darkmatter#513: inbound was dispatched serially (async for -> await handle_message),
+        # mdk#513: inbound was dispatched serially (async for -> await handle_message),
         # so a slow/hung turn in one group blocked dispatch for every group. With per-group
         # serialization, a stuck turn in group A must NOT prevent group B's turn from running.
         group_a = "aa" * 32
@@ -1165,7 +1165,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.final_sends[0][3], "33" * 32)
 
     async def test_hung_group_does_not_block_reconnect_for_other_groups(self):
-        # darkmatter#513 (adversarial follow-up): the inline-dispatch fix kept the happy path
+        # mdk#513 (adversarial follow-up): the inline-dispatch fix kept the happy path
         # unblocked, but draining the per-group queue on stream end re-introduced head-of-line
         # blocking on the RECONNECT path. The queue is long-lived (owned by the adapter) and must
         # survive resync: a hung turn in group A must not hold the resync hostage, or group B —
@@ -1264,7 +1264,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter._inbound_queue.cancel_all()
 
     async def test_concurrent_first_messages_prompt_once_and_consume_one(self):
-        # darkmatter#513 (adversarial follow-up): under the new per-group concurrency, two first
+        # mdk#513 (adversarial follow-up): under the new per-group concurrency, two first
         # messages for the SAME account in DIFFERENT groups could both read empty onboarding state
         # before either wrote "prompted", so both sent a prompt and both original user messages
         # were swallowed. The atomic try_claim_prompt() must let exactly one group win the prompt;
@@ -2121,7 +2121,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
 
         with tempfile.TemporaryDirectory() as tempdir:
-            socket_path = str(Path(tempdir) / "dm-agent.sock")
+            socket_path = str(Path(tempdir) / "wn-agent.sock")
             server = await asyncio.start_unix_server(handler, path=socket_path)
             try:
                 client = self.adapter_module.MarmotAgentControlClient(socket_path)

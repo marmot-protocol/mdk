@@ -817,7 +817,7 @@ fn convergence_status_for_result(
     // a proposal only takes effect once a commit consumes it
     // (convergence.md:7-8), so an un-dispositioned proposal does not leave
     // canonical state ambiguous and MUST NOT pin the pass in `Resolving`
-    // (darkmatter#154). A proposal that *was* consumed by the selected branch
+    // (mdk#154). A proposal that *was* consumed by the selected branch
     // already lands in `resolved` via `accepted_proposals`, so this exemption
     // only affects proposals with no disposition — exactly the lone case that
     // would otherwise wedge convergence (and, transitively, all outbound sends)

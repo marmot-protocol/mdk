@@ -29,7 +29,7 @@ use crate::{MarmotApp, config};
 
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
-/// Always-on, append-only per-account key-reveal audit log (darkmatter#543).
+/// Always-on, append-only per-account key-reveal audit log (mdk#543).
 /// The name matches the `audit-*.jsonl` glob so it is enumerable via
 /// [`MarmotApp::audit_log_files`].
 const KEY_REVEAL_AUDIT_FILE: &str = "audit-key-reveal.jsonl";
@@ -88,7 +88,7 @@ pub struct AuditLogSettings {
     pub data_mode: AuditDataMode,
 }
 
-/// One always-on key-reveal audit record (darkmatter#543). Privacy-safe: it
+/// One always-on key-reveal audit record (mdk#543). Privacy-safe: it
 /// carries only a salted-hash account ref, never key material, the nsec, the
 /// raw pubkey, or the npub.
 ///
@@ -585,7 +585,7 @@ impl MarmotApp {
     }
 
     /// Export the account's raw private key as an `nsec1...` bech32 string for
-    /// in-app backup display (darkmatter#543). Logs an always-on reveal record
+    /// in-app backup display (mdk#543). Logs an always-on reveal record
     /// to the per-account audit log and flips the NIP-49 KEY_SECURITY_BYTE to
     /// 0x00. Never caches or logs the key material itself.
     ///
@@ -612,7 +612,7 @@ impl MarmotApp {
     }
 
     /// Export the account's private key as a password-encrypted NIP-49
-    /// `ncryptsec1...` backup string (darkmatter#544). Logs an always-on
+    /// `ncryptsec1...` backup string (mdk#544). Logs an always-on
     /// encrypted-export record to the per-account audit log without downgrading
     /// the account's KEY_SECURITY_BYTE.
     pub fn export_encrypted_secret_key(
@@ -638,7 +638,7 @@ impl MarmotApp {
     }
 
     /// Append an always-on, privacy-safe reveal record to the per-account
-    /// `audit-key-reveal.jsonl` file (darkmatter#543).
+    /// `audit-key-reveal.jsonl` file (mdk#543).
     ///
     /// The record carries only a salted-hash account ref (matching the
     /// forensic audit log's derivation), the reveal action/format, and the

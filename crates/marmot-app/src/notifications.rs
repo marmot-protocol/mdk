@@ -1168,7 +1168,7 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
 /// nostr pubkey entity referencing it (a bare `@npub1…` handle or an explicit
 /// `nostr:` URI). Shared with the chat-list unread projection so the @-badge
 /// reuses the exact notification classification. The inline Markdown fallback
-/// is intentionally bounded (darkmatter#654); send-side / wire `p` tags are the
+/// is intentionally bounded (mdk#654); send-side / wire `p` tags are the
 /// authoritative mention signal for content beyond that cap.
 pub(crate) fn message_text_mentions_account(
     kind: u64,

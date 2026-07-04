@@ -1,7 +1,7 @@
-// Inbound bridge: holds a long-lived `subscribe_inbound` connection to dm-agent,
+// Inbound bridge: holds a long-lived `subscribe_inbound` connection to wn-agent,
 // maps inbound Marmot messages to a normalized shape, dedupes by message id, and
 // hands each to an injected handler. Reconnects on disconnect; a `resync_required`
-// event is surfaced so the caller can re-sync (dm-agent already replays what it
+// event is surfaced so the caller can re-sync (wn-agent already replays what it
 // can before emitting it). SDK-independent so it can be unit-tested directly.
 
 import type {
@@ -84,7 +84,7 @@ const DEFAULT_DEDUPE_WINDOW = 2048;
  * Reconnect backoff with jitter: a delay in `[baseMs, min(capMs, baseMs * 2**attempt)]`.
  * Attempt 0 returns exactly `baseMs` (ceiling == base), so the first reconnect is as
  * prompt as the old flat delay; later attempts grow geometrically toward `capMs`. The
- * jitter spreads retries so a persistent failure (e.g. dm-agent down) doesn't spin at a
+ * jitter spreads retries so a persistent failure (e.g. wn-agent down) doesn't spin at a
  * fixed cadence competing for the event loop the rest of the gateway shares.
  */
 export function reconnectBackoffMs(
@@ -236,7 +236,7 @@ export class MarmotInboundBridge {
     if (this.recent.has(event.message_id_hex)) {
       return;
     }
-    // Record before dispatching: dm-agent can re-emit the same message (e.g. a
+    // Record before dispatching: wn-agent can re-emit the same message (e.g. a
     // rapid catch-up just after subscribe), and an agent turn takes long enough
     // that a record-after-dispatch would let the duplicate slip through and
     // start a second, concurrent turn for the same message.

@@ -365,7 +365,7 @@ fn mention_classification_uses_inline_nip27_entities() {
     }
 
     // `nostr:<raw-hex>` is not a NIP-21 URI, so the tokenizer leaves it as
-    // literal text and it is not classified as a mention (darkmatter#617).
+    // literal text and it is not classified as a mention (mdk#617).
     let raw_hex = received_chat(&format!("hi nostr:{receiver}"), Vec::new());
     assert!(!message_mentions_account(&raw_hex, &receiver));
 }
@@ -442,7 +442,7 @@ fn mention_classification_covers_bare_npub_mention() {
     // The form clients actually emit is the bare `@npub1…` handle (no
     // `nostr:` scheme and no `p`-tag). It must still classify as a mention so
     // `is_mention` / unread-mention surfaces fire. Regression for
-    // darkmatter#617.
+    // mdk#617.
     let receiver = nostr::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
 

@@ -811,7 +811,7 @@ impl MarmotApp {
     /// Promoting every followed pubkey via [`Self::remember_directory_user`]
     /// would schedule a directory-sync rebuild that watches the new pubkeys,
     /// whose own contact lists would in turn be ingested — an unbounded
-    /// transitive social-graph crawl (darkmatter#687). Instead the edges are
+    /// transitive social-graph crawl (mdk#687). Instead the edges are
     /// recorded in the per-account search graph, which directory search reads
     /// but [`Self::directory_sync_plan`] does not. When the author is already a
     /// known directory entry (e.g. a local account whose contact list we sync),
@@ -856,7 +856,7 @@ impl MarmotApp {
         // profile republish can carry the same timestamp as the previous
         // pre-edit kind-0. A strict `>` guard would treat an equal-second stale
         // relay copy as "newer or equal -> replace" and revert the just-published
-        // local edit (darkmatter#206). Keeping the cache on equality protects
+        // local edit (mdk#206). Keeping the cache on equality protects
         // the local edit; an equal-timestamp event re-fetched from a relay is
         // either the user's own echoed publish (identical content) or a stale
         // copy that must not win.

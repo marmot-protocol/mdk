@@ -1497,7 +1497,7 @@ fn message_state_for_dropped_reason(reason: DroppedMessageReason) -> MessageStat
 /// * **Future epoch (retryable).** The message targets an epoch *beyond* the
 ///   tip convergence settled on — the commit that advances the group to its
 ///   epoch has not been selected yet (ordinary out-of-order relay delivery,
-///   darkmatter#144). Persisting it as the terminal `EpochInvalidated` would
+///   mdk#144). Persisting it as the terminal `EpochInvalidated` would
 ///   permanently drop it: `record_state_is_canonicalization_input` never
 ///   re-admits `EpochInvalidated`, so the buffered message could never re-enter
 ///   convergence once that commit arrives. Keep it `Retryable` so a later

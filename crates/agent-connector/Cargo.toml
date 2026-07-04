@@ -6,8 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "dm-agent"
-path = "src/bin/dm-agent.rs"
+name = "wn-agent"
+path = "src/bin/wn-agent.rs"
 
 [dependencies]
 agent-control.workspace = true

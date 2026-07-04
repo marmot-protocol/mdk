@@ -1,14 +1,14 @@
 # OpenClaw Marmot Plugin
 
 This directory is an [OpenClaw](https://docs.openclaw.ai) **channel plugin** for the
-local `dm-agent` connector. OpenClaw runs the agent, model, tools, and channel
-routing. `dm-agent` owns the Marmot account, MLS group state, Nostr transport,
+local `wn-agent` connector. OpenClaw runs the agent, model, tools, and channel
+routing. `wn-agent` owns the Marmot account, MLS group state, Nostr transport,
 durable encrypted sends, and QUIC live-preview stream records.
 
 The plugin is intentionally thin and **control-plane only**: it speaks the
-`marmot.agent-control.v1` newline-delimited JSON protocol to `dm-agent` over a
+`marmot.agent-control.v1` newline-delimited JSON protocol to `wn-agent` over a
 local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
-to a relay — all of that stays in `dm-agent`. It is the OpenClaw counterpart of
+to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 - Pinned OpenClaw SDK: **`openclaw@2026.6.8`** (`openclaw/plugin-sdk/*`).
@@ -16,7 +16,7 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 ## Install (release)
 
-Versioned `dm-agent` builds and this plugin are published as [`dm-agent-v*`](https://github.com/marmot-protocol/darkmatter/releases)
+Versioned `wn-agent` builds and this plugin are published as [`wn-agent-v*`](https://github.com/marmot-protocol/mdk/releases)
 GitHub pre-releases. OpenClaw must already be installed with `openclaw` on `PATH`.
 
 Prerequisites:
@@ -26,23 +26,23 @@ Prerequisites:
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
-DM_AGENT_VERSION=0.2.0
-curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
+WN_AGENT_VERSION=0.2.0
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
 # or install + bootstrap the agent account in one step:
 curl -fsSL ".../install-openclaw-marmot.sh" | bash -s -- --bootstrap
 ```
 
-The installer puts `dm-agent` in `~/.local/bin`, downloads and verifies the plugin
+The installer puts `wn-agent` in `~/.local/bin`, downloads and verifies the plugin
 tarball, runs `openclaw plugins install`, and enables the `marmot` channel.
 Supported platforms match the Hermes installer.
 
 Then start the connector and bootstrap (same public relays as the phone app):
 
 ```sh
-dm-agent --home ~/.marmot-agent \
+wn-agent --home ~/.marmot-agent \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
-dm-agent bootstrap --home ~/.marmot-agent --qr
+wn-agent bootstrap --home ~/.marmot-agent --qr
 openclaw gateway run
 ```
 
@@ -57,13 +57,13 @@ just openclaw-dev-teardown --force     # remove the throwaway dev root
 ```
 
 `openclaw-dev-setup` builds the plugin, prepares an isolated dev root under
-`${TMPDIR:-/tmp}/openclaw-marmot-test`, and generates `run-dm-agent.sh`,
+`${TMPDIR:-/tmp}/openclaw-marmot-test`, and generates `run-wn-agent.sh`,
 `run-openclaw-gateway.sh`, `smoke-plugin.sh`, and `env.sh`.
 
 ## Docker phone test
 
-A Compose profile builds a container with `dm-agent`, OpenClaw, this plugin, and
-`qrencode`. It starts `dm-agent` with `MARMOT_AGENT_ALLOW_ANY=1` so the first
+A Compose profile builds a container with `wn-agent`, OpenClaw, this plugin, and
+`qrencode`. It starts `wn-agent` with `MARMOT_AGENT_ALLOW_ANY=1` so the first
 phone invite lands without pre-seeding an allowlist (use an explicit allowlist
 for a real deployment).
 
@@ -83,12 +83,12 @@ against a real phone; omit it for the default `block` mode.
 
 Configure under `channels.marmot` in the OpenClaw config, or via `MARMOT_*`
 environment variables (config wins). Keys mirror the Hermes plugin so one
-`dm-agent` deployment can serve both gateways:
+`wn-agent` deployment can serve both gateways:
 
 | Key (config) | Env | Default |
 | --- | --- | --- |
 | `home` | `MARMOT_HOME` | `~/.marmot` |
-| `socketPath` | `MARMOT_AGENT_SOCKET` | `$MARMOT_HOME/dev/dm-agent.sock` |
+| `socketPath` | `MARMOT_AGENT_SOCKET` | `$MARMOT_HOME/dev/wn-agent.sock` |
 | `authToken` | `MARMOT_AGENT_AUTH_TOKEN` | — |
 | `authTokenFile` | `MARMOT_AGENT_AUTH_TOKEN_FILE` | — |
 | `accountIdHex` | `MARMOT_ACCOUNT_ID_HEX` | sole local account |
@@ -102,14 +102,14 @@ environment variables (config wins). Keys mirror the Hermes plugin so one
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
 
-`accountIdHex` is the Marmot/dm-agent account id. It is intentionally distinct
+`accountIdHex` is the Marmot/wn-agent account id. It is intentionally distinct
 from OpenClaw's channel account id (`default`, or a key under
 `channels.marmot.accounts`) used for routing, session metadata, and message-tool
 target lookup.
 
 The default control socket is same-UID only (parent dir `0700`, socket `0600`,
-no TCP listener). If OpenClaw and `dm-agent` run as different local users, start
-`dm-agent` with `--auth-token-file` + group-readable socket modes (`0660`) and
+no TCP listener). If OpenClaw and `wn-agent` run as different local users, start
+`wn-agent` with `--auth-token-file` + group-readable socket modes (`0660`) and
 set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
 [`crates/agent-connector/README.md`](../../../crates/agent-connector/README.md).
 
@@ -142,7 +142,7 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   the adapter never merges or rewrites text across sends. Each durable reply is
   **idempotent + retried**: the sink generates one `idempotency_key` per reply
   and retries the send a few times (with a short backoff) on retryable errors,
-  reusing the same key so `dm-agent` dedups instead of double-posting. A repeated
+  reusing the same key so `wn-agent` dedups instead of double-posting. A repeated
   key returns the original message ids without a second send, so a retry after a
   post-write timeout cannot double-post an unrecallable encrypted message.
   (Follow-up: `stream_finalize` is not yet idempotent.)
@@ -182,13 +182,13 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw
   base64-encodes for a vision model. Outbound — the message adapter declares
   `media` and maps an agent reply's `mediaUrl` (resolved to a local path via
-  `mediaReadFile` when needed) onto `send_media` (`dm-agent` encrypts + uploads
+  `mediaReadFile` when needed) onto `send_media` (`wn-agent` encrypts + uploads
   to Blossom; the content key never leaves it). The vision model actually
   receiving the image is confirmed on the docker harness.
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
   append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only
   update cancels the preview and sends the final verbatim. The transcript hash +
-  chunk count match `dm-agent` byte-for-byte (Rust-anchored parity test in
+  chunk count match `wn-agent` byte-for-byte (Rust-anchored parity test in
   `test/transcript.test.ts`). Previews run whenever `streaming.mode` is not
   `off` and `quicCandidates` are set, and OpenClaw is emitting progressive
   blocks. Marmot enables OpenClaw block delivery automatically when
@@ -204,9 +204,9 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
     committing. Tool/progress chatter is written as non-text progress records and
     never becomes durable chat text.
 - **Allowlist mirroring**: on startup the plugin mirrors the configured
-  `channels.marmot.dm.allowFrom` (hex account ids) into `dm-agent`'s welcomer
+  `channels.marmot.dm.allowFrom` (hex account ids) into `wn-agent`'s welcomer
   allowlist (a no-op when none is configured, so it never wipes an allowlist
-  managed directly on `dm-agent`). `dm-agent` still performs welcomer-based
+  managed directly on `wn-agent`). `wn-agent` still performs welcomer-based
   post-join accept/decline.
 - **Profile-name onboarding** (`src/profile-onboarding.ts`, on by default;
   disable with `profileNameOnboarding: false`): when the agent joins a group it
@@ -225,11 +225,11 @@ validated by running the local `openclaw-gateway` harness (below).
 ## Local gateway harness
 
 `just openclaw-gateway-up` brings up a fully local stack — the in-repo
-`nostr-rs-relay` + QUIC broker + `dm-agent` (with `--allow-any` and
+`nostr-rs-relay` + QUIC broker + `wn-agent` (with `--allow-any` and
 `--debug-controls`) + a real OpenClaw gateway with this plugin installed — with
 no public relays and no phone required. This is the harness for wiring and
 validating the inbound and live-preview paths above: inject an inbound message
-over the `dm-agent` control socket (`debug_inject_inbound`), then observe the
+over the `wn-agent` control socket (`debug_inject_inbound`), then observe the
 agent turn and the reply.
 
 ```sh

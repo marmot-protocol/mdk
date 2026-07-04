@@ -822,7 +822,7 @@ mod tests {
     /// Build the group-creation `app_data_dictionary` for `required` with no
     /// initial component bytes, then assert that every entry the engine writes
     /// passes the engine's own `validate_app_component_update`. Regression for
-    /// darkmatter#174: the engine wrote zero bytes for a required blossom-image
+    /// mdk#174: the engine wrote zero bytes for a required blossom-image
     /// at creation, which its own `validate_group_image` rejects.
     fn assert_creation_state_self_validates(required: AppComponentSet) {
         let initial = InitialComponentState {

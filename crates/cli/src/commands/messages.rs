@@ -19,7 +19,7 @@ use marmot_app::{
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, DmError, MessageCommand, MessageTimelineCommand,
+    CommandOutput, MessageCommand, MessageTimelineCommand, WnError,
     agent_text_stream_payload_value, display_name_for_sender, ensure_local_signing,
     normalize_group_id_hex, npub_for_account_id, resolve_account,
 };
@@ -27,12 +27,12 @@ use crate::{
 fn message_target_and_text(
     group_flag: Option<String>,
     mut args: Vec<String>,
-) -> Result<(String, Vec<String>), DmError> {
+) -> Result<(String, Vec<String>), WnError> {
     if let Some(group) = group_flag {
         return Ok((group, args));
     }
     if args.is_empty() {
-        return Err(DmError::MissingGroupId);
+        return Err(WnError::MissingGroupId);
     }
     let group = args.remove(0);
     Ok((group, args))
@@ -43,7 +43,7 @@ pub(crate) async fn message_command(
     app: &MarmotApp,
     command: MessageCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     message_command_with_runtime(account_home, app, &runtime, command, account_flag).await
 }
@@ -54,12 +54,12 @@ pub(crate) async fn message_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: MessageCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         MessageCommand::Send { group_flag, args } => {
             let (group, text) = message_target_and_text(group_flag, args)?;
             if text.is_empty() {
-                return Err(DmError::EmptyMessage);
+                return Err(WnError::EmptyMessage);
             }
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -273,7 +273,7 @@ pub(crate) async fn message_command_with_runtime(
                 }),
             })
         }
-        MessageCommand::Subscribe { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
+        MessageCommand::Subscribe { .. } => Err(WnError::MessagesSubscribeRequiresDaemon),
     }
 }
 
@@ -282,7 +282,7 @@ fn handle_message_timeline_command(
     account_home: &AccountHome,
     command: MessageTimelineCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         MessageTimelineCommand::List {
             group_id,
@@ -341,7 +341,7 @@ fn handle_message_timeline_command(
             )?;
             timeline_page_output(app, &account.account_id_hex, page, Some(query))
         }
-        MessageTimelineCommand::Subscribe { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
+        MessageTimelineCommand::Subscribe { .. } => Err(WnError::MessagesSubscribeRequiresDaemon),
     }
 }
 
@@ -351,7 +351,7 @@ fn search_messages(
     group_id: Option<String>,
     query: &str,
     limit: Option<usize>,
-) -> Result<Vec<AppMessageRecord>, DmError> {
+) -> Result<Vec<AppMessageRecord>, WnError> {
     let group_id_hex = group_id
         .map(|group| normalize_group_id_hex(&group))
         .transpose()?;
@@ -377,21 +377,21 @@ pub(crate) fn validate_message_list_cursors(
     before_message_id: Option<&str>,
     after: Option<u64>,
     after_message_id: Option<&str>,
-) -> Result<(), DmError> {
+) -> Result<(), WnError> {
     if before.is_some() != before_message_id.is_some() {
-        return Err(DmError::MessagePaginationCursorMismatch {
+        return Err(WnError::MessagePaginationCursorMismatch {
             timestamp_flag: "--before",
             message_id_flag: "--before-message-id",
         });
     }
     if after.is_some() != after_message_id.is_some() {
-        return Err(DmError::MessagePaginationCursorMismatch {
+        return Err(WnError::MessagePaginationCursorMismatch {
             timestamp_flag: "--after",
             message_id_flag: "--after-message-id",
         });
     }
     if before.is_some() && after.is_some() {
-        return Err(DmError::MessagePaginationConflictingCursors);
+        return Err(WnError::MessagePaginationConflictingCursors);
     }
     Ok(())
 }
@@ -467,7 +467,7 @@ fn timeline_page_output(
     account_id_hex: &str,
     page: TimelinePage,
     query: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let messages = timeline_message_list_json_with_profiles(app, page.messages, account_id_hex);
     let plain = timeline_message_list_plain(&messages);
     let mut json = json!({

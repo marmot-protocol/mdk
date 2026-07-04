@@ -17,7 +17,7 @@ function send(socket: Socket, id: unknown, payload: Record<string, unknown>): vo
   socket.write(`${JSON.stringify({ marmot_agent_control: PROTOCOL, id, ...payload })}\n`);
 }
 
-/** Minimal in-memory dm-agent control socket for exercising the client. */
+/** Minimal in-memory wn-agent control socket for exercising the client. */
 function handleRequest(socket: Socket, req: Record<string, unknown>): void {
   const id = req.id;
   switch (req.type) {
@@ -29,7 +29,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       break;
     case "send_final":
       // Echo back the idempotency_key (when present) so a test can assert the
-      // client forwarded it; real dm-agent never returns it.
+      // client forwarded it; real wn-agent never returns it.
       send(socket, id, {
         type: "final_sent",
         message_ids_hex: [HEX32("ab")],

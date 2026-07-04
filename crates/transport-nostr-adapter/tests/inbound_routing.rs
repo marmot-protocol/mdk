@@ -958,7 +958,7 @@ async fn inbox_subscription_since_saturates_at_zero() {
     assert_eq!(inbox_since, Some(Timestamp(0)));
 }
 
-// Regression for darkmatter#482: routing must tolerate non-canonical relay-URL
+// Regression for mdk#482: routing must tolerate non-canonical relay-URL
 // differences between the stored (verbatim, signed-routing) endpoint and the
 // endpoint an inbound event arrives on (built from a parsed `RelayUrl`). A raw
 // `==` silently dropped events that differed only by a trailing slash (or host
@@ -1018,7 +1018,7 @@ async fn group_event_routes_despite_trailing_slash_mismatch() {
     assert_eq!(delivery.source.endpoint, Some(inbound_endpoint));
 }
 
-// Regression for darkmatter#482: welcome inbox routing must tolerate the same
+// Regression for mdk#482: welcome inbox routing must tolerate the same
 // non-canonical relay-URL difference as group routing.
 #[tokio::test]
 async fn welcome_event_routes_despite_trailing_slash_mismatch() {

@@ -1,11 +1,11 @@
-# DM Agent Connector
+# WN Agent Connector
 
-This crate ships the `dm-agent` binary: the local Dark Matter agent connector.
+This crate ships the `wn-agent` binary: the local Dark Matter agent connector.
 
-`dm-agent` is the headless Marmot process that lets an agent runtime appear as a normal Marmot member. It owns the
+`wn-agent` is the headless Marmot process that lets an agent runtime appear as a normal Marmot member. It owns the
 Marmot account home, MLS state, Nostr relay IO, invite allowlists, durable encrypted sends, and live QUIC preview
 composition. Agent runtimes such as Hermes, and later OpenClaw, stay thin: they run models and tools, then talk to
-`dm-agent` through the local agent-control socket.
+`wn-agent` through the local agent-control socket.
 
 Hermes is the first supported adapter. OpenClaw is the second: a TypeScript channel plugin at
 [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
@@ -14,12 +14,12 @@ connector.
 ## Names
 
 - `agent-connector` is the Rust crate.
-- `dm-agent` is the installed binary.
-- "DM Agent" is the release track used for binary and adapter-install releases.
+- `wn-agent` is the installed binary.
+- "WN Agent" is the release track used for binary and adapter-install releases.
 
-The DM Agent release tag has its own prefix, for example `dm-agent-v0.1.0`, but the numeric version is the root
+The WN Agent release tag has its own prefix, for example `wn-agent-v0.1.0`, but the numeric version is the root
 workspace version from `Cargo.toml`. That keeps the agent binary, agent-control protocol, app runtime, and generated
-bindings in one compatibility cohort while still letting us publish only the DM Agent artifacts when that is all that
+bindings in one compatibility cohort while still letting us publish only the WN Agent artifacts when that is all that
 changed.
 
 See the root [`release.md`](../../release.md) for the full versioning and release policy.
@@ -29,8 +29,8 @@ See the root [`release.md`](../../release.md) for the full versioning and releas
 This crate is process glue. It owns:
 
 - `AgentConnector` and `serve_socket`;
-- the `dm-agent` Unix-socket daemon;
-- `dm-agent bootstrap`;
+- the `wn-agent` Unix-socket daemon;
+- `wn-agent bootstrap`;
 - local socket binding, peer checks, file modes, and optional bearer-token auth;
 - allowlist-backed welcome confirmation for local agent accounts;
 - final Marmot sends and QUIC live-preview composition through the app runtime.
@@ -43,7 +43,7 @@ This crate does not own the stable control DTOs or stream composition rules. Kee
 Start the connector with the same public relay set the phone app uses:
 
 ```sh
-cargo run -p agent-connector --bin dm-agent -- \
+cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
@@ -52,13 +52,13 @@ cargo run -p agent-connector --bin dm-agent -- \
 By default the control socket is:
 
 ```text
-~/.marmot-agent/dev/dm-agent.sock
+~/.marmot-agent/dev/wn-agent.sock
 ```
 
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
 ```sh
-cargo run -p agent-connector --bin dm-agent -- bootstrap \
+cargo run -p agent-connector --bin wn-agent -- bootstrap \
   --home ~/.marmot-agent \
   --qr
 ```
@@ -69,44 +69,44 @@ from the phone app.
 Check the installed or locally built version with:
 
 ```sh
-dm-agent --version
+wn-agent --version
 ```
 
 ## Hermes Install
 
-Versioned DM Agent builds publish the `dm-agent` binary, the Hermes Marmot plugin, and an installer script on GitHub
-Releases under `dm-agent-v*` tags. Hermes itself must already be installed.
+Versioned WN Agent builds publish the `wn-agent` binary, the Hermes Marmot plugin, and an installer script on GitHub
+Releases under `wn-agent-v*` tags. Hermes itself must already be installed.
 
 ```sh
-DM_AGENT_VERSION=0.2.0
-curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash
+WN_AGENT_VERSION=0.2.0
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
-To install and immediately run `dm-agent bootstrap --qr`:
+To install and immediately run `wn-agent bootstrap --qr`:
 
 ```sh
-DM_AGENT_VERSION=0.2.0
-curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
+WN_AGENT_VERSION=0.2.0
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
 ```
 
-The installer puts `dm-agent` in `~/.local/bin`, extracts the Hermes plugin to `~/.hermes/plugins/marmot`, and enables
+The installer puts `wn-agent` in `~/.local/bin`, extracts the Hermes plugin to `~/.hermes/plugins/marmot`, and enables
 the plugin when the `hermes` launcher is on `PATH`.
 
 Hermes-specific setup, development helpers, and phone-test commands live in
 [`integrations/hermes/marmot/README.md`](../../integrations/hermes/marmot/README.md).
 
-## Cutting A DM Agent Release
+## Cutting A WN Agent Release
 
-After the release commit is merged to `master`, cut a DM Agent release tag with:
+After the release commit is merged to `master`, cut a WN Agent release tag with:
 
 ```sh
-just release-dm-agent 0.1.0
+just release-wn-agent 0.1.0
 ```
 
 For a dry run:
 
 ```sh
-just release-dm-agent-dry-run 0.1.0
+just release-wn-agent-dry-run 0.1.0
 ```
 
 The helper checks that:
@@ -114,10 +114,10 @@ The helper checks that:
 - the requested version matches the root workspace version;
 - the working tree is clean;
 - `HEAD` matches `origin/master`;
-- `dm-agent-v<version>` does not already exist locally or remotely.
+- `wn-agent-v<version>` does not already exist locally or remotely.
 
-It creates and pushes an annotated `dm-agent-v<version>` tag. Pushing that tag starts
-`.github/workflows/dm-agent-binaries.yml`, which publishes the versioned binary/plugin assets and the installer script.
+It creates and pushes an annotated `wn-agent-v<version>` tag. Pushing that tag starts
+`.github/workflows/wn-agent-binaries.yml`, which publishes the versioned binary/plugin assets and the installer script.
 Pull requests, `master` pushes, and manual workflow runs build validation artifacts only; they do not publish a GitHub
 Release.
 
@@ -131,14 +131,14 @@ The v1 control plane is local-only:
 - same effective UID required;
 - no TCP listener.
 
-When the gateway and `dm-agent` run as different local service users, use a bearer token file plus group-readable socket
+When the gateway and `wn-agent` run as different local service users, use a bearer token file plus group-readable socket
 modes:
 
 ```sh
 openssl rand -hex 32 > ~/.marmot-agent/control.token
 chmod 0600 ~/.marmot-agent/control.token
 
-cargo run -p agent-connector --bin dm-agent -- \
+cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
   --auth-token-file ~/.marmot-agent/control.token \
   --socket-dir-mode 0770 \
@@ -161,7 +161,7 @@ Use the narrow checks first:
 
 ```sh
 cargo test -p agent-connector
-cargo check -p agent-connector --bin dm-agent
+cargo check -p agent-connector --bin wn-agent
 bash scripts/install-hermes-marmot.sh --dry-run
 integrations/hermes/marmot/tests/test_dev_scripts.sh
 ```

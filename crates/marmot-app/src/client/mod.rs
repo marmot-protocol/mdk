@@ -333,8 +333,8 @@ impl AppClient {
     }
 
     /// Stored groups that failed session-open hydration and were skipped so the
-    /// rest of the account could open (darkmatter#151 / #417). The application
-    /// reads this to surface a per-group recovery flow (darkmatter#426) — these
+    /// rest of the account could open (mdk#151 / #417). The application
+    /// reads this to surface a per-group recovery flow (mdk#426) — these
     /// groups are not in the live roster and otherwise vanish with no
     /// explanation. Each entry carries a coarse, privacy-safe recovery reason.
     pub fn quarantined_groups(&self) -> Vec<AppQuarantinedGroup> {
@@ -398,7 +398,7 @@ impl AppClient {
         })
     }
 
-    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    /// Re-attempt hydration of a single quarantined group (mdk#426).
     ///
     /// This is the non-destructive, user-initiated recovery path for a
     /// transiently-bad group (e.g. a partial DB restore that has since

@@ -917,7 +917,7 @@ fn prune_app_events_before_reprojects_survivor_when_delete_is_pruned() {
 #[test]
 fn app_messages_tie_break_on_message_id_matches_cursor_order() {
     // Same `recorded_at`, but `message_id_hex` lexical order differs from both
-    // insertion order and `received_at` order. `dm messages list` filters
+    // insertion order and `received_at` order. `wn messages list` filters
     // cursor ties on `(recorded_at, message_id_hex)`, so the projection must
     // return same-timestamp rows in `message_id_hex` order or pagination skips
     // or duplicates rows. Regression test for issue #390.

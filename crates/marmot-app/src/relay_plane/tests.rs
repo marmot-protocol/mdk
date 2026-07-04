@@ -22,7 +22,7 @@ fn relay_telemetry_runtime_config() -> RelayTelemetryRuntimeConfig {
             service_version: "1.4.2".to_owned(),
             service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
             deployment_environment: "staging".to_owned(),
-            tenant: "darkmatter-ios".to_owned(),
+            tenant: "mdk-ios".to_owned(),
             os_type: "ios".to_owned(),
             os_version: "17.5".to_owned(),
             device_model_identifier: None,
@@ -35,7 +35,7 @@ fn subscription_rebuild_since_treats_future_cursor_as_corrupted() {
     // A persisted cursor poisoned by a far-future sender-controlled
     // `created_at` must not push `since` past the present, or relays would
     // stop returning present-dated events and the account would silently
-    // halt forever (darkmatter#182). A detectably-future cursor is
+    // halt forever (mdk#182). A detectably-future cursor is
     // corrupted, not authoritative: rather than clamping it to
     // `now - lookback` (which would permanently skip valid backlog older
     // than the short production lookback), we treat it as untrusted and
@@ -841,7 +841,7 @@ async fn directory_live_event_with_wrong_author_is_rejected() {
         !directory
             .accepts_live_event("directory_users_0_abc", &other_author, 0)
             .await,
-        "an author the subscription never requested must be rejected (darkmatter#709)"
+        "an author the subscription never requested must be rejected (mdk#709)"
     );
 }
 
@@ -861,7 +861,7 @@ async fn directory_live_event_with_wrong_kind_is_rejected() {
         !directory
             .accepts_live_event("directory_users_0_abc", &author, 3)
             .await,
-        "a kind outside the subscription filter must be rejected (darkmatter#709)"
+        "a kind outside the subscription filter must be rejected (mdk#709)"
     );
 }
 

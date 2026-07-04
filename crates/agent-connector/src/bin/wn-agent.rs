@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "dm-agent",
+    name = "wn-agent",
     version,
     about = "Marmot local agent connector for Hermes and OpenClaw gateways"
 )]
@@ -31,7 +31,11 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    #[arg(long, value_name = "PATH", help = "Use this Darkmatter data directory")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Use this White Noise data directory"
+    )]
     home: Option<PathBuf>,
     #[arg(long, value_name = "PATH", help = "Listen on this Unix socket")]
     socket: Option<PathBuf>,
@@ -89,7 +93,7 @@ struct BootstrapArgs {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Connect to this dm-agent Unix control socket"
+        help = "Connect to this wn-agent Unix control socket"
     )]
     socket: Option<PathBuf>,
     #[arg(
@@ -144,7 +148,7 @@ struct BootstrapArgs {
         long,
         value_name = "SECS",
         default_value = "15",
-        help = "Seconds to wait for dm-agent control socket"
+        help = "Seconds to wait for wn-agent control socket"
     )]
     wait_for_socket: f64,
     #[arg(
@@ -167,28 +171,28 @@ async fn main() -> ExitCode {
 
 async fn run_serve_command(args: ServeArgs) -> ExitCode {
     let Some(home) = args.home else {
-        eprintln!("dm-agent: startup failed code=missing_home detail=--home is required");
+        eprintln!("wn-agent: startup failed code=missing_home detail=--home is required");
         return ExitCode::FAILURE;
     };
     let socket = args.socket.unwrap_or_else(|| default_socket_path(&home));
     let socket_dir_mode = match fs_private::parse_octal_mode(&args.socket_dir_mode) {
         Ok(mode) => mode,
         Err(message) => {
-            eprintln!("dm-agent: startup failed code=invalid_socket_mode detail={message}");
+            eprintln!("wn-agent: startup failed code=invalid_socket_mode detail={message}");
             return ExitCode::FAILURE;
         }
     };
     let socket_mode = match fs_private::parse_octal_mode(&args.socket_mode) {
         Ok(mode) => mode,
         Err(message) => {
-            eprintln!("dm-agent: startup failed code=invalid_socket_mode detail={message}");
+            eprintln!("wn-agent: startup failed code=invalid_socket_mode detail={message}");
             return ExitCode::FAILURE;
         }
     };
     let auth_token = match read_auth_token(args.auth_token_file.as_ref()) {
         Ok(token) => token,
         Err(message) => {
-            eprintln!("dm-agent: startup failed code=auth_token_file detail={message}");
+            eprintln!("wn-agent: startup failed code=auth_token_file detail={message}");
             return ExitCode::FAILURE;
         }
     };
@@ -206,7 +210,7 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
     match serve_socket(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("dm-agent: {}", safe_error_message(&err));
+            eprintln!("wn-agent: {}", safe_error_message(&err));
             ExitCode::FAILURE
         }
     }

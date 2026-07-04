@@ -156,10 +156,10 @@ fn bare_tel() {
 }
 
 #[test]
-fn bare_darkmatter() {
+fn bare_marmot() {
     assert_eq!(
-        parse_inlines("open darkmatter://profile/npub1abc"),
-        vec![t("open "), uri("darkmatter://profile/npub1abc")]
+        parse_inlines("open marmot://profile/npub1abc"),
+        vec![t("open "), uri("marmot://profile/npub1abc")]
     );
 }
 
@@ -187,8 +187,8 @@ fn whitenoise_opaque_form_stays_text() {
 }
 
 #[test]
-fn darkmatter_opaque_form_stays_text() {
-    assert_eq!(parse_inlines("darkmatter:foo"), vec![t("darkmatter:foo")]);
+fn marmot_opaque_form_stays_text() {
+    assert_eq!(parse_inlines("marmot:foo"), vec![t("marmot:foo")]);
 }
 
 #[test]

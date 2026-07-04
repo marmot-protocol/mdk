@@ -122,7 +122,7 @@ export interface MarmotDeleteActionDeps {
     targetMessageIdHex: string,
     resolveCtx: { cfg: unknown; accountId?: string | null },
   ) => Promise<boolean>;
-  /** Resolve the dm-agent client + Marmot account for the explicit-group fallback. */
+  /** Resolve the wn-agent client + Marmot account for the explicit-group fallback. */
   resolveTarget: (
     cfg: unknown,
     accountId?: string | null,
@@ -172,7 +172,7 @@ export function createMarmotDeleteActionAdapter(
 
 /** Build the Marmot channel plugin for registration with OpenClaw. */
 export function createMarmotChannelPlugin() {
-  // Resolve the dm-agent client + Marmot agent account for an outbound send or
+  // Resolve the wn-agent client + Marmot agent account for an outbound send or
   // an agent-invoked action (e.g. delete). Hoisted so both the message adapter
   // and the action adapter share one resolver.
   const resolveTarget = async (cfg: unknown, accountId?: string | null) => {
@@ -200,7 +200,7 @@ export function createMarmotChannelPlugin() {
         label: "Marmot",
         selectionLabel: "Marmot",
         docsPath: "channels/marmot",
-        blurb: "End-to-end encrypted Marmot groups through the local dm-agent connector.",
+        blurb: "End-to-end encrypted Marmot groups through the local wn-agent connector.",
         markdownCapable: true,
       },
       capabilities: {

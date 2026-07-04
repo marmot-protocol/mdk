@@ -1184,7 +1184,7 @@ fn message_id_invalidation_is_group_scoped() {
     // account sending identical content to two groups in the same second
     // produces the same message_id_hex in both. Invalidating one group's copy
     // (e.g. reason "local_publish_failed" when one fan-out leg fails) must NOT
-    // touch the other group's delivered copy. Regression for darkmatter#156.
+    // touch the other group's delivered copy. Regression for mdk#156.
     let store = SqliteAccountStorage::in_memory().unwrap();
     let group_a = "11".repeat(32);
     let group_b = "22".repeat(32);

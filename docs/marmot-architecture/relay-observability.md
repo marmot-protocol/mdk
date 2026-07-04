@@ -7,7 +7,7 @@ guarantees, and how they reach a first-party metrics stack. It is the broad-obse
 exports nothing.
 
 The privacy carve-out below is accepted and the matching amendment is now in
-[`overview/observability.md`](./overview/observability.md). Local visibility (`dm relay-stats`), the opt-in
+[`overview/observability.md`](./overview/observability.md). Local visibility (`wn relay-stats`), the opt-in
 index→identity resolution boundary, the relay-plane rollup, and the opt-in OTLP exporter are now implemented; the
 exporter's wire encoding and push live behind the `marmot-app` `otlp-export` build feature, and the dashboards plus the
 k-anonymity gate remain ops work. No telemetry leaves the device unless a user opts in **and** a first-party endpoint is
@@ -166,10 +166,10 @@ This amendment is **accepted and now applied** in [`overview/observability.md`](
    (`MarmotRelayPlane::telemetry_rollup`), keyed by opaque relay index, with an optional engine-metrics seam.
 4. **Opt-in exporter** — *done*: off-by-default opt-in gate, index→identity resolution behind a consent token, contract
    enforcement in the export-batch types, and an OTLP/HTTP push binding (behind the `otlp-export` feature). Local
-   visibility landed first via `dm relay-stats`.
+   visibility landed first via `wn relay-stats`.
 5. **Dashboards and k-anonymity gate** in the first-party stack; relay ranking and the quiescence-tuning view.
 
-Wiring the exporter's periodic `run` loop into a long-running host (e.g. `dmd`) against the production first-party
+Wiring the exporter's periodic `run` loop into a long-running host (e.g. `wnd`) against the production first-party
 endpoint is an ops step and is intentionally out of scope here; `RelayTelemetryExporter::export_once` / `run` are the
 entry points, and the production endpoint must be stood up behind the IP-stripping proxy with `k` raised before any
 external reporters are added.

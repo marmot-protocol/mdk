@@ -1,11 +1,11 @@
-# dm Homebrew Release Checklist
+# wn Homebrew Release Checklist
 
 This checklist covers the project-side release steps for the namespaced Homebrew tap.
 
 Intended install path:
 
 ```sh
-brew install marmot-protocol/tap/darkmatter
+brew install marmot-protocol/tap/wn
 ```
 
 The tap lives at:
@@ -17,27 +17,27 @@ github.com/marmot-protocol/homebrew-tap
 The canonical formula lives in the tap repo:
 
 ```text
-github.com/marmot-protocol/homebrew-tap/Formula/darkmatter.rb
+github.com/marmot-protocol/homebrew-tap/Formula/wn.rb
 ```
 
 It should install both binaries:
 
-- `dm`
-- `dmd`
+- `wn`
+- `wnd`
 
 ## Tap Repo Setup
 
-1. Keep the formula in `github.com/marmot-protocol/homebrew-tap/Formula/darkmatter.rb`.
-2. Keep the formula name `darkmatter`; the installed binaries remain `dm` and `dmd`.
+1. Keep the formula in `github.com/marmot-protocol/homebrew-tap/Formula/wn.rb`.
+2. Keep the formula name `wn`; the installed binaries remain `wn` and `wnd`.
 3. Do not keep a second live formula in this repo.
-4. Do not submit this formula to `homebrew/core` while Darkmatter is still candidate work.
+4. Do not submit this formula to `homebrew/core` while MDK is still candidate work.
 
 Minimum tap layout:
 
 ```text
 README.md
 Formula/
-  darkmatter.rb
+  wn.rb
 ```
 
 Recommended tap layout:
@@ -45,7 +45,7 @@ Recommended tap layout:
 ```text
 README.md
 Formula/
-  darkmatter.rb
+  wn.rb
 .github/
   workflows/
     tests.yml
@@ -60,7 +60,7 @@ The tap can hold more packages later:
 
 ```text
 Formula/
-  darkmatter.rb
+  wn.rb
   another-tool.rb
 Casks/
   some-app.rb
@@ -77,7 +77,7 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 3. Run the focused CLI checks:
 
    ```sh
-   cargo test -p darkmatter-cli
+   cargo test -p wn-cli
    cargo test -p marmot-app
    ```
 
@@ -96,9 +96,9 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
    ```sh
    install_root="$(mktemp -d)"
    cargo install --path crates/cli --locked --bins --root "$install_root" --force
-   "$install_root/bin/dm" --help
-   "$install_root/bin/dmd" --help
-   DM_HOME="$(mktemp -d)" DM_SECRET_STORE=file "$install_root/bin/dm" account create
+   "$install_root/bin/wn" --help
+   "$install_root/bin/wnd" --help
+   WN_HOME="$(mktemp -d)" WN_SECRET_STORE=file "$install_root/bin/wn" account create
    ```
 
 6. Update user-facing docs if commands, defaults, or daemon behavior changed:
@@ -113,32 +113,32 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 1. Create an annotated tag from the commit whose `Cargo.toml` version matches the tag:
 
    ```sh
-   git tag -a v0.1.0 -m "darkmatter v0.1.0"
+   git tag -a v0.1.0 -m "mdk v0.1.0"
    git push origin v0.1.0
    ```
 
-2. For the current private source repo, update `Formula/darkmatter.rb` in `marmot-protocol/homebrew-tap` to use the
+2. For the current private source repo, update `Formula/wn.rb` in `marmot-protocol/homebrew-tap` to use the
    private Git tag plus the exact commit revision:
 
    ```ruby
-   url "ssh://git@github.com/marmot-protocol/darkmatter.git",
+   url "ssh://git@github.com/marmot-protocol/mdk.git",
        tag:      "v0.1.0",
        revision: "<tagged-commit-sha>"
    ```
 
-   Users and CI runners need GitHub access to `marmot-protocol/darkmatter` for this source build path.
+   Users and CI runners need GitHub access to `marmot-protocol/mdk` for this source build path.
 
 3. If the source repo is public, prefer the GitHub source archive plus `sha256`:
 
    ```sh
-   curl -L -o darkmatter-v0.1.0.tar.gz \
-     https://github.com/marmot-protocol/darkmatter/archive/refs/tags/v0.1.0.tar.gz
-   shasum -a 256 darkmatter-v0.1.0.tar.gz
+   curl -L -o mdk-v0.1.0.tar.gz \
+     https://github.com/marmot-protocol/mdk/archive/refs/tags/v0.1.0.tar.gz
+   shasum -a 256 mdk-v0.1.0.tar.gz
    ```
 
    Then set:
 
-   - `url "https://github.com/marmot-protocol/darkmatter/archive/refs/tags/v0.1.0.tar.gz"`
+   - `url "https://github.com/marmot-protocol/mdk/archive/refs/tags/v0.1.0.tar.gz"`
    - `sha256 "<archive-sha256>"`
    - Omit `revision 0` for the first formula update.
 
@@ -148,34 +148,34 @@ Run these from a checkout of `github.com/marmot-protocol/homebrew-tap`:
 
 ```sh
 brew update
-brew audit --strict --online Formula/darkmatter.rb
-brew install --build-from-source Formula/darkmatter.rb
-brew test Formula/darkmatter.rb
-brew uninstall darkmatter
+brew audit --strict --online Formula/wn.rb
+brew install --build-from-source Formula/wn.rb
+brew test Formula/wn.rb
+brew uninstall wn
 ```
 
 Then test the namespaced install path:
 
 ```sh
 brew tap marmot-protocol/tap
-brew install marmot-protocol/tap/darkmatter
-dm --help
-dmd --help
-brew test marmot-protocol/tap/darkmatter
+brew install marmot-protocol/tap/wn
+wn --help
+wnd --help
+brew test marmot-protocol/tap/wn
 ```
 
 ## Bottle Path
 
 Source builds are enough for the first tap release. Add bottles after release CI exists.
 
-While `marmot-protocol/darkmatter` is private, bottle CI needs either access to the source repo or a prebuilt source
+While `marmot-protocol/mdk` is private, bottle CI needs either access to the source repo or a prebuilt source
 archive/release asset it can download. Public source archives avoid that extra CI setup.
 
 Manual bottle flow:
 
 ```sh
-brew install --build-bottle marmot-protocol/tap/darkmatter
-brew bottle marmot-protocol/tap/darkmatter
+brew install --build-bottle marmot-protocol/tap/wn
+brew bottle marmot-protocol/tap/wn
 ```
 
 Commit the generated `bottle do` block to `marmot-protocol/homebrew-tap` after the bottle artifacts are uploaded to the
@@ -186,19 +186,19 @@ tap's release storage.
 Run this on a machine without a local source checkout on `PATH`:
 
 ```sh
-brew install marmot-protocol/tap/darkmatter
-which dm
-which dmd
-dm --help
-dmd --help
-DM_HOME="$(mktemp -d)" DM_SECRET_STORE=file dm account create
-brew uninstall darkmatter
+brew install marmot-protocol/tap/wn
+which wn
+which wnd
+wn --help
+wnd --help
+WN_HOME="$(mktemp -d)" WN_SECRET_STORE=file wn account create
+brew uninstall wn
 ```
 
 ## Current Limits
 
 - The formula builds from source until bottles are published.
-- While `marmot-protocol/darkmatter` is private, the formula should use the Git tag and exact revision. Public tarball
+- While `marmot-protocol/mdk` is private, the formula should use the Git tag and exact revision. Public tarball
   URLs return 404 without authentication.
 - The formula uses `cargo install --locked --bins --path crates/cli`, so source archives must include the workspace
   `Cargo.lock`.

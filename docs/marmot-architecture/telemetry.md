@@ -20,7 +20,7 @@ runtime. It complements the policy docs:
 | Surface | Current state | Leaves device? | Primary source |
 | --- | --- | --- | --- |
 | Structured tracing/logging | Code uses `tracing` macros with explicit `target` and `method` fields. The app/CLI does not install a global tracing subscriber in the current source, so host apps or tests decide whether these events are collected. | No, unless a host installs and exports a subscriber. | [`overview/observability.md`](./overview/observability.md), [`tracing_audit.rs`](../../crates/cgka-conformance-simulator/tests/tracing_audit.rs) |
-| Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `dm relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
+| Device-local relay telemetry | Always collected by the shared Nostr relay plane while it runs: lifecycle counters, delivery-spread histograms, sync timing, and redacted relay health. | No. Exposed locally via `MarmotApp::relay_telemetry`, runtime `relay_plane().relay_telemetry()`, and `wn relay-stats`. | [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs), [`telemetry.rs`](../../crates/transport-nostr-adapter/src/telemetry.rs) |
 | Device-local app performance telemetry | Always available inside `RuntimeSharedServices` while the runtime exists: aggregate duration histograms plus attempts/success/failure counters for startup, directory subscription sync, account reconcile/open/sync/catch-up, one-sided outbound message send, group invite/admin/read operations, and media upload/download. | No by itself. Included in the OTLP export batch only after the same opt-in export gate passes. | [`app_telemetry.rs`](../../crates/marmot-app/src/app_telemetry.rs), [`runtime.rs`](../../crates/marmot-app/src/runtime.rs) |
 | Opt-in telemetry export | Implemented and off by default. Requires opt-in settings to be persisted, plus runtime endpoint, bearer token, and resource metadata. OTLP wire encoding and HTTP push are behind the `otlp-export` feature. Exports relay metrics and app-performance metrics in one batch. | Yes, only after the export gate passes. Relay URL is the only metric label, and only relay metrics may carry it; app-performance metrics are unlabeled population metrics. | [`relay_telemetry_export.rs`](../../crates/marmot-app/src/relay_telemetry_export.rs), [`config.rs`](../../crates/marmot-app/src/config.rs) |
 | Engine reorg telemetry | Implemented inside `cgka-engine` as aggregate post-settle reorg counters/histograms. Exposed by `Engine::engine_metrics()`. The relay-plane/export structs have an optional seam for it, but the periodic runtime exporter currently passes `None`. | No via the runtime exporter today. Engine metrics can be exported only if a caller explicitly folds a snapshot into the rollup/batch. | [`engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs), [`relay_plane.rs`](../../crates/marmot-app/src/relay_plane.rs) |
@@ -237,7 +237,7 @@ export config passes validation.
 
 ## Local inspection surfaces
 
-`dm relay-stats` prints the current process/runtime's `RelayTelemetrySnapshot` as human text. `dm relay-stats --json`
+`wn relay-stats` prints the current process/runtime's `RelayTelemetrySnapshot` as human text. `wn relay-stats --json`
 serializes the full snapshot shape. The plain text intentionally says:
 
 ```text
@@ -413,7 +413,7 @@ Resource attributes on every OTLP request:
 
 | Attribute | Source |
 | --- | --- |
-| `service.name` | Constant `darkmatter`. |
+| `service.name` | Constant `mdk`. |
 | `service.namespace` | Constant `marmot`. |
 | `service.version` | `RelayTelemetryResource.service_version`. |
 | `service.instance.id` | `RelayTelemetryResource.service_instance_id`, typically the app-root `telemetry_install_id()`. |
@@ -434,7 +434,7 @@ Exporter timing:
 
 ## Tracing and logging
 
-The repo has the `tracing` and `tracing-subscriber` dependencies, but the current `dm`, `dmd`, `dm-agent`, and
+The repo has the `tracing` and `tracing-subscriber` dependencies, but the current `wn`, `wnd`, `wn-agent`, and
 `marmot-app` runtime source does not install a global tracing subscriber. As a result, these `tracing::*` calls are
 instrumentation points. They are collected only if a host application, test harness, or future binary initializes a
 subscriber.
@@ -468,9 +468,9 @@ Notable tracing targets currently present:
 
 Direct CLI output:
 
-- `dm` and `dmd` write command outputs produced by `darkmatter_cli` to stdout/stderr and print only a safe write-output
+- `wn` and `wnd` write command outputs produced by `wn_cli` to stdout/stderr and print only a safe write-output
   failure message if writing fails.
-- `dm-agent` prints startup failures with safe error codes/details from argument parsing and token-file setup. Its
+- `wn-agent` prints startup failures with safe error codes/details from argument parsing and token-file setup. Its
   `ConnectorError` display path is reduced through `privacy_safe_code()` for startup failure output.
 
 ## What is deliberately not collected in telemetry/tracing

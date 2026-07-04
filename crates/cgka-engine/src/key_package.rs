@@ -118,7 +118,7 @@ impl<S: StorageProvider> Engine<S> {
     /// `KeyPackageBuilder::build`. When the higher layer fails to publish that
     /// KeyPackage it must call this to prune the orphaned private bundle;
     /// otherwise retries against a failing publisher accumulate unused private
-    /// key material indefinitely (darkmatter#160). The KeyPackages produced
+    /// key material indefinitely (mdk#160). The KeyPackages produced
     /// here carry the last-resort extension, so OpenMLS never deletes them on
     /// the welcome path — cleanup is entirely the caller's responsibility.
     ///

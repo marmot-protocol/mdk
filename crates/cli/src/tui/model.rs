@@ -12,22 +12,22 @@ pub(crate) enum TuiError {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct DmInvocation {
+pub(crate) struct WnInvocation {
     pub(crate) args: Vec<String>,
     pub(crate) stdin: Option<String>,
 }
 
-pub(crate) fn account_setup_invocation(identity: Option<String>) -> DmInvocation {
+pub(crate) fn account_setup_invocation(identity: Option<String>) -> WnInvocation {
     match identity {
-        Some(identity) if crate::is_nostr_secret(&identity) => DmInvocation {
+        Some(identity) if crate::is_nostr_secret(&identity) => WnInvocation {
             args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
             stdin: Some(format!("{identity}\n")),
         },
-        Some(identity) => DmInvocation {
+        Some(identity) => WnInvocation {
             args: vec!["login".to_owned(), identity],
             stdin: None,
         },
-        None => DmInvocation {
+        None => WnInvocation {
             args: vec!["create-identity".to_owned()],
             stdin: None,
         },

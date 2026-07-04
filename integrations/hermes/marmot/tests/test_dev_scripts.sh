@@ -22,9 +22,9 @@ group_id="$(printf '22%.0s' {1..32})"
     --print-env
 
 [ -f "$dev_root/env.sh" ]
-[ -x "$dev_root/run-dm-agent.sh" ]
+[ -x "$dev_root/run-wn-agent.sh" ]
 [ -x "$dev_root/run-hermes-gateway.sh" ]
-[ -x "$dev_root/start-dm-agent.sh" ]
+[ -x "$dev_root/start-wn-agent.sh" ]
 [ -x "$dev_root/start-hermes-gateway.sh" ]
 [ -x "$dev_root/stop-dev-processes.sh" ]
 [ -x "$dev_root/smoke-plugin.sh" ]
@@ -38,7 +38,7 @@ source "$dev_root/env.sh"
 
 [ "$HERMES_HOME" = "$dev_root/hermes-home" ]
 [ "$MARMOT_HOME" = "$dev_root/marmot-agent-home" ]
-[ "$MARMOT_AGENT_SOCKET" = "$dev_root/marmot-agent-home/dev/dm-agent.sock" ]
+[ "$MARMOT_AGENT_SOCKET" = "$dev_root/marmot-agent-home/dev/wn-agent.sock" ]
 [ "$MARMOT_AGENT_AUTH_TOKEN_FILE" = "$dev_root/control.token" ]
 [ "$MARMOT_AGENT_SOCKET_DIR_MODE" = "0770" ]
 [ "$MARMOT_AGENT_SOCKET_MODE" = "0660" ]
@@ -47,8 +47,8 @@ source "$dev_root/env.sh"
 [ "$MARMOT_RELAYS" = "wss://relay.example" ]
 [ "$MARMOT_QUIC_CANDIDATES" = "quic://127.0.0.1:4433" ]
 [ "$(cat "$MARMOT_AGENT_AUTH_TOKEN_FILE")" = "script-token" ]
-[ "${dm_agent_relay_args[0]}" = "--relay" ]
-[ "${dm_agent_relay_args[1]}" = "wss://relay.example" ]
+[ "${wn_agent_relay_args[0]}" = "--relay" ]
+[ "${wn_agent_relay_args[1]}" = "wss://relay.example" ]
 
 "$repo_root/scripts/hermes_marmot_dev_teardown.sh" --root "$dev_root" --dry-run
 [ -d "$dev_root" ]
@@ -72,7 +72,7 @@ source "$default_root/env.sh"
 [ "$MARMOT_AGENT_SOCKET_DIR_MODE" = "0700" ]
 [ "$MARMOT_AGENT_SOCKET_MODE" = "0600" ]
 [ "$MARMOT_RELAYS" = "" ]
-[ "${#dm_agent_relay_args[@]}" -eq 0 ]
+[ "${#wn_agent_relay_args[@]}" -eq 0 ]
 "$repo_root/scripts/hermes_marmot_dev_teardown.sh" --root "$default_root" --force
 [ ! -e "$default_root" ]
 

@@ -4,14 +4,14 @@ use marmot_app::{MarmotApp, SyncSummary};
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, DmError, agent_text_stream_payload_value, display_name_for_sender,
+    CommandOutput, WnError, agent_text_stream_payload_value, display_name_for_sender,
     npub_for_account_id,
 };
 
 pub(crate) async fn sync_command(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     app.status(&account.label)?;
     let mut client = app.client(&account.label).await?;
     let summary = client.sync().await?;
@@ -49,7 +49,7 @@ fn sync_json(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
     summary: SyncSummary,
-) -> Result<Value, DmError> {
+) -> Result<Value, WnError> {
     Ok(json!({
         "account_id": account.account_id_hex,
         "npub": npub_for_account_id(&account.account_id_hex)?,

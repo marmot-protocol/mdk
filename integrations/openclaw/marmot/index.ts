@@ -24,7 +24,7 @@ import { DEFAULT_MARMOT_CHANNEL_ACCOUNT_ID } from "./src/runtime-state.js";
 export default defineChannelPluginEntry({
   id: MARMOT_CHANNEL_ID,
   name: "Marmot",
-  description: "End-to-end encrypted Marmot groups through the local dm-agent connector.",
+  description: "End-to-end encrypted Marmot groups through the local wn-agent connector.",
   plugin: createMarmotChannelPlugin(),
   registerFull(api: OpenClawPluginApi) {
     api.logger.info(
@@ -34,7 +34,7 @@ export default defineChannelPluginEntry({
     );
     void (async () => {
       try {
-        // Mirror configured dm.allowFrom welcomers into dm-agent before consuming
+        // Mirror configured dm.allowFrom welcomers into wn-agent before consuming
         // inbound, so the welcomer policy is in place when the agent goes live.
         // (syncMarmotAllowlist is self-guarded and never rejects.)
         await syncMarmotAllowlist(api);

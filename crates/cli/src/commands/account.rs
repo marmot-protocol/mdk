@@ -9,7 +9,7 @@ use marmot_app::{
 use serde_json::{Value, json};
 
 use crate::{
-    AccountCommand, CliRuntimeInfo, CommandOutput, DmError, SecretStoreKind,
+    AccountCommand, CliRuntimeInfo, CommandOutput, SecretStoreKind, WnError,
     account_selector_or_default, is_nostr_secret, npub_for_account_id, parse_public_key,
     profile_display_name, relay_endpoints, relay_lists_json, resolve_account, unsupported_command,
     validate_materialized_secret_identity,
@@ -21,7 +21,7 @@ pub(crate) async fn identity_create_command(
     relay: Option<String>,
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     create_or_import_account_command(
         app,
         None,
@@ -44,10 +44,10 @@ pub(crate) async fn identity_login_command(
     relay: Option<String>,
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     validate_materialized_secret_identity("login", &identity, nsec_stdin)?;
     let Some(identity) = identity else {
-        return Err(DmError::MissingLoginIdentity);
+        return Err(WnError::MissingLoginIdentity);
     };
     create_or_import_account_command(
         app,
@@ -68,11 +68,11 @@ pub(crate) fn whoami_command(
     app: &MarmotApp,
     runtime_info: CliRuntimeInfo,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     if account_flag.is_some() {
         let account = resolve_account(account_home, account_flag)?;
         let status = if account.local_signing {
-            dm_status_json(app.status(&account.label)?, &runtime_info)?
+            wn_status_json(app.status(&account.label)?, &runtime_info)?
         } else {
             public_account_status_json(
                 &account,
@@ -122,7 +122,7 @@ pub(crate) fn whoami_command(
 pub(crate) fn logout_command(
     account_home: &AccountHome,
     pubkey: String,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let account_id = parse_public_key(&pubkey)?;
     account_home.remove_account(&account_id)?;
     Ok(CommandOutput {
@@ -135,10 +135,10 @@ pub(crate) fn logout_command(
     })
 }
 
-pub(crate) fn export_nsec_command(_pubkey: String) -> Result<CommandOutput, DmError> {
+pub(crate) fn export_nsec_command(_pubkey: String) -> Result<CommandOutput, WnError> {
     unsupported_command(
         "export-nsec",
-        "Darkmatter CLI policy forbids printing private keys",
+        "White Noise CLI policy forbids printing private keys",
     )
 }
 
@@ -153,7 +153,7 @@ pub(crate) async fn create_or_import_account_command(
     nsec_stdin: bool,
     _runtime_info: CliRuntimeInfo,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     validate_materialized_secret_identity("account create", &identity, nsec_stdin)?;
     let global_relay_defaults =
         apply_global_relay_defaults(&mut default_relays, &mut bootstrap_relays, relay);
@@ -163,16 +163,16 @@ pub(crate) async fn create_or_import_account_command(
         .as_deref()
         .is_some_and(|value| !is_nostr_secret(value));
     if creates_new_private_key && default_relays.is_empty() {
-        return Err(DmError::MissingRelay);
+        return Err(WnError::MissingRelay);
     }
     if imports_private_key && default_relays.is_empty() && bootstrap_relays.is_empty() {
-        return Err(DmError::MissingRelay);
+        return Err(WnError::MissingRelay);
     }
     if adds_public_account && bootstrap_relays.is_empty() && default_relays.is_empty() {
-        return Err(DmError::MissingRelay);
+        return Err(WnError::MissingRelay);
     }
     if adds_public_account && !default_relays.is_empty() && !global_relay_defaults.default_relays {
-        return Err(DmError::PublicAccountCannotSign);
+        return Err(WnError::PublicAccountCannotSign);
     }
 
     let default_relays = relay_endpoints(default_relays)?;
@@ -194,7 +194,7 @@ pub(crate) async fn create_or_import_account_command(
 
 pub(crate) fn account_setup_command_output(
     setup: AccountSetupResult,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let key_package_plain = setup
         .key_package_bytes
         .map(|bytes| format!(" key-package-bytes={bytes}"))
@@ -221,10 +221,10 @@ pub(crate) fn account_setup_command_output(
     })
 }
 
-pub(crate) fn map_account_setup_error(err: AppError) -> DmError {
+pub(crate) fn map_account_setup_error(err: AppError) -> WnError {
     if let AppError::MissingRelayLists(missing) = &err {
         let status = missing_relay_list_status(missing.clone());
-        return DmError::MissingRelayLists(missing.clone(), Box::new(status));
+        return WnError::MissingRelayLists(missing.clone(), Box::new(status));
     }
     err.into()
 }
@@ -253,7 +253,7 @@ pub(crate) async fn account_command(
     runtime_info: CliRuntimeInfo,
     account_flag: Option<String>,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         AccountCommand::Create {
             identity,
@@ -321,7 +321,7 @@ pub(crate) async fn account_command(
                 });
             }
             let status = app.status(&account.label)?;
-            let json = dm_status_json(status, &runtime_info)?;
+            let json = wn_status_json(status, &runtime_info)?;
             Ok(CommandOutput {
                 plain: serde_json::to_string_pretty(&json)
                     .expect("JSON response serialization cannot fail"),
@@ -371,7 +371,7 @@ async fn relay_list_status_for_account_id(
     app: &MarmotApp,
     account_id: &str,
     bootstrap_relays: Vec<TransportEndpoint>,
-) -> Result<AccountRelayListStatus, DmError> {
+) -> Result<AccountRelayListStatus, WnError> {
     if bootstrap_relays.is_empty() {
         Ok(app.account_relay_list_status_for_account_id(account_id)?)
     } else {
@@ -384,7 +384,7 @@ async fn relay_list_status_for_account_id(
 fn account_summary_json(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
-) -> Result<Value, DmError> {
+) -> Result<Value, WnError> {
     let profile = app
         .directory_entry_for_account_id(&account.account_id_hex)
         .ok()
@@ -409,7 +409,7 @@ fn account_display_name_or_npub(account: &Value) -> &str {
         .unwrap_or("")
 }
 
-fn dm_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Result<Value, DmError> {
+fn wn_status_json(status: AppStatus, runtime_info: &CliRuntimeInfo) -> Result<Value, WnError> {
     Ok(json!({
         "account_id": status.account_id_hex,
         "npub": npub_for_account_id(&status.account_id_hex)?,
@@ -443,7 +443,7 @@ fn secret_store_json(runtime_info: &CliRuntimeInfo) -> Value {
 fn public_account_status_json(
     account: &marmot_account::AccountSummary,
     relay_lists: AccountRelayListStatus,
-) -> Result<Value, DmError> {
+) -> Result<Value, WnError> {
     Ok(json!({
         "account_id": account.account_id_hex,
         "npub": npub_for_account_id(&account.account_id_hex)?,

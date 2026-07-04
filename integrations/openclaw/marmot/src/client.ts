@@ -110,7 +110,7 @@ export interface AgentControlMediaLocator {
 /**
  * Faithful, non-secret mirror of the Rust `MediaAttachmentReference`. Carries
  * everything needed to fetch + authenticate an encrypted blob EXCEPT the content
- * key, which never leaves `dm-agent`. Pass it back to {@link MarmotAgentControlClient.downloadMedia}.
+ * key, which never leaves `wn-agent`. Pass it back to {@link MarmotAgentControlClient.downloadMedia}.
  */
 export interface AgentControlMediaRef {
   media_type: string;
@@ -127,7 +127,7 @@ export interface AgentControlMediaRef {
 
 /**
  * A local file for {@link MarmotAgentControlClient.sendMedia} to encrypt + upload
- * as an attachment. `dm-agent` reads the bytes from `path` on its own host; the
+ * as an attachment. `wn-agent` reads the bytes from `path` on its own host; the
  * control plane never carries plaintext or a content key.
  */
 export interface AgentControlMediaUpload {
@@ -140,7 +140,7 @@ export interface AgentControlMediaUpload {
 
 export interface MediaDownloadedResponse {
   type: "media_downloaded";
-  /** Host-local path on the `dm-agent` machine where the plaintext was written. */
+  /** Host-local path on the `wn-agent` machine where the plaintext was written. */
   path: string;
   media_type: string;
   file_name: string;
@@ -483,7 +483,7 @@ export class MarmotAgentControlClient {
 
   /**
    * Encrypt + upload local files as encrypted media and send them as a kind-9
-   * message in the group. `dm-agent` reads each file's bytes from its host by
+   * message in the group. `wn-agent` reads each file's bytes from its host by
    * `path`; the control plane never carries plaintext or a content key. Returns
    * the durable message ids (`final_sent`).
    */
@@ -504,7 +504,7 @@ export class MarmotAgentControlClient {
 
   /**
    * Fetch + decrypt an inbound media reference and write the plaintext to a temp
-   * file on the `dm-agent` host. The content key stays in `dm-agent`; the reply
+   * file on the `wn-agent` host. The content key stays in `wn-agent`; the reply
    * carries only the host-local path and metadata (`media_downloaded`).
    */
   async downloadMedia(

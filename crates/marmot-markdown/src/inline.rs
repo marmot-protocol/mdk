@@ -20,13 +20,13 @@ use crate::scanner;
 /// Keep in sync with the explicit match arms — used as the exit condition
 /// for the plain-byte fast-scan in the `_` wildcard arm.
 ///
-/// `d`, `h`, `m`, `t`, `w` are tripwires for bare-URL schemes (`darkmatter://`,
-/// `http(s)://`, `mailto:`, `tel:`, `whitenoise:`); the bulk-scan rescue below keeps the
+/// `h`, `m`, `t`, `w` are tripwires for bare-URL schemes (`http(s)://`,
+/// `mailto:`, `marmot://`, `tel:`, `whitenoise:`); the bulk-scan rescue below keeps the
 /// fast path for the overwhelmingly common case of ordinary prose containing
 /// those letters.
 const INLINE_SPECIAL: [bool; 128] = {
     let mut t = [false; 128];
-    let chars = b"\\`$&[!*_~]<@ndhmtw\n";
+    let chars = b"\\`$&[!*_~]<@nhmtw\n";
     let mut k = 0;
     while k < chars.len() {
         t[chars[k] as usize] = true;
@@ -44,14 +44,14 @@ const INLINE_SPECIAL: [bool; 128] = {
 /// tree — the derived `serde` (de)serialization, the `marmot-uniffi` `From`
 /// conversions, and `coalesce_text_runs` — so that hostile input cannot drive
 /// any of them into a stack-overflow abort (a fatal, uncatchable crash). See
-/// darkmatter#208.
+/// mdk#208.
 pub(crate) const MAX_INLINE_NESTING_DEPTH: usize = 96;
 
 /// Maximum number of simultaneously-open link/image bracket delimiters kept on
 /// the delimiter stack. Excess openers remain literal text. This mirrors the
 /// emitted inline nesting cap: a deeper bracket stack cannot produce valid
 /// display nesting, and keeping it unbounded lets hostile input spend quadratic
-/// time repeatedly searching/dropping unmatched openers (darkmatter#654).
+/// time repeatedly searching/dropping unmatched openers (mdk#654).
 const MAX_OPEN_BRACKET_DELIMITERS: usize = MAX_INLINE_NESTING_DEPTH;
 
 /// Returns `true` if any inline in `items` is nested at least `cap` levels
@@ -422,7 +422,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                     i += 1;
                 }
             }
-            b'd' | b'h' | b'm' | b't' | b'w' => {
+            b'h' | b'm' | b't' | b'w' => {
                 if let Some((url, end)) = try_bare_url(bytes, i) {
                     flush_text(&mut out, &mut buf, &delims);
                     out.push(Inline::Autolink {
@@ -490,7 +490,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                             // Same rescue for `h`/`m`/`t`/`w` — they're
                             // tripwires for bare-URL schemes and most occur
                             // mid-word in prose.
-                            if matches!(cc, b'd' | b'h' | b'm' | b't' | b'w')
+                            if matches!(cc, b'h' | b'm' | b't' | b'w')
                                 && !looks_like_bare_url_start(bytes, i)
                             {
                                 i += 1;
@@ -951,7 +951,7 @@ fn label_text(b: &[u8], start: usize, end: usize) -> String {
 ///
 /// Returns `true` if the link/image was wrapped, `false` if wrapping was
 /// refused because it would push the inline tree past
-/// [`MAX_INLINE_NESTING_DEPTH`] (darkmatter#208). On refusal `out`/`delims`
+/// [`MAX_INLINE_NESTING_DEPTH`] (mdk#208). On refusal `out`/`delims`
 /// are left untouched so the caller can fall back to literal-text handling
 /// of the closing `]` after deactivating the refused opener.
 fn absorb_link(
@@ -970,7 +970,7 @@ fn absorb_link(
     let opener = delims[opener_idx];
     let prev_bracket = opener.prev_bracket;
 
-    // Depth guard (darkmatter#208). Wrapping the children in a Link/Image node
+    // Depth guard (mdk#208). Wrapping the children in a Link/Image node
     // produces a node one level deeper than its deepest child, exactly like
     // emphasis pairing. Without this bound, input shaped as
     // `"![" * N + "a" + "](x)" * N` builds image nesting of depth ~N and later
@@ -1039,7 +1039,7 @@ const BARE_URL_SCHEMES: &[&[u8]] = &[
     b"http://",
     b"mailto:",
     b"tel:",
-    b"darkmatter://",
+    b"marmot://",
     b"whitenoise-staging://",
     b"whitenoise://",
 ];
@@ -1466,7 +1466,7 @@ fn process_emphasis(out: &mut Vec<Inline>, delims: &mut [BracketDelim], stack_bo
             let strong = opener.len >= 2 && closer.len >= 2;
             let n = if closer.kind == b'~' || strong { 2 } else { 1 };
 
-            // Depth guard (darkmatter#208). Wrapping these children produces a
+            // Depth guard (mdk#208). Wrapping these children produces a
             // node one level deeper than the deepest child. If that would push
             // the inline tree past MAX_INLINE_NESTING_DEPTH, refuse the pairing
             // and leave the closer's delimiter run as literal text — exactly

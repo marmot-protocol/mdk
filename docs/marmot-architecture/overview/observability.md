@@ -46,7 +46,7 @@ Keep field names neutral. Prefer `endpoint_count` over a field or local name tha
 
 A sensitive value can escape through more than one exit. Each value class below lists the required posture per escape
 route, so "does not leak" holds by construction rather than by author vigilance at every call site (tracked in
-darkmatter#379).
+mdk#379).
 
 | Value class | Memory | `Debug`/`Display` | FFI | Tracing/logs | Forensic audit |
 | --- | --- | --- | --- | --- | --- |

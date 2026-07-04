@@ -14,7 +14,7 @@ This repo owns the Rust implementation workspace for Marmot:
 - SQLCipher-backed storage backend,
 - Nostr transport adapter and peeler,
 - raw QUIC agent text stream preview transport and memory-only broker,
-- agent control protocol, stream composition, and the `dm-agent` connector daemon,
+- agent control protocol, stream composition, and the `wn-agent` connector daemon,
 - app message Markdown display parser,
 - shared JSONL forensic audit schema,
 - UniFFI bindings for the app runtime,
@@ -45,7 +45,7 @@ The canonical protocol specification lives in
 | QUIC preview broker | `crates/transport-quic-broker/AGENTS.md` |
 | Agent control protocol DTOs / framing | `crates/agent-control/AGENTS.md` |
 | Agent stream composition | `crates/agent-stream-compose/AGENTS.md` |
-| `dm-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
+| `wn-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/README.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |

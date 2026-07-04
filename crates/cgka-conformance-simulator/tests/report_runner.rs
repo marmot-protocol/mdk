@@ -152,7 +152,7 @@ fn property_test_coverage_matrix_names_each_property_family() {
 #[tokio::test]
 async fn report_runner_writes_send_leave_json_reports() {
     let out_dir = std::env::temp_dir().join(format!(
-        "darkmatter-cgka-conformance-simulator-report-test-{}",
+        "mdk-cgka-conformance-simulator-report-test-{}",
         std::process::id()
     ));
     if out_dir.exists() {
@@ -199,7 +199,7 @@ async fn report_runner_writes_send_leave_json_reports() {
 #[tokio::test]
 async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
     let out_dir = std::env::temp_dir().join(format!(
-        "darkmatter-cgka-strict-oracle-report-test-{}",
+        "mdk-cgka-strict-oracle-report-test-{}",
         std::process::id()
     ));
     if out_dir.exists() {
@@ -233,7 +233,7 @@ async fn report_runner_strict_oracle_counts_weak_warnings_as_failures() {
 #[tokio::test]
 async fn report_runner_writes_convergence_delivery_json_reports() {
     let out_dir = std::env::temp_dir().join(format!(
-        "darkmatter-cgka-convergence-delivery-report-test-{}",
+        "mdk-cgka-convergence-delivery-report-test-{}",
         std::process::id()
     ));
     if out_dir.exists() {
@@ -284,7 +284,7 @@ async fn report_runner_writes_convergence_delivery_json_reports() {
 #[tokio::test]
 async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates() {
     let out_dir = std::env::temp_dir().join(format!(
-        "darkmatter-cgka-convergence-chaos-report-test-{}",
+        "mdk-cgka-convergence-chaos-report-test-{}",
         std::process::id()
     ));
     if out_dir.exists() {
@@ -375,7 +375,7 @@ async fn report_runner_writes_convergence_chaos_reports_and_fixture_candidates()
 #[tokio::test]
 async fn report_runner_writes_vector_fixture_reports_and_summary() {
     let out_dir = std::env::temp_dir().join(format!(
-        "darkmatter-cgka-vector-report-test-{}",
+        "mdk-cgka-vector-report-test-{}",
         std::process::id()
     ));
     if out_dir.exists() {

@@ -30,7 +30,7 @@ impl Marmot {
     }
 
     /// Per-account unread aggregate for the account-switcher badge
-    /// (darkmatter#461). Each entry's `unread_count` is read from that
+    /// (mdk#461). Each entry's `unread_count` is read from that
     /// account's materialized chat-list projection, so this does not require
     /// switching into, or loading a full session/timeline for, any account —
     /// non-active (not-`running`) accounts are reported too. Only
@@ -58,7 +58,7 @@ impl Marmot {
     /// the secret-store nsec). After this returns the account ref is no longer
     /// valid for any further FFI call. The returned `WipeOutcomeFfi` reports
     /// each stage independently so the app can show progress and a
-    /// partial-failure sheet (darkmatter#478).
+    /// partial-failure sheet (mdk#478).
     pub async fn sign_out_and_wipe(
         &self,
         account_ref: String,
@@ -80,7 +80,7 @@ impl Marmot {
     /// groups, message history, and drafts intact. The account ref stays valid
     /// after this returns. The returned `SignOutOutcomeFfi` surfaces per-relay
     /// KeyPackage cleanup failures so the app can show a "will retry on next
-    /// sign-in" hint (darkmatter#477).
+    /// sign-in" hint (mdk#477).
     pub async fn sign_out(
         &self,
         account_ref: String,
@@ -264,7 +264,7 @@ impl Marmot {
     }
 
     /// Export the active account's raw private key in canonical `nsec1...`
-    /// bech32 form for an in-app key-backup display (darkmatter#543).
+    /// bech32 form for an in-app key-backup display (mdk#543).
     ///
     /// SENSITIVE: revealing the raw key is logged to the per-account audit log
     /// and permanently marks the account's NIP-49 KEY_SECURITY_BYTE as 0x00
@@ -283,7 +283,7 @@ impl Marmot {
     }
 
     /// Export the active account's private key as a password-encrypted NIP-49
-    /// `ncryptsec1...` bech32 backup string (darkmatter#544).
+    /// `ncryptsec1...` bech32 backup string (mdk#544).
     ///
     /// SENSITIVE: the passphrase is accepted as an owned FFI string and zeroed
     /// on return by the Rust boundary. The encrypted export is logged to the

@@ -481,7 +481,7 @@ pub(crate) fn group_state_subscribe_args(cli: &Cli) -> Result<String, String> {
         crate::Command::Groups {
             command: crate::GroupsCommand::SubscribeState { group_id },
         } => crate::normalize_group_id_hex(group_id).map_err(|err| err.to_string()),
-        _ => Err("groups subscribe-state requires dm groups subscribe-state".to_owned()),
+        _ => Err("groups subscribe-state requires wn groups subscribe-state".to_owned()),
     }
 }
 
@@ -493,7 +493,7 @@ pub(crate) fn chats_subscribe_args(cli: &Cli) -> Result<bool, String> {
         crate::Command::Chats {
             command: crate::ChatsCommand::SubscribeArchived,
         } => Ok(true),
-        _ => Err("chats subscribe requires dm chats subscribe".to_owned()),
+        _ => Err("chats subscribe requires wn chats subscribe".to_owned()),
     }
 }
 
@@ -507,7 +507,7 @@ pub(crate) fn messages_subscribe_args(
         | crate::Command::Messages {
             command: crate::MessageCommand::Subscribe { group, limit },
         } => (group, *limit),
-        _ => return Err("messages subscribe requires dm messages subscribe".to_owned()),
+        _ => return Err("messages subscribe requires wn messages subscribe".to_owned()),
     };
     let group_id = group
         .as_deref()
@@ -550,7 +550,7 @@ pub(crate) fn timeline_messages_subscribe_args(
         } => (group, *limit),
         _ => {
             return Err(
-                "timeline messages subscribe requires dm messages timeline subscribe".to_owned(),
+                "timeline messages subscribe requires wn messages timeline subscribe".to_owned(),
             );
         }
     };

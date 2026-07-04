@@ -25,7 +25,7 @@ use crate::{
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 // nostr-sdk 0.44 waits up to 10s for each relay's OK response. Keep this
 // wrapper above that so SDK endpoint-level success/failure results surface
-// instead of a Darkmatter-level timeout masking them.
+// instead of a MDK-level timeout masking them.
 const SDK_RELAY_PUBLISH_WAIT: Duration = Duration::from_secs(12);
 /// Publishing to relays is best-effort over a flaky network: retry the send a
 /// few times (with a short backoff) before giving up, so a single slow relay

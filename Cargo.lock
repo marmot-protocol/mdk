@@ -1080,34 +1080,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkmatter-cli"
-version = "0.2.0"
-dependencies = [
- "agent-stream-compose",
- "cgka-session",
- "cgka-traits",
- "clap",
- "crossterm",
- "fs-private",
- "hex",
- "libc",
- "marmot-account",
- "marmot-app",
- "nostr",
- "nostr-relay-builder",
- "ratatui",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "transport-quic-broker",
- "transport-quic-stream",
- "unicode-properties",
- "url",
-]
-
-[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5837,6 +5809,34 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wn-cli"
+version = "0.2.0"
+dependencies = [
+ "agent-stream-compose",
+ "cgka-session",
+ "cgka-traits",
+ "clap",
+ "crossterm",
+ "fs-private",
+ "hex",
+ "libc",
+ "marmot-account",
+ "marmot-app",
+ "nostr",
+ "nostr-relay-builder",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "transport-quic-broker",
+ "transport-quic-stream",
+ "unicode-properties",
+ "url",
 ]
 
 [[package]]

@@ -188,7 +188,7 @@ async fn remove_account_updates_list_accounts() {
 
 #[tokio::test]
 async fn account_unread_summary_reports_local_accounts_without_session_load() {
-    // darkmatter#461: the account-switcher badge query must work for accounts
+    // mdk#461: the account-switcher badge query must work for accounts
     // that have never been started/loaded. A fresh local account with no
     // messages reports zero unread, and the call does not require start().
     install_mock_keyring();
@@ -282,7 +282,7 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
         account_id.to_string(),
         npub.to_string(),
         format!("nostr:{npub}"),
-        format!("darkmatter://profile/{npub}?from=qr"),
+        format!("marmot://profile/{npub}?from=qr"),
     ] {
         let normalized = kit
             .normalize_member_ref(reference.clone())
@@ -788,7 +788,7 @@ async fn message_history_binding_methods_validate_group_hex() {
 
     // Invalid group hex must be rejected with InvalidHex before the account
     // lookup, matching every other group-scoped FFI method (regression for
-    // darkmatter#204: messages() previously passed the host string straight
+    // mdk#204: messages() previously passed the host string straight
     // into the query, silently yielding empty history).
     let invalid_group = kit
         .messages("missing".into(), Some("not-hex".into()), Some(25))
@@ -827,7 +827,7 @@ async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
     )
     .expect("open marmot kit");
 
-    // The convergence-retry binding (darkmatter#472) must reject invalid group
+    // The convergence-retry binding (mdk#472) must reject invalid group
     // hex with InvalidHex before any account/runtime work, matching every other
     // group-scoped FFI method.
     let invalid_group = kit

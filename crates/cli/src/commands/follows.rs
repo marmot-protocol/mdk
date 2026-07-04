@@ -6,7 +6,7 @@ use marmot_app::{AccountRelayListBootstrap, MarmotApp, MarmotAppRuntime};
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, DmError, FollowsCommand, ensure_local_signing, npub_for_account_id,
+    CommandOutput, FollowsCommand, WnError, ensure_local_signing, npub_for_account_id,
     parse_public_key, replaceable_list_inconclusive, resolve_account, validate_relay_url,
 };
 
@@ -16,7 +16,7 @@ pub(crate) async fn follows_command(
     command: FollowsCommand,
     account_flag: Option<String>,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     follows_command_with_runtime(account_home, app, &runtime, command, account_flag, relay).await
 }
@@ -28,7 +28,7 @@ pub(crate) async fn follows_command_with_runtime(
     command: FollowsCommand,
     account_flag: Option<String>,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, account_flag)?;
     ensure_local_signing(&account)?;
     match command {
@@ -76,9 +76,9 @@ async fn update_follows_command(
     relay: Option<String>,
     pubkey: String,
     add: bool,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let target = parse_public_key(&pubkey)?;
-    let relay = relay.ok_or(DmError::MissingRelay)?;
+    let relay = relay.ok_or(WnError::MissingRelay)?;
     let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
     let mut follows = app
         .fetch_current_follow_list_for_account_id(&account.account_id_hex, vec![endpoint.clone()])
@@ -112,7 +112,7 @@ async fn update_follows_command(
     follows_output(account.account_id_hex, follows)
 }
 
-fn follows_output(account_id: String, follows: Vec<String>) -> Result<CommandOutput, DmError> {
+fn follows_output(account_id: String, follows: Vec<String>) -> Result<CommandOutput, WnError> {
     let follows_json = follows
         .iter()
         .map(|follow| {
@@ -121,7 +121,7 @@ fn follows_output(account_id: String, follows: Vec<String>) -> Result<CommandOut
                 "npub": npub_for_account_id(follow)?,
             }))
         })
-        .collect::<Result<Vec<_>, DmError>>()?;
+        .collect::<Result<Vec<_>, WnError>>()?;
     Ok(CommandOutput {
         plain: if follows_json.is_empty() {
             "no follows".to_owned()

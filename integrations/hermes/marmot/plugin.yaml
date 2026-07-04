@@ -2,24 +2,24 @@ name: marmot
 label: Marmot
 kind: platform
 version: 0.2.0
-description: Hermes platform adapter for Marmot through the local dm-agent control socket
-author: Darkmatter
+description: Hermes platform adapter for Marmot through the local wn-agent control socket
+author: Marmot Protocol
 requires_env: []
 optional_env:
   - name: MARMOT_HOME
-    description: "dm-agent home directory; required unless MARMOT_AGENT_SOCKET is set"
+    description: "wn-agent home directory; required unless MARMOT_AGENT_SOCKET is set"
     password: false
   - name: MARMOT_AGENT_SOCKET
-    description: "Unix socket for dm-agent; defaults to $MARMOT_HOME/dev/dm-agent.sock"
+    description: "Unix socket for wn-agent; defaults to $MARMOT_HOME/dev/wn-agent.sock"
     password: false
   - name: MARMOT_AGENT_AUTH_TOKEN
-    description: "Bearer token for a token-gated dm-agent control socket"
+    description: "Bearer token for a token-gated wn-agent control socket"
     password: true
   - name: MARMOT_AGENT_AUTH_TOKEN_FILE
-    description: "Path to a bearer token file for a token-gated dm-agent control socket"
+    description: "Path to a bearer token file for a token-gated wn-agent control socket"
     password: false
   - name: MARMOT_ACCOUNT_ID_HEX
-    description: "Agent account pubkey/account id hex; required when dm-agent has more than one account"
+    description: "Agent account pubkey/account id hex; required when wn-agent has more than one account"
     password: false
   - name: MARMOT_GROUP_ID_HEX
     description: "Optional Marmot group id filter for inbound messages"
@@ -43,7 +43,7 @@ optional_env:
     description: "Agent display name used as an extra mention trigger in multi-party groups and as the default Nostr profile name during onboarding"
     password: false
   - name: MARMOT_WELCOMER_ALLOWLIST
-    description: "Comma-separated hex account ids mirrored into dm-agent's welcomer allowlist on connect (also MARMOT_DM_ALLOW_FROM)"
+    description: "Comma-separated hex account ids mirrored into wn-agent's welcomer allowlist on connect (also MARMOT_DM_ALLOW_FROM)"
     password: false
   - name: MARMOT_MEDIA_LOCAL_ROOTS
     description: "Comma-separated local directories allowed for outbound media sends; defaults to $MARMOT_HOME/dev/inbound-media"

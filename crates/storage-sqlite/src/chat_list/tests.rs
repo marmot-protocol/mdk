@@ -1112,7 +1112,7 @@ fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
 
 #[test]
 fn set_group_self_membership_propagates_backend_errors() {
-    // darkmatter#573 review follow-up (blocking finding 2): the
+    // mdk#573 review follow-up (blocking finding 2): the
     // `self_membership` projection write is the source of truth for the account
     // unread aggregate, so a backend failure must surface as an `Err` (the sync
     // / local-leave callers propagate it with `?`) instead of being swallowed.

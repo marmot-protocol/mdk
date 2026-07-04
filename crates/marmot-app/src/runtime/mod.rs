@@ -575,7 +575,7 @@ pub struct RelayFailure {
     pub reason: String,
 }
 
-/// Local-cleanup stage result. In darkmatter, removing the account directory
+/// Local-cleanup stage result. In mdk, removing the account directory
 /// atomically drops the SQLCipher session database (MLS state + projections),
 /// the cached media/source-epoch secrets, the on-disk KeyPackage material, the
 /// SQL account record, and the secret-store nsec; the in-memory caches,
@@ -597,7 +597,7 @@ pub struct LocalCleanupReport {
 /// sign-out keeps the encrypted local databases (app SQL + MLS state) and the
 /// secret-store nsec on device so the same identity can be re-activated from
 /// the account picker with its groups, history, and drafts intact
-/// (darkmatter#477, parent darkmatter-android#347).
+/// (mdk#477, parent mdk-android#347).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignOutOptions {
     /// Publish kind:5 deletions for every relay-published KeyPackage of this
@@ -1034,8 +1034,8 @@ impl MarmotAppRuntime {
     }
 
     /// Stored groups that failed session-open hydration and were skipped
-    /// (darkmatter#151 / #417). Backs the per-group recovery surface
-    /// (darkmatter#426).
+    /// (mdk#151 / #417). Backs the per-group recovery surface
+    /// (mdk#426).
     pub async fn quarantined_groups(
         &self,
         account_ref: &str,
@@ -1043,7 +1043,7 @@ impl MarmotAppRuntime {
         self.accounts.quarantined_groups(account_ref).await
     }
 
-    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    /// Re-attempt hydration of a single quarantined group (mdk#426).
     /// `Ok(true)` if it recovered and is now live, `Ok(false)` if still
     /// unhealthy.
     pub async fn retry_hydrate_quarantined_group(
@@ -1067,7 +1067,7 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// See [`MarmotApp::reveal_nsec`]. darkmatter#543. `caller_context` is the
+    /// See [`MarmotApp::reveal_nsec`]. mdk#543. `caller_context` is the
     /// privacy-safe surface label recorded in the reveal audit entry.
     pub fn reveal_nsec(
         &self,
@@ -1077,7 +1077,7 @@ impl MarmotAppRuntime {
         self.accounts.reveal_nsec(account_ref, caller_context)
     }
 
-    /// See [`MarmotApp::export_encrypted_secret_key`]. darkmatter#544.
+    /// See [`MarmotApp::export_encrypted_secret_key`]. mdk#544.
     /// `caller_context` is the privacy-safe surface label recorded in the
     /// encrypted-export audit entry.
     pub fn export_encrypted_secret_key(
@@ -1804,7 +1804,7 @@ impl MarmotAppRuntime {
     ///
     /// This is the reversible counterpart to [`sign_out_and_wipe`]. It
     /// implements the engine half of the "Sign Out" action in
-    /// darkmatter#477 / parent darkmatter-android#347.
+    /// mdk#477 / parent mdk-android#347.
     ///
     /// Steps:
     /// 1. **Local teardown (always).** Shut the managed account worker down
@@ -1923,12 +1923,12 @@ impl MarmotAppRuntime {
     /// Destructive sign-out: fully remove the account's footprint from this
     /// device and from the relays the engine controls publishing to.
     ///
-    /// Stages run in the order the spec (darkmatter#478) mandates:
+    /// Stages run in the order the spec (mdk#478) mandates:
     /// 1. Best-effort leave for every active MLS group. Failures are collected
     ///    per group and do not abort the wipe. This MUST happen while MLS state
     ///    still exists — once the session DB is wiped the engine can no longer
     ///    sign leave messages. "Active" here means *locally MLS-joined*, which
-    ///    in darkmatter includes groups still marked `pending_confirmation`: an
+    ///    in mdk includes groups still marked `pending_confirmation`: an
     ///    incoming Welcome auto-joins MLS state before the user accepts, so a
     ///    pending invite is a real committed membership this device must leave
     ///    (the decline path leaves such groups too). Group-enumeration failures
@@ -1936,7 +1936,7 @@ impl MarmotAppRuntime {
     /// 2. Best-effort delete of every relay-published KeyPackage event, always
     ///    (no toggle), mirroring the `delete_key_package` path.
     /// 3. Local cleanup (stages 3-5 of the spec): tear down the managed worker
-    ///    and in-memory caches, then remove the account directory. In darkmatter
+    ///    and in-memory caches, then remove the account directory. In mdk
     ///    `remove_account` first **atomically renames** the live account
     ///    directory out of the active namespace and only then deletes the
     ///    tombstoned bytes (the SQLCipher session database holding MLS state,
@@ -1975,7 +1975,7 @@ impl MarmotAppRuntime {
         // group set directly from the in-memory account state (no relay round
         // trip). We attempt the leave for *every* group with local MLS
         // membership, including ones still marked `pending_confirmation`: in
-        // darkmatter an incoming Welcome auto-joins MLS state while the app
+        // mdk an incoming Welcome auto-joins MLS state while the app
         // keeps the invite pending until the user accepts, so a
         // pending-confirmation group is already a committed MLS member this
         // device can — and must — leave before its state is wiped (mirroring
@@ -2210,7 +2210,7 @@ impl MarmotAppRuntime {
     }
 
     /// Per-account unread aggregate for the account-switcher badge
-    /// (darkmatter#461). Computed from each account's materialized chat-list
+    /// (mdk#461). Computed from each account's materialized chat-list
     /// projection without loading a full session/timeline, so accounts that are
     /// not the active/running one are reported too.
     pub fn account_unread_summary(&self) -> Result<Vec<AccountUnread>, AppError> {
@@ -2230,7 +2230,7 @@ impl MarmotAppRuntime {
         // long-lived in-memory `AccountState` is updated in place. A direct
         // `MarmotApp::set_group_archived` would only touch the database; the
         // worker's stale snapshot (archived = false) would then silently revert
-        // it on the next inbound delivery's `save_state`. See darkmatter#178.
+        // it on the next inbound delivery's `save_state`. See mdk#178.
         let group = self
             .accounts
             .set_group_archived(account_ref, &group_id, archived)
@@ -3083,7 +3083,7 @@ impl AccountManager {
         // Setup probes (e.g. `status()`) may have already cached this account's
         // storage/directory handles. Evict them before the directory is deleted
         // so a later re-import does not reuse a handle bound to the now-unlinked
-        // inode. See `drop_account_caches` and darkmatter#220.
+        // inode. See `drop_account_caches` and mdk#220.
         self.app.drop_account_caches(account);
         match self.app.account_home().remove_account(account) {
             Ok(()) => Err(source),

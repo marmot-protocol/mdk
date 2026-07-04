@@ -556,7 +556,7 @@ async fn fresh_key_package_is_mls_last_resort() {
 async fn delete_key_package_is_idempotent_noop_when_absent() {
     // Deleting a KeyPackage that is not (or no longer) in storage must be a
     // no-op rather than an error, so the publisher-failure cleanup path is safe
-    // to call idempotently across retries (darkmatter#160).
+    // to call idempotently across retries (mdk#160).
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
 
@@ -567,7 +567,7 @@ async fn delete_key_package_is_idempotent_noop_when_absent() {
 
 #[tokio::test]
 async fn delete_key_package_removes_bundle_so_welcome_cannot_be_joined() {
-    // darkmatter#160: fresh_key_package persists the private bundle into
+    // mdk#160: fresh_key_package persists the private bundle into
     // storage. After delete_key_package prunes it, a Welcome built against that
     // KeyPackage can no longer be joined because the private bundle is gone.
     let mut alice = build_client(b"alice", selfremove_registry());

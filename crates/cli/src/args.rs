@@ -1,4 +1,4 @@
-//! Declarative `clap` command-line argument surface for the `dm` CLI.
+//! Declarative `clap` command-line argument surface for the `wn` CLI.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(
-    name = "dm",
+    name = "wn",
     version,
-    about = "Darkmatter account, group, message, stream, and daemon CLI",
+    about = "White Noise account, group, message, stream, and daemon CLI",
     disable_help_subcommand = true
 )]
 pub(crate) struct Cli {
@@ -18,14 +18,14 @@ pub(crate) struct Cli {
         long,
         global = true,
         value_name = "PATH",
-        help = "Use this Darkmatter data directory"
+        help = "Use this White Noise data directory"
     )]
     pub(crate) home: Option<PathBuf>,
     #[arg(
         long,
         global = true,
         value_name = "PATH",
-        help = "Connect to this dmd daemon socket"
+        help = "Connect to this wnd daemon socket"
     )]
     pub(crate) socket: Option<PathBuf>,
     #[arg(long, global = true, value_name = "URL", hide = true)]
@@ -118,7 +118,7 @@ pub(crate) enum Command {
     },
     #[command(
         name = "export-nsec",
-        about = "Exporting private keys is disabled by Darkmatter CLI policy"
+        about = "Exporting private keys is disabled by White Noise CLI policy"
     )]
     ExportNsec {
         #[arg(
@@ -207,7 +207,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: StreamCommand,
     },
-    #[command(about = "Start, stop, and inspect the local dmd runtime")]
+    #[command(about = "Start, stop, and inspect the local wnd runtime")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -219,7 +219,7 @@ pub(crate) enum Command {
         about = "Show device-local relay performance telemetry (aggregate, no relay URLs)"
     )]
     RelayStats,
-    #[command(about = "Delete all local Darkmatter CLI data after confirmation")]
+    #[command(about = "Delete all local White Noise CLI data after confirmation")]
     Reset {
         #[arg(long, help = "Required safety flag before deleting local data")]
         confirm: bool,
@@ -995,12 +995,12 @@ pub(crate) enum StreamCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum DaemonCommand {
-    #[command(about = "Start dmd in the background")]
+    #[command(about = "Start wnd in the background")]
     Start {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Use this Darkmatter data directory (alias for --home)"
+            help = "Use this White Noise data directory (alias for --home)"
         )]
         data_dir: Option<PathBuf>,
         #[arg(
@@ -1024,7 +1024,7 @@ pub(crate) enum DaemonCommand {
         )]
         logs_dir: Option<PathBuf>,
     },
-    #[command(about = "Stop the background dmd daemon")]
+    #[command(about = "Stop the background wnd daemon")]
     Stop,
     #[command(about = "Show daemon status, relay health, and stream watches")]
     Status,

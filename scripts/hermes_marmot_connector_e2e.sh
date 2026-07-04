@@ -5,7 +5,7 @@ usage() {
     cat <<'USAGE'
 Usage: scripts/hermes_marmot_connector_e2e.sh [options]
 
-Runs a deterministic Hermes/Marmot E2E against a real dm-agent process started
+Runs a deterministic Hermes/Marmot E2E against a real wn-agent process started
 with debug controls. No model, real Marmot account, group, or relay is required.
 
 Options:
@@ -51,4 +51,4 @@ fi
 cd "$HERMES_AGENT_REPO"
 export PYTHONDONTWRITEBYTECODE=1
 exec "$HERMES_AGENT_REPO/.venv/bin/python" \
-    "$DARKMATTER_REPO/integrations/hermes/marmot/tests/e2e_connector.py"
+    "$MDK_REPO/integrations/hermes/marmot/tests/e2e_connector.py"

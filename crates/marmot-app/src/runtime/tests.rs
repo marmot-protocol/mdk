@@ -105,7 +105,7 @@ fn stamp_published_profile_created_at_preserves_existing_stamp() {
 
 #[test]
 fn stamped_profile_wins_over_stale_relay_copy_in_if_newer_check() {
-    // Regression for darkmatter#206: model the exact comparison
+    // Regression for mdk#206: model the exact comparison
     // remember_directory_profile_if_newer performs. A zero-stamped cache
     // loses to any fetched copy; a now-stamped cache beats an older one.
     let mut zero_cache = UserProfileMetadata {
@@ -1047,7 +1047,7 @@ fn recovery_record_drops_undecodable_group_id() {
 
 #[test]
 fn messages_recovery_query_drops_initial_replay_limit() {
-    // Regression for darkmatter#180 follow-up: the caller's `limit` is an
+    // Regression for mdk#180 follow-up: the caller's `limit` is an
     // initial-replay cap (latest N rows). Reusing it on lag recovery would
     // reload only the latest N stored rows, so a limited subscriber could
     // still permanently lose messages between the last delivered id and

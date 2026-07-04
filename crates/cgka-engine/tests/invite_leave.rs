@@ -1207,7 +1207,7 @@ async fn remove_co_admin_couples_admin_policy_update_in_same_commit() {
     );
 }
 
-/// Regression for darkmatter#557: re-adding a previously removed member to the
+/// Regression for mdk#557: re-adding a previously removed member to the
 /// SAME group must produce a fresh Welcome the receiver decrypts and acts on,
 /// with no special-casing between "first add" and "re-add after removal".
 ///
@@ -1799,7 +1799,7 @@ async fn selfremove_full_flow_with_auto_commit() {
     // Bob ingests alice's commit — his epoch advances and he sees himself
     // removed. The engine retains his (tombstoned) local group state on removal
     // so the convergence artifacts needed to invalidate a losing removal branch
-    // survive (darkmatter#557 keeps re-add working via a lazy teardown at
+    // survive (mdk#557 keeps re-add working via a lazy teardown at
     // re-join time, not an eager destroy here).
     let commit = auto.msg;
     let routed = TransportMessage {

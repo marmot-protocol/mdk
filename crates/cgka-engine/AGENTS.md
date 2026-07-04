@@ -219,7 +219,7 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
   - **What changed:** `EpochManager::confirm_publish` / `rollback_publish` / `begin_pending` clone the prior
     `EpochState` and run the fallible inner transition BEFORE mutating `states` / `committed_from` / `pending`. A
     failing inner transition no longer orphans the group's state map entry. `begin_pending` got this treatment in
-    darkmatter#146 (it previously removed-before-transition, orphaning the group to `UnknownGroup` when staged from a
+    mdk#146 (it previously removed-before-transition, orphaning the group to `UnknownGroup` when staged from a
     non-`Stable` state). The auto-commit ingest arm also now requires `Stable` (`EpochState::is_stable`) before staging,
     so a `Recovering` group — which still accepts ingest — leaves the SelfRemove proposal queued instead of staging a
     commit that `begin_pending` would reject.
@@ -233,7 +233,7 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     (`openmls_projection::persist_openmls_canonicalization_dispositions`) honours the same split: a
     `UndecryptableInCanonicalState` app message is persisted `Retryable` (not terminal `EpochInvalidated`), and
     `distributed_convergence` neither marks it seen nor emits `AppMessageInvalidated`, so it re-enters convergence
-    once the awaited commit advances the epoch (darkmatter#144).
+    once the awaited commit advances the epoch (mdk#144).
   - **Test:** covered by distributed-convergence integration tests, incl.
     `future_epoch_app_message_stays_retryable_until_commit_arrives`
 

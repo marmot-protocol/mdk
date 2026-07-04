@@ -477,7 +477,7 @@ pub enum GroupEvent {
     /// by an application-initiated retry and is now a live group again.
     ///
     /// Emitted only by the engine's quarantine-retry recovery path
-    /// (darkmatter#426), never at session-open hydration. The group is usable
+    /// (mdk#426), never at session-open hydration. The group is usable
     /// at `recovered_epoch`; the application SHOULD move it out of any
     /// "needs recovery" surface, refresh its chat-list / projection, and
     /// trigger a normal resync so it catches up on anything missed while it was
@@ -731,7 +731,7 @@ pub trait CgkaEngine: Send + Sync {
     /// as a side effect of building it. Callers that fail to publish a
     /// generated KeyPackage must call this to prune the orphaned private bundle,
     /// otherwise retries against a failing publisher accumulate unused private
-    /// key material indefinitely (darkmatter#160). Deleting a KeyPackage that is
+    /// key material indefinitely (mdk#160). Deleting a KeyPackage that is
     /// not present in storage is a no-op, so this is safe to call idempotently.
     async fn delete_key_package(&mut self, key_package: &KeyPackage) -> Result<(), EngineError>;
 }

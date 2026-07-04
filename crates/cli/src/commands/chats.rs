@@ -5,7 +5,7 @@ use marmot_app::{MarmotApp, MarmotAppRuntime};
 use serde_json::json;
 
 use crate::{
-    ChatsCommand, CommandOutput, DmError, ensure_local_signing, group_json, group_list_plain,
+    ChatsCommand, CommandOutput, WnError, ensure_local_signing, group_json, group_list_plain,
     group_show_output, normalize_group_id_hex, npub_for_account_id, resolve_account,
     unsupported_command,
 };
@@ -15,7 +15,7 @@ pub(crate) async fn chats_command(
     app: &MarmotApp,
     command: ChatsCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     chats_command_with_runtime(account_home, app, &runtime, command, account_flag).await
 }
@@ -26,7 +26,7 @@ pub(crate) async fn chats_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: ChatsCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         ChatsCommand::List { include_archived } => {
             let account = resolve_account(account_home, account_flag)?;
@@ -52,7 +52,7 @@ pub(crate) async fn chats_command_with_runtime(
             ensure_local_signing(&account)?;
             group_show_output(app, account, group, None)
         }
-        ChatsCommand::Subscribe => Err(DmError::ChatsSubscribeRequiresDaemon),
+        ChatsCommand::Subscribe => Err(WnError::ChatsSubscribeRequiresDaemon),
         ChatsCommand::Archive { group } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -81,7 +81,7 @@ pub(crate) async fn chats_command_with_runtime(
                 }),
             })
         }
-        ChatsCommand::SubscribeArchived => Err(DmError::ChatsSubscribeRequiresDaemon),
+        ChatsCommand::SubscribeArchived => Err(WnError::ChatsSubscribeRequiresDaemon),
         ChatsCommand::Mute { .. } => unsupported_command(
             "chats mute",
             "chat notification mute state is not modeled in marmot-app yet",
@@ -98,7 +98,7 @@ async fn group_archive_output(
     account: marmot_account::AccountSummary,
     group: String,
     archived: bool,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let group_id = normalize_group_id_hex(&group)?;
     let group = runtime
         .set_group_archived(&account.label, &group_id, archived)

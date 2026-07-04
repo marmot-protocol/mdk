@@ -2,7 +2,7 @@
 // (`crates/traits/src/agent_text_stream.rs`) and the UTF-8 chunk splitter
 // (`transport_quic_stream::split_text_deltas`).
 //
-// dm-agent validates the `transcript_hash_hex` / `chunk_count` we send in
+// wn-agent validates the `transcript_hash_hex` / `chunk_count` we send in
 // `stream_finalize` against its own locally-composed transcript and REJECTS a
 // finalize on any mismatch (see `crates/agent-connector/src/stream.rs`). So
 // this file must reproduce the Rust hashing byte-for-byte: the same SHA-256
@@ -24,9 +24,9 @@ export const AGENT_TEXT_STREAM_RECORD_ABORT = 0x05;
 export const AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE = 0x06;
 
 /**
- * Default preview chunk size. Must equal dm-agent's `STREAM_COMPOSE_CHUNK_BYTES`
+ * Default preview chunk size. Must equal wn-agent's `STREAM_COMPOSE_CHUNK_BYTES`
  * (1024) so our chunk boundaries — and therefore the transcript hash and chunk
- * count — match what the connector composes. dm-agent actually uses
+ * count — match what the connector composes. wn-agent actually uses
  * `min(requested, group max_plaintext_frame_len)`; with the default 65503-byte
  * cap that is 1024. Previews in a group whose agent-text-stream policy caps the
  * plaintext frame below this value would re-chunk smaller on the connector side
