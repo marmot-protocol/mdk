@@ -214,7 +214,7 @@ const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 /// is never validated upstream. Clamping the advance to `now + skew` bounds how
 /// far a malicious or buggy far-future `created_at` can move the subscription
 /// `since` filter, preventing an account from silently halting message
-/// reception (darkmatter#182). The margin tolerates benign sender clock skew.
+/// reception (mdk#182). The margin tolerates benign sender clock skew.
 const TRANSPORT_CURSOR_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
@@ -468,7 +468,7 @@ pub struct AccountRelayListStatus {
 }
 
 /// A relay list the account is missing. Typed so FFI clients can localize
-/// each kind without parsing protocol-jargon strings (darkmatter#565).
+/// each kind without parsing protocol-jargon strings (mdk#565).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MissingRelayListKind {
     /// NIP-65 relay list (kind 10002) — where this account publishes
@@ -566,7 +566,7 @@ pub struct SyncSummary {
 impl SyncSummary {
     /// Fold another summary's contents into this one. Used to combine the
     /// relay-delivery sync with the no-inbound engine-event drain so a single
-    /// `sync()` returns all surfaced events together (darkmatter#426).
+    /// `sync()` returns all surfaced events together (mdk#426).
     pub fn merge(&mut self, other: SyncSummary) {
         self.joined_groups.extend(other.joined_groups);
         self.messages.extend(other.messages);
@@ -715,7 +715,7 @@ pub struct AccountKeyPackageRecord {
 }
 
 /// Per-account unread aggregate, suitable for an account-switcher badge
-/// (darkmatter#461). Computed from each account's materialized chat-list
+/// (mdk#461). Computed from each account's materialized chat-list
 /// projection without loading a full session/timeline, so it can be reported
 /// for accounts that are not the active/running one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1349,7 +1349,7 @@ impl MarmotApp {
     }
 
     /// Per-account unread aggregate for the account-switcher badge
-    /// (darkmatter#461). Each account's count is read from its materialized
+    /// (mdk#461). Each account's count is read from its materialized
     /// `chat_list_rows` projection (a single grouped `COUNT`/`SUM`), so this
     /// does not require switching into, or loading a full session/timeline for,
     /// any account — non-active accounts are reported too.
@@ -3125,7 +3125,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         // the event (`NostrKeyPackagePublisher` requires >=1 ack and returns
         // `Err` only when the accept count falls short), so the KeyPackage was
         // never externally exposed and the orphaned private bundle is safe to
-        // prune (darkmatter#160).
+        // prune (mdk#160).
         let outcome = NostrKeyPackagePublisher::new(relay_client)
             .publish_key_package(&nostr_publication)
             .await
@@ -3139,7 +3139,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         // so it is externally discoverable. Any subsequent failure must NOT
         // prune the private bundle, or an inviter could build a Welcome against
         // the published event that this account can never join. Mark these
-        // errors `exposed` (darkmatter#160 adversarial review).
+        // errors `exposed` (mdk#160 adversarial review).
         let dir = self.app.key_package_cache_dir().join(KEY_PACKAGE_DIR);
         fs::create_dir_all(&dir).map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
         write_json(

@@ -7,7 +7,7 @@ tags: [marmot, architecture, runtime, daemon, broker, memory]
 
 # Long-lived runtime state — bounds and reclamation
 
-The daemon (`dm-agent`), the QUIC preview broker, and the app runtime are long-lived processes. Every long-lived
+The daemon (`wn-agent`), the QUIC preview broker, and the app runtime are long-lived processes. Every long-lived
 collection, handle set, counter, and temp artifact they hold must have a defined lifecycle: creation, accounting,
 eviction/expiry, and reclamation, with an enforced bound. Unbounded growth is a contract violation, not a latent leak.
 Tracking issue: marmot-protocol/mdk#381.
@@ -34,7 +34,7 @@ Tracking issue: marmot-protocol/mdk#381.
 | Per-subscriber queue | `per_subscriber_queue` records (default 32) | A lagging subscriber is dropped rather than buffered. |
 | Connections | `max_connections` semaphore (default 256), `max_streams_per_connection` (default 64) | Over-cap connections are refused at accept; permits release on disconnect. |
 
-### `agent-connector` / `dm-agent` (`src/lib.rs` and modules)
+### `agent-connector` / `wn-agent` (`src/lib.rs` and modules)
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ Tracking issue: marmot-protocol/mdk#381.
 | `AgentStreamWatchManager.watches` | 256 (`AGENT_STREAM_WATCH_RETAIN_LIMIT`), including `running` watches | Enforced on both start and finish. Finished watches evict oldest-first; when running watches alone exceed the cap (a finish that never arrives), the oldest running watches evict too (mdk#343). |
 | `recent_updates` replay ring | 256 (`AGENT_STREAM_UPDATE_REPLAY_LIMIT`) | Oldest popped on publish. |
 
-### `darkmatter-cli` daemon / `dmd` (`src/daemon/`)
+### `wn-cli` daemon / `wnd` (`src/daemon/`)
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |

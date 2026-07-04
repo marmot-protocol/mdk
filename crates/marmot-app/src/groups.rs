@@ -126,7 +126,7 @@ fn non_empty_group_system_data(event: &GroupSystemEvent, key: &str) -> Option<St
 }
 
 /// Coarse, app-facing classification of why a stored group failed session-open
-/// hydration and was quarantined (darkmatter#151 / #417). Mirrors
+/// hydration and was quarantined (mdk#151 / #417). Mirrors
 /// [`cgka_traits::engine::GroupHydrationQuarantineReason`] one-to-one so app
 /// clients can render per-reason recovery guidance without depending on the
 /// engine crate. The categories are deliberately coarse and privacy-safe — they
@@ -161,8 +161,8 @@ impl From<GroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReason 
 }
 
 /// A stored group that failed session-open hydration and was skipped so the
-/// rest of the account could open (darkmatter#151 / #417). Surfaced to the app
-/// so it can present a per-group recovery flow (darkmatter#426) distinct from
+/// rest of the account could open (mdk#151 / #417). Surfaced to the app
+/// so it can present a per-group recovery flow (mdk#426) distinct from
 /// healthy and archived groups, and offer a non-destructive re-hydration retry.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppQuarantinedGroup {
@@ -395,7 +395,7 @@ impl AppGroupRecord {
                 // A genuine re-invite carries a *different* `via_welcome` id and
                 // must re-surface as pending even though MLS auto-joined, so the
                 // pending-invite projection stays visible until accepted
-                // (see darkmatter#184).
+                // (see mdk#184).
                 if !self.pending_confirmation
                     && self.via_welcome_message_id_hex.as_deref()
                         == Some(via_welcome_message_id_hex.as_str())
@@ -1063,7 +1063,7 @@ pub(crate) fn add_group(
 /// epoch 1 with at least one welcome exposed), even if some welcomes or relays
 /// were unreached. Dropping the local app projection in that case strands the
 /// creator with a confirmed MLS group its own UI never recorded, while invitees
-/// who did receive a welcome see a real group (darkmatter#428).
+/// who did receive a welcome see a real group (mdk#428).
 ///
 /// Resolution semantics:
 /// - no failures: success.
@@ -1231,7 +1231,7 @@ mod confirmation_state_tests {
 
     // A genuine re-invite (a new GroupJoined carrying a *different* welcome id)
     // after the user accepted must re-surface the group as pending and record
-    // the new welcome/welcomer. Regression test for darkmatter#184.
+    // the new welcome/welcomer. Regression test for mdk#184.
     #[test]
     fn reinvite_after_accept_resurfaces_as_pending() {
         let mut record = test_record();
@@ -1398,7 +1398,7 @@ mod fail_if_publish_failed_tests {
         assert!(fail_if_publish_failed(&effects).is_ok());
     }
 
-    // darkmatter#428: a confirmed-but-partial create/commit (pending Confirmed,
+    // mdk#428: a confirmed-but-partial create/commit (pending Confirmed,
     // welcomes/relays unreached) must NOT abort the app-layer projection. The
     // group is live at its new epoch; unreached endpoints are recoverable.
     #[test]
@@ -1412,7 +1412,7 @@ mod fail_if_publish_failed_tests {
         });
         assert!(
             fail_if_publish_failed(&effects).is_ok(),
-            "confirmed-but-partial create must keep the local projection (darkmatter#428)"
+            "confirmed-but-partial create must keep the local projection (mdk#428)"
         );
     }
 

@@ -375,7 +375,7 @@ impl TuiApp {
         let daemon = terminal_safe_text(&daemon_header_label(&self.daemon));
         let line = Line::from(vec![
             Span::styled(
-                "dm",
+                "wn",
                 Style::default()
                     .fg(FOCUS_ACCENT)
                     .add_modifier(Modifier::BOLD),
@@ -387,7 +387,7 @@ impl TuiApp {
         ]);
         frame.render_widget(
             Paragraph::new(line)
-                .block(Block::default().borders(Borders::ALL).title("Darkmatter"))
+                .block(Block::default().borders(Borders::ALL).title("White Noise"))
                 .alignment(Alignment::Left),
             area,
         );
@@ -559,7 +559,7 @@ impl TuiApp {
     pub(crate) fn render_help(&self, frame: &mut Frame, area: Rect) {
         let lines = vec![
             Line::from(Span::styled(
-                "Darkmatter TUI",
+                "White Noise TUI",
                 Style::default()
                     .fg(FOCUS_ACCENT)
                     .add_modifier(Modifier::BOLD),

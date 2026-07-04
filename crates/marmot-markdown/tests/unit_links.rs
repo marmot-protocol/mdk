@@ -88,7 +88,7 @@ fn parse_blocks_within(input: &str, max_elapsed: Duration) -> Vec<Block> {
 
 /// Mirrors the crate-internal `MAX_OPEN_BRACKET_DELIMITERS` /
 /// `MAX_INLINE_NESTING_DEPTH` constants. They are intentionally not public API,
-/// but the boundary behavior is security-relevant for darkmatter#654.
+/// but the boundary behavior is security-relevant for mdk#654.
 const BRACKET_DELIM_CAP: usize = 96;
 
 // ----- Inline links ---------------------------------------------------
@@ -152,7 +152,7 @@ fn inline_link_with_emphasis_in_text() {
 
 #[test]
 fn many_emphasis_delimiters_interleaved_with_links_stay_bounded() {
-    // Regression for darkmatter#686: each link used to rescan the full
+    // Regression for mdk#686: each link used to rescan the full
     // delimiter stack just to deactivate earlier `[` openers, so unrelated
     // accumulated `*` delimiters made `*[a](b)` repeated in one paragraph
     // quadratic. The wall-clock budget is deliberately generous for CI, but a
@@ -167,7 +167,7 @@ fn many_emphasis_delimiters_interleaved_with_links_stay_bounded() {
 
 #[test]
 fn many_emphasis_delimiters_interleaved_with_unmatched_close_brackets_stay_bounded() {
-    // Regression for darkmatter#710, fixed in #712: every `*` pushes an
+    // Regression for mdk#710, fixed in #712: every `*` pushes an
     // emphasis delimiter, and every following unmatched `]` used to rescan the
     // full mixed delimiter stack looking for a bracket/image opener that was
     // never present. Keep the hostile single-paragraph `*]` shape under an
@@ -254,7 +254,7 @@ fn unmatched_close_bracket_is_text() {
 
 #[test]
 fn many_unmatched_link_brackets_stay_literal_without_quadratic_work() {
-    // Regression for darkmatter#654: `"[" * N + "]" * N` used to keep every
+    // Regression for mdk#654: `"[" * N + "]" * N` used to keep every
     // `[` on the delimiter stack and then spend quadratic time scanning and
     // shifting that stack on the closing `]` run. The parser now caps the open
     // bracket stack and advances one opener per unmatched close.

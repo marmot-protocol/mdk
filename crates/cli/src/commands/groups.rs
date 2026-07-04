@@ -6,7 +6,7 @@ use marmot_app::{AppError, AppGroupMemberRecord, AppGroupMlsState, MarmotApp, Ma
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, DmError, GroupCommand, GroupsCommand, ensure_local_signing, group_json,
+    CommandOutput, GroupCommand, GroupsCommand, WnError, ensure_local_signing, group_json,
     group_list_plain, group_show_output, normalize_group_id_hex, npub_for_account_id,
     parse_public_key, resolve_account, unsupported_command,
 };
@@ -16,7 +16,7 @@ pub(crate) async fn group_command(
     app: &MarmotApp,
     command: GroupCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     group_command_with_runtime(account_home, app, &runtime, command, account_flag).await
 }
@@ -27,7 +27,7 @@ pub(crate) async fn group_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: GroupCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         GroupCommand::Create {
             name,
@@ -219,7 +219,7 @@ pub(crate) async fn groups_command(
     app: &MarmotApp,
     command: GroupsCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     groups_command_with_runtime(account_home, app, &runtime, command, account_flag).await
 }
@@ -230,7 +230,7 @@ pub(crate) async fn groups_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: GroupsCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         GroupsCommand::List => {
             let account = resolve_account(account_home, account_flag)?;
@@ -329,7 +329,7 @@ pub(crate) async fn groups_command_with_runtime(
                         "npub": npub_for_account_id(admin)?,
                     }))
                 })
-                .collect::<Result<Vec<_>, DmError>>()?;
+                .collect::<Result<Vec<_>, WnError>>()?;
             Ok(CommandOutput {
                 plain: if admins.is_empty() {
                     "no admins".to_owned()
@@ -471,7 +471,7 @@ pub(crate) async fn groups_command_with_runtime(
             )
             .await
         }
-        GroupsCommand::SubscribeState { .. } => Err(DmError::MessagesSubscribeRequiresDaemon),
+        GroupsCommand::SubscribeState { .. } => Err(WnError::MessagesSubscribeRequiresDaemon),
     }
 }
 
@@ -487,7 +487,7 @@ async fn group_admin_policy_output(
     account: marmot_account::AccountSummary,
     group_id: String,
     action: GroupAdminAction,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     app.status(&account.label)?;
     let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -540,7 +540,7 @@ pub(crate) fn group_mls_state_json(state: AppGroupMlsState) -> Value {
     })
 }
 
-fn group_members_plain(members: &[AppGroupMemberRecord]) -> Result<String, DmError> {
+fn group_members_plain(members: &[AppGroupMemberRecord]) -> Result<String, WnError> {
     if members.is_empty() {
         return Ok("no members".to_owned());
     }
@@ -551,7 +551,7 @@ fn group_members_plain(members: &[AppGroupMemberRecord]) -> Result<String, DmErr
         .join("\n"))
 }
 
-fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, DmError> {
+fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, WnError> {
     members
         .into_iter()
         .map(|member| {

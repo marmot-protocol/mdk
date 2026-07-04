@@ -16,7 +16,7 @@
 // normalizing `resolveTarget` and the `marmot:` prefix) makes a Marmot group id
 // a first-class, resolvable target, so an agent-driven send routes to the right
 // conversation. This only affects target resolution for the `message` tool; the
-// inbound auto-reply path sends through dm-agent directly and is unchanged.
+// inbound auto-reply path sends through wn-agent directly and is unchanged.
 
 import type {
   ChannelMessagingAdapter,
@@ -48,7 +48,7 @@ export function isMarmotGroupIdHex(value: string): boolean {
  * Normalize a raw target into a bare Marmot group id hex, or `undefined` when it
  * is not a Marmot group id. Strips an optional `marmot:` channel prefix and an
  * optional `0x`, lowercases, and validates an even-length hex string within the
- * group-id size band. The returned value is exactly what dm-agent's `send_final`
+ * group-id size band. The returned value is exactly what wn-agent's `send_final`
  * expects as the group id (no prefix), matching `normalizeHex` in src/client.ts.
  */
 export function normalizeMarmotTarget(raw: string): string | undefined {
@@ -85,7 +85,7 @@ export function looksLikeMarmotTarget(raw: string): boolean {
  *   src/dispatch.ts — and an agent-driven send lands in the same session.
  * - `targetResolver.looksLikeId` lets a bare or `marmot:`-prefixed group id skip
  *   directory search and resolve as an explicit id.
- * - `targetResolver.resolveTarget` normalizes the input to the bare hex dm-agent
+ * - `targetResolver.resolveTarget` normalizes the input to the bare hex wn-agent
  *   expects and tags it as a group; it returns `null` for anything that is not a
  *   Marmot group id so an invalid target still fails cleanly (with `hint`).
  * - `targetPrefixes` lets `marmot:<hex>` self-route to this channel and lets core

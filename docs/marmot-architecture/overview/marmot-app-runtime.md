@@ -110,14 +110,14 @@ and [`../cgka-engine-canonicalization-contract.md`](../cgka-engine-canonicalizat
 
 ## Daemon Boundary
 
-`dmd` should host one `MarmotAppRuntime`. It should accept socket requests, pass intents into the runtime, and stream
+`wnd` should host one `MarmotAppRuntime`. It should accept socket requests, pass intents into the runtime, and stream
 runtime events back to clients.
 
 Daemon responsibilities stay narrow: process lifecycle, socket protocol, request routing, and stream fanout.
 
 ## CLI And TUI Boundary
 
-`dm` and the TUI should be thin clients of the daemon/runtime:
+`wn` and the TUI should be thin clients of the daemon/runtime:
 
 - command calls become runtime intents;
 - subscription calls attach to runtime broadcast streams;
@@ -139,7 +139,7 @@ The useful pattern in `whitenoise-rs` is the app runtime shape:
 - stream managers use broadcast channels keyed by account, group, or user;
 - subscription APIs return an initial snapshot plus a live receiver.
 
-Darkmatter should copy the shape and leave the legacy weight behind. The existing Darkmatter crates give us cleaner
+MDK should copy the shape and leave the legacy weight behind. The existing MDK crates give us cleaner
 engine/session boundaries and per-account persistence. The runtime work should build on those crates.
 
 ## First Vertical Slice
@@ -151,7 +151,7 @@ The first slice now proves the architecture without filling in every product sur
 3. Identity creation publishes relay lists, a profile, and a fresh KeyPackage through runtime-backed setup.
 4. Runtime events cover group joins, group-state changes, messages, and typed agent stream start/final messages.
 5. Live Nostr receive and ingest run inside `marmot-app` account workers.
-6. `dmd` hosts one runtime and forwards command intents into it.
+6. `wnd` hosts one runtime and forwards command intents into it.
 7. `messages subscribe`, `chats subscribe`, and `groups subscribe-state` use runtime snapshots plus live receivers.
 8. Agent stream preview state and deltas are owned by a runtime shared stream manager and surfaced through message
    subscriptions.
@@ -161,7 +161,7 @@ The first slice now proves the architecture without filling in every product sur
 11. The TUI remains a daemon client.
 
 The acceptance test should create Alice and Bob, create a group, receive Bob's group join, send a normal message, start
-an agent stream, receive stream deltas, and finish the stream without calling `dm sync` or publishing keys manually.
+an agent stream, receive stream deltas, and finish the stream without calling `wn sync` or publishing keys manually.
 
 ## Remaining Hardening
 

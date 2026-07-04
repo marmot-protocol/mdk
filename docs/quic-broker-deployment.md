@@ -22,15 +22,15 @@ The broker listens on UDP `127.0.0.1:4450` and uses a generated self-signed cert
 `--insecure-local`:
 
 ```sh
-dm --account <alice> stream start <group-hex> \
+wn --account <alice> stream start <group-hex> \
   --stream-id <stream-hex> --quic-candidate quic://127.0.0.1:4450
-dm --account <bob> stream watch <group-hex> --stream-id <stream-hex> --insecure-local
-dm --account <bob> stream watch <group-hex> --stream-id <stream-hex> --insecure-local --background
-dm stream send --broker --connect 127.0.0.1:4450 --insecure-local \
+wn --account <bob> stream watch <group-hex> --stream-id <stream-hex> --insecure-local
+wn --account <bob> stream watch <group-hex> --stream-id <stream-hex> --insecure-local --background
+wn stream send --broker --connect 127.0.0.1:4450 --insecure-local \
   --stream-id <stream-hex> --start-event-id <start-message-id-hex> "hello over brokered quic"
 ```
 
-Use the foreground watch for one-off transport probes. With `dmd` running, `--background` hands the watch to the daemon
+Use the foreground watch for one-off transport probes. With `wnd` running, `--background` hands the watch to the daemon
 so `messages subscribe` receives `agent_stream_delta` and `stream_preview` updates in the normal typed message stream.
 
 Stop the stack with:
@@ -70,7 +70,7 @@ docker run --rm \
 Clients should announce the reachable candidate in the durable MLS start payload:
 
 ```sh
-dm --account <alice> stream start <group-hex> \
+wn --account <alice> stream start <group-hex> \
   --stream-id <stream-hex> --quic-candidate quic://broker.example.com:4450
 ```
 

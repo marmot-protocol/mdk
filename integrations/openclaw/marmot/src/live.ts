@@ -3,8 +3,8 @@
 //
 // OpenClaw hands us growing full-text snapshots (draft-stream `update(text)`);
 // we reduce each to an append-only suffix, mirror it into a local transcript
-// (byte-for-byte with dm-agent's), and send `stream_append`. On finalize we send
-// the transcript hash + chunk count dm-agent validates against its own. A
+// (byte-for-byte with wn-agent's), and send `stream_append`. On finalize we send
+// the transcript hash + chunk count wn-agent validates against its own. A
 // non-append-only update throws so the caller can cancel + send a plain final.
 
 import { AppendOnlyText, NonAppendOnlyUpdateError } from "./append-only.js";
@@ -131,7 +131,7 @@ export class MarmotLivePreview {
     }
     // Commit local transcript/append state only after the remote append
     // succeeds, so a failed append can be retried with the same text without
-    // diverging from dm-agent's transcript.
+    // diverging from wn-agent's transcript.
     await this.client.streamAppend(this.streamIdHex!, suffix);
     this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(fullText);

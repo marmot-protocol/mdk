@@ -1972,7 +1972,7 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     runtime.shutdown().await;
 }
 
-// Regression test for darkmatter#178: an external `set_group_archived` must not
+// Regression test for mdk#178: an external `set_group_archived` must not
 // be reverted by the long-lived account worker's stale in-memory snapshot when
 // the next inbound delivery re-persists the worker's `AccountState`.
 #[tokio::test]
@@ -2065,7 +2065,7 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
     runtime.shutdown().await;
 }
 
-// Regression for the darkmatter#178 review: a local-signing account must NEVER
+// Regression for the mdk#178 review: a local-signing account must NEVER
 // fall back to a direct `MarmotApp::set_group_archived` write when the account
 // worker is unavailable (e.g. a startup/reconcile failure). The direct write
 // can race a freshly spawned worker holding the pre-archive snapshot and revert
@@ -2294,7 +2294,7 @@ async fn directory_sync_worker_ingests_profile_metadata_events() {
     runtime.start().await.unwrap();
     // `create_identity` publishes a default profile (kind-0) for this account at
     // ~now, and the directory keeps only the *newer* of two profiles (ties go to
-    // the cached copy, darkmatter#206). Stamp the test profile a minute ahead so
+    // the cached copy, mdk#206). Stamp the test profile a minute ahead so
     // it deterministically wins regardless of how fast `start()` returns —
     // `start()` no longer blocks on the account worker's initial catch-up, so the
     // two profiles can otherwise land in the same wall-clock second and tie. The
@@ -2356,7 +2356,7 @@ async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     // The local account's own contact list is ingested and its follow edges are
     // cached on the account's directory entry for bounded search, but the
     // followed pubkey must NOT be promoted into a known directory entry: doing
-    // so would feed the unbounded transitive social-graph crawl (darkmatter#687).
+    // so would feed the unbounded transitive social-graph crawl (mdk#687).
     timeout(Duration::from_secs(5), async {
         loop {
             let cached_follow = app
@@ -2839,7 +2839,7 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
 
 #[tokio::test]
 async fn self_removal_suppresses_account_unread_while_peer_removal_preserves_it() {
-    // darkmatter#573: the projection-only account unread aggregate must exclude
+    // mdk#573: the projection-only account unread aggregate must exclude
     // groups the local account left / was removed from, but a peer removal must
     // leave the observer's own unread untouched.
     let dir = tempfile::tempdir().unwrap();
@@ -2945,7 +2945,7 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_preserves_it(
 
 #[tokio::test]
 async fn local_leave_suppresses_account_unread_total() {
-    // darkmatter#573 review follow-up: a locally initiated leave departs the
+    // mdk#573 review follow-up: a locally initiated leave departs the
     // group just like an observed self-removal, but the leaver's own relay echo
     // is skipped, so `observe_account_device_effects` never fires for it. The
     // leave path itself must suppress the account unread aggregate, otherwise a
@@ -3023,7 +3023,7 @@ async fn local_leave_suppresses_account_unread_total() {
 
 #[tokio::test]
 async fn open_backfill_preserves_unread_for_still_member_account() {
-    // darkmatter#573 review follow-up (blocking finding 1): the one-time
+    // mdk#573 review follow-up (blocking finding 1): the one-time
     // open/upgrade backfill derives `self_membership` from current engine
     // state for rows that predate migration 0018. It must only suppress groups
     // the local account is no longer a member of — a still-member account that
@@ -4671,7 +4671,7 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
 
 #[tokio::test]
 async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
-    // Regression for darkmatter#478: an incoming Welcome auto-joins MLS state
+    // Regression for mdk#478: an incoming Welcome auto-joins MLS state
     // while the app keeps the invite `pending_confirmation` until accepted. A
     // destructive wipe must still leave such a group before destroying the
     // local MLS state — otherwise the account keeps a residual remote
@@ -4757,7 +4757,7 @@ async fn app_runtime_sign_out_and_wipe_rejects_unknown_account() {
 
 #[tokio::test]
 async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
-    // darkmatter#477: a non-destructive sign-out must clean up the relay
+    // mdk#477: a non-destructive sign-out must clean up the relay
     // KeyPackages (so strangers can't gift-wrap a Welcome while signed out)
     // while keeping ALL local state, so the same identity can be signed back
     // in. This is the reversible counterpart to `sign_out_and_wipe`.

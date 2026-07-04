@@ -10,7 +10,7 @@ import android.content.Context
  * exported from that single library rather than from a standalone keyring `.so`.
  * The package, class name, and the `companion object` + `external fun` shape are
  * fixed by the crate's JNI contract and MUST NOT change — only the loaded
- * library name is darkmatter-specific.
+ * library name is mdk-specific.
  *
  * Do not call this directly from app code; use
  * [dev.ipf.marmotkit.MarmotAndroid.initialize] instead.

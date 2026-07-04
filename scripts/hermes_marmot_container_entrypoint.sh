@@ -7,7 +7,7 @@ fi
 
 : "${MARMOT_HOME:=/data/marmot-agent}"
 : "${HERMES_HOME:=/data/hermes-home}"
-: "${MARMOT_AGENT_SOCKET:=/run/marmot-agent/dm-agent.sock}"
+: "${MARMOT_AGENT_SOCKET:=/run/marmot-agent/wn-agent.sock}"
 : "${MARMOT_AGENT_AUTH_TOKEN_FILE:=$MARMOT_HOME/control.token}"
 : "${MARMOT_AGENT_SOCKET_DIR_MODE:=0770}"
 : "${MARMOT_AGENT_SOCKET_MODE:=0660}"
@@ -48,9 +48,9 @@ PY
 fi
 chmod 0600 "$MARMOT_AGENT_AUTH_TOKEN_FILE"
 
-ln -sfn /work/darkmatter/integrations/hermes/marmot "$HERMES_HOME/plugins/marmot"
+ln -sfn /work/mdk/integrations/hermes/marmot "$HERMES_HOME/plugins/marmot"
 
-dm_agent_args=(
+wn_agent_args=(
     --home "$MARMOT_HOME"
     --socket "$MARMOT_AGENT_SOCKET"
     --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE"
@@ -62,20 +62,20 @@ IFS=',' read -r -a configured_relays <<<"$MARMOT_RELAYS"
 for relay in "${configured_relays[@]}"; do
     relay="${relay#"${relay%%[![:space:]]*}"}"
     relay="${relay%"${relay##*[![:space:]]}"}"
-    [ -z "$relay" ] || dm_agent_args+=(--relay "$relay")
+    [ -z "$relay" ] || wn_agent_args+=(--relay "$relay")
 done
 
 case "${MARMOT_AGENT_ALLOW_ANY:-1}" in
     1|true|TRUE|yes|YES)
-        dm_agent_args+=(--allow-any)
+        wn_agent_args+=(--allow-any)
         ;;
 esac
 
-dm-agent "${dm_agent_args[@]}" &
-dm_agent_pid="$!"
+wn-agent "${wn_agent_args[@]}" &
+wn_agent_pid="$!"
 
 cleanup() {
-    kill "$dm_agent_pid" 2>/dev/null || true
+    kill "$wn_agent_pid" 2>/dev/null || true
     if [ -n "${hermes_pid:-}" ]; then
         kill "$hermes_pid" 2>/dev/null || true
     fi
@@ -83,7 +83,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "$HERMES_MARMOT_AUTO_BOOTSTRAP" != "0" ]; then
-    bootstrap_json="$(dm-agent bootstrap --json --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")"
+    bootstrap_json="$(wn-agent bootstrap --json --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")"
     printf '%s\n' "$bootstrap_json" >"$MARMOT_HOME/bootstrap.json"
     MARMOT_ACCOUNT_ID_HEX="$(
         printf '%s\n' "$bootstrap_json" |
@@ -111,11 +111,11 @@ marmot-configure-hermes-gateway \
     --busy-ack-detail "$HERMES_MARMOT_BUSY_ACK_DETAIL"
 
 if [ "$HERMES_MARMOT_START_GATEWAY" = "0" ]; then
-    echo "Hermes gateway disabled; dm-agent is running."
-    wait "$dm_agent_pid"
+    echo "Hermes gateway disabled; wn-agent is running."
+    wait "$wn_agent_pid"
 fi
 
 hermes gateway run &
 hermes_pid="$!"
 
-wait -n "$dm_agent_pid" "$hermes_pid"
+wait -n "$wn_agent_pid" "$hermes_pid"

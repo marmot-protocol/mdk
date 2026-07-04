@@ -1,5 +1,5 @@
 /**
- * dm-agent control-plane smoke test (standalone; NOT part of the build).
+ * wn-agent control-plane smoke test (standalone; NOT part of the build).
  *
  * Exercises the `marmot.agent-control.v1` socket end-to-end through
  * `MarmotAgentControlClient`: account_list, group_info, send_final (capturing
@@ -10,15 +10,15 @@
  * Usage (this file is excluded from tsconfig, so it is not type-checked/built):
  *
  *   # Preferred — run the TypeScript directly with tsx:
- *   MARMOT_AGENT_SOCKET=/path/to/dm-agent.sock \
- *     npx tsx integrations/openclaw/marmot/scripts/dm-agent-smoketest.ts
+ *   MARMOT_AGENT_SOCKET=/path/to/wn-agent.sock \
+ *     npx tsx integrations/openclaw/marmot/scripts/wn-agent-smoketest.ts
  *
  *   # Or, after `pnpm build`, with a modern Node (>= 22.18 strips TS natively):
- *   pnpm build && MARMOT_AGENT_SOCKET=/path/to/dm-agent.sock \
- *     node integrations/openclaw/marmot/scripts/dm-agent-smoketest.ts
+ *   pnpm build && MARMOT_AGENT_SOCKET=/path/to/wn-agent.sock \
+ *     node integrations/openclaw/marmot/scripts/wn-agent-smoketest.ts
  *
  * Env:
- *   MARMOT_AGENT_SOCKET     (required) path to the dm-agent control Unix socket
+ *   MARMOT_AGENT_SOCKET     (required) path to the wn-agent control Unix socket
  *   MARMOT_AGENT_TOKEN      (optional) auth token, if the connector requires one
  *   MARMOT_ACCOUNT_ID_HEX   (optional) account hex; defaults to the sole local-signing account
  *   MARMOT_GROUP_ID_HEX     (optional) group hex; required for the send/delete/media steps
@@ -78,7 +78,7 @@ function skip(step: string, reason: string): void {
 async function main(): Promise<void> {
   const socketPath = process.env.MARMOT_AGENT_SOCKET;
   if (!socketPath) {
-    console.error("MARMOT_AGENT_SOCKET is required (path to the dm-agent control socket).");
+    console.error("MARMOT_AGENT_SOCKET is required (path to the wn-agent control socket).");
     process.exitCode = 2;
     return;
   }
@@ -132,7 +132,7 @@ async function main(): Promise<void> {
       const sent = await client.sendFinal(
         accountIdHex,
         groupIdHex,
-        "dm-agent smoke test (this message will be deleted)",
+        "wn-agent smoke test (this message will be deleted)",
       );
       sentMessageIdHex = sent.message_ids_hex[0] ?? null;
       pass(
@@ -178,7 +178,7 @@ async function main(): Promise<void> {
         accountIdHex,
         groupIdHex,
         [{ path: imagePath, media_type: mediaType, file_name: fileName }],
-        "dm-agent smoke test attachment",
+        "wn-agent smoke test attachment",
       );
       pass("send_media", `ids=${sent.message_ids_hex.length} mime=${mediaType}`);
     } catch (err) {

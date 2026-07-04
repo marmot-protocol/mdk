@@ -12,7 +12,7 @@ use marmot_app::{
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, DmError, MediaCommand, ensure_local_signing, normalize_group_id_hex,
+    CommandOutput, MediaCommand, WnError, ensure_local_signing, normalize_group_id_hex,
     npub_for_account_id, resolve_account, write_private_file,
 };
 
@@ -21,7 +21,7 @@ pub(crate) async fn media_command(
     app: &MarmotApp,
     command: MediaCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     media_command_with_runtime(account_home, app, &runtime, command, account_flag).await
 }
@@ -32,7 +32,7 @@ pub(crate) async fn media_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: MediaCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         MediaCommand::Upload {
             group,
@@ -70,7 +70,7 @@ pub(crate) async fn media_command_with_runtime(
                 )
                 .await?;
             let first = upload.attachments.first().ok_or_else(|| {
-                DmError::InvalidMediaAttachment("upload returned no attachments".to_owned())
+                WnError::InvalidMediaAttachment("upload returned no attachments".to_owned())
             })?;
             Ok(CommandOutput {
                 plain: if upload.sent.is_some() {
@@ -157,7 +157,7 @@ pub(crate) async fn media_command_with_runtime(
     }
 }
 
-fn media_records_json(messages: Vec<AppMessageRecord>) -> Result<Vec<Value>, DmError> {
+fn media_records_json(messages: Vec<AppMessageRecord>) -> Result<Vec<Value>, WnError> {
     let mut records = Vec::new();
     for message in messages {
         let caption = (!message.plaintext.is_empty()).then(|| message.plaintext.clone());
@@ -235,7 +235,7 @@ fn send_summary_json(summary: marmot_app::SendSummary) -> Value {
 fn media_attachment_for_hash(
     messages: Vec<AppMessageRecord>,
     file_hash_hex: &str,
-) -> Result<MediaAttachmentReference, DmError> {
+) -> Result<MediaAttachmentReference, WnError> {
     for message in messages {
         for reference in media_attachments_from_message(&message)? {
             if reference.plaintext_sha256 == file_hash_hex {
@@ -243,12 +243,12 @@ fn media_attachment_for_hash(
             }
         }
     }
-    Err(DmError::MediaAttachmentNotFound(file_hash_hex.to_owned()))
+    Err(WnError::MediaAttachmentNotFound(file_hash_hex.to_owned()))
 }
 
 fn media_attachments_from_message(
     message: &AppMessageRecord,
-) -> Result<Vec<MediaAttachmentReference>, DmError> {
+) -> Result<Vec<MediaAttachmentReference>, WnError> {
     message
         .tags
         .iter()
@@ -260,17 +260,17 @@ fn media_attachments_from_message(
 fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
-) -> Result<MediaAttachmentReference, DmError> {
+) -> Result<MediaAttachmentReference, WnError> {
     let mut locators = Vec::new();
     let mut fields = HashMap::new();
     for field in tag.iter().skip(1) {
         if field.starts_with("blurhash ") {
-            return Err(DmError::InvalidMediaAttachment("blurhash".to_owned()));
+            return Err(WnError::InvalidMediaAttachment("blurhash".to_owned()));
         }
         if let Some(rest) = field.strip_prefix("locator ") {
             let (kind, value) = rest
                 .split_once(' ')
-                .ok_or_else(|| DmError::InvalidMediaAttachment("locator".to_owned()))?;
+                .ok_or_else(|| WnError::InvalidMediaAttachment("locator".to_owned()))?;
             locators.push(MediaLocator {
                 kind: kind.to_owned(),
                 value: value.to_owned(),
@@ -286,7 +286,7 @@ fn media_attachment_from_imeta_tag(
             .get(key)
             .cloned()
             .filter(|value| !value.trim().is_empty())
-            .ok_or(DmError::InvalidMediaAttachment(key.to_owned()))
+            .ok_or(WnError::InvalidMediaAttachment(key.to_owned()))
     };
     Ok(MediaAttachmentReference {
         locators,
@@ -297,29 +297,29 @@ fn media_attachment_from_imeta_tag(
         media_type: required("m")?,
         version: required("v")?,
         source_epoch: source_epoch
-            .ok_or_else(|| DmError::InvalidMediaAttachment("source_epoch".to_owned()))?,
+            .ok_or_else(|| WnError::InvalidMediaAttachment("source_epoch".to_owned()))?,
         dim: fields.get("dim").cloned(),
         thumbhash: fields.get("thumbhash").cloned(),
     })
 }
 
-fn normalize_sha256_hex(value: &str) -> Result<String, DmError> {
+fn normalize_sha256_hex(value: &str) -> Result<String, WnError> {
     let decoded = hex::decode(value)?;
     if decoded.len() != 32 {
-        return Err(DmError::InvalidMediaAttachment(
+        return Err(WnError::InvalidMediaAttachment(
             "file hash must be 32 bytes".to_owned(),
         ));
     }
     Ok(hex::encode(decoded))
 }
 
-fn media_file_name(path: &Path) -> Result<String, DmError> {
+fn media_file_name(path: &Path) -> Result<String, WnError> {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| DmError::InvalidMediaAttachment("file name".to_owned()))
+        .ok_or_else(|| WnError::InvalidMediaAttachment("file name".to_owned()))
 }
 
 fn media_output_path(output: Option<String>, file_name: &str) -> PathBuf {

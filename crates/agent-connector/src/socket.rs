@@ -11,7 +11,7 @@ use crate::error::ConnectorError;
 use crate::{AGENT_SOCKET_DIR_MODE, AGENT_SOCKET_MODE};
 
 pub fn default_socket_path(home: &Path) -> PathBuf {
-    home.join("dev").join("dm-agent.sock")
+    home.join("dev").join("wn-agent.sock")
 }
 
 pub fn bind_connector_socket(socket: &Path) -> Result<UnixListener, ConnectorError> {

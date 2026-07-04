@@ -410,7 +410,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
 #[tokio::test]
 async fn connector_socket_bind_removes_stale_socket() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let listener = bind_connector_socket(&socket).unwrap();
     drop(listener);
 
@@ -425,7 +425,7 @@ async fn connector_socket_bind_removes_stale_socket() {
 #[tokio::test]
 async fn connector_socket_bind_preserves_existing_non_socket_path() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     std::fs::write(&socket, b"not a socket").unwrap();
 
@@ -438,7 +438,7 @@ async fn connector_socket_bind_preserves_existing_non_socket_path() {
 #[tokio::test]
 async fn connector_socket_bind_applies_configured_group_modes() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
 
     let listener = bind_connector_socket_with_mode(&socket, 0o770, 0o660).unwrap();
 
@@ -470,7 +470,7 @@ async fn connector_socket_bind_applies_configured_group_modes() {
 #[tokio::test]
 async fn connector_control_plane_requires_token_for_group_shared_modes() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
     config.socket_dir_mode = 0o770;
     config.socket_mode = 0o660;
@@ -483,7 +483,7 @@ async fn connector_control_plane_requires_token_for_group_shared_modes() {
 #[tokio::test]
 async fn connector_control_plane_rejects_world_accessible_modes() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
     config.auth_token = Some("shared-secret".to_owned());
     config.socket_mode = 0o666;
@@ -498,7 +498,7 @@ async fn connector_socket_serves_account_list() {
     let dir = tempfile::tempdir().unwrap();
     let account_home = AccountHome::open(dir.path());
     let account = account_home.create_account("agent").unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -551,7 +551,7 @@ async fn connector_socket_serves_account_list() {
 #[tokio::test]
 async fn connector_socket_caps_concurrent_connections() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let mut config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
     config.max_connections = 1;
     let server = tokio::spawn(serve_socket(config));
@@ -634,7 +634,7 @@ async fn connector_socket_caps_concurrent_connections() {
 #[tokio::test]
 async fn connector_control_plane_rejects_zero_connection_cap() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
     config.max_connections = 0;
 
@@ -648,7 +648,7 @@ async fn connector_socket_requires_configured_auth_token() {
     let dir = tempfile::tempdir().unwrap();
     let account_home = AccountHome::open(dir.path());
     let account = account_home.create_account("agent").unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let mut config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
     config.auth_token = Some("test-token".to_owned());
     let connector = AgentConnector::open(config).unwrap();
@@ -734,7 +734,7 @@ async fn connector_socket_subscribes_to_inbound_messages() {
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let server = tokio::spawn(serve_socket(test_config(
         dir.path(),
         socket.clone(),
@@ -816,7 +816,7 @@ async fn connector_socket_subscribes_to_inbound_messages() {
 #[tokio::test]
 async fn connector_socket_subscribe_terminates_when_client_disconnects() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -864,7 +864,7 @@ async fn connector_socket_subscribe_terminates_when_client_disconnects() {
 #[tokio::test]
 async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let account_id_hex = "11".repeat(32);
     let group_id_hex = "22".repeat(32);
     let message_id_hex = "33".repeat(32);
@@ -978,7 +978,7 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
 #[tokio::test]
 async fn connector_debug_controls_are_disabled_by_default() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -1009,7 +1009,7 @@ async fn connector_socket_updates_allowlist() {
     let account_home = AccountHome::open(dir.path());
     let agent = account_home.create_account("agent").unwrap();
     let welcomer = account_home.create_account("welcomer").unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -1305,7 +1305,7 @@ async fn connector_policy_accepts_allowed_welcomer() {
     let human = human_runtime.create_identity(setup).await.unwrap();
     agent_setup_runtime.shutdown().await;
 
-    let socket = agent_dir.path().join("dev").join("dm-agent.sock");
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
     let server = tokio::spawn(serve_socket(test_config(
         agent_dir.path(),
         socket.clone(),
@@ -1372,7 +1372,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
     let human = human_runtime.create_identity(setup).await.unwrap();
     agent_setup_runtime.shutdown().await;
 
-    let socket = agent_dir.path().join("dev").join("dm-agent.sock");
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
     let server = tokio::spawn(serve_socket(test_config(
         agent_dir.path(),
         socket.clone(),
@@ -1430,7 +1430,7 @@ async fn connector_policy_allow_any_accepts_unlisted_welcomer() {
     let human = human_runtime.create_identity(setup).await.unwrap();
     agent_setup_runtime.shutdown().await;
 
-    let socket = agent_dir.path().join("dev").join("dm-agent.sock");
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
     let server = tokio::spawn(serve_socket(test_config(
         agent_dir.path(),
         socket.clone(),
@@ -1470,7 +1470,7 @@ async fn connector_start_reconciles_existing_allowed_pending_invite() {
     let setup = setup_existing_pending_invite("existing pending invite").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
-        setup.dir.path().join("dev").join("dm-agent.sock"),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
         vec![setup.relay_url.clone()],
         false,
         false,
@@ -1498,7 +1498,7 @@ async fn connector_start_reconciles_existing_unlisted_pending_invite_by_declinin
     let setup = setup_existing_pending_invite("existing unlisted pending invite").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
-        setup.dir.path().join("dev").join("dm-agent.sock"),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
         vec![setup.relay_url.clone()],
         false,
         false,
@@ -1559,7 +1559,7 @@ fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
 #[tokio::test]
 async fn connector_socket_creates_local_account() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -1606,7 +1606,7 @@ async fn connector_socket_publishes_key_package() {
     let account_home = AccountHome::open(dir.path());
     let account = account_home.create_account("agent").unwrap();
     let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -1664,7 +1664,7 @@ async fn connector_socket_publishes_profile_metadata() {
     let account_home = AccountHome::open(dir.path());
     let account = account_home.create_account("agent").unwrap();
     let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -1734,7 +1734,7 @@ async fn connector_start_publishes_key_package_for_existing_local_account() {
     let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
     let connector = AgentConnector::open(test_config(
         dir.path(),
-        dir.path().join("dev").join("dm-agent.sock"),
+        dir.path().join("dev").join("wn-agent.sock"),
         vec![relay_url.clone()],
         false,
         false,
@@ -1782,7 +1782,7 @@ async fn connector_socket_sends_final_message() {
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -1849,7 +1849,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
 
     let group_id_hex = hex::encode(group_id.as_slice());
     let stream_id_hex = hex::encode([0x77; 32]);
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -1972,7 +1972,7 @@ async fn connector_socket_cancels_stream_session() {
 
     let group_id_hex = hex::encode(group_id.as_slice());
     let stream_id_hex = hex::encode([0x88; 32]);
-    let socket = dir.path().join("dev").join("dm-agent.sock");
+    let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
         socket.clone(),
@@ -2254,7 +2254,7 @@ where
 
 #[test]
 fn resync_required_event_carries_dropped_count_and_subscription_scope() {
-    // Regression for darkmatter#210: a lagged inbound broadcast must surface a
+    // Regression for mdk#210: a lagged inbound broadcast must surface a
     // ResyncRequired event (scoped to the subscription) instead of silently dropping
     // user messages to the agent.
     let event = resync_required_event(Some("aa"), Some("bb"), 42);
@@ -2327,7 +2327,7 @@ fn received_chat_record(
 
 #[test]
 fn inbound_message_event_from_record_projects_received_chat() {
-    // Regression for darkmatter#210: a missed inbound chat recovered from storage must
+    // Regression for mdk#210: a missed inbound chat recovered from storage must
     // project into exactly the same InboundMessage event the live path emits, so the
     // consumer's existing handler delivers it to the agent.
     let record = received_chat_record("aa", "bb", "cc", "hello agent");
@@ -2351,7 +2351,7 @@ fn inbound_message_event_from_record_projects_received_chat() {
 
 #[test]
 fn inbound_message_event_from_record_projects_received_delete() {
-    // Regression for darkmatter#505: storage replay must surface a missed inbound kind-5
+    // Regression for mdk#505: storage replay must surface a missed inbound kind-5
     // deletion the same way the live MessageReceived path does.
     let target = "99".repeat(32);
     let mut record = received_chat_record("dd", "bb", "cc", "");
@@ -2373,7 +2373,7 @@ fn inbound_message_event_from_record_projects_received_delete() {
 
 #[test]
 fn inbound_message_event_from_record_projects_group_system_row() {
-    // Regression for darkmatter#505: durable kind-1210 group-system rows synthesized from
+    // Regression for mdk#505: durable kind-1210 group-system rows synthesized from
     // GroupStateChanged events must replay as group_state_changed control events after lag.
     let content = cgka_traits::app_event::GroupSystemEvent::new(
         cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED,
@@ -2585,7 +2585,7 @@ fn inbound_message_event_ignores_bare_at_npub_in_image_alt_text() {
 
 #[test]
 fn inbound_message_mention_check_is_fast_on_hostile_markdown_without_npub() {
-    // Regression for darkmatter#663: mention classification ran the unbounded
+    // Regression for mdk#663: mention classification ran the unbounded
     // Markdown parser on attacker-controlled inbound plaintext. A bracket/image
     // emphasis bomb with no p-tag and no npub reference forced a super-linear
     // full parse on every kind-9 chat message (live projection and replay).
@@ -2757,7 +2757,7 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
 
 #[tokio::test]
 async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
-    // End-to-end regression for darkmatter#210: when the inbound broadcast lags, the
+    // End-to-end regression for mdk#210: when the inbound broadcast lags, the
     // connector re-queries storage and re-delivers the genuinely-missed inbound messages on
     // the existing InboundMessage path the consumer already handles. A real send populates
     // storage; replay must surface it, and a second replay (with the id already delivered)
@@ -2789,7 +2789,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
     let connector = AgentConnector::open(test_config(
         dir.path(),
-        dir.path().join("dev").join("dm-agent.sock"),
+        dir.path().join("dev").join("wn-agent.sock"),
         vec![relay_url],
         false,
         false,
@@ -2905,7 +2905,7 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
 
     let connector = AgentConnector::open(test_config(
         dir.path(),
-        dir.path().join("dev").join("dm-agent.sock"),
+        dir.path().join("dev").join("wn-agent.sock"),
         vec![relay_url],
         false,
         false,

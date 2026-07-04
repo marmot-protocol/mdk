@@ -1,4 +1,4 @@
-//! Ratatui terminal UI over the `dm --json` surface: entry point and module wiring.
+//! Ratatui terminal UI over the `wn --json` surface: entry point and module wiring.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};

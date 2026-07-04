@@ -9,7 +9,7 @@ This repository contains the Marmot engine and production-shaped integration lay
 - account, app-runtime, CLI, daemon, and TUI surfaces;
 - Nostr transport adapter and peeler;
 - QUIC agent stream preview transport and broker;
-- agent control protocol, stream composition, and `dm-agent` connector;
+- agent control protocol, stream composition, and `wn-agent` connector;
 - UniFFI bindings used by app runtimes;
 - Tamarin models and architecture notes that map implementation behavior back to the protocol.
 
@@ -49,8 +49,8 @@ Primary implementation areas:
 - `crates/marmot-forensics` - append-only JSONL forensic audit schema and recorder traits.
 - `crates/agent-control` - `marmot.agent-control.v1` control-protocol DTOs and newline-delimited JSON framing.
 - `crates/agent-stream-compose` - reusable live-preview stream composition over the QUIC broker publisher.
-- `crates/agent-connector` - local `dm-agent` connector daemon bridging agent control and stream composition.
-- `crates/cli` - CLI app surface plus `dmd` daemon and `dm tui`.
+- `crates/agent-connector` - local `wn-agent` connector daemon bridging agent control and stream composition.
+- `crates/cli` - CLI app surface plus `wnd` daemon and `wn tui`.
 
 Reference and model support:
 

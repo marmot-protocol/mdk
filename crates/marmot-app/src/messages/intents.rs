@@ -24,7 +24,7 @@ pub(crate) const PUBKEY_REF_TAG: &str = "p";
 /// Upper bound for app-internal Markdown mention scans over untrusted message
 /// plaintext. The sender stores the full content, but p-tag derivation only
 /// parses this bounded prefix so one hostile message cannot force unbounded
-/// synchronous Markdown work before send/classification (darkmatter#654).
+/// synchronous Markdown work before send/classification (mdk#654).
 const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
 /// Extract the mentioned pubkey hex from a token following a `nostr:` scheme (or
@@ -50,7 +50,7 @@ pub(crate) fn mention_pubkey_hex(token: &str) -> Option<String> {
 /// surface a client renders as a mention. Scanning the raw `"nostr:"`
 /// substring missed bare `@npub1…` mentions (the form clients actually emit),
 /// so those never got a `p`-tag on send or classified on receive
-/// (darkmatter#617). Event/coordinate references (`note`/`nevent`/`naddr`) and
+/// (mdk#617). Event/coordinate references (`note`/`nevent`/`naddr`) and
 /// unparseable tokens are ignored.
 pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
     let mut hexes = Vec::new();
@@ -641,7 +641,7 @@ mod mention_tests {
         // `nostr:<raw-hex>` is not a NIP-21 URI (those carry bech32 entities,
         // never raw hex), so the markdown tokenizer leaves it as literal text
         // and never renders it as a mention. p-tag derivation tracks that
-        // display surface, so it yields no p-tag (darkmatter#617).
+        // display surface, so it yields no p-tag (mdk#617).
         let hex = valid_pubkey_hex();
         assert!(mention_p_tags(&format!("hey nostr:{hex} how are you?")).is_empty());
     }
@@ -662,7 +662,7 @@ mod mention_tests {
     fn mention_p_tags_covers_bare_npub_mention() {
         // Clients insert mentions as the bare `@npub1…` form (no `nostr:`),
         // which the markdown tokenizer renders as a mention. That form must
-        // still get its NIP-27 `p`-tag on send. Regression for darkmatter#617.
+        // still get its NIP-27 `p`-tag on send. Regression for mdk#617.
         let hex = valid_pubkey_hex();
         let npub = npub_for_account_id(&hex).unwrap();
         let content = format!("hey @{npub} how are you?");

@@ -17,7 +17,7 @@ Read [`README.md`](README.md) for the human framing, [`SCENARIOS.md`](SCENARIOS.
 - **Module:** `src/client.rs`
   - **Role:** `HarnessClient` + `ClientBuilder`. Wraps an `Engine<SqliteAccountStorage>`, a real `NostrMlsPeeler`, and the bus
     handle. It uses in-memory SQLite by default and can run on temp file-backed SQLite via
-    `DARKMATTER_CONFORMANCE_SQLITE_STORAGE=file` or `ClientBuilder::storage_mode`. `tick().await` drains pending inbound
+    `MDK_CONFORMANCE_SQLITE_STORAGE=file` or `ClientBuilder::storage_mode`. `tick().await` drains pending inbound
     for one client. `confirm(pending).await` finishes a `GroupEvolution`.
 
 - **Module:** `cgka_engine::convergence`

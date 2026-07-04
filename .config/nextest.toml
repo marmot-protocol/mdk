@@ -1,7 +1,7 @@
 # nextest configuration.
 #
-# The `darkmatter-cli::cli` integration tests behave like mini end-to-end
-# systems: each one spawns `dm` subprocesses, a `dmd` daemon, local relays, QUIC
+# The `wn-cli::cli` integration tests behave like mini end-to-end
+# systems: each one spawns `wn` subprocesses, a `wnd` daemon, local relays, QUIC
 # brokers, and account/runtime workers, then drives polling loops. nextest runs
 # every test in its own process at per-CPU parallelism, so under load the heavy
 # per-test setup is multiplied across the box and worker/daemon startup is
@@ -30,7 +30,7 @@ leak-timeout = "500ms"
 cli-e2e = { max-threads = 2 }
 
 [[profile.default.overrides]]
-filter = 'package(darkmatter-cli) & binary(cli)'
+filter = 'package(wn-cli) & binary(cli)'
 test-group = 'cli-e2e'
 
 # CI profile (`cargo nextest run --profile ci`).
@@ -49,6 +49,6 @@ slow-timeout = { period = "60s" }
 # a couple of retries and a generous hung-test backstop so a wedged subprocess
 # wait is killed and retried instead of burning the whole job's 30-minute budget.
 [[profile.ci.overrides]]
-filter = 'package(darkmatter-cli) & binary(cli)'
+filter = 'package(wn-cli) & binary(cli)'
 retries = 2
 slow-timeout = { period = "60s", terminate-after = 4 }

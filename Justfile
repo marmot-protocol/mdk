@@ -1,6 +1,6 @@
 set shell := ["bash", "-cu"]
 
-otlp-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,darkmatter-cli/otlp-export"
+otlp-features := "marmot-app/otlp-export,marmot-uniffi/otlp-export,wn-cli/otlp-export"
 
 default:
     @just --list
@@ -69,11 +69,11 @@ hermes-dev-teardown args="":
 hermes-dev-script-test:
     integrations/hermes/marmot/tests/test_dev_scripts.sh
 
-release-dm-agent version:
-    ./scripts/cut-dm-agent-release.sh {{version}}
+release-wn-agent version:
+    ./scripts/cut-wn-agent-release.sh {{version}}
 
-release-dm-agent-dry-run version:
-    ./scripts/cut-dm-agent-release.sh --dry-run {{version}}
+release-wn-agent-dry-run version:
+    ./scripts/cut-wn-agent-release.sh --dry-run {{version}}
 
 hermes-bootstrap-test:
     PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integrations/hermes/marmot/tests -p 'test_bootstrap_agent.py'
@@ -82,7 +82,7 @@ hermes-phone-test-up:
     docker compose --profile hermes-phone-test up -d --build hermes-marmot-phone-test
 
 hermes-phone-test-bootstrap:
-    docker compose exec hermes-marmot-phone-test dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
+    docker compose exec hermes-marmot-phone-test wn-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/wn-agent.sock --auth-token-file /data/marmot-agent/control.token
 
 hermes-phone-test-logs:
     docker compose logs -f hermes-marmot-phone-test
@@ -133,7 +133,7 @@ openclaw-phone-test-up:
     docker compose --profile openclaw-phone-test up -d --build openclaw-marmot-phone-test
 
 openclaw-phone-test-bootstrap:
-    docker compose exec openclaw-marmot-phone-test dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
+    docker compose exec openclaw-marmot-phone-test wn-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/wn-agent.sock --auth-token-file /data/marmot-agent/control.token
 
 openclaw-phone-test-logs:
     docker compose logs -f openclaw-marmot-phone-test
@@ -148,7 +148,7 @@ openclaw-gateway-up:
     docker compose --profile openclaw-gateway up -d --build openclaw-gateway
 
 openclaw-gateway-bootstrap:
-    docker compose exec openclaw-gateway dm-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/dm-agent.sock --auth-token-file /data/marmot-agent/control.token
+    docker compose exec openclaw-gateway wn-agent bootstrap --qr --home /data/marmot-agent --socket /run/marmot-agent/wn-agent.sock --auth-token-file /data/marmot-agent/control.token
 
 openclaw-gateway-logs:
     docker compose logs -f openclaw-gateway
@@ -163,9 +163,9 @@ e2e-test test="":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -z "{{test}}" ]; then
-        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo nextest run -p darkmatter-cli --test cli -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
+        MDK_E2E_REQUIRE_RELAYS=1 cargo nextest run -p wn-cli --test cli -E 'test(=real_local_relays_deliver_cli_messages_over_sdk_path)'
     else
-        DARKMATTER_E2E_REQUIRE_RELAYS=1 cargo nextest run -p darkmatter-cli --test cli "{{test}}"
+        MDK_E2E_REQUIRE_RELAYS=1 cargo nextest run -p wn-cli --test cli "{{test}}"
     fi
 
 conformance:
@@ -216,8 +216,12 @@ coverage-conformance-html:
 dead-code-audit:
     @rg -n '#\[allow\(([^]]*dead_code|dead_code)' crates docs plans Cargo.toml || true
 
+# Guard against retired legacy naming reappearing (see PR #725).
+naming-gate:
+    ./scripts/check_legacy_naming.sh
+
 # Fast local pre-push gate: mechanical/static checks only. GitHub CI runs the
 # full `just ci` suite (including the workspace test matrix).
-fast-ci: fmt-check check clippy
+fast-ci: fmt-check naming-gate check clippy
 
-ci: fmt-check check clippy test
+ci: fmt-check naming-gate check clippy test

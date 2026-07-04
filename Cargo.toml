@@ -112,4 +112,4 @@ marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
-darkmatter-cli = { path = "crates/cli" }
+wn-cli = { path = "crates/cli" }

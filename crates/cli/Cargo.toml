@@ -1,5 +1,5 @@
 [package]
-name = "darkmatter-cli"
+name = "wn-cli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -10,12 +10,12 @@ default = []
 otlp-export = ["marmot-app/otlp-export"]
 
 [[bin]]
-name = "dm"
+name = "wn"
 path = "src/main.rs"
 
 [[bin]]
-name = "dmd"
-path = "src/bin/dmd.rs"
+name = "wnd"
+path = "src/bin/wnd.rs"
 
 [dependencies]
 agent-stream-compose.workspace = true

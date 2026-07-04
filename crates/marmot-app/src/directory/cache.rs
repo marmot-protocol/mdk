@@ -295,7 +295,7 @@ impl DirectoryCache {
     /// promoting the author or its follows into known directory entries
     /// (`directory_users`). This keeps follow edges available for bounded
     /// directory search while avoiding the unbounded social-graph crawl that
-    /// promoting every follow would trigger (darkmatter#687). The author's
+    /// promoting every follow would trigger (mdk#687). The author's
     /// cached profile metadata in the search graph is preserved; only the
     /// follow edges are replaced.
     pub(crate) fn remember_search_graph_follows(

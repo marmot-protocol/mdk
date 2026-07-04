@@ -31,7 +31,7 @@ use std::time::Duration;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 use transport_nostr_peeler::NostrMlsPeeler;
 
-const STORAGE_MODE_ENV: &str = "DARKMATTER_CONFORMANCE_SQLITE_STORAGE";
+const STORAGE_MODE_ENV: &str = "MDK_CONFORMANCE_SQLITE_STORAGE";
 const TEMP_FILE_KEY: &str = "marmot-conformance-sqlite-temp-key";
 const HARNESS_CONVERGENCE_SETTLED_AT_MS: u64 = 1_000_000;
 const HARNESS_CONVERGENCE_DRAIN_PASSES: usize = 8;

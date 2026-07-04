@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn clients_converged_expectation_rejects_group_data_branch_fork() {
-        // Regression for darkmatter#162: a multi-committer group-data storm fork
+        // Regression for mdk#162: a multi-committer group-data storm fork
         // leaves the committers on competing branches that share an epoch and
         // member count (group-data commits change only the group name). The
         // epoch/member_count facts alone cannot tell the branches apart, so the

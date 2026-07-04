@@ -6,8 +6,8 @@ cd "$ROOT_DIR"
 
 HOME_ARG="dev/data"
 DATA_DIR="$ROOT_DIR/$HOME_ARG"
-DM_BIN="$ROOT_DIR/target/debug/dm"
-RELAYS="${DARKMATTER_TUI_DEV_RELAYS:-ws://127.0.0.1:28080,ws://127.0.0.1:27777}"
+WN_BIN="$ROOT_DIR/target/debug/wn"
+RELAYS="${MDK_TUI_DEV_RELAYS:-ws://127.0.0.1:28080,ws://127.0.0.1:27777}"
 
 require_command() {
     local command_name=$1
@@ -42,18 +42,18 @@ json_result_field() {
 }
 
 stop_daemon_if_running() {
-    if [ -x "$DM_BIN" ]; then
-        "$DM_BIN" --home "$HOME_ARG" --json daemon stop >/dev/null 2>&1 || true
+    if [ -x "$WN_BIN" ]; then
+        "$WN_BIN" --home "$HOME_ARG" --json daemon stop >/dev/null 2>&1 || true
     fi
 
-    local pid_file="$DATA_DIR/dev/dmd.pid"
+    local pid_file="$DATA_DIR/dev/wnd.pid"
     if [ -f "$pid_file" ]; then
         local pid
         pid="$(tr -d '[:space:]' < "$pid_file")"
         if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
             local command_name
             command_name="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
-            if grep -q 'dmd' <<< "$command_name"; then
+            if grep -q 'wnd' <<< "$command_name"; then
                 kill "$pid" >/dev/null 2>&1 || true
                 for _ in {1..30}; do
                     if ! kill -0 "$pid" >/dev/null 2>&1; then
@@ -73,7 +73,7 @@ assert_relay_lists_complete() {
     local account=$1
     local name=$2
     local status
-    status="$(run_json "$DM_BIN" --home "$HOME_ARG" --account "$account" --json accounts status "$account")"
+    status="$(run_json "$WN_BIN" --home "$HOME_ARG" --account "$account" --json accounts status "$account")"
     if ! jq -e '.result.relay_lists.complete == true' >/dev/null <<< "$status"; then
         echo "error: $name relay lists are not complete" >&2
         jq '.result.relay_lists' <<< "$status" >&2
@@ -83,7 +83,7 @@ assert_relay_lists_complete() {
 
 start_daemon() {
     run_json \
-        "$DM_BIN" \
+        "$WN_BIN" \
         --home "$HOME_ARG" \
         --secret-store file \
         --json \
@@ -95,7 +95,7 @@ start_daemon() {
 require_daemon_running() {
     local status
     for _ in {1..30}; do
-        status="$(run_json "$DM_BIN" --home "$HOME_ARG" --json daemon status)"
+        status="$(run_json "$WN_BIN" --home "$HOME_ARG" --json daemon status)"
         if jq -e '.ok == true and .result.running == true' >/dev/null <<< "$status"; then
             return 0
         fi
@@ -109,7 +109,7 @@ require_daemon_running() {
 
 ensure_daemon_running() {
     local status
-    status="$(run_json "$DM_BIN" --home "$HOME_ARG" --json daemon status)"
+    status="$(run_json "$WN_BIN" --home "$HOME_ARG" --json daemon status)"
     if jq -e '.ok == true and .result.running == true' >/dev/null <<< "$status"; then
         return 0
     fi
@@ -131,13 +131,13 @@ echo "==> deleting $HOME_ARG"
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
 
-echo "==> rebuilding dm and dmd"
+echo "==> rebuilding wn and wnd"
 require_command cargo
-cargo build -p darkmatter-cli --bins
+cargo build -p wn-cli --bins
 
 echo "==> starting local relays"
 docker compose up -d setup nostr-rs-relay strfry-nostr-relay
-DARKMATTER_E2E_RELAYS="$RELAYS" ./scripts/wait_for_relays.sh
+MDK_E2E_RELAYS="$RELAYS" ./scripts/wait_for_relays.sh
 
 echo "==> starting daemon"
 daemon_start="$(start_daemon)"
@@ -148,11 +148,11 @@ if ! jq -e '.ok == true and .result.running == true' >/dev/null <<< "$daemon_sta
 fi
 
 echo "==> creating Alice"
-alice_json="$(run_json "$DM_BIN" --home "$HOME_ARG" --json create-identity)"
+alice_json="$(run_json "$WN_BIN" --home "$HOME_ARG" --json create-identity)"
 ALICE_ACCOUNT_ID="$(json_result_field account_id <<< "$alice_json")"
 ALICE_NPUB="$(json_result_field npub <<< "$alice_json")"
 run_json \
-    "$DM_BIN" \
+    "$WN_BIN" \
     --home "$HOME_ARG" \
     --account "$ALICE_ACCOUNT_ID" \
     --json \
@@ -161,11 +161,11 @@ run_json \
     --display-name Alice >/dev/null
 
 echo "==> creating Bob"
-bob_json="$(run_json "$DM_BIN" --home "$HOME_ARG" --json create-identity)"
+bob_json="$(run_json "$WN_BIN" --home "$HOME_ARG" --json create-identity)"
 BOB_ACCOUNT_ID="$(json_result_field account_id <<< "$bob_json")"
 BOB_NPUB="$(json_result_field npub <<< "$bob_json")"
 run_json \
-    "$DM_BIN" \
+    "$WN_BIN" \
     --home "$HOME_ARG" \
     --account "$BOB_ACCOUNT_ID" \
     --json \
@@ -176,8 +176,8 @@ run_json \
 echo "==> verifying account setup"
 assert_relay_lists_complete "$ALICE_ACCOUNT_ID" "Alice"
 assert_relay_lists_complete "$BOB_ACCOUNT_ID" "Bob"
-run_json "$DM_BIN" --home "$HOME_ARG" --account "$ALICE_ACCOUNT_ID" --json keys fetch "$BOB_ACCOUNT_ID" >/dev/null
-run_json "$DM_BIN" --home "$HOME_ARG" --account "$BOB_ACCOUNT_ID" --json keys fetch "$ALICE_ACCOUNT_ID" >/dev/null
+run_json "$WN_BIN" --home "$HOME_ARG" --account "$ALICE_ACCOUNT_ID" --json keys fetch "$BOB_ACCOUNT_ID" >/dev/null
+run_json "$WN_BIN" --home "$HOME_ARG" --account "$BOB_ACCOUNT_ID" --json keys fetch "$ALICE_ACCOUNT_ID" >/dev/null
 
 echo "==> ensuring daemon is running for TUI handoff"
 ensure_daemon_running
@@ -193,8 +193,8 @@ Bob pubkey:       $BOB_ACCOUNT_ID
 Bob npub:         $BOB_NPUB
 
 Open TUIs:
-  target/debug/dm --home "$HOME_ARG" --account "$ALICE_ACCOUNT_ID" tui
-  target/debug/dm --home "$HOME_ARG" --account "$BOB_ACCOUNT_ID" tui
+  target/debug/wn --home "$HOME_ARG" --account "$ALICE_ACCOUNT_ID" tui
+  target/debug/wn --home "$HOME_ARG" --account "$BOB_ACCOUNT_ID" tui
 
 Relay logs:
   just relay-logs

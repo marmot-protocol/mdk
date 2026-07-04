@@ -1,10 +1,10 @@
 //! `notifications` command namespace handlers.
 
-use crate::{CommandOutput, DmError, NotificationsCommand, unsupported_command};
+use crate::{CommandOutput, NotificationsCommand, WnError, unsupported_command};
 
 pub(crate) fn notifications_command(
     command: NotificationsCommand,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         NotificationsCommand::Subscribe => unsupported_command(
             "notifications subscribe",

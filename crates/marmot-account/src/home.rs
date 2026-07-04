@@ -21,7 +21,7 @@ const ACCOUNT_RECORD_FILE: &str = "account.json";
 const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
-pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.darkmatter";
+pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.whitenoise";
 const TRACE_TARGET: &str = "marmot_account::home";
 /// Subdirectory of the home root that holds account directories that have been
 /// atomically renamed out of the live `accounts/` namespace by

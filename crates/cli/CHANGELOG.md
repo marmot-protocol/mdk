@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `darkmatter-cli` are tracked here.
+All notable changes to `wn-cli` (previously `darkmatter-cli`) are tracked here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This crate uses semantic
 versioning through the workspace version in the root `Cargo.toml`.
@@ -9,7 +9,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Security
 
-- The `dmd` daemon control socket (and the `dm-agent` connector socket) is now created owner-only (0600)
+- The `wnd` daemon control socket (and the `wn-agent` connector socket) is now created owner-only (0600)
   atomically — bound inside a private 0700 staging directory and linked into place — instead of being chmod-ed
   after `bind`, removing the brief window where the socket was reachable at umask-default permissions (for
   example under a caller-supplied `--socket` in a pre-existing shared directory).
@@ -21,7 +21,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
-- `dmd` now buffers daemon request frames before scanning for the newline delimiter, avoiding one async `read()` call per
+- `wnd` now buffers daemon request frames before scanning for the newline delimiter, avoiding one async `read()` call per
   byte for large `Execute` requests while preserving the existing 1 MiB request cap and stalled-client timeout.
 - A group copy that realized your own removal no longer stays self-quarantined when the removing commit later loses
   branch selection: the convergence apply clears the removed marker whenever the selected canonical branch records your
@@ -30,6 +30,22 @@ versioning through the workspace version in the root `Cargo.toml`.
   Welcome is only required while the removal remains canonical.
 
 ### Changed
+
+- **Breaking:** retired the experimental "darkmatter" naming. The crate is now `wn-cli` and installs the `wn` CLI and
+  `wnd` daemon; the connector daemon is `wn-agent`. Env vars moved from `DM_*` to `WN_*` (`WN_ACCOUNT`, `WN_RELAY`,
+  `WN_SOCKET`, `WN_SECRET_STORE`, `WN_HOME`, `WN_KEYCHAIN_SERVICE`, `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`,
+  `WN_DEV_SETTLEMENT_QUIESCENCE_MS`), the default data directory moved from `darkmatter` to `whitenoise` (dev fallback
+  `.whitenoise`), the default keychain service is `com.marmot.whitenoise`, daemon sockets are `wnd.sock` /
+  `wn-agent.sock`, the profile deep-link scheme is `marmot://`, release tags follow `wn-agent-v*`, and the Homebrew
+  formula is `marmot-protocol/tap/wn`. There is no automatic compatibility fallback: stop any still-running legacy
+  daemon **before** the first `wnd` start (`dm daemon stop` with the old binary, or kill the pid recorded in the old
+  data directory's `dev/dmd.pid`) — the renamed socket/pid files make an old `dmd` invisible to `wn daemon status`.
+  Then move the data directory (for example
+  `mv ~/Library/Application\ Support/darkmatter ~/Library/Application\ Support/whitenoise`), update `DM_*` env vars in
+  shell profiles and service units, and reinstall from the new formula. If the data directory is not moved, `wn` starts
+  with an empty account list rather than a targeted error. Keychain entries stored under the old
+  `com.marmot.darkmatter` service can still be read manually by setting `WN_KEYCHAIN_SERVICE=com.marmot.darkmatter`, or
+  re-import the account to write them under the new service.
 
 - `message send` (and every other group send) on a group whose local copy records your own removal now fails with the
   deterministic JSON error code `invalid_transition` ("local group copy is marked removed (self-evicted)") instead of an

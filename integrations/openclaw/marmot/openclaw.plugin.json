@@ -1,7 +1,7 @@
 {
   "id": "marmot",
   "name": "Marmot",
-  "description": "OpenClaw channel plugin for Marmot through the local dm-agent control socket.",
+  "description": "OpenClaw channel plugin for Marmot through the local wn-agent control socket.",
   "activation": { "onStartup": true, "onChannels": ["marmot"] },
   "channels": ["marmot"],
   "configSchema": {
@@ -12,17 +12,17 @@
   "channelConfigs": {
     "marmot": {
       "label": "Marmot",
-      "description": "End-to-end encrypted Marmot groups through the local dm-agent connector.",
+      "description": "End-to-end encrypted Marmot groups through the local wn-agent connector.",
       "schema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean", "description": "Whether this Marmot channel instance is active." },
-          "home": { "type": "string", "description": "dm-agent home directory (default ~/.marmot)." },
-          "socketPath": { "type": "string", "description": "dm-agent control socket path." },
+          "home": { "type": "string", "description": "wn-agent home directory (default ~/.marmot)." },
+          "socketPath": { "type": "string", "description": "wn-agent control socket path." },
           "accountIdHex": {
             "type": "string",
-            "description": "Marmot agent account id hex; required when dm-agent has more than one account."
+            "description": "Marmot agent account id hex; required when wn-agent has more than one account."
           },
           "authToken": { "type": "string", "description": "Bearer token for a token-gated control socket." },
           "authTokenFile": { "type": "string", "description": "Path to a bearer token file." },
@@ -58,7 +58,7 @@
         }
       },
       "uiHints": {
-        "authToken": { "label": "dm-agent control auth token", "sensitive": true }
+        "authToken": { "label": "wn-agent control auth token", "sensitive": true }
       }
     }
   }

@@ -76,7 +76,7 @@ const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize =
 /// decision only needs the visible Nostr token shapes that the Markdown surface
 /// recognizes (`@npub1…`, `nostr:npub1…`, and bare `npub1…`), so a bounded
 /// token-boundary scan is enough and keeps replay/live drain work predictable
-/// (darkmatter#663).
+/// (mdk#663).
 fn plaintext_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
     plaintext_scan_has_visible_npub_ref(mention_plaintext_scan_input(plaintext), npub)
 }

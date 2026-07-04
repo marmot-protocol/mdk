@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{CommandOutput, DmError, SettingsCommand, write_private_file};
+use crate::{CommandOutput, SettingsCommand, WnError, write_private_file};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CliSettings {
@@ -25,7 +25,7 @@ impl Default for CliSettings {
 pub(crate) fn settings_command(
     home: &Path,
     command: SettingsCommand,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let mut settings = read_settings(home)?;
     match command {
         SettingsCommand::Show => {}
@@ -51,7 +51,7 @@ fn settings_path(home: &Path) -> PathBuf {
     home.join("dev").join("settings.json")
 }
 
-fn read_settings(home: &Path) -> Result<CliSettings, DmError> {
+fn read_settings(home: &Path) -> Result<CliSettings, WnError> {
     let path = settings_path(home);
     if !path.exists() {
         return Ok(CliSettings::default());
@@ -60,7 +60,7 @@ fn read_settings(home: &Path) -> Result<CliSettings, DmError> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn write_settings(home: &Path, settings: &CliSettings) -> Result<(), DmError> {
+fn write_settings(home: &Path, settings: &CliSettings) -> Result<(), WnError> {
     let path = settings_path(home);
     let bytes = serde_json::to_vec_pretty(settings)?;
     write_private_file(&path, bytes)?;

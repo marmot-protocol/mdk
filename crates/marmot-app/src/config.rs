@@ -34,7 +34,7 @@ pub struct MarmotAppConfig {
 /// and forensic audit-log tracker uploads.
 ///
 /// Defaults are intentionally separate from bearer tokens. Host apps supply
-/// credentials at runtime, while the Dark Matter/Marmot build owns stable
+/// credentials at runtime, while the MDK/Marmot build owns stable
 /// first-party URLs. `MarmotAppConfig::default()` reads these from
 /// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` and
 /// `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time.
@@ -517,7 +517,7 @@ mod tests {
                 service_version: "1.4.2".to_owned(),
                 service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
                 deployment_environment: "staging".to_owned(),
-                tenant: "darkmatter-ios".to_owned(),
+                tenant: "mdk-ios".to_owned(),
                 os_type: "ios".to_owned(),
                 os_version: "17.5".to_owned(),
                 device_model_identifier: None,
@@ -644,7 +644,7 @@ mod tests {
                 service_version: " 1.4.2 ".to_owned(),
                 service_instance_id: " 8e1ca50b-05a2-4c31-a31c-1e69c75a9366 ".to_owned(),
                 deployment_environment: " staging ".to_owned(),
-                tenant: " darkmatter-ios ".to_owned(),
+                tenant: " mdk-ios ".to_owned(),
                 os_type: " ios ".to_owned(),
                 os_version: " 17.5 ".to_owned(),
                 device_model_identifier: Some(" iPhone15,2 ".to_owned()),
@@ -663,7 +663,7 @@ mod tests {
         );
         assert_eq!(config.authorization_bearer_token.as_deref(), Some("token"));
         let resource = config.resource.as_ref().unwrap();
-        assert_eq!(resource.tenant, "darkmatter-ios");
+        assert_eq!(resource.tenant, "mdk-ios");
         assert_eq!(resource.os_type, "ios");
         assert_eq!(
             resource.device_model_identifier.as_deref(),

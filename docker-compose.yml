@@ -61,7 +61,7 @@ services:
     environment:
       MARMOT_HOME: /data/marmot-agent
       HERMES_HOME: /data/hermes-home
-      MARMOT_AGENT_SOCKET: /run/marmot-agent/dm-agent.sock
+      MARMOT_AGENT_SOCKET: /run/marmot-agent/wn-agent.sock
       MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
       MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
       MARMOT_AGENT_SOCKET_MODE: "0660"
@@ -103,7 +103,7 @@ services:
     environment:
       MARMOT_HOME: /data/marmot-agent
       OPENCLAW_HOME: /data/openclaw-home
-      MARMOT_AGENT_SOCKET: /run/marmot-agent/dm-agent.sock
+      MARMOT_AGENT_SOCKET: /run/marmot-agent/wn-agent.sock
       MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
       MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
       MARMOT_AGENT_SOCKET_MODE: "0660"
@@ -129,8 +129,8 @@ services:
     restart: unless-stopped
 
   # Self-contained local harness: a real OpenClaw gateway + Marmot plugin +
-  # dm-agent wired to the in-repo nostr relay + QUIC broker (no public relays,
-  # no phone needed). dm-agent runs with --allow-any + --debug-controls so an
+  # wn-agent wired to the in-repo nostr relay + QUIC broker (no public relays,
+  # no phone needed). wn-agent runs with --allow-any + --debug-controls so an
   # inbound message can be injected over the control socket to wire/validate the
   # inbound->agent turn dispatch and live-preview paths.
   openclaw-gateway:
@@ -144,7 +144,7 @@ services:
     environment:
       MARMOT_HOME: /data/marmot-agent
       OPENCLAW_HOME: /data/openclaw-home
-      MARMOT_AGENT_SOCKET: /run/marmot-agent/dm-agent.sock
+      MARMOT_AGENT_SOCKET: /run/marmot-agent/wn-agent.sock
       MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
       MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
       MARMOT_AGENT_SOCKET_MODE: "0660"

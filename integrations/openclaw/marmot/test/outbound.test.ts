@@ -413,7 +413,7 @@ describe("SentMessageTargetCache", () => {
 });
 
 describe("receiptFromMessageIds", () => {
-  it("throws when dm-agent returns no message ids", () => {
+  it("throws when wn-agent returns no message ids", () => {
     expect(() => receiptFromMessageIds([], 0)).toThrow();
   });
 

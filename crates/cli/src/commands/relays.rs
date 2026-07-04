@@ -6,7 +6,7 @@ use marmot_app::{AccountRelayListStatus, MarmotApp, MarmotAppRuntime};
 use serde_json::json;
 
 use crate::{
-    CommandOutput, DmError, RelaysCommand, ensure_local_signing, npub_for_account_id,
+    CommandOutput, RelaysCommand, WnError, ensure_local_signing, npub_for_account_id,
     relay_endpoints, relay_lists_json, replaceable_list_inconclusive, resolve_account,
     unsupported_command, validate_relay_url,
 };
@@ -17,7 +17,7 @@ pub(crate) async fn relays_command(
     command: RelaysCommand,
     account_flag: Option<String>,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     relays_command_with_runtime(account_home, app, &runtime, command, account_flag, relay).await
 }
@@ -29,7 +29,7 @@ pub(crate) async fn relays_command_with_runtime(
     command: RelaysCommand,
     account_flag: Option<String>,
     relay: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let account = resolve_account(account_home, account_flag)?;
     ensure_local_signing(&account)?;
     match command {
@@ -68,7 +68,7 @@ async fn update_relay_list(
     relay_type: String,
     url: String,
     add: bool,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let relay_type = normalize_relay_type(&relay_type)?;
     let url = validate_relay_url(&url)?;
     let explicit_bootstrap = relay.map(validate_relay_url).transpose()?;
@@ -115,7 +115,7 @@ async fn update_relay_list(
     let bootstrap = explicit_bootstrap
         .or_else(|| source_relays.first().map(|endpoint| endpoint.0.clone()))
         .or_else(|| relays.first().cloned())
-        .ok_or(DmError::MissingRelay)?;
+        .ok_or(WnError::MissingRelay)?;
     let bootstrap_relays = vec![TransportEndpoint(bootstrap)];
     let status = runtime
         .publish_account_relay_list_kind(
@@ -140,7 +140,7 @@ async fn update_relay_list(
 fn relays_for_type(
     status: &AccountRelayListStatus,
     relay_type: Option<&str>,
-) -> Result<Vec<String>, DmError> {
+) -> Result<Vec<String>, WnError> {
     match relay_type.map(normalize_relay_type).transpose()?.as_deref() {
         Some("nip65") => Ok(status.nip65.relays.clone()),
         Some("inbox") => Ok(status.inbox.relays.clone()),
@@ -155,7 +155,7 @@ fn relays_for_type(
     }
 }
 
-fn normalize_relay_type(value: &str) -> Result<String, DmError> {
+fn normalize_relay_type(value: &str) -> Result<String, WnError> {
     match value {
         "nip65" => Ok("nip65".to_owned()),
         "inbox" => Ok("inbox".to_owned()),

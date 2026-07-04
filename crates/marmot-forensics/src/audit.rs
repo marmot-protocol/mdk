@@ -840,7 +840,7 @@ pub enum AuditEventKind {
         reason: String,
     },
     /// A previously hydration-quarantined group was successfully re-hydrated by
-    /// an application-initiated retry (darkmatter#426) and is live again.
+    /// an application-initiated retry (mdk#426) and is live again.
     /// `group_digest` is a SHA-256 digest of the group id with the same
     /// domain-separation prefix as [`AuditEventKind::GroupHydrationQuarantined`],
     /// so an analyzer can correlate a quarantine with its later recovery.

@@ -5,7 +5,7 @@ use marmot_app::{AppError, MarmotApp, UserDirectorySearch};
 use serde_json::json;
 
 use crate::{
-    CommandOutput, DmError, UsersCommand, npub_for_account_id, parse_public_key, resolve_account,
+    CommandOutput, UsersCommand, WnError, npub_for_account_id, parse_public_key, resolve_account,
 };
 
 pub(crate) fn users_command(
@@ -13,7 +13,7 @@ pub(crate) fn users_command(
     app: &MarmotApp,
     command: UsersCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         UsersCommand::Show { pubkey } => {
             let account_id = parse_public_key(&pubkey)?;

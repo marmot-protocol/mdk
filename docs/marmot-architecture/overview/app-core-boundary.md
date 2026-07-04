@@ -8,9 +8,9 @@ status: overview
 
 # App Core Boundary
 
-The first app surface is `dm`, but the durable product boundary is the app-core layer underneath it.
+The first app surface is `wn`, but the durable product boundary is the app-core layer underneath it.
 
-`dm` should stay a CLI/TUI-friendly presentation surface. It is useful because it exercises real account setup, relay
+`wn` should stay a CLI/TUI-friendly presentation surface. It is useful because it exercises real account setup, relay
 lists, KeyPackage publication, directory lookup, group operations, message projection, and sync. It should not become the
 place where app policy or protocol state secretly lives.
 
@@ -47,7 +47,7 @@ The current app-core concepts are:
 
 ## CLI Contract
 
-`dm --json` always returns:
+`wn --json` always returns:
 
 ```json
 {"ok": true, "result": {}}

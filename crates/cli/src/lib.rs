@@ -32,7 +32,7 @@ pub(crate) use args::{
     MessageTimelineCommand, NotificationsCommand, ProfileCommand, RelaysCommand, SettingsCommand,
     StreamCommand, UsersCommand,
 };
-pub(crate) use error::{DmError, dm_error_json};
+pub(crate) use error::{WnError, wn_error_json};
 
 pub(crate) const DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE: &str = "quic://quic-broker.ipf.dev:4450";
 const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -112,7 +112,7 @@ where
             //
             // Crucially, gate on the exit code, not just the kind:
             // `DisplayHelpOnMissingArgumentOrSubcommand` is also rendered as help
-            // text but exits nonzero (e.g. `dm messages` with no subcommand). That
+            // text but exits nonzero (e.g. `wn messages` with no subcommand). That
             // is a genuine usage error and must stay on stderr / `ok:false`, never
             // be reported as success. Only zero-exit display errors are real
             // help/version requests.
@@ -195,19 +195,19 @@ where
 
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         let explicit_daemon_socket =
-            cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some();
+            cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
         match daemon::send_execute(&socket, cli.clone()).await {
             Ok(output) => return output,
             // An oversized request is a client-side limit violation, not a
             // daemon-unavailable or lost-response condition: the encoder rejects
-            // it before it ever reaches `dmd`. Surface it as a terminal error
+            // it before it ever reaches `wnd`. Surface it as a terminal error
             // even on the implicit-socket path, otherwise the request silently
             // falls through to `run_cli_local` and masks the size cap (see #190).
             Err(err @ daemon::DaemonClientError::RequestTooLarge { .. }) => {
                 return daemon_client_error(cli.json, err);
             }
             // Only fall back to local execution when the client could not reach
-            // `dmd` over an auto-discovered socket. If the daemon accepted the
+            // `wnd` over an auto-discovered socket. If the daemon accepted the
             // command but the response was lost/malformed, do NOT re-run locally
             // (that would double-execute); report it via `daemon_execute_error`.
             Err(err)
@@ -222,7 +222,7 @@ where
     run_cli_local(cli).await
 }
 
-fn materialize_secret_inputs(cli: &mut Cli) -> Result<(), DmError> {
+fn materialize_secret_inputs(cli: &mut Cli) -> Result<(), WnError> {
     match &mut cli.command {
         Command::Login {
             identity,
@@ -253,25 +253,25 @@ fn materialize_identity_secret_input(
     command: &'static str,
     identity: &mut Option<String>,
     nsec_stdin: bool,
-) -> Result<(), DmError> {
+) -> Result<(), WnError> {
     if nsec_stdin {
         if identity.is_some() {
-            return Err(DmError::ConflictingSecretInput { command });
+            return Err(WnError::ConflictingSecretInput { command });
         }
         *identity = Some(read_nsec_from_stdin(command)?);
     }
     validate_materialized_secret_identity(command, identity, nsec_stdin)
 }
 
-fn read_nsec_from_stdin(command: &'static str) -> Result<String, DmError> {
+fn read_nsec_from_stdin(command: &'static str) -> Result<String, WnError> {
     let mut value = String::new();
     std::io::stdin().read_to_string(&mut value)?;
     let value = value.trim().to_owned();
     if value.is_empty() {
-        return Err(DmError::MissingStdinSecret { command });
+        return Err(WnError::MissingStdinSecret { command });
     }
     if !is_nostr_secret(&value) {
-        return Err(DmError::InvalidStdinSecret { command });
+        return Err(WnError::InvalidStdinSecret { command });
     }
     Ok(value)
 }
@@ -280,9 +280,9 @@ pub(crate) fn validate_materialized_secret_identity(
     command: &'static str,
     identity: &Option<String>,
     nsec_stdin: bool,
-) -> Result<(), DmError> {
+) -> Result<(), WnError> {
     if identity.as_deref().is_some_and(is_nostr_secret) && !nsec_stdin {
-        return Err(DmError::SecretArgumentRejected { command });
+        return Err(WnError::SecretArgumentRejected { command });
     }
     Ok(())
 }
@@ -345,7 +345,7 @@ pub(crate) async fn run_cli_local(cli: Cli) -> CliOutput {
 
 pub(crate) fn command_output_result(
     json_output: bool,
-    result: Result<CommandOutput, DmError>,
+    result: Result<CommandOutput, WnError>,
 ) -> CliOutput {
     match result {
         Ok(output) if json_output => CliOutput {
@@ -365,7 +365,7 @@ pub(crate) fn command_output_result(
             stdout: ensure_trailing_newline(output.plain),
             stderr: String::new(),
         },
-        Err(err) if json_output => json_dm_error(err),
+        Err(err) if json_output => json_wn_error(err),
         Err(err) => CliOutput {
             code: 1,
             stdout: String::new(),
@@ -374,7 +374,7 @@ pub(crate) fn command_output_result(
     }
 }
 
-async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, DmError)> {
+async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, WnError)> {
     let json_output = cli.json;
     execute_inner(cli)
         .await
@@ -382,7 +382,7 @@ async fn execute(cli: Cli) -> Result<(bool, CommandOutput), (bool, DmError)> {
         .map_err(|err| (json_output, err))
 }
 
-async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
+async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
@@ -523,11 +523,11 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, DmError> {
             commands::stream::stream_command_app(&account_home, &app, command, account_flag).await
         }
         Command::Daemon { .. } => Ok(CommandOutput {
-            plain: "daemon command is handled by dm".to_owned(),
+            plain: "daemon command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
         }),
         Command::Tui => Ok(CommandOutput {
-            plain: "tui command is handled by dm".to_owned(),
+            plain: "tui command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
         }),
         Command::Sync => {
@@ -548,7 +548,7 @@ fn daemon_socket_for_client(cli: &Cli, home: &Path) -> Option<PathBuf> {
     }
 
     let socket = daemon_socket_path_for_client(cli, home);
-    let explicit_daemon_socket = cli.socket.is_some() || std::env::var_os("DM_SOCKET").is_some();
+    let explicit_daemon_socket = cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
     if matches!(cli.command, Command::Logout { .. }) && !explicit_daemon_socket {
         return None;
     }
@@ -565,7 +565,7 @@ pub(crate) fn client_hosted_stream_command(
     match command {
         StreamCommand::Receive { .. } => Some((
             "stream receive",
-            "it waits for incoming stream traffic; run dm stream receive directly without --socket",
+            "it waits for incoming stream traffic; run wn stream receive directly without --socket",
         )),
         StreamCommand::Send {
             start_event_id: None,
@@ -585,7 +585,7 @@ pub(crate) fn client_hosted_stream_command(
 }
 
 fn daemon_socket_path_for_client(cli: &Cli, home: &Path) -> PathBuf {
-    let env_socket = std::env::var_os("DM_SOCKET").map(PathBuf::from);
+    let env_socket = std::env::var_os("WN_SOCKET").map(PathBuf::from);
     cli.socket
         .clone()
         .or(env_socket.clone())
@@ -665,8 +665,8 @@ fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> Cli
 pub(crate) fn unsupported_command<T>(
     command: &'static str,
     reason: &'static str,
-) -> Result<T, DmError> {
-    Err(DmError::UnsupportedCommand { command, reason })
+) -> Result<T, WnError> {
+    Err(WnError::UnsupportedCommand { command, reason })
 }
 
 pub(crate) fn group_show_output(
@@ -674,7 +674,7 @@ pub(crate) fn group_show_output(
     account: marmot_account::AccountSummary,
     group: String,
     mls: Option<Value>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     app.status(&account.label)?;
     let group_id = normalize_group_id_hex(&group)?;
     let group = app
@@ -702,8 +702,8 @@ pub(crate) fn replaceable_list_inconclusive(
     list: &str,
     account_id: &str,
     source_relays: &[TransportEndpoint],
-) -> DmError {
-    DmError::ReplaceableListInconclusive {
+) -> WnError {
+    WnError::ReplaceableListInconclusive {
         list: list.to_owned(),
         account_id: account_id.to_owned(),
         source_relays: source_relays
@@ -713,11 +713,11 @@ pub(crate) fn replaceable_list_inconclusive(
     }
 }
 
-fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, DmError> {
+fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
     if !confirm {
         return unsupported_command(
             "reset",
-            "pass --confirm to delete all local Darkmatter data",
+            "pass --confirm to delete all local White Noise data",
         );
     }
     match std::fs::remove_dir_all(home) {
@@ -849,26 +849,26 @@ pub(crate) fn is_nostr_secret(value: &str) -> bool {
     value.starts_with("nsec")
 }
 
-fn resolve_relay(relay: Option<String>) -> Result<Option<String>, DmError> {
-    match relay.or_else(|| std::env::var("DM_RELAY").ok()) {
+fn resolve_relay(relay: Option<String>) -> Result<Option<String>, WnError> {
+    match relay.or_else(|| std::env::var("WN_RELAY").ok()) {
         Some(relay) => validate_relay_url(relay).map(Some),
         None => Ok(None),
     }
 }
 
-pub(crate) fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, DmError> {
+pub(crate) fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, WnError> {
     let relay = relay.as_ref().trim();
     if relay.is_empty() {
-        return Err(DmError::EmptyRelayUrl);
+        return Err(WnError::EmptyRelayUrl);
     }
-    let parsed = url::Url::parse(relay).map_err(|_| DmError::InvalidRelayUrl(relay.to_owned()))?;
+    let parsed = url::Url::parse(relay).map_err(|_| WnError::InvalidRelayUrl(relay.to_owned()))?;
     if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host().is_none() {
-        return Err(DmError::InvalidRelayUrl(relay.to_owned()));
+        return Err(WnError::InvalidRelayUrl(relay.to_owned()));
     }
     Ok(relay.to_owned())
 }
 
-pub(crate) fn relay_endpoints(values: Vec<String>) -> Result<Vec<TransportEndpoint>, DmError> {
+pub(crate) fn relay_endpoints(values: Vec<String>) -> Result<Vec<TransportEndpoint>, WnError> {
     let mut endpoints = Vec::new();
     for value in values {
         let endpoint = TransportEndpoint(validate_relay_url(value)?);
@@ -883,7 +883,7 @@ pub(crate) fn account_selector_or_default(
     account_home: &AccountHome,
     account_ref: Option<String>,
     default_account: Option<String>,
-) -> Result<String, DmError> {
+) -> Result<String, WnError> {
     if let Some(account_ref) = account_ref {
         return parse_public_key(&account_ref);
     }
@@ -893,9 +893,9 @@ pub(crate) fn account_selector_or_default(
 pub(crate) fn resolve_account(
     account_home: &AccountHome,
     explicit: Option<String>,
-) -> Result<marmot_account::AccountSummary, DmError> {
+) -> Result<marmot_account::AccountSummary, WnError> {
     if let Some(account) = explicit
-        .or_else(|| std::env::var("DM_ACCOUNT").ok())
+        .or_else(|| std::env::var("WN_ACCOUNT").ok())
         .filter(|account| !account.trim().is_empty())
     {
         return resolve_account_ref(account_home, &account);
@@ -903,16 +903,16 @@ pub(crate) fn resolve_account(
 
     let accounts = account_home.accounts()?;
     match accounts.as_slice() {
-        [] => Err(DmError::MissingAccount),
+        [] => Err(WnError::MissingAccount),
         [account] => Ok(account.clone()),
-        _ => Err(DmError::MultipleAccounts),
+        _ => Err(WnError::MultipleAccounts),
     }
 }
 
 pub(crate) fn resolve_account_ref(
     account_home: &AccountHome,
     value: &str,
-) -> Result<marmot_account::AccountSummary, DmError> {
+) -> Result<marmot_account::AccountSummary, WnError> {
     let account_id_hex = parse_public_key(value)?;
     for account in account_home.accounts()? {
         if account.account_id_hex == account_id_hex {
@@ -920,30 +920,30 @@ pub(crate) fn resolve_account_ref(
         }
     }
 
-    Err(DmError::UnknownLocalAccount(value.to_owned()))
+    Err(WnError::UnknownLocalAccount(value.to_owned()))
 }
 
 pub(crate) fn ensure_local_signing(
     account: &marmot_account::AccountSummary,
-) -> Result<(), DmError> {
+) -> Result<(), WnError> {
     if account.local_signing {
         Ok(())
     } else {
-        Err(DmError::PublicAccountCannotSign)
+        Err(WnError::PublicAccountCannotSign)
     }
 }
 
-pub(crate) fn parse_public_key(value: &str) -> Result<String, DmError> {
+pub(crate) fn parse_public_key(value: &str) -> Result<String, WnError> {
     nostr::PublicKey::parse(value)
         .map(|pubkey| pubkey.to_hex())
-        .map_err(|_| DmError::InvalidPublicKey)
+        .map_err(|_| WnError::InvalidPublicKey)
 }
 
-pub(crate) fn npub_for_account_id(account_id: &str) -> Result<String, DmError> {
-    marmot_app::npub_for_account_id(account_id).map_err(DmError::from)
+pub(crate) fn npub_for_account_id(account_id: &str) -> Result<String, WnError> {
+    marmot_app::npub_for_account_id(account_id).map_err(WnError::from)
 }
 
-pub(crate) fn normalize_group_id_hex(value: &str) -> Result<String, DmError> {
+pub(crate) fn normalize_group_id_hex(value: &str) -> Result<String, WnError> {
     Ok(hex::encode(hex::decode(value)?))
 }
 
@@ -961,15 +961,15 @@ pub(crate) fn relay_lists_json(status: AccountRelayListStatus) -> Value {
 fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> MarmotApp {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
-    // DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
+    // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
     // installs leave it unset.
     let mut config = MarmotAppConfig::default()
-        .with_allow_loopback_blob_endpoints(dm_allow_loopback_blob_endpoints());
-    // Dev/test only: DM_DEV_SETTLEMENT_QUIESCENCE_MS overrides the pinned
+        .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints());
+    // Dev/test only: WN_DEV_SETTLEMENT_QUIESCENCE_MS overrides the pinned
     // convergence settlement window (e.g. `0` for instant settlement in
     // integration tests). Production installs leave it unset and use the pinned
     // default.
-    if let Some(ms) = dm_dev_settlement_quiescence_ms() {
+    if let Some(ms) = wn_dev_settlement_quiescence_ms() {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
     MarmotApp::with_relays_and_account_home_and_config(
@@ -980,15 +980,15 @@ fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> M
     )
 }
 
-fn dm_allow_loopback_blob_endpoints() -> bool {
+fn wn_allow_loopback_blob_endpoints() -> bool {
     matches!(
-        std::env::var("DM_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
+        std::env::var("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS").as_deref(),
         Ok("1") | Ok("true")
     )
 }
 
-fn dm_dev_settlement_quiescence_ms() -> Option<u64> {
-    std::env::var("DM_DEV_SETTLEMENT_QUIESCENCE_MS")
+fn wn_dev_settlement_quiescence_ms() -> Option<u64> {
+    std::env::var("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
         .ok()
         .and_then(|value| value.trim().parse().ok())
 }
@@ -997,7 +997,7 @@ fn open_account_home(
     home: &std::path::Path,
     secret_store: SecretStoreKind,
     keychain_service: &str,
-) -> Result<AccountHome, DmError> {
+) -> Result<AccountHome, WnError> {
     match secret_store {
         SecretStoreKind::File => Ok(AccountHome::open(home)),
         SecretStoreKind::Keychain => Ok(AccountHome::open_with_keychain(home, keychain_service)?),
@@ -1006,26 +1006,26 @@ fn open_account_home(
 
 fn resolve_keychain_service(keychain_service: Option<String>) -> String {
     keychain_service
-        .or_else(|| std::env::var("DM_KEYCHAIN_SERVICE").ok())
+        .or_else(|| std::env::var("WN_KEYCHAIN_SERVICE").ok())
         .unwrap_or_else(|| DEFAULT_KEYCHAIN_SERVICE_NAME.to_owned())
 }
 
-fn resolve_secret_store(secret_store: Option<SecretStoreKind>) -> Result<SecretStoreKind, DmError> {
+fn resolve_secret_store(secret_store: Option<SecretStoreKind>) -> Result<SecretStoreKind, WnError> {
     if let Some(secret_store) = secret_store {
         return Ok(secret_store);
     }
-    match std::env::var("DM_SECRET_STORE") {
+    match std::env::var("WN_SECRET_STORE") {
         Ok(value) => match value.trim() {
             "keychain" => Ok(SecretStoreKind::Keychain),
             "file" | "local-file" | "local_file" => Ok(SecretStoreKind::File),
-            other => Err(DmError::InvalidSecretStore(other.to_owned())),
+            other => Err(WnError::InvalidSecretStore(other.to_owned())),
         },
         Err(_) => Ok(SecretStoreKind::Keychain),
     }
 }
 
 fn resolve_home(home: Option<PathBuf>) -> PathBuf {
-    home.or_else(|| std::env::var_os("DM_HOME").map(PathBuf::from))
+    home.or_else(|| std::env::var_os("WN_HOME").map(PathBuf::from))
         .unwrap_or_else(default_home)
 }
 
@@ -1037,7 +1037,7 @@ fn default_home_from_env(mut var: impl FnMut(&str) -> Option<OsString>) -> PathB
     #[cfg(target_os = "windows")]
     {
         if let Some(appdata) = var("APPDATA") {
-            return PathBuf::from(appdata).join("darkmatter");
+            return PathBuf::from(appdata).join("whitenoise");
         }
     }
 
@@ -1047,24 +1047,24 @@ fn default_home_from_env(mut var: impl FnMut(&str) -> Option<OsString>) -> PathB
             return PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
-                .join("darkmatter");
+                .join("whitenoise");
         }
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Some(xdg_data_home) = var("XDG_DATA_HOME") {
-            return PathBuf::from(xdg_data_home).join("darkmatter");
+            return PathBuf::from(xdg_data_home).join("whitenoise");
         }
         if let Some(home) = var("HOME") {
             return PathBuf::from(home)
                 .join(".local")
                 .join("share")
-                .join("darkmatter");
+                .join("whitenoise");
         }
     }
 
-    PathBuf::from(".darkmatter")
+    PathBuf::from(".whitenoise")
 }
 
 fn ensure_trailing_newline(mut value: String) -> String {
@@ -1111,8 +1111,8 @@ fn json_error(code: i32, error_code: &str, message: String) -> CliOutput {
     }
 }
 
-fn json_dm_error(err: DmError) -> CliOutput {
-    let error = dm_error_json(&err);
+fn json_wn_error(err: WnError) -> CliOutput {
+    let error = wn_error_json(&err);
     CliOutput {
         code: 1,
         stdout: format!(
@@ -1140,7 +1140,7 @@ mod tests {
         resolve_quic_candidate_addr,
     };
     use super::{
-        Cli, Command, DmError, StreamCommand, daemon, daemon_socket_for_client,
+        Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
         default_home_from_env, npub_for_account_id, relay_endpoints, resolve_relay, run_from,
     };
 
@@ -1217,14 +1217,14 @@ mod tests {
 
         let err = npub_for_account_id("not-a-public-key")
             .expect_err("invalid account ids must surface as a CLI error");
-        let rendered = super::dm_error_json(&err);
+        let rendered = super::wn_error_json(&err);
         assert_eq!(rendered["code"], "invalid_public_key");
     }
 
     fn test_cli(command: Command) -> Cli {
         Cli {
             home: None,
-            socket: Some(PathBuf::from("/tmp/dmd.sock")),
+            socket: Some(PathBuf::from("/tmp/wnd.sock")),
             relay: None,
             daemon_discovery_relays: Vec::new(),
             daemon_default_account_relays: Vec::new(),
@@ -1242,7 +1242,7 @@ mod tests {
 
     #[test]
     fn daemon_execute_socket_skips_stream_commands_that_must_run_in_client() {
-        let home = Path::new("/tmp/dm-home");
+        let home = Path::new("/tmp/wn-home");
         let commands = [
             StreamCommand::Receive {
                 bind: loopback_stream_addr(),
@@ -1277,10 +1277,10 @@ mod tests {
 
     #[test]
     fn daemon_execute_socket_skips_implicit_logout() {
-        // DM_SOCKET makes the socket selection explicit; this regression covers
+        // WN_SOCKET makes the socket selection explicit; this regression covers
         // the auto-discovered daemon socket path that previously forwarded
-        // `dm logout` even though the user did not pass `--socket`.
-        if std::env::var_os("DM_SOCKET").is_some() {
+        // `wn logout` even though the user did not pass `--socket`.
+        if std::env::var_os("WN_SOCKET").is_some() {
             return;
         }
 
@@ -1300,8 +1300,8 @@ mod tests {
 
     #[test]
     fn daemon_execute_socket_keeps_explicit_logout() {
-        let home = Path::new("/tmp/dm-home");
-        let socket = Path::new("/tmp/dmd.sock");
+        let home = Path::new("/tmp/wn-home");
+        let socket = Path::new("/tmp/wnd.sock");
         let cli = test_cli(Command::Logout {
             pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         });
@@ -1314,8 +1314,8 @@ mod tests {
 
     #[test]
     fn daemon_execute_socket_keeps_finite_stream_commands() {
-        let home = Path::new("/tmp/dm-home");
-        let socket = Path::new("/tmp/dmd.sock");
+        let home = Path::new("/tmp/wn-home");
+        let socket = Path::new("/tmp/wnd.sock");
         let commands = [
             StreamCommand::Start {
                 group: "aa".repeat(32),
@@ -1356,7 +1356,7 @@ mod tests {
     #[cfg(unix)]
     fn account_list_args(home: &Path, socket: Option<&Path>) -> Vec<OsString> {
         let mut args = vec![
-            OsString::from("dm"),
+            OsString::from("wn"),
             OsString::from("--home"),
             home.as_os_str().to_owned(),
             OsString::from("--secret-store"),
@@ -1499,10 +1499,10 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             home,
-            PathBuf::from("/Users/alice/Library/Application Support/darkmatter")
+            PathBuf::from("/Users/alice/Library/Application Support/whitenoise")
         );
         #[cfg(all(unix, not(target_os = "macos")))]
-        assert_eq!(home, PathBuf::from("/Users/alice/.local/share/darkmatter"));
+        assert_eq!(home, PathBuf::from("/Users/alice/.local/share/whitenoise"));
     }
 
     #[test]
@@ -1515,11 +1515,11 @@ mod tests {
         });
 
         #[cfg(all(unix, not(target_os = "macos")))]
-        assert_eq!(home, PathBuf::from("/tmp/xdg-data/darkmatter"));
+        assert_eq!(home, PathBuf::from("/tmp/xdg-data/whitenoise"));
         #[cfg(target_os = "macos")]
         assert_eq!(
             home,
-            PathBuf::from("/home/alice/Library/Application Support/darkmatter")
+            PathBuf::from("/home/alice/Library/Application Support/whitenoise")
         );
     }
 
@@ -1568,15 +1568,15 @@ mod tests {
     fn relay_url_helpers_reject_malformed_or_non_websocket_urls() {
         assert!(matches!(
             resolve_relay(Some("not-a-relay-url".to_owned())),
-            Err(DmError::InvalidRelayUrl(value)) if value == "not-a-relay-url"
+            Err(WnError::InvalidRelayUrl(value)) if value == "not-a-relay-url"
         ));
         assert!(matches!(
             resolve_relay(Some("https://relay.example".to_owned())),
-            Err(DmError::InvalidRelayUrl(value)) if value == "https://relay.example"
+            Err(WnError::InvalidRelayUrl(value)) if value == "https://relay.example"
         ));
         assert!(matches!(
             relay_endpoints(vec!["mailto:relay@example.com".to_owned()]),
-            Err(DmError::InvalidRelayUrl(value)) if value == "mailto:relay@example.com"
+            Err(WnError::InvalidRelayUrl(value)) if value == "mailto:relay@example.com"
         ));
         assert_eq!(
             resolve_relay(Some(" wss://relay.example/path ".to_owned())).unwrap(),
@@ -1632,7 +1632,7 @@ mod tests {
             let parsed = parse_quic_candidate(candidate).expect("candidate parses");
             let result = resolve_quic_candidate_addr(&parsed, false).await;
             assert!(
-                matches!(result, Err(DmError::UnsafeQuicCandidateEndpoint { .. })),
+                matches!(result, Err(WnError::UnsafeQuicCandidateEndpoint { .. })),
                 "expected {candidate} to be rejected without opt-in, got {result:?}"
             );
         }
@@ -1744,7 +1744,7 @@ mod tests {
             .expect_err("lone --before-message-id must be rejected");
         assert!(matches!(
             err,
-            DmError::MessagePaginationCursorMismatch {
+            WnError::MessagePaginationCursorMismatch {
                 timestamp_flag: "--before",
                 message_id_flag: "--before-message-id",
             }
@@ -1757,7 +1757,7 @@ mod tests {
             .expect_err("lone --after-message-id must be rejected");
         assert!(matches!(
             err,
-            DmError::MessagePaginationCursorMismatch {
+            WnError::MessagePaginationCursorMismatch {
                 timestamp_flag: "--after",
                 message_id_flag: "--after-message-id",
             }
@@ -1770,7 +1770,7 @@ mod tests {
             .expect_err("lone --before timestamp must be rejected");
         assert!(matches!(
             err,
-            DmError::MessagePaginationCursorMismatch {
+            WnError::MessagePaginationCursorMismatch {
                 timestamp_flag: "--before",
                 message_id_flag: "--before-message-id",
             }
@@ -1781,7 +1781,7 @@ mod tests {
     fn message_list_cursors_reject_before_and_after_together() {
         let err = validate_message_list_cursors(Some(101), Some("d"), Some(100), Some("a"))
             .expect_err("before and after cursors cannot be combined");
-        assert!(matches!(err, DmError::MessagePaginationConflictingCursors));
+        assert!(matches!(err, WnError::MessagePaginationConflictingCursors));
     }
 
     // `chats subscribe` / `chats subscribe-archived` without a daemon must surface
@@ -1790,9 +1790,9 @@ mod tests {
     // branch on `code` keep working.
     #[test]
     fn chats_subscribe_requires_daemon_renders_chat_specific_message() {
-        let chats = super::dm_error_json(&DmError::ChatsSubscribeRequiresDaemon);
+        let chats = super::wn_error_json(&WnError::ChatsSubscribeRequiresDaemon);
         assert_eq!(chats["code"], "daemon_required");
-        assert_eq!(chats["repair"]["start"], "dm daemon start");
+        assert_eq!(chats["repair"]["start"], "wn daemon start");
         let message = chats["message"].as_str().expect("chats message");
         assert!(
             message.starts_with("chats subscribe"),
@@ -1801,7 +1801,7 @@ mod tests {
 
         // The messages variant must stay messages-specific so the two namespaces
         // do not drift back into the same text.
-        let messages = super::dm_error_json(&DmError::MessagesSubscribeRequiresDaemon);
+        let messages = super::wn_error_json(&WnError::MessagesSubscribeRequiresDaemon);
         let messages_message = messages["message"].as_str().expect("messages message");
         assert!(
             messages_message.starts_with("messages subscribe"),
@@ -1811,16 +1811,16 @@ mod tests {
     }
 
     // Regression for #190: an oversized request on the *implicit* daemon socket
-    // path (default socket merely exists, no `--socket`/`DM_SOCKET`) must surface
+    // path (default socket merely exists, no `--socket`/`WN_SOCKET`) must surface
     // the client-side size-limit error instead of silently falling through to
     // local execution. Without the terminal `RequestTooLarge` arm in `run_from`,
     // the encoder rejects the request and the request silently runs locally,
     // masking the cap.
     #[tokio::test]
     async fn run_from_oversized_request_on_implicit_socket_fails_locally() {
-        // DM_SOCKET would force the explicit-socket branch and invalidate the
+        // WN_SOCKET would force the explicit-socket branch and invalidate the
         // implicit-path assertion; only run the check when it is unset.
-        if std::env::var_os("DM_SOCKET").is_some() {
+        if std::env::var_os("WN_SOCKET").is_some() {
             return;
         }
 
@@ -1836,7 +1836,7 @@ mod tests {
         // before any connection attempt.
         let huge_text = "a".repeat(2 * 1024 * 1024);
         let args: Vec<OsString> = vec![
-            OsString::from("dm"),
+            OsString::from("wn"),
             OsString::from("--json"),
             OsString::from("--home"),
             home.path().as_os_str().to_owned(),
@@ -1861,7 +1861,7 @@ mod tests {
     // stderr), so piping and scripting work.
     #[tokio::test]
     async fn top_level_help_goes_to_stdout_not_stderr() {
-        let output = run_from([OsString::from("dm"), OsString::from("--help")]).await;
+        let output = run_from([OsString::from("wn"), OsString::from("--help")]).await;
         assert_eq!(output.code, 0, "help exit code must be 0");
         assert!(
             !output.stdout.is_empty(),
@@ -1882,7 +1882,7 @@ mod tests {
     #[tokio::test]
     async fn subcommand_help_goes_to_stdout_not_stderr() {
         let output = run_from([
-            OsString::from("dm"),
+            OsString::from("wn"),
             OsString::from("messages"),
             OsString::from("--help"),
         ])
@@ -1901,7 +1901,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_goes_to_stdout_not_stderr() {
-        let output = run_from([OsString::from("dm"), OsString::from("--version")]).await;
+        let output = run_from([OsString::from("wn"), OsString::from("--version")]).await;
         assert_eq!(output.code, 0, "version exit code must be 0");
         assert!(
             !output.stdout.is_empty(),
@@ -1917,7 +1917,7 @@ mod tests {
     #[tokio::test]
     async fn help_in_json_mode_is_reported_as_ok() {
         let output = run_from([
-            OsString::from("dm"),
+            OsString::from("wn"),
             OsString::from("--json"),
             OsString::from("--help"),
         ])
@@ -1939,7 +1939,7 @@ mod tests {
     #[tokio::test]
     async fn version_in_json_mode_is_reported_as_ok() {
         let output = run_from([
-            OsString::from("dm"),
+            OsString::from("wn"),
             OsString::from("--json"),
             OsString::from("--version"),
         ])
@@ -1959,7 +1959,7 @@ mod tests {
     async fn real_usage_error_still_goes_to_stderr() {
         // An unknown subcommand is a genuine usage error (nonzero exit) and must
         // keep going to stderr.
-        let output = run_from([OsString::from("dm"), OsString::from("definitely-not-a-cmd")]).await;
+        let output = run_from([OsString::from("wn"), OsString::from("definitely-not-a-cmd")]).await;
         assert_ne!(output.code, 0, "usage error must have nonzero exit");
         assert!(
             output.stdout.is_empty(),
@@ -1975,7 +1975,7 @@ mod tests {
     #[tokio::test]
     async fn real_usage_error_in_json_mode_is_reported_as_error() {
         let output = run_from([
-            OsString::from("dm"),
+            OsString::from("wn"),
             OsString::from("--json"),
             OsString::from("definitely-not-a-cmd"),
         ])
@@ -1989,11 +1989,11 @@ mod tests {
 
     #[tokio::test]
     async fn missing_subcommand_is_a_usage_error_not_help() {
-        // `dm messages` with no subcommand renders help text but exits nonzero
+        // `wn messages` with no subcommand renders help text but exits nonzero
         // (clap's DisplayHelpOnMissingArgumentOrSubcommand). It is a genuine
         // usage error and must go to stderr, never stdout, despite resembling
-        // help output. Regression for darkmatter#192 adversarial review.
-        let output = run_from([OsString::from("dm"), OsString::from("messages")]).await;
+        // help output. Regression for mdk#192 adversarial review.
+        let output = run_from([OsString::from("wn"), OsString::from("messages")]).await;
         assert_ne!(output.code, 0, "missing subcommand must have nonzero exit");
         assert!(
             output.stdout.is_empty(),
@@ -2008,11 +2008,11 @@ mod tests {
 
     #[tokio::test]
     async fn missing_subcommand_in_json_mode_is_reported_as_error() {
-        // `dm --json messages` with no subcommand must be ok:false with a
+        // `wn --json messages` with no subcommand must be ok:false with a
         // nonzero exit, not wrapped as a success help object. Regression for
-        // darkmatter#192 adversarial review.
+        // mdk#192 adversarial review.
         let output = run_from([
-            OsString::from("dm"),
+            OsString::from("wn"),
             OsString::from("--json"),
             OsString::from("messages"),
         ])

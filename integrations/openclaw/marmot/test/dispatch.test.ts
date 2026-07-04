@@ -914,7 +914,7 @@ describe("createMarmotInboundDispatcher inbound media", () => {
     expect(downloads).toEqual([ref]);
     const ctxArg = buildCtxMock.mock.calls[0]?.[0] as { media?: unknown };
     // The fact path is the OpenClaw media-store staged path (allowlisted for both
-    // native vision and the agent's `image` tool), not the raw dm-agent temp path.
+    // native vision and the agent's `image` tool), not the raw wn-agent temp path.
     expect(ctxArg.media).toEqual([
       {
         path: `/oc/media/inbound/${ref.file_name}`,

@@ -21,13 +21,13 @@ pub struct KeyPackagePublication {
 ///
 /// - `externally_exposed == false`: publication failed before any external
 ///   exposure, so the just-generated private bundle is safe to prune
-///   (darkmatter#160 — the original orphan-accumulation bug).
+///   (mdk#160 — the original orphan-accumulation bug).
 /// - `externally_exposed == true`: the KeyPackage may already be discoverable on
 ///   a relay, so the private bundle MUST be retained. Pruning it would turn a
 ///   local post-publish failure (e.g. a cache write) into a remotely visible but
 ///   unjoinable KeyPackage: an inviter could build a Welcome against the
 ///   published event, but the account could never join because the matching
-///   private bundle was deleted (darkmatter#160 adversarial review).
+///   private bundle was deleted (mdk#160 adversarial review).
 #[derive(Debug, thiserror::Error)]
 #[error("key package publication failed: {message}")]
 pub struct KeyPackagePublishError {

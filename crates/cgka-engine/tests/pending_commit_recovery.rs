@@ -1,4 +1,4 @@
-//! Crash-during-publish recovery at session open (darkmatter#150).
+//! Crash-during-publish recovery at session open (mdk#150).
 //!
 //! The publish-before-apply contract durably persists a staged commit
 //! (`MlsGroupState::PendingCommit`) at send time and resolves it only when the
@@ -290,7 +290,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
     assert_eq!(alice.members(&group_id).unwrap().len(), 3);
 }
 
-/// Regression for the auto-commit leave path (darkmatter#150 follow-up).
+/// Regression for the auto-commit leave path (mdk#150 follow-up).
 ///
 /// A deferred SelfRemove auto-commit legitimately persists a staged commit
 /// across a process boundary: a remaining member stages the commit, projects

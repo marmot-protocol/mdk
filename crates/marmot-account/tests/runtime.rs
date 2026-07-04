@@ -349,7 +349,7 @@ impl KeyPackagePublisher for FlakyKeyPackages {
 /// shape: it "publishes" to an external transport first and only then performs
 /// a local step that fails. The returned error is therefore `externally_exposed`
 /// — the KeyPackage may already be discoverable on a relay, so the runtime must
-/// NOT prune the private bundle (darkmatter#160 adversarial review).
+/// NOT prune the private bundle (mdk#160 adversarial review).
 #[derive(Clone, Default)]
 struct ExposedThenFailsKeyPackages {
     publications: Arc<Mutex<Vec<KeyPackagePublication>>>,
@@ -435,7 +435,7 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
 
 #[tokio::test]
 async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() {
-    // darkmatter#160: when publication fails, publish_fresh_key_package must
+    // mdk#160: when publication fails, publish_fresh_key_package must
     // surface the publish error AND delete the orphaned private bundle that
     // fresh_key_package persisted, so a failing-publisher retry loop does not
     // accumulate unused private key material.
@@ -479,7 +479,7 @@ async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() 
 
 #[tokio::test]
 async fn publish_fresh_key_package_retains_bundle_when_publish_fails_after_exposure() {
-    // darkmatter#160 adversarial review: the orphan-cleanup must NOT prune the
+    // mdk#160 adversarial review: the orphan-cleanup must NOT prune the
     // private bundle when the publisher fails *after* the KeyPackage may already
     // be externally exposed (e.g. the production AppKeyPackagePublisher publishes
     // to a relay first, then fails on a local cache write). Pruning there would
@@ -869,7 +869,7 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
     ));
 }
 
-// darkmatter#499 regression: an explicit group-evolution commit that a relay
+// mdk#499 regression: an explicit group-evolution commit that a relay
 // accepted but that missed `required_acks` has already been exposed to peers.
 // Rolling it back locally diverges the sender from recipients; mirror the
 // `publish_pending`/group-created exposure rule and keep the commit, then still
@@ -970,7 +970,7 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
     ));
 }
 
-// darkmatter#426 regression: hydration-quarantine events must reach the
+// mdk#426 regression: hydration-quarantine events must reach the
 // app/account layer through the no-inbound `drain()` path, not only when an
 // unrelated relay delivery happens to trigger an engine drain. Build a session
 // DB with a group whose Marmot metadata exists but whose OpenMLS state is
@@ -1059,7 +1059,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
     );
 }
 
-// darkmatter#483 regression: an auto-published commit (here, the admin's
+// mdk#483 regression: an auto-published commit (here, the admin's
 // auto-commit of a peer self-remove proposal) that a relay *accepted* but that
 // did not meet `required_acks` must be CONFIRMED, not rolled back. Rolling it
 // back leaves the sender's local row falsely failed while peers already have

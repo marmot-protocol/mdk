@@ -21,7 +21,7 @@ const DIRECT_OUTPUT_MACROS: &[&str] = &["println!(", "eprintln!(", "dbg!("];
 /// attacker-controlled event content, so tracing must log a stable
 /// privacy-safe kind (`error_kind = err.privacy_safe_kind()`,
 /// `error_kind = %err.kind()`, an error-code enum) instead of the raw error
-/// value (darkmatter#340, darkmatter#399).
+/// value (mdk#340, mdk#399).
 /// Matching is keyed to the interpolated *value* (`%err`, `?e`, ...) as well
 /// as the conventional `error` field name, so renaming the field (`cause =
 /// %err`, `reason = %e`) does not bypass the audit. Tokens are terminated by

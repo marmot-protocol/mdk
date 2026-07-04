@@ -24,17 +24,17 @@ RUN apt-get update \
 # being hijacked by openclaw's own packageManager field.
 RUN corepack prepare pnpm@10.13.1 --activate
 
-WORKDIR /work/darkmatter
+WORKDIR /work/mdk
 COPY . .
 
-RUN cargo build --locked --release -p agent-connector --bin dm-agent \
-    && install -m 0755 target/release/dm-agent /usr/local/bin/dm-agent \
+RUN cargo build --locked --release -p agent-connector --bin wn-agent \
+    && install -m 0755 target/release/wn-agent /usr/local/bin/wn-agent \
     && install -m 0755 scripts/openclaw_marmot_container_entrypoint.sh /usr/local/bin/openclaw-marmot-entrypoint \
     && ( cd integrations/openclaw/marmot && pnpm install && pnpm build )
 
 ENV MARMOT_HOME=/data/marmot-agent \
     OPENCLAW_HOME=/data/openclaw-home \
-    MARMOT_AGENT_SOCKET=/run/marmot-agent/dm-agent.sock \
+    MARMOT_AGENT_SOCKET=/run/marmot-agent/wn-agent.sock \
     MARMOT_AGENT_AUTH_TOKEN_FILE=/data/marmot-agent/control.token \
     MARMOT_AGENT_SOCKET_DIR_MODE=0770 \
     MARMOT_AGENT_SOCKET_MODE=0660 \

@@ -33,7 +33,7 @@ pub(crate) struct DirectoryRelayEventRecord {
 /// `subscription_id` is still active and its author/kind match the filter that
 /// subscription was created with. This prevents a malicious or buggy relay from
 /// injecting unsolicited directory-shaped events (e.g. arbitrary kind-3 contact
-/// lists) into the persistent directory search graph (darkmatter#709). Authors
+/// lists) into the persistent directory search graph (mdk#709). Authors
 /// and kinds are kept as the canonical hex / `u64` already present in the
 /// [`DirectorySyncBatch`], so matching is a plain membership check.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -289,7 +289,7 @@ impl DirectoryRelayPlane {
     /// the subscription never requested, or a kind outside its filter is
     /// rejected so a malicious or buggy relay cannot inject unsolicited
     /// directory-shaped events into the persistent search graph
-    /// (darkmatter#709).
+    /// (mdk#709).
     pub(crate) async fn accepts_live_event(
         &self,
         subscription_id: &str,

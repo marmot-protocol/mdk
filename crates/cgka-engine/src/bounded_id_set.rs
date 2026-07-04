@@ -6,7 +6,7 @@
 //! `recorded_message_outcome` in `do_ingest`), so these caches are a hot-process
 //! fast path, not history. Backing them with a plain `HashSet` made them
 //! append-only: RSS climbed monotonically with total lifetime message volume on
-//! always-on clients (agents, daemons, the `dm-agent` connector).
+//! always-on clients (agents, daemons, the `wn-agent` connector).
 //!
 //! This type bounds that growth: it tracks membership in a `HashSet` for O(1)
 //! `contains`, and insertion order in a `VecDeque` so the oldest id is evicted

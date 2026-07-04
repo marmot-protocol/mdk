@@ -72,10 +72,10 @@ pub use ast::{
 /// - GFM strikethrough (`~~foo~~`).
 /// - GFM task-list items (`- [ ]`, `- [x]`).
 /// - Bare URLs (GFM-style extended autolinks) for the schemes `http://`,
-///   `https://`, `mailto:`, `tel:`, `darkmatter://`, `whitenoise://`, and
+///   `https://`, `mailto:`, `tel:`, `marmot://`, `whitenoise://`, and
 ///   `whitenoise-staging://`. Recognized at word boundaries; trailing
 ///   punctuation (`.,;:!?*_~` and unbalanced `)`) is excluded from the
-///   matched URL. Opaque app-scheme forms like `darkmatter:foo` and
+///   matched URL. Opaque app-scheme forms like `marmot:foo` and
 ///   `whitenoise:foo` (no `//`) stay literal.
 /// - Math: inline `$…$` and block `$$ … $$` (content is opaque — recognized
 ///   but never parsed as LaTeX).

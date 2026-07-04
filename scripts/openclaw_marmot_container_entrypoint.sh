@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Container entrypoint for the OpenClaw Marmot phone test: start dm-agent, bootstrap
+# Container entrypoint for the OpenClaw Marmot phone test: start wn-agent, bootstrap
 # the agent account, install + enable the Marmot channel plugin, run the gateway.
 # Mirrors scripts/hermes_marmot_container_entrypoint.sh.
 set -euo pipefail
@@ -26,11 +26,11 @@ if [ "${MARMOT_AGENT_DEBUG_CONTROLS:-0}" = "1" ]; then
     extra_args+=(--debug-controls)
 fi
 
-# Surface dm-agent's privacy-safe connector tracing in the container logs so the
+# Surface wn-agent's privacy-safe connector tracing in the container logs so the
 # phone test can see welcome/group/inbound activity (override with RUST_LOG).
 export RUST_LOG="${RUST_LOG:-info}"
 
-dm-agent \
+wn-agent \
     --home "$MARMOT_HOME" \
     --socket "$MARMOT_AGENT_SOCKET" \
     --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE" \
@@ -46,11 +46,11 @@ for _ in $(seq 1 30); do
 done
 
 if [ ! -S "$MARMOT_AGENT_SOCKET" ]; then
-    echo "error: dm-agent control socket not available at $MARMOT_AGENT_SOCKET" >&2
+    echo "error: wn-agent control socket not available at $MARMOT_AGENT_SOCKET" >&2
     exit 1
 fi
 
-dm-agent bootstrap \
+wn-agent bootstrap \
     --home "$MARMOT_HOME" \
     --socket "$MARMOT_AGENT_SOCKET" \
     --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE" \
@@ -89,12 +89,12 @@ fi
 # --force overwrites an already-installed copy. OPENCLAW_HOME lives on a
 # persisted volume, so without --force a rebuilt image's updated plugin dist is
 # ignored in favor of the stale copy left in the volume from a prior run.
-openclaw plugins install --force /work/darkmatter/integrations/openclaw/marmot || true
+openclaw plugins install --force /work/mdk/integrations/openclaw/marmot || true
 openclaw plugins enable marmot || true
 
 # Enabling the plugin loads its code but does not start a channel: OpenClaw only
 # starts channels configured under channels.<id>. `openclaw channels add
-# --channel marmot` insists on installing @darkmatter/openclaw-marmot from npm
+# --channel marmot` insists on installing @marmot-protocol/openclaw-marmot from npm
 # (this is a local, unpublished plugin), so write the channel entry directly.
 # Every marmot channel field is optional and resolved from MARMOT_* env, so an
 # enabled entry is sufficient. Idempotent, so it also re-asserts on restart.

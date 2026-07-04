@@ -1,4 +1,4 @@
-//! `dmd` background runtime daemon: accept loop, request dispatch, and module wiring.
+//! `wnd` background runtime daemon: accept loop, request dispatch, and module wiring.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -88,7 +88,7 @@ where
         }
     };
 
-    server_output("dmd", run_server(args).await)
+    server_output("wnd", run_server(args).await)
 }
 
 fn server_output(
@@ -119,7 +119,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     let log_path = args
         .logs_dir
         .clone()
-        .map(|logs_dir| logs_dir.join("dmd.log"))
+        .map(|logs_dir| logs_dir.join("wnd.log"))
         .unwrap_or_else(|| default_log_path(&home));
     if let Some(parent) = socket.parent() {
         prepare_socket_dir(parent, &home)?;
@@ -157,7 +157,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     let relay = hidden_relay
         .or_else(|| discovery_relays.first().cloned())
         .or_else(|| default_account_relays.first().cloned())
-        .ok_or(crate::DmError::MissingRelay)?;
+        .ok_or(crate::WnError::MissingRelay)?;
     let defaults = DaemonDefaults {
         home,
         socket: socket.clone(),

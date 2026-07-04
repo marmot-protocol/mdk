@@ -120,11 +120,11 @@
                 "Paragraph": {
                   "inlines": [
                     {
-                      "Text": "darkmatter: "
+                      "Text": "marmot: "
                     },
                     {
                       "Autolink": {
-                        "url": "darkmatter://profile/npub1abc",
+                        "url": "marmot://profile/npub1abc",
                         "kind": "Uri"
                       }
                     }
@@ -435,7 +435,7 @@
                     },
                     {
                       "Autolink": {
-                        "url": "darkmatter://thread/xyz",
+                        "url": "marmot://thread/xyz",
                         "kind": "Uri"
                       }
                     }

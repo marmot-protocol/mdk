@@ -750,7 +750,7 @@ impl CanonicalEndpoint {
     /// (`marmot.transport.nostr.routing.v1`), which are intentionally never
     /// rewritten. A raw `==` therefore drops events whenever the two differ only
     /// by a `url`-canonicalizable detail (trailing slash, host case, default
-    /// port, percent-encoding) — see darkmatter#482.
+    /// port, percent-encoding) — see mdk#482.
     ///
     /// Fast path is byte equality against the verbatim string. Otherwise both
     /// sides are compared by their cached/parsed `RelayUrl` value, folding those

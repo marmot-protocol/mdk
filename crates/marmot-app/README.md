@@ -3,7 +3,7 @@
 `marmot-app` is the first non-lab multi-account app runtime bridge.
 
 It wires the app-owned `AccountHome` to encrypted session storage, the Nostr MLS peeler, the Nostr transport adapter, and
-relay-backed transport state. The crate is intentionally below presentation layers like `dm` and above the generic
+relay-backed transport state. The crate is intentionally below presentation layers like `wn` and above the generic
 account/session/engine crates.
 
 It owns the first app projections:

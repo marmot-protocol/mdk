@@ -1533,14 +1533,14 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
 fn account_setup_invocation_pipes_nsec_imports_to_stdin() {
     assert_eq!(
         account_setup_invocation(Some("nsec1secret".to_owned())),
-        DmInvocation {
+        WnInvocation {
             args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
             stdin: Some("nsec1secret\n".to_owned()),
         }
     );
     assert_eq!(
         account_setup_invocation(Some("npub1bob".to_owned())),
-        DmInvocation {
+        WnInvocation {
             args: vec!["login".to_owned(), "npub1bob".to_owned()],
             stdin: None,
         }
@@ -1728,7 +1728,7 @@ fn char_key(character: char) -> KeyEvent {
 
 #[test]
 fn leading_question_mark_inserts_into_empty_composer() {
-    // Regression for darkmatter#200: a leading '?' in an empty composer
+    // Regression for mdk#200: a leading '?' in an empty composer
     // used to toggle help and was swallowed instead of being inserted.
     let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
     app.focus = Focus::Composer;
@@ -1767,7 +1767,7 @@ fn line_text(line: &Line<'_>) -> String {
         .collect::<String>()
 }
 
-fn test_tui_app(client: DmClient, account_id: &str) -> TuiApp {
+fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
     TuiApp {
         client,
         initial_account: None,
@@ -1805,8 +1805,8 @@ fn test_tui_app(client: DmClient, account_id: &str) -> TuiApp {
     }
 }
 
-fn test_unused_client() -> DmClient {
-    DmClient {
+fn test_unused_client() -> WnClient {
+    WnClient {
         exe: PathBuf::from("unused"),
         home: None,
         socket: None,
@@ -1816,10 +1816,10 @@ fn test_unused_client() -> DmClient {
     }
 }
 
-fn test_json_client(response: &str) -> (tempfile::TempDir, DmClient) {
+fn test_json_client(response: &str) -> (tempfile::TempDir, WnClient) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let exe = test_json_executable(tempdir.path(), response);
-    let client = DmClient {
+    let client = WnClient {
         exe,
         home: None,
         socket: None,
@@ -1834,21 +1834,21 @@ fn test_json_client(response: &str) -> (tempfile::TempDir, DmClient) {
 fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    let exe = dir.join("dm-json");
+    let exe = dir.join("wn-json");
     std::fs::write(&exe, format!("#!/bin/sh\ncat <<'JSON'\n{response}\nJSON\n"))
-        .expect("write fake dm");
+        .expect("write fake wn");
     let mut permissions = std::fs::metadata(&exe)
-        .expect("fake dm metadata")
+        .expect("fake wn metadata")
         .permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&exe, permissions).expect("chmod fake dm");
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
     exe
 }
 
 #[cfg(windows)]
 fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
-    let exe = dir.join("dm-json.cmd");
-    std::fs::write(&exe, format!("@echo off\r\necho {response}\r\n")).expect("write fake dm");
+    let exe = dir.join("wn-json.cmd");
+    std::fs::write(&exe, format!("@echo off\r\necho {response}\r\n")).expect("write fake wn");
     exe
 }
 
@@ -1865,9 +1865,9 @@ fn test_chat_subscription(account_id: &str, include_archived: bool) -> ChatSubsc
 
 #[test]
 fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
-    // Regression for darkmatter#197: automatic stream-append retries come from
+    // Regression for mdk#197: automatic stream-append retries come from
     // tick(), which runs every UI event interval. A failing append must move the
-    // retry gate forward so a down daemon/broker does not spawn a blocking `dm`
+    // retry gate forward so a down daemon/broker does not spawn a blocking `wn`
     // subprocess on every tick.
     let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let (_tempdir, client) =
@@ -1932,7 +1932,7 @@ fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
         app.status
     );
     // The compose-finish call consumes the composer before running the
-    // fallible `dm stream compose-finish`. On failure it must be restored so
+    // fallible `wn stream compose-finish`. On failure it must be restored so
     // the draft text in `self.input` is not silently re-sent as a normal
     // message through the non-streaming Enter path on the next keypress.
     assert!(

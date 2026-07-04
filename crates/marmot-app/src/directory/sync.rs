@@ -20,7 +20,7 @@ pub(crate) const DIRECTORY_SYNC_USER_BATCH_SIZE: usize = 200;
 /// discovered). Contact lists are deliberately excluded here: subscribing to
 /// kind-3 for transitively discovered users and persisting every followed
 /// pubkey would turn directory sync into an unbounded social-graph crawler
-/// (darkmatter#687). See [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`].
+/// (mdk#687). See [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`].
 pub(crate) const DIRECTORY_SYNC_KINDS: &[u64] = &[
     KIND_NOSTR_METADATA,
     KIND_NIP65_RELAY_LIST,
@@ -86,7 +86,7 @@ impl DirectorySyncPlan {
     /// `known_user_ids` are every known directory user (including the local
     /// accounts); the non-local subset syncs only [`DIRECTORY_SYNC_KINDS`],
     /// which omits contact lists so transitively discovered users cannot feed
-    /// new kind-3 subscriptions back into the plan (darkmatter#687).
+    /// new kind-3 subscriptions back into the plan (mdk#687).
     pub(crate) fn from_known_users(
         endpoints: Vec<TransportEndpoint>,
         local_account_ids: Vec<String>,

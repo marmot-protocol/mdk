@@ -844,7 +844,7 @@ async fn convergence_rejects_remove_that_leaves_orphan_admin_key() {
 
 #[tokio::test]
 async fn convergence_rejects_remove_whose_context_carries_no_admin_policy_bytes() {
-    // darkmatter#393 / admin-policy-v1.md "Validation": the cross-component
+    // mdk#393 / admin-policy-v1.md "Validation": the cross-component
     // check runs on every commit that changes the member leaf set, whether or
     // not the commit carries admin-policy bytes. Bob's raw commit removes
     // Alice's last member leaf and swaps in GroupContext extensions with no
@@ -1415,7 +1415,7 @@ async fn convergence_rejects_group_context_commit_rewriting_admin_policy_bytes()
     );
 }
 
-/// darkmatter#286: a commit applied through STORED CONVERGENCE that later loses
+/// mdk#286: a commit applied through STORED CONVERGENCE that later loses
 /// a same-epoch fork must (a) attribute its winning-branch group-system rows to
 /// the accepted commit via `origin_commit_id`, and (b) emit
 /// `GroupEvent::CommitRolledBack` for the losing commit so the app can tombstone
@@ -3420,7 +3420,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
     );
 }
 
-/// Regression for darkmatter#144: a future-epoch app message that is
+/// Regression for mdk#144: a future-epoch app message that is
 /// canonicalized as `UndecryptableInCanonicalState` (the retryable case — the
 /// commit advancing the group to the message's epoch has not been selected
 /// yet) must NOT be persisted as the terminal `EpochInvalidated`, and must not

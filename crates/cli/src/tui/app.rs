@@ -3,7 +3,7 @@
 use super::*;
 
 pub(crate) struct TuiApp {
-    pub(crate) client: DmClient,
+    pub(crate) client: WnClient,
     pub(crate) initial_account: Option<String>,
     pub(crate) running: bool,
     pub(crate) focus: Focus,
@@ -32,7 +32,7 @@ pub(crate) struct TuiApp {
 
 impl TuiApp {
     pub(crate) fn new(cli: Cli) -> TuiResult<Self> {
-        let client = DmClient::from_cli(&cli)?;
+        let client = WnClient::from_cli(&cli)?;
         Ok(Self {
             client,
             initial_account: cli.account.clone(),

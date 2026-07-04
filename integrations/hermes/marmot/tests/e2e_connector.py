@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Deterministic Hermes/Marmot E2E using a real ``dm-agent`` process.
+"""Deterministic Hermes/Marmot E2E using a real ``wn-agent`` process.
 
 This harness keeps the agent response deterministic and model-free, but replaces
 the fake agent-control socket from ``e2e_deterministic.py`` with the real
-connector daemon. ``dm-agent`` runs with explicit debug controls enabled so the
+connector daemon. ``wn-agent`` runs with explicit debug controls enabled so the
 test can inject one inbound message and inspect the final send without creating
 real Marmot accounts, groups, relays, or an LLM provider.
 """
@@ -70,14 +70,14 @@ async def wait_for_connector(socket_path: Path, client, proc: asyncio.subprocess
     while asyncio.get_running_loop().time() < deadline:
         if proc.returncode is not None:
             stderr = await read_stream_tail(proc.stderr)
-            raise RuntimeError(f"dm-agent exited before socket was ready:\n{stderr}")
+            raise RuntimeError(f"wn-agent exited before socket was ready:\n{stderr}")
         try:
             await client.request({"type": "debug_recorded_finals"}, request_id=uuid.uuid4().hex)
             return
         except Exception:
             await asyncio.sleep(0.1)
     raise RuntimeError(
-        f"dm-agent socket did not become ready within "
+        f"wn-agent socket did not become ready within "
         f"{CONNECTOR_START_TIMEOUT_SECONDS:.0f}s: {socket_path}"
     )
 
@@ -110,11 +110,11 @@ async def inject_until_final(client) -> list[dict[str, Any]]:
             if sends:
                 return sends
             await asyncio.sleep(0.1)
-    raise AssertionError("Hermes did not produce a recorded final send through dm-agent")
+    raise AssertionError("Hermes did not produce a recorded final send through wn-agent")
 
 
 async def run() -> None:
-    darkmatter_repo = Path(os.environ["DARKMATTER_REPO"])
+    mdk_repo = Path(os.environ["MDK_REPO"])
     plugin_path = Path(os.environ.get("HERMES_HOME", "")) / "plugins" / "marmot" / "adapter.py"
     if not plugin_path.exists():
         raise SystemExit(f"plugin adapter not found: {plugin_path}")
@@ -127,7 +127,7 @@ async def run() -> None:
     with tempfile.TemporaryDirectory(prefix="marmot-hermes-connector-e2e-") as tmp:
         tmp_path = Path(tmp)
         marmot_home = tmp_path / "marmot-home"
-        socket_path = tmp_path / "dm-agent.sock"
+        socket_path = tmp_path / "wn-agent.sock"
         proc = await asyncio.create_subprocess_exec(
             "cargo",
             "run",
@@ -135,14 +135,14 @@ async def run() -> None:
             "-p",
             "agent-connector",
             "--bin",
-            "dm-agent",
+            "wn-agent",
             "--",
             "--home",
             str(marmot_home),
             "--socket",
             str(socket_path),
             "--debug-controls",
-            cwd=str(darkmatter_repo),
+            cwd=str(mdk_repo),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

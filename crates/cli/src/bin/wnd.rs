@@ -3,15 +3,15 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let output = darkmatter_cli::daemon::run_server_from(std::env::args_os()).await;
+    let output = wn_cli::daemon::run_server_from(std::env::args_os()).await;
     if let Err(err) = write_output(&output) {
-        eprintln!("dmd: failed to write command output: {err}");
+        eprintln!("wnd: failed to write command output: {err}");
         return ExitCode::FAILURE;
     }
     exit_code(output.code)
 }
 
-fn write_output(output: &darkmatter_cli::CliOutput) -> std::io::Result<()> {
+fn write_output(output: &wn_cli::CliOutput) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(output.stdout.as_bytes())?;
     stdout.flush()?;

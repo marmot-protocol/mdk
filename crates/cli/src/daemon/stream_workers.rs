@@ -180,7 +180,7 @@ pub(crate) fn new_stream_watch_start(
         },
     } = &cli.command
     else {
-        return Err("background stream watch requires dm stream watch".to_owned());
+        return Err("background stream watch requires wn stream watch".to_owned());
     };
     let group_id = crate::normalize_group_id_hex(group).map_err(|err| err.to_string())?;
     let stream_id = stream_id

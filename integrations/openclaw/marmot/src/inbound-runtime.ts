@@ -1,6 +1,6 @@
 // Inbound runtime wiring + startup allowlist sync.
 //
-// `startMarmotInbound` runs the dm-agent inbound subscription and hands each
+// `startMarmotInbound` runs the wn-agent inbound subscription and hands each
 // mapped message to a real agent dispatcher (no production no-op fallback —
 // consuming inbound without dispatching would silently swallow messages). The
 // dispatcher in `src/dispatch.ts` drives the OpenClaw turn kernel; the plugin
@@ -8,7 +8,7 @@
 // docker `openclaw-gateway` harness (it needs a running gateway + a model).
 //
 // `syncMarmotAllowlist` mirrors the configured `dm.allowFrom` welcomers into
-// dm-agent's per-account allowlist so configured welcomers are accepted.
+// wn-agent's per-account allowlist so configured welcomers are accepted.
 
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
 
@@ -154,7 +154,7 @@ export interface StartMarmotInboundOptions {
   surfaceAmbientEvent?: MarmotAmbientSurfacer;
   /**
    * Invalidate the dispatcher's cached `is_direct` activation fact for one group.
-   * Called when dm-agent reports a `group_state_changed` event so the next
+   * Called when wn-agent reports a `group_state_changed` event so the next
    * unaddressed message in that group re-reads fresh membership instead of a
    * stale cached value. When omitted, the cache is never invalidated from here.
    */
@@ -176,7 +176,7 @@ export interface StartMarmotInboundOptions {
 let inboundActive = false;
 
 /**
- * Run the dm-agent inbound subscription, dispatching each mapped message to
+ * Run the wn-agent inbound subscription, dispatching each mapped message to
  * `dispatch`. Returns a stop function that aborts the loop. Requires a real
  * dispatcher — see the module note.
  */
@@ -382,9 +382,9 @@ export interface SyncAllowlistOptions {
 }
 
 /**
- * Mirror the configured `dm.allowFrom` welcomers into dm-agent's allowlist for
+ * Mirror the configured `dm.allowFrom` welcomers into wn-agent's allowlist for
  * the resolved account. No-op when no allow-from is configured, so a bare
- * deployment does not wipe an allowlist managed directly on dm-agent.
+ * deployment does not wipe an allowlist managed directly on wn-agent.
  */
 export async function syncMarmotAllowlist(
   api: InboundPluginApi,
@@ -404,6 +404,6 @@ export async function syncMarmotAllowlist(
   } catch {
     // Best-effort on startup: account/config resolution or the sync itself can
     // throw; keep it inside the guard so the voided caller can't reject.
-    api.logger.warn("marmot: failed to sync the welcomer allowlist with dm-agent");
+    api.logger.warn("marmot: failed to sync the welcomer allowlist with wn-agent");
   }
 }

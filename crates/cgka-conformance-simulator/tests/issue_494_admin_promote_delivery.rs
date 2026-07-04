@@ -1,4 +1,4 @@
-//! Regression tests for darkmatter#494.
+//! Regression tests for mdk#494.
 //!
 //! After an admin-promote commit, the promoted peer must receive subsequent
 //! messages from the promoter without sending first. Production clients ingest
@@ -90,7 +90,7 @@ async fn alice_promotes_bob_and_sends_three_messages(
     bob.tick_ingest_only().await;
 }
 
-/// darkmatter#494: the fixed app worker retries scheduled convergence when the
+/// mdk#494: the fixed app worker retries scheduled convergence when the
 /// first pass does not settle. The promoted peer must receive all post-promote
 /// messages without sending first.
 #[tokio::test]

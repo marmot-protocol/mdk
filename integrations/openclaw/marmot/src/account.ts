@@ -1,5 +1,5 @@
 // Marmot account selection. Mirrors the Hermes shim's `_ensure_account_id`:
-// when the config does not pin an account and dm-agent hosts exactly one
+// when the config does not pin an account and wn-agent hosts exactly one
 // local-signing account, select it automatically; otherwise require an explicit
 // id. Errors stay privacy-safe (no account ids).
 
@@ -13,7 +13,7 @@ function normalizeHex(value: string): string {
 
 /**
  * Resolve the Marmot agent account id hex to use. Validates a preferred id
- * against dm-agent's account list, or auto-selects the sole local-signing
+ * against wn-agent's account list, or auto-selects the sole local-signing
  * account when none is pinned.
  */
 export async function resolveSingleAccount(
@@ -27,7 +27,7 @@ export async function resolveSingleAccount(
     const wanted = normalizeHex(preferredAccountIdHex);
     const match = accounts.find((account) => normalizeHex(account.account_id_hex) === wanted);
     if (!match) {
-      throw new Error("configured Marmot account is not present on dm-agent");
+      throw new Error("configured Marmot account is not present on wn-agent");
     }
     return match.account_id_hex;
   }
@@ -38,10 +38,10 @@ export async function resolveSingleAccount(
   }
   if (signing.length === 0) {
     throw new Error(
-      "dm-agent has no local-signing Marmot account; run `dm-agent bootstrap` first",
+      "wn-agent has no local-signing Marmot account; run `wn-agent bootstrap` first",
     );
   }
   throw new Error(
-    "dm-agent hosts multiple accounts; set the marmot channel `accountIdHex` (or MARMOT_ACCOUNT_ID_HEX)",
+    "wn-agent hosts multiple accounts; set the marmot channel `accountIdHex` (or MARMOT_ACCOUNT_ID_HEX)",
   );
 }

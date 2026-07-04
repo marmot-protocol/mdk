@@ -319,7 +319,7 @@ fn commit_pending_proposals(
     // OpenMLS proposal store so `commit_to_pending_proposals` can pick it up.
     //
     // The engine no longer leaves an observed proposal in a non-committing
-    // member's live OpenMLS store (darkmatter#154): doing so tripped OpenMLS's
+    // member's live OpenMLS store (mdk#154): doing so tripped OpenMLS's
     // `create_message` PendingProposal guard and blocked all outbound app
     // payloads. The engine never commits received Update proposals by reference
     // (only the SelfRemove auto-committer commits received proposals), so this

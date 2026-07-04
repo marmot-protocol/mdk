@@ -665,7 +665,7 @@ mod tests {
         // A client that streams data without a trailing newline must not be able
         // to make read_frame buffer past the cap. The read-side `.take()` adapter
         // stops at MAX + 1 bytes, so the post-read size check fires deterministically
-        // instead of letting allocation grow unbounded (pre-auth OOM, darkmatter#212).
+        // instead of letting allocation grow unbounded (pre-auth OOM, mdk#212).
         let oversize = MAX_AGENT_CONTROL_FRAME_BYTES + 4096;
         let payload = vec![b'a'; oversize]; // no newline, intentionally over the cap
         let mut reader = BufReader::new(std::io::Cursor::new(payload));

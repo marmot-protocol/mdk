@@ -226,7 +226,7 @@ impl Marmot {
     }
 
     /// Normalize a member reference for group-management UI. Accepts hex,
-    /// `npub`, `nostr:npub...`, and `darkmatter://profile/...` references.
+    /// `npub`, `nostr:npub...`, and `marmot://profile/...` references.
     pub fn normalize_member_ref(&self, member_ref: String) -> Result<MemberRefFfi, MarmotKitError> {
         normalize_member_ref_ffi(&member_ref)
     }
@@ -347,7 +347,7 @@ impl Marmot {
     /// Set the per-group disappearing-message retention, wrapping the engine's
     /// `update_message_retention`. `disappearing_message_secs` of `0` disables
     /// expiry; any positive value is the retention window in seconds. Thin
-    /// passthrough over the already-public engine API (darkmatter#571).
+    /// passthrough over the already-public engine API (mdk#571).
     pub async fn update_message_retention(
         &self,
         account_ref: String,
@@ -610,9 +610,9 @@ impl Marmot {
     }
 
     /// Stored groups that failed session-open hydration and were skipped so the
-    /// rest of the account could open (darkmatter#151 / #417). These groups are
+    /// rest of the account could open (mdk#151 / #417). These groups are
     /// not in the live roster and otherwise vanish from the account with no
-    /// explanation; surface them in a per-group recovery flow (darkmatter#426)
+    /// explanation; surface them in a per-group recovery flow (mdk#426)
     /// distinct from healthy and archived groups, using `reason` to pick the
     /// per-reason guidance, and offer
     /// [`Self::retry_hydrate_quarantined_group`].
@@ -624,7 +624,7 @@ impl Marmot {
         Ok(groups.into_iter().map(Into::into).collect())
     }
 
-    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    /// Re-attempt hydration of a single quarantined group (mdk#426).
     ///
     /// Non-destructive, user-initiated recovery for a transiently-bad group
     /// (e.g. a partial DB restore that has since completed). Returns `true` if
@@ -730,7 +730,7 @@ mod tests {
         // "member absent" via error-variant differences (membership-existence
         // oracle). Both promote and demote must short-circuit on caller admin
         // status before resolving the target, even for a ref that is not in the
-        // group (darkmatter#667).
+        // group (mdk#667).
         let group_id_hex = "01".repeat(32);
         let absent_member = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9";
 

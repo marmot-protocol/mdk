@@ -5,7 +5,7 @@ use marmot_app::MarmotApp;
 use serde_json::json;
 
 use crate::{
-    CommandOutput, DebugCommand, DmError, npub_for_account_id, relay_lists_json, resolve_account,
+    CommandOutput, DebugCommand, WnError, npub_for_account_id, relay_lists_json, resolve_account,
     unsupported_command,
 };
 
@@ -14,7 +14,7 @@ pub(crate) fn debug_command(
     app: &MarmotApp,
     command: DebugCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         DebugCommand::RelayControlState => {
             let accounts = account_home.accounts()?;
@@ -31,7 +31,7 @@ pub(crate) fn debug_command(
                         "relay_lists": relay_lists,
                     }))
                 })
-                .collect::<Result<Vec<_>, DmError>>()?;
+                .collect::<Result<Vec<_>, WnError>>()?;
             Ok(CommandOutput {
                 plain: serde_json::to_string_pretty(&statuses)
                     .expect("JSON response serialization cannot fail"),

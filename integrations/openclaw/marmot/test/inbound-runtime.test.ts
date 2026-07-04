@@ -412,7 +412,7 @@ describe("syncMarmotAllowlist", () => {
     return { client, added, removed };
   }
 
-  it("mirrors configured dm.allowFrom into the dm-agent allowlist", async () => {
+  it("mirrors configured dm.allowFrom into the wn-agent allowlist", async () => {
     const { client, added } = allowlistStubClient([]);
     const api: InboundPluginApi = {
       config: { channels: { marmot: { dm: { allowFrom: [HEX32("11")] } } } },

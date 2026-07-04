@@ -3,7 +3,7 @@
 # touching your normal OpenClaw home. Mirrors scripts/hermes_marmot_dev_setup.sh.
 #
 # It builds the plugin, prepares an isolated dev root + env, and generates helper
-# scripts to run dm-agent and the OpenClaw gateway against it.
+# scripts to run wn-agent and the OpenClaw gateway against it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,11 +64,11 @@ RELAY_ARGS=()
 for relay in "${RELAYS[@]}"; do RELAY_ARGS+=(--relay "$relay"); done
 QUIC_CSV="$(IFS=,; echo "${QUIC_CANDIDATES[*]:-}")"
 
-SOCKET_PATH="$MARMOT_HOME/dev/dm-agent.sock"
-DM_AGENT_EXTRA=()
-[ -n "$AUTH_TOKEN_FILE" ] && DM_AGENT_EXTRA+=(--auth-token-file "$AUTH_TOKEN_FILE")
-[ -n "$SOCKET_DIR_MODE" ] && DM_AGENT_EXTRA+=(--socket-dir-mode "$SOCKET_DIR_MODE")
-[ -n "$SOCKET_MODE" ] && DM_AGENT_EXTRA+=(--socket-mode "$SOCKET_MODE")
+SOCKET_PATH="$MARMOT_HOME/dev/wn-agent.sock"
+WN_AGENT_EXTRA=()
+[ -n "$AUTH_TOKEN_FILE" ] && WN_AGENT_EXTRA+=(--auth-token-file "$AUTH_TOKEN_FILE")
+[ -n "$SOCKET_DIR_MODE" ] && WN_AGENT_EXTRA+=(--socket-dir-mode "$SOCKET_DIR_MODE")
+[ -n "$SOCKET_MODE" ] && WN_AGENT_EXTRA+=(--socket-mode "$SOCKET_MODE")
 
 cat > "$ROOT/env.sh" <<ENV
 # Source this to configure the OpenClaw Marmot dev environment.
@@ -80,15 +80,21 @@ export MARMOT_QUIC_CANDIDATES="$QUIC_CSV"
 ${AUTH_TOKEN_FILE:+export MARMOT_AGENT_AUTH_TOKEN_FILE="$AUTH_TOKEN_FILE"}
 ENV
 
-cat > "$ROOT/run-dm-agent.sh" <<RUN
+# Bake the args shell-quoted so paths/tokens with spaces survive the wrapper.
+RELAY_ARGS_QUOTED="$(printf '%q ' "${RELAY_ARGS[@]}")"
+WN_AGENT_EXTRA_QUOTED=""
+if [ "${#WN_AGENT_EXTRA[@]}" -gt 0 ]; then
+    WN_AGENT_EXTRA_QUOTED="$(printf '%q ' "${WN_AGENT_EXTRA[@]}")"
+fi
+
+cat > "$ROOT/run-wn-agent.sh" <<RUN
 #!/usr/bin/env bash
 set -euo pipefail
-exec cargo run -p agent-connector --bin dm-agent -- \\
+exec cargo run -p agent-connector --bin wn-agent -- \\
   --home "$MARMOT_HOME" \\
-  ${RELAY_ARGS[*]} \\
-  ${DM_AGENT_EXTRA[*]:-}
+  $RELAY_ARGS_QUOTED$WN_AGENT_EXTRA_QUOTED
 RUN
-chmod +x "$ROOT/run-dm-agent.sh"
+chmod +x "$ROOT/run-wn-agent.sh"
 
 cat > "$ROOT/run-openclaw-gateway.sh" <<RUN
 #!/usr/bin/env bash
@@ -110,8 +116,8 @@ RUN
 chmod +x "$ROOT/smoke-plugin.sh"
 
 echo "openclaw-marmot dev setup ready under: $ROOT"
-echo "  1. start dm-agent:        $ROOT/run-dm-agent.sh"
-echo "  2. bootstrap the account: cargo run -p agent-connector --bin dm-agent -- bootstrap --home '$MARMOT_HOME' --qr"
+echo "  1. start wn-agent:        $ROOT/run-wn-agent.sh"
+echo "  2. bootstrap the account: cargo run -p agent-connector --bin wn-agent -- bootstrap --home '$MARMOT_HOME' --qr"
 echo "  3. run the gateway:       $ROOT/run-openclaw-gateway.sh"
 if [ "$PRINT_ENV" -eq 1 ]; then
     echo "$ROOT/env.sh"

@@ -710,7 +710,7 @@ async fn handle_account_worker_command(
                 // subscribers see the typed recovery event
                 // deterministically at retry time rather than only
                 // when unrelated relay traffic later triggers a
-                // drain (darkmatter#426). Publish those events plus a
+                // drain (mdk#426). Publish those events plus a
                 // `GroupStateUpdated` so chat-list / projection
                 // consumers refresh and the group leaves the recovery
                 // surface and reappears as a normal chat.
@@ -1255,7 +1255,7 @@ fn account_worker_reconnect_jitter() -> Duration {
 const DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 /// Extra delay beyond the engine quiescence window before the first scheduled
 /// convergence tick fires. Avoids off-by-one-ms races where the timer fires
-/// while `ConvergenceStatus` is still `Syncing` (darkmatter#494).
+/// while `ConvergenceStatus` is still `Syncing` (mdk#494).
 const CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS: u64 = 100;
 const IDLE_CONVERGENCE_TIMER_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const MIN_CONVERGENCE_SETTLEMENT_DELAY: Duration = Duration::from_millis(10);
@@ -1491,7 +1491,7 @@ fn agent_stream_runtime_event(
 
 /// Build a [`RuntimeAccountError`] message from a static prefix and the
 /// error's privacy-safe kind. These messages leave the runtime: the CLI daemon
-/// persists them into `dm daemon status --json` and the TUI, and host apps may
+/// persists them into `wn daemon status --json` and the TUI, and host apps may
 /// log them. Never interpolate the raw error — `AppError::Transport` Display
 /// can embed relay URLs, which the privacy invariant forbids surfacing.
 fn account_error_message(prefix: &str, err: &AppError) -> String {
@@ -1523,7 +1523,7 @@ mod tests {
     fn account_error_message_never_carries_transport_error_detail() {
         // Transport errors commonly embed relay URLs (nostr-sdk error strings,
         // per-endpoint failure reasons). RuntimeAccountError messages are
-        // persisted into `dm daemon status --json` and host surfaces, so only
+        // persisted into `wn daemon status --json` and host surfaces, so only
         // the stable privacy-safe kind may appear.
         let err = AppError::Transport(cgka_traits::TransportAdapterError::Publish(
             "connect relay: wss://private-relay.example".to_owned(),

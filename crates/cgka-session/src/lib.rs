@@ -247,7 +247,7 @@ impl AccountDeviceSession {
     ///
     /// Used by the account orchestration layer to prune the private bundle
     /// persisted by `fresh_key_package` when publication fails, so a retrying
-    /// app does not accumulate orphaned private key material (darkmatter#160).
+    /// app does not accumulate orphaned private key material (mdk#160).
     pub async fn delete_key_package(
         &mut self,
         key_package: &KeyPackage,
@@ -271,8 +271,8 @@ impl AccountDeviceSession {
     }
 
     /// Stored groups that failed session-open hydration and were skipped
-    /// (darkmatter#151 / #417), paired with their coarse quarantine reason.
-    /// Backs the application's per-group recovery surface (darkmatter#426).
+    /// (mdk#151 / #417), paired with their coarse quarantine reason.
+    /// Backs the application's per-group recovery surface (mdk#426).
     pub fn quarantined_groups(&self) -> Vec<(GroupId, GroupHydrationQuarantineReason)> {
         self.engine.quarantined_groups()
     }

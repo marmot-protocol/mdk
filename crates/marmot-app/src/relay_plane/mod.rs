@@ -206,7 +206,7 @@ impl MarmotRelayPlane {
         // `created_at`; a far-future value would push `since` past the present,
         // so relays return no present-dated events and reception silently halts
         // forever (the cursor is persisted and monotonic, so it survives
-        // restarts — darkmatter#182).
+        // restarts — mdk#182).
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -397,7 +397,7 @@ impl MarmotRelayPlane {
         // active) is keyed on the same canonical-hex authors and kinds the SDK
         // subscription is issued with, so a live notification is only forwarded
         // into the directory cache when it matches an active subscription's
-        // requested authors and kinds (darkmatter#709).
+        // requested authors and kinds (mdk#709).
         let mut desired = HashMap::with_capacity(plan.batches.len());
         for batch in &plan.batches {
             let authors = batch
@@ -628,7 +628,7 @@ fn spawn_relay_notification_forwarder(
                                 // gated, so an unsolicited or filter-mismatched
                                 // event from a malicious or buggy relay cannot
                                 // create persistent directory search-graph writes
-                                // (darkmatter#709).
+                                // (mdk#709).
                                 let _ = adapter.handle_relay_event(relay_event).await;
                                 if directory
                                     .accepts_live_event(

@@ -5,15 +5,15 @@ use marmot_app::{
     RelayDeliveryStats, RelayLatencyStats, RelaySyncSnapshot, RelayTelemetrySnapshot,
 };
 
-use crate::{CommandOutput, DmError};
+use crate::{CommandOutput, WnError};
 
-pub(crate) async fn relay_stats_command(app: &MarmotApp) -> Result<CommandOutput, DmError> {
+pub(crate) async fn relay_stats_command(app: &MarmotApp) -> Result<CommandOutput, WnError> {
     relay_stats_output(app.relay_telemetry().await)
 }
 
 pub(crate) async fn relay_stats_command_with_runtime(
     runtime: &MarmotAppRuntime,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     relay_stats_output(
         runtime
             .shared_services()
@@ -25,7 +25,7 @@ pub(crate) async fn relay_stats_command_with_runtime(
 
 pub(crate) fn relay_stats_output(
     snapshot: RelayTelemetrySnapshot,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let json = serde_json::to_value(&snapshot)?;
     Ok(CommandOutput {
         plain: relay_stats_plain(&snapshot),

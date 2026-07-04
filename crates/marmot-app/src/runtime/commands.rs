@@ -94,8 +94,8 @@ impl AccountManager {
     }
 
     /// Stored groups that failed session-open hydration and were skipped
-    /// (darkmatter#151 / #417). Backs the per-group recovery surface
-    /// (darkmatter#426).
+    /// (mdk#151 / #417). Backs the per-group recovery surface
+    /// (mdk#426).
     pub async fn quarantined_groups(
         &self,
         account_ref: &str,
@@ -109,7 +109,7 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
-    /// Re-attempt hydration of a single quarantined group (darkmatter#426).
+    /// Re-attempt hydration of a single quarantined group (mdk#426).
     /// `Ok(true)` if it recovered and is now live, `Ok(false)` if still
     /// unhealthy. On success the recovered group is refreshed in chat-list
     /// projections.
@@ -121,7 +121,7 @@ impl AccountManager {
     /// catch-up must NOT turn an already-successful recovery into `Err` (that
     /// would make the UI show a failed retry for a group that is in fact live).
     /// A catch-up failure here just means the recovered group will sync on the
-    /// next normal sync cycle; it is logged, not surfaced. (darkmatter#441
+    /// next normal sync cycle; it is logged, not surfaced. (mdk#441
     /// finding 2.)
     pub async fn retry_hydrate_quarantined_group(
         &self,
@@ -175,7 +175,7 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
-    /// See `MarmotApp::reveal_nsec`. darkmatter#543. Reads from the keystore
+    /// See `MarmotApp::reveal_nsec`. mdk#543. Reads from the keystore
     /// directly; does not require a running account worker. `caller_context` is
     /// the privacy-safe surface label recorded in the reveal audit entry.
     pub fn reveal_nsec(
@@ -186,7 +186,7 @@ impl AccountManager {
         self.app.reveal_nsec(account_ref, caller_context)
     }
 
-    /// See `MarmotApp::export_encrypted_secret_key`. darkmatter#544. Reads from
+    /// See `MarmotApp::export_encrypted_secret_key`. mdk#544. Reads from
     /// the keystore directly; does not require a running account worker.
     /// `caller_context` is the privacy-safe surface label recorded in the export
     /// audit entry.
@@ -385,7 +385,7 @@ impl AccountManager {
         // Prefer the account worker so its authoritative in-memory
         // `AccountState` is updated in place; otherwise a later inbound
         // delivery would re-persist the stale `archived = false` snapshot and
-        // silently un-archive the chat (darkmatter#178).
+        // silently un-archive the chat (mdk#178).
         //
         // Only a non-local-signing (public-only) account can never own a
         // long-lived worker, so its direct persistence write is safe: there is

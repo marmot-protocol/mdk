@@ -1,8 +1,8 @@
 // Outbound message adapter (durable kind-9 sends) for the OpenClaw channel.
 //
 // Built with the current `openclaw/plugin-sdk/channel-outbound` message
-// lifecycle: `send.text` is the durable final path and maps onto dm-agent's
-// `send_final`; `send.media` maps onto dm-agent's `send_media`. Live QUIC
+// lifecycle: `send.text` is the durable final path and maps onto wn-agent's
+// `send_final`; `send.media` maps onto wn-agent's `send_media`. Live QUIC
 // previews are layered on separately via the finalizable-live-preview adapter
 // (see src/live.ts) and are only declared as capabilities once backed by
 // contract tests.
@@ -34,7 +34,7 @@ export interface ResolvedMarmotTarget {
 
 export interface MarmotMessageAdapterDeps {
   /**
-   * Resolve the dm-agent client and the Marmot agent account for an outbound
+   * Resolve the wn-agent client and the Marmot agent account for an outbound
    * send. `accountId` is OpenClaw's per-account id; `cfg` is the gateway config.
    */
   resolveTarget: (
@@ -46,14 +46,14 @@ export interface MarmotMessageAdapterDeps {
   writeTempMedia?: (fileName: string, bytes: Buffer) => Promise<string>;
 }
 
-/** Build an OpenClaw `MessageReceipt` from dm-agent's durable message ids. */
+/** Build an OpenClaw `MessageReceipt` from wn-agent's durable message ids. */
 export function receiptFromMessageIds(
   messageIdsHex: string[],
   nowMs: number,
   kind: MessageReceiptPart["kind"] = "text",
 ): MessageReceipt {
   if (messageIdsHex.length === 0) {
-    throw new Error("dm-agent send returned no durable message ids");
+    throw new Error("wn-agent send returned no durable message ids");
   }
   const parts: MessageReceiptPart[] = messageIdsHex.map((id, index) => ({
     platformMessageId: id,
@@ -118,7 +118,7 @@ export class SentMessageTargetCache {
 
 // --- outbound media resolution (Seam 2) -------------------------------------
 
-/** Map a file extension onto a best-effort MIME type; dm-agent re-detects from bytes. */
+/** Map a file extension onto a best-effort MIME type; wn-agent re-detects from bytes. */
 function mimeFromExtension(fileName: string): string {
   const ext = extname(fileName).toLowerCase();
   switch (ext) {
@@ -252,7 +252,7 @@ async function defaultWriteTempMedia(fileName: string, bytes: Buffer): Promise<s
 
 /**
  * Define the Marmot channel message adapter. The durable text send routes to
- * dm-agent `send_final`; the media send routes to `send_media`. The chat id
+ * wn-agent `send_final`; the media send routes to `send_media`. The chat id
  * (`ctx.to`) is the Marmot group id hex and `ctx.replyToId` is a durable
  * message id hex. Every durable send records its returned ids in
  * {@link SentMessageTargetCache} so a later delete can be routed.
@@ -270,7 +270,7 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
    * exposed here so the cache + lookup is ready to wire.
    *
    * `resolveCtx` carries the delete action's own routing context (`cfg` +
-   * `accountId`) so the dm-agent client is resolved for the correct account in a
+   * `accountId`) so the wn-agent client is resolved for the correct account in a
    * multi-account deployment, rather than defaulting to whatever account a
    * context-free resolve would pick.
    */
@@ -313,7 +313,7 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
         const resolved = await resolveOutboundMediaUpload(ctx, writeTempMedia);
         if (!resolved) {
           throw new Error(
-            "marmot: outbound media has no local path; dm-agent send_media needs a file path",
+            "marmot: outbound media has no local path; wn-agent send_media needs a file path",
           );
         }
         try {

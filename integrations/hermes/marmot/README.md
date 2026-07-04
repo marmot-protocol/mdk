@@ -1,7 +1,7 @@
 # Hermes Marmot Plugin
 
-This directory is a Hermes platform plugin for the local `dm-agent` connector.
-Hermes runs the agent and tools. `dm-agent` owns the Marmot account, MLS state,
+This directory is a Hermes platform plugin for the local `wn-agent` connector.
+Hermes runs the agent and tools. `wn-agent` owns the Marmot account, MLS state,
 Nostr transport, final encrypted sends, and QUIC live-preview stream records.
 
 For a real Hermes install, install it by copying or symlinking this directory to:
@@ -16,37 +16,37 @@ adapter implementation files.
 
 ## Release Install (Hermes Already Installed)
 
-Versioned `dm-agent` builds and the Hermes plugin are published as
-[`dm-agent-v*`](https://github.com/marmot-protocol/darkmatter/releases) GitHub
+Versioned `wn-agent` builds and the Hermes plugin are published as
+[`wn-agent-v*`](https://github.com/marmot-protocol/mdk/releases) GitHub
 pre-releases.
 
 Prerequisites:
 
 - Hermes Agent installed and working locally
-- Dark Matter phone app pointed at the same public relay set
+- White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 One-line install:
 
 ```sh
-DM_AGENT_VERSION=0.2.0
-curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash
+WN_AGENT_VERSION=0.2.0
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
 Install and bootstrap in one step:
 
 ```sh
-DM_AGENT_VERSION=0.2.0
-curl -fsSL "https://github.com/marmot-protocol/darkmatter/releases/download/dm-agent-v${DM_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
+WN_AGENT_VERSION=0.2.0
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
 ```
 
 Use the exact release version when reporting bugs:
 
 ```sh
-dm-agent --version
+wn-agent --version
 ```
 
-The installer puts `dm-agent` in `~/.local/bin`, extracts the plugin to
+The installer puts `wn-agent` in `~/.local/bin`, extracts the plugin to
 `~/.hermes/plugins/marmot`, and runs `hermes plugins enable marmot` when the
 `hermes` launcher is on `PATH`.
 
@@ -59,11 +59,11 @@ After a normal install, start the connector and bootstrap the agent account:
 export MARMOT_HOME="$HOME/.marmot-agent"
 export PATH="$HOME/.local/bin:$PATH"
 
-dm-agent --home "$MARMOT_HOME" \
+wn-agent --home "$MARMOT_HOME" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
-dm-agent bootstrap --home "$MARMOT_HOME" --qr
+wn-agent bootstrap --home "$MARMOT_HOME" --qr
 hermes gateway run
 ```
 
@@ -84,11 +84,11 @@ The setup script creates these paths under that root:
 
 - `hermes-agent` for the isolated Hermes checkout.
 - `hermes-home` for isolated Hermes state.
-- `marmot-agent-home` for isolated `dm-agent` state.
+- `marmot-agent-home` for isolated `wn-agent` state.
 - `hermes-home/plugins/marmot` as a symlink back to this plugin directory.
 - helper scripts: `smoke-plugin.sh`, `e2e-deterministic.sh`,
   `e2e-connector.sh`, `bootstrap-agent.sh`,
-  `run-dm-agent.sh`, `run-hermes-gateway.sh`, `start-dm-agent.sh`,
+  `run-wn-agent.sh`, `run-hermes-gateway.sh`, `start-wn-agent.sh`,
   `start-hermes-gateway.sh`, and `stop-dev-processes.sh`.
 
 When Hermes is installed, the setup script also runs `hermes plugins enable
@@ -110,7 +110,7 @@ just hermes-dev-setup \
   --quic-candidate quic://quic-broker.ipf.dev:4450 \
   --print-env
 
-# Use a token-gated local control socket for a group-shared Hermes/dm-agent setup.
+# Use a token-gated local control socket for a group-shared Hermes/wn-agent setup.
 openssl rand -hex 32 > /tmp/hermes-marmot-control.token
 chmod 0600 /tmp/hermes-marmot-control.token
 just hermes-dev-setup --auth-token-file /tmp/hermes-marmot-control.token --socket-dir-mode 0770 --socket-mode 0660 --print-env
@@ -129,8 +129,8 @@ just hermes-dev-e2e-deterministic
 ```
 
 This test uses the real Hermes platform base and the real Marmot plugin, but it
-uses a fake `dm-agent` socket and a fixed handler response. It does not need a
-Marmot account, a running `dm-agent`, or a model.
+uses a fake `wn-agent` socket and a fixed handler response. It does not need a
+Marmot account, a running `wn-agent`, or a model.
 
 Run the deterministic connector E2E:
 
@@ -138,15 +138,15 @@ Run the deterministic connector E2E:
 just hermes-dev-e2e-connector
 ```
 
-This test starts a real `dm-agent` process with debug controls enabled, injects
+This test starts a real `wn-agent` process with debug controls enabled, injects
 one inbound message through its local control socket, and verifies the fixed
-Hermes response is sent back through `dm-agent`.
+Hermes response is sent back through `wn-agent`.
 
 Run the services in foreground terminals:
 
 ```sh
 source "${HERMES_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/hermes-marmot-test}/env.sh"
-"$HERMES_MARMOT_DEV_ROOT/run-dm-agent.sh"
+"$HERMES_MARMOT_DEV_ROOT/run-wn-agent.sh"
 "$HERMES_MARMOT_DEV_ROOT/run-hermes-gateway.sh"
 ```
 
@@ -154,7 +154,7 @@ Or run them in the background with logs under `/tmp/hermes-marmot-test/logs`:
 
 ```sh
 source "${HERMES_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/hermes-marmot-test}/env.sh"
-"$HERMES_MARMOT_DEV_ROOT/start-dm-agent.sh"
+"$HERMES_MARMOT_DEV_ROOT/start-wn-agent.sh"
 "$HERMES_MARMOT_DEV_ROOT/start-hermes-gateway.sh"
 "$HERMES_MARMOT_DEV_ROOT/stop-dev-processes.sh"
 ```
@@ -167,8 +167,8 @@ just hermes-dev-teardown --force
 
 ## Docker Phone Test
 
-The repo has a Compose profile for the dedicated-computer phone test. It builds a container with `dm-agent`, Hermes,
-the Marmot plugin, and `qrencode` for terminal QR output. Run these commands on the host from the Dark Matter repo root.
+The repo has a Compose profile for the dedicated-computer phone test. It builds a container with `wn-agent`, Hermes,
+the Marmot plugin, and `qrencode` for terminal QR output. Run these commands on the host from the MDK repo root.
 They start or exec into the container for you. The container uses the pilot public relays and broker:
 
 ```sh
@@ -216,7 +216,7 @@ Hermes in the first agent-stream start message. Run logs in another terminal whi
 just hermes-phone-test-logs
 ```
 
-For this manual test the container starts `dm-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
+For this manual test the container starts `wn-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
 without knowing the phone account id ahead of time. Use an explicit allowlist for a real deployment.
 
 In the phone-test container, `MARMOT_PROFILE_NAME_ONBOARDING=1` makes the Marmot Hermes adapter ask on the first
@@ -241,7 +241,7 @@ just hermes-phone-test-reset
 Start the connector first with the same public Nostr relay set the phone uses:
 
 ```sh
-cargo run -p agent-connector --bin dm-agent -- \
+cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
@@ -250,7 +250,7 @@ cargo run -p agent-connector --bin dm-agent -- \
 Bootstrap or reuse the agent account through the running connector:
 
 ```sh
-dm-agent bootstrap \
+wn-agent bootstrap \
   --home ~/.marmot-agent \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
@@ -266,11 +266,11 @@ export MARMOT_QUIC_CANDIDATES="quic://quic-broker.ipf.dev:4450"
 ```
 
 `MARMOT_AGENT_SOCKET` can override the socket path. If it is not set, the plugin
-uses `$MARMOT_HOME/dev/dm-agent.sock`. If `MARMOT_ACCOUNT_ID_HEX` is omitted and
-`dm-agent` has exactly one local account, the adapter selects it automatically.
+uses `$MARMOT_HOME/dev/wn-agent.sock`. If `MARMOT_ACCOUNT_ID_HEX` is omitted and
+`wn-agent` has exactly one local account, the adapter selects it automatically.
 
 The default control socket is same-UID only: parent directory `0700`, socket
-`0600`, no TCP listener. If Hermes and `dm-agent` run as different local service
+`0600`, no TCP listener. If Hermes and `wn-agent` run as different local service
 users, use a token file and group-readable socket modes:
 
 ```sh
@@ -278,7 +278,7 @@ install -d -m 0750 ~/.marmot-agent
 openssl rand -hex 32 > ~/.marmot-agent/control.token
 chmod 0600 ~/.marmot-agent/control.token
 
-cargo run -p agent-connector --bin dm-agent -- \
+cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
@@ -304,15 +304,15 @@ members) always reply.
 ### Welcomer allowlist
 
 On connect, `MARMOT_WELCOMER_ALLOWLIST` (or `MARMOT_DM_ALLOW_FROM`) mirrors
-configured hex account ids into `dm-agent`'s welcomer allowlist so approved
+configured hex account ids into `wn-agent`'s welcomer allowlist so approved
 inviters are accepted. Non-hex entries are ignored. When unset, the adapter
-does not touch an allowlist managed directly on `dm-agent`.
+does not touch an allowlist managed directly on `wn-agent`.
 
 ### Media trust model
 
-Inbound attachments are downloaded through `dm-agent`, re-staged under
+Inbound attachments are downloaded through `wn-agent`, re-staged under
 `$MARMOT_HOME/dev/inbound-media` (override with `MARMOT_INBOUND_MEDIA_DIR`),
-and the dm-agent temp file is removed. Outbound local-path sends must stay
+and the wn-agent temp file is removed. Outbound local-path sends must stay
 within `MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory).
 
 ## Behavior

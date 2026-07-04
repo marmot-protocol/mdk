@@ -17,7 +17,7 @@ describe("resolveMarmotAccount", () => {
       MARMOT_ACCOUNT_ID_HEX: "aa",
       MARMOT_QUIC_CANDIDATES: "quic://a:1, quic://b:2",
     }));
-    expect(resolved.socketPath).toBe("/home/agent/.marmot/dev/dm-agent.sock");
+    expect(resolved.socketPath).toBe("/home/agent/.marmot/dev/wn-agent.sock");
     expect(resolved.marmotAccountIdHex).toBe("aa");
     expect(resolved.quicCandidates).toEqual(["quic://a:1", "quic://b:2"]);
     expect(resolved.streamMode).toBe("block");
@@ -102,7 +102,7 @@ describe("resolveMarmotAccount", () => {
 
   it("derives the socket path from MARMOT_HOME", () => {
     const resolved = resolveMarmotAccount(undefined, null, deps({ MARMOT_HOME: "/data/agent" }));
-    expect(resolved.socketPath).toBe("/data/agent/dev/dm-agent.sock");
+    expect(resolved.socketPath).toBe("/data/agent/dev/wn-agent.sock");
   });
 
   it("reads the auth token from a (~-expanded) file when no inline token is set", () => {

@@ -59,7 +59,7 @@ backend on the same rail.
 
 - **File:** `pending_commit_recovery.rs`
   - **Owns:** Crash-during-publish recovery at session open — `hydrate_stable_groups_from_storage` detects a surviving
-    `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (darkmatter#150)
+    `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open

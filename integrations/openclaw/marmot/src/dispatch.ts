@@ -505,7 +505,7 @@ function matchesMentionPattern(text: string, patterns: string[]): boolean {
  * (the group has exactly two members → effective DM → always reply) only changes
  * when membership changes, so it is cached after the first lookup and reused for
  * every subsequent unaddressed message in that group. The inbound runtime
- * invalidates an entry when dm-agent reports a `group_state_changed` event for
+ * invalidates an entry when wn-agent reports a `group_state_changed` event for
  * the group (membership/admin/rename/avatar), so the next unaddressed message
  * re-reads fresh membership. Keyed on `${accountIdHex}:${groupIdHex}`; both are
  * already lowercase hex (the client normalizes them), and neither the key nor
@@ -598,13 +598,13 @@ function inboundMediaKind(mediaType: string): NonNullable<InboundMediaFacts["kin
 }
 
 /**
- * Best-effort: download each inbound media ref to a local path on the dm-agent
+ * Best-effort: download each inbound media ref to a local path on the wn-agent
  * host, then re-stage the decrypted bytes through OpenClaw's official media store
  * so the resulting path is under an allowlisted media root. Native vision trusts
  * the path directly, but the agent's `image` tool enforces an allowlist
  * (`assertLocalMediaAllowed`) whose roots are OpenClaw's media dir — the raw
- * dm-agent temp path is not under them, so the tool would reject it. Building the
- * `InboundMediaFacts` from the staged path keeps both paths working. The dm-agent
+ * wn-agent temp path is not under them, so the tool would reject it. Building the
+ * `InboundMediaFacts` from the staged path keeps both paths working. The wn-agent
  * temp file is unlinked (best-effort) once re-staged. A ref that fails is skipped
  * (privacy-safe log) so one broken attachment never drops the whole turn. Returns
  * `undefined` when the message carries no media so the context builder omits the
@@ -621,7 +621,7 @@ async function downloadInboundMedia(
   }
   const facts: InboundMediaFacts[] = [];
   for (const ref of refs) {
-    // Captured so the dm-agent temp file is unlinked even if readFile or
+    // Captured so the wn-agent temp file is unlinked even if readFile or
     // saveMediaBuffer throws after a successful download.
     let tempPath: string | undefined;
     try {
@@ -638,7 +638,7 @@ async function downloadInboundMedia(
     } catch {
       log?.("marmot: inbound media download failed; skipping attachment");
     } finally {
-      // The dm-agent temp file is redundant once re-staged (or unusable on a
+      // The wn-agent temp file is redundant once re-staged (or unusable on a
       // mid-stage failure); drop it (best-effort).
       if (tempPath !== undefined) {
         await unlink(tempPath).catch(() => undefined);
@@ -686,7 +686,7 @@ export function createMarmotInboundDispatcher(
     });
 
     // Surface any inbound encrypted media to the agent: download each ref to a
-    // local path (dm-agent decrypts; the content key never leaves it) and hand
+    // local path (wn-agent decrypts; the content key never leaves it) and hand
     // the local file facts to OpenClaw, which reads + base64-encodes them.
     const media = await downloadInboundMedia(deps.client, message, deps.log);
 

@@ -6,7 +6,7 @@ The engine crate proves local engine rules. This crate asks the bigger question:
 the network behaves badly, do they still end up with the same group state?
 
 The simulator does not use real relays. It runs `Engine<SqliteAccountStorage>` clients against a deterministic in-memory
-`TransportBus`, using in-memory SQLite by default. Set `DARKMATTER_CONFORMANCE_SQLITE_STORAGE=file` to run harness
+`TransportBus`, using in-memory SQLite by default. Set `MDK_CONFORMANCE_SQLITE_STORAGE=file` to run harness
 clients on temporary encrypted SQLite files. Transport wrapping still goes through the real Nostr peeler, so group
 messages use the Marmot kind-445 envelope and welcomes use NIP-59 gift wraps before the bus delivers them.
 

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::relay_lists_json;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum DmError {
+pub(crate) enum WnError {
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
     #[error(transparent)]
@@ -39,7 +39,7 @@ pub(crate) enum DmError {
     MissingRelay,
     #[error("no account selected")]
     MissingAccount,
-    #[error("multiple accounts exist; pass --account or set DM_ACCOUNT")]
+    #[error("multiple accounts exist; pass --account or set WN_ACCOUNT")]
     MultipleAccounts,
     #[error("account not found: {0}")]
     UnknownLocalAccount(String),
@@ -76,9 +76,9 @@ pub(crate) enum DmError {
     ConflictingStreamTrust,
     #[error("--insecure-local is only allowed for loopback QUIC endpoints, got {0}")]
     InsecureLocalRequiresLoopback(SocketAddr),
-    #[error("messages subscribe requires the daemon; start it with `dm daemon start`")]
+    #[error("messages subscribe requires the daemon; start it with `wn daemon start`")]
     MessagesSubscribeRequiresDaemon,
-    #[error("chats subscribe requires the daemon; start it with `dm daemon start`")]
+    #[error("chats subscribe requires the daemon; start it with `wn daemon start`")]
     ChatsSubscribeRequiresDaemon,
     #[error("login requires --nsec-stdin or an npub identity")]
     MissingLoginIdentity,
@@ -129,9 +129,9 @@ pub(crate) enum DmError {
     },
 }
 
-pub(crate) fn dm_error_json(err: &DmError) -> Value {
+pub(crate) fn wn_error_json(err: &WnError) -> Value {
     match err {
-        DmError::MissingRelayLists(missing, status) => json!({
+        WnError::MissingRelayLists(missing, status) => json!({
             "code": "missing_relay_lists",
             "message": "account is missing required relay lists",
             "missing": missing.iter().map(|k| k.token()).collect::<Vec<_>>(),
@@ -141,7 +141,7 @@ pub(crate) fn dm_error_json(err: &DmError) -> Value {
                 "publish_missing": "--publish-missing-relay-lists",
             },
         }),
-        DmError::ReplaceableListInconclusive {
+        WnError::ReplaceableListInconclusive {
             list,
             account_id,
             source_relays,
@@ -155,7 +155,7 @@ pub(crate) fn dm_error_json(err: &DmError) -> Value {
                 "retry_with_relay": "--relay <relay-that-has-the-current-list>",
             },
         }),
-        DmError::MessagePaginationCursorMismatch {
+        WnError::MessagePaginationCursorMismatch {
             timestamp_flag,
             message_id_flag,
         } => json!({
@@ -167,15 +167,15 @@ pub(crate) fn dm_error_json(err: &DmError) -> Value {
                 "supply_both": format!("pass {timestamp_flag} and {message_id_flag} together"),
             },
         }),
-        DmError::MessagePaginationConflictingCursors => json!({
+        WnError::MessagePaginationConflictingCursors => json!({
             "code": "message_pagination_conflicting_cursors",
             "message": err.to_string(),
         }),
-        DmError::EmptyProfileUpdate => json!({
+        WnError::EmptyProfileUpdate => json!({
             "code": "empty_profile_update",
             "message": err.to_string(),
         }),
-        DmError::ProfileUpdateInconclusive {
+        WnError::ProfileUpdateInconclusive {
             account_id,
             source_relays,
         } => json!({
@@ -187,203 +187,203 @@ pub(crate) fn dm_error_json(err: &DmError) -> Value {
                 "retry_with_relay": "--relay <relay-that-has-the-current-profile>",
             },
         }),
-        DmError::AccountHome(err) => account_home_error_json(err),
-        DmError::App(err) => app_error_json(err),
-        DmError::QuicStream(err) => json!({
+        WnError::AccountHome(err) => account_home_error_json(err),
+        WnError::App(err) => app_error_json(err),
+        WnError::QuicStream(err) => json!({
             "code": "quic_stream",
             "message": err.to_string(),
         }),
-        DmError::QuicBroker(err) => json!({
+        WnError::QuicBroker(err) => json!({
             "code": "quic_broker",
             "message": err.to_string(),
         }),
-        DmError::Hex(err) => json!({
+        WnError::Hex(err) => json!({
             "code": "invalid_hex",
             "message": err.to_string(),
         }),
-        DmError::Io(err) => json!({
+        WnError::Io(err) => json!({
             "code": "io_error",
             "message": err.to_string(),
         }),
-        DmError::Json(err) => json!({
+        WnError::Json(err) => json!({
             "code": "json_error",
             "message": err.to_string(),
         }),
-        DmError::EmptyMessage => json!({
+        WnError::EmptyMessage => json!({
             "code": "empty_message",
             "message": err.to_string(),
         }),
-        DmError::EmptyStreamText => json!({
+        WnError::EmptyStreamText => json!({
             "code": "empty_stream_text",
             "message": err.to_string(),
         }),
-        DmError::MissingStreamStart => json!({
+        WnError::MissingStreamStart => json!({
             "code": "missing_stream_start",
             "message": err.to_string(),
         }),
-        DmError::StreamStartNotConfirmed => json!({
+        WnError::StreamStartNotConfirmed => json!({
             "code": "stream_start_not_confirmed",
             "message": err.to_string(),
         }),
-        DmError::MissingQuicCandidate => json!({
+        WnError::MissingQuicCandidate => json!({
             "code": "missing_quic_candidate",
             "message": err.to_string(),
         }),
-        DmError::UnsupportedStreamRoute(route) => json!({
+        WnError::UnsupportedStreamRoute(route) => json!({
             "code": "unsupported_stream_route",
             "message": err.to_string(),
             "route": route,
         }),
-        DmError::InvalidQuicCandidate(candidate) => json!({
+        WnError::InvalidQuicCandidate(candidate) => json!({
             "code": "invalid_quic_candidate",
             "message": err.to_string(),
             "candidate": candidate,
         }),
-        DmError::QuicCandidateResolve { candidate, source } => json!({
+        WnError::QuicCandidateResolve { candidate, source } => json!({
             "code": "quic_candidate_resolve",
             "message": err.to_string(),
             "candidate": candidate,
             "source": source.to_string(),
         }),
-        DmError::UnsafeQuicCandidateEndpoint { candidate, addr } => json!({
+        WnError::UnsafeQuicCandidateEndpoint { candidate, addr } => json!({
             "code": "unsafe_quic_candidate_endpoint",
             "message": err.to_string(),
             "candidate": candidate,
             "addr": addr.to_string(),
         }),
-        DmError::InvalidTranscriptHashLength(actual) => json!({
+        WnError::InvalidTranscriptHashLength(actual) => json!({
             "code": "invalid_transcript_hash",
             "message": err.to_string(),
             "actual_bytes": actual,
             "expected_bytes": 32,
         }),
-        DmError::ConflictingStreamTrust => json!({
+        WnError::ConflictingStreamTrust => json!({
             "code": "conflicting_stream_trust",
             "message": err.to_string(),
         }),
-        DmError::InsecureLocalRequiresLoopback(addr) => json!({
+        WnError::InsecureLocalRequiresLoopback(addr) => json!({
             "code": "insecure_local_requires_loopback",
             "message": err.to_string(),
             "addr": addr.to_string(),
         }),
-        DmError::MessagesSubscribeRequiresDaemon => json!({
+        WnError::MessagesSubscribeRequiresDaemon => json!({
             "code": "daemon_required",
             "message": err.to_string(),
             "repair": {
-                "start": "dm daemon start",
+                "start": "wn daemon start",
             },
         }),
-        DmError::ChatsSubscribeRequiresDaemon => json!({
+        WnError::ChatsSubscribeRequiresDaemon => json!({
             "code": "daemon_required",
             "message": err.to_string(),
             "repair": {
-                "start": "dm daemon start",
+                "start": "wn daemon start",
             },
         }),
-        DmError::MissingLoginIdentity => json!({
+        WnError::MissingLoginIdentity => json!({
             "code": "missing_login_identity",
             "message": err.to_string(),
             "repair": {
-                "login": "dm login <npub-or-hex>",
-                "import_nsec": "printf '%s\\n' \"$NSEC\" | dm login --nsec-stdin",
+                "login": "wn login <npub-or-hex>",
+                "import_nsec": "printf '%s\\n' \"$NSEC\" | wn login --nsec-stdin",
             },
         }),
-        DmError::SecretArgumentRejected { command } => json!({
+        WnError::SecretArgumentRejected { command } => json!({
             "code": "secret_argument_rejected",
             "message": err.to_string(),
             "command": command,
             "repair": {
-                "login": "printf '%s\\n' \"$NSEC\" | dm login --nsec-stdin",
-                "account_create": "printf '%s\\n' \"$NSEC\" | dm account create --nsec-stdin",
+                "login": "printf '%s\\n' \"$NSEC\" | wn login --nsec-stdin",
+                "account_create": "printf '%s\\n' \"$NSEC\" | wn account create --nsec-stdin",
             },
         }),
-        DmError::ConflictingSecretInput { command } => json!({
+        WnError::ConflictingSecretInput { command } => json!({
             "code": "conflicting_secret_input",
             "message": err.to_string(),
             "command": command,
         }),
-        DmError::MissingStdinSecret { command } => json!({
+        WnError::MissingStdinSecret { command } => json!({
             "code": "missing_stdin_secret",
             "message": err.to_string(),
             "command": command,
         }),
-        DmError::InvalidStdinSecret { command } => json!({
+        WnError::InvalidStdinSecret { command } => json!({
             "code": "invalid_stdin_secret",
             "message": err.to_string(),
             "command": command,
         }),
-        DmError::MediaAttachmentNotFound(file_hash) => json!({
+        WnError::MediaAttachmentNotFound(file_hash) => json!({
             "code": "media_attachment_not_found",
             "message": err.to_string(),
             "plaintext_sha256": file_hash,
         }),
-        DmError::InvalidMediaAttachment(reason) => json!({
+        WnError::InvalidMediaAttachment(reason) => json!({
             "code": "invalid_media_attachment",
             "message": err.to_string(),
             "reason": reason,
         }),
-        DmError::UnsupportedCommand { command, reason } => json!({
+        WnError::UnsupportedCommand { command, reason } => json!({
             "code": "unsupported_command",
             "message": err.to_string(),
             "command": command,
             "reason": reason,
         }),
-        DmError::MissingGroupId => json!({
+        WnError::MissingGroupId => json!({
             "code": "missing_group_id",
             "message": err.to_string(),
         }),
-        DmError::EmptyRelayUrl => json!({
+        WnError::EmptyRelayUrl => json!({
             "code": "empty_relay_url",
             "message": err.to_string(),
         }),
-        DmError::InvalidRelayUrl(_) => json!({
+        WnError::InvalidRelayUrl(_) => json!({
             "code": "invalid_relay_url",
             "message": err.to_string(),
             "repair": {
-                "login": "printf '%s\\n' \"$NSEC\" | dm login --nsec-stdin --relay <ws-or-wss-url>",
-                "daemon": "dm daemon start --discovery-relays <url> --default-account-relays <url>",
+                "login": "printf '%s\\n' \"$NSEC\" | wn login --nsec-stdin --relay <ws-or-wss-url>",
+                "daemon": "wn daemon start --discovery-relays <url> --default-account-relays <url>",
                 "account_setup": "--default-relays <ws-or-wss-url> --bootstrap-relays <ws-or-wss-url>",
             },
         }),
-        DmError::MissingRelay => json!({
+        WnError::MissingRelay => json!({
             "code": "missing_relay_url",
             "message": err.to_string(),
             "repair": {
-                "daemon": "dm daemon start --discovery-relays <url> --default-account-relays <url>",
+                "daemon": "wn daemon start --discovery-relays <url> --default-account-relays <url>",
                 "account_setup": "--default-relays <url> --bootstrap-relays <url>",
             },
         }),
-        DmError::MissingAccount => json!({
+        WnError::MissingAccount => json!({
             "code": "missing_account",
             "message": err.to_string(),
             "repair": {
-                "create": "dm account create [npub-or-hex]",
-                "import_nsec": "printf '%s\\n' \"$NSEC\" | dm account create --nsec-stdin",
+                "create": "wn account create [npub-or-hex]",
+                "import_nsec": "printf '%s\\n' \"$NSEC\" | wn account create --nsec-stdin",
                 "select": "--account <npub-or-hex>",
             },
         }),
-        DmError::MultipleAccounts => json!({
+        WnError::MultipleAccounts => json!({
             "code": "multiple_accounts",
             "message": err.to_string(),
             "repair": {
                 "flag": "--account",
-                "env": "DM_ACCOUNT",
+                "env": "WN_ACCOUNT",
             },
         }),
-        DmError::UnknownLocalAccount(account) => json!({
+        WnError::UnknownLocalAccount(account) => json!({
             "code": "unknown_account",
             "message": err.to_string(),
             "account_ref": account,
         }),
-        DmError::InvalidPublicKey => json!({
+        WnError::InvalidPublicKey => json!({
             "code": "invalid_public_key",
             "message": err.to_string(),
         }),
-        DmError::PublicAccountCannotSign => json!({
+        WnError::PublicAccountCannotSign => json!({
             "code": "public_account_cannot_sign",
             "message": err.to_string(),
         }),
-        DmError::InvalidSecretStore(store) => json!({
+        WnError::InvalidSecretStore(store) => json!({
             "code": "invalid_secret_store",
             "message": err.to_string(),
             "secret_store": store,
@@ -449,8 +449,8 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "account_id": account,
             "repair": {
-                "local": format!("dm --account {account} keys publish"),
-                "remote": "dm keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+                "local": format!("wn --account {account} keys publish"),
+                "remote": "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
             },
         }),
         AppError::UnknownGroup(group_id) => json!({
@@ -498,7 +498,7 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "account_id": account_id,
             "repair": {
-                "command": format!("dm keys fetch {account_id} --bootstrap-relays <relay-url>")
+                "command": format!("wn keys fetch {account_id} --bootstrap-relays <relay-url>")
             },
         }),
         AppError::InvalidGroupProfile(reason) => json!({

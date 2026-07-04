@@ -5,7 +5,7 @@ use marmot_app::{FetchedKeyPackage, MarmotApp, MarmotAppRuntime};
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, DmError, KeyPackageCommand, account_selector_or_default, ensure_local_signing,
+    CommandOutput, KeyPackageCommand, WnError, account_selector_or_default, ensure_local_signing,
     npub_for_account_id, parse_public_key, relay_endpoints, relay_lists_json, resolve_account,
     unsupported_command,
 };
@@ -15,7 +15,7 @@ pub(crate) async fn key_package_command(
     app: &MarmotApp,
     command: KeyPackageCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     key_package_command_with_runtime(account_home, app, &runtime, command, account_flag).await
 }
@@ -26,7 +26,7 @@ pub(crate) async fn key_package_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: KeyPackageCommand,
     account_flag: Option<String>,
-) -> Result<CommandOutput, DmError> {
+) -> Result<CommandOutput, WnError> {
     match command {
         KeyPackageCommand::List => {
             let account = resolve_account(account_home, account_flag)?;

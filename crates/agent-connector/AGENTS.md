@@ -1,12 +1,12 @@
 # AGENTS.md - agent-connector
 
-Local Marmot agent connector daemon; ships the `dm-agent` binary.
+Local Marmot agent connector daemon; ships the `wn-agent` binary.
 
 ## Scope
 
-- Own `serve_socket`/`AgentConnector` and the `dm-agent` Unix-socket daemon that bridges the `agent-control` protocol
+- Own `serve_socket`/`AgentConnector` and the `wn-agent` Unix-socket daemon that bridges the `agent-control` protocol
   and `agent-stream-compose` previews to `MarmotApp`/`MarmotAppRuntime`.
-- Own `dm-agent bootstrap`, which creates or reuses a local agent account through the running control socket and prints
+- Own `wn-agent bootstrap`, which creates or reuses a local agent account through the running control socket and prints
   phone invite details (`npub`, `nprofile`, optional terminal QR).
 - Own connector socket binding and permission hardening (`bind_connector_socket`, `default_socket_path`).
 - Keep agent-facing wire types in `agent-control` and stream composition in `agent-stream-compose`; this crate is the
@@ -45,8 +45,8 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/event_projection.rs` — runtime/debug event → control event projection, the `DeliveredInboundCursor`, and the
   `InboundCatchUpDriver`.
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
-- `src/bootstrap.rs` — `dm-agent bootstrap` flow.
-- `src/bin/dm-agent.rs` — the `dm-agent` binary entrypoint and clap CLI surface (`ServeArgs`, the `bootstrap`
+- `src/bootstrap.rs` — `wn-agent bootstrap` flow.
+- `src/bin/wn-agent.rs` — the `wn-agent` binary entrypoint and clap CLI surface (`ServeArgs`, the `bootstrap`
   subcommand and `BootstrapArgs`, octal socket-mode parsing, and terminal-QR rendering).
 - `src/tests.rs` — white-box test suite exercising the above `pub(crate)` internals.
 

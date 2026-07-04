@@ -7,7 +7,7 @@ Usage: scripts/hermes_marmot_deterministic_e2e.sh [options]
 
 Runs a deterministic Hermes/Marmot adapter E2E against an isolated Hermes dev
 root created by scripts/hermes_marmot_dev_setup.sh. The test uses a fake
-dm-agent socket and a fixed Hermes handler response, so no model or real Marmot
+wn-agent socket and a fixed Hermes handler response, so no model or real Marmot
 account is required.
 
 Options:
@@ -53,4 +53,4 @@ fi
 cd "$HERMES_AGENT_REPO"
 export PYTHONDONTWRITEBYTECODE=1
 exec "$HERMES_AGENT_REPO/.venv/bin/python" \
-    "$DARKMATTER_REPO/integrations/hermes/marmot/tests/e2e_deterministic.py"
+    "$MDK_REPO/integrations/hermes/marmot/tests/e2e_deterministic.py"

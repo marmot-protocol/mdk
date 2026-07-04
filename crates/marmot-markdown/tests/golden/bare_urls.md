@@ -6,7 +6,7 @@ All seven recognized schemes, bare (no `<>`):
 - http: http://example.com
 - mailto: mailto:foo@bar.com
 - tel: tel:+15551234567
-- darkmatter: darkmatter://profile/npub1abc
+- marmot: marmot://profile/npub1abc
 - whitenoise: whitenoise://group/abc
 - whitenoise-staging: whitenoise-staging://group/abc
 
@@ -34,7 +34,7 @@ In a list:
 
 - click https://example.com to continue
 - or mailto:help@example.com
-- deep link: darkmatter://thread/xyz
+- deep link: marmot://thread/xyz
 
 In a blockquote:
 
