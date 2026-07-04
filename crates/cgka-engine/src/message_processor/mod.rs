@@ -832,12 +832,36 @@ impl<S: StorageProvider> Engine<S> {
                 .await
             {
                 Ok(IngestOutcome::Buffered { .. }) => {
-                    self.update_stored_message_state(&record.id, MessageState::Retryable)?;
                     if was_peel_deferred {
+                        // The content-derived row is now the buffered
+                        // convergence witness; retire the raw deferred wrapper
+                        // so it leaves the retry lifecycle and frees its cap
+                        // slot (mdk#339), mirroring `retry_deferred_peels`.
+                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                        self.note_peel_deferred_row_retired(group_id, &record.id);
+                    } else {
+                        self.update_stored_message_state(&record.id, MessageState::Retryable)?;
+                    }
+                }
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed | StaleReason::Quarantined,
+                }) => {
+                    // Still un-peelable, or the group is quarantined: leave the
+                    // row deferred. A terminal-after-peel `PeelFailed` already
+                    // retired its raw deferred row inside `ingest_group_message`
+                    // via `mark_raw_transport_message_failed_if_deferred`.
+                }
+                Ok(_) => {
+                    // Applied (`Processed`) or terminally reclassified
+                    // (`AlreadySeen`, `SelfEvicted`, ...): retire a raw
+                    // deferred wrapper so it stops holding a cap slot
+                    // (mdk#339). Non-deferred rows keep the pre-existing
+                    // no-op behavior.
+                    if was_peel_deferred {
+                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
                         self.note_peel_deferred_row_retired(group_id, &record.id);
                     }
                 }
-                Ok(_) => {}
                 Err(EngineError::ForkedEpoch {
                     group_id: forked_group_id,
                     last_stable,

@@ -4426,6 +4426,113 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
     );
 }
 
+/// Regression for mdk#707 review finding 2: a raw `PeelDeferred` row
+/// that becomes peelable but whose content is terminally rejected (here a
+/// forged, unattributable application payload) must be retired from the
+/// deferred queue — marked terminal and released from the retry lifecycle —
+/// not left durably `PeelDeferred` holding a per-group cap slot. Without the
+/// fix, `retry_deferred_peels` treats the post-peel terminal `PeelFailed`
+/// like "still cannot peel" and leaves the raw row deferred forever.
+#[tokio::test]
+async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "deferred-terminal-after-peel".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Alice advances to epoch 2 and forges an unattributable app message
+    // there (inner `pubkey: ""`), which validation must reject.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch2, pending) = evolution(invite);
+    let commit_to_epoch2 = route(commit_to_epoch2, &group_id);
+    alice.confirm_published(pending).await.unwrap();
+    let forged_payload = MarmotAppEvent::new(
+        "",
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "forged",
+    )
+    .encode()
+    .expect("forged app event encodes");
+    let forged =
+        raw_app_message_with_payload(&alice_storage, &alice.self_id(), &group_id, &forged_payload);
+
+    // Carol is at epoch 1: the epoch-gate peeler cannot peel an epoch-2
+    // message, so it is retained as a PeelDeferred raw row.
+    assert!(matches!(
+        carol.ingest(forged.clone()).await.unwrap(),
+        IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::PeelFailed
+        }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&forged.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    // Deliver the epoch-2 commit and converge: carol catches up, re-peels the
+    // forged message, and terminally rejects it. The raw deferred row must be
+    // retired (terminal `Failed`), not left `PeelDeferred`.
+    carol
+        .ingest(commit_to_epoch2)
+        .await
+        .expect("commit buffered");
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    });
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        carol_storage.get_message(&forged.id).unwrap().state,
+        MessageState::Failed,
+        "a deferred row terminally rejected after peel must leave the deferred queue"
+    );
+    for event in carol.drain_events() {
+        if let GroupEvent::MessageReceived {
+            sender, payload, ..
+        } = event
+        {
+            assert!(!sender.as_slice().is_empty());
+            assert_ne!(payload, forged_payload);
+        }
+    }
+}
+
 #[tokio::test]
 async fn send_preflight_terminally_retires_deferred_app_message_outside_past_epoch_window() {
     let (mut alice, _alice_storage) = build_client(b"alice");

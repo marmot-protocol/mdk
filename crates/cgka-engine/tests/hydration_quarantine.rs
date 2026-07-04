@@ -979,6 +979,104 @@ async fn rejoin_welcome_clears_quarantine() {
     );
 }
 
+/// Regression for mdk#707 review finding 1: input retained while
+/// quarantined and replayed by `do_join_welcome`'s `replay_buffered_messages`
+/// must be retired from the deferred queue on a successful or terminal
+/// outcome — not left durably `PeelDeferred` holding a per-group cap slot.
+#[tokio::test]
+async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
+    // Bob owns the real group; alice has a corrupted partial copy that
+    // quarantines as OpenMlsGroupMissing.
+    let (mut bob, _bob_storage) = build_named_client(b"bob-replay");
+    let (group_id, send_result) = bob
+        .create_group(CreateGroupRequest {
+            name: "rejoin-replays-retained".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect("bob creates group");
+    let SendResult::GroupCreated { pending, .. } = send_result else {
+        panic!("expected group-created send result");
+    };
+    bob.confirm_published(pending).await.expect("bob confirms");
+
+    let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut alice = EngineBuilder::new(alice_storage.clone())
+        .identity(pad32(b"alice-replay"))
+        .account_identity_proof_signer(proof_signer(b"alice-replay"))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build alice");
+    insert_marmot_group_without_openmls_state(&alice_storage, &group_id, "corrupted-copy", 1);
+    alice
+        .hydrate_stable_groups_from_storage()
+        .expect("hydration quarantines the corrupted copy");
+    assert_eq!(alice.quarantined_groups().len(), 1);
+    alice.drain_events();
+
+    // A group message arrives while alice is quarantined: it is retained as a
+    // PeelDeferred replay-buffer row.
+    let retained_commit = bob_invites_carol(&mut bob, &group_id).await;
+    let outcome = alice
+        .ingest(retained_commit.clone())
+        .await
+        .expect("quarantine gate classifies");
+    assert!(matches!(
+        outcome,
+        cgka_traits::ingest::IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::Quarantined
+        }
+    ));
+    let deferred_before = alice_storage
+        .list_messages(&group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.state == MessageState::PeelDeferred)
+        .count();
+    assert_eq!(
+        deferred_before, 1,
+        "retained input must be a PeelDeferred row"
+    );
+
+    // Bob re-invites alice; the authenticated welcome clears the quarantine
+    // and do_join_welcome replays the retained input.
+    let alice_kp = alice.fresh_key_package().await.expect("alice key package");
+    let invite = bob
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![alice_kp],
+        })
+        .await
+        .expect("bob invites alice");
+    let SendResult::GroupEvolution {
+        pending, welcomes, ..
+    } = invite
+    else {
+        panic!("expected group evolution with welcomes");
+    };
+    bob.confirm_published(pending).await.expect("bob confirms");
+    alice
+        .join_welcome(welcome_for(&welcomes, b"alice-replay"))
+        .await
+        .expect("re-join succeeds");
+
+    assert!(alice.quarantined_groups().is_empty());
+    let deferred_after = alice_storage
+        .list_messages(&group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.state == MessageState::PeelDeferred)
+        .count();
+    assert_eq!(
+        deferred_after, 0,
+        "replay must retire the retained deferred row, not leave it holding a cap slot"
+    );
+}
+
 // mdk#152: session open must not re-verify an unchanged group's
 // account-identity proofs on every open. After a successful hydration the
 // engine persists a content-bound validation marker; reopening an unchanged

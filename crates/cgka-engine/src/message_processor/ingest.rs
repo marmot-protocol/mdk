@@ -353,6 +353,14 @@ impl<S: StorageProvider> Engine<S> {
                         );
                         recovery.peeled
                     } else {
+                        // Terminal peel failure. Retire the raw deferred row
+                        // (if this came via the retry lifecycle) so it stops
+                        // holding a per-group cap slot (mdk#339); a no-op on
+                        // the direct path where no deferred row exists.
+                        self.mark_raw_transport_message_failed_if_deferred(
+                            &raw_msg_id,
+                            "stale_epoch_no_snapshot",
+                        )?;
                         self.persist_transport_message(
                             msg,
                             &group_id,
@@ -377,13 +385,19 @@ impl<S: StorageProvider> Engine<S> {
             let mls_bytes = match peeled.content {
                 PeeledContent::MlsMessage { bytes } => bytes,
                 PeeledContent::Welcome { .. } => {
+                    // A group-message envelope that peels to a Welcome is
+                    // malformed: terminal. Retire the raw deferred row first
+                    // so its cap slot is released (mdk#339).
+                    self.mark_raw_transport_message_failed_if_deferred(
+                        &raw_msg_id,
+                        "peeled_welcome_in_group_message",
+                    )?;
                     self.persist_transport_message(
                         msg,
                         &group_id,
                         current_epoch,
                         MessageState::Failed,
                     )?;
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -443,6 +457,13 @@ impl<S: StorageProvider> Engine<S> {
                         &group_id,
                         current_epoch,
                         MessageState::Failed,
+                    )?;
+                    // Peeled successfully but the MLS body is neither a
+                    // public nor private message: terminal. Retire the raw
+                    // deferred row so it leaves the retry lifecycle (mdk#339).
+                    self.mark_raw_transport_message_failed_if_deferred(
+                        &raw_msg_id,
+                        "non_mls_message_body",
                     )?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
@@ -693,6 +714,13 @@ impl<S: StorageProvider> Engine<S> {
                             "dropping application message with unattributable sender"
                         );
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        // Peeled successfully but terminally rejected: retire
+                        // the raw deferred row so it leaves the retry
+                        // lifecycle instead of holding a cap slot (mdk#339).
+                        self.mark_raw_transport_message_failed_if_deferred(
+                            &raw_msg_id,
+                            "unattributable_sender",
+                        )?;
                         return Ok(IngestOutcome::Stale {
                             reason: StaleReason::PeelFailed,
                         });
@@ -707,6 +735,12 @@ impl<S: StorageProvider> Engine<S> {
                             "dropping application message with invalid Marmot app event",
                         );
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        // Peeled successfully but terminally rejected: retire
+                        // the raw deferred row (mdk#339).
+                        self.mark_raw_transport_message_failed_if_deferred(
+                            &raw_msg_id,
+                            "invalid_app_payload",
+                        )?;
                         return Ok(IngestOutcome::Stale {
                             reason: StaleReason::PeelFailed,
                         });
