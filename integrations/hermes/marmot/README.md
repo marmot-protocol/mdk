@@ -29,14 +29,14 @@ Prerequisites:
 One-line install:
 
 ```sh
-WN_AGENT_VERSION=0.2.0
+WN_AGENT_VERSION=0.9.0
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
 Install and bootstrap in one step:
 
 ```sh
-WN_AGENT_VERSION=0.2.0
+WN_AGENT_VERSION=0.9.0
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
 ```
 

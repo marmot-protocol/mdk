@@ -11,23 +11,24 @@ artifact that changed.
 
 Current tracks:
 
-- Whole-workspace releases use tags like `v0.1.0`. These identify a versioned source snapshot of the protocol draft,
-  Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate.
-- WN Agent releases use tags like `wn-agent-v0.2.0`. These publish the `wn-agent` connector binary plus adapter
+- Whole-workspace releases use tags like `v0.9.0`. These identify a versioned source snapshot of the protocol draft,
+  Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate. MDK
+  `0.9.0` is the unifying workspace bump above the previous `0.8.0` release.
+- WN Agent releases use tags like `wn-agent-v0.9.0`. These publish the `wn-agent` connector binary plus adapter
   install assets, starting with the Hermes Marmot plugin and installer.
-- MarmotKit binding releases use tags like `marmotkit-v0.1.0`. These build generated app-consumable binding bundles
+- MarmotKit binding releases use tags like `marmotkit-v0.9.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
 
-Future binary or package tracks should follow the same shape, for example `quic-broker-v0.1.0` or `wn-cli-v0.1.0`, only
+Future binary or package tracks should follow the same shape, for example `quic-broker-v0.9.0` or `wn-cli-v0.9.0`, only
 when those artifacts become independently consumed release surfaces.
 
 When multiple tracks correspond to the same source snapshot, create the tags on the same commit:
 
 ```sh
-git tag -a v0.2.0 -m "mdk v0.2.0"
-git tag -a wn-agent-v0.2.0 -m "WN Agent v0.2.0"
-git tag -a marmotkit-v0.2.0 -m "MarmotKit v0.2.0"
-git push origin v0.2.0 wn-agent-v0.2.0 marmotkit-v0.2.0
+git tag -a v0.9.0 -m "mdk v0.9.0"
+git tag -a wn-agent-v0.9.0 -m "WN Agent v0.9.0"
+git tag -a marmotkit-v0.9.0 -m "MarmotKit v0.9.0"
+git push origin v0.9.0 wn-agent-v0.9.0 marmotkit-v0.9.0
 ```
 
 The workspace is not published to crates.io today. The root `Cargo.toml` has `publish = false`, and the crates depend
@@ -40,7 +41,7 @@ app runtime, and generated bindings:
 
 ```toml
 [workspace.package]
-version = "0.2.0"
+version = "0.9.0"
 ```
 
 Use the same version number in:
@@ -131,11 +132,11 @@ Use this for a versioned MDK source/library release.
 5. Create an annotated tag:
 
    ```sh
-   git tag -a v0.2.0 -m "mdk v0.2.0"
-   git push origin v0.2.0
+   git tag -a v0.9.0 -m "mdk v0.9.0"
+   git push origin v0.9.0
    ```
 
-6. Create or update the GitHub Release for `v0.2.0` on the MDK repo releases page.
+6. Create or update the GitHub Release for `v0.9.0` on the MDK repo releases page.
 7. Include release notes that name the source commit, major user-visible changes, and any migration notes.
 
 Until a dedicated whole-workspace release workflow exists, the whole-workspace GitHub Release is a source release. The
@@ -154,7 +155,7 @@ The workflow lives at:
 ```
 
 Pull requests, master pushes, and manual workflow runs build validation artifacts only. Publishing happens only when a
-tag matching `wn-agent-v*` is pushed. The workflow validates version-like tags such as `wn-agent-v0.2.0` and requires
+tag matching `wn-agent-v*` is pushed. The workflow validates version-like tags such as `wn-agent-v0.9.0` and requires
 the tag version to match the root workspace version in `Cargo.toml`.
 
 Before a WN Agent release, run the normal preflight plus:
@@ -168,13 +169,13 @@ bash scripts/install-openclaw-marmot.sh --dry-run
 Cut the release tag from the current `origin/master` commit:
 
 ```sh
-just release-wn-agent 0.2.0
+just release-wn-agent 0.9.0
 ```
 
 For a dry run:
 
 ```sh
-just release-wn-agent-dry-run 0.2.0
+just release-wn-agent-dry-run 0.9.0
 ```
 
 The helper checks that the workspace version matches, the working tree is clean, `HEAD` matches `origin/master`, and the
@@ -205,9 +206,9 @@ The installer assets are generated during the release and default to their own `
 
 ```sh
 # Hermes gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.2.0/install-hermes-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.0/install-hermes-marmot.sh | bash
 # OpenClaw gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.2.0/install-openclaw-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.0/install-openclaw-marmot.sh | bash
 ```
 
 ## MarmotKit Binding Release
@@ -221,13 +222,13 @@ The workflow lives at:
 ```
 
 It runs only when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
-`marmotkit-v0.2.0`, builds both binding bundles, and creates or updates the matching GitHub Release.
+`marmotkit-v0.9.0`, builds both binding bundles, and creates or updates the matching GitHub Release.
 
 Create the tag:
 
 ```sh
-git tag -a marmotkit-v0.2.0 -m "MarmotKit v0.2.0"
-git push origin marmotkit-v0.2.0
+git tag -a marmotkit-v0.9.0 -m "MarmotKit v0.9.0"
+git push origin marmotkit-v0.9.0
 ```
 
 The release job creates these assets:
@@ -312,10 +313,10 @@ If a tag points at the wrong commit and nobody should consume it, delete and rec
 testers pin it:
 
 ```sh
-git tag -d wn-agent-v0.2.0
-git push origin :refs/tags/wn-agent-v0.2.0
-git tag -a wn-agent-v0.2.0 -m "WN Agent v0.2.0"
-git push origin wn-agent-v0.2.0
+git tag -d wn-agent-v0.9.0
+git push origin :refs/tags/wn-agent-v0.9.0
+git tag -a wn-agent-v0.9.0 -m "WN Agent v0.9.0"
+git push origin wn-agent-v0.9.0
 ```
 
 If a release has already been consumed, create a new patch version instead.

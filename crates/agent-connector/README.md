@@ -17,7 +17,7 @@ connector.
 - `wn-agent` is the installed binary.
 - "WN Agent" is the release track used for binary and adapter-install releases.
 
-The WN Agent release tag has its own prefix, for example `wn-agent-v0.1.0`, but the numeric version is the root
+The WN Agent release tag has its own prefix, for example `wn-agent-v0.9.0`, but the numeric version is the root
 workspace version from `Cargo.toml`. That keeps the agent binary, agent-control protocol, app runtime, and generated
 bindings in one compatibility cohort while still letting us publish only the WN Agent artifacts when that is all that
 changed.
@@ -78,14 +78,14 @@ Versioned WN Agent builds publish the `wn-agent` binary, the Hermes Marmot plugi
 Releases under `wn-agent-v*` tags. Hermes itself must already be installed.
 
 ```sh
-WN_AGENT_VERSION=0.2.0
+WN_AGENT_VERSION=0.9.0
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
 To install and immediately run `wn-agent bootstrap --qr`:
 
 ```sh
-WN_AGENT_VERSION=0.2.0
+WN_AGENT_VERSION=0.9.0
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
 ```
 
@@ -100,13 +100,13 @@ Hermes-specific setup, development helpers, and phone-test commands live in
 After the release commit is merged to `master`, cut a WN Agent release tag with:
 
 ```sh
-just release-wn-agent 0.1.0
+just release-wn-agent 0.9.0
 ```
 
 For a dry run:
 
 ```sh
-just release-wn-agent-dry-run 0.1.0
+just release-wn-agent-dry-run 0.9.0
 ```
 
 The helper checks that:

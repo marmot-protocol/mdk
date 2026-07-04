@@ -7,6 +7,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- Workspace version unified at `0.9.0` across all crates (successor to MDK `0.8.0`).
+- Documentation refresh: current-state inventory, missing crate READMEs, agent integration agent maps, and release
+  doc alignment.
+
 ### Security
 
 - The `wnd` daemon control socket (and the `wn-agent` connector socket) is now created owner-only (0600)
@@ -370,6 +376,7 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/darkmatter/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/marmot-protocol/darkmatter/releases/tag/v0.2.0
-[0.1.0]: https://github.com/marmot-protocol/darkmatter/releases/tag/v0.1.0
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/marmot-protocol/mdk/releases/tag/v0.9.0
+[0.2.0]: https://github.com/marmot-protocol/mdk/releases/tag/v0.2.0
+[0.1.0]: https://github.com/marmot-protocol/mdk/releases/tag/v0.1.0

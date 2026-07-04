@@ -72,7 +72,8 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 
 ## Before Tagging
 
-1. Confirm the CLI version in the workspace root `Cargo.toml`. The first release is `0.1.0`, tagged as `v0.1.0`.
+1. Confirm the CLI version in the workspace root `Cargo.toml`. The current workspace release is `0.9.0`, tagged as
+   `v0.9.0` (the unifying bump above the previous MDK `0.8.0` release).
 2. Confirm `Cargo.lock` is committed and current.
 3. Run the focused CLI checks:
 
@@ -113,8 +114,8 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 1. Create an annotated tag from the commit whose `Cargo.toml` version matches the tag:
 
    ```sh
-   git tag -a v0.1.0 -m "mdk v0.1.0"
-   git push origin v0.1.0
+   git tag -a v0.9.0 -m "mdk v0.9.0"
+   git push origin v0.9.0
    ```
 
 2. For the current private source repo, update `Formula/wn.rb` in `marmot-protocol/homebrew-tap` to use the
@@ -122,7 +123,7 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 
    ```ruby
    url "ssh://git@github.com/marmot-protocol/mdk.git",
-       tag:      "v0.1.0",
+       tag:      "v0.9.0",
        revision: "<tagged-commit-sha>"
    ```
 
@@ -131,14 +132,14 @@ Use `Formula/` for CLI/source-built packages, `Casks/` for app bundles, and `cmd
 3. If the source repo is public, prefer the GitHub source archive plus `sha256`:
 
    ```sh
-   curl -L -o mdk-v0.1.0.tar.gz \
-     https://github.com/marmot-protocol/mdk/archive/refs/tags/v0.1.0.tar.gz
-   shasum -a 256 mdk-v0.1.0.tar.gz
+   curl -L -o mdk-v0.9.0.tar.gz \
+     https://github.com/marmot-protocol/mdk/archive/refs/tags/v0.9.0.tar.gz
+   shasum -a 256 mdk-v0.9.0.tar.gz
    ```
 
    Then set:
 
-   - `url "https://github.com/marmot-protocol/mdk/archive/refs/tags/v0.1.0.tar.gz"`
+   - `url "https://github.com/marmot-protocol/mdk/archive/refs/tags/v0.9.0.tar.gz"`
    - `sha256 "<archive-sha256>"`
    - Omit `revision 0` for the first formula update.
 

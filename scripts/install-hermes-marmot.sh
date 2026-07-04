@@ -50,7 +50,7 @@ Environment:
   MARMOT_RELAYS         Relay CSV used when --bootstrap starts wn-agent
 
 Example:
-  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.2.0/install-hermes-marmot.sh | bash
+  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.0/install-hermes-marmot.sh | bash
 
   curl -fsSL .../install-hermes-marmot.sh | bash -s -- --bootstrap
 USAGE
