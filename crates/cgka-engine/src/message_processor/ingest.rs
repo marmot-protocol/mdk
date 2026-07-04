@@ -116,10 +116,11 @@ impl<S: StorageProvider> Engine<S> {
                         crate::message_disposition::MessageDisposition::Quarantined.tag(),
                     ),
                 );
-            } else {
+            } else if self.should_audit_peel_deferred_cap_rejection(&group_id) {
                 // Same flood cap as the deferral seam (mdk#339): a
                 // quarantined group's replay buffer must not grow unboundedly
-                // either.
+                // either. Audited once per cap-full episode so a flood does
+                // not emit one write per rejected message.
                 self.audit_group(
                     &group_id,
                     marmot_forensics::AuditEventKind::Rejection {
@@ -288,15 +289,17 @@ impl<S: StorageProvider> Engine<S> {
                         );
                         if !already_retained && !self.reserve_peel_deferred_slot(&group_id)? {
                             self.seen_message_ids.insert(msg.id.clone());
-                            self.audit_group(
-                                &group_id,
-                                marmot_forensics::AuditEventKind::Rejection {
-                                    msg_id: msg_id_hex.clone(),
-                                    reason: crate::message_disposition::MessageDisposition::DeferredCapExceeded
-                                        .tag()
-                                        .to_string(),
-                                },
-                            );
+                            if self.should_audit_peel_deferred_cap_rejection(&group_id) {
+                                self.audit_group(
+                                    &group_id,
+                                    marmot_forensics::AuditEventKind::Rejection {
+                                        msg_id: msg_id_hex.clone(),
+                                        reason: crate::message_disposition::MessageDisposition::DeferredCapExceeded
+                                            .tag()
+                                            .to_string(),
+                                    },
+                                );
+                            }
                             tracing::debug!(
                                 target: "cgka_engine::message_processor",
                                 method = "ingest_group_message",
@@ -455,30 +458,29 @@ impl<S: StorageProvider> Engine<S> {
             // never be decrypted here by design — OpenMLS holds no secrets
             // for epochs before the welcome. Classify it terminal before any
             // OpenMLS processing instead of feeding it the retry lifecycle.
-            if msg_content_type == ContentType::Application && msg_epoch < current_epoch {
-                let join_epoch = self.group_join_epoch(&group_id);
-                if join_epoch.0 > 0 && msg_epoch < join_epoch {
-                    let tag =
-                        crate::message_disposition::MessageDisposition::PreMembershipEvent.tag();
-                    self.persist_openmls_wire_message(
-                        &openmls_msg,
-                        &group_id,
-                        current_epoch,
+            if msg_content_type == ContentType::Application
+                && msg_epoch < current_epoch
+                && self.msg_is_pre_membership(&group_id, msg_epoch)
+            {
+                let tag = crate::message_disposition::MessageDisposition::PreMembershipEvent.tag();
+                self.persist_openmls_wire_message(
+                    &openmls_msg,
+                    &group_id,
+                    current_epoch,
+                    MessageState::Failed,
+                )?;
+                self.audit_group(
+                    &group_id,
+                    crate::audit_helpers::message_state_changed_event(
+                        hex::encode(msg.id.as_slice()),
                         MessageState::Failed,
-                    )?;
-                    self.audit_group(
-                        &group_id,
-                        crate::audit_helpers::message_state_changed_event(
-                            hex::encode(msg.id.as_slice()),
-                            MessageState::Failed,
-                            tag,
-                        ),
-                    );
-                    self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
-                    });
-                }
+                        tag,
+                    ),
+                );
+                self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                });
             }
 
             let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
@@ -547,8 +549,7 @@ impl<S: StorageProvider> Engine<S> {
                     // before the join epoch the message was never decryptable
                     // here by design; at or after it, this device was a
                     // member but the past-epoch secrets are gone.
-                    let join_epoch = self.group_join_epoch(&group_id);
-                    let tag = if join_epoch.0 > 0 && msg_epoch < join_epoch {
+                    let tag = if self.msg_is_pre_membership(&group_id, msg_epoch) {
                         crate::message_disposition::MessageDisposition::PreMembershipEvent.tag()
                     } else {
                         crate::message_disposition::MessageDisposition::ValidHistorySnapshotMissing
@@ -1526,14 +1527,19 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Best-effort join-epoch bound for post-peel pre-membership
-    /// classification (mdk#339). `EpochId(0)` (legacy records or a
-    /// missing record) means "unknown — apply no bound".
-    fn group_join_epoch(&self, group_id: &GroupId) -> EpochId {
-        self.storage
+    /// Whether `msg_epoch` predates this device's membership in `group_id`
+    /// (mdk#339): such a message was never decryptable here by design —
+    /// OpenMLS holds no secrets for epochs before the welcome — so it is
+    /// terminal, never retried. Best-effort: a `join_epoch` of `EpochId(0)`
+    /// (legacy records or a missing record) is "unknown", which applies no
+    /// bound and returns `false`.
+    fn msg_is_pre_membership(&self, group_id: &GroupId, msg_epoch: EpochId) -> bool {
+        let join_epoch = self
+            .storage
             .get_group(group_id)
             .map(|group| group.join_epoch)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        join_epoch.0 > 0 && msg_epoch < join_epoch
     }
 
     /// Fail-closed terminal handling for a same-epoch fork commit with no

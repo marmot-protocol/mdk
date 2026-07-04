@@ -78,6 +78,12 @@ pub(crate) struct DeferredPeelGroupState {
     /// Whether `deferred_rows` has been initialized from storage this
     /// session.
     counted: bool,
+    /// Whether a cap-exceeded `Rejection` has already been audited for the
+    /// current cap-full episode. Raw transport ids are attacker-controlled,
+    /// so a sustained flood past the cap would otherwise emit one audit write
+    /// per rejected message; this suppresses the repeats until the backlog
+    /// drops back below the cap and re-arms.
+    cap_rejection_audited: bool,
     /// Per-row attempt count and first-seen sweep, keyed by the raw
     /// transport message id.
     attempts: std::collections::HashMap<MessageId, DeferredPeelAttempts>,
@@ -669,7 +675,9 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Bookkeeping for a row leaving `PeelDeferred` (applied, reclassified,
     /// invalidated, or terminally failed): release its flood-cap slot and its
-    /// attempt-tracking entry.
+    /// attempt-tracking entry. Once the backlog drops back below the cap, the
+    /// cap-rejection audit re-arms so a fresh cap-full episode is recorded
+    /// once more.
     pub(crate) fn note_peel_deferred_row_retired(
         &mut self,
         group_id: &GroupId,
@@ -678,7 +686,24 @@ impl<S: StorageProvider> Engine<S> {
         if let Some(state) = self.deferred_peel.get_mut(group_id) {
             state.deferred_rows = state.deferred_rows.saturating_sub(1);
             state.attempts.remove(msg_id);
+            if state.deferred_rows < MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+                state.cap_rejection_audited = false;
+            }
         }
+    }
+
+    /// Whether a cap-exceeded `Rejection` should be audited now: `true` only
+    /// the first time the cap is hit for the current cap-full episode, so a
+    /// sustained attacker flood past the cap does not emit one audit write
+    /// per rejected message (mdk#339). Re-arms via
+    /// [`Self::note_peel_deferred_row_retired`] once the backlog drains.
+    pub(crate) fn should_audit_peel_deferred_cap_rejection(&mut self, group_id: &GroupId) -> bool {
+        let state = self.deferred_peel.entry(group_id.clone()).or_default();
+        if state.cap_rejection_audited {
+            return false;
+        }
+        state.cap_rejection_audited = true;
+        true
     }
 
     /// Discard every queued outbound intent for a group whose local copy is

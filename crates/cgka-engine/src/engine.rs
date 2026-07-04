@@ -1362,10 +1362,6 @@ impl<S: StorageProvider> Engine<S> {
         self.recorder.set_data_mode(mode, reason)
     }
 
-    /// Replace the installed forensic recorder on a live engine. Dropping the
-    /// prior recorder flushes and closes any file it held. Used to start or
-    /// stop audit logging in place when the audit switch is toggled, without
-    /// rebuilding the engine. Pass [`NoopRecorder`] to stop recording.
     /// Override the deferred-peel retry budget (mdk#339). Rows that
     /// exceed it without ever peeling transition to terminal `Failed`
     /// (`permanently_undecryptable`). Exposed so tests can exhaust the budget
@@ -1374,6 +1370,10 @@ impl<S: StorageProvider> Engine<S> {
         self.deferred_peel_retry_budget = budget.max(1);
     }
 
+    /// Replace the installed forensic recorder on a live engine. Dropping the
+    /// prior recorder flushes and closes any file it held. Used to start or
+    /// stop audit logging in place when the audit switch is toggled, without
+    /// rebuilding the engine. Pass [`NoopRecorder`] to stop recording.
     pub fn set_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) {
         self.recorder = recorder;
     }
