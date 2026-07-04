@@ -1094,17 +1094,21 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     // apply at all (MLS cannot re-process own commits), and it avoids
     // re-replaying history the live state already reflects.
     let applied_prefix = already_applied_commit_prefix(storage, result, current_epoch)?;
-    let replay_messages =
-        replay_messages_for_canonicalization_result(storage, result, &applied_prefix)?;
+    let apply_start_epoch =
+        apply_start_epoch_for_canonicalization_result(storage, result, &applied_prefix)?
+            .unwrap_or(current_epoch);
+    let replay_messages = replay_messages_for_canonicalization_result(
+        storage,
+        result,
+        &applied_prefix,
+        apply_start_epoch,
+    )?;
     let live_message_records = storage
         .list_messages(group_id, EpochId(0))
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     let live_queued_outbound = storage
         .list_queued_outbound_intents(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    let apply_start_epoch =
-        apply_start_epoch_for_canonicalization_result(storage, result, &applied_prefix)?
-            .unwrap_or(current_epoch);
     let has_new_commits = result.accepted_commits.len() > applied_prefix.len();
     let snapshot = apply_snapshot_name(group_id, result);
     storage
@@ -1357,6 +1361,7 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
     storage: &S,
     result: &CanonicalizationResult,
     applied_prefix: &BTreeSet<String>,
+    apply_start_epoch: u64,
 ) -> Result<Vec<TransportMessage>, OpenMlsProjectionError> {
     let mut replay_messages = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1378,6 +1383,16 @@ fn replay_messages_for_canonicalization_result<S: StorageProvider>(
         let record = storage
             .get_message(&message_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+        // An accepted proposal below the apply-start epoch was consumed by a
+        // commit in the skipped already-applied prefix: its effect is inside
+        // the live state, and MLS proposals are epoch-scoped, so replaying it
+        // against the post-prefix state would be rejected (WrongEpoch) and
+        // fail the whole apply. Skip the replay; its `Processed` disposition
+        // still persists so it leaves the convergence input set.
+        if result.accepted_proposals.contains(hex_message_id) && record.epoch.0 < apply_start_epoch
+        {
+            continue;
+        }
         let Some(message) = openmls_wire_message_from_record(&record)? else {
             return Err(OpenMlsProjectionError::Decode(format!(
                 "accepted message {} is not a stored OpenMLS wire payload",

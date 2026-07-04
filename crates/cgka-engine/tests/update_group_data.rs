@@ -2119,6 +2119,211 @@ async fn mutually_rebuilt_engines_converge_on_same_branch_after_concurrent_renam
     }
 }
 
+/// Restart-winner variant where the winning own commit CONSUMED a by-reference
+/// proposal (a SelfRemove auto-commit) and that proposal is simultaneously a
+/// pending convergence input on the restarted device.
+///
+/// The apply path skips the already-applied own commit (it cannot be
+/// re-processed), so it must also skip replaying the proposal that commit
+/// consumed: MLS proposals are epoch-scoped, and replaying the fork-epoch
+/// proposal against the live tip would be rejected (WrongEpoch) and fail the
+/// whole apply — rolling back the convergence pass on every retry, a
+/// permanent livelock. The proposal's `Processed` disposition must still
+/// persist so it leaves the convergence input set.
+#[tokio::test]
+async fn rebuilt_winner_applies_own_selfremove_commit_without_replaying_consumed_proposal() {
+    use cgka_traits::engine::{CommitOrderingKey, CommitOrderingPriority};
+
+    async fn advance_selfremove_auto_commit(
+        engine: &mut Engine<SqliteAccountStorage>,
+        group_id: &GroupId,
+    ) {
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        let results = engine.advance_convergence(group_id).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "SelfRemove auto-commit should drain through auto-publish, got {results:?}"
+        );
+    }
+
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let mut carol = build(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "mip03-fork".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, mut welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    // A settled rename round first, so every member holds a retained anchor at
+    // the upcoming fork epoch: the committer retains it at confirm, each
+    // recipient when its convergence pass applies the commit. (A welcome-joined
+    // member whose only own commit is the auto-commit would otherwise hold no
+    // anchor at the fork epoch — the auto-commit send path projects the group
+    // record to the post-merge epoch before confirm's retention reads it.)
+    let res = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("settled before fork".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (rename_commit, rename_pending) = match res {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(rename_pending).await.unwrap();
+    bob.ingest(route_to_group(&rename_commit, &gid))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    carol
+        .ingest(route_to_group(&rename_commit, &gid))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut carol, &gid);
+    assert_eq!(alice.epoch(&gid).unwrap().0, 2);
+    assert_eq!(bob.epoch(&gid).unwrap().0, 2);
+
+    // Carol leaves; BOTH remaining members ingest her SelfRemove proposal and
+    // race the SelfRemove-only auto-commit at the same epoch — an ordinary
+    // same-epoch fork whose commits each consume the proposal by reference.
+    let proposal = match carol
+        .send(SendIntent::Leave {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        other => panic!("expected Proposal, got {other:?}"),
+    };
+    alice.ingest(route_to_group(&proposal, &gid)).await.unwrap();
+    bob.ingest(route_to_group(&proposal, &gid)).await.unwrap();
+    advance_selfremove_auto_commit(&mut alice, &gid).await;
+    advance_selfremove_auto_commit(&mut bob, &gid).await;
+    let mut alice_auto = alice.drain_auto_publish();
+    let mut bob_auto = bob.drain_auto_publish();
+    assert_eq!(alice_auto.len(), 1);
+    assert_eq!(bob_auto.len(), 1);
+    let alice_auto = alice_auto.remove(0);
+    let bob_auto = bob_auto.remove(0);
+    alice.confirm_published(alice_auto.pending).await.unwrap();
+    bob.confirm_published(bob_auto.pending).await.unwrap();
+    alice.drain_events();
+    bob.drain_events();
+
+    // Deterministic winner: both auto-commits are SelfRemove-only (Ordinary),
+    // so the authenticated committer id decides.
+    let alice_key = CommitOrderingKey::from_commit_bytes(
+        cgka_traits::EpochId(2),
+        CommitOrderingPriority::Ordinary,
+        alice.self_id(),
+        &alice_auto.msg.payload,
+    );
+    let bob_key = CommitOrderingKey::from_commit_bytes(
+        cgka_traits::EpochId(2),
+        CommitOrderingPriority::Ordinary,
+        bob.self_id(),
+        &bob_auto.msg.payload,
+    );
+    let alice_wins = alice_key < bob_key;
+    let (winner, winner_storage, winner_commit, winner_id, loser_commit) = if alice_wins {
+        (
+            alice,
+            alice_storage,
+            alice_auto.msg,
+            b"alice".as_slice(),
+            bob_auto.msg,
+        )
+    } else {
+        (
+            bob,
+            bob_storage,
+            bob_auto.msg,
+            b"bob".as_slice(),
+            alice_auto.msg,
+        )
+    };
+
+    // The WINNER restarts.
+    drop(winner);
+    let mut winner =
+        build_with_storage_and_peeler(winner_id, winner_storage.clone(), mock_peeler());
+    winner.drain_events();
+
+    // Re-open carol's consumed proposal as a pending convergence input on the
+    // restarted winner — the state left behind when the proposal's disposition
+    // write is lost (crash between the convergence apply and its disposition
+    // persistence, or a restored backup). Its record exists under the content
+    // dedup id from the direct ingest.
+    let proposal_record_id = content_id(&proposal);
+    winner_storage
+        .get_message(&proposal_record_id)
+        .expect("consumed proposal record exists under its content id");
+    winner_storage
+        .update_message_state(&proposal_record_id, MessageState::Created)
+        .expect("re-open consumed proposal as pending");
+
+    // The losing sibling commit arrives through stored convergence.
+    winner
+        .buffer_openmls_convergence_message(&gid, route_to_group(&loser_commit, &gid), 1_000)
+        .expect("losing sibling auto-commit buffered on the restarted winner");
+    let result = winner
+        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .expect("apply must not replay the proposal consumed by the skipped own commit");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+
+    // Own branch selected and intact: carol removed, epoch unchanged, the
+    // losing sibling dropped against the candidate state.
+    assert_eq!(winner.epoch(&gid).unwrap().0, 3);
+    let members = winner.members(&gid).unwrap();
+    assert_eq!(members.len(), 2, "carol must stay removed; got {members:?}");
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == hex::encode(content_id(&loser_commit).as_slice())
+                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+        }),
+        "losing sibling must be dropped against the selected candidate state, got {:?}",
+        result.dropped_messages
+    );
+
+    // The re-opened proposal was accepted on the selected branch WITHOUT being
+    // replayed: its disposition returns to Processed, closing the retry loop.
+    assert_eq!(
+        winner_storage
+            .get_message(&proposal_record_id)
+            .unwrap()
+            .state,
+        MessageState::Processed,
+        "consumed proposal must settle back to Processed, not stay a pending input"
+    );
+
+    // And no withdrawal names the winner's own canonical commit.
+    let invalidations = state_invalidations(&winner.drain_events());
+    assert!(
+        !invalidations.iter().any(|(id, _)| id == &winner_commit.id),
+        "winner must not withdraw its own canonical auto-commit, got {invalidations:?}"
+    );
+}
+
 /// Sequential control: when the second rename builds on the first commit
 /// (no fork), both notifications are accurate history — two
 /// `GroupStateChanged` events, and no `GroupStateInvalidated` anywhere.
