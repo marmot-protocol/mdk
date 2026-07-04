@@ -1444,7 +1444,12 @@ impl JsonlRecorder {
         let file = fs_private::create_new_private(&staged)?;
         // Atomic replace: the live path always names either the old complete
         // file or the fresh empty one, and rename preserves the staged 0600
-        // mode. Recorder state advances only after the rename succeeds.
+        // mode. Recorder state advances only after the rename succeeds. This
+        // relies on POSIX rename replacing an existing destination in place;
+        // the crate targets Unix only (like `fs_private`'s owner-only file
+        // model), so the Windows "rename fails if the destination exists"
+        // behavior does not apply — and a delete-then-rename fallback would
+        // reintroduce exactly the non-atomic window this swap removes.
         if let Err(err) = std::fs::rename(&staged, &self.path) {
             let _ = std::fs::remove_file(&staged);
             return Err(err);

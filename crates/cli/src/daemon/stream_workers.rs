@@ -625,6 +625,14 @@ pub(crate) async fn finish_stream_compose(
             format!("no active stream compose session for {stream_id}"),
         );
     };
+    // `expected: None` deliberately skips the transcript cross-check the
+    // connector performs. The connector validates because a remote agent
+    // supplies its own final_text/hash/chunk over the control protocol, which
+    // can disagree with the compose task's accumulated transcript. The daemon
+    // has no such independent claim: `finish_stream_compose` derives the final
+    // marker entirely from the compose task's own report below, so there is
+    // nothing to validate it against — the compose task is the single source of
+    // truth for the transcript here.
     let (respond, response) = oneshot::channel();
     if tx
         .send(StreamComposeCommand::Finish {

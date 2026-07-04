@@ -660,6 +660,10 @@ pub(crate) async fn handle_app_runtime_event(
         marmot_app::MarmotAppEvent::AccountError(error) => {
             record_runtime_activity_error(&state, account_error_activity_message(&error));
         }
+        // A confirmed create/invite queued a welcome for re-delivery (mdk#352).
+        // The durable record + `redeliver_welcome` handle the repair; this
+        // daemon activity path has no runtime-summary shape to record for it.
+        marmot_app::MarmotAppEvent::WelcomeDeliveryPending { .. } => {}
     }
 }
 
