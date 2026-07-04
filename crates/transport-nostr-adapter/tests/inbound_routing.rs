@@ -205,6 +205,135 @@ impl NostrRelayClient for FlakyUnsubscribeRelayClient {
     }
 }
 
+/// Records the maximum number of `unsubscribe` calls observed in flight at
+/// once. Each `unsubscribe` yields several times so that, absent serialization,
+/// a concurrent lifecycle op's `unsubscribe` would be seen overlapping.
+#[derive(Default)]
+struct UnsubscribeOverlapProbeRelayClient {
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
+}
+
+#[async_trait]
+impl NostrRelayClient for UnsubscribeOverlapProbeRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
+/// Regression for the unsubscribe/re-add race: two group syncs on different
+/// accounts, run concurrently, each remove their account's group and so each
+/// drives an `unsubscribe`. The subscription-lifecycle lock must serialize
+/// them, so the relay never sees two `unsubscribe` calls overlapping — the
+/// window in which a concurrent re-add could tear down a freshly re-subscribed
+/// deterministic subscription id.
+#[tokio::test]
+async fn concurrent_group_syncs_do_not_overlap_relay_unsubscribes() {
+    let relay = Arc::new(UnsubscribeOverlapProbeRelayClient::default());
+    let adapter = Arc::new(NostrTransportAdapter::new(relay.clone()));
+
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let alice_group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xC1; 32]),
+        transport_group_id: vec![0xD1; 32],
+        endpoints: vec![TransportEndpoint("wss://group-a.example".into())],
+    };
+    let bob_group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xC2; 32]),
+        transport_group_id: vec![0xD2; 32],
+        endpoints: vec![TransportEndpoint("wss://group-b.example".into())],
+    };
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: alice.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://alice-inbox.example".into())],
+            group_subscriptions: vec![alice_group],
+            since: None,
+        })
+        .await
+        .expect("alice activation succeeds");
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: bob.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            group_subscriptions: vec![bob_group],
+            since: None,
+        })
+        .await
+        .expect("bob activation succeeds");
+
+    // Each sync drops its account's only group, so each drains one unsubscribe.
+    let adapter_a = Arc::clone(&adapter);
+    let adapter_b = Arc::clone(&adapter);
+    let sync_a = tokio::spawn(async move {
+        adapter_a
+            .sync_account_groups(TransportGroupSync {
+                account_id: alice,
+                group_subscriptions: vec![],
+                since: None,
+            })
+            .await
+    });
+    let sync_b = tokio::spawn(async move {
+        adapter_b
+            .sync_account_groups(TransportGroupSync {
+                account_id: bob,
+                group_subscriptions: vec![],
+                since: None,
+            })
+            .await
+    });
+    sync_a.await.unwrap().expect("alice sync succeeds");
+    sync_b.await.unwrap().expect("bob sync succeeds");
+
+    assert_eq!(
+        relay.max_in_flight.load(Ordering::SeqCst),
+        1,
+        "subscription-lifecycle ops must not run relay unsubscribes concurrently"
+    );
+    assert_eq!(
+        adapter.metrics().await.subscriptions_removed,
+        2,
+        "both group unsubscribes should have been confirmed"
+    );
+}
+
 #[tokio::test]
 async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_again() {
     let relay = Arc::new(FakeRelayClient::default());

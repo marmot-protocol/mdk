@@ -265,6 +265,14 @@ pub struct NostrTransportAdapter {
     state: Arc<RwLock<AdapterState>>,
     delivery_tx: mpsc::Sender<TransportDelivery>,
     delivery_rx: Arc<Mutex<mpsc::Receiver<TransportDelivery>>>,
+    /// Serializes the subscription-lifecycle operations (activate / deactivate /
+    /// group sync) so their relay-side subscribe/unsubscribe network calls —
+    /// which run OUTSIDE the `state` `RwLock` — cannot interleave. Without it a
+    /// concurrent sync could re-add a group (minting the same deterministic
+    /// subscription id) in the window between another sync's live-route filter
+    /// and its stale `unsubscribe`, tearing the fresh subscription back down.
+    /// The `RwLock` still guards the fast delivery/routing path independently.
+    subscription_lock: Arc<Mutex<()>>,
     /// Local monotonic origin for delivery telemetry. Never `created_at`.
     monotonic_start: std::time::Instant,
 }
@@ -277,6 +285,7 @@ impl NostrTransportAdapter {
             state: Arc::new(RwLock::new(AdapterState::default())),
             delivery_tx,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
+            subscription_lock: Arc::new(Mutex::new(())),
             monotonic_start: std::time::Instant::now(),
         }
     }
@@ -483,6 +492,9 @@ impl TransportAdapter for NostrTransportAdapter {
         &self,
         activation: TransportAccountActivation,
     ) -> Result<(), TransportAdapterError> {
+        // Serialize with sync/deactivate so this account's re-subscribe cannot
+        // interleave a concurrent sync's unsubscribe drain (see the field doc).
+        let _subscription_guard = self.subscription_lock.lock().await;
         let account_id = activation.account_id.clone();
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -540,6 +552,10 @@ impl TransportAdapter for NostrTransportAdapter {
         &self,
         sync: TransportGroupSync,
     ) -> Result<(), TransportAdapterError> {
+        // Serialize against other subscription-lifecycle operations so the
+        // drain's live-route filter and its relay unsubscribes cannot race a
+        // concurrent re-add of the same deterministic subscription id.
+        let _subscription_guard = self.subscription_lock.lock().await;
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
@@ -623,6 +639,9 @@ impl TransportAdapter for NostrTransportAdapter {
     }
 
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
+        // Serialize with sync/activate so the blanket unsubscribe cannot
+        // interleave a concurrent sync's unsubscribe drain (see the field doc).
+        let _subscription_guard = self.subscription_lock.lock().await;
         let removed_count = {
             let state = self.state.read().await;
             state
