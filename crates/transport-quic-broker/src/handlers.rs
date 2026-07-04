@@ -22,18 +22,26 @@ pub(crate) struct BrokerStreamPolicy {
 }
 
 /// Forward-role bounds for a publish stream, from `QuicBrokerConfig` — never
-/// the subscriber-sized receive defaults.
+/// the subscriber-sized receive defaults. `max_frame_bytes` counts record
+/// frame bytes as carried on the wire (the broker never decrypts):
+/// ciphertext including the 16-byte AEAD tag per record for encrypted
+/// previews, plaintext for unencrypted ones.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PublishForwardLimits {
     pub(crate) max_records: u64,
-    pub(crate) max_plaintext_bytes: usize,
+    pub(crate) max_frame_bytes: usize,
 }
 
 impl PublishForwardLimits {
     fn accumulator(self) -> AgentTextStreamReceiveAccumulator {
+        // The accumulator's `max_plaintext_bytes` counts each record's frame
+        // field. Subscribers observe records after decryption, so there it
+        // is true plaintext; this publish handler observes them undecrypted,
+        // so the same budget counts wire frame bytes here — hence the
+        // frame-bytes name on the broker config knob.
         AgentTextStreamReceiveAccumulator::new(AgentTextStreamReceiveLimits {
             max_records: self.max_records,
-            max_plaintext_bytes: self.max_plaintext_bytes,
+            max_plaintext_bytes: self.max_frame_bytes,
             ..AgentTextStreamReceiveLimits::default()
         })
     }

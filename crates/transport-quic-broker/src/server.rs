@@ -57,8 +57,8 @@ impl QuicBrokerServer {
         if config.publish_max_records == 0 {
             return Err(QuicBrokerError::EmptyPublishRecordLimit);
         }
-        if config.publish_max_plaintext_bytes == 0 {
-            return Err(QuicBrokerError::EmptyPublishByteLimit);
+        if config.publish_max_frame_bytes == 0 {
+            return Err(QuicBrokerError::EmptyPublishFrameByteLimit);
         }
         if config.replay_ttl > MAX_BROKER_REPLAY_TTL {
             return Err(QuicBrokerError::ReplayTtlTooLarge {
@@ -85,7 +85,7 @@ impl QuicBrokerServer {
                 read_timeout: config.read_timeout,
                 publish_limits: PublishForwardLimits {
                     max_records: config.publish_max_records,
-                    max_plaintext_bytes: config.publish_max_plaintext_bytes,
+                    max_frame_bytes: config.publish_max_frame_bytes,
                 },
             },
         })

@@ -5,18 +5,20 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_ABORT, AGENT_TEXT_STREAM_RECORD_CHECKPOINT,
     AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamRecordV1, AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamKeyContextV1, AgentTextStreamRecordV1,
+    AgentTextStreamTranscriptV1,
 };
+use cgka_traits::{EpochId, GroupId, MemberId, MessageId, SecretBytes};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
-    AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits, stream_record_text,
+    AgentTextStreamCrypto, AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits,
+    stream_record_text,
 };
 
 use crate::client::{
@@ -1066,10 +1068,10 @@ fn broker_config_rejects_zero_resource_limits() {
     assert!(matches!(
         QuicBrokerServer::bind(QuicBrokerConfig {
             bind_addr: LOCAL_SERVER_BIND,
-            publish_max_plaintext_bytes: 0,
+            publish_max_frame_bytes: 0,
             ..QuicBrokerConfig::default()
         }),
-        Err(QuicBrokerError::EmptyPublishByteLimit)
+        Err(QuicBrokerError::EmptyPublishFrameByteLimit)
     ));
 }
 
@@ -2120,4 +2122,80 @@ async fn broker_subscribe_snapshots_backlog_by_reference() {
     assert_eq!(second_backlog.len(), 1);
     assert!(Arc::ptr_eq(&first_backlog[0], &second_backlog[0]));
     state.unsubscribe(&key, first_id).await;
+}
+
+#[tokio::test]
+async fn broker_publish_frame_byte_limit_counts_wire_bytes_for_encrypted_records() {
+    // The broker forwards records without decrypting, so the publish byte
+    // budget counts the frame payload as carried on the wire: for encrypted
+    // previews that is ciphertext, i.e. plaintext plus a 16-byte AEAD tag per
+    // record. Five 10-byte plaintext chunks (50 plaintext bytes) encrypt to
+    // 26-byte wire frames; against a 100-byte budget the fourth record trips
+    // it (4 x 26 = 104), while a plaintext-counting budget would have passed
+    // all five. This pins the wire semantics the knob's name advertises.
+    let stream_id = vec![0xb1; 32];
+    let start_event_id = MessageId::new(vec![0x66; 32]);
+    let crypto = AgentTextStreamCrypto::new(
+        SecretBytes::new(vec![0x07; 32]),
+        AgentTextStreamKeyContextV1::new(
+            GroupId::new(vec![0x01; 32]),
+            stream_id.clone(),
+            EpochId(3),
+            MemberId::new(vec![0x02; 32]),
+            start_event_id.clone(),
+        ),
+    );
+
+    let server = QuicBrokerServer::bind(QuicBrokerConfig {
+        bind_addr: LOCAL_SERVER_BIND,
+        publish_max_frame_bytes: 100,
+        ..QuicBrokerConfig::default()
+    })
+    .unwrap();
+    let broker_addr = server.local_addr().unwrap();
+    let server_cert = server.server_cert_der().to_vec();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let broker_task = tokio::spawn(server.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
+        stream_id: stream_id.clone(),
+        start_event_id: start_event_id.clone(),
+        crypto: Some(crypto.clone()),
+    }));
+    sleep(Duration::from_millis(100)).await;
+
+    let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
+        broker_addr,
+        server_name: "localhost".to_owned(),
+        trust: BrokerServerTrust::CertificateDer(server_cert),
+        stream_id: stream_id.clone(),
+        start_event_id,
+        crypto: Some(crypto),
+        max_plaintext_frame_len: None,
+    })
+    .await
+    .unwrap();
+    publisher
+        .append_text(&"a".repeat(50), 10, Duration::ZERO)
+        .await
+        .unwrap();
+    // The broker kills the publish stream on the fourth record; the
+    // publisher's close handshake may surface that asynchronously.
+    let _ = publisher.finish().await;
+
+    let received = timeout(Duration::from_secs(5), subscriber)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.chunk_count, 3);
+    assert_eq!(received.text, "a".repeat(30));
+
+    let _ = shutdown_tx.send(());
+    broker_task.await.unwrap().unwrap();
 }

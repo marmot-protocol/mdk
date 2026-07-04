@@ -8,7 +8,7 @@ use crate::protocol::{
     DEFAULT_BROKER_BACKLOG_DEPTH, DEFAULT_BROKER_KEEP_ALIVE_INTERVAL,
     DEFAULT_BROKER_MAX_BACKLOG_BYTES, DEFAULT_BROKER_MAX_CONNECTIONS,
     DEFAULT_BROKER_MAX_IDLE_TIMEOUT, DEFAULT_BROKER_MAX_ROOMS,
-    DEFAULT_BROKER_MAX_STREAMS_PER_CONNECTION, DEFAULT_BROKER_PUBLISH_MAX_PLAINTEXT_BYTES,
+    DEFAULT_BROKER_MAX_STREAMS_PER_CONNECTION, DEFAULT_BROKER_PUBLISH_MAX_FRAME_BYTES,
     DEFAULT_BROKER_PUBLISH_MAX_RECORDS, DEFAULT_BROKER_READ_TIMEOUT, DEFAULT_BROKER_REPLAY_TTL,
     DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
 };
@@ -28,9 +28,12 @@ pub struct QuicBrokerConfig {
     /// forward legitimate long previews, not truncate them at the
     /// subscriber-sized default.
     pub publish_max_records: u64,
-    /// Cap on cumulative forwarded plaintext bytes per publish stream; the
-    /// forward-role counterpart of `publish_max_records`.
-    pub publish_max_plaintext_bytes: usize,
+    /// Cap on cumulative forwarded record frame bytes per publish stream;
+    /// the forward-role counterpart of `publish_max_records`. Counted as
+    /// carried on the wire (the broker never decrypts): ciphertext including
+    /// the 16-byte AEAD tag per record for encrypted previews, plaintext for
+    /// unencrypted ones.
+    pub publish_max_frame_bytes: usize,
     pub read_timeout: Duration,
     pub max_idle_timeout: Duration,
     pub keep_alive_interval: Duration,
@@ -69,7 +72,7 @@ impl Default for QuicBrokerConfig {
             max_connections: DEFAULT_BROKER_MAX_CONNECTIONS,
             max_streams_per_connection: DEFAULT_BROKER_MAX_STREAMS_PER_CONNECTION,
             publish_max_records: DEFAULT_BROKER_PUBLISH_MAX_RECORDS,
-            publish_max_plaintext_bytes: DEFAULT_BROKER_PUBLISH_MAX_PLAINTEXT_BYTES,
+            publish_max_frame_bytes: DEFAULT_BROKER_PUBLISH_MAX_FRAME_BYTES,
             read_timeout: DEFAULT_BROKER_READ_TIMEOUT,
             max_idle_timeout: DEFAULT_BROKER_MAX_IDLE_TIMEOUT,
             keep_alive_interval: DEFAULT_BROKER_KEEP_ALIVE_INTERVAL,

@@ -37,11 +37,14 @@ pub const DEFAULT_BROKER_KEEP_ALIVE_INTERVAL: Duration = QUIC_PREVIEW_KEEP_ALIVE
 /// protect subscribers: the broker forwards long previews; each subscriber
 /// still enforces its own receive limits.
 pub const DEFAULT_BROKER_PUBLISH_MAX_RECORDS: u64 = AGENT_TEXT_STREAM_DEFAULT_MAX_RECORDS * 16;
-/// Default cap on cumulative forwarded plaintext bytes per publish stream.
-/// Matches the scale of the broker's whole-process backlog budget
-/// (`DEFAULT_BROKER_MAX_BACKLOG_BYTES`) rather than the 1 MiB receiver
-/// default.
-pub const DEFAULT_BROKER_PUBLISH_MAX_PLAINTEXT_BYTES: usize = 64 * 1024 * 1024;
+/// Default cap on cumulative forwarded record frame bytes per publish
+/// stream. The broker forwards records without decrypting them, so this
+/// counts the frame payload as carried on the wire: ciphertext (plaintext
+/// plus a 16-byte AEAD tag per record) for encrypted previews, plaintext for
+/// unencrypted ones. Matches the scale of the broker's whole-process backlog
+/// budget (`DEFAULT_BROKER_MAX_BACKLOG_BYTES`) rather than the 1 MiB
+/// receiver default.
+pub const DEFAULT_BROKER_PUBLISH_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Default broker replay window: `0` retains no replay backlog, matching the
 /// first-profile `replay_ttl_secs` default of `0` (no retained replay).
 pub const DEFAULT_BROKER_REPLAY_TTL: Duration = Duration::ZERO;

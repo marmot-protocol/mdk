@@ -65,8 +65,8 @@ pub enum QuicBrokerError {
     EmptyKeepAliveInterval,
     #[error("broker publish record limit cannot be zero")]
     EmptyPublishRecordLimit,
-    #[error("broker publish plaintext byte limit cannot be zero")]
-    EmptyPublishByteLimit,
+    #[error("broker publish frame byte limit cannot be zero")]
+    EmptyPublishFrameByteLimit,
     #[error(
         "broker replay ttl exceeds the application profile cap: {requested_secs}s > {cap_secs}s"
     )]

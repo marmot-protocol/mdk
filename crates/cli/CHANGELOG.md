@@ -33,8 +33,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 - A legitimate long agent preview (more than 4096 records or 1 MiB of cumulative deltas) is no longer silently
   terminated mid-stream by the QUIC broker: the broker's publish path previously enforced the subscriber-sized receive
   defaults on the publisher and closed the room when they tripped. Forward-role limits now come from broker
-  configuration (see the new `--publish-max-records` / `--publish-max-plaintext-bytes` flags) with defaults far above
-  the receive defaults; subscribers still enforce their own receive limits.
+  configuration (see the new `--publish-max-records` / `--publish-max-frame-bytes` flags) with defaults far above
+  the receive defaults; subscribers still enforce their own receive limits. The byte bound counts record frame bytes
+  as forwarded on the wire (ciphertext, including the per-record AEAD tag, for encrypted previews) since the broker
+  never decrypts.
 - A single non-UTF-8 frame on a text-bearing preview record no longer tears down the whole received preview (direct
   receive and broker subscribe): the frame renders as replacement characters and the stream continues. Transcript
   hashing covers the raw bytes, so sender/receiver transcript verification is unaffected.
@@ -49,8 +51,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- `marmot-quic-broker` gained `--publish-max-records` (default 65536) and `--publish-max-plaintext-bytes` (default
-  64 MiB) flags bounding what the broker forwards per publish stream; both appear in the startup output. The broker's
+- `marmot-quic-broker` gained `--publish-max-records` (default 65536) and `--publish-max-frame-bytes` (default
+  64 MiB) flags bounding what the broker forwards per publish stream (frame bytes counted as carried on the wire);
+  both appear in the startup output. The broker's
   publish path also now applies the same generous 120 s quiet-gap deadline to record reads that the direct path and
   the subscriber loop already used, so an alive-but-wedged publisher (kept alive by QUIC keepalives) can no longer pin
   a room indefinitely; agents quiet for under two minutes between records are unaffected.
