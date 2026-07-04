@@ -16,8 +16,8 @@ use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, GroupId, Timestamp, TransportAccountActivation, TransportAdapter, TransportDelivery,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest,
+    EpochId, GroupId, MemberId, Timestamp, TransportAccountActivation, TransportAdapter,
+    TransportDelivery, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
 };
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
@@ -477,10 +477,22 @@ where
     ) -> AccountResult<()> {
         let mut all_published = true;
         let mut any_welcome_exposed = false;
+        let mut welcome_failures = Vec::new();
         for welcome in welcomes {
+            let recipient = welcome_recipient(&welcome);
+            let welcome_id = welcome.id.clone();
+            let failures_before = output.failures.len();
             let status = self.publish_one(welcome, output, context.clone()).await?;
             any_welcome_exposed |= status.accepted_by_any_endpoint;
             if !status.met_required_acks {
+                if let Some(recipient) = recipient {
+                    welcome_failures.push(self.welcome_delivery_failure(
+                        welcome_id,
+                        recipient,
+                        output,
+                        failures_before,
+                    ));
+                }
                 all_published = false;
                 if !any_welcome_exposed {
                     break;
@@ -494,6 +506,10 @@ where
                 .pending
                 .push(PendingResolution::Confirmed { pending });
             output.absorb_session_effects(effects, queue);
+            // Only a confirmed create leaves welcomes worth re-delivering; a
+            // rolled-back create discards the whole evolution, welcomes
+            // included.
+            output.welcome_failures.extend(welcome_failures);
         } else {
             let effects = self.session.publish_failed(pending).await?;
             output
@@ -526,7 +542,23 @@ where
             output.absorb_session_effects(effects, queue);
 
             for welcome in welcomes {
-                self.publish_one(welcome, output, context.clone()).await?;
+                let recipient = welcome_recipient(&welcome);
+                let welcome_id = welcome.id.clone();
+                let failures_before = output.failures.len();
+                let status = self.publish_one(welcome, output, context.clone()).await?;
+                if !status.met_required_acks {
+                    // The commit is already confirmed, so this member's join
+                    // hinges on re-delivering exactly this welcome.
+                    if let Some(recipient) = recipient {
+                        let failure = self.welcome_delivery_failure(
+                            welcome_id,
+                            recipient,
+                            output,
+                            failures_before,
+                        );
+                        output.welcome_failures.push(failure);
+                    }
+                }
             }
         } else {
             let effects = self.session.publish_failed(pending).await?;
@@ -536,6 +568,71 @@ where
             output.absorb_session_effects(effects, queue);
         }
         Ok(())
+    }
+
+    /// Re-publish a stored welcome whose original delivery failed after its
+    /// commit was already confirmed (mdk#352).
+    ///
+    /// The wrapped welcome is loaded from the engine's sent-message store, so
+    /// no re-commit happens and no pending confirm/rollback lifecycle is
+    /// involved — the group evolution this welcome belongs to was confirmed
+    /// when the failure was recorded. A re-delivery that again misses the ack
+    /// threshold records a fresh [`WelcomeDeliveryFailure`] on the returned
+    /// effects, so the caller can keep retrying from the same handle.
+    pub async fn redeliver_welcome(
+        &mut self,
+        message_id: &cgka_traits::MessageId,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let (group_id, message) = self.session.stored_sent_welcome(message_id)?;
+        // `stored_sent_welcome` only returns welcome envelopes.
+        let recipient = welcome_recipient(&message);
+        let mut output = AccountDeviceEffects::default();
+        let failures_before = output.failures.len();
+        let status = self.publish_one(message, &mut output, None).await?;
+        if !status.met_required_acks
+            && let Some(recipient) = recipient
+        {
+            let mut failure = self.welcome_delivery_failure(
+                message_id.clone(),
+                recipient,
+                &output,
+                failures_before,
+            );
+            failure.group_id = Some(group_id);
+            output.welcome_failures.push(failure);
+        }
+        Ok(output)
+    }
+
+    /// Build the structured re-delivery record for a welcome that just failed
+    /// to publish, pairing the recipient with the reason `publish_one` pushed.
+    fn welcome_delivery_failure(
+        &self,
+        message_id: cgka_traits::MessageId,
+        recipient: MemberId,
+        output: &AccountDeviceEffects,
+        failures_before: usize,
+    ) -> WelcomeDeliveryFailure {
+        // `publish_one` pushes exactly one `PublishFailure` on each failing
+        // path (routing, adapter, required_acks); the defensive fallback only
+        // guards against that contract changing.
+        let reason = output
+            .failures
+            .get(failures_before..)
+            .and_then(<[PublishFailure]>::last)
+            .map(|failure| failure.reason.clone())
+            .unwrap_or_else(|| "welcome publish failed".into());
+        let group_id = self
+            .session
+            .stored_sent_welcome(&message_id)
+            .ok()
+            .map(|(group_id, _)| group_id);
+        WelcomeDeliveryFailure {
+            message_id,
+            recipient,
+            group_id,
+            reason,
+        }
     }
 
     async fn publish_one(
@@ -696,6 +793,15 @@ where
     }
 }
 
+/// The welcome recipient carried in the message's transport envelope, if the
+/// message is a welcome.
+fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
+    match &message.envelope {
+        TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
+        TransportEnvelope::GroupMessage { .. } => None,
+    }
+}
+
 /// Build the outbound transport wire envelope for a publish, from the message's
 /// transport source and (for group messages) the transport-visible group id.
 /// Transport-generic: the post-wrap relay event id and ephemeral pubkey are
@@ -722,6 +828,11 @@ pub struct AccountDeviceEffects {
     pub pending_convergence: Vec<GroupId>,
     pub reports: Vec<TransportPublishReport>,
     pub failures: Vec<PublishFailure>,
+    /// Welcomes whose publish failed after their commit/create was already
+    /// confirmed. Unlike `failures`, each entry carries the recipient and
+    /// group so the caller can re-deliver the stored welcome via
+    /// [`AccountDeviceRuntime::redeliver_welcome`] without re-committing.
+    pub welcome_failures: Vec<WelcomeDeliveryFailure>,
     pub pending: Vec<PendingResolution>,
 }
 
@@ -747,6 +858,21 @@ pub struct AccountIngestEffects {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishFailure {
     pub message_id: cgka_traits::MessageId,
+    pub reason: String,
+}
+
+/// A welcome left undelivered by a confirmed group create/evolution (mdk#352).
+///
+/// The added member cannot join until the welcome reaches them, and the commit
+/// cannot be rolled back (it is already confirmed and externally visible), so
+/// re-delivery is the only repair. The wrapped welcome stays available in the
+/// engine's sent-message store under `message_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WelcomeDeliveryFailure {
+    pub message_id: cgka_traits::MessageId,
+    pub recipient: MemberId,
+    /// From the stored sent-welcome record; best-effort.
+    pub group_id: Option<GroupId>,
     pub reason: String,
 }
 
