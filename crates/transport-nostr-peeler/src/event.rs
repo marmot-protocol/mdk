@@ -44,7 +44,10 @@ impl NostrTransportEvent {
             KIND_MARMOT_GROUP_MESSAGE => {
                 let group_id = self.single_tag_value(GROUP_TAG)?;
                 TransportEnvelope::GroupMessage {
-                    transport_group_id: decode_hex("group h tag", group_id)?,
+                    // The `h` tag is the hex of the 32-byte nostr_group_id
+                    // (spec/transports/nostr.md); shorter/longer route ids are
+                    // rejected, not passed through.
+                    transport_group_id: decode_hex_exact("group h tag", group_id, 32)?,
                 }
             }
             KIND_NIP59_GIFT_WRAP => {
@@ -130,16 +133,27 @@ impl NostrTransportEvent {
             .collect()
     }
 
-    /// Return exactly one value for a Nostr tag name.
+    /// Return the value of exactly one Nostr tag.
+    ///
+    /// Counts tag *occurrences* (any tag whose name matches), not extracted
+    /// values, so a valueless duplicate like `["p"]` next to `["p", <value>]`
+    /// is still rejected instead of collapsing to a single first-match value.
     pub fn single_tag_value(&self, name: &str) -> Result<&str, NostrPeelerError> {
-        let values = self.tag_values(name);
-        match values.as_slice() {
-            [] => Err(NostrPeelerError::MissingTag(name.into())),
-            [value] => Ok(value),
-            _ => Err(NostrPeelerError::Malformed(format!(
+        let mut matches = self
+            .tags
+            .iter()
+            .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name));
+        let first = matches
+            .next()
+            .ok_or_else(|| NostrPeelerError::MissingTag(name.into()))?;
+        if matches.next().is_some() {
+            return Err(NostrPeelerError::Malformed(format!(
                 "Nostr event must contain exactly one {name} tag"
-            ))),
+            )));
         }
+        first.get(1).map(String::as_str).ok_or_else(|| {
+            NostrPeelerError::Malformed(format!("Nostr event {name} tag has no value"))
+        })
     }
 
     /// NIP-01 event id (lowercase hex sha256 of the canonical serialization)
@@ -237,7 +251,7 @@ mod tests {
             pubkey: "22".repeat(32),
             created_at: 1_700_000_000,
             kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into(), "aa55".into()]],
+            tags: vec![vec!["h".into(), "aa".repeat(32)]],
             content: "encrypted body".into(),
             sig: None,
         };
@@ -257,7 +271,7 @@ mod tests {
         assert_eq!(
             msg.envelope,
             TransportEnvelope::GroupMessage {
-                transport_group_id: vec![0xaa, 0x55],
+                transport_group_id: vec![0xaa; 32],
             }
         );
         assert_eq!(
@@ -329,7 +343,7 @@ mod tests {
             pubkey: "22".repeat(32),
             created_at: 1_700_000_000,
             kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into(), "aa55".into()]],
+            tags: vec![vec!["h".into(), "aa".repeat(32)]],
             content: "encrypted body".into(),
             sig: None,
         };
@@ -361,6 +375,80 @@ mod tests {
 
         assert!(matches!(
             event.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn route_mapping_rejects_non_32_byte_group_route_id() {
+        // The `h` tag is the hex of the 32-byte nostr_group_id
+        // (spec/transports/nostr.md); a short route id must be rejected at the
+        // boundary, not passed through into the transport envelope.
+        let mut event = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_000,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into(), "aa55".into()]],
+            content: "encrypted body".into(),
+            sig: None,
+        };
+        event.id = event.computed_id();
+
+        assert!(matches!(
+            event.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn single_tag_enforcement_counts_valueless_duplicate_tags() {
+        // A valueless `["p"]` next to `["p", <valid>]` must not collapse into
+        // "exactly one value" — duplicate occurrences are rejected regardless
+        // of whether each carries a value. Same contract for `h`.
+        let mut gift_wrap = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: KIND_NIP59_GIFT_WRAP,
+            tags: vec![vec!["p".into()], vec!["p".into(), "55".repeat(32)]],
+            content: "gift wrap body".into(),
+            sig: None,
+        };
+        gift_wrap.id = gift_wrap.computed_id();
+        assert!(matches!(
+            gift_wrap.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+
+        let mut group = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_000,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into()], vec!["h".into(), "aa".repeat(32)]],
+            content: "encrypted body".into(),
+            sig: None,
+        };
+        group.id = group.computed_id();
+        assert!(matches!(
+            group.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+
+        // A single matching tag with no value is malformed, not missing.
+        let mut valueless = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: KIND_NIP59_GIFT_WRAP,
+            tags: vec![vec!["p".into()]],
+            content: "gift wrap body".into(),
+            sig: None,
+        };
+        valueless.id = valueless.computed_id();
+        assert!(matches!(
+            valueless.to_transport_message(),
             Err(NostrPeelerError::Malformed(_))
         ));
     }

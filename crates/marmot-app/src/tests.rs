@@ -81,7 +81,7 @@ fn relay_delivery(marker: &str, pubkey: String) -> cgka_traits::TransportDeliver
         pubkey,
         created_at: 1,
         kind: transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
-        tags: vec![vec!["h".to_owned(), "aa".to_owned()]],
+        tags: vec![vec!["h".to_owned(), "aa".repeat(32)]],
         content: format!("ciphertext {marker}"),
         sig: None,
     };

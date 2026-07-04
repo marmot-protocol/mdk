@@ -1,5 +1,5 @@
 use crate::error::to_peeler_error;
-use crate::event::{decode_hex, decode_hex_exact};
+use crate::event::decode_hex_exact;
 use crate::{
     DEFAULT_EXPORTER_LABEL, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_MARMOT_WELCOME_RUMOR,
     KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN, NOSTR_GROUP_KEY_LEN, NostrTransportEvent,
@@ -464,7 +464,7 @@ fn ensure_group_routing_matches(
     let event_group_id = event
         .single_tag_value(GROUP_TAG)
         .map_err(to_peeler_error)
-        .and_then(|h| decode_hex("group h tag", h).map_err(to_peeler_error))?;
+        .and_then(|h| decode_hex_exact("group h tag", h, 32).map_err(to_peeler_error))?;
     match &msg.envelope {
         TransportEnvelope::GroupMessage { transport_group_id }
             if *transport_group_id == event_group_id =>
