@@ -1937,6 +1937,121 @@ async fn convergence_apply_clears_removed_marker_without_canonical_evidence() {
     send_app(&mut carol, &group_id, b"send after healing".to_vec()).await;
 }
 
+/// Sibling of the test above with the FULL post-`realize_self_eviction`
+/// record shape: `removed = true` AND self stripped from `Group.members`,
+/// while the live MLS state (the canonical evidence) still records our
+/// active leaf. The convergence apply rebuilds the roster from the replayed
+/// MLS state and the reconciliation guard clears the marker, so the heal
+/// works even when the record looked fully evicted before the replay
+/// refreshed it.
+#[tokio::test]
+async fn convergence_apply_heals_fully_evicted_shaped_record() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-heal-evicted-record".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Pathological copy mirroring the shape `realize_self_eviction` writes
+    // (marker + roster reconciliation in one record), but WITHOUT any
+    // removal in MLS state: the canonical evidence still records our leaf.
+    let mut record = carol_storage.get_group(&group_id).unwrap();
+    record.removed = true;
+    let self_id = carol.self_id();
+    record.members.retain(|member| member.id != self_id);
+    carol_storage.put_group(&record).unwrap();
+    let payload = app_payload_for(&carol, b"blocked by evicted-shaped record");
+    let gate = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await;
+    assert!(
+        matches!(
+            &gate,
+            Err(cgka_traits::error::EngineError::InvalidTransition(t)) if t.from == "Removed"
+        ),
+        "marked copy must reject sends, got {gate:?}"
+    );
+
+    let rename_res = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("healed from evicted shape".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (rename_commit, rename_pending) = evolution(rename_res);
+    alice.confirm_published(rename_pending).await.unwrap();
+    let rename_commit = route(rename_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, rename_commit.clone(), 1_000)
+        .expect("rename commit buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("forward apply converges");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
+
+    let group = carol_storage.get_group(&group_id).unwrap();
+    assert!(
+        !group.removed,
+        "convergence apply must clear a marker the canonical MLS state contradicts"
+    );
+    assert_eq!(group.name, "healed from evicted shape");
+    assert!(
+        group.members.iter().any(|m| m.id == carol.self_id()),
+        "replay must rebuild the roster from canonical MLS state"
+    );
+    // The stale record presented us as absent, so the apply re-announces our
+    // membership as a roster-correction row.
+    let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateChanged {
+                group_id: g,
+                change: cgka_traits::engine::GroupStateChange::MemberAdded { member },
+                ..
+            } if g == &group_id && *member == carol.self_id()
+        )),
+        "expected roster-correction MemberAdded for self, got {events:?}"
+    );
+    send_app(
+        &mut carol,
+        &group_id,
+        b"send after evicted-shape heal".to_vec(),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn engine_does_not_apply_stored_branch_before_stability_gate() {
     let (mut alice, _alice_storage) = build_client(b"alice");

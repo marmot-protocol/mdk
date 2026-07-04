@@ -1,4 +1,25 @@
 //! Engine entry point for stored-message distributed convergence.
+//!
+//! # Removed-marker lifecycle
+//!
+//! `Group.removed` realizes the local member's own removal
+//! (member-departure.md, "Realizing removal"): it is set when an accepted
+//! commit on the selected canonical branch removes our leaf — on the direct
+//! seam, via `realize_self_eviction`, or in `emit_convergence_events` here —
+//! and it clears in exactly two ways: an authenticated re-join
+//! (`do_join_welcome`), or branch selection superseding the removal that set
+//! it. A superseded removal was never canonically applied, so it "MUST NOT
+//! remain visible to the application as a completed change" (convergence.md,
+//! "Applying the selected branch"); member-departure.md's "terminal for that
+//! group copy" rule presumes the removal stays canonical (clarification
+//! tracked in marmot-protocol/marmot#220). A supersession reorg normally
+//! restores the pre-removal record wholesale from the retained anchor (the
+//! anchor predates the marker write); the explicit reconciliation in
+//! `emit_convergence_events` is the state-derived inverse of
+//! `realize_self_eviction` for markers no anchor restore can see, and it
+//! clears only when the canonical roster AND the live MLS state both record
+//! our active membership. Outbound intents purged at realization stay purged
+//! — the app re-issues sends against the reopened send gate.
 
 use std::collections::HashSet;
 
@@ -492,6 +513,38 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
+    /// Whether the live OpenMLS group state records the local member as an
+    /// active member: the group loads, is active, and its own leaf carries
+    /// the engine's identity. Fail-closed (`false`) on any missing or
+    /// unreadable state, so callers gating a safety-relevant transition on
+    /// canonical membership never act on a copy MLS itself would refuse.
+    fn self_leaf_is_active_in_mls(&self, group_id: &GroupId) -> bool {
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let Ok(Some(mls_group)) = openmls::group::MlsGroup::load(
+            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                &provider,
+            ),
+            &mls_gid,
+        ) else {
+            return false;
+        };
+        if !mls_group.is_active() {
+            return false;
+        }
+        let Some(leaf) = mls_group.own_leaf_node() else {
+            return false;
+        };
+        let Ok(credential) = openmls::prelude::BasicCredential::try_from(leaf.credential().clone())
+        else {
+            return false;
+        };
+        credential.identity() == self.identity.self_id().as_slice()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_convergence_events(
         &mut self,
@@ -637,26 +690,13 @@ impl<S: StorageProvider> Engine<S> {
         }
         if current_ids.contains(self.identity.self_id()) {
             // The selected canonical branch records our membership, so a
-            // `removed` marker on the record is inconsistent with canonical
-            // state and must clear: a previously applied removal that lost
-            // branch selection "MUST NOT remain visible to the application as
-            // a completed change" (convergence.md, "Applying the selected
-            // branch"), and member-departure.md's "terminal for that group
-            // copy" rule presumes removal evidence on the selected canonical
-            // branch (clarification tracked in marmot-protocol/marmot#220).
-            // A reorg normally already restored the pre-removal
-            // record from the retained anchor before the replay (the anchor
-            // predates the marker write), so this is the explicit
-            // state-derived inverse of `realize_self_eviction`: it reconciles
-            // the pathological copy whose marker survived without canonical
-            // evidence, and keeps the send-gate posture derivable from
-            // canonical state alone. Outbound intents purged at realization
-            // stay purged — the app re-issues sends against the reopened
-            // send gate. Gated on the record snapshot loaded above so the
-            // common (not-removed) path re-reads nothing; the re-fetch on the
-            // rare marked path re-checks under the fresh record before
-            // writing.
-            if group_record_was_removed {
+            // surviving `removed` marker must clear (module docs, "Removed-
+            // marker lifecycle"; marmot-protocol/marmot#220). Gated on the
+            // record snapshot loaded above (no extra read on the common
+            // not-removed path) AND on the live MLS state carrying our
+            // active leaf, so the heal stays derivable from canonical MLS
+            // state even if the record roster were ever stale.
+            if group_record_was_removed && self.self_leaf_is_active_in_mls(group_id) {
                 let mut group = self
                     .storage
                     .get_group(group_id)
