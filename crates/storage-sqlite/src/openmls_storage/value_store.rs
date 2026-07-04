@@ -225,14 +225,24 @@ impl SqliteOpenMlsStorage {
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let storage_key = build_key(label, key.clone());
         let legacy_storage_key = build_key_legacy(label, key);
-        // Single autocommit statement: retry the whole delete on transient lock
-        // contention (issue #484).
-        retry_on_busy(|| {
+        if self.connection.is_current_thread_transaction_owner() {
             let conn = self.lock()?;
             delete_value_on_connection(&conn, storage_key.as_slice())?;
             delete_value_on_connection(&conn, legacy_storage_key.as_slice())?;
             Ok(())
-        })
+        } else {
+            // Own a fresh transaction so the new-format row and legacy row are
+            // removed atomically; retry the whole idempotent delete on transient
+            // lock contention (issue #484).
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction()?;
+                delete_value_on_connection(&tx, storage_key.as_slice())?;
+                delete_value_on_connection(&tx, legacy_storage_key.as_slice())?;
+                tx.commit()?;
+                Ok(())
+            })
+        }
     }
 
     pub(in crate::openmls_storage) fn delete_group_value<GroupId: Key<CURRENT_VERSION>>(
