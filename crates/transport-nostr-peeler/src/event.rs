@@ -30,6 +30,15 @@ pub struct NostrTransportEvent {
 impl NostrTransportEvent {
     /// Convert a Nostr event into the raw transport message the engine ingests.
     pub fn to_transport_message(&self) -> Result<TransportMessage, NostrPeelerError> {
+        // #709/#351 — the resulting `TransportMessage.id` keys routing metrics,
+        // telemetry, and the forensic `wire_id`, so bind it to the event hash
+        // here rather than trusting the self-reported id. Signature
+        // verification still happens at peel time.
+        if !self.id.eq_ignore_ascii_case(&self.computed_id()) {
+            return Err(NostrPeelerError::Malformed(
+                "event id does not match event hash".into(),
+            ));
+        }
         let id = MessageId::new(decode_hex_exact("event id", &self.id, 32)?);
         let envelope = match self.kind {
             KIND_MARMOT_GROUP_MESSAGE => {
@@ -39,9 +48,7 @@ impl NostrTransportEvent {
                 }
             }
             KIND_NIP59_GIFT_WRAP => {
-                let recipient = self
-                    .tag_value(RECIPIENT_TAG)
-                    .ok_or_else(|| NostrPeelerError::MissingTag(RECIPIENT_TAG.into()))?;
+                let recipient = self.single_tag_value(RECIPIENT_TAG)?;
                 TransportEnvelope::Welcome {
                     recipient: MemberId::new(decode_hex_exact("recipient p tag", recipient, 32)?),
                 }
@@ -135,6 +142,19 @@ impl NostrTransportEvent {
         }
     }
 
+    /// NIP-01 event id (lowercase hex sha256 of the canonical serialization)
+    /// computed from this event's own fields, independent of the self-reported
+    /// `id` field.
+    pub fn computed_id(&self) -> String {
+        pre_signing_id(
+            &self.pubkey,
+            self.created_at,
+            self.kind,
+            &self.tags,
+            &self.content,
+        )
+    }
+
     /// Build an unsigned local Nostr DTO and precompute the event id for the
     /// supplied unsigned event core.
     pub fn new_unsigned(
@@ -212,8 +232,8 @@ mod tests {
 
     #[test]
     fn kind_445_event_maps_to_group_transport_message() {
-        let event = NostrTransportEvent {
-            id: "11".repeat(32),
+        let mut event = NostrTransportEvent {
+            id: String::new(),
             pubkey: "22".repeat(32),
             created_at: 1_700_000_000,
             kind: KIND_MARMOT_GROUP_MESSAGE,
@@ -221,10 +241,14 @@ mod tests {
             content: "encrypted body".into(),
             sig: None,
         };
+        event.id = event.computed_id();
 
         let msg = event.to_transport_message().expect("event maps");
 
-        assert_eq!(msg.id.as_slice(), vec![0x11; 32].as_slice());
+        assert_eq!(
+            msg.id.as_slice(),
+            hex::decode(&event.id).unwrap().as_slice()
+        );
         assert_eq!(msg.timestamp.0, 1_700_000_000);
         assert_eq!(msg.source.0, NOSTR_SOURCE);
         // The peeler does not extract `e` causal-dependency tags (kind 445 carries
@@ -273,8 +297,8 @@ mod tests {
 
     #[test]
     fn kind_1059_route_mapping_defers_signature_verification_to_peeling() {
-        let event = NostrTransportEvent {
-            id: "33".repeat(32),
+        let mut event = NostrTransportEvent {
+            id: String::new(),
             pubkey: "44".repeat(32),
             created_at: 1_700_000_001,
             kind: KIND_NIP59_GIFT_WRAP,
@@ -282,6 +306,7 @@ mod tests {
             content: "gift wrap body".into(),
             sig: None,
         };
+        event.id = event.computed_id();
 
         let msg = event
             .to_transport_message()
@@ -293,5 +318,73 @@ mod tests {
                 recipient: MemberId::new(vec![0x55; 32]),
             }
         );
+    }
+
+    #[test]
+    fn route_mapping_rejects_forged_event_id() {
+        // #351 — `TransportMessage.id` keys routing/telemetry/forensics, so a
+        // self-reported id that does not match the event hash fails closed.
+        let event = NostrTransportEvent {
+            id: "33".repeat(32),
+            pubkey: "22".repeat(32),
+            created_at: 1_700_000_000,
+            kind: KIND_MARMOT_GROUP_MESSAGE,
+            tags: vec![vec!["h".into(), "aa55".into()]],
+            content: "encrypted body".into(),
+            sig: None,
+        };
+        assert_ne!(event.id, event.computed_id());
+
+        assert!(matches!(
+            event.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn route_mapping_rejects_duplicate_recipient_tags() {
+        // #336 — gift-wrap `p` extraction is strict single-tag, matching the
+        // kind-445 `h` path; a multi-`p` wrap is rejected, not first-matched.
+        let mut event = NostrTransportEvent {
+            id: String::new(),
+            pubkey: "44".repeat(32),
+            created_at: 1_700_000_001,
+            kind: KIND_NIP59_GIFT_WRAP,
+            tags: vec![
+                vec!["p".into(), "55".repeat(32)],
+                vec!["p".into(), "66".repeat(32)],
+            ],
+            content: "gift wrap body".into(),
+            sig: None,
+        };
+        event.id = event.computed_id();
+
+        assert!(matches!(
+            event.to_transport_message(),
+            Err(NostrPeelerError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn computed_id_matches_sdk_signed_event_id() {
+        // `to_transport_message` verifies self-reported ids against
+        // `computed_id`, so the local NIP-01 id computation must agree with the
+        // Nostr SDK's — including for content that needs JSON escaping.
+        let content = "line\nbreak \"quote\" back\\slash tab\t unicode ✨ control \u{1}";
+        let signed = nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
+            content,
+        )
+        .tags([nostr::Tag::custom(
+            nostr::TagKind::custom("h"),
+            [hex::encode([0x99; 32])],
+        )])
+        .sign_with_keys(&nostr::Keys::generate())
+        .expect("sign kind-445");
+
+        let dto = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+
+        assert_eq!(dto.id, dto.computed_id());
+        assert!(dto.to_transport_message().is_ok());
     }
 }

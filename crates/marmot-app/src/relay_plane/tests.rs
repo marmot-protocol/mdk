@@ -888,15 +888,20 @@ async fn directory_live_event_rejected_after_subscription_removed() {
 }
 
 fn group_event(id_prefix: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
-    NostrTransportEvent {
-        id: id_prefix.repeat(32),
+    // `to_transport_message` verifies the id against the event hash (#351), so
+    // the distinguishing prefix lives in the content and the id is computed
+    // from it — distinct `id_prefix` values still yield distinct event ids.
+    let mut event = NostrTransportEvent {
+        id: String::new(),
         pubkey: "22".repeat(32),
         created_at: 1_700_000_000,
         kind: KIND_MARMOT_GROUP_MESSAGE,
         tags: vec![vec!["h".into(), hex::encode(transport_group_id)]],
-        content: "encrypted".into(),
+        content: format!("encrypted {id_prefix}"),
         sig: None,
-    }
+    };
+    event.id = event.computed_id();
+    event
 }
 
 #[test]

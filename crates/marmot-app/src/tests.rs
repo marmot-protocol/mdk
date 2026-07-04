@@ -73,16 +73,19 @@ fn assert_profile_word_list(name: &str, words: &[&str]) {
     }
 }
 
-fn relay_delivery(event_id: String, pubkey: String) -> cgka_traits::TransportDelivery {
-    let event = NostrTransportEvent {
-        id: event_id,
+fn relay_delivery(marker: &str, pubkey: String) -> cgka_traits::TransportDelivery {
+    // `to_transport_message` verifies the id against the event hash (#351), so
+    // the distinguishing marker lives in the content and the id is computed.
+    let mut event = NostrTransportEvent {
+        id: String::new(),
         pubkey,
         created_at: 1,
         kind: transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE,
         tags: vec![vec!["h".to_owned(), "aa".to_owned()]],
-        content: "ciphertext".to_owned(),
+        content: format!("ciphertext {marker}"),
         sig: None,
     };
+    event.id = event.computed_id();
     cgka_traits::TransportDelivery {
         account_id: MemberId::new(vec![0; 32]),
         group_id_hint: None,
@@ -1228,25 +1231,28 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
 #[test]
 fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
     let local_pubkey = "11".repeat(32);
-    let known_event_id = "22".repeat(32);
-    let new_cross_device_event_id = "33".repeat(32);
-    let known_event_ids = HashSet::from([known_event_id.clone()]);
 
-    let known_local_delivery = relay_delivery(known_event_id.clone(), local_pubkey.clone());
+    let known_local_delivery = relay_delivery("known", local_pubkey.clone());
+    let known_event_ids = HashSet::from([hex::encode(known_local_delivery.message.id.as_slice())]);
     assert!(client::is_own_relay_echo(
         &known_local_delivery,
         &local_pubkey,
         &known_event_ids
     ));
 
-    let same_pubkey_new_event = relay_delivery(new_cross_device_event_id, local_pubkey.clone());
+    let same_pubkey_new_event = relay_delivery("new-cross-device", local_pubkey.clone());
     assert!(!client::is_own_relay_echo(
         &same_pubkey_new_event,
         &local_pubkey,
         &known_event_ids
     ));
 
-    let known_other_pubkey_delivery = relay_delivery(known_event_id, "44".repeat(32));
+    // A delivery claiming a known id under another pubkey can no longer come
+    // out of the transport boundary (the id is verified against the event
+    // hash, #351); forge one directly to prove the echo check independently
+    // requires the local pubkey.
+    let mut known_other_pubkey_delivery = relay_delivery("known", "44".repeat(32));
+    known_other_pubkey_delivery.message.id = known_local_delivery.message.id.clone();
     assert!(!client::is_own_relay_echo(
         &known_other_pubkey_delivery,
         &local_pubkey,

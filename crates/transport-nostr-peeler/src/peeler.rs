@@ -17,7 +17,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use nostr::{EventBuilder, Keys, Kind, NostrSigner, PublicKey, Tag, UnsignedEvent};
+use nostr::{EventBuilder, Keys, Kind, NostrSigner, PublicKey, RelayUrl, Tag, UnsignedEvent};
 use rand::RngCore;
 use std::sync::Arc;
 
@@ -26,6 +26,11 @@ const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
 const KEY_PACKAGE_EVENT_TAG: &str = "e";
 const EXPIRATION_TAG: &str = "expiration";
 const WELCOME_RELAYS_TAG: &str = "relays";
+/// Bound on the welcome rumor `relays` tag value count (#392). Parity with
+/// `MAX_RELAY_ENDPOINTS_PER_ROUTE` in `marmot-app`'s relay safety policy.
+const MAX_WELCOME_RELAYS: usize = 16;
+/// Bound on each welcome rumor relay URL length in bytes (#392).
+const MAX_WELCOME_RELAY_URL_LEN: usize = 512;
 
 /// Empty AAD for the outer kind-445 ChaCha20-Poly1305 sealing
 /// (`spec/transports/nostr.md`: `aad = ""`).
@@ -260,17 +265,13 @@ impl TransportPeeler for NostrMlsPeeler {
 
         // spec/transports/nostr.md — the kind-444 welcome rumor links to the
         // KeyPackage event consumed for this welcome and carries the group
-        // relay list the new member should use next.
-        let key_package_event_id = rumor_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG)
-            .ok_or_else(|| PeelerError::Malformed("welcome rumor is missing e tag".into()))?;
+        // relay list the new member should use next. Both tags are
+        // routing-significant, so duplicates are rejected and the relay values
+        // are content-validated before anything downstream sees them (#709).
+        let key_package_event_id = rumor_single_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG)?;
         decode_hex_exact("welcome e tag", key_package_event_id, 32).map_err(to_peeler_error)?;
-        let relays = rumor_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG)
-            .ok_or_else(|| PeelerError::Malformed("welcome rumor is missing relays tag".into()))?;
-        if relays.is_empty() || relays.iter().any(|relay| relay.is_empty()) {
-            return Err(PeelerError::Malformed(
-                "welcome rumor relays tag must contain at least one non-empty relay".into(),
-            ));
-        }
+        let relays = rumor_single_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG)?;
+        validate_welcome_relays(&relays).map_err(PeelerError::Malformed)?;
 
         let welcome_bytes = BASE64_STANDARD
             .decode(unwrapped.rumor.content.as_bytes())
@@ -344,11 +345,10 @@ impl TransportPeeler for NostrMlsPeeler {
             .await
             .map_err(|e| PeelerError::WrapFailed(format!("signer public key: {e}")))?;
         let recipient_pubkey = Self::recipient_pubkey(recipient)?;
-        if metadata.relays.is_empty() {
-            return Err(PeelerError::WrapFailed(
-                "Nostr welcome relays tag must not be empty".into(),
-            ));
-        }
+        // Outbound parity with `peel_welcome`: never emit a relays tag this
+        // peeler would reject on ingest (#392).
+        let relay_strs: Vec<&str> = metadata.relays.iter().map(|relay| relay.as_str()).collect();
+        validate_welcome_relays(&relay_strs).map_err(PeelerError::WrapFailed)?;
         let rumor: UnsignedEvent = EventBuilder::new(
             Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
             BASE64_STANDARD.encode(&payload.ciphertext),
@@ -372,28 +372,80 @@ impl TransportPeeler for NostrMlsPeeler {
     }
 }
 
-/// First value of a tag on an unwrapped NIP-59 rumor (`tag[0] == name` →
-/// `tag[1]`).
-fn rumor_tag_value<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<&'a str> {
-    rumor.tags.iter().find_map(|tag| {
-        let slice = tag.as_slice();
-        match (slice.first(), slice.get(1)) {
-            (Some(tag_name), Some(value)) if tag_name == name => Some(value.as_str()),
-            _ => None,
-        }
-    })
-}
-
-fn rumor_tag_values<'a>(rumor: &'a UnsignedEvent, name: &str) -> Option<Vec<&'a str>> {
-    rumor.tags.iter().find_map(|tag| {
+/// Exactly one `[name, ...]` tag on an unwrapped NIP-59 rumor.
+///
+/// Boundary validation contract (#709): routing-significant rumor tags are
+/// single-valued, so a missing tag and a duplicate tag are both rejected
+/// instead of first-matched, mirroring `single_tag_value` on the outer event.
+fn rumor_single_tag<'a>(rumor: &'a UnsignedEvent, name: &str) -> Result<&'a [String], PeelerError> {
+    let mut matches = rumor.tags.iter().filter_map(|tag| {
         let slice = tag.as_slice();
         match slice.first() {
-            Some(tag_name) if tag_name == name => {
-                Some(slice.iter().skip(1).map(String::as_str).collect())
-            }
+            Some(tag_name) if tag_name == name => Some(slice),
             _ => None,
         }
-    })
+    });
+    let first = matches
+        .next()
+        .ok_or_else(|| PeelerError::Malformed(format!("welcome rumor is missing {name} tag")))?;
+    if matches.next().is_some() {
+        return Err(PeelerError::Malformed(format!(
+            "welcome rumor must contain exactly one {name} tag"
+        )));
+    }
+    Ok(first)
+}
+
+/// Value of the single `[name, value]` tag on an unwrapped NIP-59 rumor.
+fn rumor_single_tag_value<'a>(
+    rumor: &'a UnsignedEvent,
+    name: &str,
+) -> Result<&'a str, PeelerError> {
+    rumor_single_tag(rumor, name)?
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| PeelerError::Malformed(format!("welcome rumor {name} tag has no value")))
+}
+
+/// All values of the single `[name, value, ...]` tag on an unwrapped NIP-59
+/// rumor. The tag itself must appear exactly once; its values stay multi.
+fn rumor_single_tag_values<'a>(
+    rumor: &'a UnsignedEvent,
+    name: &str,
+) -> Result<Vec<&'a str>, PeelerError> {
+    Ok(rumor_single_tag(rumor, name)?
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .collect())
+}
+
+/// Content-validate welcome `relays` values on both wrap and peel (#392):
+/// bounded count, bounded per-entry length, and well-formed ws/wss relay URLs
+/// via [`RelayUrl::parse`]. The relay strings are attacker-controlled on
+/// ingest, so error messages carry only aggregate values, never the URL.
+fn validate_welcome_relays(relays: &[&str]) -> Result<(), String> {
+    if relays.is_empty() {
+        return Err("welcome relays tag must contain at least one relay".into());
+    }
+    if relays.len() > MAX_WELCOME_RELAYS {
+        return Err(format!(
+            "welcome relays tag lists {} relays, limit is {MAX_WELCOME_RELAYS}",
+            relays.len()
+        ));
+    }
+    for relay in relays {
+        if relay.len() > MAX_WELCOME_RELAY_URL_LEN {
+            return Err(format!(
+                "welcome relay URL is {} bytes, limit is {MAX_WELCOME_RELAY_URL_LEN}",
+                relay.len()
+            ));
+        }
+        if RelayUrl::parse(relay).is_err() {
+            return Err("welcome relay is not a valid ws/wss relay URL".into());
+        }
+    }
+    Ok(())
 }
 
 fn transport_group_id(msg: &TransportMessage) -> Option<GroupId> {
@@ -433,8 +485,8 @@ fn ensure_welcome_routing_matches(
     msg: &TransportMessage,
 ) -> Result<(), PeelerError> {
     let event_recipient = event
-        .tag_value(RECIPIENT_TAG)
-        .ok_or_else(|| PeelerError::Malformed("missing p tag".into()))
+        .single_tag_value(RECIPIENT_TAG)
+        .map_err(to_peeler_error)
         .and_then(|p| decode_hex_exact("recipient p tag", p, 32).map_err(to_peeler_error))?;
     match &msg.envelope {
         TransportEnvelope::Welcome { recipient } if recipient.as_slice() == event_recipient => {
@@ -927,19 +979,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn welcome_peel_rejects_duplicate_recipient_tags() {
+        // #336 — `ensure_welcome_routing_matches` runs before gift-wrap
+        // signature verification, so a multi-`p` payload is rejected at the
+        // routing boundary even when the envelope names a valid recipient.
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let mut wrapped = NostrMlsPeeler::new()
+            .with_welcome_signer(sender)
+            .wrap_welcome_with_metadata(
+                &EncryptedPayload {
+                    ciphertext: b"mls welcome bytes".to_vec(),
+                    aad: vec![],
+                },
+                &recipient,
+                &sample_welcome_metadata(),
+            )
+            .await
+            .expect("wrap succeeds");
+        let mut event = NostrTransportEvent::from_transport_message(&wrapped).unwrap();
+        event.tags.push(vec!["p".into(), "66".repeat(32)]);
+        event.id = event.computed_id();
+        wrapped.payload = serde_json::to_vec(&event).unwrap();
+
+        let err = NostrMlsPeeler::new()
+            .with_welcome_signer(receiver)
+            .peel_welcome(&wrapped)
+            .await
+            .expect_err("duplicate p tags should not peel");
+
+        assert!(matches!(err, PeelerError::Malformed(_)));
+    }
+
+    #[tokio::test]
     async fn welcome_peel_rejects_unsigned_gift_wrap_after_route_mapping() {
         let receiver = receiver_keys();
-        let unsigned = NostrTransportEvent {
-            id: "33".repeat(32),
+        let mut event = NostrTransportEvent {
+            id: String::new(),
             pubkey: "44".repeat(32),
             created_at: 1_700_000_001,
             kind: KIND_NIP59_GIFT_WRAP,
             tags: vec![vec!["p".into(), receiver.public_key().to_hex()]],
             content: "gift wrap body".into(),
             sig: None,
-        }
-        .to_transport_message()
-        .expect("route mapping accepts unverified gift-wrap envelope");
+        };
+        event.id = event.computed_id();
+        let unsigned = event
+            .to_transport_message()
+            .expect("route mapping accepts unverified gift-wrap envelope");
 
         let err = NostrMlsPeeler::new()
             .with_welcome_signer(receiver)
@@ -998,14 +1086,14 @@ mod tests {
             .await
             .expect("unwrap");
         assert_eq!(
-            rumor_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG),
-            Some(hex::encode(metadata.key_package_event_id.as_slice()).as_str())
+            rumor_single_tag_value(&unwrapped.rumor, KEY_PACKAGE_EVENT_TAG).unwrap(),
+            hex::encode(metadata.key_package_event_id.as_slice()).as_str()
         );
         assert_eq!(
-            rumor_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG),
-            Some(vec!["wss://group-a.example", "wss://group-b.example"])
+            rumor_single_tag_values(&unwrapped.rumor, WELCOME_RELAYS_TAG).unwrap(),
+            vec!["wss://group-a.example", "wss://group-b.example"]
         );
-        assert_eq!(rumor_tag_value(&unwrapped.rumor, "encoding"), None);
+        assert!(rumor_single_tag_value(&unwrapped.rumor, "encoding").is_err());
         // Content is base64 of the welcome bytes.
         assert_eq!(
             BASE64_STANDARD
@@ -1021,33 +1109,134 @@ mod tests {
         let receiver = receiver_keys();
         let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
 
-        let missing_key_package = welcome_rumor_gift_wrap(&sender, &receiver, false, true).await;
+        let missing_key_package =
+            welcome_rumor_gift_wrap(&sender, &receiver, 0, &[&["wss://group-a.example"]]).await;
         assert!(matches!(
             receiver_peeler.peel_welcome(&missing_key_package).await,
             Err(PeelerError::Malformed(_))
         ));
 
-        let missing_relays = welcome_rumor_gift_wrap(&sender, &receiver, true, false).await;
+        let missing_relays = welcome_rumor_gift_wrap(&sender, &receiver, 1, &[]).await;
         assert!(matches!(
             receiver_peeler.peel_welcome(&missing_relays).await,
             Err(PeelerError::Malformed(_))
         ));
     }
 
-    /// Build a kind-444 welcome rumor gift wrap with optional required tags,
-    /// used to exercise receiver-side metadata validation.
+    #[tokio::test]
+    async fn welcome_peel_rejects_duplicate_key_package_or_relays_tags() {
+        // #350 — the rumor `e` and `relays` tags are strict single-tag, matching
+        // the kind-445 `h` path; duplicates are rejected, not first-matched.
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+
+        let duplicate_key_package =
+            welcome_rumor_gift_wrap(&sender, &receiver, 2, &[&["wss://group-a.example"]]).await;
+        assert!(matches!(
+            receiver_peeler.peel_welcome(&duplicate_key_package).await,
+            Err(PeelerError::Malformed(_))
+        ));
+
+        let duplicate_relays = welcome_rumor_gift_wrap(
+            &sender,
+            &receiver,
+            1,
+            &[&["wss://group-a.example"], &["wss://group-b.example"]],
+        )
+        .await;
+        assert!(matches!(
+            receiver_peeler.peel_welcome(&duplicate_relays).await,
+            Err(PeelerError::Malformed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn welcome_peel_rejects_unvalidated_relay_values() {
+        // #392 — the relay strings are attacker-controlled: bound the count,
+        // bound each entry's length, and require well-formed ws/wss URLs.
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let receiver_peeler = NostrMlsPeeler::new().with_welcome_signer(receiver.clone());
+
+        let too_many: Vec<String> = (0..MAX_WELCOME_RELAYS + 1)
+            .map(|i| format!("wss://relay-{i}.example"))
+            .collect();
+        let oversized_entry = format!("wss://{}.example", "a".repeat(MAX_WELCOME_RELAY_URL_LEN));
+        let cases: Vec<Vec<&str>> = vec![
+            too_many.iter().map(String::as_str).collect(),
+            vec![oversized_entry.as_str()],
+            vec!["https://relay.example"],
+            vec!["not a relay url"],
+            vec![],
+        ];
+
+        for relays in cases {
+            let relay_tag: Vec<&[&str]> = vec![&relays[..]];
+            let msg = welcome_rumor_gift_wrap(&sender, &receiver, 1, &relay_tag).await;
+            assert!(
+                matches!(
+                    receiver_peeler.peel_welcome(&msg).await,
+                    Err(PeelerError::Malformed(_))
+                ),
+                "relay list {:?}... (len {}) should be rejected",
+                relays.first(),
+                relays.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn welcome_wrap_rejects_relay_metadata_it_would_not_peel() {
+        // Outbound parity for #392: the wrap path applies the same relay
+        // validation, so a misconfigured local relay list fails closed.
+        let sender = sender_keys();
+        let receiver = receiver_keys();
+        let recipient = MemberId::new(receiver.public_key().to_bytes().to_vec());
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(sender);
+
+        let too_many: Vec<TransportEndpoint> = (0..MAX_WELCOME_RELAYS + 1)
+            .map(|i| TransportEndpoint(format!("wss://relay-{i}.example")))
+            .collect();
+        for relays in [
+            vec![],
+            vec![TransportEndpoint("https://relay.example".into())],
+            too_many,
+        ] {
+            let metadata = WelcomeMetadata {
+                key_package_event_id: MessageId::new(vec![0x44; 32]),
+                relays,
+            };
+            let err = peeler
+                .wrap_welcome_with_metadata(
+                    &EncryptedPayload {
+                        ciphertext: b"mls welcome bytes".to_vec(),
+                        aad: vec![],
+                    },
+                    &recipient,
+                    &metadata,
+                )
+                .await
+                .expect_err("invalid relay metadata should not wrap");
+            assert!(matches!(err, PeelerError::WrapFailed(_)));
+        }
+    }
+
+    /// Build a kind-444 welcome rumor gift wrap with `key_package_tags` copies
+    /// of the `e` tag and one `relays` tag per entry of `relays_tags`, used to
+    /// exercise receiver-side metadata validation.
     async fn welcome_rumor_gift_wrap(
         sender: &nostr::Keys,
         receiver: &nostr::Keys,
-        include_key_package: bool,
-        include_relays: bool,
+        key_package_tags: usize,
+        relays_tags: &[&[&str]],
     ) -> TransportMessage {
         let mut builder = EventBuilder::new(
             Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
             BASE64_STANDARD.encode(b"mls welcome bytes"),
         );
         let mut tags = Vec::new();
-        if include_key_package {
+        for _ in 0..key_package_tags {
             tags.push(Tag::custom(
                 nostr::TagKind::custom(KEY_PACKAGE_EVENT_TAG),
                 [hex::encode(
@@ -1055,10 +1244,10 @@ mod tests {
                 )],
             ));
         }
-        if include_relays {
+        for relays in relays_tags {
             tags.push(Tag::custom(
                 nostr::TagKind::custom(WELCOME_RELAYS_TAG),
-                ["wss://group-a.example"],
+                relays.iter().copied(),
             ));
         }
         if !tags.is_empty() {

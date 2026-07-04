@@ -25,6 +25,25 @@ storage. Keep those in adapters or the app layer above this crate.
 | `src/peeler.rs` | `TransportPeeler` implementation for Nostr/MLS group messages. |
 | `src/error.rs` | Nostr boundary error vocabulary. |
 
+## Boundary validation contract
+
+Default contract for every field read off an ingest path (#709). A new tag or identifier that uses a loose helper or
+skips content validation is a contract violation, not a style choice.
+
+- **Routing-significant tags are strict single-tag.** The kind `445` `h` tag, the kind `1059` `p` tag, and the kind
+  `444` rumor `e` and `relays` tags are extracted with exactly-one-tag enforcement (`single_tag_value` on the outer
+  event, `rumor_single_tag_*` on the rumor). Missing and duplicate tags are both rejected — never first-matched. Any
+  future routing-significant tag gets the same treatment.
+- **Content-validate at extraction.** Tag values are validated before they surface: ids are hex/length-checked
+  (`decode_hex_exact`), and `relays` values are count-bounded (`MAX_WELCOME_RELAYS`), length-bounded
+  (`MAX_WELCOME_RELAY_URL_LEN`), and ws/wss-scheme-validated (`RelayUrl::parse`) on both wrap and peel.
+- **No self-reported identifier is trusted before verification.** `to_transport_message` verifies the event `id`
+  against the recomputed NIP-01 event hash before it becomes `TransportMessage.id` (which keys routing metrics,
+  telemetry, and the forensic `wire_id`); a mismatch fails closed on every ingest path, including telemetry-only
+  observation. Signature verification still happens at peel time.
+- **Loose first-match helpers (`tag_value`, `tag_values`) are for non-routing, genuinely multi-valued fields only**,
+  and any such field must carry explicit count/length bounds. Do not reach for them when wiring up a new tag.
+
 ## Current limits
 
 - Group messages are wrapped and peeled. Each outbound kind `445` event is signed by a fresh ephemeral Nostr key

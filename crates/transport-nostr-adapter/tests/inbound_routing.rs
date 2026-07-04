@@ -450,6 +450,58 @@ async fn deduplicated_delivery_path_does_not_record_spread() {
 }
 
 #[tokio::test]
+async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
+    // #351 — a subscribed, otherwise well-formed event whose self-reported id
+    // does not match the event hash must neither be routed (no `wire_id`
+    // poisoning) nor key per-relay telemetry on `observe_relay_event`.
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id,
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+
+    let mut forged = group_event("11", &transport_group_id);
+    forged.id = "77".repeat(32);
+
+    adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some("group-sub".into()),
+            event: forged.clone(),
+        })
+        .await
+        .expect_err("forged id must not map to a delivery");
+
+    adapter
+        .observe_relay_event(NostrRelayEvent {
+            endpoint,
+            subscription_id: Some("group-sub".into()),
+            event: forged,
+        })
+        .await;
+
+    let spread = adapter.delivery_spread().await;
+    assert_eq!(spread.observed, 0, "forged id must not enter telemetry");
+    assert_eq!(spread.spread.sample_count(), 0);
+    assert_eq!(spread.per_relay.len(), 0);
+}
+
+#[tokio::test]
 async fn initial_sync_gate_closes_only_after_every_endpoint_eoses() {
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
@@ -1143,13 +1195,18 @@ async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
 }
 
 fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
-    NostrTransportEvent {
-        id: id_byte.repeat(32),
+    // `to_transport_message` verifies the id against the event hash (#351), so
+    // the distinguishing byte lives in the content and the id is computed from
+    // it — distinct `id_byte` values still yield distinct event ids.
+    let mut event = NostrTransportEvent {
+        id: String::new(),
         pubkey: "22".repeat(32),
         created_at: 1_700_000_010,
         kind: KIND_MARMOT_GROUP_MESSAGE,
         tags: vec![vec!["h".into(), hex::encode(transport_group_id)]],
-        content: "outer encrypted body".into(),
+        content: format!("outer encrypted body {id_byte}"),
         sig: None,
-    }
+    };
+    event.id = event.computed_id();
+    event
 }
