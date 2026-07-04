@@ -36,6 +36,14 @@ pub struct Group {
     /// persisted before this field existed.
     #[serde(default)]
     pub removed: bool,
+    /// Epoch at which this device's membership began (welcome-join or group
+    /// creation), refreshed on an authenticated re-join. Post-peel
+    /// classification lower bound: an application message whose MLS epoch
+    /// precedes it is pre-membership — permanently undecryptable by design
+    /// and never worth retrying. `EpochId(0)` (the default for records
+    /// persisted before this field existed) means "unknown — no bound".
+    #[serde(default)]
+    pub join_epoch: EpochId,
 }
 
 /// One member of a group, as storage sees it.

@@ -361,6 +361,51 @@ fn raw_remove_members_commit(
     }
 }
 
+/// Raw OpenMLS application message from `sender`'s current group state whose
+/// inner payload the test controls entirely — the engine `send` path would
+/// refuse a payload whose `MarmotAppEvent.pubkey` differs from the sender's
+/// own id, so forged-attribution payloads must be built at the OpenMLS layer.
+fn raw_app_message_with_payload(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    payload: &[u8],
+) -> TransportMessage {
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load sender MLS group")
+        .expect("sender joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+    let msg = mls_group
+        .create_message(&provider, &signer, payload)
+        .expect("raw OpenMLS application message");
+    let payload = msg
+        .tls_serialize_detached()
+        .expect("serialize raw app message");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-app".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
 /// Raw OpenMLS commit that removes `targets` and ALSO replaces the
 /// GroupContext extensions with a copy that drops the `app_data_dictionary`
 /// entirely, so the resulting epoch carries no admin-policy bytes at all.
@@ -3420,6 +3465,123 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
     );
 }
 
+/// Regression for mdk#383 (audit item S3 on the convergence/replay seam): a
+/// replayed application message whose attribution fails validation is never
+/// surfaced as `MessageReceived` and lands in a terminal state, exactly as on
+/// the direct ingest seam.
+///
+/// The exploit payload is a `MarmotAppEvent` whose `pubkey` is the empty
+/// string. Pre-fix, the replay arm validated it against raw sender bytes that
+/// default to empty when the MLS sender leaf does not resolve to a validated
+/// member id — `hex::encode([]) == ""` matched the forged `pubkey` and the
+/// message surfaced with a blank, unauthenticated author. A truly
+/// unresolvable in-tree sender cannot be constructed end-to-end (every
+/// credential ingress validates identities — this fix is defense-in-depth),
+/// so this test drives the forged payload through the real
+/// ingest → stored-convergence → replay path from a resolvable sender and
+/// pins the seam behavior: no `MessageReceived` for the forged payload, no
+/// `MessageReceived` with an empty `MemberId` ever, and a terminal stored
+/// state. The unresolvable-sender half of the guard is pinned by the
+/// `app_payload` unit tests (empty `MemberId` rejected outright) and the
+/// emit-side backstop in `emit_application_replay_events`.
+#[tokio::test]
+async fn convergence_app_message_with_unresolvable_sender_emits_no_event_and_lands_terminal() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-forged-sender-app".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Alice advances the group epoch 1 -> 2, then authors an application
+    // message at epoch 2 whose inner event claims an empty author.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = evolution(invite);
+    alice.confirm_published(pending).await.unwrap();
+    let forged_payload = MarmotAppEvent::new(
+        "",
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "forged",
+    )
+    .encode()
+    .expect("forged app event encodes");
+    let forged_msg =
+        raw_app_message_with_payload(&alice_storage, &alice.self_id(), &group_id, &forged_payload);
+
+    // Carol buffers the future-epoch app message as a convergence witness,
+    // then the commit, and converges — the forged message replays through the
+    // stored-convergence seam at epoch 2.
+    let outcome = carol.ingest(forged_msg.clone()).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+    carol
+        .ingest(route(commit, &group_id))
+        .await
+        .expect("commit is buffered by ingest");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence settles despite forged app message");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert!(
+        !result
+            .accepted_app_messages
+            .contains(&content_hex(&forged_msg)),
+        "forged-attribution app message must not be accepted"
+    );
+    // Message epoch (2) is at the settled tip (2): the failed validation is
+    // terminal, not retryable — the message cannot re-enter convergence.
+    assert_message_state(&carol_storage, &forged_msg, MessageState::EpochInvalidated);
+
+    let events = carol.drain_events();
+    for event in &events {
+        if let GroupEvent::MessageReceived {
+            sender, payload, ..
+        } = event
+        {
+            assert!(
+                !sender.as_slice().is_empty(),
+                "no MessageReceived may carry an empty MemberId, got {events:?}"
+            );
+            assert_ne!(
+                payload, &forged_payload,
+                "forged app message must not surface, got {events:?}"
+            );
+        }
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+}
+
 /// Regression for mdk#144: a future-epoch app message that is
 /// canonicalized as `UndecryptableInCanonicalState` (the retryable case — the
 /// commit advancing the group to the message's epoch has not been selected
@@ -4262,6 +4424,113 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Regression for mdk#707 review finding 2: a raw `PeelDeferred` row
+/// that becomes peelable but whose content is terminally rejected (here a
+/// forged, unattributable application payload) must be retired from the
+/// deferred queue — marked terminal and released from the retry lifecycle —
+/// not left durably `PeelDeferred` holding a per-group cap slot. Without the
+/// fix, `retry_deferred_peels` treats the post-peel terminal `PeelFailed`
+/// like "still cannot peel" and leaves the raw row deferred forever.
+#[tokio::test]
+async fn deferred_row_terminally_rejected_after_peel_leaves_the_deferred_queue() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_epoch_gate_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "deferred-terminal-after-peel".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Alice advances to epoch 2 and forges an unattributable app message
+    // there (inner `pubkey: ""`), which validation must reject.
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit_to_epoch2, pending) = evolution(invite);
+    let commit_to_epoch2 = route(commit_to_epoch2, &group_id);
+    alice.confirm_published(pending).await.unwrap();
+    let forged_payload = MarmotAppEvent::new(
+        "",
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "forged",
+    )
+    .encode()
+    .expect("forged app event encodes");
+    let forged =
+        raw_app_message_with_payload(&alice_storage, &alice.self_id(), &group_id, &forged_payload);
+
+    // Carol is at epoch 1: the epoch-gate peeler cannot peel an epoch-2
+    // message, so it is retained as a PeelDeferred raw row.
+    assert!(matches!(
+        carol.ingest(forged.clone()).await.unwrap(),
+        IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::PeelFailed
+        }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&forged.id).unwrap().state,
+        MessageState::PeelDeferred
+    );
+
+    // Deliver the epoch-2 commit and converge: carol catches up, re-peels the
+    // forged message, and terminally rejects it. The raw deferred row must be
+    // retired (terminal `Failed`), not left `PeelDeferred`.
+    carol
+        .ingest(commit_to_epoch2)
+        .await
+        .expect("commit buffered");
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        settlement_quiescence_ms: 0,
+        ..CanonicalizationPolicy::default()
+    });
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        carol_storage.get_message(&forged.id).unwrap().state,
+        MessageState::Failed,
+        "a deferred row terminally rejected after peel must leave the deferred queue"
+    );
+    for event in carol.drain_events() {
+        if let GroupEvent::MessageReceived {
+            sender, payload, ..
+        } = event
+        {
+            assert!(!sender.as_slice().is_empty());
+            assert_ne!(payload, forged_payload);
+        }
+    }
 }
 
 #[tokio::test]

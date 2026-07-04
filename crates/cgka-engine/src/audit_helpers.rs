@@ -78,6 +78,7 @@ pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
         StaleReason::OwnEcho => "own_echo",
         StaleReason::PeelFailed => "peel_failed",
         StaleReason::SelfEvicted => "self_evicted",
+        StaleReason::Quarantined => "quarantined",
     }
 }
 
@@ -452,6 +453,8 @@ pub(crate) fn message_state_changed_event(
         new_state: message_state_str(state).to_string(),
         epoch: None,
         reason: reason.to_string(),
+        retry_count: None,
+        sweeps_waited: None,
     }
 }
 
@@ -469,6 +472,31 @@ pub(crate) fn message_state_transition_event(
         new_state: message_state_str(state).to_string(),
         epoch: epoch.map(|epoch| epoch.0),
         reason: reason.to_string(),
+        retry_count: None,
+        sweeps_waited: None,
+    }
+}
+
+/// Terminal transition of a deferred-peel row, carrying the lifecycle's
+/// per-row telemetry: how many re-peel attempts it consumed and how many
+/// retry sweeps it waited between first attempt and this transition
+/// (mdk#339).
+pub(crate) fn deferred_peel_terminal_event(
+    msg_id_hex: MessageRefHex,
+    epoch: Option<EpochId>,
+    reason: &str,
+    retry_count: u64,
+    sweeps_waited: u64,
+) -> AuditEventKind {
+    AuditEventKind::MessageStateChanged {
+        msg_id: msg_id_hex,
+        artifact_kind: None,
+        previous_state: Some(message_state_str(MessageState::PeelDeferred).to_string()),
+        new_state: message_state_str(MessageState::Failed).to_string(),
+        epoch: epoch.map(|epoch| epoch.0),
+        reason: reason.to_string(),
+        retry_count: Some(retry_count),
+        sweeps_waited: Some(sweeps_waited),
     }
 }
 

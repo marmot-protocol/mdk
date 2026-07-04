@@ -57,6 +57,15 @@ pub enum StaleReason {
     /// decrypt failure is a missing-history/repair condition, never
     /// `SelfEvicted`.
     SelfEvicted,
+    /// The group is under hydration quarantine: it failed session-open
+    /// validation and is frozen until explicit repair. The message was not
+    /// applied and no group state changed, but the raw input is retained
+    /// durably and replays automatically once
+    /// `retry_hydrate_quarantined_group` (or an authenticated re-join
+    /// welcome) clears the quarantine. Terminal for the message until then.
+    /// The application can read the quarantine reason from
+    /// `quarantined_groups()`.
+    Quarantined,
 }
 
 /// Decrypted inbound message ready for engine processing.

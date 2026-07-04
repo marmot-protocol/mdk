@@ -385,6 +385,12 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::SelfEvicted
         }
     );
+    insta::assert_json_snapshot!(
+        "stale_quarantined",
+        IngestOutcome::Stale {
+            reason: StaleReason::Quarantined
+        }
+    );
 }
 
 #[test]
@@ -657,6 +663,7 @@ fn snapshot_group_and_member() {
             }],
             required_capabilities: GroupCapabilities::default(),
             removed: false,
+            join_epoch: EpochId(2),
         }
     );
 }

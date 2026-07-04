@@ -88,6 +88,54 @@ impl<S: StorageProvider> Engine<S> {
         transport_group_id: Vec<u8>,
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
+
+        // Quarantine gate (mdk#364): a group frozen by hydration
+        // quarantine must not process any input — its OpenMLS state may load
+        // fine (e.g. MemberValidationFailed) and a merged commit would call
+        // set_stable, silently re-activating a group validation rejected.
+        // Retain the raw transport durably instead: PeelDeferred rows are
+        // excluded from settlement math and replay through
+        // retry_deferred_peels once repair clears the quarantine.
+        if self.quarantined_reason(&group_id).is_some() {
+            let already_retained = matches!(
+                self.storage.get_message(&msg.id),
+                Ok(record) if record.state == MessageState::PeelDeferred
+            );
+            if already_retained || self.reserve_peel_deferred_slot(&group_id)? {
+                self.persist_transport_message_for_existing_group(
+                    msg,
+                    &group_id,
+                    EpochId(0),
+                    MessageState::PeelDeferred,
+                )?;
+                self.audit_group(
+                    &group_id,
+                    crate::audit_helpers::message_state_changed_event(
+                        hex::encode(msg.id.as_slice()),
+                        MessageState::PeelDeferred,
+                        crate::message_disposition::MessageDisposition::Quarantined.tag(),
+                    ),
+                );
+            } else if self.should_audit_peel_deferred_cap_rejection(&group_id) {
+                // Same flood cap as the deferral seam (mdk#339): a
+                // quarantined group's replay buffer must not grow unboundedly
+                // either. Audited once per cap-full episode so a flood does
+                // not emit one write per rejected message.
+                self.audit_group(
+                    &group_id,
+                    marmot_forensics::AuditEventKind::Rejection {
+                        msg_id: hex::encode(msg.id.as_slice()),
+                        reason: crate::message_disposition::MessageDisposition::DeferredCapExceeded
+                            .tag()
+                            .to_string(),
+                    },
+                );
+            }
+            return Ok(IngestOutcome::Stale {
+                reason: StaleReason::Quarantined,
+            });
+        }
+
         let mut pending_recovery: Option<(
             EpochId,
             CommitOrderingKey,
@@ -230,6 +278,37 @@ impl<S: StorageProvider> Engine<S> {
                         );
                         recovery.peeled
                     } else {
+                        // Flood cap (mdk#339): raw transport ids are
+                        // attacker-controllable, so retained rows are capped
+                        // per group; at the cap, new undecryptable input is
+                        // dropped unpersisted and transport redelivery is the
+                        // recovery path once the backlog drains.
+                        let already_retained = matches!(
+                            self.storage.get_message(&msg.id),
+                            Ok(record) if record.state == MessageState::PeelDeferred
+                        );
+                        if !already_retained && !self.reserve_peel_deferred_slot(&group_id)? {
+                            self.seen_message_ids.insert(msg.id.clone());
+                            if self.should_audit_peel_deferred_cap_rejection(&group_id) {
+                                self.audit_group(
+                                    &group_id,
+                                    marmot_forensics::AuditEventKind::Rejection {
+                                        msg_id: msg_id_hex.clone(),
+                                        reason: crate::message_disposition::MessageDisposition::DeferredCapExceeded
+                                            .tag()
+                                            .to_string(),
+                                    },
+                                );
+                            }
+                            tracing::debug!(
+                                target: "cgka_engine::message_processor",
+                                method = "ingest_group_message",
+                                "peel-deferred row cap reached; dropping undecryptable input unpersisted"
+                            );
+                            return Ok(IngestOutcome::Stale {
+                                reason: StaleReason::PeelFailed,
+                            });
+                        }
                         self.persist_transport_message(
                             msg,
                             &group_id,
@@ -241,7 +320,7 @@ impl<S: StorageProvider> Engine<S> {
                             crate::audit_helpers::message_state_changed_event(
                                 msg_id_hex.clone(),
                                 MessageState::PeelDeferred,
-                                "peel_failed_no_snapshot",
+                                crate::message_disposition::MessageDisposition::RetryPending.tag(),
                             ),
                         );
                         return Ok(IngestOutcome::Stale {
@@ -274,6 +353,14 @@ impl<S: StorageProvider> Engine<S> {
                         );
                         recovery.peeled
                     } else {
+                        // Terminal peel failure. Retire the raw deferred row
+                        // (if this came via the retry lifecycle) so it stops
+                        // holding a per-group cap slot (mdk#339); a no-op on
+                        // the direct path where no deferred row exists.
+                        self.mark_raw_transport_message_failed_if_deferred(
+                            &raw_msg_id,
+                            "stale_epoch_no_snapshot",
+                        )?;
                         self.persist_transport_message(
                             msg,
                             &group_id,
@@ -298,13 +385,19 @@ impl<S: StorageProvider> Engine<S> {
             let mls_bytes = match peeled.content {
                 PeeledContent::MlsMessage { bytes } => bytes,
                 PeeledContent::Welcome { .. } => {
+                    // A group-message envelope that peels to a Welcome is
+                    // malformed: terminal. Retire the raw deferred row first
+                    // so its cap slot is released (mdk#339).
+                    self.mark_raw_transport_message_failed_if_deferred(
+                        &raw_msg_id,
+                        "peeled_welcome_in_group_message",
+                    )?;
                     self.persist_transport_message(
                         msg,
                         &group_id,
                         current_epoch,
                         MessageState::Failed,
                     )?;
-                    self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -365,6 +458,13 @@ impl<S: StorageProvider> Engine<S> {
                         current_epoch,
                         MessageState::Failed,
                     )?;
+                    // Peeled successfully but the MLS body is neither a
+                    // public nor private message: terminal. Retire the raw
+                    // deferred row so it leaves the retry lifecycle (mdk#339).
+                    self.mark_raw_transport_message_failed_if_deferred(
+                        &raw_msg_id,
+                        "non_mls_message_body",
+                    )?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -373,6 +473,37 @@ impl<S: StorageProvider> Engine<S> {
 
             let msg_epoch = EpochId(proto.epoch().as_u64());
             let msg_content_type = proto.content_type();
+
+            // Pre-membership classification (mdk#339): an application
+            // message whose MLS epoch precedes this device's join epoch can
+            // never be decrypted here by design — OpenMLS holds no secrets
+            // for epochs before the welcome. Classify it terminal before any
+            // OpenMLS processing instead of feeding it the retry lifecycle.
+            if msg_content_type == ContentType::Application
+                && msg_epoch < current_epoch
+                && self.msg_is_pre_membership(&group_id, msg_epoch)
+            {
+                let tag = crate::message_disposition::MessageDisposition::PreMembershipEvent.tag();
+                self.persist_openmls_wire_message(
+                    &openmls_msg,
+                    &group_id,
+                    current_epoch,
+                    MessageState::Failed,
+                )?;
+                self.audit_group(
+                    &group_id,
+                    crate::audit_helpers::message_state_changed_event(
+                        hex::encode(msg.id.as_slice()),
+                        MessageState::Failed,
+                        tag,
+                    ),
+                );
+                self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
+                return Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                });
+            }
+
             let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
                 if msg_epoch >= current_epoch {
                     true
@@ -435,11 +566,18 @@ impl<S: StorageProvider> Engine<S> {
             } {
                 Ok(p) => p,
                 Err(e) if process_message_error_is_too_distant_in_the_past(&e) => {
+                    // Refine the historical classification (mdk#339):
+                    // before the join epoch the message was never decryptable
+                    // here by design; at or after it, this device was a
+                    // member but the past-epoch secrets are gone.
+                    let tag = if self.msg_is_pre_membership(&group_id, msg_epoch) {
+                        crate::message_disposition::MessageDisposition::PreMembershipEvent.tag()
+                    } else {
+                        crate::message_disposition::MessageDisposition::ValidHistorySnapshotMissing
+                            .tag()
+                    };
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    self.mark_raw_transport_message_failed_if_deferred(
-                        &raw_msg_id,
-                        "too_distant_in_the_past",
-                    )?;
+                    self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -466,36 +604,27 @@ impl<S: StorageProvider> Engine<S> {
                                 mls_bytes.as_slice(),
                             )? {
                                 ForkResolution::MissingSnapshot => {
-                                    let previous_state =
-                                        self.epoch_manager.state(&group_id).map(|state| {
-                                            crate::audit_helpers::epoch_state_name_str(state.name())
-                                                .to_string()
-                                        });
-                                    self.epoch_manager.detect_fork(&group_id, vec![]);
-                                    self.audit_group(
-                                        &group_id,
-                                        crate::audit_helpers::epoch_state_changed_event(
-                                            previous_state.as_deref(),
-                                            "recovering",
-                                            msg_epoch,
-                                            "fork_detected",
-                                            None,
-                                            None,
-                                        ),
-                                    );
-                                    self.update_stored_message_state(
-                                        &msg.id,
-                                        MessageState::EpochInvalidated,
-                                    )?;
-                                    return Err(EngineError::ForkedEpoch {
-                                        group_id: group_id.clone(),
-                                        last_stable: msg_epoch,
-                                        conflicting_epoch: current,
-                                    });
+                                    return Err(self.forked_epoch_fail_closed(
+                                        &group_id, &msg.id, msg_epoch, current,
+                                    ));
                                 }
                                 ForkResolution::IncumbentWins
                                 | ForkResolution::CandidateWins { .. } => {
-                                    unreachable!("missing snapshot cannot resolve a fork candidate")
+                                    // recovery_snapshot_name_for_fork and
+                                    // resolve_fork_candidate read the same
+                                    // incumbents map, so a resolution without
+                                    // a snapshot means that coupling broke.
+                                    // This path is reachable from inbound
+                                    // same-epoch fork commits — fail closed
+                                    // instead of panicking (#394).
+                                    tracing::warn!(
+                                        target: "cgka_engine::message_processor",
+                                        method = "ingest_group_message",
+                                        "fork candidate resolved without a recovery snapshot; failing closed"
+                                    );
+                                    return Err(self.forked_epoch_fail_closed(
+                                        &group_id, &msg.id, msg_epoch, current,
+                                    ));
                                 }
                             }
                         };
@@ -532,32 +661,9 @@ impl<S: StorageProvider> Engine<S> {
                                 });
                             }
                             ForkResolution::MissingSnapshot => {
-                                let previous_state =
-                                    self.epoch_manager.state(&group_id).map(|state| {
-                                        crate::audit_helpers::epoch_state_name_str(state.name())
-                                            .to_string()
-                                    });
-                                self.epoch_manager.detect_fork(&group_id, vec![]);
-                                self.audit_group(
-                                    &group_id,
-                                    crate::audit_helpers::epoch_state_changed_event(
-                                        previous_state.as_deref(),
-                                        "recovering",
-                                        msg_epoch,
-                                        "fork_detected",
-                                        None,
-                                        None,
-                                    ),
-                                );
-                                self.update_stored_message_state(
-                                    &msg.id,
-                                    MessageState::EpochInvalidated,
-                                )?;
-                                return Err(EngineError::ForkedEpoch {
-                                    group_id: group_id.clone(),
-                                    last_stable: msg_epoch,
-                                    conflicting_epoch: current,
-                                });
+                                return Err(self.forked_epoch_fail_closed(
+                                    &group_id, &msg.id, msg_epoch, current,
+                                ));
                             }
                         }
                     }
@@ -608,6 +714,13 @@ impl<S: StorageProvider> Engine<S> {
                             "dropping application message with unattributable sender"
                         );
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        // Peeled successfully but terminally rejected: retire
+                        // the raw deferred row so it leaves the retry
+                        // lifecycle instead of holding a cap slot (mdk#339).
+                        self.mark_raw_transport_message_failed_if_deferred(
+                            &raw_msg_id,
+                            "unattributable_sender",
+                        )?;
                         return Ok(IngestOutcome::Stale {
                             reason: StaleReason::PeelFailed,
                         });
@@ -622,6 +735,12 @@ impl<S: StorageProvider> Engine<S> {
                             "dropping application message with invalid Marmot app event",
                         );
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        // Peeled successfully but terminally rejected: retire
+                        // the raw deferred row (mdk#339).
+                        self.mark_raw_transport_message_failed_if_deferred(
+                            &raw_msg_id,
+                            "invalid_app_payload",
+                        )?;
                         return Ok(IngestOutcome::Stale {
                             reason: StaleReason::PeelFailed,
                         });
@@ -1416,7 +1535,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     fn mark_raw_transport_message_failed_if_deferred(
-        &self,
+        &mut self,
         raw_msg_id: &MessageId,
         reason: &str,
     ) -> Result<(), EngineError> {
@@ -1434,10 +1553,66 @@ impl<S: StorageProvider> Engine<S> {
                         reason,
                     ),
                 );
+                self.note_peel_deferred_row_retired(&record.group_id, raw_msg_id);
                 Ok(())
             }
             Ok(_) | Err(StorageError::NotFound) => Ok(()),
             Err(err) => Err(EngineError::Storage(err)),
+        }
+    }
+
+    /// Whether `msg_epoch` predates this device's membership in `group_id`
+    /// (mdk#339): such a message was never decryptable here by design —
+    /// OpenMLS holds no secrets for epochs before the welcome — so it is
+    /// terminal, never retried. Best-effort: a `join_epoch` of `EpochId(0)`
+    /// (legacy records or a missing record) is "unknown", which applies no
+    /// bound and returns `false`.
+    fn msg_is_pre_membership(&self, group_id: &GroupId, msg_epoch: EpochId) -> bool {
+        let join_epoch = self
+            .storage
+            .get_group(group_id)
+            .map(|group| group.join_epoch)
+            .unwrap_or_default();
+        join_epoch.0 > 0 && msg_epoch < join_epoch
+    }
+
+    /// Fail-closed terminal handling for a same-epoch fork commit with no
+    /// replayable winner: mark the group recovering, record the fork in the
+    /// audit log, invalidate the stored message, and hand back the typed
+    /// `ForkedEpoch` error for the caller to return. Every arm of the
+    /// fork-recovery seam that ends without a recovery snapshot goes through
+    /// this — including the invariant-break arm that previously panicked via
+    /// `unreachable!` on attacker-delivered input (#394).
+    fn forked_epoch_fail_closed(
+        &mut self,
+        group_id: &GroupId,
+        msg_id: &MessageId,
+        msg_epoch: EpochId,
+        current: EpochId,
+    ) -> EngineError {
+        let previous_state = self
+            .epoch_manager
+            .state(group_id)
+            .map(|state| crate::audit_helpers::epoch_state_name_str(state.name()).to_string());
+        self.epoch_manager.detect_fork(group_id, vec![]);
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                previous_state.as_deref(),
+                "recovering",
+                msg_epoch,
+                "fork_detected",
+                None,
+                None,
+            ),
+        );
+        if let Err(err) = self.update_stored_message_state(msg_id, MessageState::EpochInvalidated) {
+            return err;
+        }
+        EngineError::ForkedEpoch {
+            group_id: group_id.clone(),
+            last_stable: msg_epoch,
+            conflicting_epoch: current,
         }
     }
 
@@ -1612,7 +1787,7 @@ impl<S: StorageProvider> Engine<S> {
         Ok(false)
     }
 
-    fn available_past_peel_snapshots(
+    pub(crate) fn available_past_peel_snapshots(
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<(EpochId, String)>, EngineError> {

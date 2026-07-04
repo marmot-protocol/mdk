@@ -28,6 +28,7 @@ use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId};
+use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
 use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
 use openmls::treesync::Node;
@@ -222,6 +223,7 @@ impl<S: StorageProvider> Engine<S> {
             members: projected_members,
             required_capabilities: required_caps,
             removed: false,
+            join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         self.storage.put_group(&group_record)?;
         // #740: index this group's transport routing id for O(1) inbound
@@ -540,6 +542,7 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_group,
             ),
             removed: false,
+            join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         mirror_app_components_into_record(&mls_group, &mut group_record);
         self.storage.put_group(&group_record)?;
@@ -618,6 +621,31 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         self.seen_message_ids.insert(welcome_id);
+
+        // An authenticated welcome re-validated every leaf and wrote fresh
+        // group state — strictly stronger evidence of health than
+        // `retry_hydrate_quarantined_group` re-reading stored state. Clear a
+        // hydration quarantine for this id so the map cannot go stale against
+        // the now-live group (and so an unrepairable group can always be
+        // recovered by re-invite). The buffered-message replay below picks up
+        // any input retained while quarantined.
+        if self.quarantined_groups.remove(&group_id).is_some() {
+            let recovered_epoch = EpochId(mls_group.epoch().as_u64());
+            tracing::info!(
+                target: "cgka_engine::hydrate",
+                method = "do_join_welcome",
+                outcome = "recovered_via_rejoin",
+                "authenticated re-join welcome cleared a hydration quarantine"
+            );
+            self.audit(AuditEventKind::GroupHydrationRecovered {
+                group_digest: crate::engine::hydration_quarantine_group_digest(&group_id),
+            });
+            self.events_buf
+                .push_back(cgka_traits::engine::GroupEvent::GroupHydrationRecovered {
+                    group_id: group_id.clone(),
+                    recovered_epoch,
+                });
+        }
 
         self.replay_buffered_messages(&group_id).await?;
         Ok(group_id)

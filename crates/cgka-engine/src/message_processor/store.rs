@@ -221,14 +221,22 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => None,
             Err(err) => return Err(EngineError::Storage(err)),
         };
-        if previous.as_ref().is_some_and(|record| {
-            record.group_id == *group_id && record.epoch == epoch && record.state == state
-        }) {
-            return Ok(());
-        }
         let payload = payload
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        // Short-circuit only when the stored record is fully identical,
+        // including the encoded payload bytes. A same (group, epoch, state)
+        // row persisted under a different payload variant (e.g. RawTransport
+        // then OpenMlsWire) must be overwritten, not silently kept — a reader
+        // on the other processing path would otherwise skip the record (#369).
+        if previous.as_ref().is_some_and(|record| {
+            record.group_id == *group_id
+                && record.epoch == epoch
+                && record.state == state
+                && record.payload == payload
+        }) {
+            return Ok(());
+        }
         self.storage.put_message(&MessageRecord {
             id,
             group_id: group_id.clone(),
@@ -269,5 +277,160 @@ impl<S: StorageProvider> Engine<S> {
             self.audit(event);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::account_identity_proof::{AccountIdentityProofRequest, AccountIdentityProofSigner};
+    use crate::engine::EngineBuilder;
+    use async_trait::async_trait;
+    use cgka_traits::error::PeelerError;
+    use cgka_traits::group_context::GroupContextSnapshot;
+    use cgka_traits::ingest::PeeledMessage;
+    use cgka_traits::message::{MessageState, StoredMessagePayload};
+    use cgka_traits::peeler::TransportPeeler;
+    use cgka_traits::storage::{GroupStorage, MessageStorage};
+    use cgka_traits::transport::{
+        EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+    };
+    use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+    use k256::schnorr::{SigningKey, signature::hazmat::PrehashSigner};
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use storage_sqlite::SqliteAccountStorage;
+
+    struct UnreachablePeeler;
+
+    #[async_trait]
+    impl TransportPeeler for UnreachablePeeler {
+        async fn peel_group_message(
+            &self,
+            _msg: &TransportMessage,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<PeeledMessage, PeelerError> {
+            Err(PeelerError::DecryptFailed)
+        }
+
+        async fn peel_welcome(
+            &self,
+            _msg: &TransportMessage,
+        ) -> Result<PeeledMessage, PeelerError> {
+            Err(PeelerError::DecryptFailed)
+        }
+
+        async fn wrap_group_message(
+            &self,
+            _payload: &EncryptedPayload,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<TransportMessage, PeelerError> {
+            Err(PeelerError::DecryptFailed)
+        }
+
+        async fn wrap_welcome(
+            &self,
+            _payload: &EncryptedPayload,
+            _recipient: &MemberId,
+        ) -> Result<TransportMessage, PeelerError> {
+            Err(PeelerError::DecryptFailed)
+        }
+    }
+
+    struct TestProofSigner(SigningKey);
+
+    impl AccountIdentityProofSigner for TestProofSigner {
+        fn sign_account_identity_proof(
+            &self,
+            request: &AccountIdentityProofRequest,
+        ) -> Result<[u8; 64], String> {
+            let signature = self
+                .0
+                .sign_prehash(&request.signing_digest())
+                .map_err(|e| e.to_string())?;
+            Ok(signature.to_bytes())
+        }
+    }
+
+    fn test_signing_key() -> SigningKey {
+        let mut counter = 0u64;
+        loop {
+            let mut material = [0u8; 32];
+            let mut hasher = Sha256::new();
+            hasher.update(b"cgka-engine-store-test-identity-v1");
+            hasher.update(counter.to_be_bytes());
+            material.copy_from_slice(&hasher.finalize());
+            if let Ok(sk) = SigningKey::from_bytes(&material) {
+                return sk;
+            }
+            counter += 1;
+        }
+    }
+
+    fn transport_message(id: &[u8], payload: &[u8]) -> TransportMessage {
+        TransportMessage {
+            id: MessageId::new(id.to_vec()),
+            payload: payload.to_vec(),
+            timestamp: Timestamp(0),
+            causal_deps: vec![],
+            source: TransportSource("store-test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        }
+    }
+
+    /// Regression for mdk#369: the idempotency short-circuit must compare the
+    /// encoded payload, not just (group, epoch, state) — a second persist of
+    /// the same id under a different `StoredMessagePayload` variant must
+    /// overwrite, or a reader on the other processing path silently loses the
+    /// record.
+    #[test]
+    fn same_key_persist_with_different_payload_variant_overwrites() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let signing_key = test_signing_key();
+        let identity = signing_key.verifying_key().to_bytes().to_vec();
+        let engine = EngineBuilder::new(storage.clone())
+            .identity(identity)
+            .account_identity_proof_signer(Arc::new(TestProofSigner(signing_key)))
+            .peeler(Box::new(UnreachablePeeler))
+            .build()
+            .unwrap();
+
+        let group_id = GroupId::new(vec![7u8; 16]);
+        storage
+            .put_group(&cgka_traits::group::Group {
+                id: group_id.clone(),
+                name: "store-test".into(),
+                description: String::new(),
+                epoch: EpochId(3),
+                members: vec![],
+                required_capabilities: Default::default(),
+                removed: false,
+                join_epoch: EpochId(0),
+            })
+            .unwrap();
+        let msg = transport_message(b"colliding-id", b"wire-bytes");
+
+        engine
+            .persist_transport_message(&msg, &group_id, EpochId(3), MessageState::Failed)
+            .unwrap();
+        engine
+            .persist_openmls_wire_message(&msg, &group_id, EpochId(3), MessageState::Failed)
+            .unwrap();
+
+        let record = storage.get_message(&msg.id).unwrap();
+        let stored = StoredMessagePayload::decode(&record.payload).unwrap();
+        assert!(
+            stored.as_openmls_wire().is_some(),
+            "second persist with a different payload variant must overwrite the record"
+        );
+
+        // Fully identical re-persist still short-circuits without error.
+        engine
+            .persist_openmls_wire_message(&msg, &group_id, EpochId(3), MessageState::Failed)
+            .unwrap();
+        let record = storage.get_message(&msg.id).unwrap();
+        let stored = StoredMessagePayload::decode(&record.payload).unwrap();
+        assert!(stored.as_openmls_wire().is_some());
     }
 }

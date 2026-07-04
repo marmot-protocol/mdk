@@ -21,7 +21,7 @@ use openmls::group::{MlsGroup, ProcessMessageError, ValidationError};
 use openmls::messages::proposals::{AppDataUpdateOperation, Proposal, ProposalOrRef};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
-    ProcessedMessageContent, ProtocolMessage, ProtocolVersion, Sender,
+    ProcessedMessageContent, ProtocolMessage, ProtocolVersion,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
@@ -1819,11 +1819,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             Err(e) => return Err(replay_error("process_message", e)),
         };
-        let sender_id = sender_member_id(processed.sender(), &mls_group);
-        let sender = sender_id
-            .as_ref()
-            .map(|id| id.as_slice().to_vec())
-            .unwrap_or_default();
+        let sender_id = crate::identity::member_id_of_sender(processed.sender(), &mls_group);
 
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
@@ -1881,7 +1877,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     ));
                 }
                 let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
-                let committer = sender.clone();
+                let committer = sender_id
+                    .as_ref()
+                    .expect("checked above")
+                    .as_slice()
+                    .to_vec();
                 // foundation/identity.md: deferred commits replayed during
                 // convergence are an inbound credential ingress too. Reject
                 // commits that introduce or mutate a member LeafNode whose
@@ -1927,11 +1927,26 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let payload = bytes.into_bytes();
-                if crate::app_payload::app_payload_is_valid_for_sender(&payload, &sender) {
+                // Mirror the direct ingest seam (audit item S3): an
+                // application message whose MLS sender does not resolve to a
+                // validated member leaf is never surfaced, so a blank,
+                // unauthenticated author cannot reach the app through the
+                // replay seam (#383). Pushing `Ignored` keeps the message out
+                // of `app_messages_by_id`; canonicalization then classifies
+                // it undecryptable-in-canonical-state and the disposition
+                // writer marks it terminal once its epoch is at or below the
+                // settled tip. A bad-sender future-epoch message stays
+                // retryable until the tip passes it — indistinguishable from
+                // a legitimate future message at this point, and it converts
+                // to terminal as the tip advances.
+                let validated_sender = sender_id.as_ref().filter(|sender| {
+                    crate::app_payload::validate_app_payload_for_sender(&payload, sender).is_ok()
+                });
+                if let Some(sender) = validated_sender {
                     observations.push(OpenMlsReplayObservation::ApplicationProcessed {
                         message_id,
                         source_epoch,
-                        sender,
+                        sender: sender.as_slice().to_vec(),
                         payload: payload.clone(),
                         decrypted_payload_ref: format!(
                             "sha256:{}",
@@ -2073,14 +2088,6 @@ pub(crate) fn process_commit_with_app_data_updates<S: StorageProvider>(
         unverified,
         updater.changes(),
     )
-}
-
-fn sender_member_id(sender: &Sender, group: &MlsGroup) -> Option<MemberId> {
-    let Sender::Member(leaf_idx) = sender else {
-        return None;
-    };
-    let member = group.member_at(*leaf_idx)?;
-    crate::identity::validated_member_id(&member.credential).ok()
 }
 
 fn message_digest(bytes: &[u8]) -> [u8; 32] {

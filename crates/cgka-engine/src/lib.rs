@@ -53,6 +53,7 @@ pub mod group_lifecycle;
 pub mod group_state_changes;
 pub mod identity;
 pub mod key_package;
+pub(crate) mod message_disposition;
 pub mod message_processor;
 pub mod openmls_projection;
 pub mod pending_commit_guard;

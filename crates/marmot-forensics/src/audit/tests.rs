@@ -692,6 +692,8 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             new_state: "epoch_invalidated".into(),
             epoch: Some(3),
             reason: "fork_loser".into(),
+            retry_count: Some(2),
+            sweeps_waited: Some(5),
         },
         AuditEventKind::Rejection {
             msg_id: "m".into(),

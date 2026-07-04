@@ -1432,6 +1432,7 @@ fn dummy_group(group_id: GroupId) -> Group {
         }],
         required_capabilities: GroupCapabilities::default(),
         removed: false,
+        join_epoch: EpochId(0),
     }
 }
 
