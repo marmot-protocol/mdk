@@ -17,6 +17,10 @@ use crate::{
 use super::AppClient;
 
 impl AppClient {
+    /// `advance_read_marker`: pre-publish projections must pass `false` so a
+    /// failed publish never leaves the group read marker advanced past inbound
+    /// unreads or pointing at an invalidated own message (#338); only the
+    /// post-publish success projection advances it.
     pub(crate) fn record_local_app_event_projection(
         &self,
         group_id_hex: &str,
@@ -24,6 +28,7 @@ impl AppClient {
         event: &MarmotInnerEvent,
         source_message_id_hex: Option<String>,
         source_epoch: Option<u64>,
+        advance_read_marker: bool,
     ) -> Result<crate::AppProjectionUpdate, AppError> {
         let message_projection = AppMessageProjection {
             message_id_hex: event.id.clone(),
@@ -43,7 +48,7 @@ impl AppClient {
         let update = self
             .app
             .record_account_app_event(&self.state.label, &message_projection)?;
-        if event.kind == MARMOT_APP_EVENT_KIND_CHAT {
+        if advance_read_marker && event.kind == MARMOT_APP_EVENT_KIND_CHAT {
             let read_marker =
                 self.app
                     .mark_timeline_message_read(&self.state.label, group_id_hex, &event.id);

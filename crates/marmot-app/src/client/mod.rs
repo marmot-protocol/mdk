@@ -1109,6 +1109,7 @@ impl AppClient {
                 &event,
                 None,
                 source_epoch,
+                false,
             )?;
             on_local_projection(update);
         }
@@ -1137,6 +1138,8 @@ impl AppClient {
             Ok(effects) => effects,
             Err(err) => {
                 if should_project_locally {
+                    // No read-marker rollback needed: the marker only advances
+                    // in the post-publish success projection below.
                     match self.app.invalidate_timeline_app_event(
                         &self.state.label,
                         &group_id_hex,
@@ -1173,6 +1176,7 @@ impl AppClient {
                 &event,
                 source_message_id_hex,
                 source_epoch,
+                true,
             )?;
             on_local_projection(update);
             self.prune_plaintext_retention_for_group(group_id)?;

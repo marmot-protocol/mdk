@@ -3102,6 +3102,135 @@ async fn open_backfill_preserves_unread_for_still_member_account() {
 }
 
 #[tokio::test]
+async fn failed_send_keeps_read_marker_and_inbound_unread() {
+    // mdk#338: the local-send projection recorded BEFORE publish must not
+    // advance the per-group read marker. If it did, a hard publish failure
+    // would leave the marker pointing at the invalidated own message and
+    // silently mark older inbound unreads as read. Only the post-publish
+    // success projection may advance the marker.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+
+    let (relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("markers", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let bob_row = || {
+        app.chat_list_row("bob", &group_id_hex)
+            .unwrap()
+            .expect("bob's chat-list row exists after joining")
+    };
+
+    // Phase 1: a SUCCESSFUL own send must still advance bob's read marker to
+    // his own event id — the marker advance is deferred to the post-publish
+    // projection, so this guards that it still fires on success.
+    let bob_success_id = bob
+        .send(&group_id, b"bob success")
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    assert_eq!(
+        bob_row().last_read_message_id_hex.as_deref(),
+        Some(bob_success_id.as_str()),
+        "a successful own send must advance the sender's read marker to his own event"
+    );
+
+    // `timeline_at` is second-granular and the unread window is strictly after
+    // the marker tuple, so each subsequent message must land in a strictly
+    // later second to register past the previous watermark.
+    sleep(Duration::from_millis(1100)).await;
+    let read_baseline_id = alice
+        .send(&group_id, b"baseline")
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        bob.sync().await.unwrap();
+        if bob_row().unread_count == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for bob to register alice's baseline as unread"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    app.mark_timeline_message_read("bob", &group_id_hex, &read_baseline_id)
+        .unwrap();
+    let row = bob_row();
+    assert_eq!(
+        row.last_read_message_id_hex.as_deref(),
+        Some(read_baseline_id.as_str())
+    );
+    assert_eq!(row.unread_count, 0);
+
+    sleep(Duration::from_millis(1100)).await;
+    let inbound_unread_id = alice
+        .send(&group_id, b"inbound unread")
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        bob.sync().await.unwrap();
+        if bob_row().unread_count == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for bob to register the inbound unread"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Hard publish failure: no relay left to accept bob's message. The failed
+    // attempt can take up to the adapter's ~20s publish overall-wait
+    // (SDK_RELAY_PUBLISH_OVERALL_WAIT) before it reports the failure.
+    relay.shutdown();
+    bob.send(&group_id, b"bob failure")
+        .await
+        .expect_err("send must fail once the relay is gone");
+
+    let row = bob_row();
+    assert_eq!(
+        row.unread_count, 1,
+        "a failed send must not mark inbound unreads as read"
+    );
+    assert_eq!(
+        row.last_read_message_id_hex.as_deref(),
+        Some(read_baseline_id.as_str()),
+        "a failed send must leave the read marker untouched, never at the failed event"
+    );
+    assert_eq!(
+        row.first_unread_message_id_hex.as_deref(),
+        Some(inbound_unread_id.as_str()),
+        "the first unread must still be alice's inbound message"
+    );
+    let account_unread = app
+        .account_unread_summary()
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.account_id_hex == bob_account.account_id_hex)
+        .map(|summary| summary.unread_count)
+        .unwrap_or(0);
+    assert_eq!(
+        account_unread, 1,
+        "the account-level unread aggregate must survive the failed send"
+    );
+}
+
+#[tokio::test]
 async fn relay_app_runtime_publishes_member_leave() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
