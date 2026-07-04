@@ -568,6 +568,10 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
         }
+        // Captured before `current_group.members` is consumed below: gates the
+        // removed-marker reconciliation so the common (not-removed) path pays
+        // no extra storage read.
+        let group_record_was_removed = current_group.removed;
         let previous_ids: HashSet<MemberId> = previous_members
             .iter()
             .map(|member| member.id.clone())
@@ -648,23 +652,28 @@ impl<S: StorageProvider> Engine<S> {
             // evidence, and keeps the send-gate posture derivable from
             // canonical state alone. Outbound intents purged at realization
             // stay purged — the app re-issues sends against the reopened
-            // send gate.
-            let mut group = self
-                .storage
-                .get_group(group_id)
-                .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-            if group.removed {
-                group.removed = false;
-                self.storage
-                    .put_group(&group)
+            // send gate. Gated on the record snapshot loaded above so the
+            // common (not-removed) path re-reads nothing; the re-fetch on the
+            // rare marked path re-checks under the fresh record before
+            // writing.
+            if group_record_was_removed {
+                let mut group = self
+                    .storage
+                    .get_group(group_id)
                     .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                // Privacy-safe breadcrumb: aggregate signal only, no
-                // group/member ids (observability.md).
-                tracing::info!(
-                    target: "cgka_engine::distributed_convergence",
-                    method = "emit_convergence_events",
-                    "cleared removed marker: selected canonical branch records local membership"
-                );
+                if group.removed {
+                    group.removed = false;
+                    self.storage
+                        .put_group(&group)
+                        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                    // Privacy-safe breadcrumb: aggregate signal only, no
+                    // group/member ids (observability.md).
+                    tracing::info!(
+                        target: "cgka_engine::distributed_convergence",
+                        method = "emit_convergence_events",
+                        "cleared removed marker: selected canonical branch records local membership"
+                    );
+                }
             }
             if self
                 .load_leave_request_state(group_id)
