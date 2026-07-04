@@ -1,6 +1,6 @@
 # WN Agent Connector
 
-This crate ships the `wn-agent` binary: the local Dark Matter agent connector.
+This crate ships the `wn-agent` binary: the local White Noise agent connector.
 
 `wn-agent` is the headless Marmot process that lets an agent runtime appear as a normal Marmot member. It owns the
 Marmot account home, MLS state, Nostr relay IO, invite allowlists, durable encrypted sends, and live QUIC preview

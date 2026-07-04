@@ -365,7 +365,7 @@ pub(crate) fn command_output_result(
             stdout: ensure_trailing_newline(output.plain),
             stderr: String::new(),
         },
-        Err(err) if json_output => json_dm_error(err),
+        Err(err) if json_output => json_wn_error(err),
         Err(err) => CliOutput {
             code: 1,
             stdout: String::new(),
@@ -1111,7 +1111,7 @@ fn json_error(code: i32, error_code: &str, message: String) -> CliOutput {
     }
 }
 
-fn json_dm_error(err: WnError) -> CliOutput {
+fn json_wn_error(err: WnError) -> CliOutput {
     let error = wn_error_json(&err);
     CliOutput {
         code: 1,

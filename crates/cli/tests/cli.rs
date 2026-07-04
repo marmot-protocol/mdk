@@ -543,19 +543,19 @@ fn whitenoise_command_surface_names_are_present() {
         "wn login --help should expose stdin-based nsec import"
     );
 
-    let dmd_help = Command::new(env!("CARGO_BIN_EXE_wnd"))
+    let wnd_help = Command::new(env!("CARGO_BIN_EXE_wnd"))
         .arg("--help")
         .output()
         .expect("wnd help should run");
     assert!(
-        dmd_help.status.success(),
+        wnd_help.status.success(),
         "{}",
-        command_output_summary(&dmd_help)
+        command_output_summary(&wnd_help)
     );
-    let dmd_help = format!(
+    let wnd_help = format!(
         "{}{}",
-        String::from_utf8_lossy(&dmd_help.stdout),
-        String::from_utf8_lossy(&dmd_help.stderr)
+        String::from_utf8_lossy(&wnd_help.stdout),
+        String::from_utf8_lossy(&wnd_help.stderr)
     );
     for flag in [
         "--data-dir",
@@ -563,10 +563,10 @@ fn whitenoise_command_surface_names_are_present() {
         "--discovery-relays",
         "--default-account-relays",
     ] {
-        assert!(dmd_help.contains(flag), "wnd --help missing {flag}");
+        assert!(wnd_help.contains(flag), "wnd --help missing {flag}");
     }
     assert!(
-        !dmd_help.contains("--relay"),
+        !wnd_help.contains("--relay"),
         "wnd --help should match wnd-style relay defaults instead of singular --relay"
     );
 

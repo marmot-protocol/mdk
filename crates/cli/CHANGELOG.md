@@ -37,10 +37,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   `WN_DEV_SETTLEMENT_QUIESCENCE_MS`), the default data directory moved from `darkmatter` to `whitenoise` (dev fallback
   `.whitenoise`), the default keychain service is `com.marmot.whitenoise`, daemon sockets are `wnd.sock` /
   `wn-agent.sock`, the profile deep-link scheme is `marmot://`, release tags follow `wn-agent-v*`, and the Homebrew
-  formula is `marmot-protocol/tap/wn`. There are no compatibility fallbacks: move the data directory (for example
+  formula is `marmot-protocol/tap/wn`. There is no automatic compatibility fallback: move the data directory (for example
   `mv ~/Library/Application\ Support/darkmatter ~/Library/Application\ Support/whitenoise`), update `DM_*` env vars in
   shell profiles and service units, and reinstall from the new formula. Keychain entries stored under the old
-  `com.marmot.darkmatter` service are still readable by setting `WN_KEYCHAIN_SERVICE=com.marmot.darkmatter`, or
+  `com.marmot.darkmatter` service can still be read manually by setting `WN_KEYCHAIN_SERVICE=com.marmot.darkmatter`, or
   re-import the account to write them under the new service.
 
 - `message send` (and every other group send) on a group whose local copy records your own removal now fails with the

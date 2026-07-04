@@ -34,7 +34,7 @@ Do not run this as an unattended production service until the manual phone test 
 - Hermes gateway: model and tool runtime. Uses the Marmot platform plugin in `integrations/hermes/marmot`.
 - Public Nostr relays: durable Marmot transport. A normal deployment does not host its own relay.
 - QUIC broker: optional memory-only live-preview transport.
-- Dark Matter phone app: invites the agent and verifies the chat experience from the real client side.
+- White Noise phone app: invites the agent and verifies the chat experience from the real client side.
 
 Current pilot values:
 
@@ -148,7 +148,7 @@ Use `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` for th
 computer exercise the same public relay set. Use `quic://quic-broker.ipf.dev:4450` for live previews. If preview
 debugging gets in the way, omit `--quic-candidate`; final encrypted replies still exercise the durable production path.
 
-Use the repo Compose profile for the fastest container test. Run these commands on the host from the Dark Matter repo
+Use the repo Compose profile for the fastest container test. Run these commands on the host from the MDK repo
 root. They start or exec into the container for you:
 
 ```sh
@@ -181,7 +181,7 @@ phone account id. For a real deployment, disable allow-any and add the phone acc
 
 From the phone:
 
-1. Point Dark Matter at the same public relay set.
+1. Point White Noise at the same public relay set.
 2. Invite the agent account into a new chat or test group. Scan the QR code if the phone build supports the
    `marmot-agent:v1` payload; otherwise copy the printed `npub` or account hex.
 3. Send a short prompt.

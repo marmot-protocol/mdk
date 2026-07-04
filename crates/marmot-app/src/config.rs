@@ -34,7 +34,7 @@ pub struct MarmotAppConfig {
 /// and forensic audit-log tracker uploads.
 ///
 /// Defaults are intentionally separate from bearer tokens. Host apps supply
-/// credentials at runtime, while the Dark Matter/Marmot build owns stable
+/// credentials at runtime, while the MDK/Marmot build owns stable
 /// first-party URLs. `MarmotAppConfig::default()` reads these from
 /// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` and
 /// `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time.

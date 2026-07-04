@@ -80,13 +80,19 @@ export MARMOT_QUIC_CANDIDATES="$QUIC_CSV"
 ${AUTH_TOKEN_FILE:+export MARMOT_AGENT_AUTH_TOKEN_FILE="$AUTH_TOKEN_FILE"}
 ENV
 
+# Bake the args shell-quoted so paths/tokens with spaces survive the wrapper.
+RELAY_ARGS_QUOTED="$(printf '%q ' "${RELAY_ARGS[@]}")"
+WN_AGENT_EXTRA_QUOTED=""
+if [ "${#WN_AGENT_EXTRA[@]}" -gt 0 ]; then
+    WN_AGENT_EXTRA_QUOTED="$(printf '%q ' "${WN_AGENT_EXTRA[@]}")"
+fi
+
 cat > "$ROOT/run-wn-agent.sh" <<RUN
 #!/usr/bin/env bash
 set -euo pipefail
 exec cargo run -p agent-connector --bin wn-agent -- \\
   --home "$MARMOT_HOME" \\
-  ${RELAY_ARGS[*]} \\
-  ${WN_AGENT_EXTRA[*]:-}
+  $RELAY_ARGS_QUOTED$WN_AGENT_EXTRA_QUOTED
 RUN
 chmod +x "$ROOT/run-wn-agent.sh"
 

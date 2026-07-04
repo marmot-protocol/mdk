@@ -23,7 +23,7 @@ pre-releases.
 Prerequisites:
 
 - Hermes Agent installed and working locally
-- Dark Matter phone app pointed at the same public relay set
+- White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 One-line install:
@@ -168,7 +168,7 @@ just hermes-dev-teardown --force
 ## Docker Phone Test
 
 The repo has a Compose profile for the dedicated-computer phone test. It builds a container with `wn-agent`, Hermes,
-the Marmot plugin, and `qrencode` for terminal QR output. Run these commands on the host from the Dark Matter repo root.
+the Marmot plugin, and `qrencode` for terminal QR output. Run these commands on the host from the MDK repo root.
 They start or exec into the container for you. The container uses the pilot public relays and broker:
 
 ```sh

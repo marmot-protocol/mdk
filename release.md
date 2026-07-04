@@ -143,7 +143,7 @@ GitHub-generated source archives are the downloadable artifacts.
 
 ## WN Agent Release
 
-Use this for the Dark Matter agent connector entry point. The release publishes `wn-agent` binaries for supported
+Use this for the White Noise agent connector entry point. The release publishes `wn-agent` binaries for supported
 platforms plus adapter install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, and the OpenClaw Marmot
 channel plugin + `install-openclaw-marmot.sh`. The track can grow other agent-system assets later.
 
