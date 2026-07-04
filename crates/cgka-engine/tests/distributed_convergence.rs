@@ -1612,6 +1612,331 @@ async fn convergence_rollback_emits_commit_rolled_back_for_losing_branch() {
     );
 }
 
+/// A commit that removes the LOCAL member's own leaf is applied (realizing
+/// removal: `Group.removed` set, send gate closed, group presented as
+/// removed), then LOSES branch selection to a same-epoch sibling through
+/// stored convergence. The realized removal was never canonically applied,
+/// so it "MUST NOT remain visible to the application as a completed change"
+/// (convergence.md, "Applying the selected branch") — member-departure.md's
+/// terminal-marker rule presumes removal evidence "on the selected canonical
+/// branch". This test pins the whole resulting view of that supersession:
+/// the withdrawal names the superseded removal in the id space the
+/// self-removed notification was stamped with, the copy stops
+/// self-quarantining (marker cleared, membership and the winner's rename
+/// presented), and the send gate reopens.
+#[tokio::test]
+async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-superseded-self-removal".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    });
+    carol.drain_events();
+
+    // Same-epoch fork by the two admins: one removes Carol, the other renames
+    // the group. Both commit shapes are admin-gated (Privileged), so the
+    // authenticated committer tie-break decides branch selection — give the
+    // rename to the winning committer so the REMOVAL deterministically loses.
+    let (mut renamer, mut remover) =
+        if commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id()) == 0 {
+            (alice, bob)
+        } else {
+            (bob, alice)
+        };
+    let remove_res = remover
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let (remove_commit, remove_pending) = evolution(remove_res);
+    remover.confirm_published(remove_pending).await.unwrap();
+    let rename_res = renamer
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("name after reorg".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (rename_commit, rename_pending) = evolution(rename_res);
+    renamer.confirm_published(rename_pending).await.unwrap();
+    let remove_commit = route(remove_commit, &group_id);
+    let rename_commit = route(rename_commit, &group_id);
+
+    // Carol's copy applies the removal: the inbound commit is buffered for the
+    // convergence quiescence window, then the convergence apply realizes the
+    // removal (marker + self-removed notification, the seam #703 added at
+    // `emit_convergence_events`).
+    let outcome = carol.ingest(remove_commit.clone()).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "removal commit buffers for convergence, got {outcome:?}"
+    );
+    let applied = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("removal branch applies");
+    assert_eq!(applied.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(applied.accepted_commits, vec![content_hex(&remove_commit)]);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    let removal_events = carol.drain_events();
+    let self_removed_origin = removal_events
+        .iter()
+        .find_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::MemberRemoved { member },
+                origin_commit_id,
+                ..
+            } if *member == carol.self_id() => origin_commit_id.clone(),
+            _ => None,
+        })
+        .expect("self-removed state notification carries an origin commit");
+    assert_eq!(self_removed_origin, content_id(&remove_commit));
+    assert!(
+        carol_storage.get_group(&group_id).unwrap().removed,
+        "applying the removal marks the local copy removed"
+    );
+    // The removed-copy send gate quarantines outbound work.
+    let payload = app_payload_for(&carol, b"blocked while removed");
+    let gate = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await;
+    assert!(
+        matches!(
+            &gate,
+            Err(cgka_traits::error::EngineError::InvalidTransition(t)) if t.from == "Removed"
+        ),
+        "removed copy must reject sends, got {gate:?}"
+    );
+
+    // The winning same-epoch sibling arrives through stored convergence: the
+    // direct seam classifies every further input `SelfEvicted` once the copy
+    // is removed, so this is the stored-message path (e.g. a session-layer
+    // replay after restart).
+    carol
+        .buffer_openmls_convergence_message(&group_id, rename_commit.clone(), 1_001_000)
+        .expect("sibling rename commit buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .expect("reorg over the superseded removal");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
+    assert_message_state(
+        &carol_storage,
+        &remove_commit,
+        MessageState::EpochInvalidated,
+    );
+
+    // Final presented state: the removal never canonically happened. The copy
+    // is a member again, presents the winner's rename, and is NOT removed.
+    let group = carol_storage.get_group(&group_id).unwrap();
+    assert!(
+        !group.removed,
+        "superseded removal must clear the removed marker"
+    );
+    assert_eq!(group.name, "name after reorg");
+    assert_eq!(group.epoch, EpochId(2));
+    assert!(group.members.iter().any(|m| m.id == carol.self_id()));
+    assert!(
+        carol
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == carol.self_id())
+    );
+
+    let events = carol.drain_events();
+    // The withdrawal names the superseded removal in the SAME id space the
+    // self-removed notification was stamped with, so the app tombstones that
+    // row: the removal is treated as not having happened.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateInvalidated {
+                group_id: g,
+                epoch,
+                invalidated_commit_id,
+                reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+            } if g == &group_id && *invalidated_commit_id == self_removed_origin && epoch.0 == 1
+        )),
+        "expected withdrawal naming the superseded removal, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::CommitRolledBack { group_id: g, invalidated_commit_id }
+                if g == &group_id && *invalidated_commit_id == content_id(&remove_commit)
+        )),
+        "expected CommitRolledBack for the superseded removal, got {events:?}"
+    );
+    // The winning rename is never withdrawn, and no direct-seam ForkRecovered
+    // fires on the stored-convergence path.
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateInvalidated { invalidated_commit_id, .. }
+                if *invalidated_commit_id == content_id(&rename_commit)
+        )),
+        "the accepted rename must not be withdrawn, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::ForkRecovered { .. })),
+        "stored convergence must not emit ForkRecovered, got {events:?}"
+    );
+    // Roster correction: the reorg diff re-announces our membership relative
+    // to the previously presented (removed) roster, attributed to the
+    // accepted commit that drove the pass.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateChanged {
+                group_id: g,
+                change: cgka_traits::engine::GroupStateChange::MemberAdded { member },
+                origin_commit_id: Some(origin),
+                ..
+            } if g == &group_id
+                && *member == carol.self_id()
+                && *origin == content_id(&rename_commit)
+        )),
+        "expected roster-correction MemberAdded for self, got {events:?}"
+    );
+
+    // Send eligibility is restored: the intent the removed-copy gate rejected
+    // above now succeeds.
+    send_app(&mut carol, &group_id, b"post-reorg send".to_vec()).await;
+}
+
+/// State-derived inverse of `realize_self_eviction`: a `removed` marker that
+/// survives WITHOUT canonical evidence — the selected canonical branch
+/// records our membership — is reconciled by the next convergence apply. The
+/// marker is forced directly on the record to simulate the pathological
+/// copy: a real supersession reorg already restores the pre-removal record
+/// from the retained anchor (covered by
+/// `superseded_self_removal_clears_removed_marker_and_restores_send`); this
+/// pins the explicit guard for a marker no anchor restore can see.
+#[tokio::test]
+async fn convergence_apply_clears_removed_marker_without_canonical_evidence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-heal-removed-marker".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Pathological copy: marker set while canonical state (active MLS group,
+    // roster with our leaf) records membership — no removal was ever applied.
+    let mut record = carol_storage.get_group(&group_id).unwrap();
+    record.removed = true;
+    carol_storage.put_group(&record).unwrap();
+    let payload = app_payload_for(&carol, b"blocked by pathological marker");
+    let gate = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await;
+    assert!(
+        matches!(
+            &gate,
+            Err(cgka_traits::error::EngineError::InvalidTransition(t)) if t.from == "Removed"
+        ),
+        "marked copy must reject sends, got {gate:?}"
+    );
+
+    // An ordinary accepted commit converges (forward apply, no reorg): the
+    // selected canonical branch still records our membership, so the apply
+    // reconciles the marker.
+    let rename_res = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("healed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (rename_commit, rename_pending) = evolution(rename_res);
+    alice.confirm_published(rename_pending).await.unwrap();
+    let rename_commit = route(rename_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, rename_commit.clone(), 1_000)
+        .expect("rename commit buffered");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("forward apply converges");
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(result.accepted_commits, vec![content_hex(&rename_commit)]);
+
+    let group = carol_storage.get_group(&group_id).unwrap();
+    assert!(
+        !group.removed,
+        "convergence apply must clear a marker the canonical roster contradicts"
+    );
+    assert_eq!(group.name, "healed");
+    assert!(group.members.iter().any(|m| m.id == carol.self_id()));
+    send_app(&mut carol, &group_id, b"send after healing".to_vec()).await;
+}
+
 #[tokio::test]
 async fn engine_does_not_apply_stored_branch_before_stability_gate() {
     let (mut alice, _alice_storage) = build_client(b"alice");

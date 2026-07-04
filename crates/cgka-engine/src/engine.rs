@@ -954,8 +954,11 @@ impl<S: StorageProvider> Engine<S> {
     /// self-eviction; member-departure.md "Realizing removal"). A removed copy
     /// is terminal for outbound work: nothing may be prepared or published for
     /// it. Unknown groups report `false` — callers fail them with their own
-    /// unknown-group handling. The marker clears only through an authenticated
-    /// re-join (`do_join_welcome` rebuilds the record).
+    /// unknown-group handling. The marker clears through an authenticated
+    /// re-join (`do_join_welcome` rebuilds the record) or when branch
+    /// selection supersedes the removal that set it — the convergence reorg
+    /// path re-derives membership from the selected canonical branch
+    /// (`emit_convergence_events`).
     pub(crate) fn group_record_is_removed(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         match self.storage.get_group(group_id) {
             Ok(group) => Ok(group.removed),

@@ -27,7 +27,12 @@ pub struct Group {
     /// flag is the idempotence marker for the realization obligation: it is
     /// set together with the self-removed state notification, so later input
     /// classified `SelfEvicted` does not re-emit the notification. Terminal
-    /// for the group on this client. Defaults to `false` for records
+    /// for the group on this client while the removal stays canonical; it
+    /// clears on an authenticated re-join, or when branch selection
+    /// supersedes the removal that set it — the selected canonical branch
+    /// then records the local member's membership, so the removal "is treated
+    /// as not having happened" (spec `protocol-core/convergence.md`,
+    /// "Applying the selected branch"). Defaults to `false` for records
     /// persisted before this field existed.
     #[serde(default)]
     pub removed: bool,

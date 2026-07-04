@@ -23,6 +23,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - `dmd` now buffers daemon request frames before scanning for the newline delimiter, avoiding one async `read()` call per
   byte for large `Execute` requests while preserving the existing 1 MiB request cap and stalled-client timeout.
+- A group copy that realized your own removal no longer stays self-quarantined when the removing commit later loses
+  branch selection: the convergence apply clears the removed marker whenever the selected canonical branch records your
+  membership, so `message send` works again on that group instead of failing `invalid_transition` ("local group copy is
+  marked removed"). The removal's system rows are withdrawn through the existing invalidation event; rejoining via a new
+  Welcome is only required while the removal remains canonical.
 
 ### Changed
 

@@ -632,6 +632,40 @@ impl<S: StorageProvider> Engine<S> {
             );
         }
         if current_ids.contains(self.identity.self_id()) {
+            // The selected canonical branch records our membership, so a
+            // `removed` marker on the record is inconsistent with canonical
+            // state and must clear: a previously applied removal that lost
+            // branch selection "MUST NOT remain visible to the application as
+            // a completed change" (convergence.md, "Applying the selected
+            // branch"), and member-departure.md's "terminal for that group
+            // copy" rule presumes removal evidence on the selected canonical
+            // branch (clarification tracked in marmot-protocol/marmot#220).
+            // A reorg normally already restored the pre-removal
+            // record from the retained anchor before the replay (the anchor
+            // predates the marker write), so this is the explicit
+            // state-derived inverse of `realize_self_eviction`: it reconciles
+            // the pathological copy whose marker survived without canonical
+            // evidence, and keeps the send-gate posture derivable from
+            // canonical state alone. Outbound intents purged at realization
+            // stay purged — the app re-issues sends against the reopened
+            // send gate.
+            let mut group = self
+                .storage
+                .get_group(group_id)
+                .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+            if group.removed {
+                group.removed = false;
+                self.storage
+                    .put_group(&group)
+                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+                // Privacy-safe breadcrumb: aggregate signal only, no
+                // group/member ids (observability.md).
+                tracing::info!(
+                    target: "cgka_engine::distributed_convergence",
+                    method = "emit_convergence_events",
+                    "cleared removed marker: selected canonical branch records local membership"
+                );
+            }
             if self
                 .load_leave_request_state(group_id)
                 .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
