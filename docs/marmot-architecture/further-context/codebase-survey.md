@@ -4,7 +4,6 @@
 > `mdk-sqlite-storage`, and related crates) and whitenoise-rs metrics from before the current `crates/*` workspace
 > refactor. For current crate boundaries and status, read [`../overview/current-state.md`](../overview/current-state.md)
 > and the per-crate `README.md` / `AGENTS.md` files. Keep this page only for historical archaeology.
-
 > **Reference doc.** Raw data only — skip this unless you need to understand the current size, shape, or dependency
 > structure of the repos. For architectural direction, read [[target-architecture]] instead.
 

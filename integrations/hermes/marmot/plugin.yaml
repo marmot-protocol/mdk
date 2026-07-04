@@ -1,7 +1,7 @@
 name: marmot
 label: Marmot
 kind: platform
-version: 0.2.0
+version: 0.9.0
 description: Hermes platform adapter for Marmot through the local wn-agent control socket
 author: Marmot Protocol
 requires_env: []
