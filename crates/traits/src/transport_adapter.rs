@@ -294,6 +294,12 @@ pub trait TransportAdapter: Send + Sync {
     ) -> Result<(), TransportAdapterError>;
 
     /// Refresh only the group subscription plane for an active account.
+    ///
+    /// Subscribe failures for added groups fail fast and leave adapter state
+    /// untouched. Unsubscribe failures for removed groups are absorbed: the
+    /// removal takes effect in the adapter's routing state immediately, the
+    /// relay-side unsubscribe is retried on subsequent syncs, and such
+    /// failures never fail the call.
     async fn sync_account_groups(
         &self,
         sync: TransportGroupSync,
