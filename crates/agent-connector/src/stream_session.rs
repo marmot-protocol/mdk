@@ -322,6 +322,23 @@ pub(crate) struct ActiveStreamSession {
     pub(crate) cancel_tx: mpsc::Sender<()>,
     pub(crate) abort: tokio::task::AbortHandle,
     pub(crate) last_activity: Instant,
+    /// Set once the compose task has validated the finalize expectation and
+    /// exited. The compose task is then gone, but the durable
+    /// `finish_agent_text_stream` publish that follows can still fail; the
+    /// retained transcript lets a re-issued `StreamFinalize` retry that publish
+    /// without the (dead) compose task, so a transient error never strands the
+    /// stream with a live preview and no durable final (#366).
+    pub(crate) finalized: Option<FinalizedStream>,
+}
+
+/// Frozen finalize inputs retained after the compose task exits, so the durable
+/// finish step is retryable and a retry that disagrees with the frozen
+/// transcript is rejected.
+#[derive(Clone)]
+pub(crate) struct FinalizedStream {
+    pub(crate) final_text: String,
+    pub(crate) transcript_hash: [u8; 32],
+    pub(crate) chunk_count: u64,
 }
 
 impl StreamSessionStore {
@@ -371,6 +388,25 @@ impl StreamSessionStore {
         match sessions.get(stream_id_hex) {
             Some(entry) if entry.tx.same_channel(&session.tx) => sessions.remove(stream_id_hex),
             _ => None,
+        }
+    }
+
+    /// Freeze the finalize inputs on the stored entry (only when it is still the
+    /// same session) so a durable-finish failure can be retried without the
+    /// compose task, which has exited by this point. Also refreshes activity so
+    /// the idle sweep does not reclaim a session mid-finalize.
+    pub(crate) fn mark_finalized(
+        &self,
+        stream_id_hex: &str,
+        session: &ActiveStreamSession,
+        finalized: FinalizedStream,
+    ) {
+        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        if let Some(entry) = sessions.get_mut(stream_id_hex)
+            && entry.tx.same_channel(&session.tx)
+        {
+            entry.finalized = Some(finalized);
+            entry.last_activity = Instant::now();
         }
     }
 
