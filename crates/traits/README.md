@@ -48,8 +48,10 @@ cargo insta review
 
 ## Stability
 
-`0.1.0`, no public consumers outside this workspace. Snapshot tests will catch accidental drift; deliberate drift is a
+`0.9.0`, no public consumers outside this workspace. Snapshot tests will catch accidental drift; deliberate drift is a
 normal trait-evolution change for now.
 
 For the responsibility breakdown of each trait method (which states are legal, which errors fire, what ordering
 guarantees apply), see the rustdoc on each trait in `src/`.
+
+See [`AGENTS.md`](AGENTS.md) for scope and invariants.

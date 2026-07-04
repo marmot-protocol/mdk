@@ -36,6 +36,7 @@ Primary implementation areas:
 - `crates/cgka-engine` - OpenMLS-backed CGKA engine and local group state machine.
 - `crates/cgka-conformance-simulator` - multi-client scenarios, generated chaos, reports, property tests, and vectors.
 - `crates/traits` - shared traits and cross-boundary types.
+- `crates/fs-private` - restrictive-by-construction local file, directory, and socket creation helpers.
 - `crates/storage-sqlite` - SQLCipher-backed persistence for session, engine integration, tests, and simulator runs.
 - `crates/transport-nostr-peeler` - Nostr event to engine-message boundary and MLS envelope peeling.
 - `crates/transport-nostr-adapter` - Nostr transport adapter core behind an injectable relay-client boundary.
@@ -73,7 +74,10 @@ cargo test -p cgka-conformance-simulator
 # Wider simulator property-test run.
 cargo test -p cgka-conformance-simulator --features conformance-slow
 
-# Workspace checks.
+# Fast pre-push gate (formatting, naming, compile checks, clippy; skips tests).
+just fast-ci
+
+# Full workspace checks.
 just fmt-check
 just check
 just clippy

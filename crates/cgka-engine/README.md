@@ -69,5 +69,5 @@ For the Marmot app-component model now used by new groups, see
 
 ## Status
 
-`0.1.0`, single internal consumer, not semver-stable. For current readiness and open production work, start with
+`0.9.0`, single internal consumer, not semver-stable. For current readiness and open production work, start with
 [`../../docs/marmot-architecture/overview/current-state.md`](../../docs/marmot-architecture/overview/current-state.md).
