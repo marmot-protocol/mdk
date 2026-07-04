@@ -21,7 +21,29 @@ pub(crate) const EPOCH_SECRETS_LABEL: &[u8] = b"EpochSecrets";
 pub(crate) const RESUMPTION_PSK_STORE_LABEL: &[u8] = b"ResumptionPsk";
 pub(crate) const MESSAGE_SECRETS_LABEL: &[u8] = b"MessageSecrets";
 
+const VALUE_STORAGE_KEY_V1: &[u8] = b"mdk.openmls.value-key.v1";
+
 pub(crate) fn build_key(label: &[u8], key: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        VALUE_STORAGE_KEY_V1.len() + 8 + label.len() + 8 + key.len() + std::mem::size_of::<u16>(),
+    );
+    out.extend_from_slice(VALUE_STORAGE_KEY_V1);
+    out.extend_from_slice(&(label.len() as u64).to_be_bytes());
+    out.extend_from_slice(label);
+    out.extend_from_slice(&(key.len() as u64).to_be_bytes());
+    out.extend_from_slice(&key);
+    out.extend_from_slice(&CURRENT_VERSION.to_be_bytes());
+    out
+}
+
+/// Reconstructs the pre-#349 generic value-store key: the bare concatenation
+/// of label, key, and provider version.
+///
+/// This format is ambiguous because the label/key boundary is not encoded:
+/// `(label = "A", key = "BC")` and `(label = "AB", key = "C")` collide. New
+/// writes must use [`build_key`]. Legacy keys remain readable/deletable so
+/// upgraded databases do not strand OpenMLS rows written by older builds.
+pub(crate) fn build_key_legacy(label: &[u8], key: Vec<u8>) -> Vec<u8> {
     let mut out = label.to_vec();
     out.extend_from_slice(&key);
     out.extend_from_slice(&CURRENT_VERSION.to_be_bytes());
