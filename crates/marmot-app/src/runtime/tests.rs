@@ -1172,3 +1172,43 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
         Err(AppError::RuntimeStopping)
     ));
 }
+
+// Sender-controlled broker candidates must clear the shared dial-safety gate
+// at resolve time: literal-IP authorities resolve without DNS, so these cover
+// the canonical non-public classes end to end (issue #331).
+#[tokio::test]
+async fn broker_resolve_rejects_non_public_candidates_without_dev_opt_in() {
+    for authority in [
+        "10.0.0.5:4433",      // private
+        "169.254.169.254:80", // link-local (cloud metadata)
+        "100.64.0.1:4433",    // CGNAT
+        "192.168.1.1:4433",   // private
+        "127.0.0.1:4433",     // loopback
+        "[::1]:4433",         // loopback v6
+        "[fc00::1]:4433",     // unique-local
+    ] {
+        let result = agent_stream_watch::resolve_broker_addr(authority, false).await;
+        assert!(
+            matches!(result, Err(AppError::AgentStreamInvalidCandidate(_))),
+            "{authority} must be rejected without the dev opt-in"
+        );
+    }
+}
+
+#[tokio::test]
+async fn broker_resolve_dev_opt_in_admits_loopback_only() {
+    let addr = agent_stream_watch::resolve_broker_addr("127.0.0.1:4433", true)
+        .await
+        .expect("loopback resolves under the dev opt-in");
+    assert!(addr.ip().is_loopback());
+
+    // The opt-in opens loopback only; private/link-local candidates stay
+    // rejected even in dev mode.
+    for authority in ["10.0.0.5:4433", "169.254.169.254:80", "[fc00::1]:4433"] {
+        let result = agent_stream_watch::resolve_broker_addr(authority, true).await;
+        assert!(
+            matches!(result, Err(AppError::AgentStreamInvalidCandidate(_))),
+            "{authority} must be rejected even with the dev opt-in"
+        );
+    }
+}

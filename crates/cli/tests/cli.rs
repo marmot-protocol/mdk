@@ -254,6 +254,9 @@ fn wn(home: &std::path::Path) -> Command {
     // CLI tests exercise encrypted media against a loopback Blossom server,
     // which is the dev/test scenario the loopback-HTTP gate is for.
     command.env("WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS", "1");
+    // CLI tests connect to an in-process `MockRelay` at loopback, which is the
+    // dev/test scenario the loopback-relay gate is for.
+    command.env("WN_ALLOW_LOOPBACK_RELAYS", "1");
     // Instant convergence settlement so multi-client tests do not wait on the
     // pinned 1000 ms quiescence window (dev/test only).
     command.env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0");
@@ -2099,6 +2102,9 @@ fn account_create_requires_relay_setup() {
         .arg("--json")
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .args(["account", "create"])
         .output()
         .expect("wn command should start");
@@ -3197,6 +3203,9 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
         .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
@@ -3310,6 +3319,9 @@ fn messages_subscribe_streams_messages_and_quic_previews_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
         .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
@@ -3462,6 +3474,9 @@ fn tui_style_stream_compose_blocks_loopback_auto_watch_and_publishes_final_messa
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
         .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
@@ -3614,6 +3629,9 @@ fn daemon_defaults_create_identities_and_block_loopback_auto_watch_without_manua
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
         .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
@@ -4175,6 +4193,9 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
         .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
@@ -4241,6 +4262,9 @@ fn groups_subscribe_state_streams_initial_group_state_from_daemon() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         // Instant convergence settlement (dev/test) so the daemon surfaces
         // synced state without waiting on the pinned quiescence window.
         .env("WN_DEV_SETTLEMENT_QUIESCENCE_MS", "0")
@@ -4323,6 +4347,9 @@ fn daemon_executes_cli_commands_over_socket() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .spawn()
         .expect("wnd should start");
 
@@ -4368,6 +4395,9 @@ fn daemon_socket_path_is_private() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .spawn()
         .expect("wnd should start");
 
@@ -4419,6 +4449,9 @@ fn daemon_refuses_reset_over_socket() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .spawn()
         .expect("wnd should start");
 
@@ -4460,6 +4493,9 @@ fn daemon_running_does_not_auto_forward_logout() {
         .arg(test_relay_url())
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .spawn()
         .expect("wnd should start");
 
@@ -4499,6 +4535,9 @@ fn daemon_start_status_execute_and_stop_are_user_facing_commands() {
         .arg(&socket)
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .arg("--json")
         .args([
             "daemon",
@@ -4645,6 +4684,9 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
         .arg(&socket)
         .arg("--secret-store")
         .arg("file")
+        // Daemon tests drive an in-process `MockRelay` at loopback; production
+        // rejects non-public relay hosts unless this dev gate is set.
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
         .arg("--json")
         .args([
             "daemon",

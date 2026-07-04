@@ -34,6 +34,10 @@ for reconnect/backoff and relay status mechanics.
 - Preserve account-scoped deliveries even when group subscriptions share relay endpoints.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
+- Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
+  (`crates/marmot-app/src/relay_plane/safety.rs`); literal loopback/private/non-public relay hosts are rejected unless
+  the dev loopback flag is set. A new relay-connect path must go through that chokepoint, not around it. See
+  `docs/marmot-architecture/overview/dial-safety.md`.
 - Keep per-relay telemetry keyed by the opaque `RelayIndex`. `resolve_relay_labels` (gated behind a
   `RelayExportConsent` token) is the only path that turns an index back into a relay URL, and exists solely for the
   opt-in export boundary. Do not add another reverse mapping or resolve indices outside that boundary.

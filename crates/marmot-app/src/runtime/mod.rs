@@ -74,7 +74,8 @@ pub(crate) use audit_tracker::{AuditLogTrackerUploader, post_audit_log_tracker_u
 pub(crate) use account_worker::AccountWorkerReconnectBackoff;
 #[cfg(test)]
 pub(crate) use agent_stream_watch::{
-    broker_trust_for_addr, latest_agent_stream_start, parse_quic_candidate, parse_quic_candidates,
+    broker_trust_for_candidate, latest_agent_stream_start, parse_quic_candidate,
+    parse_quic_candidates,
 };
 #[cfg(test)]
 pub(crate) use subscriptions::{

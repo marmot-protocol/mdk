@@ -13,6 +13,10 @@ Ephemeral QUIC broker for Marmot agent text stream previews.
 - Use bounded live queues only. If a subscriber lags, dropping the subscriber is preferable to storing payloads.
 - Keep diagnostics privacy-safe: no account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext,
   plaintext, or key material in tracing/logging.
+- Keep the client dial safe: the `client_endpoint` `InsecureLocalRequiresLoopback` check is the resolved-address
+  backstop, not the primary gate, and the client connect is bounded by the shared QUIC-preview connect timeout (#710).
+  Callers validate and pin the resolved broker address and choose `InsecureLocal` only from an explicit dev flag plus a
+  literal loopback candidate host. See `docs/marmot-architecture/overview/dial-safety.md`.
 
 ## Layout
 

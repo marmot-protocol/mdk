@@ -56,6 +56,11 @@ fn test_config(
     config.relays = relays;
     config.allow_any = allow_any;
     config.debug_controls = debug_controls;
+    // The white-box suite drives streams at loopback brokers and connects to an
+    // in-process `MockRelay` at loopback; production defaults keep both off (see
+    // `allow_insecure_local_broker` / `allow_loopback_relays`).
+    config.allow_insecure_local_broker = true;
+    config.allow_loopback_relays = true;
     config
 }
 
@@ -3460,4 +3465,88 @@ async fn create_media_download_dir_rejects_non_directory_per_blob_child() {
         root.join(subdir).is_file(),
         "the pre-existing file child must be left untouched"
     );
+}
+
+#[test]
+fn broker_trust_requires_explicit_opt_in_and_a_literal_loopback_host() {
+    use transport_quic_broker::BrokerServerTrust;
+
+    use crate::quic::broker_trust_for_candidate;
+
+    // Off by default: even a literal loopback candidate verifies certificates.
+    assert!(matches!(
+        broker_trust_for_candidate("127.0.0.1", false),
+        BrokerServerTrust::Platform
+    ));
+    assert!(matches!(
+        broker_trust_for_candidate("localhost", false),
+        BrokerServerTrust::Platform
+    ));
+
+    // With the dev opt-in only LITERAL loopback hosts skip verification.
+    assert!(matches!(
+        broker_trust_for_candidate("127.0.0.1", true),
+        BrokerServerTrust::InsecureLocal
+    ));
+    assert!(matches!(
+        broker_trust_for_candidate("localhost", true),
+        BrokerServerTrust::InsecureLocal
+    ));
+    assert!(matches!(
+        broker_trust_for_candidate("::1", true),
+        BrokerServerTrust::InsecureLocal
+    ));
+
+    // A DOMAIN that could resolve to loopback never selects insecure trust
+    // (resolution-dependent downgrade, issue #356).
+    assert!(matches!(
+        broker_trust_for_candidate("evil.example", true),
+        BrokerServerTrust::Platform
+    ));
+}
+
+// Agent-supplied `quic://` candidates must clear the shared dial-safety gate
+// at resolve time: literal-IP authorities resolve without DNS, so these cover
+// the canonical non-public classes end to end (issue #385).
+#[tokio::test]
+async fn quic_candidate_resolve_rejects_non_public_addresses_without_opt_in() {
+    use crate::quic::{parse_quic_candidate, resolve_quic_candidate_addr};
+
+    for authority in [
+        "quic://10.0.0.5:4433",
+        "quic://169.254.169.254:80",
+        "quic://100.64.0.1:4433",
+        "quic://127.0.0.1:4433",
+        "quic://[::1]:4433",
+        "quic://[fc00::1]:4433",
+    ] {
+        let candidate = parse_quic_candidate(authority).expect("candidate parses");
+        let result = resolve_quic_candidate_addr(&candidate, false).await;
+        assert!(
+            result.is_err(),
+            "{authority} must be rejected without the dev opt-in"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quic_candidate_resolve_opt_in_admits_loopback_only() {
+    use crate::quic::{parse_quic_candidate, resolve_quic_candidate_addr};
+
+    let candidate = parse_quic_candidate("quic://127.0.0.1:4433").expect("candidate parses");
+    let addr = resolve_quic_candidate_addr(&candidate, true)
+        .await
+        .expect("loopback resolves under the dev opt-in");
+    assert!(addr.ip().is_loopback());
+
+    // The opt-in opens loopback only; private/link-local candidates stay
+    // rejected even in dev mode.
+    for authority in ["quic://10.0.0.5:4433", "quic://169.254.169.254:80"] {
+        let candidate = parse_quic_candidate(authority).expect("candidate parses");
+        let result = resolve_quic_candidate_addr(&candidate, true).await;
+        assert!(
+            result.is_err(),
+            "{authority} must be rejected even with the dev opt-in"
+        );
+    }
 }

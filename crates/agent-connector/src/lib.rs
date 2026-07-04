@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use agent_control::AgentControlEvent;
 use marmot_account::AccountHome;
-use marmot_app::{MarmotApp, MarmotAppRuntime};
+use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppRuntime};
 use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, broadcast};
 
@@ -94,6 +94,20 @@ pub struct AgentConnectorConfig {
     /// Cap on concurrently served control connections; connections beyond it
     /// are closed at accept time. Must be nonzero.
     pub max_connections: usize,
+    /// Dev/test gate for insecure loopback brokers. When set, a stream-begin
+    /// `quic://` candidate whose host is a LITERAL loopback (`localhost` or a
+    /// loopback IP literal) may resolve to loopback and connect with
+    /// certificate verification disabled (`BrokerServerTrust::InsecureLocal`).
+    /// Off by default: agent-supplied candidates must resolve to public
+    /// addresses and always verify certificates, so a prompt-injected gateway
+    /// cannot steer the connector at local services (SSRF) or downgrade TLS
+    /// trust through DNS. See `docs/marmot-architecture/overview/dial-safety.md`.
+    pub allow_insecure_local_broker: bool,
+    /// Dev/test gate for loopback/private relay endpoints (e.g. an in-process
+    /// `MockRelay` or a local `nostr-rs-relay`). Off by default: production
+    /// rejects non-public relay hosts at the relay-safety chokepoint. Threaded
+    /// into the connector's `MarmotAppConfig::allow_loopback_relay_endpoints`.
+    pub allow_loopback_relays: bool,
 }
 
 impl AgentConnectorConfig {
@@ -110,6 +124,8 @@ impl AgentConnectorConfig {
             debug_controls: false,
             auth_token: None,
             max_connections: MAX_CONTROL_CONNECTIONS,
+            allow_insecure_local_broker: false,
+            allow_loopback_relays: false,
         }
     }
 }
@@ -121,6 +137,7 @@ pub struct AgentConnector {
     pub(crate) allow_any: bool,
     pub(crate) debug_controls: bool,
     pub(crate) auth_token: Option<String>,
+    pub(crate) allow_insecure_local_broker: bool,
     pub(crate) debug_events: broadcast::Sender<AgentControlEvent>,
     pub(crate) debug_final_sends: DebugFinalSendStore,
     pub(crate) idempotency: SendIdempotencyStore,
@@ -140,10 +157,12 @@ impl AgentConnector {
     pub fn open(config: AgentConnectorConfig) -> Result<Self, ConnectorError> {
         let account_home = AccountHome::open(&config.home);
         let relays = config.relays;
-        let app = MarmotApp::with_relays_and_account_home(
+        let app = MarmotApp::with_relays_and_account_home_and_config(
             &config.home,
             relays.clone(),
             account_home.clone(),
+            MarmotAppConfig::default()
+                .with_allow_loopback_relay_endpoints(config.allow_loopback_relays),
         );
         let runtime = MarmotAppRuntime::new(app.clone());
         let inbound_catch_up = InboundCatchUpDriver::new(runtime.clone());
@@ -155,6 +174,7 @@ impl AgentConnector {
             allow_any: config.allow_any,
             debug_controls: config.debug_controls,
             auth_token: config.auth_token,
+            allow_insecure_local_broker: config.allow_insecure_local_broker,
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),
             idempotency: SendIdempotencyStore::new(&config.home),

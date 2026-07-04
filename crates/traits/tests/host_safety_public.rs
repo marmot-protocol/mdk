@@ -1,7 +1,8 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use cgka_traits::app_components::{
     is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4, is_public_ipv6,
+    reject_non_public_ip, reject_non_public_socket_addr,
 };
 use url::Host;
 
@@ -72,4 +73,53 @@ fn shared_host_safety_classifies_canonical_ipv6_ranges() {
         assert!(!is_public_ipv6(addr), "{raw} should be rejected");
         assert!(!is_public_ip(IpAddr::V6(addr)), "{raw} should be rejected");
     }
+}
+
+#[test]
+fn shared_dial_gate_rejects_non_public_addresses() {
+    // Public control addresses pass regardless of the loopback opt-in.
+    for raw in ["93.184.216.34", "2606:4700::1"] {
+        let addr: IpAddr = raw.parse().expect("test IP literal parses");
+        assert!(reject_non_public_ip(addr, false).is_ok(), "{raw}");
+        assert!(reject_non_public_ip(addr, true).is_ok(), "{raw}");
+    }
+
+    // Loopback is accepted only under the explicit dev/test opt-in.
+    for raw in ["127.0.0.1", "::1"] {
+        let addr: IpAddr = raw.parse().expect("test IP literal parses");
+        assert!(reject_non_public_ip(addr, false).is_err(), "{raw}");
+        assert!(reject_non_public_ip(addr, true).is_ok(), "{raw}");
+    }
+
+    // Every other non-public class stays rejected even with the loopback
+    // opt-in: the flag opens loopback only, never private/link-local ranges.
+    // Mapped loopback (`::ffff:127.0.0.1`) is not a plain loopback literal and
+    // stays rejected too.
+    for raw in [
+        "10.0.0.1",         // private
+        "100.64.0.1",       // CGNAT
+        "169.254.169.254",  // link-local (cloud metadata)
+        "172.16.0.1",       // private
+        "192.168.1.1",      // private
+        "fc00::1",          // unique-local
+        "fe80::1",          // link-local
+        "::ffff:10.0.0.1",  // mapped private IPv4
+        "::ffff:127.0.0.1", // mapped loopback
+    ] {
+        let addr: IpAddr = raw.parse().expect("test IP literal parses");
+        assert!(reject_non_public_ip(addr, false).is_err(), "{raw}");
+        assert!(reject_non_public_ip(addr, true).is_err(), "{raw}");
+    }
+}
+
+#[test]
+fn shared_dial_gate_socket_addr_form_matches_ip_form() {
+    let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+    let loopback: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let private: SocketAddr = "[fc00::1]:4433".parse().unwrap();
+
+    assert!(reject_non_public_socket_addr(public, false).is_ok());
+    assert!(reject_non_public_socket_addr(loopback, false).is_err());
+    assert!(reject_non_public_socket_addr(loopback, true).is_ok());
+    assert!(reject_non_public_socket_addr(private, true).is_err());
 }

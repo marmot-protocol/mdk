@@ -6,7 +6,7 @@
 //! error wording, but share these low-level host and IP classifiers so SSRF
 //! hardening cannot drift across crates.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use url::Host;
 
 /// Whether `host` is `localhost`, a subdomain of `.localhost`, or an IP
@@ -94,6 +94,25 @@ pub fn is_public_ipv6(addr: Ipv6Addr) -> bool {
     // Only global unicast 2000::/3 is routable today; reject anything else not
     // already caught above.
     (first & 0xe000) == 0x2000
+}
+
+/// Reject `addr` unless it is public/global-routable. When `allow_loopback`
+/// is set (an explicit dev/test opt-in, never inferred from resolution), an IP
+/// loopback literal is also accepted. Every other non-public address (private,
+/// link-local, CGNAT, ULA, multicast, unspecified, documentation, IPv6
+/// transition) is always rejected. This is the shared dial-policy gate every
+/// outbound connector runs each resolved address through; see
+/// `docs/marmot-architecture/overview/dial-safety.md`.
+pub fn reject_non_public_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
+    if (allow_loopback && is_loopback_ip(addr)) || is_public_ip(addr) {
+        return Ok(());
+    }
+    Err("address is not a public unicast address".into())
+}
+
+/// [`reject_non_public_ip`] for an already-resolved socket address.
+pub fn reject_non_public_socket_addr(addr: SocketAddr, allow_loopback: bool) -> Result<(), String> {
+    reject_non_public_ip(addr.ip(), allow_loopback)
 }
 
 pub(crate) fn reject_non_routable_ipv4(addr: Ipv4Addr) -> Result<(), String> {

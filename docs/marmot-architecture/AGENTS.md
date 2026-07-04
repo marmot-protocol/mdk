@@ -35,6 +35,10 @@ Agent map for the Marmot architecture docs.
   - **Role:** Restrictive-by-construction creation policy for local files, sockets, and databases; the
     `crates/fs-private` helper contract.
 
+- **Path:** `overview/dial-safety.md`
+  - **Role:** One host-safety discipline for every outbound connection (validate resolved addresses, pin, trust from
+    config, connect timeout); the `cgka_traits::app_components::host_safety` classifier and per-transport chokepoints.
+
 - **Path:** `further-context/`
   - **Role:** Older or deeper context. Check status and dates before relying on it.
 

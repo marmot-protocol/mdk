@@ -214,6 +214,8 @@ fn relay_plane_with_directory_fetcher(
         None,
         None,
         directory_fetcher,
+        // These plane tests drive an in-process `MockRelay` at loopback.
+        true,
     )
 }
 

@@ -48,7 +48,9 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+        MarmotAppConfig::default()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
 }
@@ -4185,7 +4187,9 @@ async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
     let app = MarmotApp::with_relays_and_config(
         dir.path(),
         vec![seed_url.clone()],
-        MarmotAppConfig::default().with_directory_max_future_skew(Duration::from_secs(900)),
+        MarmotAppConfig::default()
+            .with_directory_max_future_skew(Duration::from_secs(900))
+            .with_allow_loopback_relay_endpoints(true),
     );
 
     publish_account_relay_lists_at(

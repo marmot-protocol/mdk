@@ -11,6 +11,10 @@ Local Marmot agent connector daemon; ships the `wn-agent` binary.
 - Own connector socket binding and permission hardening (`bind_connector_socket`, `default_socket_path`).
 - Keep agent-facing wire types in `agent-control` and stream composition in `agent-stream-compose`; this crate is the
   process glue, not the protocol or composition owner.
+- Keep the QUIC broker dial safe (`src/quic.rs`): agent-supplied `quic://` candidates are validated + pinned through
+  the shared host-safety classifier, and `InsecureLocal` trust is chosen only from `allow_insecure_local_broker` (the
+  `--insecure-local-broker` dev flag, off by default) plus a literal loopback candidate host — never a resolved
+  loopback IP. See `docs/marmot-architecture/overview/dial-safety.md`.
 
 ## Key files
 
