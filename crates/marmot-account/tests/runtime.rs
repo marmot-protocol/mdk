@@ -671,6 +671,58 @@ async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
 }
 
+// A "best effort" routing policy (`required_acks == 0`) must still fail a
+// publish that no endpoint accepted: confirming it would advance the local
+// epoch/membership past a welcome that reached no relay (#375).
+#[tokio::test]
+async fn create_group_with_best_effort_acks_rolls_back_when_nothing_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot best effort key").unwrap();
+    let mut bob_session = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+    let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_next(0);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .required_acks(0)
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let (group_id, effects) = runtime
+        .create_group(CreateGroupRequest {
+            name: "runtime best effort".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(effects.pending.len(), 1);
+    assert!(matches!(
+        effects.pending[0],
+        PendingResolution::RolledBack { .. }
+    ));
+    assert_eq!(effects.failures.len(), 1);
+    assert_eq!(effects.reports.len(), 1);
+    assert_eq!(effects.reports[0].accepted_count(), 0);
+    assert!(!effects.reports[0].met_required_acks());
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 0);
+    assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn create_group_stops_welcome_publish_after_unexposed_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -867,6 +919,7 @@ async fn group_evolution_confirms_commit_when_welcome_publish_fails() {
         publishes[1].message.envelope,
         TransportEnvelope::Welcome { .. }
     ));
+
 }
 
 // mdk#499 regression: an explicit group-evolution commit that a relay
