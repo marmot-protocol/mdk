@@ -192,5 +192,8 @@ mod tests {
         );
         // Invalid hex is rejected rather than silently yielding empty history.
         assert!(optional_group_id_hex(Some("nothex".into())).is_err());
+        // Hex that decodes but is not a Marmot 32-byte group id is rejected at
+        // the FFI boundary instead of surfacing later as UnknownGroup.
+        assert!(optional_group_id_hex(Some("abcd".into())).is_err());
     }
 }
