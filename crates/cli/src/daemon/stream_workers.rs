@@ -601,7 +601,10 @@ pub(crate) async fn finish_stream_compose(
     };
     let (respond, response) = oneshot::channel();
     if tx
-        .send(StreamComposeCommand::Finish { respond })
+        .send(StreamComposeCommand::Finish {
+            expected: None,
+            respond,
+        })
         .await
         .is_err()
     {

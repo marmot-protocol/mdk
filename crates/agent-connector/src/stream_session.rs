@@ -355,6 +355,25 @@ impl StreamSessionStore {
         Ok(session.clone())
     }
 
+    /// Remove the entry for `stream_id_hex` only when it is still the same
+    /// session as `session` (identified by command-channel identity).
+    ///
+    /// With a get-first finalize flow, an unconditional removal could tear
+    /// down a same-stream-id replacement session inserted concurrently
+    /// between the `get` and the removal; the channel-identity check makes
+    /// the removal a no-op in that case.
+    pub(crate) fn remove_if_same(
+        &self,
+        stream_id_hex: &str,
+        session: &ActiveStreamSession,
+    ) -> Option<ActiveStreamSession> {
+        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        match sessions.get(stream_id_hex) {
+            Some(entry) if entry.tx.same_channel(&session.tx) => sessions.remove(stream_id_hex),
+            _ => None,
+        }
+    }
+
     pub(crate) fn remove(
         &self,
         stream_id_hex: &str,

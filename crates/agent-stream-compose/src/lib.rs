@@ -45,6 +45,17 @@ pub struct StreamComposeReport {
     pub error: Option<String>,
 }
 
+/// Caller-supplied final-transcript expectation, validated atomically inside
+/// the compose task before any teardown. On mismatch the session responds
+/// `Err` and keeps running, so finalize is retryable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamFinishExpectation {
+    pub final_text: String,
+    /// Lowercase hex of the expected transcript hash.
+    pub transcript_hash_hex: String,
+    pub chunk_count: u64,
+}
+
 pub enum StreamComposeCommand {
     Append {
         text: String,
@@ -59,6 +70,13 @@ pub enum StreamComposeCommand {
         respond: oneshot::Sender<Result<StreamComposeReport, String>>,
     },
     Finish {
+        /// Optional final-transcript expectation. When set, it is validated
+        /// inside the compose task before any teardown: an `Err` response
+        /// means the expectation did not match and the session is STILL
+        /// RUNNING (further appends and a retried finish remain possible);
+        /// `Ok` means the session finished and the task has exited. With
+        /// `None`, the session finishes unconditionally.
+        expected: Option<StreamFinishExpectation>,
         respond: oneshot::Sender<Result<StreamComposeReport, String>>,
     },
 }
@@ -285,7 +303,19 @@ async fn run_stream_compose_session_with_connector<P, C, E>(
                 .await;
                 let _ = respond.send(result);
             }
-            StreamComposeCommand::Finish { respond } => {
+            StreamComposeCommand::Finish { expected, respond } => {
+                // Validate the caller-supplied expectation BEFORE any teardown
+                // (connect-task abort, publisher consumption, report mutation).
+                // The command loop is strictly sequential, so this check is
+                // atomic with the finish: on mismatch the session keeps
+                // running with no side effects and finalize stays retryable.
+                if let Some(expected) = &expected
+                    && let Err(mismatch) =
+                        validate_finish_expectation(&report, &transcript, expected)
+                {
+                    let _ = respond.send(Err(mismatch));
+                    continue;
+                }
                 if let Some(task) = connect_task.take() {
                     task.abort();
                 }
@@ -539,6 +569,28 @@ async fn append_live_record<P: LiveBrokerPublisher>(
             *live.live_error = Some(err);
         }
     }
+}
+
+/// Validate a caller-supplied [`StreamFinishExpectation`] against the local
+/// transcript. Hash and chunk count are compared against the transcript's own
+/// accessors (not the report fields) so an empty-transcript finalize is
+/// validated against the empty-transcript hash rather than the report's
+/// `None` hash.
+fn validate_finish_expectation(
+    report: &StreamComposeReport,
+    transcript: &LocalComposeTranscript,
+    expected: &StreamFinishExpectation,
+) -> Result<(), String> {
+    if report.text != expected.final_text {
+        return Err("stream final text does not match appended transcript".to_owned());
+    }
+    if transcript.transcript_hash() != expected.transcript_hash_hex {
+        return Err("stream final transcript hash does not match appended transcript".to_owned());
+    }
+    if transcript.chunk_count() != expected.chunk_count {
+        return Err("stream final chunk count does not match appended transcript".to_owned());
+    }
+    Ok(())
 }
 
 async fn finish_stream_compose_report<P: LiveBrokerPublisher>(

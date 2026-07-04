@@ -317,9 +317,12 @@ async fn stream_compose_returns_local_transcript_when_broker_connect_is_pending(
     assert_eq!(appended.chunk_count, 1);
 
     let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond: finish_tx })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond: finish_tx,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
         .await
         .expect("finish should use local transcript fallback")
@@ -363,9 +366,12 @@ async fn stream_compose_final_report_contains_full_transcript_text() {
     }
 
     let (respond, response) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish { respond })
-        .await
-        .unwrap();
+    tx.send(StreamComposeCommand::Finish {
+        expected: None,
+        respond,
+    })
+    .await
+    .unwrap();
     let finished = tokio::time::timeout(Duration::from_millis(250), response)
         .await
         .expect("finish should complete")
@@ -865,7 +871,7 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
         // Minimal stand-in for the compose worker: answer a single Finish with a
         // completed report, then exit like the real session does.
         while let Some(command) = rx.recv().await {
-            if let StreamComposeCommand::Finish { respond } = command {
+            if let StreamComposeCommand::Finish { respond, .. } = command {
                 let _ = respond.send(Ok(report.clone()));
                 return;
             }

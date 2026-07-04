@@ -1949,6 +1949,157 @@ async fn connector_socket_composes_and_finalizes_stream() {
     assert!(!message_ids_hex[0].is_empty());
 }
 
+/// Regression for #366: a finalize whose expectation does not match the
+/// composed transcript must not tear down the stream session. The compose
+/// task keeps running, further appends succeed, and a corrected finalize
+/// completes the stream.
+#[tokio::test]
+async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent retryable finalize",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode([0x99; 32]);
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-begin",
+        AgentControlRequest::StreamBegin {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            stream_id_hex: Some(stream_id_hex.clone()),
+            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamBegun {
+        start_message_id_hex,
+        ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+
+    let appended = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-append",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex: stream_id_hex.clone(),
+            append_text: "hello stream".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(appended.payload, AgentControlResponse::Ack);
+
+    // Correct text and hash, wrong chunk count: the finalize must fail
+    // without tearing down the compose session.
+    let first_hash = expected_stream_transcript_hash(
+        &stream_id_hex,
+        &start_message_id_hex,
+        &[(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream")],
+    );
+    let mismatched = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-finalize-mismatch",
+        AgentControlRequest::StreamFinalize {
+            stream_id_hex: stream_id_hex.clone(),
+            final_text: "hello stream".to_owned(),
+            transcript_hash_hex: first_hash,
+            chunk_count: 7,
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = mismatched.payload else {
+        panic!("expected finalize mismatch error");
+    };
+    assert_eq!(code, "stream_error");
+
+    // The compose session must have survived the mismatch: a further append
+    // still succeeds.
+    let appended_again = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-append-again",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex: stream_id_hex.clone(),
+            append_text: " again".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(appended_again.payload, AgentControlResponse::Ack);
+
+    // A corrected finalize over the full transcript succeeds.
+    let corrected_hash = expected_stream_transcript_hash(
+        &stream_id_hex,
+        &start_message_id_hex,
+        &[
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream"),
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, " again"),
+        ],
+    );
+    let finalized = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-finalize",
+        AgentControlRequest::StreamFinalize {
+            stream_id_hex: stream_id_hex.clone(),
+            final_text: "hello stream again".to_owned(),
+            transcript_hash_hex: corrected_hash,
+            chunk_count: 2,
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamFinalized {
+        stream_id_hex: finalized_stream_id_hex,
+        message_ids_hex,
+    } = finalized.payload
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(finalized_stream_id_hex, stream_id_hex);
+    assert_eq!(message_ids_hex.len(), 1);
+    assert!(!message_ids_hex[0].is_empty());
+}
+
 #[tokio::test]
 async fn connector_socket_cancels_stream_session() {
     let dir = tempfile::tempdir().unwrap();

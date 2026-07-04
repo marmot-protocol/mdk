@@ -3,7 +3,9 @@
 use std::time::Instant;
 
 use agent_control::AgentControlResponse;
-use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
+use agent_stream_compose::{
+    StreamComposeCommand, StreamComposeReport, StreamFinishExpectation, run_stream_compose_session,
+};
 use cgka_traits::{GroupId, MessageId};
 use marmot_app::AgentTextStreamFinishRequest;
 use tokio::sync::mpsc::error::TrySendError;
@@ -196,45 +198,53 @@ impl AgentConnector {
         chunk_count: u64,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
-        let session = self.streams.remove(&stream_id_hex)?;
+        let transcript_hash = transcript_hash_from_hex(transcript_hash_hex)?;
+        // Clone (not remove) the session: the final text/hash/chunk-count
+        // expectation is validated inside the compose task, atomically with
+        // its teardown. On mismatch the session stays registered and the
+        // compose task keeps running, so finalize is retryable (#366).
+        let session = self.streams.get(&stream_id_hex)?;
         let (respond, response) = oneshot::channel();
         if session
             .tx
-            .send(StreamComposeCommand::Finish { respond })
+            .send(StreamComposeCommand::Finish {
+                expected: Some(StreamFinishExpectation {
+                    final_text: final_text.clone(),
+                    transcript_hash_hex: hex::encode(transcript_hash),
+                    chunk_count,
+                }),
+                respond,
+            })
             .await
             .is_err()
         {
+            // The compose task is gone: drop the dead registration (only if
+            // it is still this session) and reclaim the task, preserving the
+            // previous remove-then-abort cleanup semantics.
+            let _ = self.streams.remove_if_same(&stream_id_hex, &session);
             session.abort.abort();
             return Err(ConnectorError::Stream(
                 "stream compose session is closed".into(),
             ));
         }
-        let report = response
-            .await
-            .map_err(|err| ConnectorError::Stream(err.to_string()))?
-            .map_err(ConnectorError::Stream)?;
-        if report.text != final_text {
-            return Err(ConnectorError::Stream(
-                "stream final text does not match appended transcript".into(),
-            ));
-        }
-        let transcript_hash = transcript_hash_from_hex(transcript_hash_hex)?;
-        let expected_transcript_hash_hex = hex::encode(transcript_hash);
-        let actual_transcript_hash_hex = report
-            .transcript_hash
-            .as_deref()
-            .map(normalize_hex)
-            .transpose()?;
-        if actual_transcript_hash_hex.as_deref() != Some(expected_transcript_hash_hex.as_str()) {
-            return Err(ConnectorError::Stream(
-                "stream final transcript hash does not match appended transcript".into(),
-            ));
-        }
-        if report.chunk_count != chunk_count {
-            return Err(ConnectorError::Stream(
-                "stream final chunk count does not match appended transcript".into(),
-            ));
-        }
+        let report = match response.await {
+            Ok(report) => report,
+            Err(err) => {
+                // The compose task died mid-command: same cleanup as the
+                // send failure above.
+                let _ = self.streams.remove_if_same(&stream_id_hex, &session);
+                session.abort.abort();
+                return Err(ConnectorError::Stream(err.to_string()));
+            }
+        };
+        // An `Err` report is a validation mismatch: the compose task is still
+        // running and the session stays registered, so do nothing else here
+        // and the agent can append again and/or retry the finalize.
+        report.map_err(ConnectorError::Stream)?;
+        let _ = self.streams.remove_if_same(&stream_id_hex, &session);
+        // If the runtime finish below fails, the compose task has already
+        // exited and the durable final remains unretryable — pre-existing
+        // gap, out of scope for #366.
         let (_payload, summary) = self
             .runtime
             .finish_agent_text_stream(
