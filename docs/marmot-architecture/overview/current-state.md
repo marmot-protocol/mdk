@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-06-06
+updated: 2026-07-04
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -19,9 +19,9 @@ status: overview
 
 # Current State — Implementations & Spec
 
-Where Marmot is today: the merged MIPs define the deployed protocol shape, MDK and Marmot-TS give us independent
-implementations, and this repository now contains the candidate CGKA engine/convergence workspace that is being shaped
-into spec text.
+Where Marmot is today: the merged MIPs define the deployed protocol shape, this workspace is MDK at `0.9.0` (the
+unifying bump above the previous `0.8.0` release), Marmot-TS gives us an independent TypeScript implementation, and the
+CGKA engine/convergence workspace here is being shaped into spec text.
 
 ## The spec
 
@@ -49,11 +49,12 @@ deliver unordered, duplicated, delayed input. The engine contract is where that 
 
 ## Protocol implementations
 
-### MDK (Rust)
+### MDK (this repository)
 
-MDK is the deployed Rust protocol implementation. It still carries Nostr-aware API surface in places, but it remains the
-main source of production experience: persistent storage, OpenMLS integration, group operations, and current MIP
-coverage.
+This workspace is the Marmot Development Kit (MDK). Release `0.9.0` unifies every workspace crate under one version
+cohort above the previous `0.8.0` MDK layout (`mdk-core`, `mdk-sqlite-storage`, and related crates). The current
+crate tree under `crates/` is the production-shaped replacement: OpenMLS-backed engine, SQLCipher storage, Nostr
+transports, multi-account app runtime, CLI/daemon/TUI, agent connector stack, UniFFI bindings, and conformance tooling.
 
 ### Marmot-TS (TypeScript)
 
@@ -75,6 +76,7 @@ event-processing complexity. Those are separate from the CGKA engine convergence
 
 This repository now has the main engine candidate:
 
+- `crates/fs-private` — restrictive-by-construction helpers for local files, directories, and Unix sockets.
 - `crates/traits` — cross-boundary value types and traits, including the account-aware `TransportAdapter` boundary.
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
 - `crates/cgka-session` — production-shaped account-device session wrapper over `Engine<SqliteAccountStorage>`.
@@ -99,9 +101,18 @@ This repository now has the main engine candidate:
 - `crates/transport-quic-broker` — memory-only QUIC pub/sub broker for forwarding live preview records by
   `stream_id + start_event_id` without account state, relay integration, or payload persistence.
 - `crates/cgka-conformance-simulator` — multi-client simulator, vectors, generated scenarios, and property tests.
+- `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
+- `crates/marmot-forensics` — opt-in JSONL forensic audit schema and recorder traits.
+- `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
+- `crates/agent-control` — `marmot.agent-control.v1` DTOs and newline-delimited JSON framing for agent integrations.
+- `crates/agent-stream-compose` — reusable live-preview stream composition over the QUIC broker publisher.
+- `crates/agent-connector` — local `wn-agent` connector daemon bridging agent control, account runtime, and stream
+  composition; Hermes and OpenClaw plugins talk to it over a Unix socket.
+- `integrations/hermes/marmot` and `integrations/openclaw/marmot` — thin control-plane-only agent plugins.
 - `formal/tamarin` — formal models for the convergence selector, delivery-order robustness, lifecycle cases, and
   proof/test mapping.
-- `spec` — Marmot v2 protocol draft by stable surface, including protocol principles and app components.
+- [marmot-protocol/marmot](https://github.com/marmot-protocol/marmot) — canonical Marmot v2 protocol draft by stable
+  surface, including protocol principles and app components (external to this repo).
 
 The current workspace can exercise the peeler-ingest boundary through in-memory clients, reopen encrypted
 SQLCipher-backed account-device sessions, preserve MLS signing identity across those reopens, drive a real
