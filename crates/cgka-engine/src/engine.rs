@@ -60,7 +60,7 @@ fn hydration_quarantine_reason_tag(reason: GroupHydrationQuarantineReason) -> &'
     }
 }
 
-fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
+pub(crate) fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"marmot-hydration-quarantine-group/v1");
     hasher.update(group_id.as_slice());
@@ -730,6 +730,18 @@ impl<S: StorageProvider> Engine<S> {
         .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
         .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?;
 
+        // Record the transport routing id as soon as the MLS state loads —
+        // before any validation that can quarantine the group — so inbound
+        // messages for a quarantined-but-loadable group still resolve to the
+        // group id and can be retained for post-repair replay instead of
+        // dying as UnknownGroup at routing (mdk#364).
+        if let Ok(transport_group_id) =
+            crate::app_components::transport_group_id_of_group(&mls_group)
+        {
+            self.transport_group_id_index
+                .insert(transport_group_id, group_id.clone());
+        }
+
         // Member-credential + account-identity-proof validation runs one
         // BIP-340 schnorr verification per leaf. All of this state was already
         // validated at join/invite/commit ingress and read back from this
@@ -848,17 +860,9 @@ impl<S: StorageProvider> Engine<S> {
             self.leaving_groups.remove(group_id);
         }
 
-        // #740: record this group's transport routing id so inbound resolution
-        // is an O(1) index hit rather than a pre-auth O(groups) MlsGroup-load
-        // scan. `mls_group` is owned here (not borrowing `self`), and the
-        // `provider` borrow is already released, so this direct field insert is
-        // disjoint from the storage/crypto borrows above.
-        if let Ok(transport_group_id) =
-            crate::app_components::transport_group_id_of_group(&mls_group)
-        {
-            self.transport_group_id_index
-                .insert(transport_group_id, group_id.clone());
-        }
+        // #740: the transport routing id was already indexed right after the
+        // MLS load above (kept pre-validation so quarantined groups resolve
+        // too); nothing on this path changes it.
 
         self.epoch_manager.set_stable(group_id.clone(), group.epoch);
         self.audit_group(
@@ -1116,8 +1120,17 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// This is the engine-side source of truth for the application's per-group
     /// recovery flow (mdk#426): a quarantined group is not in the live
-    /// roster (`epoch`/`members` return `UnknownGroup`) and otherwise vanishes
-    /// from the account with no explanation. The app reads this list to surface
+    /// roster and otherwise vanishes from the account with no explanation. The
+    /// contract is enforced on every live surface (mdk#364 / #365):
+    /// every accessor that reads durable or MLS group state (`epoch`,
+    /// `members`, `group_record`, `group_context`, `admin_pubkeys`,
+    /// `app_component`, `feature_status`, the safe-export family, …) returns
+    /// `UnknownGroup`; `send` and convergence refuse to run; inbound group
+    /// messages are retained durably (`PeelDeferred`) and classified
+    /// `Stale { reason: Quarantined }` without touching group state. Retained
+    /// input replays automatically after a successful
+    /// [`Self::retry_hydrate_quarantined_group`] or an authenticated re-join
+    /// welcome (both clear the quarantine). The app reads this list to surface
     /// those groups distinctly from healthy/archived ones and to offer
     /// [`Self::retry_hydrate_quarantined_group`].
     ///
@@ -1128,6 +1141,27 @@ impl<S: StorageProvider> Engine<S> {
             .iter()
             .map(|(group_id, reason)| (group_id.clone(), *reason))
             .collect()
+    }
+
+    /// Quarantine lookup for the live data-path gates.
+    pub(crate) fn quarantined_reason(
+        &self,
+        group_id: &GroupId,
+    ) -> Option<GroupHydrationQuarantineReason> {
+        self.quarantined_groups.get(group_id).copied()
+    }
+
+    /// Enforce the documented quarantine contract on a live surface: a
+    /// quarantined group is indistinguishable from an unknown one on every
+    /// accessor and every send/convergence entry point, so validation-rejected
+    /// state can neither leak to the application nor keep evolving out of
+    /// band (mdk#364 / #365). Ingest has its own gate that additionally
+    /// retains the input for post-repair replay.
+    pub(crate) fn ensure_group_live(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        if self.quarantined_groups.contains_key(group_id) {
+            return Err(EngineError::UnknownGroup(group_id.clone()));
+        }
+        Ok(())
     }
 
     /// Re-attempt hydration of a single quarantined group.
@@ -1186,6 +1220,11 @@ impl<S: StorageProvider> Engine<S> {
                         group_id: group_id.clone(),
                         recovered_epoch,
                     });
+                // Inbound messages that arrived while the group was
+                // quarantined were retained as PeelDeferred. Schedule the
+                // group so the application's convergence drain replays them
+                // now that the group is live again.
+                self.schedule_pending_convergence_group(group_id);
                 Ok(true)
             }
             Err(reason) => {
@@ -1400,12 +1439,14 @@ impl<S: StorageProvider> Engine<S> {
     /// App surfaces use this for projections such as group profile components
     /// without reaching into OpenMLS internals.
     pub fn group_record(&self, group_id: &GroupId) -> Result<Group, EngineError> {
+        self.ensure_group_live(group_id)?;
         Ok(self.storage.get_group(group_id)?)
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS
     /// group state.
     pub fn admin_pubkeys(&self, group_id: &GroupId) -> Result<Vec<[u8; 32]>, EngineError> {
+        self.ensure_group_live(group_id)?;
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -1428,6 +1469,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<(EpochId, cgka_traits::SecretBytes), EngineError> {
+        self.ensure_group_live(group_id)?;
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -1476,6 +1518,7 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<EpochId, EngineError> {
+        self.ensure_group_live(group_id)?;
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -1574,6 +1617,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         group_id: &GroupId,
         feature: &Feature,
     ) -> Result<FeatureStatus, EngineError> {
+        self.ensure_group_live(group_id)?;
         self.do_feature_status(group_id, feature)
     }
 
@@ -1588,6 +1632,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &self,
         group_id: &GroupId,
     ) -> Result<GroupCapabilities, EngineError> {
+        self.ensure_group_live(group_id)?;
         self.do_upgradeable_capabilities(group_id)
     }
 
@@ -1595,11 +1640,15 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<SendResult, EngineError> {
+        self.ensure_group_live(group_id)?;
         self.do_upgrade_group_capabilities(group_id).await
     }
 
     fn group_context(&self, group_id: &GroupId) -> Result<Box<dyn GroupContext + '_>, EngineError> {
         use crate::provider::EngineOpenMlsProvider;
+        // A quarantined group's MLS state may load fine (e.g.
+        // MemberValidationFailed) — never export its secrets.
+        self.ensure_group_live(group_id)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let mls_group = openmls::group::MlsGroup::load(
@@ -1723,6 +1772,7 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         group_id: &GroupId,
         component_id: AppComponentId,
     ) -> Result<Option<Vec<u8>>, EngineError> {
+        self.ensure_group_live(group_id)?;
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -1741,10 +1791,12 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     }
 
     fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {
+        self.ensure_group_live(group_id)?;
         self.do_own_leaf_index(group_id)
     }
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
+        self.ensure_group_live(group_id)?;
         self.do_members(group_id)
     }
 

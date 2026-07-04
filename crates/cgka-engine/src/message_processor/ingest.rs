@@ -88,6 +88,34 @@ impl<S: StorageProvider> Engine<S> {
         transport_group_id: Vec<u8>,
     ) -> Result<IngestOutcome, EngineError> {
         let group_id = self.group_id_for_transport_group_id(&transport_group_id)?;
+
+        // Quarantine gate (mdk#364): a group frozen by hydration
+        // quarantine must not process any input — its OpenMLS state may load
+        // fine (e.g. MemberValidationFailed) and a merged commit would call
+        // set_stable, silently re-activating a group validation rejected.
+        // Retain the raw transport durably instead: PeelDeferred rows are
+        // excluded from settlement math and replay through
+        // retry_deferred_peels once repair clears the quarantine.
+        if self.quarantined_reason(&group_id).is_some() {
+            self.persist_transport_message_for_existing_group(
+                msg,
+                &group_id,
+                EpochId(0),
+                MessageState::PeelDeferred,
+            )?;
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::message_state_changed_event(
+                    hex::encode(msg.id.as_slice()),
+                    MessageState::PeelDeferred,
+                    "quarantined_group_input_deferred",
+                ),
+            );
+            return Ok(IngestOutcome::Stale {
+                reason: StaleReason::Quarantined,
+            });
+        }
+
         let mut pending_recovery: Option<(
             EpochId,
             CommitOrderingKey,

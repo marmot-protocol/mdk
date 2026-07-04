@@ -599,6 +599,385 @@ async fn retry_for_unknown_group_errors() {
     ));
 }
 
+// ── Quarantine enforcement on the live data path (mdk#364 / #365) ──
+
+fn build_named_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build client");
+    (engine, storage)
+}
+
+fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
+    match msg.envelope {
+        TransportEnvelope::Welcome { .. } => msg,
+        TransportEnvelope::GroupMessage { .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+    }
+}
+
+fn welcome_for(welcomes: &[TransportMessage], name: &[u8]) -> TransportMessage {
+    let recipient = MemberId::new(pad32(name));
+    welcomes
+        .iter()
+        .find(|welcome| {
+            matches!(&welcome.envelope, TransportEnvelope::Welcome { recipient: r } if *r == recipient)
+        })
+        .cloned()
+        .expect("welcome for recipient")
+}
+
+fn evolution(result: SendResult) -> (TransportMessage, cgka_traits::engine_state::PendingStateRef) {
+    match result {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected group evolution, got {other:?}"),
+    }
+}
+
+/// Shared setup: alice (flaky storage) creates a group with bob as
+/// member+admin; bob joins; alice reopens with `get_group` failing so the
+/// group is quarantined (`GroupRecordLoadFailed`) while its OpenMLS state
+/// stays fully intact; then storage is un-failed again. What blocks activity
+/// afterwards is the quarantine gate, not broken storage. Returns
+/// (quarantined alice, alice storage handle, bob, group id).
+async fn quarantined_alice_with_live_bob() -> (
+    Engine<FlakyGroupRecordStorage>,
+    FlakyGroupRecordStorage,
+    Engine<SqliteAccountStorage>,
+    GroupId,
+) {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut alice = build_flaky_engine(storage.clone());
+    let (mut bob, _bob_storage) = build_named_client(b"bob-quarantine");
+
+    let bob_kp = bob.fresh_key_package().await.expect("bob key package");
+    let (group_id, send_result) = alice
+        .create_group(CreateGroupRequest {
+            name: "quarantine-enforcement".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .expect("create group");
+    let SendResult::GroupCreated { pending, welcomes } = send_result else {
+        panic!("expected group-created send result");
+    };
+    alice.confirm_published(pending).await.expect("confirm");
+    bob.join_welcome(welcome_for(&welcomes, b"bob-quarantine"))
+        .await
+        .expect("bob joins");
+    bob.drain_events();
+    drop(alice);
+
+    storage.set_fail_get_group(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydration quarantines the unreadable group");
+    assert_eq!(
+        reopened.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed
+        )]
+    );
+    reopened.drain_events();
+    storage.set_fail_get_group(false);
+
+    (reopened, storage, bob, group_id)
+}
+
+/// A valid inbound commit authored by bob (admin) inviting carol; advances
+/// the group from epoch 1 to epoch 2.
+async fn bob_invites_carol(
+    bob: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let (mut carol, _carol_storage) = build_named_client(b"carol-quarantine");
+    let carol_kp = carol.fresh_key_package().await.expect("carol key package");
+    let invite = bob
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .expect("bob invites carol");
+    let (commit, pending) = evolution(invite);
+    bob.confirm_published(pending).await.expect("bob confirms");
+    route(commit, group_id)
+}
+
+/// The #707 acceptance-criterion test: a quarantined group rejects a valid
+/// inbound commit on `ingest`, retains the input durably for post-repair
+/// replay, stays quarantined, and both `epoch()` and `members()` report it
+/// vanished — no `set_stable` resurrection out of band.
+#[tokio::test]
+async fn quarantined_group_rejects_valid_inbound_commit_on_do_ingest() {
+    let (mut alice, storage, mut bob, group_id) = quarantined_alice_with_live_bob().await;
+    let commit = bob_invites_carol(&mut bob, &group_id).await;
+
+    let outcome = alice
+        .ingest(commit.clone())
+        .await
+        .expect("ingest classifies");
+    assert!(
+        matches!(
+            outcome,
+            cgka_traits::ingest::IngestOutcome::Stale {
+                reason: cgka_traits::ingest::StaleReason::Quarantined
+            }
+        ),
+        "expected Stale::Quarantined, got {outcome:?}"
+    );
+
+    // Still quarantined, still vanished on every accessor.
+    assert_eq!(alice.quarantined_groups().len(), 1);
+    assert!(matches!(
+        alice.epoch(&group_id),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    assert!(matches!(
+        alice.members(&group_id),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+
+    // The commit is retained durably as the post-repair replay buffer.
+    let record = storage.get_message(&commit.id).expect("commit retained");
+    assert_eq!(record.state, MessageState::PeelDeferred);
+
+    // No epoch_manager resurrection happened as a side effect.
+    assert!(matches!(
+        alice.epoch(&group_id),
+        Err(EngineError::UnknownGroup(_))
+    ));
+}
+
+#[tokio::test]
+async fn quarantined_group_blocks_convergence_and_send() {
+    let (mut alice, _storage, _bob, group_id) = quarantined_alice_with_live_bob().await;
+
+    assert!(matches!(
+        alice
+            .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+            .await,
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+
+    let result = alice
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("quarantined convergence reports a blocked no-op run");
+    assert_eq!(
+        result.convergence_status,
+        cgka_engine::canonicalization::ConvergenceStatus::Blocked
+    );
+    assert!(result.errors.is_empty());
+    assert!(result.accepted_commits.is_empty());
+
+    assert!(matches!(
+        alice
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: b"blocked".to_vec(),
+            })
+            .await,
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+
+    // Nothing above re-activated the group.
+    assert!(matches!(
+        alice.epoch(&group_id),
+        Err(EngineError::UnknownGroup(_))
+    ));
+    assert_eq!(alice.quarantined_groups().len(), 1);
+}
+
+#[tokio::test]
+async fn quarantined_group_accessors_all_report_unknown_group() {
+    let (mut alice, _storage, _bob, group_id) = quarantined_alice_with_live_bob().await;
+    let component = cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
+
+    let unknown = |result: Result<(), EngineError>, name: &str| {
+        assert!(
+            matches!(&result, Err(EngineError::UnknownGroup(id)) if *id == group_id),
+            "{name} must report UnknownGroup for a quarantined group, got {result:?}"
+        );
+    };
+
+    unknown(alice.members(&group_id).map(drop), "members");
+    unknown(alice.epoch(&group_id).map(drop), "epoch");
+    unknown(alice.group_record(&group_id).map(drop), "group_record");
+    unknown(alice.admin_pubkeys(&group_id).map(drop), "admin_pubkeys");
+    unknown(alice.group_context(&group_id).map(drop), "group_context");
+    unknown(
+        alice.app_component(&group_id, component).map(drop),
+        "app_component",
+    );
+    unknown(
+        alice
+            .feature_status(&group_id, &Feature("self-remove"))
+            .map(drop),
+        "feature_status",
+    );
+    unknown(
+        alice.upgradeable_capabilities(&group_id).map(drop),
+        "upgradeable_capabilities",
+    );
+    unknown(
+        alice.upgrade_group_capabilities(&group_id).await.map(drop),
+        "upgrade_group_capabilities",
+    );
+    unknown(alice.own_leaf_index(&group_id).map(drop), "own_leaf_index");
+    unknown(
+        alice
+            .safe_export_secret_with_epoch(&group_id, component)
+            .map(drop),
+        "safe_export_secret_with_epoch",
+    );
+    unknown(
+        alice
+            .current_safe_export_epoch(&group_id, component)
+            .map(drop),
+        "current_safe_export_epoch",
+    );
+    unknown(
+        alice.safe_export_secret(&group_id, component).map(drop),
+        "safe_export_secret",
+    );
+}
+
+/// After repair, input retained while quarantined replays through the
+/// existing deferred-peel machinery and the group catches up to the commit.
+#[tokio::test]
+async fn repair_replays_buffered_commit_and_group_catches_up() {
+    let (mut alice, storage, mut bob, group_id) = quarantined_alice_with_live_bob().await;
+    let commit = bob_invites_carol(&mut bob, &group_id).await;
+
+    let outcome = alice
+        .ingest(commit.clone())
+        .await
+        .expect("ingest classifies");
+    assert!(matches!(
+        outcome,
+        cgka_traits::ingest::IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::Quarantined
+        }
+    ));
+
+    let recovered = alice
+        .retry_hydrate_quarantined_group(&group_id)
+        .expect("retry runs");
+    assert!(recovered, "storage is healthy again; retry must recover");
+    assert!(alice.quarantined_groups().is_empty());
+
+    // Repair scheduled the group for the app's convergence drain.
+    let scheduled = alice.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&group_id),
+        "repair must schedule the recovered group for convergence, got {scheduled:?}"
+    );
+
+    alice
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .expect("post-repair drain replays retained input");
+
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+    let record = storage.get_message(&commit.id).expect("replayed row");
+    assert_eq!(record.state, MessageState::Processed);
+}
+
+/// An authenticated re-join welcome for a quarantined id clears the
+/// quarantine: the welcome re-validated every leaf and wrote fresh state —
+/// strictly stronger than `retry_hydrate_quarantined_group`. Blocking it
+/// would permanently strand a group whose stored state is unrecoverable.
+#[tokio::test]
+async fn rejoin_welcome_clears_quarantine() {
+    // Bob owns the real group; alice has a corrupted partial copy (Marmot
+    // record without OpenMLS state) that quarantines as OpenMlsGroupMissing.
+    let (mut bob, _bob_storage) = build_named_client(b"bob-rejoin");
+    let (group_id, send_result) = bob
+        .create_group(CreateGroupRequest {
+            name: "rejoin-clears-quarantine".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect("bob creates group");
+    let SendResult::GroupCreated { pending, .. } = send_result else {
+        panic!("expected group-created send result");
+    };
+    bob.confirm_published(pending).await.expect("bob confirms");
+
+    let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut alice = EngineBuilder::new(alice_storage.clone())
+        .identity(pad32(b"alice-rejoin"))
+        .account_identity_proof_signer(proof_signer(b"alice-rejoin"))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build alice");
+    insert_marmot_group_without_openmls_state(&alice_storage, &group_id, "corrupted-copy", 1);
+    alice
+        .hydrate_stable_groups_from_storage()
+        .expect("hydration quarantines the corrupted copy");
+    assert_eq!(
+        alice.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            GroupHydrationQuarantineReason::OpenMlsGroupMissing
+        )]
+    );
+    alice.drain_events();
+
+    // Bob invites alice into the real group; the welcome carries the same id.
+    let alice_kp = alice.fresh_key_package().await.expect("alice key package");
+    let invite = bob
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![alice_kp],
+        })
+        .await
+        .expect("bob invites alice");
+    let SendResult::GroupEvolution {
+        pending, welcomes, ..
+    } = invite
+    else {
+        panic!("expected group evolution with welcomes");
+    };
+    bob.confirm_published(pending).await.expect("bob confirms");
+    let joined = alice
+        .join_welcome(welcome_for(&welcomes, b"alice-rejoin"))
+        .await
+        .expect("authenticated re-join succeeds for a quarantined id");
+    assert_eq!(joined, group_id);
+
+    assert!(alice.quarantined_groups().is_empty());
+    assert!(alice.epoch(&group_id).is_ok());
+    assert!(alice.members(&group_id).is_ok());
+    let events = alice.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupHydrationRecovered { group_id: gid, .. } if gid == &group_id
+        )),
+        "re-join must emit GroupHydrationRecovered: {events:?}"
+    );
+}
+
 // mdk#152: session open must not re-verify an unchanged group's
 // account-identity proofs on every open. After a successful hydration the
 // engine persists a content-bound validation marker; reopening an unchanged

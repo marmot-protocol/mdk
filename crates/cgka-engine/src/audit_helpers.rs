@@ -78,6 +78,7 @@ pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
         StaleReason::OwnEcho => "own_echo",
         StaleReason::PeelFailed => "peel_failed",
         StaleReason::SelfEvicted => "self_evicted",
+        StaleReason::Quarantined => "quarantined",
     }
 }
 

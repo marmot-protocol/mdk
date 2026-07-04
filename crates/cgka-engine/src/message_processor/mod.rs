@@ -85,6 +85,10 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) async fn do_send(&mut self, intent: SendIntent) -> Result<SendResult, EngineError> {
         let group_id = send_intent_group_id(&intent).clone();
+        // Quarantine gate: a group frozen by hydration quarantine must not
+        // stage, queue, or publish anything — a confirm would set_stable and
+        // silently un-quarantine it out of band (mdk#364).
+        self.ensure_group_live(&group_id)?;
         // Terminal gate before queueing: a local copy marked removed (realized
         // self-eviction) must never accept or queue outbound work. Checked
         // again in `do_send_ready` so queued-intent drains for a copy removed
@@ -119,6 +123,9 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         now_ms: u64,
     ) -> Result<Vec<SendResult>, EngineError> {
+        // Quarantined groups vanish from every live surface; convergence and
+        // queued-intent drains must not touch their state (mdk#364).
+        self.ensure_group_live(group_id)?;
         // Terminal: a removed copy must never publish, and the removed-copy
         // gate in `do_send_ready` would turn every queued record into a
         // permanent drain error that the app retries forever. Discard the
@@ -353,6 +360,13 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     pub async fn retry_deferred_peels(&mut self, group_id: &GroupId) -> Result<usize, EngineError> {
+        // A quarantined group has no epoch_manager entry, so the Stable gate
+        // below would fall through and re-ingest its retained rows against
+        // the very state validation rejected (mdk#364). The rows replay
+        // once repair clears the quarantine.
+        if self.quarantined_reason(group_id).is_some() {
+            return Ok(0);
+        }
         if let Some(state) = self.epoch_manager.state(group_id)
             && !matches!(state, EpochState::Stable { .. })
         {
@@ -377,6 +391,15 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(IngestOutcome::Stale {
                     reason: StaleReason::PeelFailed,
                 }) => {}
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::Quarantined,
+                }) => {
+                    // Defense-in-depth: the gate above should keep this loop
+                    // from running for a quarantined group at all, but if a
+                    // row still classifies Quarantined it must keep its
+                    // PeelDeferred state — the catch-all arm below would
+                    // retire the replay buffer.
+                }
                 Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
                     // The peeled content now has its own content-derived record;
                     // retire the raw transport wrapper so it does not keep

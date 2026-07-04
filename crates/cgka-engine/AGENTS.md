@@ -332,6 +332,16 @@ shapes. Tests: `tests/fork_detection.rs` plus the harness `deliberate_fork_via_h
   terminal disposition). Fork-recovery paths fail closed with typed errors (`EngineError::ForkedEpoch` / `Backend`) —
   never `unreachable!`/`panic!` — on attacker-influenced input. When you add a guard to one seam, add it to the shared
   helper (or all seams) and extend the parity tests; a guard that exists on one seam only is a bug (see mdk#707).
+- **Hydration quarantine is enforced through `Engine::ensure_group_live`.** A quarantined group vanishes from every
+  live surface (mdk#364 / #365): every public accessor that reads durable or MLS group state (`members`,
+  `group_record`, `group_context`, `admin_pubkeys`, `app_component`, `feature_status`, capability queries, the
+  safe-export family, `own_leaf_index`) calls `ensure_group_live` first and returns `UnknownGroup`; `do_send` and
+  `converge_and_drain_queued_outbound_intents` refuse to run; `ingest_group_message` retains inbound input as
+  `PeelDeferred` and classifies it `Stale { reason: Quarantined }`; `converge_stored_openmls_messages` reports a
+  `Blocked` run without touching state; `retry_deferred_peels` skips the group. When you add a new accessor or data
+  path that reads group state, add the gate — a path that bypasses it can silently un-quarantine a group via
+  `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join welcome,
+  both of which schedule retained input for replay.
 - **Only `EpochManager` may construct non-`Stable` `EpochState` variants.** This is enforced by visibility — the
   variants' fields are private. Don't add a public constructor for `Recovering` etc. somewhere else.
 - **No Nostr library/SDK dependency.** These crates do not depend on any Nostr crate and use no Nostr SDK types. They

@@ -385,6 +385,12 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::SelfEvicted
         }
     );
+    insta::assert_json_snapshot!(
+        "stale_quarantined",
+        IngestOutcome::Stale {
+            reason: StaleReason::Quarantined
+        }
+    );
 }
 
 #[test]

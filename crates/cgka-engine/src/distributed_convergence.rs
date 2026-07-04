@@ -254,6 +254,30 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(unrecoverable_result(epoch));
         }
 
+        // A hydration-quarantined group is frozen until explicit repair: no
+        // canonicalization pass may read or mutate its state, and no
+        // set_stable may re-activate it out of band (mdk#364). Report a
+        // blocked run and leave everything untouched; retained inputs replay
+        // once repair clears the quarantine.
+        if self.quarantined_reason(group_id).is_some() {
+            let epoch = self
+                .epoch_manager
+                .epoch(group_id)
+                .map(|e| e.0)
+                .unwrap_or_default();
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::ConvergenceRunState {
+                    phase: ConvergencePhase::Blocked,
+                    current_tip_epoch: Some(epoch),
+                    retained_anchor_horizon: None,
+                    reason: Some("group_quarantined".to_string()),
+                    error_kind: None,
+                },
+            );
+            return Ok(quarantined_result(epoch));
+        }
+
         let previous_group = self
             .storage
             .get_group(group_id)
@@ -1044,6 +1068,31 @@ fn unrecoverable_result(current_tip: u64) -> CanonicalizationResult {
         queued_outbound_intents: Vec::new(),
         publishable_outbound_messages: Vec::new(),
         errors: vec![CanonicalizationError::MissingRetainedAnchor],
+        selection_trace: None,
+    }
+}
+
+/// Blocked no-op result for a hydration-quarantined group: convergence ran
+/// against nothing, selected nothing, and reports no errors — the group is
+/// deliberately frozen, not failing.
+fn quarantined_result(current_tip: u64) -> CanonicalizationResult {
+    CanonicalizationResult {
+        previous_tip: current_tip,
+        selected_tip: None,
+        selected_fork_epoch: None,
+        selected_branch_id: None,
+        candidate_count: 0,
+        eligible_count: 0,
+        convergence_status: ConvergenceStatus::Blocked,
+        accepted_commits: Vec::new(),
+        accepted_proposals: Vec::new(),
+        accepted_app_messages: Vec::new(),
+        invalidated_app_messages: Vec::new(),
+        dropped_messages: Vec::new(),
+        already_seen: Vec::new(),
+        queued_outbound_intents: Vec::new(),
+        publishable_outbound_messages: Vec::new(),
+        errors: Vec::new(),
         selection_trace: None,
     }
 }
