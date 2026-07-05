@@ -4322,6 +4322,278 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
     );
 }
 
+/// mdk#736: a convergence input whose source epoch is beyond the FUTURE horizon
+/// (`current_tip + max_rewind_commits`) can never chain from the tip, so it is
+/// not resolvable convergence work and MUST NOT gate outbound sends. Before the
+/// fix, a single member could forge one far-future-epoch plaintext message whose
+/// buffered `Created`/`Retryable` row was never materialized and never given a
+/// terminal disposition, so `has_unresolved_convergence_inputs` reported the
+/// group unsettled forever and every send was queued and never drained — a
+/// durable, whole-group denial of service from one insider.
+#[tokio::test]
+async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-future-horizon-gate".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    // Tight horizon so a small real epoch is already "far future": with the tip
+    // at epoch 1 and `max_rewind_commits = 1`, the ceiling is epoch 2.
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    });
+    carol.drain_events();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+
+    // Alice advances her own copy to epoch 3 (Carol never ingests these), then
+    // frames an application message at epoch 3 — source_epoch 3, beyond Carol's
+    // ceiling of 2.
+    for invitee in [&mut david, &mut eve] {
+        let invitee_kp = invitee.fresh_key_package().await.unwrap();
+        let invite = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![invitee_kp],
+            })
+            .await
+            .unwrap();
+        let (_commit, pending) = evolution(invite);
+        alice.confirm_published(pending).await.unwrap();
+    }
+    let far_future_msg = send_app(&mut alice, &group_id, b"far future payload".to_vec()).await;
+    assert_eq!(
+        project_mls_message(&far_future_msg.payload)
+            .expect("far-future app projects")
+            .source_epoch,
+        Some(3)
+    );
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, far_future_msg.clone(), 1_000)
+        .expect("far-future message buffered");
+
+    // Convergence is not perpetually unsettled on account of the beyond-ceiling
+    // row — this distinguishes "send gate fixed" from "convergence loop still
+    // wedged on the same forged input", which was the original failure mode.
+    assert!(
+        carol
+            .advance_convergence_inputs_until_settled(&group_id, 1_000_000)
+            .await
+            .unwrap(),
+        "beyond-ceiling row must not leave convergence perpetually unsettled"
+    );
+
+    // The fix: the beyond-ceiling row does not gate, so Carol can still send.
+    // Pre-fix this returned `SendResult::Queued` forever.
+    let sent = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"still able to send"),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { .. }),
+        "beyond-ceiling convergence input must not gate the send, got {sent:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    // The forged row is NOT dropped — it stays retained so it would gate again
+    // (correctly) once the tip advances into `[anchor, ceiling]`.
+    assert_message_state(&carol_storage, &far_future_msg, MessageState::Created);
+}
+
+/// mdk#736 (related hardening): a `Created`/`Retryable` convergence row that
+/// cannot be decoded / is not an openmls-wire payload / fails projection is NOT
+/// resolvable convergence work and must fail OPEN (not gate sends). Before the
+/// fix, `has_unresolved_convergence_inputs` returned `true` on any such row,
+/// permanently gating sends with no recovery path.
+#[tokio::test]
+async fn undecodable_convergence_row_does_not_gate_sends() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-fail-open-gate".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    // Inject a garbage convergence row within the gate's scan window (epoch 1)
+    // whose payload cannot be decoded as a stored message.
+    let garbage_id = MessageId::new(b"garbage-convergence-row".to_vec());
+    carol_storage
+        .put_message(&MessageRecord {
+            id: garbage_id.clone(),
+            group_id: group_id.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Created,
+            payload: b"not-a-valid-stored-message-payload".to_vec(),
+        })
+        .unwrap();
+    assert!(
+        StoredMessagePayload::decode(&carol_storage.get_message(&garbage_id).unwrap().payload)
+            .is_err(),
+        "garbage row must fail to decode for this test to exercise the fail-open path"
+    );
+
+    // The fix: an undecodable row does not gate. Pre-fix this returned Queued.
+    let sent = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"send despite garbage row"),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { .. }),
+        "an undecodable convergence row must not gate the send, got {sent:?}"
+    );
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// mdk#752 review: the fail-open gate has three branches — decode failure
+/// (covered by `undecodable_convergence_row_does_not_gate_sends`), a decodable
+/// payload that is NOT openmls-wire, and an openmls-wire payload whose inner
+/// bytes do not project. The latter two are the branches an adversary is more
+/// likely to craft (a well-formed stored envelope wrapping non-MLS bytes), so
+/// pin them too.
+#[tokio::test]
+async fn non_wire_and_unprojectable_convergence_rows_do_not_gate_sends() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut carol, carol_storage) = build_client(b"carol");
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-fail-open-branches".into(),
+            description: "".into(),
+            members: vec![carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let tm = |payload: Vec<u8>| TransportMessage {
+        id: MessageId::new(b"inner".to_vec()),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("fail-open-branch".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+
+    // Branch 2: a decodable stored payload that is NOT openmls-wire.
+    carol_storage
+        .put_message(&MessageRecord {
+            id: MessageId::new(b"not-openmls-wire-row".to_vec()),
+            group_id: group_id.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Created,
+            payload: StoredMessagePayload::raw_transport(tm(b"raw-transport-bytes".to_vec()))
+                .encode()
+                .unwrap(),
+        })
+        .unwrap();
+
+    // Branch 3: an openmls-wire payload whose inner bytes do not project as MLS.
+    carol_storage
+        .put_message(&MessageRecord {
+            id: MessageId::new(b"unprojectable-wire-row".to_vec()),
+            group_id: group_id.clone(),
+            epoch: EpochId(1),
+            state: MessageState::Retryable,
+            payload: StoredMessagePayload::openmls_wire(tm(b"not-mls-bytes".to_vec()))
+                .encode()
+                .unwrap(),
+        })
+        .unwrap();
+
+    let sent = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&carol, b"send despite fail-open rows"),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, SendResult::ApplicationMessage { .. }),
+        "neither a non-wire nor an unprojectable convergence row may gate the send, got {sent:?}"
+    );
+    assert!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
     let (mut alice, _alice_storage) = build_client(b"alice");

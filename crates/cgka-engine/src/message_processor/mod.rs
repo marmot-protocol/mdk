@@ -16,7 +16,7 @@ pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use send::merge_capabilities;
 
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
-use crate::openmls_projection::{OpenMlsContentKind, project_mls_message};
+use crate::openmls_projection::{OpenMlsContentKind, decode_openmls_wire_projection};
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
@@ -365,20 +365,34 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     fn has_unresolved_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
-        let anchor = match self.storage.get_group(group_id) {
+        // The convergence horizon is bounded on BOTH sides (mdk#736). The past
+        // side (`anchor`) drops inputs older than the retained-anchor window.
+        // The future side (`ceiling`) is symmetric: a convergence input more
+        // than `max_rewind_commits` epochs ahead of the current tip cannot chain
+        // from the tip yet (the candidate-path BFS in `openmls_projection` only
+        // extends `source_epoch == tip_epoch`), so it is not *resolvable
+        // convergence work* and must not gate outbound sends. Without the
+        // ceiling, a single member could forge one far-future-epoch (e.g. 2^63)
+        // plaintext message whose buffered `Created` row is never materialized
+        // and never given a terminal disposition, permanently gating every send
+        // for the whole group. The row is left in storage (not dropped here), so
+        // it gates again correctly once the tip advances into `[anchor, ceiling]`.
+        let (anchor, ceiling) = match self.storage.get_group(group_id) {
             Ok(group) => {
                 let policy = self
                     .convergence_policy_for_group(group_id)
                     .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
-                group
-                    .epoch
-                    .0
-                    .saturating_sub(policy.convergence.max_rewind_commits)
+                let rewind = policy.convergence.max_rewind_commits;
+                (
+                    group.epoch.0.saturating_sub(rewind),
+                    group.epoch.0.saturating_add(rewind),
+                )
             }
             Err(StorageError::NotFound) => return Ok(false),
             Err(e) => return Err(EngineError::Storage(e)),
         };
         let records = self.storage.list_messages(group_id, EpochId(anchor))?;
+        let mut skipped_non_resolvable: usize = 0;
         for record in records {
             if !matches!(
                 record.state,
@@ -386,15 +400,25 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 continue;
             }
-            let Ok(stored_payload) = StoredMessagePayload::decode(&record.payload) else {
-                return Ok(true);
+            // Fail OPEN, not closed (mdk#736): a row we cannot decode, is not an
+            // openmls-wire payload, or cannot be projected is NOT resolvable
+            // convergence work — treating it as "unresolved" would let a single
+            // corrupt/garbage row permanently gate sends with no recovery path.
+            // Such a row simply does not contribute to the send gate; the
+            // convergence horizon (`openmls_projection`) is responsible for
+            // assigning it a terminal disposition. Count the skips so sustained
+            // abuse (an insider spraying undecodable rows) is visible in audits
+            // without spamming a log line per row (mdk#752 review).
+            let Some((_message, projection)) = decode_openmls_wire_projection(&record.payload)
+            else {
+                skipped_non_resolvable += 1;
+                continue;
             };
-            let Some(message) = stored_payload.as_openmls_wire() else {
-                return Ok(true);
-            };
-            let Ok(projection) = project_mls_message(&message.payload) else {
-                return Ok(true);
-            };
+            // Beyond the future horizon: unreachable from the current tip, so
+            // not gating work (see the ceiling rationale above).
+            if projection.source_epoch.is_some_and(|epoch| epoch > ceiling) {
+                continue;
+            }
             // A lone uncommitted Proposal does NOT make canonical state
             // ambiguous: commits are the consensus log; a proposal only takes
             // effect once a commit consumes it (convergence.md:7-8). The
@@ -415,6 +439,18 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 return Ok(true);
             }
+        }
+        // Reached only when nothing gates: surface any fail-open skips so an
+        // insider spraying undecodable rows (which no longer wedges the gate but
+        // still costs a scan) is visible in forensic audits. Aggregate count
+        // only — no ids, epochs, or payloads (observability privacy invariant).
+        if skipped_non_resolvable > 0 {
+            tracing::debug!(
+                target: "cgka_engine::message_processor",
+                method = "has_unresolved_convergence_inputs",
+                skipped_non_resolvable,
+                "skipped non-resolvable convergence rows (fail-open)"
+            );
         }
         Ok(false)
     }
