@@ -12,15 +12,15 @@ use crate::{
     AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
     AppGroupImageInput, AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent,
     AppGroupRecord, AppMessageProjection, AppMessageRecord, AuditLogSettings,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    ChatNotificationSettings, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID,
     NotificationSettings, PushPlatform, PushRegistration, RelayTelemetrySettings,
 };
 use storage_sqlite::{
-    AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
-    AccountStoredPushRegistration, StoredAccountGroup, StoredAccountGroupComponent,
-    StoredAccountState, StoredAppEvent, StoredAppMessageRecord, StoredAuditLogSettings,
-    StoredRelayTelemetrySettings,
+    AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
+    AccountPushRegistration, AccountStoredPushRegistration, StoredAccountGroup,
+    StoredAccountGroupComponent, StoredAccountState, StoredAppEvent, StoredAppMessageRecord,
+    StoredAuditLogSettings, StoredRelayTelemetrySettings,
 };
 
 pub(crate) fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
@@ -268,6 +268,21 @@ pub(crate) fn notification_settings_from_account(
         account_id_hex: settings.account_id_hex,
         local_notifications_enabled: settings.local_notifications_enabled,
         native_push_enabled: settings.native_push_enabled,
+    }
+}
+
+pub(crate) fn chat_notification_settings_from_account(
+    account_ref: String,
+    account_id_hex: String,
+    settings: AccountChatNotificationSettings,
+) -> ChatNotificationSettings {
+    ChatNotificationSettings {
+        account_ref,
+        account_id_hex,
+        group_id_hex: settings.group_id_hex,
+        muted: settings.muted,
+        muted_until_ms: settings.muted_until_ms,
+        updated_at_ms: settings.updated_at_ms,
     }
 }
 

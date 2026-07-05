@@ -31,14 +31,15 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppMessageQuery, AppMessageRecord, AppProjectionUpdate,
     AppQuarantinedGroup, AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings,
     AuditLogTrackerConfig, AuditLogTrackerUpdateResult, AuditLogUploadResult,
-    BackgroundNotificationCollection, ChatListRow, GroupInviteDeclineResult, GroupPushDebugInfo,
-    MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelinePage,
-    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
+    GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
+    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
+    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
+    NotificationWakeSource, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
+    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
+    unix_now_seconds,
 };
 
 mod account_worker;
@@ -1389,6 +1390,16 @@ impl MarmotAppRuntime {
         self.accounts.app.notification_settings(account_ref)
     }
 
+    pub fn chat_notification_settings(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        self.accounts
+            .app
+            .chat_notification_settings(account_ref, group_id_hex)
+    }
+
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
         self.accounts.app.relay_telemetry_settings()
     }
@@ -1510,6 +1521,27 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .set_local_notifications_enabled(account_ref, enabled)
+    }
+
+    pub fn set_chat_muted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        muted_until_ms: Option<i64>,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        self.accounts
+            .app
+            .set_chat_muted(account_ref, group_id_hex, muted_until_ms)
+    }
+
+    pub fn clear_chat_muted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        self.accounts
+            .app
+            .clear_chat_muted(account_ref, group_id_hex)
     }
 
     pub async fn set_native_push_enabled(

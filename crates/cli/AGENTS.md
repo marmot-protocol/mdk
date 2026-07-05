@@ -35,9 +35,10 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
 - `create-identity`, `login`, `logout`, `whoami`, `account`, and `accounts`: create/import/remove public or local
   signing accounts, list accounts, inspect status, and inspect relay lists. `export-nsec` is present but must not print
   private key material.
-- `keys`: list/publish/check the selected local account's KeyPackage, force-mint a replacement with `keys rotate`
-  (alias `force-publish`), and fetch another account's latest KeyPackage.
-- `chats`: list, list-archived, show, subscribe, subscribe-archived, archive, and unarchive local chat projections.
+- `keys`: list/publish/check/delete the selected local account's KeyPackage records, force-mint a replacement with
+  `keys rotate` (alias `force-publish`), and fetch another account's latest KeyPackage.
+- `chats`: list, list-archived, show, subscribe, subscribe-archived, archive, unarchive, mute, and unmute local chat
+  projections/notification policy.
 - `group` and `groups`: create groups, list/show groups, list members/admins/relays, invite/add/remove members, update
   profile fields, and subscribe to runtime-owned group-state updates through the daemon.
 - `messages`: send text messages, list/search projected messages with Whitenoise-shaped cursor flags, subscribe to
@@ -46,9 +47,8 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
 - `follows`, `profile`, `relays`, `settings`, and `users`: expose the current Nostr directory/settings behavior.
 - Reaction, delete, retry, encrypted media, and admin/member management commands have implemented CLI behavior; keep
   their JSON shapes aligned with the `Unreleased` changelog entries when changing them.
-- `notifications` and user-driven invite accept/decline commands: keep the Whitenoise-shaped command names but return
-  `unsupported_command` until real behavior exists.
-- `stream`: anchor, watch, receive, send, finish, and verify provisional QUIC agent text stream previews.
+- `notifications`: subscribe to runtime-owned local notification updates through the daemon.
+- `stream`: anchor, watch, receive, send, daemon-compose, finish, and verify provisional QUIC agent text stream previews.
 - `sync`: diagnostic catch-up for processing relay events for the selected local signing account.
 - `relay-stats`: print device-local relay performance telemetry (aggregate counters, cross-relay spread, per-relay
   first-deliverer and first-event/EOSE timing, redacted relay health). Reads the live `wnd` runtime when a socket

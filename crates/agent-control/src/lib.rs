@@ -117,6 +117,11 @@ pub enum AgentControlRequest {
         final_text: String,
         transcript_hash_hex: String,
         chunk_count: u64,
+        /// Optional client-supplied dedup key. When present, the connector
+        /// returns the original stream-final message ids for a retry whose
+        /// finalized transcript matches the first successful finalize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     StreamCancel {
         stream_id_hex: String,
@@ -573,6 +578,36 @@ mod tests {
     }
 
     #[test]
+    fn stream_finalize_idempotency_key_is_omitted_when_absent_and_present_when_set() {
+        // Same additive contract as send_final: old peers see the same frame
+        // when the key is absent, while newer clients can opt into dedup.
+        let without = AgentControlRequest::StreamFinalize {
+            stream_id_hex: "55".repeat(32),
+            final_text: "done".to_owned(),
+            transcript_hash_hex: "ab".repeat(32),
+            chunk_count: 1,
+            idempotency_key: None,
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(
+            value.get("idempotency_key").is_none(),
+            "absent key must not be serialized"
+        );
+
+        let with = AgentControlRequest::StreamFinalize {
+            stream_id_hex: "55".repeat(32),
+            final_text: "done".to_owned(),
+            transcript_hash_hex: "ab".repeat(32),
+            chunk_count: 1,
+            idempotency_key: Some("stream-key-1".to_owned()),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["idempotency_key"], "stream-key-1");
+        let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, with);
+    }
+
+    #[test]
     fn stream_begun_response_carries_policy_plaintext_cap_when_present() {
         let begun = AgentControlResponse::StreamBegun {
             stream_id_hex: "aa".repeat(32),
@@ -801,6 +836,7 @@ mod tests {
                     final_text: "hello".to_owned(),
                     transcript_hash_hex: hash(),
                     chunk_count: 1,
+                    idempotency_key: Some("stream-final-1".to_owned()),
                 },
                 "stream_finalize",
             ),

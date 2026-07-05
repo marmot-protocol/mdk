@@ -197,7 +197,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: UsersCommand,
     },
-    #[command(hide = true)]
+    #[command(about = "Subscribe to local notification updates")]
     Notifications {
         #[command(subcommand)]
         command: NotificationsCommand,
@@ -212,7 +212,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    #[command(hide = true)]
+    #[command(about = "Process relay events for the selected account")]
     Sync,
     #[command(
         name = "relay-stats",
@@ -235,8 +235,6 @@ pub(crate) enum DebugCommand {
     RelayControlState,
     #[command(about = "Run a local runtime health check for the selected account")]
     Health,
-    #[command(name = "ratchet-tree", hide = true)]
-    RatchetTree { group_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -312,9 +310,12 @@ pub(crate) enum KeyPackageCommand {
         alias = "force-publish"
     )]
     Rotate,
-    #[command(hide = true)]
+    #[command(about = "Publish a Nostr deletion for one KeyPackage event")]
     Delete { event_id: String },
-    #[command(name = "delete-all", hide = true)]
+    #[command(
+        name = "delete-all",
+        about = "Publish Nostr deletions for all relay-published KeyPackage events"
+    )]
     DeleteAll {
         #[arg(long)]
         confirm: bool,
@@ -372,10 +373,18 @@ pub(crate) enum ChatsCommand {
         about = "Subscribe to live archived-chat updates through the daemon"
     )]
     SubscribeArchived,
-    #[command(hide = true)]
-    Mute { group: String, duration: String },
-    #[command(hide = true)]
-    Unmute { group: String },
+    #[command(about = "Mute local notifications for a chat")]
+    Mute {
+        #[arg(help = "Group id to mute")]
+        group: String,
+        #[arg(help = "Mute duration: forever, or a number with s/m/h/d/w suffix")]
+        duration: String,
+    },
+    #[command(about = "Unmute local notifications for a chat")]
+    Unmute {
+        #[arg(help = "Group id to unmute")]
+        group: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
@@ -550,12 +559,18 @@ pub(crate) enum GroupsCommand {
         #[arg(long, help = "Clear the group URL avatar")]
         clear: bool,
     },
-    #[command(hide = true)]
+    #[command(about = "List pending group invites for the selected account")]
     Invites,
-    #[command(hide = true)]
-    Accept { group_id: String },
-    #[command(hide = true)]
-    Decline { group_id: String },
+    #[command(about = "Accept a pending group invite")]
+    Accept {
+        #[arg(help = "Group id to accept")]
+        group_id: String,
+    },
+    #[command(about = "Decline a pending group invite by leaving and archiving it")]
+    Decline {
+        #[arg(help = "Group id to decline")]
+        group_id: String,
+    },
     #[command(about = "Promote a member to group admin")]
     Promote {
         #[arg(help = "Group id to update")]
@@ -931,33 +946,53 @@ pub(crate) enum StreamCommand {
         )]
         background: bool,
     },
-    #[command(hide = true)]
+    #[command(about = "Open a daemon-owned live stream compose session")]
     ComposeOpen {
+        #[arg(help = "Group id that will receive the stream anchor and final message")]
         group: String,
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Stream id to use")]
         stream_id: Option<String>,
-        #[arg(long = "quic-candidate", value_name = "ADDR")]
+        #[arg(
+            long = "quic-candidate",
+            value_name = "ADDR",
+            help = "Broker candidate to advertise, e.g. quic://host:port"
+        )]
         quic_candidates: Vec<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Trust loopback QUIC broker certificates for local testing"
+        )]
         insecure_local: bool,
-        #[arg(long, default_value_t = 32, value_name = "BYTES")]
+        #[arg(
+            long,
+            default_value_t = 32,
+            value_name = "BYTES",
+            help = "Maximum bytes per streamed preview chunk"
+        )]
         chunk_bytes: usize,
     },
-    #[command(hide = true)]
+    #[command(about = "Append text to an active daemon stream compose session")]
     ComposeAppend {
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Stream id to append to")]
         stream_id: String,
-        #[arg(value_name = "TEXT", required = true, allow_hyphen_values = true)]
+        #[arg(
+            value_name = "TEXT",
+            required = true,
+            allow_hyphen_values = true,
+            help = "Text to append"
+        )]
         text: Vec<String>,
     },
-    #[command(hide = true)]
+    #[command(
+        about = "Finish a daemon stream compose session and publish the durable final message"
+    )]
     ComposeFinish {
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Stream id to finish")]
         stream_id: String,
     },
-    #[command(hide = true)]
+    #[command(about = "Cancel a daemon stream compose session")]
     ComposeCancel {
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", help = "Stream id to cancel")]
         stream_id: String,
     },
     #[command(about = "Commit the final agent text stream transcript over the MLS message path")]

@@ -129,6 +129,36 @@ openclaw-dev-teardown args="":
 openclaw-dev-test:
     cd integrations/openclaw/marmot && pnpm install && pnpm typecheck && pnpm test
 
+openclaw-dev-script-test:
+    integrations/openclaw/marmot/test/dev-scripts.sh
+
+openclaw-dev-smoke root="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{root}}"
+    if [ -z "$root" ]; then
+        root="${OPENCLAW_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/openclaw-marmot-test}"
+    fi
+    "$root/smoke-plugin.sh"
+
+openclaw-dev-control-smoke root="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{root}}"
+    if [ -z "$root" ]; then
+        root="${OPENCLAW_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/openclaw-marmot-test}"
+    fi
+    "$root/control-smoketest.sh"
+
+openclaw-dev-e2e-connector root="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{root}}" ]; then
+        ./scripts/openclaw_marmot_connector_e2e.sh
+    else
+        ./scripts/openclaw_marmot_connector_e2e.sh --root "{{root}}"
+    fi
+
 openclaw-phone-test-up:
     docker compose --profile openclaw-phone-test up -d --build openclaw-marmot-phone-test
 

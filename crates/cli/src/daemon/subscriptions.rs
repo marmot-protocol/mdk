@@ -476,6 +476,59 @@ pub(crate) async fn handle_group_state_subscription(
     Ok(())
 }
 
+pub(crate) async fn handle_notifications_subscription(
+    stream: &mut UnixStream,
+    runtime: Option<marmot_app::MarmotAppRuntime>,
+    cli: Cli,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if notifications_subscribe_args(&cli).is_err() {
+        let _ = write_stream_response(
+            stream,
+            &DaemonStreamResponse::err(
+                "notifications subscribe requires wn notifications subscribe".to_owned(),
+            ),
+        )
+        .await;
+        let _ = write_stream_end(stream).await;
+        return Ok(());
+    }
+    let Some(runtime) = runtime else {
+        let _ = write_stream_response(
+            stream,
+            &DaemonStreamResponse::err("app runtime is not running".to_owned()),
+        )
+        .await;
+        let _ = write_stream_end(stream).await;
+        return Ok(());
+    };
+    let mut subscription = match runtime.subscribe_notifications() {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            let _ =
+                write_stream_response(stream, &DaemonStreamResponse::err(err.to_string())).await;
+            let _ = write_stream_end(stream).await;
+            return Ok(());
+        }
+    };
+    if !write_stream_response(
+        stream,
+        &DaemonStreamResponse::ok(serde_json::json!({
+            "trigger": "SubscriptionReady",
+            "type": "notification_subscription_ready",
+        })),
+    )
+    .await
+    {
+        return Ok(());
+    }
+    while let Some(notification) = subscription.recv().await {
+        if !write_stream_response(stream, &notification_stream_response(notification)).await {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn group_state_subscribe_args(cli: &Cli) -> Result<String, String> {
     match &cli.command {
         crate::Command::Groups {
@@ -515,6 +568,15 @@ pub(crate) fn messages_subscribe_args(
         .transpose()
         .map_err(|err| err.to_string())?;
     Ok((group_id, Some(limit.unwrap_or(50).min(200))))
+}
+
+pub(crate) fn notifications_subscribe_args(cli: &Cli) -> Result<(), String> {
+    match &cli.command {
+        crate::Command::Notifications {
+            command: crate::NotificationsCommand::Subscribe,
+        } => Ok(()),
+        _ => Err("notifications subscribe requires wn notifications subscribe".to_owned()),
+    }
 }
 
 pub(crate) fn is_timeline_messages_subscribe(cli: &Cli) -> bool {

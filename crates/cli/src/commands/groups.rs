@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::{
     CommandOutput, GroupCommand, GroupsCommand, WnError, ensure_local_signing, group_json,
     group_list_plain, group_show_output, normalize_group_id_hex, npub_for_account_id,
-    parse_public_key, resolve_account, unsupported_command,
+    parse_public_key, resolve_account,
 };
 
 pub(crate) async fn group_command(
@@ -423,18 +423,67 @@ pub(crate) async fn groups_command_with_runtime(
             )
             .await
         }
-        GroupsCommand::Invites => unsupported_command(
-            "groups invites",
-            "user-driven invite accept/decline state is not modeled yet",
-        ),
-        GroupsCommand::Accept { .. } => unsupported_command(
-            "groups accept",
-            "welcomes are auto-accepted today; user-driven accept is not modeled yet",
-        ),
-        GroupsCommand::Decline { .. } => unsupported_command(
-            "groups decline",
-            "user-driven invite decline is not modeled yet",
-        ),
+        GroupsCommand::Invites => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let invites = app
+                .groups(&account.label)?
+                .into_iter()
+                .filter(|group| group.pending_confirmation)
+                .collect::<Vec<_>>();
+            Ok(CommandOutput {
+                plain: pending_invites_plain(&invites),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "invites": invites.into_iter().map(group_json).collect::<Vec<_>>(),
+                }),
+            })
+        }
+        GroupsCommand::Accept { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let group = runtime
+                .accept_group_invite(&account.label, &group_id)
+                .await?;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            Ok(CommandOutput {
+                plain: format!("accepted invite {group_id_hex}"),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group": group_json(group),
+                    "accepted": true,
+                }),
+            })
+        }
+        GroupsCommand::Decline { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let declined = runtime
+                .decline_group_invite(&account.label, &group_id)
+                .await?;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            Ok(CommandOutput {
+                plain: format!(
+                    "declined invite {group_id_hex} published={}",
+                    declined.summary.published
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group": group_json(declined.group),
+                    "declined": true,
+                    "published": declined.summary.published,
+                    "message_ids": declined.summary.message_ids,
+                }),
+            })
+        }
         GroupsCommand::Promote { group_id, pubkey } => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
@@ -549,6 +598,27 @@ fn group_members_plain(members: &[AppGroupMemberRecord]) -> Result<String, WnErr
         .map(|member| npub_for_account_id(&member.member_id_hex))
         .collect::<Result<Vec<_>, _>>()?
         .join("\n"))
+}
+
+fn pending_invites_plain(invites: &[marmot_app::AppGroupRecord]) -> String {
+    if invites.is_empty() {
+        return "no pending invites".to_owned();
+    }
+    invites
+        .iter()
+        .map(|group| {
+            let name = if group.profile.name.trim().is_empty() {
+                "unnamed"
+            } else {
+                group.profile.name.as_str()
+            };
+            match group.welcomer_account_id_hex.as_deref() {
+                Some(welcomer) => format!("{} {} from {}", group.group_id_hex, name, welcomer),
+                None => format!("{} {}", group.group_id_hex, name),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, WnError> {

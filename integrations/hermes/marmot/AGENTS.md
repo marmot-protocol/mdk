@@ -35,4 +35,6 @@ integrations/hermes/marmot/tests/test_dev_scripts.sh
 # or from the repo root:
 just hermes-dev-script-test
 just hermes-dev-smoke
+just hermes-dev-e2e-deterministic
+just hermes-dev-e2e-connector
 ```

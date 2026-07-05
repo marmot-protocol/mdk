@@ -221,10 +221,16 @@ pub(crate) enum SlashCommand {
     ChatDescribe(String),
     ChatArchive,
     ChatUnarchive,
+    ChatMute(String),
+    ChatUnmute,
     ChatArchived(bool),
     MembersAdd(Vec<String>),
     MembersRemove(Vec<String>),
     MembersList,
+    Image {
+        file_path: String,
+        caption: Option<String>,
+    },
     KeysFetch(String),
     KeysRotate,
     ProfileName(String),
@@ -315,6 +321,14 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
         description: "unarchive the selected chat",
     },
     SlashCommandSuggestion {
+        usage: "/chat mute <duration>",
+        description: "mute selected-chat notifications",
+    },
+    SlashCommandSuggestion {
+        usage: "/chat unmute",
+        description: "unmute selected-chat notifications",
+    },
+    SlashCommandSuggestion {
         usage: "/chat archived [on|off]",
         description: "toggle archived chat visibility",
     },
@@ -329,6 +343,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/members list",
         description: "show selected chat members",
+    },
+    SlashCommandSuggestion {
+        usage: "/image <file-path> [caption]",
+        description: "encrypt, upload, and send image/media",
     },
     SlashCommandSuggestion {
         usage: "/keys fetch <npub-or-hex>",

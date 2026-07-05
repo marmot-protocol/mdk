@@ -1,13 +1,12 @@
 //! `keys` (KeyPackage) command namespace handlers and output helpers.
 
 use marmot_account::AccountHome;
-use marmot_app::{FetchedKeyPackage, MarmotApp, MarmotAppRuntime};
+use marmot_app::{AccountKeyPackageRecord, FetchedKeyPackage, MarmotApp, MarmotAppRuntime};
 use serde_json::{Value, json};
 
 use crate::{
     CommandOutput, KeyPackageCommand, WnError, account_selector_or_default, ensure_local_signing,
     npub_for_account_id, parse_public_key, relay_endpoints, relay_lists_json, resolve_account,
-    unsupported_command,
 };
 
 pub(crate) async fn key_package_command(
@@ -30,22 +29,12 @@ pub(crate) async fn key_package_command_with_runtime(
     match command {
         KeyPackageCommand::List => {
             let account = resolve_account(account_home, account_flag)?;
-            let relay_lists =
-                app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
-            let fetched = if relay_lists.nip65.relays.is_empty() {
-                None
-            } else {
-                Some(
-                    app.fetch_latest_key_package_for_account_id(
-                        &account.account_id_hex,
-                        relay_endpoints(relay_lists.nip65.relays.clone())?,
-                    )
-                    .await?,
-                )
-            };
-            let keys = fetched
+            let records = runtime
+                .account_key_packages(&account.label, Vec::new())
+                .await?;
+            let keys = records
                 .into_iter()
-                .map(key_package_fetch_json)
+                .map(account_key_package_record_json)
                 .collect::<Vec<_>>();
             Ok(CommandOutput {
                 plain: if keys.is_empty() {
@@ -132,23 +121,96 @@ pub(crate) async fn key_package_command_with_runtime(
                 }),
             })
         }
-        KeyPackageCommand::Delete { .. } => unsupported_command(
-            "keys delete",
-            "relay deletion for KeyPackage events is not implemented yet",
-        ),
+        KeyPackageCommand::Delete { event_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let deleted = runtime
+                .delete_key_package(&account.label, &event_id, Vec::new())
+                .await?;
+            Ok(CommandOutput {
+                plain: format!("deleted key package event {event_id} relays={deleted}"),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "event_id": event_id,
+                    "deleted": true,
+                    "accepted_relays": deleted,
+                }),
+            })
+        }
         KeyPackageCommand::DeleteAll { confirm } => {
             if !confirm {
-                return unsupported_command(
-                    "keys delete-all",
-                    "pass --confirm once relay deletion is implemented",
-                );
+                return Err(WnError::ConfirmationRequired {
+                    command: "keys delete-all",
+                    flag: "--confirm",
+                    reason: "pass --confirm to publish deletion events for every relay-published KeyPackage",
+                });
             }
-            unsupported_command(
-                "keys delete-all",
-                "relay deletion for KeyPackage events is not implemented yet",
-            )
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let records = runtime
+                .account_key_packages(&account.label, Vec::new())
+                .await?;
+            let mut deleted = Vec::new();
+            let mut accepted_relays = 0_usize;
+            for record in records.into_iter().filter(|record| record.relay) {
+                if deleted.iter().any(|deleted: &DeletedKeyPackage| {
+                    deleted.event_id == record.key_package_event_id
+                }) {
+                    continue;
+                }
+                let relays = relay_endpoints(record.source_relays.clone())?;
+                let accepted = runtime
+                    .delete_key_package(&account.label, &record.key_package_event_id, relays)
+                    .await?;
+                accepted_relays += accepted;
+                deleted.push(DeletedKeyPackage {
+                    event_id: record.key_package_event_id,
+                    key_package_id: record.key_package_id,
+                    key_package_ref: record.key_package_ref_hex,
+                    accepted_relays: accepted,
+                });
+            }
+            Ok(CommandOutput {
+                plain: format!(
+                    "deleted {} key package event(s) relays={accepted_relays}",
+                    deleted.len()
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "deleted": deleted,
+                    "deleted_count": deleted.len(),
+                    "accepted_relays": accepted_relays,
+                }),
+            })
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct DeletedKeyPackage {
+    event_id: String,
+    key_package_id: String,
+    key_package_ref: String,
+    accepted_relays: usize,
+}
+
+fn account_key_package_record_json(record: AccountKeyPackageRecord) -> Value {
+    json!({
+        "account_label": record.account_label,
+        "account_id": record.account_id_hex,
+        "key_package_id": record.key_package_id,
+        "key_package_ref": record.key_package_ref_hex,
+        "key_package_event_id": record.key_package_event_id,
+        "published_at": record.published_at,
+        "key_package_bytes": record.key_package_bytes,
+        "source_relays": record.source_relays,
+        "local": record.local,
+        "relay": record.relay,
+    })
 }
 
 fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
@@ -156,6 +218,7 @@ fn key_package_fetch_json(fetched: FetchedKeyPackage) -> Value {
         "account_id": fetched.account_id_hex,
         "key_package_id": fetched.key_package_id,
         "key_package_ref": fetched.key_package_ref_hex,
+        "key_package_event_id": fetched.key_package_event_id,
         "key_package_bytes": fetched.key_package.bytes().len(),
         "created_at": fetched.created_at,
         "source_relays": fetched.source_relays,

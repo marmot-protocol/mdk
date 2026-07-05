@@ -6,7 +6,6 @@ use serde_json::json;
 
 use crate::{
     CommandOutput, DebugCommand, WnError, npub_for_account_id, relay_lists_json, resolve_account,
-    unsupported_command,
 };
 
 pub(crate) fn debug_command(
@@ -56,9 +55,5 @@ pub(crate) fn debug_command(
                 }),
             })
         }
-        DebugCommand::RatchetTree { .. } => unsupported_command(
-            "debug ratchet-tree",
-            "ratchet-tree diagnostics are not exposed by marmot-app yet",
-        ),
     }
 }

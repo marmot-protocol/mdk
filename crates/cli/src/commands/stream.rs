@@ -24,7 +24,7 @@ use transport_quic_stream::{
 use crate::{
     AgentStreamDelta, CommandOutput, StreamCommand, WnError, agent_text_stream_payload_value,
     ensure_local_signing, normalize_group_id_hex, npub_for_account_id, resolve_account,
-    resolve_account_ref, stream_route_label, unix_now_seconds, unsupported_command,
+    resolve_account_ref, stream_route_label, unix_now_seconds,
 };
 
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
@@ -357,10 +357,7 @@ pub(crate) async fn stream_command_app_with_runtime(
         StreamCommand::ComposeOpen { .. }
         | StreamCommand::ComposeAppend { .. }
         | StreamCommand::ComposeFinish { .. }
-        | StreamCommand::ComposeCancel { .. } => unsupported_command(
-            "stream compose",
-            "stream compose sessions require the daemon",
-        ),
+        | StreamCommand::ComposeCancel { .. } => Err(WnError::StreamComposeRequiresDaemon),
         StreamCommand::Finish {
             group,
             stream_id,

@@ -12,6 +12,26 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Workspace version unified at `0.9.0` across all crates (successor to MDK `0.8.0`).
 - Documentation refresh: current-state inventory, missing crate READMEs, agent integration agent maps, and release
   doc alignment.
+- The TUI now supports `/image <file-path> [caption]` by calling the real encrypted `wn media upload --send` path for
+  the selected chat instead of rejecting image sends or inventing a plaintext placeholder.
+- `wn groups invites`, `wn groups accept <group>`, and `wn groups decline <group>` now use the app runtime's
+  pending-invite state and accept/decline paths instead of returning `unsupported_command`.
+- `wn notifications subscribe` is now visible in help and streams daemon-backed local notification updates instead of
+  returning `unsupported_command`.
+- `wn keys list` now returns KeyPackage event ids and local/relay origin, and `wn keys delete` / `wn keys delete-all
+  --confirm` publish real Nostr deletion events through the app runtime.
+- The daemon-backed `wn stream compose-open`, `compose-append`, `compose-finish`, and `compose-cancel` commands are now
+  visible in help and return a daemon-required error instead of `unsupported_command` when `wnd` is unavailable.
+- `wn chats mute <group> <duration>`, `wn chats unmute <group>`, `/chat mute`, and `/chat unmute` now manage real
+  per-chat local notification suppression instead of hiding or rejecting that surface.
+- `wn sync` is visible in top-level help as the CLI diagnostic/repair catch-up path. The TUI still rejects `/sync`
+  because live updates come from daemon subscriptions.
+- `export-nsec`, relay type validation, and confirmation-gated destructive commands now return specific JSON error
+  codes instead of sharing a generic unsupported-command shape.
+- `wn-agent` stream finalization now accepts idempotency keys, and the OpenClaw/Hermes adapters retry
+  `stream_finalize` with stable per-stream keys so a post-write timeout does not duplicate the durable final.
+- Hermes dev setup now mirrors OpenClaw by passing custom QUIC preview candidates through the generated
+  `bootstrap-agent.sh` helper and syntax-checking every generated helper script in its contract test.
 
 ### Security
 

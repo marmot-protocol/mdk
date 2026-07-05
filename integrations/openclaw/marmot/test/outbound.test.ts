@@ -120,57 +120,73 @@ describe("createMarmotMessageAdapter", () => {
   });
 
   it("routes a media send with a local path to send_media with the caption", async () => {
-    const calls = emptyClientCalls();
-    const adapter = createMarmotMessageAdapter({
-      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
-      nowMs: () => 5678,
-    });
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    try {
+      const filePath = join(tmpRoot, "cat.png");
+      await writeFile(filePath, Buffer.from("png-bytes"));
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        nowMs: () => 5678,
+      });
 
-    const ctx = {
-      cfg: {},
-      to: HEX32("cc"),
-      text: "look at this",
-      mediaUrl: "/tmp/openclaw/cat.png",
-    } as unknown as ChannelMessageSendMediaContext;
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "look at this",
+        mediaUrl: filePath,
+        mediaLocalRoots: [tmpRoot],
+      } as unknown as ChannelMessageSendMediaContext;
 
-    const result = await adapter.send!.media!(ctx);
+      const result = await adapter.send!.media!(ctx);
 
-    expect(calls.sendMedia).toHaveLength(1);
-    expect(calls.sendMedia[0]).toMatchObject({
-      accountIdHex: HEX32("aa"),
-      groupIdHex: HEX32("cc"),
-      caption: "look at this",
-    });
-    expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-      path: "/tmp/openclaw/cat.png",
-      media_type: "image/png",
-      file_name: "cat.png",
-    });
-    expect(result.receipt.parts[0]).toMatchObject({ kind: "media", index: 0 });
-    expect(result.receipt.sentAt).toBe(5678);
+      expect(calls.sendMedia).toHaveLength(1);
+      expect(calls.sendMedia[0]).toMatchObject({
+        accountIdHex: HEX32("aa"),
+        groupIdHex: HEX32("cc"),
+        caption: "look at this",
+      });
+      expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
+        path: filePath,
+        media_type: "image/png",
+        file_name: "cat.png",
+      });
+      expect(result.receipt.parts[0]).toMatchObject({ kind: "media", index: 0 });
+      expect(result.receipt.sentAt).toBe(5678);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 
   it("resolves a file:// media url to a local path", async () => {
-    const calls = emptyClientCalls();
-    const adapter = createMarmotMessageAdapter({
-      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
-    });
-    const ctx = {
-      cfg: {},
-      to: HEX32("cc"),
-      text: "",
-      mediaUrl: "file:///tmp/openclaw/clip.mp4",
-    } as unknown as ChannelMessageSendMediaContext;
+    const tmpRoot = await mkdtemp(join(tmpdir(), "marmot-outbound-test-"));
+    try {
+      const filePath = join(tmpRoot, "clip.mp4");
+      await writeFile(filePath, Buffer.from("mp4-bytes"));
+      const calls = emptyClientCalls();
+      const adapter = createMarmotMessageAdapter({
+        resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+      });
+      const ctx = {
+        cfg: {},
+        to: HEX32("cc"),
+        text: "",
+        mediaUrl: `file://${filePath}`,
+        mediaLocalRoots: [tmpRoot],
+      } as unknown as ChannelMessageSendMediaContext;
 
-    await adapter.send!.media!(ctx);
+      await adapter.send!.media!(ctx);
 
-    expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-      path: "/tmp/openclaw/clip.mp4",
-      media_type: "video/mp4",
-      file_name: "clip.mp4",
-    });
-    // An empty caption is sent as null.
-    expect(calls.sendMedia[0]?.caption).toBeNull();
+      expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
+        path: filePath,
+        media_type: "video/mp4",
+        file_name: "clip.mp4",
+      });
+      // An empty caption is sent as null.
+      expect(calls.sendMedia[0]?.caption).toBeNull();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 
   it("materializes a remote media url with mediaReadFile into a temp file", async () => {

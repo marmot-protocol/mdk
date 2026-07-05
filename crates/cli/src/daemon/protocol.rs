@@ -105,6 +105,7 @@ pub(crate) enum DaemonRequest {
     MessagesSubscribe { cli: Box<Cli> },
     ChatsSubscribe { cli: Box<Cli> },
     GroupStateSubscribe { cli: Box<Cli> },
+    NotificationsSubscribe { cli: Box<Cli> },
     Execute { cli: Box<Cli> },
 }
 
@@ -212,6 +213,13 @@ pub(crate) async fn send_group_state_subscribe(
     DaemonClient::new(socket).group_state_subscribe(cli).await
 }
 
+pub(crate) async fn send_notifications_subscribe(
+    socket: &Path,
+    cli: Cli,
+) -> Result<CliOutput, DaemonClientError> {
+    DaemonClient::new(socket).notifications_subscribe(cli).await
+}
+
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
     pub(crate) socket: PathBuf,
@@ -283,6 +291,19 @@ impl DaemonClient {
         stream_request(
             &self.socket,
             &DaemonRequest::GroupStateSubscribe { cli: Box::new(cli) },
+            json,
+        )
+        .await
+    }
+
+    pub(crate) async fn notifications_subscribe(
+        &self,
+        cli: Cli,
+    ) -> Result<CliOutput, DaemonClientError> {
+        let json = cli.json;
+        stream_request(
+            &self.socket,
+            &DaemonRequest::NotificationsSubscribe { cli: Box::new(cli) },
             json,
         )
         .await
@@ -566,8 +587,40 @@ pub(crate) fn stream_result_plain(result: &serde_json::Value) -> String {
             timeline_stream_page_plain(result)
         }
         Some("timeline_projection_updated") => timeline_projection_stream_plain(result),
+        Some("notification_subscription_ready") => "notification subscription ready".to_owned(),
+        Some("notification") => notification_stream_plain(result),
         _ => result.to_string(),
     }
+}
+
+pub(crate) fn notification_stream_plain(result: &serde_json::Value) -> String {
+    let notification = result
+        .get("notification")
+        .unwrap_or(&serde_json::Value::Null);
+    let trigger = notification
+        .get("trigger")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let group_id = notification
+        .get("group_id_hex")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    let sender = notification
+        .get("sender")
+        .and_then(|sender| sender.get("display_name"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            notification
+                .get("sender")
+                .and_then(|sender| sender.get("account_id_hex"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("<unknown>");
+    let preview = notification
+        .get("preview_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    format!("notification {trigger} group={group_id} from={sender}: {preview}")
 }
 
 pub(crate) fn timeline_stream_page_plain(result: &serde_json::Value) -> String {

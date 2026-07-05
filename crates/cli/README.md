@@ -138,8 +138,8 @@ When a daemon is running, `create-identity` and `wn login --nsec-stdin` use the 
 publish the required relay lists and an initial KeyPackage. `printf '%s\n' "$NSEC" | wn login --nsec-stdin --relay
 <url>` is the command-local fallback for a custom relay-list publish during import. Public `npub` logins only check
 relay-list availability because they cannot sign.
-`export-nsec` is present for command-shape compatibility but returns `unsupported_command`; this CLI does not print
-private keys.
+`export-nsec` is present for command-shape compatibility but returns `private_key_export_disabled`; this CLI does not
+print private keys.
 
 KeyPackage commands:
 
@@ -156,8 +156,9 @@ wn --account <npub-or-hex> keys delete-all --confirm
 `keys publish` republishes the currently cached KeyPackage; `keys rotate` (alias `force-publish`) force-mints and
 publishes a fresh replacement KeyPackage.
 
-KeyPackage publish/fetch/check/list use the current relay-directory path. KeyPackage deletion commands (`keys delete`,
-`keys delete-all`) are present but return `unsupported_command` until Nostr deletion is wired through the app runtime.
+KeyPackage publish/fetch/check/list use the current relay-directory path. `keys list` returns the relay event id for
+each known KeyPackage record. `keys delete` publishes a Nostr deletion for one event id, and `keys delete-all
+--confirm` publishes deletions for every relay-published KeyPackage record found for the selected account.
 
 Chat projection commands:
 
@@ -170,6 +171,9 @@ wn --account <npub-or-hex> chats subscribe
 wn --account <npub-or-hex> chats subscribe-archived
 wn --account <npub-or-hex> chats archive <group-hex>
 wn --account <npub-or-hex> chats unarchive <group-hex>
+wn --account <npub-or-hex> chats mute <group-hex> 1h
+wn --account <npub-or-hex> chats mute <group-hex> forever
+wn --account <npub-or-hex> chats unmute <group-hex>
 ```
 
 Group commands:
@@ -183,6 +187,9 @@ wn --account <npub-or-hex> groups remove-members <group-hex> <member-npub-or-hex
 wn --account <npub-or-hex> groups members <group-hex>
 wn --account <npub-or-hex> groups admins <group-hex>
 wn --account <npub-or-hex> groups relays <group-hex>
+wn --account <npub-or-hex> groups invites
+wn --account <npub-or-hex> groups accept <group-hex>
+wn --account <npub-or-hex> groups decline <group-hex>
 wn --account <npub-or-hex> groups leave <group-hex>
 wn --account <npub-or-hex> groups rename <group-hex> <name>
 wn --account <npub-or-hex> groups set-avatar-url <group-hex> --url <https-url> [--dim <WxH>] [--thumbhash <hex>]
@@ -271,6 +278,7 @@ wn settings theme dark
 wn settings language en
 wn users show <npub-or-hex>
 wn users search <query> --radius 0..2
+wn notifications subscribe
 wn relay-stats
 wn relay-stats --json
 wn reset --confirm
@@ -281,8 +289,10 @@ spread, per-relay first-deliverer and first-event/EOSE timing, and redacted rela
 runtime when a daemon socket exists. The numbers are aggregate-only and per-relay rows use opaque device-local indices,
 never relay URLs.
 
-`notifications subscribe`, chat mute/unmute, and user-driven invite accept/decline commands currently return
-`unsupported_command` rather than faking behavior.
+`groups invites` lists groups still awaiting local confirmation; `groups accept` clears that pending state, and
+`groups decline` leaves and archives the auto-joined pending group. `notifications subscribe` streams daemon-backed
+local notification updates as JSON lines. `chats mute` and `chats unmute` control local per-chat notification
+suppression; mute durations accept `s`, `m`, `h`, `d`, or `w` suffixes, plus `forever`.
 
 Agent text stream preview commands:
 
@@ -295,6 +305,11 @@ wn --account <npub-or-hex> stream watch <group-hex> --stream-id <stream-hex> --i
 wn stream send --broker --connect 127.0.0.1:4450 --insecure-local \
   --stream-id <stream-hex> --start-event-id <start-message-id-hex> "hello over quic"
 wn stream send --connect <host:port> --server-name <dns-name> "hello over quic"
+wn --account <npub-or-hex> stream compose-open <group-hex> \
+  --stream-id <stream-hex> --quic-candidate quic://127.0.0.1:4450 --insecure-local
+wn --account <npub-or-hex> stream compose-append --stream-id <stream-hex> "hello "
+wn --account <npub-or-hex> stream compose-finish --stream-id <stream-hex>
+wn --account <npub-or-hex> stream compose-cancel --stream-id <stream-hex>
 wn --account <npub-or-hex> stream finish <group-hex> \
   --stream-id <stream-hex> --start-event-id <start-message-id-hex> \
   --transcript-hash <hash-hex> --chunk-count <n> "hello over quic"
@@ -317,6 +332,11 @@ immediately. The runtime stream manager owns the running/completed/failed previe
 includes that state under `stream_watches`, including received preview text and transcript hash after the brokered stream
 arrives. The same preview state is emitted as typed `stream_preview` updates from `wn messages subscribe <group-hex>`,
 while individual broker chunks arrive as `agent_stream_delta` updates.
+
+`stream compose-open`, `stream compose-append`, `stream compose-finish`, and `stream compose-cancel` are the
+daemon-owned live composer used by the TUI and agent connectors. They require `wnd`: opening a session publishes the
+durable stream anchor and starts live preview publication, append feeds preview text, finish publishes the durable final
+message, and cancel tears down the active session without faking a final marker.
 
 Sync command:
 
@@ -459,10 +479,13 @@ Composer slash commands:
 /chat describe <description>
 /chat archive
 /chat unarchive
+/chat mute <duration>
+/chat unmute
 /chat archived [on|off]
 /members add <npub-or-hex> [...]
 /members remove <npub-or-hex> [...]
 /members list
+/image <file-path> [caption]
 /keys fetch <npub-or-hex>
 /keys rotate
 /name <display-name>
@@ -482,6 +505,8 @@ Composer slash commands:
 `/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the
 visible-chat list. Member commands operate on the selected chat and call the same group membership commands exposed by
 the CLI.
+`/image` uses the real encrypted media path (`wn media upload <group> <file> --send`) and sends the optional caption
+as the media message text; it does not send plaintext file paths or placeholder messages.
 Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch and completed previews
 appear as provisional preview rows in the message panel. `/stream` opens the TUI stream composer, publishes the stream
 anchor, starts the receiver watch through the daemon, and then treats the next submitted composer line as the streamed

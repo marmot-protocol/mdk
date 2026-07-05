@@ -38,6 +38,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "daemon" => parse_daemon_command(rest),
         "chat" => parse_chat_command(rest),
         "members" => parse_members_command(rest),
+        "image" => parse_image_command(rest),
         "keys" => parse_keys_command(rest),
         "profile" => parse_profile_command(rest),
         "name" => parse_profile_name_command(rest),
@@ -188,14 +189,21 @@ pub(crate) fn parse_chat_command(args: Vec<String>) -> Result<SlashCommand, Stri
         }
         [command] if command == "archive" => Ok(SlashCommand::ChatArchive),
         [command] if command == "unarchive" => Ok(SlashCommand::ChatUnarchive),
+        [command, duration] if command == "mute" => Ok(SlashCommand::ChatMute(duration.clone())),
+        [command] if command == "mute" => Err("/chat mute requires a duration".to_owned()),
+        [command] if command == "unmute" => Ok(SlashCommand::ChatUnmute),
         [command] if command == "archived" => Ok(SlashCommand::ChatArchived(true)),
         [command, value] if command == "archived" => {
             parse_on_off(value).map(SlashCommand::ChatArchived)
         }
-        [] => {
-            Err("/chat expects new, rename, describe, archive, unarchive, or archived".to_owned())
-        }
-        _ => Err("/chat expects new, rename, describe, archive, unarchive, or archived".to_owned()),
+        [] => Err(
+            "/chat expects new, rename, describe, archive, unarchive, mute, unmute, or archived"
+                .to_owned(),
+        ),
+        _ => Err(
+            "/chat expects new, rename, describe, archive, unarchive, mute, unmute, or archived"
+                .to_owned(),
+        ),
     }
 }
 
@@ -219,6 +227,20 @@ pub(crate) fn parse_members_command(args: Vec<String>) -> Result<SlashCommand, S
         }
         [] => Err("/members expects add, remove, or list".to_owned()),
         _ => Err("/members expects add, remove, or list".to_owned()),
+    }
+}
+
+pub(crate) fn parse_image_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [] => Err("/image expects a file path".to_owned()),
+        [file_path] => Ok(SlashCommand::Image {
+            file_path: file_path.clone(),
+            caption: None,
+        }),
+        [file_path, caption @ ..] => Ok(SlashCommand::Image {
+            file_path: file_path.clone(),
+            caption: Some(caption.join(" ")),
+        }),
     }
 }
 

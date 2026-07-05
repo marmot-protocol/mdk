@@ -46,6 +46,8 @@ mod migration_0022_chat_list_self_membership;
 mod migration_0023_chat_list_projection_version;
 #[path = "migrations/0024_pending_welcome_delivery.rs"]
 mod migration_0024_pending_welcome_delivery;
+#[path = "migrations/0025_chat_notification_settings.rs"]
+mod migration_0025_chat_notification_settings;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -177,6 +179,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 24,
         name: "0024_pending_welcome_delivery",
         apply: migration_0024_pending_welcome_delivery::apply,
+    },
+    Migration {
+        version: 25,
+        name: "0025_chat_notification_settings",
+        apply: migration_0025_chat_notification_settings::apply,
     },
 ];
 
@@ -391,6 +398,22 @@ mod tests {
             &conn,
             "message_timeline",
             "idx_message_timeline_reply_lookup"
+        ));
+    }
+
+    #[test]
+    fn chat_notification_settings_table_is_migrated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        assert!(connection_has_column(
+            &conn,
+            "chat_notification_settings",
+            "group_id_hex"
+        ));
+        assert!(connection_has_column(
+            &conn,
+            "chat_notification_settings",
+            "muted_until_ms"
         ));
     }
 

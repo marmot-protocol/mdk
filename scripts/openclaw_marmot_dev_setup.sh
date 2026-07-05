@@ -2,8 +2,9 @@
 # Repeatable, throwaway dev setup for the OpenClaw Marmot channel plugin without
 # touching your normal OpenClaw home. Mirrors scripts/hermes_marmot_dev_setup.sh.
 #
-# It builds the plugin, prepares an isolated dev root + env, and generates helper
-# scripts to run wn-agent and the OpenClaw gateway against it.
+# It builds/tests the plugin, prepares an isolated dev root + env, and generates
+# helper scripts to run wn-agent, exercise a deterministic connector E2E, and
+# run the OpenClaw gateway against it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,9 +15,12 @@ ROOT="${OPENCLAW_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/openclaw-marmot-test}"
 PRINT_ENV=0
 RELAYS=()
 QUIC_CANDIDATES=()
+AUTH_TOKEN=""
 AUTH_TOKEN_FILE=""
-SOCKET_DIR_MODE=""
-SOCKET_MODE=""
+SOCKET_DIR_MODE="0700"
+SOCKET_MODE="0600"
+ACCOUNT_ID_HEX=""
+GROUP_ID_HEX=""
 
 usage() {
     cat <<'USAGE'
@@ -24,11 +28,14 @@ Usage: openclaw_marmot_dev_setup.sh [options]
 
 Options:
   --root DIR              Dev root (default: ${TMPDIR:-/tmp}/openclaw-marmot-test)
-  --relay URL             Public relay URL (repeatable)
+  --relay URL             Public relay URL (repeatable; defaults to the White Noise pilot relays)
   --quic-candidate URL    quic:// preview broker candidate (repeatable)
-  --auth-token-file PATH  Use a token-gated control socket
-  --socket-dir-mode MODE  Octal parent-dir mode for the control socket (e.g. 0770)
-  --socket-mode MODE      Octal socket mode (e.g. 0660)
+  --account-id-hex HEX    Marmot account id exported for plugin/gateway helpers
+  --group-id-hex HEX      Marmot group id exported for smoke/helper scripts
+  --auth-token TOKEN      Write TOKEN to ROOT/control.token for a token-gated control socket
+  --auth-token-file PATH  Use an existing token-gated control socket token file
+  --socket-dir-mode MODE  Octal parent-dir mode for the control socket (default: 0700)
+  --socket-mode MODE      Octal socket mode (default: 0600)
   --print-env             Print the path to the generated env.sh on success
   -h, --help              Show this help
 USAGE
@@ -39,6 +46,9 @@ while [ $# -gt 0 ]; do
         --root) ROOT="$2"; shift 2;;
         --relay) RELAYS+=("$2"); shift 2;;
         --quic-candidate) QUIC_CANDIDATES+=("$2"); shift 2;;
+        --account-id-hex) ACCOUNT_ID_HEX="$2"; shift 2;;
+        --group-id-hex) GROUP_ID_HEX="$2"; shift 2;;
+        --auth-token) AUTH_TOKEN="$2"; shift 2;;
         --auth-token-file) AUTH_TOKEN_FILE="$2"; shift 2;;
         --socket-dir-mode) SOCKET_DIR_MODE="$2"; shift 2;;
         --socket-mode) SOCKET_MODE="$2"; shift 2;;
@@ -48,77 +58,249 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ -n "$AUTH_TOKEN" ] && [ -n "$AUTH_TOKEN_FILE" ]; then
+    echo "error: use only one of --auth-token or --auth-token-file" >&2
+    exit 2
+fi
+
 MARMOT_HOME="$ROOT/marmot-agent-home"
 OPENCLAW_HOME="$ROOT/openclaw-home"
 LOGS_DIR="$ROOT/logs"
-mkdir -p "$MARMOT_HOME" "$OPENCLAW_HOME" "$LOGS_DIR"
+SOCKET_PATH="$MARMOT_HOME/dev/wn-agent.sock"
+ENV_FILE="$ROOT/env.sh"
+mkdir -p "$MARMOT_HOME/dev" "$OPENCLAW_HOME" "$LOGS_DIR"
+
+if [ -n "$AUTH_TOKEN" ]; then
+    AUTH_TOKEN_FILE="$ROOT/control.token"
+    printf '%s\n' "$AUTH_TOKEN" >"$AUTH_TOKEN_FILE"
+    chmod 0600 "$AUTH_TOKEN_FILE"
+fi
 
 echo "openclaw-marmot dev setup: building plugin in $PLUGIN_SRC"
-( cd "$PLUGIN_SRC" && pnpm install && pnpm typecheck && pnpm test )
+(
+    cd "$PLUGIN_SRC"
+    CI=true pnpm install
+    pnpm typecheck
+    env \
+        -u MARMOT_ACCOUNT_ID_HEX \
+        -u MARMOT_AGENT_AUTH_TOKEN \
+        -u MARMOT_AGENT_AUTH_TOKEN_FILE \
+        -u MARMOT_AGENT_SOCKET \
+        -u MARMOT_DM_ALLOW_FROM \
+        -u MARMOT_GROUP_ID_HEX \
+        -u MARMOT_HOME \
+        -u MARMOT_QUIC_CANDIDATE \
+        -u MARMOT_QUIC_CANDIDATES \
+        -u MARMOT_RELAYS \
+        -u MARMOT_WELCOMER_ALLOWLIST \
+        pnpm test
+)
 
-# Default relays/candidates match the public pilot set.
+# Default relays match the public pilot set for phone/manual tests.
 if [ "${#RELAYS[@]}" -eq 0 ]; then
     RELAYS=(wss://relay.eu.whitenoise.chat wss://relay.us.whitenoise.chat)
 fi
-RELAY_ARGS=()
-for relay in "${RELAYS[@]}"; do RELAY_ARGS+=(--relay "$relay"); done
-QUIC_CSV="$(IFS=,; echo "${QUIC_CANDIDATES[*]:-}")"
 
-SOCKET_PATH="$MARMOT_HOME/dev/wn-agent.sock"
-WN_AGENT_EXTRA=()
-[ -n "$AUTH_TOKEN_FILE" ] && WN_AGENT_EXTRA+=(--auth-token-file "$AUTH_TOKEN_FILE")
-[ -n "$SOCKET_DIR_MODE" ] && WN_AGENT_EXTRA+=(--socket-dir-mode "$SOCKET_DIR_MODE")
-[ -n "$SOCKET_MODE" ] && WN_AGENT_EXTRA+=(--socket-mode "$SOCKET_MODE")
+write_env_file() {
+    local quic_csv=""
+    local relay_csv=""
+    local candidate
+    if [ "${#QUIC_CANDIDATES[@]}" -gt 0 ]; then
+        for candidate in "${QUIC_CANDIDATES[@]}"; do
+            if [ -z "$quic_csv" ]; then
+                quic_csv="$candidate"
+            else
+                quic_csv="$quic_csv,$candidate"
+            fi
+        done
+    fi
+    local relay
+    for relay in "${RELAYS[@]}"; do
+        if [ -z "$relay_csv" ]; then
+            relay_csv="$relay"
+        else
+            relay_csv="$relay_csv,$relay"
+        fi
+    done
 
-cat > "$ROOT/env.sh" <<ENV
-# Source this to configure the OpenClaw Marmot dev environment.
-export OPENCLAW_MARMOT_DEV_ROOT="$ROOT"
-export OPENCLAW_HOME="$OPENCLAW_HOME"
-export MARMOT_HOME="$MARMOT_HOME"
-export MARMOT_AGENT_SOCKET="$SOCKET_PATH"
-export MARMOT_QUIC_CANDIDATES="$QUIC_CSV"
-${AUTH_TOKEN_FILE:+export MARMOT_AGENT_AUTH_TOKEN_FILE="$AUTH_TOKEN_FILE"}
-ENV
+    {
+        echo "# Generated by scripts/openclaw_marmot_dev_setup.sh"
+        echo "# shellcheck shell=bash"
+        printf 'export OPENCLAW_MARMOT_DEV_ROOT=%q\n' "$ROOT"
+        printf 'export MDK_REPO=%q\n' "$REPO_ROOT"
+        printf 'export OPENCLAW_PLUGIN_SRC=%q\n' "$PLUGIN_SRC"
+        printf 'export OPENCLAW_HOME=%q\n' "$OPENCLAW_HOME"
+        printf 'export MARMOT_HOME=%q\n' "$MARMOT_HOME"
+        printf 'export MARMOT_AGENT_SOCKET=%q\n' "$SOCKET_PATH"
+        printf 'export MARMOT_AGENT_AUTH_TOKEN_FILE=%q\n' "$AUTH_TOKEN_FILE"
+        printf 'export MARMOT_AGENT_SOCKET_DIR_MODE=%q\n' "$SOCKET_DIR_MODE"
+        printf 'export MARMOT_AGENT_SOCKET_MODE=%q\n' "$SOCKET_MODE"
+        printf 'export MARMOT_ACCOUNT_ID_HEX=%q\n' "$ACCOUNT_ID_HEX"
+        printf 'export MARMOT_GROUP_ID_HEX=%q\n' "$GROUP_ID_HEX"
+        printf 'export MARMOT_RELAYS=%q\n' "$relay_csv"
+        printf 'export MARMOT_QUIC_CANDIDATES=%q\n' "$quic_csv"
+        echo 'wn_agent_relay_args=('
+        for relay in "${RELAYS[@]}"; do
+            printf '  %q\n' "--relay"
+            printf '  %q\n' "$relay"
+        done
+        echo ')'
+        echo 'wn_agent_quic_args=('
+        if [ "${#QUIC_CANDIDATES[@]}" -gt 0 ]; then
+            for candidate in "${QUIC_CANDIDATES[@]}"; do
+                printf '  %q\n' "--quic-candidate"
+                printf '  %q\n' "$candidate"
+            done
+        fi
+        echo ')'
+    } >"$ENV_FILE"
+}
 
-# Bake the args shell-quoted so paths/tokens with spaces survive the wrapper.
-RELAY_ARGS_QUOTED="$(printf '%q ' "${RELAY_ARGS[@]}")"
-WN_AGENT_EXTRA_QUOTED=""
-if [ "${#WN_AGENT_EXTRA[@]}" -gt 0 ]; then
-    WN_AGENT_EXTRA_QUOTED="$(printf '%q ' "${WN_AGENT_EXTRA[@]}")"
+write_helper_scripts() {
+    cat >"$ROOT/run-wn-agent.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+cd "$MDK_REPO"
+wn_agent_control_args=(
+    --socket "$MARMOT_AGENT_SOCKET"
+    --socket-dir-mode "${MARMOT_AGENT_SOCKET_DIR_MODE:-0700}"
+    --socket-mode "${MARMOT_AGENT_SOCKET_MODE:-0600}"
+)
+if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
+    wn_agent_control_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
 fi
+exec cargo run -p agent-connector --bin wn-agent -- --home "$MARMOT_HOME" "${wn_agent_control_args[@]}" "${wn_agent_relay_args[@]}" "$@"
+SCRIPT
 
-cat > "$ROOT/run-wn-agent.sh" <<RUN
+    cat >"$ROOT/run-openclaw-gateway.sh" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
-exec cargo run -p agent-connector --bin wn-agent -- \\
-  --home "$MARMOT_HOME" \\
-  $RELAY_ARGS_QUOTED$WN_AGENT_EXTRA_QUOTED
-RUN
-chmod +x "$ROOT/run-wn-agent.sh"
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+if ! command -v openclaw >/dev/null 2>&1; then
+    echo "error: openclaw launcher not found on PATH. Install OpenClaw before running the gateway helper." >&2
+    exit 1
+fi
+openclaw plugins install --force "$OPENCLAW_PLUGIN_SRC" 2>/dev/null || openclaw plugins install "$OPENCLAW_PLUGIN_SRC"
+openclaw plugins enable marmot || true
+exec openclaw gateway run "$@"
+SCRIPT
 
-cat > "$ROOT/run-openclaw-gateway.sh" <<RUN
+    cat >"$ROOT/smoke-plugin.sh" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
-source "$ROOT/env.sh"
-# Install the local plugin into the isolated OpenClaw home, then run the gateway.
-# Adjust the run subcommand to match your OpenClaw version if needed.
-openclaw plugins install "$PLUGIN_SRC"
-exec openclaw gateway run
-RUN
-chmod +x "$ROOT/run-openclaw-gateway.sh"
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+cd "$OPENCLAW_PLUGIN_SRC"
+pnpm typecheck
+pnpm test
+SCRIPT
 
-cat > "$ROOT/smoke-plugin.sh" <<RUN
+    cat >"$ROOT/control-smoketest.sh" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$PLUGIN_SRC"
-pnpm typecheck && pnpm test
-RUN
-chmod +x "$ROOT/smoke-plugin.sh"
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+cd "$OPENCLAW_PLUGIN_SRC"
+pnpm build
+exec pnpm smoketest "$@"
+SCRIPT
+
+    cat >"$ROOT/e2e-connector.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+exec "$MDK_REPO/scripts/openclaw_marmot_connector_e2e.sh" --root "$dev_root"
+SCRIPT
+
+    cat >"$ROOT/bootstrap-agent.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$dev_root/env.sh"
+cd "$MDK_REPO"
+bootstrap_args=(bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET")
+if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
+    bootstrap_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
+fi
+if [ -n "${MARMOT_ACCOUNT_ID_HEX:-}" ]; then
+    bootstrap_args+=(--account-id-hex "$MARMOT_ACCOUNT_ID_HEX")
+fi
+exec cargo run -p agent-connector --bin wn-agent -- "${bootstrap_args[@]}" "${wn_agent_relay_args[@]}" "${wn_agent_quic_args[@]}" --qr "$@"
+SCRIPT
+
+    cat >"$ROOT/start-wn-agent.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pid_file="$dev_root/wn-agent.pid"
+if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "wn-agent already running: $(cat "$pid_file")"
+    exit 0
+fi
+nohup "$dev_root/run-wn-agent.sh" "$@" >"$dev_root/logs/wn-agent.log" 2>&1 &
+echo "$!" >"$pid_file"
+echo "wn-agent pid: $(cat "$pid_file")"
+echo "log: $dev_root/logs/wn-agent.log"
+SCRIPT
+
+    cat >"$ROOT/start-openclaw-gateway.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+pid_file="$dev_root/openclaw-gateway.pid"
+if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "OpenClaw gateway already running: $(cat "$pid_file")"
+    exit 0
+fi
+nohup "$dev_root/run-openclaw-gateway.sh" "$@" >"$dev_root/logs/openclaw-gateway.log" 2>&1 &
+echo "$!" >"$pid_file"
+echo "OpenClaw gateway pid: $(cat "$pid_file")"
+echo "log: $dev_root/logs/openclaw-gateway.log"
+SCRIPT
+
+    cat >"$ROOT/stop-dev-processes.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+dev_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for name in openclaw-gateway wn-agent; do
+    pid_file="$dev_root/$name.pid"
+    if [ ! -f "$pid_file" ]; then
+        continue
+    fi
+    pid="$(cat "$pid_file")"
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        echo "stopped $name pid $pid"
+    fi
+    rm -f "$pid_file"
+done
+SCRIPT
+
+    chmod +x \
+        "$ROOT/run-wn-agent.sh" \
+        "$ROOT/run-openclaw-gateway.sh" \
+        "$ROOT/smoke-plugin.sh" \
+        "$ROOT/control-smoketest.sh" \
+        "$ROOT/e2e-connector.sh" \
+        "$ROOT/bootstrap-agent.sh" \
+        "$ROOT/start-wn-agent.sh" \
+        "$ROOT/start-openclaw-gateway.sh" \
+        "$ROOT/stop-dev-processes.sh"
+}
+
+write_env_file
+write_helper_scripts
 
 echo "openclaw-marmot dev setup ready under: $ROOT"
 echo "  1. start wn-agent:        $ROOT/run-wn-agent.sh"
-echo "  2. bootstrap the account: cargo run -p agent-connector --bin wn-agent -- bootstrap --home '$MARMOT_HOME' --qr"
+echo "  2. bootstrap the account: $ROOT/bootstrap-agent.sh"
 echo "  3. run the gateway:       $ROOT/run-openclaw-gateway.sh"
+echo "  4. smoke control socket:  $ROOT/control-smoketest.sh"
+echo "  5. connector E2E:         $ROOT/e2e-connector.sh"
 if [ "$PRINT_ENV" -eq 1 ]; then
-    echo "$ROOT/env.sh"
+    echo "$ENV_FILE"
 fi

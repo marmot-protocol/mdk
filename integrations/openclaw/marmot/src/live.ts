@@ -7,9 +7,12 @@
 // the transcript hash + chunk count wn-agent validates against its own. A
 // non-append-only update throws so the caller can cancel + send a plain final.
 
+import { randomUUID } from "node:crypto";
 import { AppendOnlyText, NonAppendOnlyUpdateError } from "./append-only.js";
-import type { MarmotAgentControlClient } from "./client.js";
+import { isRetryable, type MarmotAgentControlClient } from "./client.js";
 import { AgentTextStreamTranscript, DEFAULT_STREAM_CHUNK_BYTES } from "./transcript.js";
+
+const STREAM_FINALIZE_RETRY_BACKOFF_MS = [100, 300] as const;
 
 /** Narrow control-client surface used by the live preview (eases testing). */
 export type StreamControlClient = Pick<
@@ -37,6 +40,7 @@ export class MarmotLivePreview {
   private streamIdHex: string | null = null;
   private startMessageIdHex: string | null = null;
   private transcript: AgentTextStreamTranscript | null = null;
+  private readonly finalizeIdempotencyKey = randomUUID();
   private readonly appendOnly = new AppendOnlyText();
   private readonly chunkBytes: number;
 
@@ -194,12 +198,28 @@ export class MarmotLivePreview {
       this.transcript!.appendText(suffix, this.chunkBytes);
       this.appendOnly.suffixFor(finalText);
     }
-    const response = await this.client.streamFinalize(
-      this.streamIdHex!,
-      finalText,
-      this.transcript!.hashHex,
-      this.transcript!.chunkCount,
-    );
+    let response: Awaited<ReturnType<StreamControlClient["streamFinalize"]>> | null = null;
+    for (let attempt = 0; attempt <= STREAM_FINALIZE_RETRY_BACKOFF_MS.length; attempt += 1) {
+      try {
+        response = await this.client.streamFinalize(
+          this.streamIdHex!,
+          finalText,
+          this.transcript!.hashHex,
+          this.transcript!.chunkCount,
+          this.finalizeIdempotencyKey,
+        );
+        break;
+      } catch (error) {
+        const backoff = STREAM_FINALIZE_RETRY_BACKOFF_MS[attempt];
+        if (backoff === undefined || !isRetryable(error)) {
+          throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+      }
+    }
+    if (!response) {
+      throw new Error("stream finalize failed without a response");
+    }
     this.closed = true;
     return {
       streamIdHex: this.streamIdHex!,

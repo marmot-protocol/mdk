@@ -45,6 +45,7 @@ TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # is reused across these attempts so a retry after a post-write timeout dedups at
 # the connector instead of double-posting. Mirrors OpenClaw dispatch ([100, 300]ms).
 SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
+STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
 MAX_TOOL_PROGRESS_MESSAGES = 512
@@ -908,7 +909,9 @@ class MarmotAgentControlClient:
         final_text: str,
         transcript_hash_hex: str,
         chunk_count: int,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
         return await self.request(
             {
                 "type": "stream_finalize",
@@ -916,6 +919,7 @@ class MarmotAgentControlClient:
                 "final_text": str(final_text or ""),
                 "transcript_hash_hex": _normalize_hex(transcript_hash_hex, "transcript_hash_hex"),
                 "chunk_count": int(chunk_count),
+                **({"idempotency_key": key} if key else {}),
             }
         )
 
@@ -1131,6 +1135,7 @@ class MarmotLiveStream:
             start_message_id_hex,
             chunk_bytes=chunk_bytes,
         )
+        self.finalize_idempotency_key = uuid.uuid4().hex
         self.finalized = False
 
     @classmethod
@@ -1180,12 +1185,33 @@ class MarmotLiveStream:
 
     async def finalize(self, final_text: str) -> Dict[str, Any]:
         await self.append_replacement(final_text)
-        response = await self.client.stream_finalize(
-            self.stream_id_hex,
-            final_text,
-            self.transcript.hash_hex,
-            self.transcript.chunk_count,
-        )
+        response: Optional[Dict[str, Any]] = None
+        for attempt in range(len(STREAM_FINALIZE_RETRY_BACKOFF_S) + 1):
+            try:
+                response = await self.client.stream_finalize(
+                    self.stream_id_hex,
+                    final_text,
+                    self.transcript.hash_hex,
+                    self.transcript.chunk_count,
+                    idempotency_key=self.finalize_idempotency_key,
+                )
+                break
+            except Exception as exc:
+                if attempt < len(STREAM_FINALIZE_RETRY_BACKOFF_S) and is_retryable(exc):
+                    logger.debug(
+                        "Marmot stream_finalize failed; retrying (attempt %d): %s",
+                        attempt + 1,
+                        exc,
+                    )
+                    await asyncio.sleep(STREAM_FINALIZE_RETRY_BACKOFF_S[attempt])
+                    continue
+                raise
+        if response is None:
+            raise AgentControlError(
+                "Marmot stream finalize failed without a response",
+                code="unexpected_stream_finalize_response",
+                retryable=True,
+            )
         self.finalized = True
         return response
 

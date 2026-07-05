@@ -337,7 +337,16 @@ fn which_qrencode() -> Option<String> {
 }
 
 fn safe_error_message(err: &ConnectorError) -> String {
-    format!("startup failed code={}", err.privacy_safe_code())
+    match err {
+        ConnectorError::Io(io) => {
+            format!(
+                "startup failed code={} detail={}",
+                err.privacy_safe_code(),
+                io
+            )
+        }
+        _ => format!("startup failed code={}", err.privacy_safe_code()),
+    }
 }
 
 fn read_auth_token(path: Option<&PathBuf>) -> Result<Option<String>, String> {

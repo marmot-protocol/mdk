@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { NonAppendOnlyUpdateError } from "../src/append-only.js";
+import { AgentControlError } from "../src/client.js";
 import { MarmotLivePreview, type StreamControlClient } from "../src/live.js";
 import { AgentTextStreamTranscript } from "../src/transcript.js";
 
@@ -18,7 +19,7 @@ interface Calls {
   append: { streamId: string; text: string }[];
   status: { streamId: string; text: string }[];
   progress: { streamId: string; text: string }[];
-  finalize: { streamId: string; finalText: string; hash: string; count: number }[];
+  finalize: { streamId: string; finalText: string; hash: string; count: number; idempotencyKey?: string }[];
   cancel: { streamId: string; reason: string | null }[];
 }
 
@@ -50,8 +51,14 @@ function stubStreamClient(calls: Calls): StreamControlClient {
       calls.progress.push({ streamId, text });
       return { type: "ack" };
     },
-    async streamFinalize(streamId: string, finalText: string, hash: string, count: number) {
-      calls.finalize.push({ streamId, finalText, hash, count });
+    async streamFinalize(
+      streamId: string,
+      finalText: string,
+      hash: string,
+      count: number,
+      idempotencyKey?: string,
+    ) {
+      calls.finalize.push({ streamId, finalText, hash, count, idempotencyKey });
       return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
     },
     async streamCancel(streamId: string, reason?: string | null) {
@@ -146,6 +153,39 @@ describe("MarmotLivePreview", () => {
 
     expect(calls.append.map((a) => a.text)).toEqual(["hel", "lo", " world"]);
     expect(calls.finalize[0]).toMatchObject({ hash: INCREMENTAL_HASH, count: 3 });
+  });
+
+  it("retries stream_finalize with the same idempotency key before falling back", async () => {
+    const calls = emptyCalls();
+    let attempts = 0;
+    const client = {
+      ...stubStreamClient(calls),
+      async streamFinalize(
+        streamId: string,
+        finalText: string,
+        hash: string,
+        count: number,
+        idempotencyKey?: string,
+      ) {
+        attempts += 1;
+        calls.finalize.push({ streamId, finalText, hash, count, idempotencyKey });
+        if (attempts === 1) {
+          throw new AgentControlError("timed out waiting for stream finalize", {
+            code: "timeout",
+            retryable: true,
+          });
+        }
+        return { type: "stream_finalized", stream_id_hex: streamId, message_ids_hex: [HEX32("ab")] };
+      },
+    } as unknown as StreamControlClient;
+    const live = previewWithClient(client);
+
+    const result = await live.finalize("hello world");
+
+    expect(result.messageIdsHex).toEqual([HEX32("ab")]);
+    expect(calls.finalize).toHaveLength(2);
+    expect(calls.finalize[0]?.idempotencyKey).toBeTruthy();
+    expect(calls.finalize[1]?.idempotencyKey).toBe(calls.finalize[0]?.idempotencyKey);
   });
 
   it("can begin before text arrives without adding transcript records", async () => {

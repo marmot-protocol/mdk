@@ -35,6 +35,9 @@ curl -fsSL ".../install-openclaw-marmot.sh" | bash -s -- --bootstrap
 The installer puts `wn-agent` in `~/.local/bin`, downloads and verifies the plugin
 tarball, runs `openclaw plugins install`, and enables the `marmot` channel.
 Supported platforms match the Hermes installer.
+Set `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`, and `WN_AGENT_VERSION` (or the
+legacy `WN_AGENT_SHA` alias) to install a non-default release asset, matching
+the Hermes installer.
 
 Then start the connector and bootstrap (same public relays as the phone app):
 
@@ -52,13 +55,69 @@ Invite the printed agent account from the phone app.
 
 ```sh
 just openclaw-dev-test                 # pnpm install + typecheck + vitest
+just openclaw-dev-script-test          # generated helper/env/installer contract test
 just openclaw-dev-setup --print-env    # build + isolated dev root + helper scripts
+just openclaw-dev-e2e-connector        # real wn-agent + debug control deterministic E2E
 just openclaw-dev-teardown --force     # remove the throwaway dev root
 ```
 
 `openclaw-dev-setup` builds the plugin, prepares an isolated dev root under
-`${TMPDIR:-/tmp}/openclaw-marmot-test`, and generates `run-wn-agent.sh`,
-`run-openclaw-gateway.sh`, `smoke-plugin.sh`, and `env.sh`.
+`${TMPDIR:-/tmp}/openclaw-marmot-test`, and generates:
+
+- `env.sh` with isolated `OPENCLAW_HOME`, `MARMOT_HOME`, socket, relay,
+  account/group, auth-token, and QUIC-preview environment variables.
+- `run-wn-agent.sh` / `start-wn-agent.sh` for the local connector.
+- `bootstrap-agent.sh` for `wn-agent bootstrap --qr` against that connector.
+- `run-openclaw-gateway.sh` / `start-openclaw-gateway.sh` for the gateway.
+- `smoke-plugin.sh` for typecheck + Vitest.
+- `control-smoketest.sh` for the real `wn-agent` control socket smoke test.
+- `e2e-connector.sh` for a model-free real `wn-agent` connector E2E.
+- `stop-dev-processes.sh` for background helper cleanup.
+
+Useful variants:
+
+```sh
+# Pin account/group env used by the plugin and smoke helpers.
+just openclaw-dev-setup --account-id-hex <agent-account-hex> --group-id-hex <group-hex> --print-env
+
+# Include relay and QUIC preview settings for generated helpers.
+just openclaw-dev-setup \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat \
+  --quic-candidate quic://quic-broker.ipf.dev:4450 \
+  --print-env
+
+# Use a token-gated local control socket for a group-shared OpenClaw/wn-agent setup.
+just openclaw-dev-setup --auth-token "$(openssl rand -hex 32)" --socket-dir-mode 0770 --socket-mode 0660 --print-env
+```
+
+After setup:
+
+```sh
+source "${OPENCLAW_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/openclaw-marmot-test}/env.sh"
+"$OPENCLAW_MARMOT_DEV_ROOT/start-wn-agent.sh"
+"$OPENCLAW_MARMOT_DEV_ROOT/bootstrap-agent.sh"
+"$OPENCLAW_MARMOT_DEV_ROOT/start-openclaw-gateway.sh"
+```
+
+The control-socket smoke test is model-free but requires a running `wn-agent`
+and a `MARMOT_GROUP_ID_HEX` for send/delete/media steps:
+
+```sh
+just openclaw-dev-control-smoke
+```
+
+Run the deterministic connector E2E:
+
+```sh
+just openclaw-dev-e2e-connector
+```
+
+This test starts a real `wn-agent` process with debug controls enabled, injects
+one inbound message through its local control socket, runs the OpenClaw Marmot
+inbound runtime, and verifies the deterministic reply is sent back through
+`wn-agent`. It is model-free and does not need a real Marmot account, group,
+relay, phone, or OpenClaw gateway.
 
 ## Docker phone test
 
@@ -145,7 +204,9 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   reusing the same key so `wn-agent` dedups instead of double-posting. A repeated
   key returns the original message ids without a second send, so a retry after a
   post-write timeout cannot double-post an unrecallable encrypted message.
-  (Follow-up: `stream_finalize` is not yet idempotent.)
+  Live-preview `stream_finalize` uses the same posture: one idempotency key per
+  preview stream, bounded retry on retryable failures, and connector-side cached
+  final message ids for post-success retries.
 - **`message`-tool target resolution** (`src/messaging.ts`): a Marmot reply is
   delivered automatically from the assistant's final text, so the agent does not
   need the shared `message` tool to answer. When it *does* call
@@ -159,12 +220,10 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
 - **Message deletion**: the control client can retract a prior message via
   `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
   kind-5 deletions from other members surface as a `message_deleted` event,
-  routed to the agent as quiet ambient context (below). The agent-facing *delete
-  trigger* is scaffolded — the message adapter records a `messageId → {account,
-  group}` map at send time and exposes `deleteByMessageId(...)` — but wiring the
-  agent's `delete` message-action requires the larger `base.actions`
-  message-tool surface (`ChannelMessageActionAdapter`), which is typed but
-  runtime-unvalidated and left as a follow-up.
+  routed to the agent as quiet ambient context (below). The agent-facing delete
+  message action is wired through the channel's `base.actions` adapter: it first
+  uses the bounded send-time `messageId → {account, group}` cache, then falls
+  back to an explicit `to` group id when the cache misses.
 - **Group state changes**: durable, MLS-authenticated changes (member
   add/remove/leave, admin grant/revoke, rename/avatar) surface as a
   `group_state_changed` event carrying only a coarse `change` kind and, for a

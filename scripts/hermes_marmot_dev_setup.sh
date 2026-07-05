@@ -294,6 +294,14 @@ write_env_file() {
             done
         fi
         echo ')'
+        echo 'wn_agent_quic_args=('
+        if [ "${#quic_candidates[@]}" -gt 0 ]; then
+            for candidate in "${quic_candidates[@]}"; do
+                printf '  %q\n' "--quic-candidate"
+                printf '  %q\n' "$candidate"
+            done
+        fi
+        echo ')'
     } >"$env_file"
 }
 
@@ -389,7 +397,10 @@ bootstrap_args=(bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET")
 if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
     bootstrap_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")
 fi
-exec cargo run -p agent-connector --bin wn-agent -- "${bootstrap_args[@]}" "$@"
+if [ -n "${MARMOT_ACCOUNT_ID_HEX:-}" ]; then
+    bootstrap_args+=(--account-id-hex "$MARMOT_ACCOUNT_ID_HEX")
+fi
+exec cargo run -p agent-connector --bin wn-agent -- "${bootstrap_args[@]}" "${wn_agent_relay_args[@]}" "${wn_agent_quic_args[@]}" --qr "$@"
 SCRIPT
 
     cat >"$dev_root/start-wn-agent.sh" <<'SCRIPT'

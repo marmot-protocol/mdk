@@ -193,6 +193,14 @@ where
         };
     }
 
+    if is_notifications_subscribe(&cli) {
+        let socket = daemon_socket_path_for_client(&cli, &home);
+        return match daemon::send_notifications_subscribe(&socket, cli.clone()).await {
+            Ok(output) => output,
+            Err(err) => daemon_client_error(cli.json, err),
+        };
+    }
+
     if let Some(socket) = daemon_socket_for_client(&cli, &home) {
         let explicit_daemon_socket =
             cli.socket.is_some() || std::env::var_os("WN_SOCKET").is_some();
@@ -332,6 +340,15 @@ fn is_group_state_subscribe(cli: &Cli) -> bool {
         &cli.command,
         Command::Groups {
             command: GroupsCommand::SubscribeState { .. },
+        }
+    )
+}
+
+fn is_notifications_subscribe(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Notifications {
+            command: NotificationsCommand::Subscribe,
         }
     )
 }
@@ -662,13 +679,6 @@ fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> Cli
     }
 }
 
-pub(crate) fn unsupported_command<T>(
-    command: &'static str,
-    reason: &'static str,
-) -> Result<T, WnError> {
-    Err(WnError::UnsupportedCommand { command, reason })
-}
-
 pub(crate) fn group_show_output(
     app: &MarmotApp,
     account: marmot_account::AccountSummary,
@@ -715,10 +725,11 @@ pub(crate) fn replaceable_list_inconclusive(
 
 fn reset_command(home: &Path, confirm: bool) -> Result<CommandOutput, WnError> {
     if !confirm {
-        return unsupported_command(
-            "reset",
-            "pass --confirm to delete all local White Noise data",
-        );
+        return Err(WnError::ConfirmationRequired {
+            command: "reset",
+            flag: "--confirm",
+            reason: "pass --confirm to delete all local White Noise data",
+        });
     }
     match std::fs::remove_dir_all(home) {
         Ok(()) => {}
@@ -832,6 +843,9 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
         "agent_text_stream": group.agent_text_stream,
         "encrypted_media": group.encrypted_media,
         "archived": group.archived,
+        "pending_confirmation": group.pending_confirmation,
+        "welcomer_account_id": group.welcomer_account_id_hex,
+        "via_welcome_message_id": group.via_welcome_message_id_hex,
     })
 }
 
@@ -1821,6 +1835,28 @@ mod tests {
             "expected messages-specific subscribe message, got {messages_message:?}"
         );
         assert_ne!(message, messages_message);
+
+        let notifications = super::wn_error_json(&WnError::NotificationsSubscribeRequiresDaemon);
+        assert_eq!(notifications["code"], "daemon_required");
+        assert_eq!(notifications["repair"]["start"], "wn daemon start");
+        let notifications_message = notifications["message"]
+            .as_str()
+            .expect("notifications message");
+        assert!(
+            notifications_message.starts_with("notifications subscribe"),
+            "expected notification-specific subscribe message, got {notifications_message:?}"
+        );
+
+        let stream_compose = super::wn_error_json(&WnError::StreamComposeRequiresDaemon);
+        assert_eq!(stream_compose["code"], "daemon_required");
+        assert_eq!(stream_compose["repair"]["start"], "wn daemon start");
+        let stream_compose_message = stream_compose["message"]
+            .as_str()
+            .expect("stream compose message");
+        assert!(
+            stream_compose_message.starts_with("stream compose"),
+            "expected stream-compose-specific daemon message, got {stream_compose_message:?}"
+        );
     }
 
     // Regression for #190: an oversized request on the *implicit* daemon socket

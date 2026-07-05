@@ -18,9 +18,10 @@ mod storage;
 mod timeline;
 
 pub use account_projection::{
-    AccountGroupPushToken, AccountNotificationSettings, AccountPushRegistration,
-    AccountStoredPushRegistration, AppEventReplayCursor, SelfMembership, StoredAccountGroup,
-    StoredAccountGroupComponent, StoredAccountState, StoredAppMessageQuery, StoredAppMessageRecord,
+    AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
+    AccountPushRegistration, AccountStoredPushRegistration, AppEventReplayCursor, SelfMembership,
+    StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState, StoredAppMessageQuery,
+    StoredAppMessageRecord,
 };
 pub use chat_list::{
     AccountUnreadTotal, ChatListAvatar, ChatListMessagePreview, ChatListQuery, ChatListRow,

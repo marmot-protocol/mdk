@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::{
     CommandOutput, RelaysCommand, WnError, ensure_local_signing, npub_for_account_id,
     relay_endpoints, relay_lists_json, replaceable_list_inconclusive, resolve_account,
-    unsupported_command, validate_relay_url,
+    validate_relay_url,
 };
 
 pub(crate) async fn relays_command(
@@ -159,6 +159,6 @@ fn normalize_relay_type(value: &str) -> Result<String, WnError> {
     match value {
         "nip65" => Ok("nip65".to_owned()),
         "inbox" => Ok("inbox".to_owned()),
-        _ => unsupported_command("relays", "relay type must be nip65 or inbox"),
+        _ => Err(WnError::InvalidRelayType(value.to_owned())),
     }
 }

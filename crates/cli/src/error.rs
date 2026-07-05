@@ -80,6 +80,10 @@ pub(crate) enum WnError {
     MessagesSubscribeRequiresDaemon,
     #[error("chats subscribe requires the daemon; start it with `wn daemon start`")]
     ChatsSubscribeRequiresDaemon,
+    #[error("notifications subscribe requires the daemon; start it with `wn daemon start`")]
+    NotificationsSubscribeRequiresDaemon,
+    #[error("stream compose requires the daemon; start it with `wn daemon start`")]
+    StreamComposeRequiresDaemon,
     #[error("login requires --nsec-stdin or an npub identity")]
     MissingLoginIdentity,
     #[error(
@@ -96,11 +100,18 @@ pub(crate) enum WnError {
     MediaAttachmentNotFound(String),
     #[error("invalid media attachment: {0}")]
     InvalidMediaAttachment(String),
-    #[error("{command} is not implemented yet: {reason}")]
-    UnsupportedCommand {
+    #[error("invalid mute duration: {0}")]
+    InvalidMuteDuration(String),
+    #[error("exporting private keys is disabled by White Noise CLI policy")]
+    PrivateKeyExportDisabled,
+    #[error("{command} requires {flag}: {reason}")]
+    ConfirmationRequired {
         command: &'static str,
+        flag: &'static str,
         reason: &'static str,
     },
+    #[error("invalid relay type: {0}")]
+    InvalidRelayType(String),
     #[error("missing account relay lists: {0:?}")]
     MissingRelayLists(Vec<MissingRelayListKind>, Box<AccountRelayListStatus>),
     #[error(
@@ -280,6 +291,20 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
                 "start": "wn daemon start",
             },
         }),
+        WnError::NotificationsSubscribeRequiresDaemon => json!({
+            "code": "daemon_required",
+            "message": err.to_string(),
+            "repair": {
+                "start": "wn daemon start",
+            },
+        }),
+        WnError::StreamComposeRequiresDaemon => json!({
+            "code": "daemon_required",
+            "message": err.to_string(),
+            "repair": {
+                "start": "wn daemon start",
+            },
+        }),
         WnError::MissingLoginIdentity => json!({
             "code": "missing_login_identity",
             "message": err.to_string(),
@@ -322,11 +347,37 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "message": err.to_string(),
             "reason": reason,
         }),
-        WnError::UnsupportedCommand { command, reason } => json!({
-            "code": "unsupported_command",
+        WnError::InvalidMuteDuration(duration) => json!({
+            "code": "invalid_mute_duration",
+            "message": err.to_string(),
+            "duration": duration,
+            "repair": {
+                "examples": ["15m", "1h", "8h", "1d", "1w", "forever"],
+            },
+        }),
+        WnError::PrivateKeyExportDisabled => json!({
+            "code": "private_key_export_disabled",
+            "message": err.to_string(),
+            "repair": {
+                "import_nsec": "printf '%s\\n' \"$NSEC\" | wn login --nsec-stdin",
+            },
+        }),
+        WnError::ConfirmationRequired {
+            command,
+            flag,
+            reason,
+        } => json!({
+            "code": "confirmation_required",
             "message": err.to_string(),
             "command": command,
+            "flag": flag,
             "reason": reason,
+        }),
+        WnError::InvalidRelayType(relay_type) => json!({
+            "code": "invalid_relay_type",
+            "message": err.to_string(),
+            "relay_type": relay_type,
+            "allowed": ["nip65", "inbox"],
         }),
         WnError::MissingGroupId => json!({
             "code": "missing_group_id",

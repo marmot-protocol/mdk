@@ -39,12 +39,16 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 - Keep the `openclaw` dependency pinned; before bumping, verify the
   `openclaw/plugin-sdk/*` subpath exports against the new version's types.
 - The inbound→agent and live-preview-pipeline seams use OpenClaw gateway runtime
-  internals and are validated by the docker phone test, not the unit tests.
+  internals and are validated by the deterministic connector E2E plus the docker
+  phone test, not the unit tests alone.
 
 ## Verification
 
 ```sh
 cd integrations/openclaw/marmot && pnpm install && pnpm typecheck && pnpm test
+integrations/openclaw/marmot/test/dev-scripts.sh
 # or from the repo root:
 just openclaw-dev-test
+just openclaw-dev-script-test
+just openclaw-dev-e2e-connector
 ```

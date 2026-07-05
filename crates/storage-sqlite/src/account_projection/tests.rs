@@ -983,6 +983,58 @@ fn notification_settings_default_local_notifications_on() {
 }
 
 #[test]
+fn chat_notification_settings_track_timed_forever_and_cleared_mutes() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "Muted")],
+            },
+            1,
+        )
+        .unwrap();
+
+    let default = store.chat_notification_settings_at("aa", 1000).unwrap();
+    assert!(!default.muted);
+    assert_eq!(default.muted_until_ms, Some(0));
+
+    let timed = store.set_chat_muted("aa", Some(5000)).unwrap();
+    assert_eq!(timed.muted_until_ms, Some(5000));
+    let timed = store.chat_notification_settings_at("aa", 1000).unwrap();
+    assert!(timed.muted);
+    assert_eq!(timed.muted_until_ms, Some(5000));
+    assert!(
+        store
+            .chat_notification_settings_at("aa", 4999)
+            .unwrap()
+            .muted
+    );
+    assert!(
+        !store
+            .chat_notification_settings_at("aa", 5000)
+            .unwrap()
+            .muted
+    );
+
+    let forever = store.set_chat_muted("aa", None).unwrap();
+    assert!(forever.muted);
+    assert_eq!(forever.muted_until_ms, None);
+    assert!(
+        store
+            .chat_notification_settings_at("aa", i64::MAX)
+            .unwrap()
+            .muted
+    );
+
+    let cleared = store.clear_chat_muted("aa").unwrap();
+    assert!(!cleared.muted);
+    assert_eq!(cleared.muted_until_ms, Some(0));
+}
+
+#[test]
 fn push_registration_preserves_created_at_when_token_rotates() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let registration = AccountPushRegistration {
