@@ -380,6 +380,7 @@ export class MarmotAgentControlClient {
     finalText: string,
     transcriptHashHex: string,
     chunkCount: number,
+    idempotencyKey?: string,
   ): Promise<StreamFinalizedResponse> {
     // Durable commit: keep the full request timeout. Abandoning a live finalize
     // early could re-send via send_final and duplicate the kind-9, so this op is
@@ -390,6 +391,7 @@ export class MarmotAgentControlClient {
       final_text: String(finalText ?? ""),
       transcript_hash_hex: normalizeHex(transcriptHashHex, "transcript_hash_hex"),
       chunk_count: Math.trunc(chunkCount),
+      ...(idempotencyKey?.trim() ? { idempotency_key: idempotencyKey.trim() } : {}),
     })) as unknown as StreamFinalizedResponse;
   }
 

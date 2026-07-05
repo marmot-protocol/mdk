@@ -15,7 +15,7 @@ workspace_version_default="${workspace_version_default:-latest}"
 
 MARMOT_RELEASE_REPO="${MARMOT_RELEASE_REPO:-marmot-protocol/mdk}"
 WN_AGENT_VERSION_DEFAULT="${WN_AGENT_VERSION_DEFAULT:-$workspace_version_default}"
-WN_AGENT_VERSION="${WN_AGENT_VERSION:-$WN_AGENT_VERSION_DEFAULT}"
+WN_AGENT_VERSION="${WN_AGENT_VERSION:-${WN_AGENT_SHA:-$WN_AGENT_VERSION_DEFAULT}}"
 MARMOT_RELEASE_TAG_DEFAULT="${MARMOT_RELEASE_TAG_DEFAULT:-wn-agent-v${WN_AGENT_VERSION}}"
 MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-$MARMOT_RELEASE_TAG_DEFAULT}"
 MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
@@ -47,6 +47,7 @@ Environment:
   MARMOT_RELEASE_REPO   GitHub repo (default: marmot-protocol/mdk)
   MARMOT_RELEASE_TAG    Release tag (default: wn-agent-v<version>)
   WN_AGENT_VERSION      Asset version suffix
+  WN_AGENT_SHA          Legacy alias for WN_AGENT_VERSION
   MARMOT_INSTALL_PREFIX Install root for wn-agent (default: ~/.local)
   MARMOT_HOME           wn-agent home used by bootstrap (default: ~/.marmot-agent)
   MARMOT_RELAYS         Relay CSV used when --bootstrap starts wn-agent

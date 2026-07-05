@@ -146,14 +146,15 @@ pub use media::{
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use notifications::{
-    BackgroundNotificationCollection, GroupPushDebugInfo, GroupPushTokenDebugEntry,
-    GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR, KIND_MARMOT_NOTIFICATION_SERVER_RELAYS,
-    LocalPushRegistrationDebug, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
-    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
-    NotificationCollectionStatus, NotificationSettings, NotificationTrigger, NotificationUpdate,
-    NotificationUser, NotificationWakeSource, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform,
-    PushRegistration, build_notification_gift_wrap, build_notification_rumor_content,
-    encrypted_push_token, parse_provider_token, push_token_fingerprint,
+    BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
+    GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
+    KIND_MARMOT_NOTIFICATION_SERVER_RELAYS, LocalPushRegistrationDebug,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE, NotificationCollectionStatus, NotificationSettings,
+    NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
+    PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform, PushRegistration,
+    build_notification_gift_wrap, build_notification_rumor_content, encrypted_push_token,
+    parse_provider_token, push_token_fingerprint,
 };
 pub use relay_plane::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter, RelayPlaneHealth,
@@ -176,7 +177,8 @@ pub use transport_nostr_adapter::{
 
 use conversions::{
     account_group_push_token_from_app, account_push_registration_from_app,
-    account_state_from_stored, app_message_record_from_stored, group_push_token_from_account,
+    account_state_from_stored, app_message_record_from_stored,
+    chat_notification_settings_from_account, group_push_token_from_account,
     normalize_relay_telemetry_settings, notification_settings_from_account,
     relay_telemetry_settings_from_storage, relay_telemetry_settings_to_storage,
     stored_app_event_from_message_record, stored_app_event_from_projection,
@@ -1501,6 +1503,64 @@ impl MarmotApp {
         Ok(notification_settings_from_account(
             self.account_storage(&account.label)?
                 .notification_settings(&account.label, &account.account_id_hex)?,
+        ))
+    }
+
+    pub fn chat_notification_settings(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.group(&account.label, group_id_hex)?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        let settings = self
+            .account_storage(&account.label)?
+            .chat_notification_settings(group_id_hex)?;
+        Ok(chat_notification_settings_from_account(
+            account.label,
+            account.account_id_hex,
+            settings,
+        ))
+    }
+
+    pub fn set_chat_muted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        muted_until_ms: Option<i64>,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.group(&account.label, group_id_hex)?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        let settings = self
+            .account_storage(&account.label)?
+            .set_chat_muted(group_id_hex, muted_until_ms)?;
+        Ok(chat_notification_settings_from_account(
+            account.label,
+            account.account_id_hex,
+            settings,
+        ))
+    }
+
+    pub fn clear_chat_muted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.group(&account.label, group_id_hex)?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        let settings = self
+            .account_storage(&account.label)?
+            .clear_chat_muted(group_id_hex)?;
+        Ok(chat_notification_settings_from_account(
+            account.label,
+            account.account_id_hex,
+            settings,
         ))
     }
 

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::{
     AccountCommand, CliRuntimeInfo, CommandOutput, SecretStoreKind, WnError,
     account_selector_or_default, is_nostr_secret, npub_for_account_id, parse_public_key,
-    profile_display_name, relay_endpoints, relay_lists_json, resolve_account, unsupported_command,
+    profile_display_name, relay_endpoints, relay_lists_json, resolve_account,
     validate_materialized_secret_identity,
 };
 
@@ -136,10 +136,7 @@ pub(crate) fn logout_command(
 }
 
 pub(crate) fn export_nsec_command(_pubkey: String) -> Result<CommandOutput, WnError> {
-    unsupported_command(
-        "export-nsec",
-        "White Noise CLI policy forbids printing private keys",
-    )
+    Err(WnError::PrivateKeyExportDisabled)
 }
 
 #[allow(clippy::too_many_arguments)]

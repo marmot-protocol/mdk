@@ -188,12 +188,14 @@ impl AgentConnector {
                 final_text,
                 transcript_hash_hex,
                 chunk_count,
+                idempotency_key,
             } => {
                 self.stream_finalize_response(
                     &stream_id_hex,
                     final_text,
                     &transcript_hash_hex,
                     chunk_count,
+                    idempotency_key,
                 )
                 .await
             }

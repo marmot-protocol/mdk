@@ -127,6 +127,16 @@ pub struct NotificationSettings {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatNotificationSettings {
+    pub account_ref: String,
+    pub account_id_hex: String,
+    pub group_id_hex: String,
+    pub muted: bool,
+    pub muted_until_ms: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushRegistration {
     pub account_ref: String,
     pub account_id_hex: String,
@@ -924,6 +934,7 @@ pub(crate) fn is_push_gossip_kind(kind: u64) -> bool {
 #[derive(Default)]
 pub(crate) struct NotificationResolver {
     settings: HashMap<String, NotificationSettings>,
+    chat_muted: HashMap<(String, String), bool>,
     groups: HashMap<(String, String), Option<AppGroupRecord>>,
     users: HashMap<String, NotificationUser>,
 }
@@ -956,6 +967,23 @@ impl NotificationResolver {
         let group = app.group(account_label, group_id_hex)?;
         self.groups.insert(key, group.clone());
         Ok(group)
+    }
+
+    fn chat_muted(
+        &mut self,
+        app: &MarmotApp,
+        account_label: &str,
+        group_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        let key = (account_label.to_owned(), group_id_hex.to_owned());
+        if let Some(muted) = self.chat_muted.get(&key) {
+            return Ok(*muted);
+        }
+        let muted = app
+            .chat_notification_settings(account_label, group_id_hex)?
+            .muted;
+        self.chat_muted.insert(key, muted);
+        Ok(muted)
     }
 
     fn user(
@@ -1039,7 +1067,19 @@ fn notification_update_from_message(
         return Ok(None);
     }
     let group_id_hex = hex::encode(event.message.group_id.as_slice());
-    let group = resolver.group(app, &event.account_label, &group_id_hex)?;
+    let group = match resolver.group(app, &event.account_label, &group_id_hex) {
+        Ok(group) => group,
+        Err(AppError::UnknownGroup(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let muted = match resolver.chat_muted(app, &event.account_label, &group_id_hex) {
+        Ok(muted) => muted,
+        Err(AppError::UnknownGroup(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if muted {
+        return Ok(None);
+    }
     let receiver = resolver.user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, resolver, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;

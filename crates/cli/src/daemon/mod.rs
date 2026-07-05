@@ -349,6 +349,21 @@ async fn handle_daemon_connection(
             };
             let _ = handle_group_state_subscription(&mut stream, &defaults, runtime, *cli).await;
         }
+        DaemonRequest::NotificationsSubscribe { mut cli } => {
+            apply_defaults(&mut cli, &defaults);
+            let runtime = {
+                let mut workers_guard = workers.lock().await;
+                reconcile_app_runtime(
+                    &defaults,
+                    state.clone(),
+                    events.clone(),
+                    &mut workers_guard.runtime,
+                )
+                .await;
+                workers_guard.runtime.runtime.clone()
+            };
+            let _ = handle_notifications_subscription(&mut stream, runtime, *cli).await;
+        }
         DaemonRequest::StreamWatch { cli } => {
             let _ = handle_stream_watch_connection(
                 cli,

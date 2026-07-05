@@ -123,6 +123,25 @@ pub(crate) fn parse_json_output(output: Output) -> TuiResult<Value> {
     Err(TuiError::Cli(message.to_owned()))
 }
 
+pub(crate) fn media_upload_send_args(
+    group_id: String,
+    file_path: String,
+    caption: Option<String>,
+) -> Vec<String> {
+    let mut args = vec![
+        "media".to_owned(),
+        "upload".to_owned(),
+        group_id,
+        file_path,
+        "--send".to_owned(),
+    ];
+    if let Some(caption) = caption.filter(|caption| !caption.trim().is_empty()) {
+        args.push("--message".to_owned());
+        args.push(caption);
+    }
+    args
+}
+
 pub(crate) fn spawn_subscription_reader(
     child: &mut Child,
     label: &'static str,
@@ -199,6 +218,34 @@ impl TuiApp {
             self.refresh_messages()?;
         }
         self.status = status;
+        Ok(())
+    }
+
+    pub(crate) fn send_image(
+        &mut self,
+        file_path: String,
+        caption: Option<String>,
+    ) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let args = media_upload_send_args(group_id, file_path, caption);
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        self.refresh_messages()?;
+        let file_name = result
+            .get("attachments")
+            .and_then(Value::as_array)
+            .and_then(|attachments| attachments.first())
+            .and_then(|attachment| attachment.get("media"))
+            .and_then(|media| media.get("file_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("media");
+        let message_count = result
+            .get("sent")
+            .and_then(|sent| sent.get("message_ids"))
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        self.status = format!("sent {file_name} ({message_count} message(s))");
         Ok(())
     }
 
@@ -524,6 +571,29 @@ impl TuiApp {
         } else {
             format!("unarchived chat {}", shorten(&group_id, 18))
         };
+        Ok(())
+    }
+
+    pub(crate) fn set_selected_chat_muted(&mut self, duration: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let group_id = self.require_selected_group()?;
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["chats", "mute", &group_id, &duration])?;
+        let muted_until = result.get("muted_until_ms").and_then(Value::as_i64);
+        self.status = match muted_until {
+            Some(until) => format!("muted chat {} until {}", shorten(&group_id, 18), until),
+            None => format!("muted chat {} forever", shorten(&group_id, 18)),
+        };
+        Ok(())
+    }
+
+    pub(crate) fn clear_selected_chat_muted(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let group_id = self.require_selected_group()?;
+        self.client
+            .run_json(Some(&account_id), &["chats", "unmute", &group_id])?;
+        self.status = format!("unmuted chat {}", shorten(&group_id, 18));
         Ok(())
     }
 

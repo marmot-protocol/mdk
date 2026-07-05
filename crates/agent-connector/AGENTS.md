@@ -41,7 +41,8 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account welcomer allowlist persistence.
 - `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the persisted
   `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
-  versioned SHA-256 request fingerprints, crash-safe atomic writes), and the
+  versioned SHA-256 request fingerprints, `stream_finalize:` keys for durable finalized sends,
+  crash-safe atomic writes), and the
   `DebugFinalSendStore` recorder.
 - `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
   `$TMPDIR/marmot-media/`.

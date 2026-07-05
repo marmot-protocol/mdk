@@ -166,6 +166,7 @@ fn slash_command_suggestions_open_on_bare_slash_and_filter_nested_commands() {
     assert!(bare.contains(&"/help"));
     assert!(bare.contains(&"/chat new <name> [member-npub-or-hex ...]"));
     assert!(bare.contains(&"/members add <npub-or-hex> [...]"));
+    assert!(bare.contains(&"/image <file-path> [caption]"));
 
     let chat_rename = slash_command_suggestions("/chat r")
         .iter()
@@ -373,6 +374,14 @@ fn slash_command_parser_handles_chat_and_member_management_commands() {
         Ok(SlashCommand::ChatUnarchive)
     );
     assert_eq!(
+        parse_slash_command("/chat mute 1h"),
+        Ok(SlashCommand::ChatMute("1h".to_owned()))
+    );
+    assert_eq!(
+        parse_slash_command("/chat unmute"),
+        Ok(SlashCommand::ChatUnmute)
+    );
+    assert_eq!(
         parse_slash_command("/chat archived"),
         Ok(SlashCommand::ChatArchived(true))
     );
@@ -401,6 +410,25 @@ fn slash_command_parser_handles_chat_and_member_management_commands() {
     assert!(parse_slash_command("/members clear").is_err());
     assert!(parse_slash_command("/invite npub1bob").is_err());
     assert!(parse_slash_command("/remove npub1bob").is_err());
+}
+
+#[test]
+fn slash_command_parser_handles_image_sends() {
+    assert_eq!(
+        parse_slash_command("/image /tmp/photo.jpg"),
+        Ok(SlashCommand::Image {
+            file_path: "/tmp/photo.jpg".to_owned(),
+            caption: None,
+        })
+    );
+    assert_eq!(
+        parse_slash_command("/image \"/tmp/family photo.jpg\" hello there"),
+        Ok(SlashCommand::Image {
+            file_path: "/tmp/family photo.jpg".to_owned(),
+            caption: Some("hello there".to_owned()),
+        })
+    );
+    assert!(parse_slash_command("/image").is_err());
 }
 
 #[test]
@@ -767,8 +795,31 @@ fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
 }
 
 #[test]
-fn slash_command_parser_rejects_unimplemented_image_send() {
-    assert!(parse_slash_command("/image /tmp/photo.jpg").is_err());
+fn image_slash_command_uses_real_media_upload_send_surface() {
+    assert_eq!(
+        media_upload_send_args(
+            "group-a".to_owned(),
+            "/tmp/photo.jpg".to_owned(),
+            Some("hello image".to_owned()),
+        ),
+        vec![
+            "media",
+            "upload",
+            "group-a",
+            "/tmp/photo.jpg",
+            "--send",
+            "--message",
+            "hello image",
+        ]
+    );
+    assert_eq!(
+        media_upload_send_args(
+            "group-a".to_owned(),
+            "/tmp/photo.jpg".to_owned(),
+            Some("   ".to_owned()),
+        ),
+        vec!["media", "upload", "group-a", "/tmp/photo.jpg", "--send"]
+    );
 }
 
 #[test]

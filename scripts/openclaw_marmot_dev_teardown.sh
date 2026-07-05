@@ -3,35 +3,121 @@
 # scripts/openclaw_marmot_dev_setup.sh. Mirrors the Hermes teardown.
 set -euo pipefail
 
-ROOT="${OPENCLAW_MARMOT_DEV_ROOT:-${TMPDIR:-/tmp}/openclaw-marmot-test}"
-FORCE=0
+usage() {
+    cat <<'USAGE'
+Usage: openclaw_marmot_dev_teardown.sh [--root DIR] [--force] [--dry-run]
+USAGE
+}
+
+default_tmp="${TMPDIR:-/tmp}"
+dev_root="${OPENCLAW_MARMOT_DEV_ROOT:-${default_tmp%/}/openclaw-marmot-test}"
+force=0
+dry_run=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --root) ROOT="$2"; shift 2;;
-        --force) FORCE=1; shift;;
-        -h|--help) echo "Usage: openclaw_marmot_dev_teardown.sh [--root DIR] [--force]"; exit 0;;
-        *) echo "unknown option: $1" >&2; exit 2;;
+        --root) dev_root="$2"; shift 2;;
+        --force) force=1; shift;;
+        --dry-run) dry_run=1; shift;;
+        -h|--help) usage; exit 0;;
+        *) echo "unknown option: $1" >&2; usage >&2; exit 2;;
     esac
 done
 
-if [ ! -d "$ROOT" ]; then
-    echo "openclaw-marmot teardown: nothing at $ROOT"
+if [ -z "$dev_root" ]; then
+    echo "error: empty dev root" >&2
+    exit 1
+fi
+
+dev_parent="$(dirname "$dev_root")"
+dev_base="$(basename "$dev_root")"
+if [ ! -d "$dev_parent" ]; then
+    echo "openclaw-marmot teardown: nothing at $dev_root"
+    exit 0
+fi
+dev_root="$(cd "$dev_parent" && pwd)/$dev_base"
+
+same_or_within() {
+    local path="${1%/}"
+    local root="${2%/}"
+    if [ -z "$path" ]; then
+        path="/"
+    fi
+    if [ -z "$root" ]; then
+        root="/"
+    fi
+    if [ "$root" = "/" ]; then
+        [ "$path" = "/" ]
+        return
+    fi
+    [ "$path" = "$root" ] || [[ "$path" = "$root/"* ]]
+}
+
+within_root() {
+    local path="${1%/}"
+    local root="${2%/}"
+    if [ -z "$path" ]; then
+        path="/"
+    fi
+    if [ -z "$root" ]; then
+        root="/"
+    fi
+    if [ "$root" = "/" ]; then
+        [ "$path" != "/" ]
+        return
+    fi
+    [[ "$path" = "$root/"* ]]
+}
+
+default_tmp_root="${default_tmp%/}"
+if [ -d "$default_tmp_root" ]; then
+    default_tmp_root="$(cd "$default_tmp_root" && pwd)"
+fi
+
+home_root="${HOME%/}"
+home_data_root="$home_root/.local/share"
+if same_or_within "$dev_root" "/" \
+    || same_or_within "$dev_root" "$PWD" \
+    || same_or_within "$dev_root" "/etc" \
+    || same_or_within "$dev_root" "/usr" \
+    || same_or_within "$dev_root" "/bin" \
+    || same_or_within "$dev_root" "/sbin" \
+    || same_or_within "$dev_root" "/System" \
+    || same_or_within "$dev_root" "/Library"; then
+    echo "error: refusing to delete unsafe root: $dev_root" >&2
+    exit 1
+fi
+if same_or_within "$dev_root" "$home_root" && ! within_root "$dev_root" "$home_data_root"; then
+    echo "error: refusing to delete unsafe root: $dev_root" >&2
+    exit 1
+fi
+if ! within_root "$dev_root" "/tmp" \
+    && ! within_root "$dev_root" "/var/tmp" \
+    && ! within_root "$dev_root" "$default_tmp_root" \
+    && ! within_root "$dev_root" "$home_data_root"; then
+    echo "error: refusing to delete unsafe root: $dev_root" >&2
+    exit 1
+fi
+
+if [ ! -e "$dev_root" ]; then
+    echo "openclaw-marmot teardown: nothing at $dev_root"
     exit 0
 fi
 
-if [ "$FORCE" -ne 1 ]; then
-    printf 'Delete dev root %s? [y/N] ' "$ROOT"
+if [ -x "$dev_root/stop-dev-processes.sh" ]; then
+    "$dev_root/stop-dev-processes.sh" || true
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+    echo "openclaw-marmot teardown: would remove $dev_root"
+    exit 0
+fi
+
+if [ "$force" -ne 1 ]; then
+    printf 'Delete dev root %s? [y/N] ' "$dev_root"
     read -r reply
     case "$reply" in y|Y|yes|YES) ;; *) echo "aborted"; exit 1;; esac
 fi
 
-case "$ROOT" in
-    ""|"/"|"."|"/home"|"/root"|"/usr"|"/opt"|"/etc"|"/var"|"$HOME")
-        echo "refusing to delete unsafe root path: '$ROOT'" >&2
-        exit 1
-        ;;
-esac
-
-rm -rf "$ROOT"
-echo "openclaw-marmot teardown: removed $ROOT"
+rm -rf "$dev_root"
+echo "openclaw-marmot teardown: removed $dev_root"

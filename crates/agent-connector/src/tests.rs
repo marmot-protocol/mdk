@@ -1986,6 +1986,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
             final_text: "hello stream".to_owned(),
             transcript_hash_hex,
             chunk_count: 2,
+            idempotency_key: None,
         },
     )
     .await;
@@ -2095,6 +2096,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
             final_text: "hello stream".to_owned(),
             transcript_hash_hex: first_hash,
             chunk_count: 7,
+            idempotency_key: None,
         },
     )
     .await;
@@ -2137,6 +2139,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
             final_text: "hello stream again".to_owned(),
             transcript_hash_hex: corrected_hash,
             chunk_count: 2,
+            idempotency_key: None,
         },
     )
     .await;
@@ -2249,6 +2252,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
             "different final".to_owned(),
             &hex::encode(transcript_hash),
             1,
+            Some("frozen-finalize".to_owned()),
         )
         .await;
     assert!(
@@ -2269,6 +2273,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
             "frozen final".to_owned(),
             &hex::encode(transcript_hash),
             1,
+            Some("frozen-finalize".to_owned()),
         )
         .await
         .expect("frozen-transcript retry finalizes without the compose task");
@@ -2284,6 +2289,28 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         connector.streams.get(&stream_id_norm).is_err(),
         "a successful durable finish must remove the session"
     );
+
+    // A client retry after receiving a timeout from the successful durable
+    // publish path must return the original ids even though the stream session
+    // is gone. This is the post-success half of stream_finalize idempotency.
+    let retried_after_success = connector
+        .stream_finalize_response(
+            &stream_id_hex,
+            "frozen final".to_owned(),
+            &hex::encode(transcript_hash),
+            1,
+            Some("frozen-finalize".to_owned()),
+        )
+        .await
+        .expect("idempotent stream_finalize retry returns cached ids");
+    let AgentControlResponse::StreamFinalized {
+        message_ids_hex: retried_ids,
+        ..
+    } = retried_after_success
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(retried_ids, message_ids_hex);
 }
 
 #[tokio::test]

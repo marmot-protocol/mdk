@@ -192,7 +192,9 @@ async def run() -> None:
             )
         )
 
-    with tempfile.TemporaryDirectory(prefix="marmot-hermes-e2e-") as tmp:
+    # Keep Unix socket paths short for macOS sockaddr_un limits. Python's
+    # default temp dir can live under a long /var/folders/... path.
+    with tempfile.TemporaryDirectory(prefix="mhe-", dir="/tmp") as tmp:
         fake_server = FakeAgentControlServer(Path(tmp) / "wn-agent.sock")
         await fake_server.start()
         prior_socket = os.environ.get("MARMOT_AGENT_SOCKET")
@@ -204,6 +206,7 @@ async def run() -> None:
                     "socket_path": str(fake_server.socket_path),
                     "account_id_hex": ACCOUNT_ID_HEX,
                     "group_id_hex": GROUP_ID_HEX,
+                    "group_activation": "always",
                     "profile_name_onboarding": False,
                 },
             )

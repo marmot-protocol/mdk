@@ -59,6 +59,14 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         quic_candidates: [],
       });
       break;
+    case "stream_finalize":
+      send(socket, id, {
+        type: "stream_finalized",
+        stream_id_hex: req.stream_id_hex ?? HEX32("ee"),
+        message_ids_hex: [HEX32("99")],
+        echoed_idempotency_key: req.idempotency_key ?? null,
+      });
+      break;
     case "group_info":
       send(socket, id, {
         type: "group_info",
@@ -172,6 +180,25 @@ describe("MarmotAgentControlClient", () => {
       HEX32("aa"),
       HEX32("cc"),
       "done",
+    )) as unknown as { echoed_idempotency_key?: string | null };
+    expect(withoutKey.echoed_idempotency_key).toBeNull();
+  });
+
+  it("forwards an idempotency_key on stream_finalize when supplied, and omits it otherwise", async () => {
+    const withKey = (await client.streamFinalize(
+      HEX32("ee"),
+      "done",
+      HEX32("aa"),
+      1,
+      "stream-key-1",
+    )) as unknown as { echoed_idempotency_key?: string | null };
+    expect(withKey.echoed_idempotency_key).toBe("stream-key-1");
+
+    const withoutKey = (await client.streamFinalize(
+      HEX32("ee"),
+      "done",
+      HEX32("aa"),
+      1,
     )) as unknown as { echoed_idempotency_key?: string | null };
     expect(withoutKey.echoed_idempotency_key).toBeNull();
   });

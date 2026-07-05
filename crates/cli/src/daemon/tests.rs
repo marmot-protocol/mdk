@@ -1237,6 +1237,34 @@ fn timeline_messages_subscribe_is_routed_by_command_shape() {
 }
 
 #[test]
+fn notifications_subscribe_args_accept_only_notifications_subscribe() {
+    let cli = Cli {
+        home: None,
+        socket: None,
+        relay: None,
+        daemon_discovery_relays: Vec::new(),
+        daemon_default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+        account: None,
+        json: true,
+        command: crate::Command::Notifications {
+            command: crate::NotificationsCommand::Subscribe,
+        },
+    };
+
+    assert_eq!(notifications_subscribe_args(&cli), Ok(()));
+
+    let wrong = Cli {
+        command: crate::Command::Chats {
+            command: crate::ChatsCommand::Subscribe,
+        },
+        ..cli
+    };
+    assert!(notifications_subscribe_args(&wrong).is_err());
+}
+
+#[test]
 fn timeline_stream_plain_output_is_human_readable() {
     let ready = serde_json::json!({
         "type": "timeline_subscription_ready",
@@ -1245,6 +1273,31 @@ fn timeline_stream_plain_output_is_human_readable() {
     assert_eq!(
         stream_result_plain(&ready),
         "timeline subscription ready group=aa"
+    );
+
+    let notification_ready = serde_json::json!({
+        "type": "notification_subscription_ready"
+    });
+    assert_eq!(
+        stream_result_plain(&notification_ready),
+        "notification subscription ready"
+    );
+
+    let notification = serde_json::json!({
+        "type": "notification",
+        "notification": {
+            "trigger": "NewMessage",
+            "group_id_hex": "aa",
+            "preview_text": "hello",
+            "sender": {
+                "display_name": "Alice Example",
+                "account_id_hex": "bb"
+            }
+        }
+    });
+    assert_eq!(
+        stream_result_plain(&notification),
+        "notification NewMessage group=aa from=Alice Example: hello"
     );
 
     let page = serde_json::json!({

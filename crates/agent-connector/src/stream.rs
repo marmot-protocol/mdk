@@ -24,6 +24,41 @@ use crate::{
     STREAM_SESSION_IDLE_TIMEOUT, STREAM_SESSION_SWEEP_INTERVAL,
 };
 
+/// Current schema version for persisted `stream_finalize` request fingerprints.
+pub(crate) const STREAM_FINALIZE_FINGERPRINT_VERSION: u8 = 1;
+
+/// Server-derived fingerprint of a `stream_finalize` request. A retry can return
+/// cached message ids only when the stream id and sealed transcript exactly
+/// match the first successful finalize for the idempotency key.
+pub(crate) fn stream_finalize_fingerprint(
+    stream_id_hex: &str,
+    final_text: &str,
+    transcript_hash: &[u8; 32],
+    chunk_count: u64,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let preimage = serde_json::json!([
+        STREAM_FINALIZE_FINGERPRINT_VERSION,
+        stream_id_hex,
+        final_text,
+        hex::encode(transcript_hash),
+        chunk_count,
+    ]);
+    let bytes =
+        serde_json::to_vec(&preimage).expect("stream_finalize fingerprint preimage cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn stream_finalize_idempotency_key(key: &str) -> String {
+    format!("stream_finalize:{key}")
+}
+
+struct StreamFinalizeIdempotency {
+    key: String,
+    fingerprint: String,
+}
+
 impl AgentConnector {
     pub(crate) async fn stream_begin_response(
         &self,
@@ -197,9 +232,25 @@ impl AgentConnector {
         final_text: String,
         transcript_hash_hex: &str,
         chunk_count: u64,
+        idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
         let transcript_hash = transcript_hash_from_hex(transcript_hash_hex)?;
+        let fingerprint =
+            stream_finalize_fingerprint(&stream_id_hex, &final_text, &transcript_hash, chunk_count);
+        let idempotency_key = idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(stream_finalize_idempotency_key);
+        if let Some(key) = idempotency_key.as_deref()
+            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
+        {
+            return Ok(AgentControlResponse::StreamFinalized {
+                stream_id_hex,
+                message_ids_hex,
+            });
+        }
         // Clone (not remove) the session: the final text/hash/chunk-count
         // expectation is validated inside the compose task, atomically with
         // its teardown. On mismatch the session stays registered and the
@@ -227,6 +278,7 @@ impl AgentConnector {
                     final_text,
                     transcript_hash,
                     chunk_count,
+                    idempotency_key.map(|key| StreamFinalizeIdempotency { key, fingerprint }),
                 )
                 .await;
         }
@@ -295,6 +347,7 @@ impl AgentConnector {
             final_text,
             transcript_hash,
             chunk_count,
+            idempotency_key.map(|key| StreamFinalizeIdempotency { key, fingerprint }),
         )
         .await
     }
@@ -310,6 +363,7 @@ impl AgentConnector {
         final_text: String,
         transcript_hash: [u8; 32],
         chunk_count: u64,
+        idempotency: Option<StreamFinalizeIdempotency>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let (_payload, summary) = self
             .runtime
@@ -326,6 +380,13 @@ impl AgentConnector {
                 },
             )
             .await?;
+        if let Some(idempotency) = idempotency {
+            self.idempotency.record(
+                idempotency.key,
+                idempotency.fingerprint,
+                summary.message_ids.clone(),
+            );
+        }
         // Durable final published: it is now safe to drop the session.
         let _ = self.streams.remove_if_same(stream_id_hex, session);
         Ok(AgentControlResponse::StreamFinalized {

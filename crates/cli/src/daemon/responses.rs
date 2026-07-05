@@ -63,6 +63,20 @@ pub(crate) fn group_state_stream_response(
     DaemonStreamResponse::ok(result)
 }
 
+pub(crate) fn notification_stream_response(
+    notification: marmot_app::NotificationUpdate,
+) -> DaemonStreamResponse {
+    DaemonStreamResponse::ok(serde_json::json!({
+        "trigger": "Notification",
+        "type": "notification",
+        "account_id": notification.account_id_hex,
+        "account_ref": notification.account_ref,
+        "group_id": notification.group_id_hex,
+        "notification_key": notification.notification_key,
+        "notification": notification,
+    }))
+}
+
 pub(crate) fn cli_output_result(output: CliOutput) -> Result<serde_json::Value, String> {
     let value = serde_json::from_str::<serde_json::Value>(output.stdout.trim())
         .map_err(|err| format!("daemon command returned invalid JSON: {err}"))?;

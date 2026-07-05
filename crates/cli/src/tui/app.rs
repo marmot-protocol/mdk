@@ -292,10 +292,13 @@ impl TuiApp {
             }
             SlashCommand::ChatArchive => self.set_selected_chat_archived(true),
             SlashCommand::ChatUnarchive => self.set_selected_chat_archived(false),
+            SlashCommand::ChatMute(duration) => self.set_selected_chat_muted(duration),
+            SlashCommand::ChatUnmute => self.clear_selected_chat_muted(),
             SlashCommand::ChatArchived(include) => self.set_archived_chat_visibility(include),
             SlashCommand::MembersAdd(members) => self.add_selected_chat_members(members),
             SlashCommand::MembersRemove(members) => self.remove_selected_chat_members(members),
             SlashCommand::MembersList => self.show_selected_chat_members(),
+            SlashCommand::Image { file_path, caption } => self.send_image(file_path, caption),
             SlashCommand::KeysFetch(account) => {
                 let result = self.client.run_json(None, &["keys", "fetch", &account])?;
                 let bytes = result

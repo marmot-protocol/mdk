@@ -179,6 +179,14 @@ pub struct AccountNotificationSettings {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountChatNotificationSettings {
+    pub group_id_hex: String,
+    pub muted: bool,
+    pub muted_until_ms: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountPushRegistration {
     pub account_label: String,
     pub account_id_hex: String,
@@ -511,6 +519,7 @@ impl SqliteAccountStorage {
                 "account_group_app_components",
                 "group_push_tokens",
                 "group_push_token_tombstones",
+                "chat_notification_settings",
                 "encrypted_media_epoch_secrets",
                 "account_groups",
             ] {
@@ -789,6 +798,73 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         self.notification_settings(account_label, account_id_hex)
+    }
+
+    pub fn chat_notification_settings(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<AccountChatNotificationSettings> {
+        self.chat_notification_settings_at(group_id_hex, unix_now_ms())
+    }
+
+    pub fn chat_notification_settings_at(
+        &self,
+        group_id_hex: &str,
+        now_ms: i64,
+    ) -> StorageResult<AccountChatNotificationSettings> {
+        let row = self
+            .lock()?
+            .query_row(
+                "SELECT muted_until_ms, updated_at_ms
+                 FROM chat_notification_settings
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .storage()?;
+        // Missing rows are unmuted. `None` means "muted forever", so the
+        // absent-row default must be a timestamp that is already expired.
+        let (muted_until_ms, updated_at_ms) = row.unwrap_or((Some(0), 0));
+        Ok(AccountChatNotificationSettings {
+            group_id_hex: group_id_hex.to_owned(),
+            muted: muted_until_ms.is_none_or(|until| until > now_ms),
+            muted_until_ms,
+            updated_at_ms,
+        })
+    }
+
+    pub fn set_chat_muted(
+        &self,
+        group_id_hex: &str,
+        muted_until_ms: Option<i64>,
+    ) -> StorageResult<AccountChatNotificationSettings> {
+        self.lock()?
+            .execute(
+                "INSERT INTO chat_notification_settings (
+                    group_id_hex, muted_until_ms, updated_at_ms
+                 )
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    muted_until_ms = excluded.muted_until_ms,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![group_id_hex, muted_until_ms, unix_now_ms()],
+            )
+            .storage()?;
+        self.chat_notification_settings(group_id_hex)
+    }
+
+    pub fn clear_chat_muted(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<AccountChatNotificationSettings> {
+        self.lock()?
+            .execute(
+                "DELETE FROM chat_notification_settings WHERE group_id_hex = ?1",
+                params![group_id_hex],
+            )
+            .storage()?;
+        self.chat_notification_settings(group_id_hex)
     }
 
     pub fn push_registration(
