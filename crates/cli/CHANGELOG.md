@@ -61,6 +61,13 @@ versioning through the workspace version in the root `Cargo.toml`.
   to dial (300 s) and the TLS handshake; broker control frames are capped at 256 bytes pre-auth (previously a peer
   could demand a ~66 KB allocation per stream before validation); and broker frame reads apply one deadline across the
   whole frame, so a peer dribbling one byte per timeout window can no longer stretch pre-auth reads.
+- Group creation now enforces the same admin-policy invariants every commit already enforces. A group can no longer be
+  created listing an admin who is not one of the initial members (a "phantom" admin that would silently gain admin
+  rights the moment a matching member joined, with no admin-grant event anyone observes), and admin identities are
+  validated as real secp256k1 keys rather than accepted on length alone. The engine-owned profile and admin-policy
+  components are also non-negotiable: an invitee whose KeyPackage omits them is rejected up front instead of the group
+  being created with an empty admin set that permanently freezes all membership changes. Welcome-join applies the same
+  admin-leaf check before accepting a group.
 
 ### Fixed
 
