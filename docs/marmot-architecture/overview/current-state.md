@@ -169,9 +169,8 @@ first-party endpoint remains ops work; see [`../relay-observability.md`](../rela
 - **Safe Extensions framework support** — still gated on backend library support and migration design.
 - **`IdentityRemove` proposal type** — identified as the first likely Marmot-custom proposal, not specified or
   implemented.
-- **KeyPackage refresh/expiry policy** — still a higher-layer production scheduling concern. The transport adapter can
-  publish a Marmot kind `30443` KeyPackage event when supplied with the required MIP-00 metadata, but deriving that
-  metadata from a fresh engine KeyPackage is still follow-up work.
+- **KeyPackage refresh scheduling** — still a higher-layer production scheduling concern. The engine validates transported
+  KeyPackage lifetime validity and range policy; product/session orchestration owns proactive refresh cadence.
 
 ## See also
 

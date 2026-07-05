@@ -78,8 +78,8 @@ wn-agent connector
 
 4. Reuse cached KeyPackages on startup.
 
-   `marmot-app` treats kind `30443` KeyPackages as long-lived last-resort packages. Connector startup should publish or
-   repair the cached package. It should rotate only when explicitly asked or when the cached package is unusable.
+   `marmot-app` treats kind `30443` KeyPackages as cached last-resort packages. Connector startup should publish or
+   repair the cached package. It should rotate when explicitly asked or when validation rejects the cached package.
 
 5. Keep the local socket deployment explicit.
 

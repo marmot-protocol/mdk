@@ -30,7 +30,7 @@ use cgka_traits::transport::{
 use cgka_traits::types::{MemberId, MessageId};
 use openmls::prelude::{
     BasicCredential, Capabilities, CredentialWithKey, ExtensionType, Extensions,
-    KeyPackage as MlsKeyPackage, MlsMessageOut,
+    KeyPackage as MlsKeyPackage, Lifetime, MlsMessageOut,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
@@ -93,6 +93,47 @@ fn key_package_with_mismatched_account_identity_proof(
             None,
         ))
         .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
+fn key_package_with_account_identity_proof_and_lifetime(
+    identity_seed: &[u8],
+    lifetime: Lifetime,
+) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential = BasicCredential::new(credential_identity.clone());
+    let credential_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_extension = account_identity_proof_extension(
+        &credential_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        proof_signer(identity_seed).as_ref(),
+    )
+    .unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[
+                ExtensionType::Unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE),
+                ExtensionType::LastResort,
+            ]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
+        .key_package_lifetime(lifetime)
+        .mark_as_last_resort()
         .build(ciphersuite, &provider, &signer, credential_with_key)
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
@@ -532,6 +573,78 @@ async fn create_group_rejects_invitee_keypackage_with_mismatched_account_identit
         .unwrap_err();
 
     assert!(matches!(err, EngineError::InvalidAccountIdentityProof(_)));
+}
+
+#[tokio::test]
+async fn create_group_rejects_expired_invitee_keypackage() {
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expired_kp = key_package_with_account_identity_proof_and_lifetime(
+        b"bob-expired",
+        Lifetime::init(now.saturating_sub(7200), now.saturating_sub(3600)),
+    );
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "expired-invitee".into(),
+            description: "".into(),
+            members: vec![expired_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("create_group must reject an expired invitee KeyPackage");
+    assert_eq!(err.to_string(), "invalid KeyPackage lifetime");
+    assert!(
+        matches!(
+            &err,
+            EngineError::InvalidKeyPackageLifetime {
+                not_before: None,
+                not_after: None,
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_group_rejects_invitee_keypackage_with_excessive_lifetime_range() {
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let excessive_kp = key_package_with_account_identity_proof_and_lifetime(
+        b"bob-long-lived",
+        Lifetime::init(now.saturating_sub(60), now + 60 * 60 * 24 * 365),
+    );
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "long-lived-invitee".into(),
+            description: "".into(),
+            members: vec![excessive_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("create_group must reject an over-long invitee KeyPackage");
+    assert_eq!(err.to_string(), "invalid KeyPackage lifetime");
+    assert!(
+        matches!(
+            &err,
+            EngineError::InvalidKeyPackageLifetime {
+                not_before: Some(_),
+                not_after: Some(_),
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[tokio::test]

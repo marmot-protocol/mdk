@@ -54,5 +54,10 @@ pub fn group_id_from_hex(group_id_hex: &str) -> Result<GroupId, crate::errors::M
         hex::decode(group_id_hex).map_err(|err| crate::errors::MarmotKitError::InvalidHex {
             details: err.to_string(),
         })?;
+    if bytes.len() != 32 {
+        return Err(crate::errors::MarmotKitError::InvalidHex {
+            details: format!("expected 32-byte group id, got {} bytes", bytes.len()),
+        });
+    }
     Ok(GroupId::new(bytes))
 }

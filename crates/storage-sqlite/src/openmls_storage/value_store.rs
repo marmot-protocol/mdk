@@ -1,4 +1,4 @@
-use super::labels::build_key;
+use super::labels::{build_key, build_key_legacy};
 use super::{SqliteOpenMlsStorage, SqliteOpenMlsStorageError};
 use crate::connection::retry_on_busy;
 use openmls_traits::storage::{CURRENT_VERSION, Entity, Key};
@@ -13,24 +13,38 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: Vec<u8>,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key);
-        // Single autocommit statement: retry the whole write on transient lock
-        // contention (issue #484).
-        retry_on_busy(|| {
-            self.lock()?.execute(
-                "INSERT OR REPLACE INTO openmls_values
-                (provider_version, label, storage_key, group_key, value)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    CURRENT_VERSION,
-                    label,
-                    storage_key,
-                    group_key.as_deref(),
-                    value
-                ],
+        let storage_key = build_key(label, key.clone());
+        let legacy_storage_key = build_key_legacy(label, key);
+        if self.connection.is_current_thread_transaction_owner() {
+            let conn = self.lock()?;
+            write_value_on_connection(
+                &conn,
+                label,
+                storage_key.as_slice(),
+                legacy_storage_key.as_slice(),
+                group_key.as_deref(),
+                value.as_slice(),
             )?;
             Ok(())
-        })
+        } else {
+            // Own a fresh transaction so the new row and legacy cleanup commit
+            // together; retry the whole idempotent write on transient lock
+            // contention (issue #484).
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction()?;
+                write_value_on_connection(
+                    &tx,
+                    label,
+                    storage_key.as_slice(),
+                    legacy_storage_key.as_slice(),
+                    group_key.as_deref(),
+                    value.as_slice(),
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+        }
     }
 
     pub(in crate::openmls_storage) fn write_entity<T: Entity<CURRENT_VERSION>>(
@@ -63,13 +77,21 @@ impl SqliteOpenMlsStorage {
         group_key: Option<Vec<u8>>,
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key);
+        let storage_key = build_key(label, key.clone());
+        let legacy_storage_key = build_key_legacy(label, key);
         if self.connection.is_current_thread_transaction_owner() {
             // Inside a broader engine-owned OpenMLS transaction: execute directly
             // and let the owning transaction handle retry/rollback. Retrying a
             // single statement inside someone else's transaction would corrupt it.
             let conn = self.lock()?;
-            append_entity_on_connection(&conn, label, storage_key, group_key.as_deref(), value)?;
+            append_entity_on_connection(
+                &conn,
+                label,
+                storage_key,
+                legacy_storage_key,
+                group_key.as_deref(),
+                value,
+            )?;
             Ok(())
         } else {
             // Own a fresh transaction: the whole read-modify-write is idempotent,
@@ -81,6 +103,7 @@ impl SqliteOpenMlsStorage {
                     &tx,
                     label,
                     storage_key.clone(),
+                    legacy_storage_key.clone(),
                     group_key.as_deref(),
                     value,
                 )?;
@@ -98,7 +121,8 @@ impl SqliteOpenMlsStorage {
         value: &T,
     ) -> Result<(), SqliteOpenMlsStorageError> {
         let encoded = serde_json::to_vec(value)?;
-        let storage_key = build_key(label, key);
+        let storage_key = build_key(label, key.clone());
+        let legacy_storage_key = build_key_legacy(label, key);
         if self.connection.is_current_thread_transaction_owner() {
             // Inside a broader engine-owned OpenMLS transaction: see append_entity.
             let conn = self.lock()?;
@@ -106,6 +130,7 @@ impl SqliteOpenMlsStorage {
                 &conn,
                 label,
                 storage_key,
+                legacy_storage_key,
                 group_key.as_deref(),
                 encoded.as_slice(),
             )?;
@@ -118,6 +143,7 @@ impl SqliteOpenMlsStorage {
                     &tx,
                     label,
                     storage_key.clone(),
+                    legacy_storage_key.clone(),
                     group_key.as_deref(),
                     encoded.as_slice(),
                 )?;
@@ -133,15 +159,12 @@ impl SqliteOpenMlsStorage {
         key: &[u8],
     ) -> Result<Option<Vec<Vec<u8>>>, SqliteOpenMlsStorageError> {
         let storage_key = build_key(label, key.to_vec());
-        let value: Option<Vec<u8>> = self
-            .lock()?
-            .query_row(
-                "SELECT value FROM openmls_values
-                 WHERE provider_version = ?1 AND storage_key = ?2",
-                params![CURRENT_VERSION, storage_key],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let legacy_storage_key = build_key_legacy(label, key.to_vec());
+        let conn = self.lock()?;
+        let value = match read_value_on_connection(&conn, &storage_key)? {
+            Some(value) => Some(value),
+            None => read_value_on_connection(&conn, &legacy_storage_key)?,
+        };
         value
             .map(|value| serde_json::from_slice(&value).map_err(Into::into))
             .transpose()
@@ -160,16 +183,13 @@ impl SqliteOpenMlsStorage {
         label: &[u8],
         key: Vec<u8>,
     ) -> Result<Option<T>, SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key);
-        let value: Option<Vec<u8>> = self
-            .lock()?
-            .query_row(
-                "SELECT value FROM openmls_values
-                 WHERE provider_version = ?1 AND storage_key = ?2",
-                params![CURRENT_VERSION, storage_key],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let storage_key = build_key(label, key.clone());
+        let legacy_storage_key = build_key_legacy(label, key);
+        let conn = self.lock()?;
+        let value = match read_value_on_connection(&conn, &storage_key)? {
+            Some(value) => Some(value),
+            None => read_value_on_connection(&conn, &legacy_storage_key)?,
+        };
         value
             .map(|value| serde_json::from_slice(&value).map_err(Into::into))
             .transpose()
@@ -203,17 +223,26 @@ impl SqliteOpenMlsStorage {
         label: &[u8],
         key: Vec<u8>,
     ) -> Result<(), SqliteOpenMlsStorageError> {
-        let storage_key = build_key(label, key);
-        // Single autocommit statement: retry the whole delete on transient lock
-        // contention (issue #484).
-        retry_on_busy(|| {
-            self.lock()?.execute(
-                "DELETE FROM openmls_values
-             WHERE provider_version = ?1 AND storage_key = ?2",
-                params![CURRENT_VERSION, storage_key],
-            )?;
+        let storage_key = build_key(label, key.clone());
+        let legacy_storage_key = build_key_legacy(label, key);
+        if self.connection.is_current_thread_transaction_owner() {
+            let conn = self.lock()?;
+            delete_value_on_connection(&conn, storage_key.as_slice())?;
+            delete_value_on_connection(&conn, legacy_storage_key.as_slice())?;
             Ok(())
-        })
+        } else {
+            // Own a fresh transaction so the new-format row and legacy row are
+            // removed atomically; retry the whole idempotent delete on transient
+            // lock contention (issue #484).
+            retry_on_busy(|| {
+                let mut conn = self.lock()?;
+                let tx = conn.transaction()?;
+                delete_value_on_connection(&tx, storage_key.as_slice())?;
+                delete_value_on_connection(&tx, legacy_storage_key.as_slice())?;
+                tx.commit()?;
+                Ok(())
+            })
+        }
     }
 
     pub(in crate::openmls_storage) fn delete_group_value<GroupId: Key<CURRENT_VERSION>>(
@@ -256,6 +285,37 @@ impl SqliteOpenMlsStorage {
     }
 }
 
+fn read_value_on_connection(
+    conn: &rusqlite::Connection,
+    storage_key: &[u8],
+) -> Result<Option<Vec<u8>>, SqliteOpenMlsStorageError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM openmls_values
+             WHERE provider_version = ?1 AND storage_key = ?2",
+            params![CURRENT_VERSION, storage_key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn write_value_on_connection(
+    conn: &rusqlite::Connection,
+    label: &[u8],
+    storage_key: &[u8],
+    legacy_storage_key: &[u8],
+    group_key: Option<&[u8]>,
+    value: &[u8],
+) -> Result<(), SqliteOpenMlsStorageError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO openmls_values
+            (provider_version, label, storage_key, group_key, value)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![CURRENT_VERSION, label, storage_key, group_key, value],
+    )?;
+    delete_value_on_connection(conn, legacy_storage_key)
+}
+
 fn list_values_on_connection(
     conn: &rusqlite::Connection,
     storage_key: &[u8],
@@ -271,6 +331,18 @@ fn list_values_on_connection(
     .transpose()
     .map(|value| value.unwrap_or_default())
     .map_err(Into::into)
+}
+
+fn list_values_with_legacy_fallback_on_connection(
+    conn: &rusqlite::Connection,
+    storage_key: &[u8],
+    legacy_storage_key: &[u8],
+) -> Result<Vec<Vec<u8>>, SqliteOpenMlsStorageError> {
+    if read_value_on_connection(conn, storage_key)?.is_some() {
+        list_values_on_connection(conn, storage_key)
+    } else {
+        list_values_on_connection(conn, legacy_storage_key)
+    }
 }
 
 fn write_list_on_connection(
@@ -299,26 +371,50 @@ fn append_entity_on_connection<T: Entity<CURRENT_VERSION>>(
     conn: &rusqlite::Connection,
     label: &[u8],
     storage_key: Vec<u8>,
+    legacy_storage_key: Vec<u8>,
     group_key: Option<&[u8]>,
     value: &T,
 ) -> Result<(), SqliteOpenMlsStorageError> {
-    let mut list = list_values_on_connection(conn, storage_key.as_slice())?;
+    let mut list = list_values_with_legacy_fallback_on_connection(
+        conn,
+        storage_key.as_slice(),
+        legacy_storage_key.as_slice(),
+    )?;
     list.push(serde_json::to_vec(value)?);
-    write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)
+    write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)?;
+    delete_value_on_connection(conn, legacy_storage_key.as_slice())
 }
 
 fn remove_entity_on_connection(
     conn: &rusqlite::Connection,
     label: &[u8],
     storage_key: Vec<u8>,
+    legacy_storage_key: Vec<u8>,
     group_key: Option<&[u8]>,
     encoded: &[u8],
 ) -> Result<(), SqliteOpenMlsStorageError> {
-    let mut list = list_values_on_connection(conn, storage_key.as_slice())?;
+    let mut list = list_values_with_legacy_fallback_on_connection(
+        conn,
+        storage_key.as_slice(),
+        legacy_storage_key.as_slice(),
+    )?;
     if let Some(pos) = list.iter().position(|stored| stored == encoded) {
         list.remove(pos);
     }
-    write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)
+    write_list_on_connection(conn, label, storage_key.as_slice(), group_key, &list)?;
+    delete_value_on_connection(conn, legacy_storage_key.as_slice())
+}
+
+fn delete_value_on_connection(
+    conn: &rusqlite::Connection,
+    storage_key: &[u8],
+) -> Result<(), SqliteOpenMlsStorageError> {
+    conn.execute(
+        "DELETE FROM openmls_values
+         WHERE provider_version = ?1 AND storage_key = ?2",
+        params![CURRENT_VERSION, storage_key],
+    )?;
+    Ok(())
 }
 
 fn delete_group_labels_on_connection(
@@ -338,6 +434,142 @@ fn delete_group_labels_on_connection(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::SqliteAccountStorage;
+    use openmls_traits::storage::Entity;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct TestEntity(u8);
+
+    impl Entity<CURRENT_VERSION> for TestEntity {}
+
+    #[test]
+    fn value_storage_key_length_delimits_label_and_key() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+
+        // These two rows collide under the legacy concatenation:
+        // label("A") + key("BC") == label("AB") + key("C").
+        mls.write_value(
+            b"A",
+            b"BC".to_vec(),
+            None,
+            serde_json::to_vec(&1u8).unwrap(),
+        )
+        .unwrap();
+        mls.write_value(
+            b"AB",
+            b"C".to_vec(),
+            None,
+            serde_json::to_vec(&2u8).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(mls.read_json::<u8>(b"A", b"BC".to_vec()).unwrap(), Some(1));
+        assert_eq!(mls.read_json::<u8>(b"AB", b"C".to_vec()).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn value_storage_reads_and_deletes_legacy_concatenated_key() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let label = b"LegacyValue";
+        let key = b"row".to_vec();
+        let legacy_key = build_key_legacy(label, key.clone());
+
+        mls.lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO openmls_values
+                    (provider_version, label, storage_key, group_key, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    CURRENT_VERSION,
+                    label,
+                    legacy_key.clone(),
+                    Option::<&[u8]>::None,
+                    serde_json::to_vec(&7u8).unwrap()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(mls.read_json::<u8>(label, key.clone()).unwrap(), Some(7));
+
+        mls.write_value(label, key.clone(), None, serde_json::to_vec(&8u8).unwrap())
+            .unwrap();
+        let legacy_count: u64 = mls
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM openmls_values
+                 WHERE provider_version = ?1 AND storage_key = ?2",
+                params![CURRENT_VERSION, legacy_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0, "new write should migrate legacy row away");
+        assert_eq!(
+            mls.read_json::<u8>(label, key.clone()).unwrap(),
+            Some(8),
+            "new length-delimited row must shadow the legacy row"
+        );
+
+        mls.delete_value(label, key.clone()).unwrap();
+        assert_eq!(mls.read_json::<u8>(label, key).unwrap(), None);
+    }
+
+    #[test]
+    fn list_storage_migrates_legacy_concatenated_key_on_mutation() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls = &store.openmls;
+        let label = b"LegacyList";
+        let key = b"list".to_vec();
+        let legacy_key = build_key_legacy(label, key.clone());
+        let legacy_list = vec![serde_json::to_vec(&TestEntity(1)).unwrap()];
+
+        mls.lock()
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO openmls_values
+                    (provider_version, label, storage_key, group_key, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    CURRENT_VERSION,
+                    label,
+                    legacy_key.clone(),
+                    Option::<&[u8]>::None,
+                    serde_json::to_vec(&legacy_list).unwrap()
+                ],
+            )
+            .unwrap();
+
+        mls.append_entity(label, key.clone(), None, &TestEntity(2))
+            .unwrap();
+        assert_eq!(
+            mls.read_list::<TestEntity>(label, key.clone()).unwrap(),
+            vec![TestEntity(1), TestEntity(2)]
+        );
+        let legacy_count: u64 = mls
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM openmls_values
+                 WHERE provider_version = ?1 AND storage_key = ?2",
+                params![CURRENT_VERSION, legacy_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0, "legacy row should be migrated away");
+
+        mls.remove_entity(label, key.clone(), None, &TestEntity(1))
+            .unwrap();
+        assert_eq!(
+            mls.read_list::<TestEntity>(label, key).unwrap(),
+            vec![TestEntity(2)]
+        );
+    }
+
     #[test]
     fn list_mutations_keep_read_modify_write_under_one_transaction() {
         let source = include_str!("value_store.rs");

@@ -68,6 +68,17 @@ pub enum EngineError {
     #[error("invalid account identity proof: {0}")]
     InvalidAccountIdentityProof(String),
 
+    /// A transported KeyPackage is missing its MLS lifetime, is not currently
+    /// valid, or exceeds the accepted OpenMLS lifetime range. The raw
+    /// timestamps stay on the typed variant for callers that need them, but the
+    /// display string intentionally omits them so audit details stay
+    /// privacy-safe.
+    #[error("invalid KeyPackage lifetime")]
+    InvalidKeyPackageLifetime {
+        not_before: Option<u64>,
+        not_after: Option<u64>,
+    },
+
     /// Epoch fork detected that the current recovery manager could not
     /// resolve, usually because no pre-commit snapshot was available.
     /// Recoverable same-epoch commit races roll back and replay internally.

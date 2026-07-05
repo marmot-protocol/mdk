@@ -26,8 +26,8 @@ published to (and fetched from) the account's NIP-65 relays; there is no dedicat
 can check whether those lists are already present before writing local account state. The same status API can fetch
 those relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for deterministic
 CLI/TUI development. KeyPackage publication keeps a stable replaceable d-tag for the account and tracks the decoded
-KeyPackage ref separately; normal publish reuses the cached last-resort package, while explicit rotate creates a new
-package under the same slot.
+KeyPackage ref separately; normal publish reuses the cached valid last-resort package, while explicit rotate or lifetime
+policy rejection creates a new package under the same slot.
 
 The user directory is keyed by Nostr pubkey. Account setup and the daemon can refresh a local account's contact-list
 event, pre-cache direct follows, and cache profile metadata for those likely contacts. Runtime startup builds chunked

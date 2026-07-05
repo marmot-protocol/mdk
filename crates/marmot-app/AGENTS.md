@@ -55,8 +55,8 @@ App runtime bridge for the first real Marmot app surfaces.
 - Keep directory search bounded over cached follow edges. Do not add web-of-trust scoring unless that is reopened as a
   deliberate product decision.
 - Keep runtime directory subscriptions chunked and privacy-safe. Subscription identifiers must not embed raw pubkeys.
-- Treat Marmot kind `30443` KeyPackages as long-lived last-resort packages. Normal publish should reuse the cached
-  package and stable replaceable d-tag; only explicit rotate/manual repair should create a new package ref.
+- Treat Marmot kind `30443` KeyPackages as cached last-resort packages. Normal publish should reuse the cached valid
+  package and stable replaceable d-tag; expired or policy-invalid packages rotate to a fresh package ref.
 - Incoming welcomes may auto-join MLS state, but app projections must preserve local confirmation state. Pending invites
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
 - Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
