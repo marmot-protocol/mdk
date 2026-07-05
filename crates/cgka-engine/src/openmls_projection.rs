@@ -432,6 +432,22 @@ pub fn project_mls_message(
     })
 }
 
+/// Fail-open decode of a stored payload into its openmls-wire
+/// [`TransportMessage`] and MLS [`OpenMlsMessageProjection`]. Returns `None`
+/// when the row cannot be decoded, is not an openmls-wire payload, or does not
+/// project — the three-step `decode -> as_openmls_wire -> project_mls_message`
+/// chain used by the send-gate (mdk#752 review). Callers that must treat such a
+/// row as an error (e.g. a `Processed` row during a convergence apply) keep
+/// their own error-propagating chain rather than call this.
+pub(crate) fn decode_openmls_wire_projection(
+    payload: &[u8],
+) -> Option<(TransportMessage, OpenMlsMessageProjection)> {
+    let stored = StoredMessagePayload::decode(payload).ok()?;
+    let message = stored.as_openmls_wire()?.clone();
+    let projection = project_mls_message(&message.payload).ok()?;
+    Some((message, projection))
+}
+
 pub fn replay_openmls_messages<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
