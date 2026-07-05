@@ -41,7 +41,9 @@ pub enum MarkdownBlockFfi {
     BlockQuote {
         blocks: Vec<MarkdownBlockFfi>,
     },
-    List {
+    /// Named `ListBlock` (not `List`) to match the sibling `*Block` variants and
+    /// to avoid shadowing `kotlin.collections.List` in generated Kotlin bindings.
+    ListBlock {
         kind: MarkdownListKindFfi,
         tight: bool,
         items: Vec<MarkdownListItemFfi>,
@@ -243,7 +245,7 @@ fn markdown_block_from_md(value: &MdBlock, depth: usize) -> MarkdownBlockFfi {
                 .map(|block| markdown_block_from_md(block, depth + 1))
                 .collect(),
         },
-        MdBlock::List { kind, tight, items } => MarkdownBlockFfi::List {
+        MdBlock::List { kind, tight, items } => MarkdownBlockFfi::ListBlock {
             kind: kind.into(),
             tight: *tight,
             items: items
@@ -545,6 +547,19 @@ mod tests {
     }
 
     #[test]
+    fn bridges_bullet_list() {
+        let document = parse_markdown_document("- a\n- b");
+        assert!(matches!(
+            document.blocks[0],
+            MarkdownBlockFfi::ListBlock {
+                kind: MarkdownListKindFfi::Bullet { ref marker },
+                ref items,
+                ..
+            } if marker == "-" && items.len() == 2
+        ));
+    }
+
+    #[test]
     fn bridges_pathological_nesting_without_unbounded_recursion() {
         let document = parse_markdown_document(&">".repeat(2_000));
         assert!(max_block_depth(&document.blocks) <= MAX_FFI_MARKDOWN_DEPTH);
@@ -557,7 +572,7 @@ mod tests {
     fn max_single_block_depth(block: &MarkdownBlockFfi) -> usize {
         match block {
             MarkdownBlockFfi::BlockQuote { blocks } => 1 + max_block_depth(blocks),
-            MarkdownBlockFfi::List { items, .. } => {
+            MarkdownBlockFfi::ListBlock { items, .. } => {
                 1 + items
                     .iter()
                     .map(|item| max_block_depth(&item.blocks))
