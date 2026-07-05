@@ -42,9 +42,14 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     let crypto = RustCrypto::default();
     let key_package = validate_key_package(kp_in, &crypto)?;
     let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+    // Validate the account-identity proof against the KeyPackage's OWN
+    // ciphersuite, matching `parse_key_package` (mdk#747). `DEFAULT_CIPHERSUITE`
+    // is correct only while the engine is single-ciphersuite; deriving it from
+    // the KeyPackage keeps these directory helpers consistent with the invite
+    // path the instant a second ciphersuite is supported.
     crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
-        crate::DEFAULT_CIPHERSUITE,
+        key_package.ciphersuite(),
     )?;
     let key_package_ref = key_package
         .hash_ref(&crypto)
@@ -71,9 +76,11 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
     let crypto = RustCrypto::default();
     let key_package = validate_key_package(kp_in, &crypto)?;
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
+    // See `key_package_metadata`: validate against the KeyPackage's own
+    // ciphersuite, not `DEFAULT_CIPHERSUITE` (mdk#747).
     crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
-        crate::DEFAULT_CIPHERSUITE,
+        key_package.ciphersuite(),
     )?;
     Ok(key_package.last_resort())
 }

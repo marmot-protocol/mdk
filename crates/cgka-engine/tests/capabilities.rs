@@ -225,12 +225,17 @@ fn build_engine_on_storage_with_registry_and_components(
 }
 
 #[tokio::test]
-async fn group_creation_negotiates_app_component_intersection() {
-    let mut alice = build_engine_with_components(
-        b"alice",
-        [GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID],
-    );
-    let mut bob = build_engine_with_components(b"bob", [GROUP_PROFILE_COMPONENT_ID]);
+async fn group_creation_retains_non_negotiable_mandatory_components() {
+    // Engine-owned components (profile + admin policy) are non-negotiable at
+    // creation (mdk#746). Even when an invitee advertises exactly the mandatory
+    // set — a subset of the creator's broader support — the created group still
+    // requires both; they can no longer be intersected out (which would leave an
+    // empty admin set and frozen membership). A NON-mandatory component the
+    // creator merely supports but does not require is not forced in.
+    let mut alice_supported = default_group_components();
+    alice_supported.insert(TEST_APP_COMPONENT);
+    let mut alice = build_engine_with_components(b"alice", alice_supported);
+    let mut bob = build_engine_with_components(b"bob", default_group_components());
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
     let constructable = alice
@@ -242,7 +247,7 @@ async fn group_creation_negotiates_app_component_intersection() {
             .contains(GROUP_PROFILE_COMPONENT_ID)
     );
     assert!(
-        !constructable
+        constructable
             .app_components
             .contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
     );
@@ -267,10 +272,16 @@ async fn group_creation_negotiates_app_component_intersection() {
             .contains(GROUP_PROFILE_COMPONENT_ID)
     );
     assert!(
-        !group
+        group
             .required_capabilities
             .app_components
             .contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+    );
+    assert!(
+        !group
+            .required_capabilities
+            .app_components
+            .contains(TEST_APP_COMPONENT)
     );
 }
 

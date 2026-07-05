@@ -10,7 +10,7 @@ use cgka_engine::account_identity_proof::{
     ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE, account_identity_proof_extension,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_engine::key_package::is_last_resort_key_package;
+use cgka_engine::key_package::{is_last_resort_key_package, key_package_metadata};
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
@@ -401,6 +401,97 @@ async fn create_group_with_three_members_happy_path() {
             }
         }
     }
+}
+
+/// mdk#737: an admin key that corresponds to no initial member (creator or
+/// invitee) is a phantom/pre-provisioned admin — it would become active the
+/// instant a matching leaf appears, with no `AdminAdded` commit other members
+/// observe. Group creation must reject it, mirroring the admin-leaf-coupling
+/// check every commit seam enforces.
+#[tokio::test]
+async fn create_group_rejects_uninvited_initial_admin() {
+    let mut alice = build_client_with_components(b"alice", default_group_components());
+    let mut bob = build_client_with_components(b"bob", default_group_components());
+    let mallory = build_client_with_components(b"mallory", default_group_components());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "phantom-admin".into(),
+            description: "".into(),
+            members: vec![bob_kp], // bob invited; mallory NOT a member
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![mallory.self_id()],
+        })
+        .await
+        .expect_err("an uninvited initial admin must be rejected");
+    assert!(
+        matches!(err, EngineError::Other(ref msg) if msg.contains("no member leaf")),
+        "expected admin-leaf-coupling rejection, got {err:?}"
+    );
+}
+
+/// mdk#737 positive control: a co-admin who IS an invited member is accepted.
+#[tokio::test]
+async fn create_group_accepts_invited_initial_admin() {
+    let mut alice = build_client_with_components(b"alice", default_group_components());
+    let mut bob = build_client_with_components(b"bob", default_group_components());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, _result) = alice
+        .create_group(CreateGroupRequest {
+            name: "co-admin".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .expect("an invited co-admin is accepted");
+    assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+}
+
+/// mdk#746: an invitee whose KeyPackage omits an engine-owned mandatory
+/// component (here admin policy) is rejected at creation, instead of the
+/// component being negotiated out — which would create a group with an empty
+/// admin set and permanently frozen membership.
+#[tokio::test]
+async fn create_group_rejects_invitee_missing_mandatory_component() {
+    let mut alice = build_client_with_components(b"alice", default_group_components());
+    // Bob advertises only the profile component, NOT admin policy.
+    let mut bob = build_client_with_components(b"bob", [GROUP_PROFILE_COMPONENT_ID]);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "missing-mandatory".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("an invitee missing a mandatory component must be rejected");
+    assert!(
+        matches!(err, EngineError::MissingRequiredCapabilities { ref required, .. }
+            if required.app_components.contains(GROUP_ADMIN_POLICY_COMPONENT_ID)),
+        "expected MissingRequiredCapabilities naming admin policy, got {err:?}"
+    );
+}
+
+/// mdk#747: the transport-directory KeyPackage helpers validate the account
+/// identity proof against the KeyPackage's OWN ciphersuite (matching
+/// `parse_key_package`), so a validly-proofed KeyPackage passes both.
+#[tokio::test]
+async fn directory_key_package_helpers_validate_against_own_ciphersuite() {
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let kp = alice.fresh_key_package().await.unwrap();
+    let meta = key_package_metadata(&kp).expect("key_package_metadata validates the proof");
+    assert!(!meta.credential_identity_hex.is_empty());
+    assert!(is_last_resort_key_package(&kp).expect("last-resort check validates the proof"));
 }
 
 #[tokio::test]
@@ -873,12 +964,20 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
     // advertising a custom app component; alice requires it; carol then rejoins
     // with an engine that does not support that component.
     const CUSTOM_COMPONENT: u16 = 0xF300;
-    let mut alice = build_client_with_components(b"alice", [CUSTOM_COMPONENT]);
+    // Advertise the engine-owned mandatory components (profile + admin policy)
+    // alongside the custom one: they are non-negotiable at creation (mdk#746),
+    // so an invitee KP that omitted them would be rejected at create time before
+    // this test could reach the join-capability path it exercises.
+    let components: Vec<u16> = default_group_components()
+        .into_iter()
+        .chain([CUSTOM_COMPONENT])
+        .collect();
+    let mut alice = build_client_with_components(b"alice", components.clone());
     let carol_storage = SqliteAccountStorage::in_memory().unwrap();
     let capable_carol = EngineBuilder::new(carol_storage.clone())
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
-        .supported_app_components([CUSTOM_COMPONENT])
+        .supported_app_components(components)
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build capable carol");

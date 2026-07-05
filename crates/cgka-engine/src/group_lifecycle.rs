@@ -101,6 +101,9 @@ impl<S: StorageProvider> Engine<S> {
         let mut parsed_kps = Vec::with_capacity(req.members.len());
         let mut negotiated_components =
             desired_components.intersection(&self.supported_app_components);
+        // Engine-owned components (profile + admin policy) are NON-NEGOTIABLE
+        // (mdk#746).
+        let mandatory_components = AppComponentSet::from(default_group_components());
         for kp in &req.members {
             let parsed = self.parse_key_package(kp)?;
             let had = capabilities_of_key_package(&parsed);
@@ -118,10 +121,37 @@ impl<S: StorageProvider> Engine<S> {
                     had: Box::new(had),
                 });
             }
+            // The per-invitee intersection below would otherwise let an invitee
+            // whose leaf omits the profile/admin-policy component negotiate it
+            // out. A group created without admin-policy bytes has an empty admin
+            // set and frozen membership — every admin-gated operation (and every
+            // later join) fails closed forever. Reject such an invitee up front,
+            // exactly like a missing required capability; legitimate clients
+            // always advertise these (mdk#746).
+            let mandatory_missing = mandatory_components.missing_from(&had.app_components);
+            if !mandatory_missing.is_empty() {
+                return Err(EngineError::MissingRequiredCapabilities {
+                    required: Box::new(GroupCapabilities {
+                        app_components: mandatory_components.clone(),
+                        ..GroupCapabilities::default()
+                    }),
+                    had: Box::new(had),
+                });
+            }
             negotiated_components = negotiated_components.intersection(&had.app_components);
             parsed_kps.push(parsed);
         }
         required_caps.app_components = negotiated_components;
+        // Belt-and-suspenders (mdk#746): the engine-owned components survived
+        // negotiation. Guaranteed by the per-invitee guard above plus the
+        // engine's own support; the assert catches a future refactor of the
+        // negotiation flow that reintroduces the drop.
+        debug_assert!(
+            mandatory_components
+                .missing_from(&required_caps.app_components)
+                .is_empty(),
+            "engine-owned components must not be negotiated out of a created group"
+        );
         let required_caps_ext = extension_from_group_capabilities(&required_caps);
 
         // 2. Build the group config with leaf capabilities, MLS
@@ -137,11 +167,16 @@ impl<S: StorageProvider> Engine<S> {
             crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         let mut admin_set: Vec<[u8; 32]> = vec![creator_pubkey];
         for extra in &req.initial_admins {
+            // Validate each co-admin as a real x-only secp256k1 account key, not
+            // just a 32-byte blob (mdk#737); `admin_pubkey_from_member_id` only
+            // length-checks.
+            crate::identity::validate_credential_identity(extra.as_slice())?;
             let pk = crate::app_components::admin_pubkey_from_member_id(extra)?;
             if !admin_set.contains(&pk) {
                 admin_set.push(pk);
             }
         }
+        let admin_set_for_coupling = admin_set.clone();
 
         let app_data_ext = crate::app_components::app_data_dictionary_extension_for_group(
             &required_caps.app_components,
@@ -179,6 +214,30 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
+
+        // Admin-leaf coupling at creation (mdk#737): every admin key MUST
+        // correspond to a member of the initial group (creator + invitees).
+        // `req.initial_admins` is independent of `req.members`, so without this
+        // a group could be created with a phantom/pre-provisioned admin that
+        // becomes active the instant a matching leaf appears — with no
+        // `AdminAdded` commit other members observe, bypassing the audit trail
+        // every commit seam enforces. Runs the SAME coupling validator those
+        // seams use, resolved against the PROJECTED initial member accounts (no
+        // post-merge MlsGroup exists yet). Placed before `add_members` so an
+        // invalid admin set produces no membership/commit side effects.
+        let mut projected_member_accounts = std::collections::BTreeSet::new();
+        projected_member_accounts.insert(creator_pubkey);
+        for parsed in &parsed_kps {
+            let member_id = member_id_of_key_package(parsed)?;
+            projected_member_accounts.insert(crate::app_components::admin_pubkey_from_member_id(
+                &member_id,
+            )?);
+        }
+        crate::app_components::reject_admins_without_member_accounts(
+            &admin_set_for_coupling,
+            &projected_member_accounts,
+            &group_id,
+        )?;
 
         // 3. Add members to produce a staged commit + welcome (skipped for
         //    solo creation). Publish-before-apply keeps the staged commit
@@ -530,6 +589,18 @@ impl<S: StorageProvider> Engine<S> {
         // signer leaf's MLS-authenticated account identity to be authorized for
         // admin-gated member additions (joining.md, admin-policy-v1.md).
         crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+
+        // 5e. Admin-leaf coupling on the joined group (mdk#737): reject a
+        // Welcome whose admin set lists an admin with no member leaf. The
+        // Welcome embeds the full ratchet tree, so every current member's leaf
+        // is present here — a phantom/pre-provisioned admin is detectable and
+        // must be rejected, mirroring the check every commit seam enforces so a
+        // joiner never silently accepts a group with a pre-provisioned admin.
+        crate::app_components::reject_admins_without_member_leaf(
+            &mls_group,
+            &group_id,
+            &crate::app_components::admins_of_group(&mls_group)?,
+        )?;
 
         // 6. Persist Marmot group record from signed group-context data.
         let mut group_record = Group {
