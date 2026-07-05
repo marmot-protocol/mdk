@@ -142,10 +142,12 @@ impl<S: StorageProvider> Engine<S> {
             parsed_kps.push(parsed);
         }
         required_caps.app_components = negotiated_components;
-        // Belt-and-suspenders (mdk#746): the engine-owned components survived
-        // negotiation. Guaranteed by the per-invitee guard above plus the
-        // engine's own support; the assert catches a future refactor of the
-        // negotiation flow that reintroduces the drop.
+        // Invariant check (mdk#746): the engine-owned components survived
+        // negotiation. The per-invitee guard above is the real runtime gate (it
+        // rejects any invitee lacking them in every build); this assertion just
+        // documents the post-condition and, because `cargo test` builds with
+        // debug assertions on, trips CI if a future negotiation refactor
+        // reintroduces the drop despite the guard.
         debug_assert!(
             mandatory_components
                 .missing_from(&required_caps.app_components)
@@ -163,6 +165,11 @@ impl<S: StorageProvider> Engine<S> {
         ])
         .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
 
+        // Validate the creator (implicit admin) on the SAME x-only secp256k1
+        // basis as the co-admins below (mdk#737 review), so no admin-set entry
+        // is accepted on length alone regardless of how the engine identity was
+        // constructed.
+        crate::identity::validate_credential_identity(self.identity.self_id().as_slice())?;
         let creator_pubkey =
             crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         let mut admin_set: Vec<[u8; 32]> = vec![creator_pubkey];

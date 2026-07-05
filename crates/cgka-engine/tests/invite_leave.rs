@@ -1648,6 +1648,79 @@ async fn join_accepts_welcome_from_fork_with_self_promoted_admin() {
 }
 
 #[tokio::test]
+async fn join_rejects_welcome_whose_admin_set_lists_a_phantom_admin() {
+    // mdk#737: welcome-join runs the admin-leaf-coupling check (step 5e). A fork
+    // whose rewritten admin policy lists a pubkey with NO ratchet-tree leaf — a
+    // phantom/pre-provisioned admin — is rejected at join, before any group
+    // record is persisted. This is distinct from the self-promotion case in
+    // `join_accepts_welcome_from_fork_with_self_promoted_admin`, where the forger
+    // holds a real leaf (coupling satisfied) and the residual gap is a documented
+    // Welcome-bootstrap-trust limit, not a coupling violation.
+    let mut alice = build_client(b"alice");
+    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let mut carol = build_client(b"carol");
+    let mut david = build_client(b"david");
+    let mallory = build_client(b"mallory"); // valid account key, never a member
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome-fork-phantom-admin".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    // Bob forks: ONE commit adds david AND rewrites admin policy to
+    // {alice, bob, mallory}. Bob is included so the fork passes the join-time
+    // `require_admin` author check (5d) and reaches the coupling check (5e);
+    // mallory is a valid account key with NO leaf — the phantom that 5e rejects.
+    let forged_admins = encode_admin_policy_for_test(&[
+        alice.self_id().as_slice().to_vec(),
+        bob.self_id().as_slice().to_vec(),
+        mallory.self_id().as_slice().to_vec(),
+    ]);
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let malicious_welcome = welcome_from_fork_with_self_promoted_admin(
+        &bob_storage,
+        &bob.self_id(),
+        &group_id,
+        &david_kp,
+        forged_admins,
+    );
+
+    let err = david
+        .join_welcome(malicious_welcome)
+        .await
+        .expect_err("a Welcome whose admin set lists a phantom admin must be rejected");
+    assert!(
+        matches!(err, EngineError::Other(ref msg) if msg.contains("no member leaf")),
+        "expected admin-leaf-coupling rejection at join, got {err:?}"
+    );
+    assert!(
+        david.members(&group_id).is_err(),
+        "david must not hold any joined group state after a rejected join"
+    );
+}
+
+#[tokio::test]
 async fn engine_rejects_malformed_local_credential_identity_at_build() {
     // foundation/identity.md: a Marmot credential identity MUST be a valid
     // 32-byte x-only secp256k1 public key. A short, non-curve identity is

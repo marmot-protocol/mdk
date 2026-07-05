@@ -436,6 +436,18 @@ pub(crate) fn member_account_pubkeys(mls_group: &MlsGroup) -> BTreeSet<[u8; 32]>
 /// resolves it from the joined group. Keeping them on one function is why a
 /// phantom/pre-provisioned admin can no longer slip in at a seam that "forgot"
 /// the check (mdk#737).
+///
+/// Note the callers build `member_accounts` on two different bases, and that is
+/// intentional. Creation uses `member_id_of_key_package` /
+/// `validated_member_id_of_leaf` (secp256k1-validated) because it is the
+/// authoring path and controls exactly which invitees it admits. The
+/// `MlsGroup`-backed callers use [`member_account_pubkeys`] /
+/// `credential_account_pubkey` (32-byte length only) because every leaf already
+/// present in the tree passed credential validation at its own ingress seam
+/// (welcome-join step 5b `validate_member_credentials_and_account_proofs`, and
+/// add/commit ingest), so the tree cannot carry an unvalidated member leaf here.
+/// The admin set (`decode_admin_policy`) is likewise length-only, so both sides
+/// of the coupling comparison share a basis.
 pub(crate) fn reject_admins_without_member_accounts(
     admins: &[[u8; 32]],
     member_accounts: &BTreeSet<[u8; 32]>,
@@ -446,7 +458,7 @@ pub(crate) fn reject_admins_without_member_accounts(
     }
     if admins.iter().any(|admin| !member_accounts.contains(admin)) {
         return Err(EngineError::Other(format!(
-            "admin-policy update is invalid: an admin key has no member leaf (group {group_id:?})"
+            "admin key has no member leaf (group {group_id:?})"
         )));
     }
     Ok(())
@@ -465,17 +477,28 @@ fn reject_admin_self_remove_proposals(
         if !matches!(queued.proposal(), Proposal::SelfRemove) {
             continue;
         }
-        // Resolve the sender through the shared, validating chokepoint
-        // (mdk#728): `identity::member_id_of_sender` runs
-        // `validate_credential_identity` (x-only secp256k1) before trusting a
-        // leaf's identity as a `MemberId`, exactly as the direct-ingest and
-        // stored-convergence seams do. A malformed identity resolves to `None`
-        // and is skipped — safe, because a malformed identity can never appear
-        // in the validated admin set it would be compared against.
-        let Some(sender) = crate::identity::member_id_of_sender(queued.sender(), mls_group) else {
-            continue;
+        // Resolve the sender's account pubkey on the SAME (length-based) basis
+        // the admin set is decoded on (`decode_admin_policy` /
+        // `credential_account_pubkey`), NOT the secp256k1-validating
+        // `identity::member_id_of_sender` (mdk#728 review). The admin set is not
+        // curve-validated, so a leaf whose 32-byte identity equals a listed
+        // admin key but fails secp256k1 validation would resolve to `None` under
+        // the validating chokepoint and SKIP this guard — letting that admin
+        // self-remove in violation of MIP-03. Matching the admin-set basis keeps
+        // both sides of the comparison comparable. Fail CLOSED: a `SelfRemove`
+        // whose sender cannot be resolved to a member account is rejected, never
+        // waved through (mirrors the Sm7 auto-committer / fork-recovery posture).
+        let sender_pubkey = match queued.sender() {
+            Sender::Member(leaf_idx) => mls_group
+                .member_at(*leaf_idx)
+                .and_then(|member| credential_account_pubkey(member.credential)),
+            _ => None,
         };
-        let sender_pubkey = admin_pubkey_from_member_id(&sender)?;
+        let Some(sender_pubkey) = sender_pubkey else {
+            return Err(EngineError::AdminCannotSelfRemove {
+                group_id: group_id.clone(),
+            });
+        };
         if admins.iter().any(|admin| admin == &sender_pubkey) {
             return Err(EngineError::AdminCannotSelfRemove {
                 group_id: group_id.clone(),

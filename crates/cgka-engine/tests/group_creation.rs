@@ -432,6 +432,32 @@ async fn create_group_rejects_uninvited_initial_admin() {
     );
 }
 
+/// mdk#737 review: an `initial_admins` entry that is 32 bytes but not a valid
+/// x-only secp256k1 key is rejected (not accepted on length alone). Guards the
+/// new `validate_credential_identity` call on the co-admin path.
+#[tokio::test]
+async fn create_group_rejects_off_curve_initial_admin() {
+    let mut alice = build_client_with_components(b"alice", default_group_components());
+    let mut bob = build_client_with_components(b"bob", default_group_components());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "off-curve-admin".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![MemberId::new(vec![0xFF; 32])],
+        })
+        .await
+        .expect_err("an off-curve 32-byte admin identity must be rejected");
+    assert!(
+        matches!(err, EngineError::InvalidCredentialIdentity(_)),
+        "expected InvalidCredentialIdentity, got {err:?}"
+    );
+}
+
 /// mdk#737 positive control: a co-admin who IS an invited member is accepted.
 #[tokio::test]
 async fn create_group_accepts_invited_initial_admin() {
