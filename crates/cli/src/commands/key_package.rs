@@ -1,5 +1,7 @@
 //! `keys` (KeyPackage) command namespace handlers and output helpers.
 
+use std::collections::HashSet;
+
 use marmot_account::AccountHome;
 use marmot_app::{AccountKeyPackageRecord, FetchedKeyPackage, MarmotApp, MarmotAppRuntime};
 use serde_json::{Value, json};
@@ -154,17 +156,30 @@ pub(crate) async fn key_package_command_with_runtime(
                 .account_key_packages(&account.label, Vec::new())
                 .await?;
             let mut deleted = Vec::new();
+            let mut failed = Vec::new();
+            let mut seen_event_ids = HashSet::new();
             let mut accepted_relays = 0_usize;
             for record in records.into_iter().filter(|record| record.relay) {
-                if deleted.iter().any(|deleted: &DeletedKeyPackage| {
-                    deleted.event_id == record.key_package_event_id
-                }) {
+                if !seen_event_ids.insert(record.key_package_event_id.clone()) {
                     continue;
                 }
-                let relays = relay_endpoints(record.source_relays.clone())?;
-                let accepted = runtime
+                let relays = match relay_endpoints(record.source_relays.clone()) {
+                    Ok(relays) => relays,
+                    Err(err) => {
+                        failed.push(FailedKeyPackageDeletion::from_record(&record, &err));
+                        continue;
+                    }
+                };
+                let accepted = match runtime
                     .delete_key_package(&account.label, &record.key_package_event_id, relays)
-                    .await?;
+                    .await
+                {
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        failed.push(FailedKeyPackageDeletion::from_record(&record, &err));
+                        continue;
+                    }
+                };
                 accepted_relays += accepted;
                 deleted.push(DeletedKeyPackage {
                     event_id: record.key_package_event_id,
@@ -175,14 +190,17 @@ pub(crate) async fn key_package_command_with_runtime(
             }
             Ok(CommandOutput {
                 plain: format!(
-                    "deleted {} key package event(s) relays={accepted_relays}",
-                    deleted.len()
+                    "deleted {} key package event(s), failed {} relays={accepted_relays}",
+                    deleted.len(),
+                    failed.len()
                 ),
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
                     "deleted": deleted,
                     "deleted_count": deleted.len(),
+                    "failed": failed,
+                    "failed_count": failed.len(),
                     "accepted_relays": accepted_relays,
                 }),
             })
@@ -196,6 +214,25 @@ struct DeletedKeyPackage {
     key_package_id: String,
     key_package_ref: String,
     accepted_relays: usize,
+}
+
+#[derive(serde::Serialize)]
+struct FailedKeyPackageDeletion {
+    event_id: String,
+    key_package_id: String,
+    key_package_ref: String,
+    error: String,
+}
+
+impl FailedKeyPackageDeletion {
+    fn from_record(record: &AccountKeyPackageRecord, err: &impl std::fmt::Display) -> Self {
+        Self {
+            event_id: record.key_package_event_id.clone(),
+            key_package_id: record.key_package_id.clone(),
+            key_package_ref: record.key_package_ref_hex.clone(),
+            error: err.to_string(),
+        }
+    }
 }
 
 fn account_key_package_record_json(record: AccountKeyPackageRecord) -> Value {

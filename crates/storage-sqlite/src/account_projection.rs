@@ -823,6 +823,8 @@ impl SqliteAccountStorage {
             )
             .optional()
             .storage()?;
+        // Missing rows are unmuted. `None` means "muted forever", so the
+        // absent-row default must be a timestamp that is already expired.
         let (muted_until_ms, updated_at_ms) = row.unwrap_or((Some(0), 0));
         Ok(AccountChatNotificationSettings {
             group_id_hex: group_id_hex.to_owned(),

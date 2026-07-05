@@ -44,6 +44,15 @@ for helper in \
     bash -n "$helper"
 done
 
+stop_marker="$tmp_parent/stop-marker"
+cat > "$dev_root/stop-dev-processes.sh" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${OPENCLAW_STOP_MARKER:?}"
+printf 'stopped\n' > "$OPENCLAW_STOP_MARKER"
+SCRIPT
+chmod +x "$dev_root/stop-dev-processes.sh"
+
 # shellcheck disable=SC1091
 source "$dev_root/env.sh"
 
@@ -66,9 +75,12 @@ source "$dev_root/env.sh"
 [ "${wn_agent_quic_args[0]}" = "--quic-candidate" ]
 [ "${wn_agent_quic_args[1]}" = "quic://127.0.0.1:4433" ]
 
-"$repo_root/scripts/openclaw_marmot_dev_teardown.sh" --root "$dev_root" --dry-run
+OPENCLAW_STOP_MARKER="$stop_marker" "$repo_root/scripts/openclaw_marmot_dev_teardown.sh" --root "$dev_root" --dry-run
+[ "$(cat "$stop_marker")" = "stopped" ]
 [ -d "$dev_root" ]
-"$repo_root/scripts/openclaw_marmot_dev_teardown.sh" --root "$dev_root" --force
+rm "$stop_marker"
+OPENCLAW_STOP_MARKER="$stop_marker" "$repo_root/scripts/openclaw_marmot_dev_teardown.sh" --root "$dev_root" --force
+[ "$(cat "$stop_marker")" = "stopped" ]
 [ ! -e "$dev_root" ]
 
 default_root="$tmp_parent/defaults/openclaw-marmot-test"

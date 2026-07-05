@@ -2849,6 +2849,8 @@ fn keys_delete_and_delete_all_use_runtime_relay_deletion() {
             .as_u64()
             .is_some_and(|count| count > 0)
     );
+    assert_eq!(delete_all["failed"], serde_json::json!([]));
+    assert_eq!(delete_all["failed_count"], 0);
 }
 
 #[test]

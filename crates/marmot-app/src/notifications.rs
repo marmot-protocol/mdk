@@ -1067,10 +1067,19 @@ fn notification_update_from_message(
         return Ok(None);
     }
     let group_id_hex = hex::encode(event.message.group_id.as_slice());
-    if resolver.chat_muted(app, &event.account_label, &group_id_hex)? {
+    let group = match resolver.group(app, &event.account_label, &group_id_hex) {
+        Ok(group) => group,
+        Err(AppError::UnknownGroup(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let muted = match resolver.chat_muted(app, &event.account_label, &group_id_hex) {
+        Ok(muted) => muted,
+        Err(AppError::UnknownGroup(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if muted {
         return Ok(None);
     }
-    let group = resolver.group(app, &event.account_label, &group_id_hex)?;
     let receiver = resolver.user(app, &event.account_id_hex)?;
     let sender = notification_user_from_message(app, resolver, &event.message)?;
     let is_from_self = event.message.sender == event.account_id_hex;

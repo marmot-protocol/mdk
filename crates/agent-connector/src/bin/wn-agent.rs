@@ -340,9 +340,9 @@ fn safe_error_message(err: &ConnectorError) -> String {
     match err {
         ConnectorError::Io(io) => {
             format!(
-                "startup failed code={} detail={}",
+                "startup failed code={} io_kind={:?}",
                 err.privacy_safe_code(),
-                io
+                io.kind()
             )
         }
         _ => format!("startup failed code={}", err.privacy_safe_code()),
