@@ -573,6 +573,7 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
+        EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
         EngineError::ForkedEpoch { .. } => "forked_epoch",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::Storage(_) => "storage",

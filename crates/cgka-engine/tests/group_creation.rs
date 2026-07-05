@@ -598,8 +598,15 @@ async fn create_group_rejects_expired_invitee_keypackage() {
         })
         .await
         .expect_err("create_group must reject an expired invitee KeyPackage");
+    assert_eq!(err.to_string(), "invalid KeyPackage lifetime");
     assert!(
-        matches!(err, EngineError::Backend(ref message) if message.contains("InvalidLifetime")),
+        matches!(
+            &err,
+            EngineError::InvalidKeyPackageLifetime {
+                not_before: None,
+                not_after: None,
+            }
+        ),
         "unexpected error: {err:?}"
     );
 }
@@ -627,8 +634,15 @@ async fn create_group_rejects_invitee_keypackage_with_excessive_lifetime_range()
         })
         .await
         .expect_err("create_group must reject an over-long invitee KeyPackage");
+    assert_eq!(err.to_string(), "invalid KeyPackage lifetime");
     assert!(
-        matches!(err, EngineError::Backend(ref message) if message.contains("lifetime range exceeds Marmot maximum")),
+        matches!(
+            &err,
+            EngineError::InvalidKeyPackageLifetime {
+                not_before: Some(_),
+                not_after: Some(_),
+            }
+        ),
         "unexpected error: {err:?}"
     );
 }

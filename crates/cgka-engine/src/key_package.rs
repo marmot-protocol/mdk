@@ -2,7 +2,7 @@
 //!
 //! Scope for 0.1.0: produce a fresh KeyPackage whose leaf capabilities are
 //! derived from the [`crate::FeatureRegistry`]. Transported KeyPackages are
-//! validated for OpenMLS lifetime validity and Marmot lifetime range policy;
+//! validated for OpenMLS lifetime validity and accepted lifetime range;
 //! refresh scheduling is handled above the engine.
 
 use crate::capabilities::leaf_capabilities;
@@ -12,11 +12,12 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    Extensions, KeyPackage as MlsKeyPackage, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
-    ProtocolVersion,
+    Extensions, KeyPackage as MlsKeyPackage, KeyPackageVerifyError, MlsMessageBodyIn, MlsMessageIn,
+    MlsMessageOut, ProtocolVersion,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
+use openmls_traits::crypto::OpenMlsCrypto;
 use tls_codec::{Deserialize as _, Serialize as _};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,10 +40,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
         }
     };
     let crypto = RustCrypto::default();
-    let key_package = kp_in
-        .validate(&crypto, ProtocolVersion::Mls10)
-        .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
-    validate_key_package_lifetime_policy(&key_package)?;
+    let key_package = validate_key_package(kp_in, &crypto)?;
     let member_id = crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
@@ -71,10 +69,7 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
         }
     };
     let crypto = RustCrypto::default();
-    let key_package = kp_in
-        .validate(&crypto, ProtocolVersion::Mls10)
-        .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
-    validate_key_package_lifetime_policy(&key_package)?;
+    let key_package = validate_key_package(kp_in, &crypto)?;
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
@@ -140,9 +135,7 @@ impl<S: StorageProvider> Engine<S> {
             }
         };
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let key_package = kp_in
-            .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
+        let key_package = validate_key_package(kp_in, provider.crypto())?;
         let hash_ref = key_package
             .hash_ref(provider.crypto())
             .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
@@ -172,10 +165,7 @@ impl<S: StorageProvider> Engine<S> {
         };
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let key_package = kp_in
-            .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .map_err(|e| EngineError::Backend(format!("key_package validate: {e:?}")))?;
-        validate_key_package_lifetime_policy(&key_package)?;
+        let key_package = validate_key_package(kp_in, provider.crypto())?;
         // foundation/key-packages.md: reject a KeyPackage whose credential
         // identity is not a valid Marmot account identity. This single gate
         // covers both the create-group and invite invitee paths.
@@ -188,14 +178,36 @@ impl<S: StorageProvider> Engine<S> {
     }
 }
 
+fn validate_key_package(
+    kp_in: openmls::prelude::KeyPackageIn,
+    crypto: &impl OpenMlsCrypto,
+) -> Result<MlsKeyPackage, EngineError> {
+    let key_package = kp_in
+        .validate(crypto, ProtocolVersion::Mls10)
+        .map_err(key_package_verify_error)?;
+    validate_key_package_lifetime_policy(&key_package)?;
+    Ok(key_package)
+}
+
+fn key_package_verify_error(err: KeyPackageVerifyError) -> EngineError {
+    match err {
+        KeyPackageVerifyError::InvalidLifetime | KeyPackageVerifyError::MissingLifetime => {
+            EngineError::InvalidKeyPackageLifetime {
+                not_before: None,
+                not_after: None,
+            }
+        }
+        other => EngineError::Backend(format!("key_package validate: {other:?}")),
+    }
+}
+
 fn validate_key_package_lifetime_policy(key_package: &MlsKeyPackage) -> Result<(), EngineError> {
     let lifetime = key_package.life_time();
     if !lifetime.has_acceptable_range() {
-        return Err(EngineError::Backend(format!(
-            "key_package lifetime range exceeds Marmot maximum: not_before={} not_after={}",
-            lifetime.not_before(),
-            lifetime.not_after()
-        )));
+        return Err(EngineError::InvalidKeyPackageLifetime {
+            not_before: Some(lifetime.not_before()),
+            not_after: Some(lifetime.not_after()),
+        });
     }
     Ok(())
 }
