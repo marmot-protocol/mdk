@@ -68,6 +68,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   components are also non-negotiable: an invitee whose KeyPackage omits them is rejected up front instead of the group
   being created with an empty admin set that permanently freezes all membership changes. Welcome-join applies the same
   admin-leaf check before accepting a group.
+- A single group member can no longer permanently disable another member's ability to send by broadcasting one crafted
+  far-future-epoch message. The convergence send-gate now bounds the future side of the horizon the same way it already
+  bounds the past: a buffered convergence input more than `max_rewind_commits` epochs ahead of the group tip (which can
+  never chain from the tip) no longer counts as unresolved work, and a convergence row that fails to decode/project now
+  fails open instead of closed. Previously such an input left the group reporting "unsettled" forever, so every outbound
+  send was queued and never drained, with no recovery short of manual database surgery.
 
 ### Fixed
 

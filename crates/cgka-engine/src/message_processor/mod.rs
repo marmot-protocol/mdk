@@ -365,15 +365,28 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     fn has_unresolved_convergence_inputs(&self, group_id: &GroupId) -> Result<bool, EngineError> {
-        let anchor = match self.storage.get_group(group_id) {
+        // The convergence horizon is bounded on BOTH sides (mdk#736). The past
+        // side (`anchor`) drops inputs older than the retained-anchor window.
+        // The future side (`ceiling`) is symmetric: a convergence input more
+        // than `max_rewind_commits` epochs ahead of the current tip cannot chain
+        // from the tip yet (the candidate-path BFS in `openmls_projection` only
+        // extends `source_epoch == tip_epoch`), so it is not *resolvable
+        // convergence work* and must not gate outbound sends. Without the
+        // ceiling, a single member could forge one far-future-epoch (e.g. 2^63)
+        // plaintext message whose buffered `Created` row is never materialized
+        // and never given a terminal disposition, permanently gating every send
+        // for the whole group. The row is left in storage (not dropped here), so
+        // it gates again correctly once the tip advances into `[anchor, ceiling]`.
+        let (anchor, ceiling) = match self.storage.get_group(group_id) {
             Ok(group) => {
                 let policy = self
                     .convergence_policy_for_group(group_id)
                     .map_err(|e| EngineError::Backend(format!("load convergence policy: {e}")))?;
-                group
-                    .epoch
-                    .0
-                    .saturating_sub(policy.convergence.max_rewind_commits)
+                let rewind = policy.convergence.max_rewind_commits;
+                (
+                    group.epoch.0.saturating_sub(rewind),
+                    group.epoch.0.saturating_add(rewind),
+                )
             }
             Err(StorageError::NotFound) => return Ok(false),
             Err(e) => return Err(EngineError::Storage(e)),
@@ -386,15 +399,27 @@ impl<S: StorageProvider> Engine<S> {
             ) {
                 continue;
             }
+            // Fail OPEN, not closed (mdk#736): a row we cannot decode, is not an
+            // openmls-wire payload, or cannot be projected is NOT resolvable
+            // convergence work — treating it as "unresolved" would let a single
+            // corrupt/garbage row permanently gate sends with no recovery path.
+            // Such a row simply does not contribute to the send gate; the
+            // convergence horizon (`openmls_projection`) is responsible for
+            // assigning it a terminal disposition.
             let Ok(stored_payload) = StoredMessagePayload::decode(&record.payload) else {
-                return Ok(true);
+                continue;
             };
             let Some(message) = stored_payload.as_openmls_wire() else {
-                return Ok(true);
+                continue;
             };
             let Ok(projection) = project_mls_message(&message.payload) else {
-                return Ok(true);
+                continue;
             };
+            // Beyond the future horizon: unreachable from the current tip, so
+            // not gating work (see the ceiling rationale above).
+            if projection.source_epoch.is_some_and(|epoch| epoch > ceiling) {
+                continue;
+            }
             // A lone uncommitted Proposal does NOT make canonical state
             // ambiguous: commits are the consensus log; a proposal only takes
             // effect once a commit consumes it (convergence.md:7-8). The

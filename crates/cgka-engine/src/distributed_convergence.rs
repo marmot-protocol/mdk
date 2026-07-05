@@ -917,9 +917,13 @@ impl<S: StorageProvider> Engine<S> {
         };
         let accepted: std::collections::BTreeSet<&str> =
             result.accepted_commits.iter().map(String::as_str).collect();
+        // Scope the scan to `fork_epoch` onward (mdk#745): rows below the fork
+        // epoch are skipped anyway, so listing from `EpochId(0)` re-decoded and
+        // re-projected the group's entire retained history on every apply. The
+        // storage query filters `at_or_after_epoch`, yielding an identical set.
         let records = self
             .storage
-            .list_messages(group_id, EpochId(0))
+            .list_messages(group_id, EpochId(fork_epoch))
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
         for record in records {
             if record.state != MessageState::Processed || record.epoch.0 < fork_epoch {
