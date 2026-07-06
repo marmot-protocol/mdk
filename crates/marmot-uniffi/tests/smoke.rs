@@ -434,7 +434,7 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
             "missing".into(),
             PushPlatformFfi::Fcm,
             "opaque-token".into(),
-            "00".repeat(32),
+            "00aa".into(),
             None,
         )
         .await
@@ -442,7 +442,7 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
     );
     assert!(kit.clear_push_registration("missing".into()).await.is_err());
     assert!(
-        kit.group_push_debug_info("missing".into(), "00".repeat(32))
+        kit.group_push_debug_info("missing".into(), "00aa".into())
             .await
             .is_err()
     );
@@ -765,7 +765,7 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
     assert!(format!("{invalid_group}").contains("invalid hex"));
 
     let invalid_message = kit
-        .mark_timeline_message_read("missing".into(), "00".repeat(32), "not-hex".into())
+        .mark_timeline_message_read("missing".into(), "00aa".into(), "not-hex".into())
         .expect_err("invalid message hex should fail before account lookup");
     assert!(format!("{invalid_message}").contains("invalid hex"));
 
@@ -808,11 +808,7 @@ async fn message_history_binding_methods_validate_group_hex() {
     // then fails on the missing account, proving the value was canonicalized
     // rather than treated as an opaque host string.
     let missing_account = kit
-        .messages(
-            "missing".into(),
-            Some(format!(" {} ", "AB".repeat(32))),
-            Some(25),
-        )
+        .messages("missing".into(), Some(" ABCD ".into()), Some(25))
         .expect_err("missing account should fail after hex validation");
     assert!(format!("{missing_account}").contains("missing"));
 }
@@ -839,7 +835,7 @@ async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
     // Valid hex gets past validation and then fails on the missing account,
     // proving the value was decoded rather than treated as an opaque string.
     let missing_account = kit
-        .retry_group_convergence("missing".into(), "AB".repeat(32))
+        .retry_group_convergence("missing".into(), "ABCD".into())
         .await
         .expect_err("missing account should fail after hex validation");
     assert!(format!("{missing_account}").contains("missing"));

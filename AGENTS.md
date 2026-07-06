@@ -61,6 +61,10 @@ The canonical protocol specification lives in
 - Keep Tamarin model names, Rust test names, and vector names easy to grep across layers.
 - Keep protocol principles and app-component documents implementation-neutral in `marmot-protocol/marmot`. Local engine,
   storage, queue, and diagnostic notes belong in architecture docs or crate docs here.
+- Keep MLS group ids distinct from transport routing ids. `GroupId` is opaque MLS group id bytes; OpenMLS-generated ids
+  are 16 bytes today, but spec surfaces that bind raw MLS group ids length-prefix them because they are variable-length.
+  `nostr_group_id` / `transport_group_id` is the 32-byte Nostr routing handle. Do not apply the 32-byte Nostr route-id
+  rule to `GroupId` validation, FFI parsing, storage lookups, or CLI/app group-id filters.
 - Keep tracing/logging privacy-safe: explicit crate/module `target` and `method` fields, aggregate values only, and no
   account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext, plaintext, or key material. See
   `docs/marmot-architecture/overview/observability.md`.

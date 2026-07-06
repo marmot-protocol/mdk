@@ -16,6 +16,9 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for build scr
 - Android consumers must call `MarmotAndroid.initialize(context)` before constructing `Marmot` (Keystore JNI via
   `ndk-context`).
 - Endpoint env vars set route URLs only; bearer tokens and runtime secrets stay with the host app.
+- Host-supplied `group_id_hex` values are variable-length MLS `GroupId` bytes, not Nostr `nostr_group_id` route handles.
+  Accept non-empty opaque MLS group ids, including the 16-byte ids OpenMLS generates for MDK today, and do not validate
+  them with the 32-byte route-id/pubkey/message-id rule.
 - Keep binding changes in lockstep with `marmot-app` public API changes; bump the workspace version when UniFFI records,
   enums, object methods, or error variants change.
 
