@@ -2952,6 +2952,15 @@ impl AccountManager {
         let reactivating_existing = account.signed_out;
         let rollback_on_setup_failure = !reactivating_existing;
 
+        if imports_private_key || reactivating_existing || !account.local_signing {
+            let _ = self
+                .preflight_existing_account_directory(
+                    &account.account_id_hex,
+                    directory_bootstrap_relays.clone(),
+                )
+                .await;
+        }
+
         let relay_lists = match self
             .setup_relay_lists_for_account(
                 &account,
@@ -3061,8 +3070,16 @@ impl AccountManager {
             return Err(err);
         }
 
+        let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
+        let _ = self
+            .preflight_existing_account_directory(
+                &account.account_id_hex,
+                directory_bootstrap_relays.clone(),
+            )
+            .await;
+
         let relay_lists = match self
-            .setup_relay_lists_for_account(&account, &request, false, false)
+            .setup_relay_lists_for_account(&account, &request, true, false)
             .await
         {
             Ok(relay_lists) => relay_lists,
@@ -3088,7 +3105,6 @@ impl AccountManager {
             None
         };
 
-        let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
         let _ = self
             .app
             .refresh_user_directory_for_account_id(
@@ -3125,6 +3141,52 @@ impl AccountManager {
             .register_external_signer(account_ref, signer)
             .await?;
         self.reconcile().await
+    }
+
+    async fn preflight_existing_account_directory(
+        &self,
+        account_id_hex: &str,
+        discovery_relays: Vec<TransportEndpoint>,
+    ) -> Option<AccountRelayListStatus> {
+        let status = match self
+            .app
+            .fetch_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
+            .await
+        {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::debug!(
+                    account_id_hex,
+                    error = %err,
+                    "existing account relay discovery failed during setup preflight"
+                );
+                return None;
+            }
+        };
+
+        let profile_relays = status
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        if profile_relays.is_empty() {
+            return Some(status);
+        }
+        if let Err(err) = self
+            .app
+            .refresh_profile_for_account_id(account_id_hex, profile_relays)
+            .await
+        {
+            tracing::debug!(
+                account_id_hex,
+                error = %err,
+                "existing account profile discovery failed during setup preflight"
+            );
+        }
+
+        Some(status)
     }
 
     async fn publish_default_profile_for_account(
