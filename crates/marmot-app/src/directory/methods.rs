@@ -621,7 +621,7 @@ impl MarmotApp {
             .account_home()
             .accounts()?
             .into_iter()
-            .filter(|account| account.is_active_local_signing())
+            .filter(|account| account.is_active_signing())
             .map(|account| account.account_id_hex)
             .collect::<Vec<_>>();
         let mut known_user_ids = self
@@ -1062,7 +1062,7 @@ impl MarmotApp {
             .account_home()
             .accounts()?
             .into_iter()
-            .filter(|account| account.is_active_local_signing())
+            .filter(|account| account.is_active_signing())
             .collect::<Vec<_>>();
         self.clean_future_dated_directory_caches_once(&accounts)?;
 
@@ -1153,7 +1153,7 @@ impl MarmotApp {
             .account_home()
             .accounts()?
             .into_iter()
-            .filter(|account| account.is_active_local_signing())
+            .filter(|account| account.is_active_signing())
             .collect::<Vec<_>>();
         self.clean_future_dated_directory_caches_once(&accounts)
     }

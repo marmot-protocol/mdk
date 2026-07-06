@@ -3045,23 +3045,45 @@ impl AccountManager {
         if signer_public_key.to_hex() != account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
+        let created_account = self.app.account_home().account(&account_id_hex).is_err();
         let mut account = self
             .app
             .account_home()
             .add_external_signer_account(&public_key)?;
-        self.app
+        if let Err(err) = self
+            .app
             .register_external_signer(&account.account_id_hex, signer)
-            .await?;
+            .await
+        {
+            if created_account {
+                return self.rollback_account_after_setup_failure(&account.label, err);
+            }
+            return Err(err);
+        }
 
-        let relay_lists = self
+        let relay_lists = match self
             .setup_relay_lists_for_account(&account, &request, false, false)
-            .await?;
+            .await
+        {
+            Ok(relay_lists) => relay_lists,
+            Err(err) => {
+                if created_account {
+                    return self.rollback_account_after_setup_failure(&account.label, err);
+                }
+                return Err(err);
+            }
+        };
 
         let key_package_bytes = if request.publish_initial_key_package {
-            Some(
-                self.publish_initial_key_package_for_account(&account)
-                    .await?,
-            )
+            match self.publish_initial_key_package_for_account(&account).await {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    if created_account {
+                        return self.rollback_account_after_setup_failure(&account.label, err);
+                    }
+                    return Err(err);
+                }
+            }
         } else {
             None
         };

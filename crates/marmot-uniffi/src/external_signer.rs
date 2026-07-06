@@ -62,7 +62,10 @@ impl NostrSigner for ExternalAccountSignerAdapter {
     fn get_public_key(&self) -> nostr::util::BoxedFuture<'_, Result<PublicKey, SignerError>> {
         let signer = self.signer.clone();
         Box::pin(async move {
-            let public_key = signer.public_key().map_err(callback_signer_error)?;
+            let public_key = tokio::task::spawn_blocking(move || signer.public_key())
+                .await
+                .map_err(signer_error)?
+                .map_err(callback_signer_error)?;
             PublicKey::parse(&public_key).map_err(signer_error)
         })
     }
@@ -73,11 +76,21 @@ impl NostrSigner for ExternalAccountSignerAdapter {
     ) -> nostr::util::BoxedFuture<'_, Result<Event, SignerError>> {
         let signer = self.signer.clone();
         Box::pin(async move {
+            let expected_id = unsigned
+                .id
+                .ok_or_else(|| SignerError::from("unsigned event id was not set"))?;
+            let expected_pubkey = unsigned.pubkey;
             let unsigned_json = unsigned.as_json();
-            let event_json = signer
-                .sign_event(unsigned_json)
+            let event_json = tokio::task::spawn_blocking(move || signer.sign_event(unsigned_json))
+                .await
+                .map_err(signer_error)?
                 .map_err(callback_signer_error)?;
             let event = Event::from_json(event_json).map_err(signer_error)?;
+            if event.id != expected_id || event.pubkey != expected_pubkey {
+                return Err(SignerError::from(
+                    "external signer returned a different event than requested",
+                ));
+            }
             event.verify().map_err(signer_error)?;
             Ok(event)
         })
@@ -89,9 +102,12 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         content: &'a str,
     ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
         let signer = self.signer.clone();
+        let public_key = public_key.to_hex();
+        let content = content.to_owned();
         Box::pin(async move {
-            signer
-                .nip04_encrypt(public_key.to_hex(), content.to_owned())
+            tokio::task::spawn_blocking(move || signer.nip04_encrypt(public_key, content))
+                .await
+                .map_err(signer_error)?
                 .map_err(callback_signer_error)
         })
     }
@@ -102,9 +118,12 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         encrypted_content: &'a str,
     ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
         let signer = self.signer.clone();
+        let public_key = public_key.to_hex();
+        let encrypted_content = encrypted_content.to_owned();
         Box::pin(async move {
-            signer
-                .nip04_decrypt(public_key.to_hex(), encrypted_content.to_owned())
+            tokio::task::spawn_blocking(move || signer.nip04_decrypt(public_key, encrypted_content))
+                .await
+                .map_err(signer_error)?
                 .map_err(callback_signer_error)
         })
     }
@@ -115,9 +134,12 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         content: &'a str,
     ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
         let signer = self.signer.clone();
+        let public_key = public_key.to_hex();
+        let content = content.to_owned();
         Box::pin(async move {
-            signer
-                .nip44_encrypt(public_key.to_hex(), content.to_owned())
+            tokio::task::spawn_blocking(move || signer.nip44_encrypt(public_key, content))
+                .await
+                .map_err(signer_error)?
                 .map_err(callback_signer_error)
         })
     }
@@ -128,9 +150,12 @@ impl NostrSigner for ExternalAccountSignerAdapter {
         payload: &'a str,
     ) -> nostr::util::BoxedFuture<'a, Result<String, SignerError>> {
         let signer = self.signer.clone();
+        let public_key = public_key.to_hex();
+        let payload = payload.to_owned();
         Box::pin(async move {
-            signer
-                .nip44_decrypt(public_key.to_hex(), payload.to_owned())
+            tokio::task::spawn_blocking(move || signer.nip44_decrypt(public_key, payload))
+                .await
+                .map_err(signer_error)?
                 .map_err(callback_signer_error)
         })
     }

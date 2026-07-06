@@ -350,6 +350,7 @@ async fn upload_blossom_blob_with_fallback(
         .await
         {
             Ok(url) => return Ok(url),
+            Err(AppError::ExternalSignerRejected) => return Err(AppError::ExternalSignerRejected),
             Err(err) => failures.push(format!(
                 "server {}: {}",
                 idx + 1,

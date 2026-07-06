@@ -15,7 +15,9 @@ mod runtime;
 mod secret_store;
 
 pub use error::{AccountError, AccountHomeError, AccountHomeResult, AccountResult};
-pub use home::{AccountHome, AccountSummary, DEFAULT_KEYCHAIN_SERVICE_NAME};
+pub use home::{
+    AccountHome, AccountSummary, DEFAULT_KEYCHAIN_SERVICE_NAME, EXTERNAL_SQLCIPHER_SECRET_FILE,
+};
 pub use key_package::{
     KeyPackagePublication, KeyPackagePublishError, KeyPackagePublisher, NoopKeyPackagePublisher,
 };

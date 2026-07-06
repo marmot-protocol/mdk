@@ -6,7 +6,8 @@
 //! crash-safe salt-write/rekey sequence, and recovery for interrupted or
 //! pre-fix bricked migrations.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use hkdf::Hkdf;
@@ -18,10 +19,10 @@ use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 use zeroize::Zeroizing;
 
 use crate::{AppError, MarmotApp};
+use marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE;
 
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
-const EXTERNAL_SQLCIPHER_SECRET_FILE: &str = ".external-sqlcipher-secret";
 const SQLCIPHER_SALT_LEN: usize = 32;
 const SQLCIPHER_KEY_LEN: usize = 32;
 
@@ -99,8 +100,14 @@ impl MarmotApp {
         }
         let mut secret = [0_u8; SQLCIPHER_KEY_LEN];
         OsRng.fill_bytes(&mut secret);
-        atomic_write(&path, hex::encode(secret).as_bytes())?;
-        Ok(Zeroizing::new(secret))
+        let encoded = hex::encode(secret);
+        match write_private_new(&path, encoded.as_bytes()) {
+            Ok(()) => Ok(Zeroizing::new(secret)),
+            Err(AppError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.external_sqlcipher_secret(label)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn external_sqlcipher_salt(
@@ -113,8 +120,14 @@ impl MarmotApp {
         }
         let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
-        write_sqlcipher_salt(&salt_path, &salt)?;
-        Ok(salt)
+        let encoded = hex::encode(salt);
+        match write_private_new(&salt_path, encoded.as_bytes()) {
+            Ok(()) => Ok(salt),
+            Err(AppError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                read_sqlcipher_salt(&salt_path)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn sqlcipher_salt(
@@ -256,6 +269,28 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), AppError> {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();
         }
+    }
+    Ok(())
+}
+
+fn write_private_new(path: &Path, contents: &[u8]) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
     Ok(())
 }

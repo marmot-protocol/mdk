@@ -5,7 +5,9 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use nostr::signer::SignerBackend;
-use nostr::{Event, NostrSigner, PublicKey, SignerError, UnsignedEvent};
+use nostr::{
+    Event, NostrSigner, PublicKey, SignerError, UnsignedEvent, secp256k1::schnorr::Signature,
+};
 
 pub const EXTERNAL_SIGNER_REJECTED: &str = "external_signer_rejected";
 
@@ -113,10 +115,13 @@ impl NostrSigner for RegisteredExternalSigner {
         let public_key = self.public_key;
         let signer = self.signer.clone();
         Box::pin(async move {
+            let expected_id = unsigned
+                .id
+                .ok_or_else(|| SignerError::from("unsigned event id was not set"))?;
             let event = signer.sign_event(unsigned).await?;
-            if event.pubkey != public_key {
+            if event.pubkey != public_key || event.id != expected_id {
                 return Err(SignerError::from(
-                    "external signer returned event for another pubkey",
+                    "external signer returned a different event than requested",
                 ));
             }
             event
@@ -169,7 +174,13 @@ impl AccountIdentityProofSigner for RegisteredExternalSigner {
                 "request account identity does not match registered external signer".into(),
             );
         }
-        self.signer.sign_account_identity_proof(request)
+        let signature = self.signer.sign_account_identity_proof(request)?;
+        let proof_event = request.proof_event()?;
+        let signature_value = Signature::from_slice(&signature).map_err(|err| err.to_string())?;
+        proof_event
+            .add_signature(signature_value)
+            .map_err(|err| err.to_string())?;
+        Ok(signature)
     }
 }
 

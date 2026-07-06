@@ -544,48 +544,61 @@ fn push_digest(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn push_owner_proof_event(
-    domain: &str,
-    group_id_hex: &str,
-    member_id_hex: &str,
+struct PushOwnerProofEvent<'a> {
+    domain: &'a str,
+    group_id_hex: &'a str,
+    member_id_hex: &'a str,
     leaf_index: u32,
     platform: PushPlatform,
-    server_pubkey_hex: &str,
-    token_fingerprint: &str,
+    server_pubkey_hex: &'a str,
+    token_fingerprint: &'a str,
     owner_ts: i64,
-    relay_hint: Option<&str>,
-    encrypted_token: Option<&[u8]>,
-) -> Result<UnsignedEvent, AppError> {
-    let member_pubkey = PublicKey::parse(member_id_hex)
+    relay_hint: Option<&'a str>,
+    encrypted_token: Option<&'a [u8]>,
+}
+
+fn push_owner_proof_event(input: PushOwnerProofEvent<'_>) -> Result<UnsignedEvent, AppError> {
+    let member_pubkey = PublicKey::parse(input.member_id_hex)
         .map_err(|_| AppError::InvalidPushGossip("member id must be a Nostr pubkey".into()))?;
-    let relay = relay_hint
+    let relay = input
+        .relay_hint
         .map(str::trim)
         .filter(|hint| !hint.is_empty())
         .unwrap_or("");
     let mut tags = vec![
-        Tag::custom(TagKind::custom("d"), [domain.to_owned()]),
-        Tag::custom(TagKind::custom("group_id"), [group_id_hex.to_owned()]),
-        Tag::custom(TagKind::custom("member_id"), [member_id_hex.to_owned()]),
-        Tag::custom(TagKind::custom("leaf_index"), [leaf_index.to_string()]),
-        Tag::custom(TagKind::custom("platform"), [platform.as_str().to_owned()]),
+        Tag::custom(TagKind::custom("d"), [input.domain.to_owned()]),
+        Tag::custom(TagKind::custom("group_id"), [input.group_id_hex.to_owned()]),
+        Tag::custom(
+            TagKind::custom("member_id"),
+            [input.member_id_hex.to_owned()],
+        ),
+        Tag::custom(
+            TagKind::custom("leaf_index"),
+            [input.leaf_index.to_string()],
+        ),
+        Tag::custom(
+            TagKind::custom("platform"),
+            [input.platform.as_str().to_owned()],
+        ),
         Tag::custom(
             TagKind::custom("server_pubkey"),
-            [server_pubkey_hex.to_owned()],
+            [input.server_pubkey_hex.to_owned()],
         ),
         Tag::custom(
             TagKind::custom("token_fingerprint"),
-            [token_fingerprint.to_owned()],
+            [input.token_fingerprint.to_owned()],
         ),
-        Tag::custom(TagKind::custom("owner_ts"), [owner_ts.to_string()]),
+        Tag::custom(TagKind::custom("owner_ts"), [input.owner_ts.to_string()]),
         Tag::custom(TagKind::custom("relay_hint"), [relay.to_owned()]),
     ];
-    if encrypted_token.is_some() {
+    if input.encrypted_token.is_some() {
         tags.push(Tag::custom(
             TagKind::custom("encrypted_token_encoding"),
             ["base64".to_owned()],
         ));
     }
-    let content = encrypted_token
+    let content = input
+        .encrypted_token
         .map(|token| BASE64_STANDARD.encode(token))
         .unwrap_or_default();
     Ok(
@@ -650,18 +663,18 @@ impl GroupPushTokenRecord {
     }
 
     fn owner_proof_event(&self) -> Result<UnsignedEvent, AppError> {
-        push_owner_proof_event(
-            PUSH_RECORD_DOMAIN,
-            &self.group_id_hex,
-            &self.member_id_hex,
-            self.leaf_index,
-            self.platform,
-            &self.server_pubkey_hex,
-            &self.token_fingerprint,
-            self.owner_ts,
-            self.relay_hint.as_deref(),
-            Some(&self.encrypted_token),
-        )
+        push_owner_proof_event(PushOwnerProofEvent {
+            domain: PUSH_RECORD_DOMAIN,
+            group_id_hex: &self.group_id_hex,
+            member_id_hex: &self.member_id_hex,
+            leaf_index: self.leaf_index,
+            platform: self.platform,
+            server_pubkey_hex: &self.server_pubkey_hex,
+            token_fingerprint: &self.token_fingerprint,
+            owner_ts: self.owner_ts,
+            relay_hint: self.relay_hint.as_deref(),
+            encrypted_token: Some(&self.encrypted_token),
+        })
     }
 
     /// Sign this record with the owner account `keys`, populating `owner_sig`.
@@ -719,18 +732,18 @@ impl PushTokenRemovalRecord {
     }
 
     fn owner_proof_event(&self, group_id_hex: &str) -> Result<UnsignedEvent, AppError> {
-        push_owner_proof_event(
-            PUSH_REMOVAL_DOMAIN,
+        push_owner_proof_event(PushOwnerProofEvent {
+            domain: PUSH_REMOVAL_DOMAIN,
             group_id_hex,
-            &self.member_id_hex,
-            self.leaf_index,
-            self.platform,
-            &self.server_pubkey_hex,
-            &self.token_fingerprint,
-            self.owner_ts,
-            None,
-            None,
-        )
+            member_id_hex: &self.member_id_hex,
+            leaf_index: self.leaf_index,
+            platform: self.platform,
+            server_pubkey_hex: &self.server_pubkey_hex,
+            token_fingerprint: &self.token_fingerprint,
+            owner_ts: self.owner_ts,
+            relay_hint: None,
+            encrypted_token: None,
+        })
     }
 
     #[cfg(test)]

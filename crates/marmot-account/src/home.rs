@@ -20,6 +20,7 @@ const ACCOUNT_RECORD_FILE: &str = "account.json";
 /// byte, never key material, so it is written with public file permissions.
 const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
+pub const EXTERNAL_SQLCIPHER_SECRET_FILE: &str = ".external-sqlcipher-secret";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.whitenoise";
 const TRACE_TARGET: &str = "marmot_account::home";
@@ -193,6 +194,10 @@ impl AccountHome {
         public_key: &str,
     ) -> AccountHomeResult<AccountSummary> {
         let account_id_hex = Self::account_id_for_public_key(public_key)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.account_record_path(&account_id_hex).exists() {
             let mut account = self.account(&account_id_hex)?;
             if account.local_signing {
@@ -362,6 +367,14 @@ impl AccountHome {
                     target: TRACE_TARGET,
                     method = "remove_account",
                     "failed to scrub tombstoned local signing secret before directory deletion"
+                );
+            }
+            let external_secret_path = tombstone.join(EXTERNAL_SQLCIPHER_SECRET_FILE);
+            if scrub_and_remove_local_secret_file(&external_secret_path).is_err() {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "remove_account",
+                    "failed to scrub tombstoned external SQLCipher secret before directory deletion"
                 );
             }
         }
