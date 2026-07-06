@@ -26,20 +26,30 @@ Prerequisites:
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
-WN_AGENT_VERSION=0.9.0
+WN_AGENT_VERSION=0.9.2
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
-# or install + bootstrap the agent account in one step:
-curl -fsSL ".../install-openclaw-marmot.sh" | bash -s -- --bootstrap
 ```
 
 The installer puts `wn-agent` in `~/.local/bin`, downloads and verifies the plugin
-tarball, runs `openclaw plugins install`, and enables the `marmot` channel.
+tarball, runs `openclaw plugins install`, enables the `marmot` channel, starts a
+same-user `wn-agent` service where supported, bootstraps or reuses
+`~/.marmot-agent`, and patches only `channels.marmot` in OpenClaw config.
 Supported platforms match the Hermes installer.
 Set `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`, and `WN_AGENT_VERSION` (or the
 legacy `WN_AGENT_SHA` alias) to install a non-default release asset, matching
 the Hermes installer.
 
-Then start the connector and bootstrap (same public relays as the phone app):
+For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
+an `npub` or raw hex public key:
+
+```sh
+WN_AGENT_VERSION=0.9.2
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
+```
+
+The installer prints restart guidance for your existing OpenClaw gateway. It
+does not restart OpenClaw automatically. Manual equivalent:
 
 ```sh
 wn-agent --home ~/.marmot-agent \

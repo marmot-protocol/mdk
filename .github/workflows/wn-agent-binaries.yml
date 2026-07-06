@@ -192,10 +192,16 @@ jobs:
 
           rm -rf "$stage_parent" "$asset" "$asset.sha256"
           mkdir -p "$bundle_dir"
-          cp integrations/hermes/marmot/plugin.yaml "$bundle_dir/"
+          sed -e "s/^version:.*/version: $artifact_version/" \
+            integrations/hermes/marmot/plugin.yaml > "$bundle_dir/plugin.yaml"
+          if ! grep -qx "version: $artifact_version" "$bundle_dir/plugin.yaml"; then
+            echo "error: packaged Hermes plugin metadata did not get version $artifact_version" >&2
+            exit 1
+          fi
           cp integrations/hermes/marmot/__init__.py "$bundle_dir/"
           cp integrations/hermes/marmot/adapter.py "$bundle_dir/"
           cp integrations/hermes/marmot/README.md "$bundle_dir/"
+          cp scripts/hermes_marmot_configure_gateway.py "$bundle_dir/configure_gateway.py"
 
           cat > "$bundle_dir/manifest.json" <<EOF
           {
@@ -208,6 +214,7 @@ jobs:
               "plugin.yaml",
               "__init__.py",
               "adapter.py",
+              "configure_gateway.py",
               "README.md",
               "manifest.json"
             ]

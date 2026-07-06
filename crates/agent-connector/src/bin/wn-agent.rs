@@ -151,6 +151,12 @@ struct BootstrapArgs {
     no_create: bool,
     #[arg(long, help = "Skip KeyPackage publish or repair during bootstrap")]
     no_publish_key_package: bool,
+    #[arg(
+        long,
+        value_name = "NPUB_OR_HEX",
+        help = "Add this welcomer/inviter public key to the agent allowlist; may be repeated"
+    )]
+    allow_welcomer: Vec<String>,
     #[arg(long, help = "Render invite URI as a terminal QR code using qrencode")]
     qr: bool,
     #[arg(long, help = "Print machine-readable JSON only")]
@@ -250,6 +256,7 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
         auth_token,
         relays,
         quic_candidates,
+        allow_welcomers: args.allow_welcomer,
         create_if_missing: !args.no_create,
         publish_key_package: !args.no_publish_key_package,
         wait_for_socket: Duration::from_secs_f64(args.wait_for_socket.max(0.0)),
@@ -296,6 +303,15 @@ fn write_bootstrap_output(
     } else {
         println!("QUIC candidate(s): {}", result.quic_candidates.join(", "));
     }
+    println!(
+        "Welcomer allowlist: {} entr{}",
+        result.welcomer_account_ids_hex.len(),
+        if result.welcomer_account_ids_hex.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
     if result.key_package_published {
         println!("KeyPackage: published or repaired");
     } else {

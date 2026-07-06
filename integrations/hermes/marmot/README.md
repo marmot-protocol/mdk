@@ -29,15 +29,17 @@ Prerequisites:
 One-line install:
 
 ```sh
-WN_AGENT_VERSION=0.9.0
+WN_AGENT_VERSION=0.9.2
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
-Install and bootstrap in one step:
+For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
+an `npub` or raw hex public key:
 
 ```sh
-WN_AGENT_VERSION=0.9.0
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
+WN_AGENT_VERSION=0.9.2
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
 ```
 
 Use the exact release version when reporting bugs:
@@ -47,13 +49,18 @@ wn-agent --version
 ```
 
 The installer puts `wn-agent` in `~/.local/bin`, extracts the plugin to
-`~/.hermes/plugins/marmot`, and runs `hermes plugins enable marmot` when the
-`hermes` launcher is on `PATH`.
+`~/.hermes/plugins/marmot`, enables the Marmot plugin, starts a same-user
+`wn-agent` service where supported, bootstraps or reuses `~/.marmot-agent`, and
+patches only Marmot-specific Hermes config entries. Existing Hermes connectors
+such as Telegram are preserved.
 
 Supported platforms: Linux x86_64, Linux arm64, macOS Apple Silicon, macOS Intel.
 Both install scripts verify SHA256 checksums for downloaded release assets.
 
-After a normal install, start the connector and bootstrap the agent account:
+The installer prints restart guidance for your existing Hermes gateway. It does
+not restart Hermes automatically.
+
+Manual equivalent:
 
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agent"

@@ -32,6 +32,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   `stream_finalize` with stable per-stream keys so a post-write timeout does not duplicate the durable final.
 - Hermes dev setup now mirrors OpenClaw by passing custom QUIC preview candidates through the generated
   `bootstrap-agent.sh` helper and syntax-checking every generated helper script in its contract test.
+- WN Agent release assets now include Hermes and OpenClaw one-line installers that perform guided full setup for
+  `wn-agent`, gateway plugin config, and same-user service startup while preserving existing gateway connectors/channels.
 
 ### Security
 

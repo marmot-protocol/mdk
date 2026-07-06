@@ -23,26 +23,37 @@ class ConfigureGatewayTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
 
-    def test_writes_marmot_streaming_defaults(self):
+    def test_writes_marmot_platform_extra_and_final_only_defaults(self):
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)
             config_path = self.module.configure_gateway_config(
                 hermes_home=home,
                 platform="marmot",
-                streaming_enabled=True,
-                streaming_transport="auto",
+                streaming_enabled=False,
+                streaming_transport="off",
                 tool_progress="off",
                 interim_assistant_messages=False,
                 long_running_notifications=False,
                 busy_ack_detail=False,
+                agent_home=home / "marmot-agent",
+                socket_path=home / "marmot-agent" / "dev" / "wn-agent.sock",
+                account_id_hex="11" * 32,
+                welcomer_allowlist=["22" * 32, "22" * 32],
             )
 
             config = self.module.load_config(config_path)
 
-        self.assertTrue(config["streaming"]["enabled"])
-        self.assertEqual(config["streaming"]["transport"], "auto")
+        self.assertNotIn("streaming", config)
+        extra = config["platforms"]["marmot"]["extra"]
+        self.assertEqual(extra["home"], str(home / "marmot-agent"))
+        self.assertEqual(
+            extra["socket_path"],
+            str(home / "marmot-agent" / "dev" / "wn-agent.sock"),
+        )
+        self.assertEqual(extra["account_id_hex"], "11" * 32)
+        self.assertEqual(extra["welcomer_allowlist"], "22" * 32)
         marmot = config["display"]["platforms"]["marmot"]
-        self.assertTrue(marmot["streaming"])
+        self.assertFalse(marmot["streaming"])
         self.assertEqual(marmot["tool_progress"], "off")
         self.assertFalse(marmot["interim_assistant_messages"])
         self.assertFalse(marmot["long_running_notifications"])
@@ -66,6 +77,10 @@ class ConfigureGatewayTests(unittest.TestCase):
                         "  platforms:",
                         "    telegram:",
                         "      tool_progress: verbose",
+                        "platforms:",
+                        "  telegram:",
+                        "    extra:",
+                        "      bot_token_file: /secret/token",
                         "",
                     ]
                 ),
@@ -81,20 +96,33 @@ class ConfigureGatewayTests(unittest.TestCase):
                 interim_assistant_messages=True,
                 long_running_notifications=True,
                 busy_ack_detail=True,
+                agent_home=home / "marmot-agent",
+                socket_path=home / "marmot-agent" / "dev" / "wn-agent.sock",
+                account_id_hex="11" * 32,
             )
 
             config = self.module.load_config(config_path)
+            backups = sorted(home.glob("config.yaml.*.bak"))
 
         self.assertEqual(config["model"], "gpt-4o")
         self.assertEqual(config["agent"]["max_turns"], 42)
         self.assertFalse(config["streaming"]["enabled"])
-        self.assertEqual(config["streaming"]["transport"], "draft")
+        self.assertNotIn("transport", config["streaming"])
         self.assertEqual(config["streaming"]["edit_interval"], 0.5)
         self.assertEqual(config["display"]["tool_progress"], "all")
         self.assertEqual(
             config["display"]["platforms"]["telegram"]["tool_progress"],
             "verbose",
         )
+        self.assertEqual(
+            config["platforms"]["telegram"]["extra"]["bot_token_file"],
+            "/secret/token",
+        )
+        self.assertEqual(
+            config["platforms"]["marmot"]["extra"]["account_id_hex"],
+            "11" * 32,
+        )
+        self.assertEqual(len(backups), 1)
         marmot = config["display"]["platforms"]["marmot"]
         self.assertFalse(marmot["streaming"])
         self.assertEqual(marmot["tool_progress"], "new")
@@ -106,25 +134,26 @@ class ConfigureGatewayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.module.parse_bool("maybe", name="streaming")
 
-    def test_transport_off_disables_platform_streaming(self):
+    def test_can_update_global_streaming_when_explicit(self):
         with tempfile.TemporaryDirectory() as tempdir:
             home = Path(tempdir)
             config_path = self.module.configure_gateway_config(
                 hermes_home=home,
                 platform="marmot",
                 streaming_enabled=True,
-                streaming_transport="off",
+                streaming_transport="auto",
                 tool_progress="off",
                 interim_assistant_messages=False,
                 long_running_notifications=False,
                 busy_ack_detail=False,
+                configure_global_streaming=True,
             )
 
             config = self.module.load_config(config_path)
 
         self.assertTrue(config["streaming"]["enabled"])
-        self.assertEqual(config["streaming"]["transport"], "off")
-        self.assertFalse(config["display"]["platforms"]["marmot"]["streaming"])
+        self.assertEqual(config["streaming"]["transport"], "auto")
+        self.assertTrue(config["display"]["platforms"]["marmot"]["streaming"])
 
 
 if __name__ == "__main__":
