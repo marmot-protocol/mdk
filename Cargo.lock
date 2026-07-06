@@ -2018,6 +2018,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "incident-replay"
+version = "0.9.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

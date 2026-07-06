@@ -1,0 +1,22 @@
+{
+  "schema_version": "marmot-agent-state/v1",
+  "events": [
+    { "kind": { "type": "epoch_confirmed", "epoch": 30 } },
+    {
+      "kind": {
+        "type": "fork_resolution",
+        "source_epoch": 30,
+        "candidate_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "incumbent_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "invalidated_msg_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "winner": "incumbent"
+      }
+    },
+    { "kind": { "type": "epoch_rolled_back", "epoch": 31 } }
+  ],
+  "derived_projections": {
+    "pagination": {
+      "convergence_runs": { "has_more": false, "limit": 500, "offset": 0, "returned": 0 }
+    }
+  }
+}

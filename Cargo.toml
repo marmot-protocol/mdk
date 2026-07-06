@@ -7,6 +7,7 @@ members = [
     "crates/cgka-session",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
+    "crates/incident-replay",
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
     "crates/transport-quic-stream",
