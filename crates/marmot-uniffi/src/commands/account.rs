@@ -1,6 +1,7 @@
 //! Account lifecycle, identity, relay-list, key-package, and profile commands.
 
-use marmot_app::{AccountSetupRequest, UserProfileMetadata};
+use cgka_traits::TransportEndpoint;
+use marmot_app::{AccountSetupRequest, UserProfileMetadata, default_directory_discovery_relays};
 
 use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi};
 use crate::errors::MarmotKitError;
@@ -106,6 +107,7 @@ impl Marmot {
             identity: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -133,6 +135,7 @@ impl Marmot {
             identity: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -165,6 +168,7 @@ impl Marmot {
             identity: None,
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
+            discovery_relays: ffi_discovery_relays(&bootstrap_relays),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -381,4 +385,14 @@ impl Marmot {
             .await?;
         Ok(pushed.into())
     }
+}
+
+fn ffi_discovery_relays(bootstrap_relays: &[String]) -> Vec<TransportEndpoint> {
+    let mut relays = endpoints(bootstrap_relays);
+    for relay in default_directory_discovery_relays() {
+        if !relays.contains(&relay) {
+            relays.push(relay);
+        }
+    }
+    relays
 }

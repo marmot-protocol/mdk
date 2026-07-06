@@ -323,6 +323,7 @@ pub(crate) fn app_runtime_account_setup_request(
                 identity: None,
                 default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
+                discovery_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
                 publish_missing_relay_lists: false,
                 publish_initial_key_package: true,
             }))
@@ -343,6 +344,7 @@ pub(crate) fn app_runtime_account_setup_request(
                 identity: Some(identity),
                 default_relays: crate::relay_endpoints(cli.daemon_default_account_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
+                discovery_relays: crate::relay_endpoints(cli.daemon_discovery_relays.clone())?,
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
             }))
@@ -372,6 +374,7 @@ pub(crate) fn app_runtime_account_setup_request(
                 identity: identity.clone(),
                 default_relays: crate::relay_endpoints(default_relays.clone())?,
                 bootstrap_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
+                discovery_relays: crate::relay_endpoints(bootstrap_relays.clone())?,
                 publish_missing_relay_lists: *publish_missing_relay_lists,
                 publish_initial_key_package: false,
             }))

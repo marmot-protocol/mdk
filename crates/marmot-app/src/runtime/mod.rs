@@ -677,6 +677,7 @@ pub struct AccountSetupRequest {
     pub identity: Option<String>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    pub discovery_relays: Vec<TransportEndpoint>,
     pub publish_missing_relay_lists: bool,
     pub publish_initial_key_package: bool,
 }
@@ -3416,17 +3417,23 @@ const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[
     "wss://nos.lol",
 ];
 
+pub fn default_directory_discovery_relays() -> Vec<TransportEndpoint> {
+    DEFAULT_DISCOVERY_INDEXER_RELAYS
+        .iter()
+        .map(|relay| TransportEndpoint((*relay).to_string()))
+        .collect()
+}
+
 /// Discovery relay set for the existing-account directory preflight.
 ///
-/// Unions the caller-supplied setup relays with the default public indexers so
+/// Unions the caller-supplied setup relays with an explicit discovery set so
 /// discovery reaches wherever a pre-existing identity actually published its
 /// kind:10002/kind:0, without dropping any indexers a caller passes explicitly.
 fn directory_discovery_relays_for_setup(request: &AccountSetupRequest) -> Vec<TransportEndpoint> {
     let mut relays = directory_bootstrap_relays_for_setup(request);
-    for indexer in DEFAULT_DISCOVERY_INDEXER_RELAYS {
-        let endpoint = TransportEndpoint((*indexer).to_string());
-        if !relays.contains(&endpoint) {
-            relays.push(endpoint);
+    for endpoint in &request.discovery_relays {
+        if !relays.contains(endpoint) {
+            relays.push(endpoint.clone());
         }
     }
     relays
