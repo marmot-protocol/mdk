@@ -80,6 +80,13 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: same-epoch invite commit race.
 - Expected: one invite branch wins, the other is invalidated, and active clients converge on the same member set.
 
+### `convergence-committer-selected/v1`
+
+- File: `vectors/convergence-committer-selected.v1.json`
+- Setup: Alice and Bob are both admins; each invites a different member from the same epoch. Carol is a passive observer who commits nothing.
+- Pressure: two competing privileged commits reach Carol at once, so her convergence selector — not the fork-recovery seam — picks the canonical branch.
+- Expected: Carol's settled `convergence_decision` selects the branch by authenticated committer identity (`tip_committer`) at tip epoch 2, with no app-witness quorum.
+
 ### `drop-queued/v1`
 
 - File: `vectors/drop-queued.v1.json`

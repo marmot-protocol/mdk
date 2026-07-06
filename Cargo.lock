@@ -718,6 +718,7 @@ dependencies = [
  "cgka-engine",
  "cgka-traits",
  "hex",
+ "marmot-forensics",
  "nostr",
  "openmls",
  "openmls_rust_crypto",

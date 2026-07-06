@@ -1,0 +1,106 @@
+{
+  "scenario_name": "convergence-committer-selected/v1",
+  "vector_version": "1",
+  "conformance_version": "0.9.1",
+  "seed": null,
+  "scenario": {
+    "name": "convergence-committer-selected/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob",
+      "carol",
+      "david",
+      "eve"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "convergence",
+        "invitees": [
+          "bob",
+          "carol"
+        ],
+        "required_features": [],
+        "initial_admins": [
+          "bob"
+        ],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "invite_members",
+        "inviter": "alice",
+        "invitees": [
+          "david"
+        ],
+        "pending": "alice-invite"
+      },
+      {
+        "type": "invite_members",
+        "inviter": "bob",
+        "invitees": [
+          "eve"
+        ],
+        "pending": "bob-invite"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "alice-invite"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "bob-invite"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "carol"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "carol"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "convergence_decision",
+      "client": "carol",
+      "selected_tip_epoch": 2,
+      "decisive_rule": "tip_committer",
+      "witness_quorum_met": false
+    }
+  ]
+}

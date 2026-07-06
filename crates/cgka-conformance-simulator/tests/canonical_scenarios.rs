@@ -7,10 +7,10 @@
 use cgka_conformance_simulator::{
     ClientBuilder, EpochChangeObservation, GeneratedScenarioCase, HarnessClient,
     PendingResolutionObservation, ScenarioReport, ScenarioSpec, ScenarioStep, ScenarioTrace,
-    TraceExpectation, TransportBus, VectorFixture, generate_convergence_chaos_family,
-    generate_convergence_e2e_delivery_family, generate_send_leave_family, observe_client,
-    run_generated_case_report, run_scenario_report, run_scenario_report_with_outcomes,
-    run_scenario_spec, run_vector_fixture_report,
+    TraceExpectation, TransportBus, VectorFixture, compare_trace_expectations,
+    generate_convergence_chaos_family, generate_convergence_e2e_delivery_family,
+    generate_send_leave_family, observe_client, run_generated_case_report, run_scenario_report,
+    run_scenario_report_with_outcomes, run_scenario_spec, run_vector_fixture_report,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::openmls_projection::{OpenMlsContentKind, project_mls_message};
@@ -282,6 +282,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch_changes: vec![],
                     app_invalidations: vec![],
                     recoveries: vec![],
+                    convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
                     client: "bob".into(),
@@ -298,6 +299,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch_changes: vec![],
                     app_invalidations: vec![],
                     recoveries: vec![],
+                    convergence_decisions: vec![],
                 },
                 cgka_conformance_simulator::ClientObservation {
                     client: "carol".into(),
@@ -314,6 +316,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     epoch_changes: vec![],
                     app_invalidations: vec![],
                     recoveries: vec![],
+                    convergence_decisions: vec![],
                 },
             ],
         }
@@ -1951,4 +1954,90 @@ async fn welcome_before_commit_rejects_commit_echo_cleanly_via_harness() {
         "expected welcome to be processed: {outcomes:?}"
     );
     assert!(saw_peel_failed, "expected stale peel failure: {outcomes:?}");
+}
+
+/// End-to-end proof of the convergence assert surface: an observer's engine
+/// makes a real `convergence_decision`, the harness recorder captures it, and it
+/// is asserted through `TraceExpectation::ConvergenceDecision`. Two admins invite
+/// different members at the same epoch, so carol's convergence selects the
+/// canonical branch by authenticated committer identity — deterministic, and
+/// distinct from a witness-decided win (covered by the vector.rs unit tests).
+#[tokio::test]
+async fn harness_captures_and_asserts_convergence_decision() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut david = ClientBuilder::new(pad32(b"david"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut eve = ClientBuilder::new(pad32(b"eve"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (_group_id, pending) = alice
+        .create_group_with_admins(
+            "convergence-decision-capture",
+            vec![bob_kp, carol_kp],
+            vec![],
+            vec![bob.member_id()],
+        )
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+    // Discard setup-phase captures so the assertion sees only the contested
+    // convergence decision under test.
+    for client in [&mut alice, &mut bob, &mut carol] {
+        client.drain_events();
+        client.clear_audit_capture();
+    }
+
+    // Two admins invite different members at the same source epoch: two branches.
+    let david_kp = david.fresh_key_package().await;
+    let eve_kp = eve.fresh_key_package().await;
+    let alice_pending = alice.invite(vec![david_kp]).await;
+    let bob_pending = bob.invite(vec![eve_kp]).await;
+    alice.confirm(alice_pending).await;
+    bob.confirm(bob_pending).await;
+
+    // Carol ingests both commits and runs convergence, which selects the
+    // canonical branch. Both commits are privileged admin invites with no
+    // app-witness quorum, so the committer-identity rule is decisive.
+    bus.deliver_all();
+    let carol_outcomes = carol.tick().await;
+    assert_tick_reached_convergence("carol", &carol_outcomes);
+
+    let observed = ScenarioTrace {
+        name: "convergence-decision-capture".into(),
+        pending_resolutions: Vec::new(),
+        errors: Vec::new(),
+        admin_policies: Vec::new(),
+        observations: vec![observe_client("carol", &mut carol)],
+    };
+    let failures = compare_trace_expectations(
+        None,
+        &[TraceExpectation::ConvergenceDecision {
+            client: Some("carol".into()),
+            selected_branch_id: None,
+            selected_tip_epoch: Some(2),
+            decisive_rule: Some("tip_committer".into()),
+            witness_quorum_met: Some(false),
+            min_app_witness_score: None,
+        }],
+        &observed,
+    );
+    assert!(
+        failures.is_empty(),
+        "carol should observe the committer-decided convergence decision: {failures:#?}"
+    );
 }

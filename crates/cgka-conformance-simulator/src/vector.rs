@@ -9,6 +9,7 @@ use cgka_traits::engine::{
     AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
     GroupStateChange,
 };
+use marmot_forensics::AuditEventKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -129,6 +130,30 @@ pub enum TraceExpectation {
         recovered_epoch: Option<u64>,
         #[serde(default)]
         winner_differs_from_invalidated: bool,
+    },
+    /// Assert against the client's **settled** convergence decision: the last
+    /// convergence pass that actually evaluated a candidate set. Not count-based
+    /// like [`Self::RecoverySummary`], and deliberately not any-match — the
+    /// engine emits one decision per settle pass, and an earlier pass can select
+    /// a branch a later pass supersedes, so any-match would let a vector bind to
+    /// a superseded intermediate (or a trailing no-candidate pass). A field left
+    /// `None` is not checked; `min_app_witness_score` asserts the winning branch
+    /// scored at least that many app witnesses. With `client` set, the scope is
+    /// that client's settled decision; with `client` `None`, any observed
+    /// client's settled decision.
+    ConvergenceDecision {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_branch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_tip_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decisive_rule: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness_quorum_met: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_app_witness_score: Option<u64>,
     },
 }
 
@@ -369,6 +394,27 @@ impl TraceExpectation {
                     mismatches,
                 );
             }
+            TraceExpectation::ConvergenceDecision {
+                client,
+                selected_branch_id,
+                selected_tip_epoch,
+                decisive_rule,
+                witness_quorum_met,
+                min_app_witness_score,
+            } => {
+                compare_convergence_decision(
+                    ConvergenceDecisionExpectation {
+                        client: client.as_deref(),
+                        selected_branch_id: selected_branch_id.as_deref(),
+                        selected_tip_epoch: *selected_tip_epoch,
+                        decisive_rule: decisive_rule.as_deref(),
+                        witness_quorum_met: *witness_quorum_met,
+                        min_app_witness_score: *min_app_witness_score,
+                    },
+                    observed,
+                    mismatches,
+                );
+            }
         }
     }
 }
@@ -450,6 +496,96 @@ fn compare_recoveries(
     }
 }
 
+struct ConvergenceDecisionExpectation<'a> {
+    client: Option<&'a str>,
+    selected_branch_id: Option<&'a str>,
+    selected_tip_epoch: Option<u64>,
+    decisive_rule: Option<&'a str>,
+    witness_quorum_met: Option<bool>,
+    min_app_witness_score: Option<u64>,
+}
+
+impl ConvergenceDecisionExpectation<'_> {
+    fn matches(&self, decision: &ConvergenceDecisionObservation) -> bool {
+        self.selected_branch_id
+            .is_none_or(|id| decision.selected_branch_id.as_deref() == Some(id))
+            && self
+                .selected_tip_epoch
+                .is_none_or(|epoch| decision.selected_tip_epoch == Some(epoch))
+            && self
+                .decisive_rule
+                .is_none_or(|rule| decision.decisive_rule.as_deref() == Some(rule))
+            && self
+                .witness_quorum_met
+                .is_none_or(|met| decision.witness_quorum_met == met)
+            && self.min_app_witness_score.is_none_or(|min| {
+                decision
+                    .selected_app_witness_score
+                    .is_some_and(|score| score >= min)
+            })
+    }
+
+    fn expected_json(&self) -> Value {
+        json!({
+            "client": self.client,
+            "selected_branch_id": self.selected_branch_id,
+            "selected_tip_epoch": self.selected_tip_epoch,
+            "decisive_rule": self.decisive_rule,
+            "witness_quorum_met": self.witness_quorum_met,
+            "min_app_witness_score": self.min_app_witness_score,
+        })
+    }
+}
+
+/// The client's settled convergence decision: the last pass that actually
+/// evaluated a candidate set. The engine emits one decision per settle pass, so
+/// this skips both superseded intermediates and trailing no-candidate passes.
+fn settled_decision(
+    decisions: &[ConvergenceDecisionObservation],
+) -> Option<&ConvergenceDecisionObservation> {
+    decisions
+        .iter()
+        .rev()
+        .find(|decision| decision.candidate_count > 0)
+}
+
+fn compare_convergence_decision(
+    expectation: ConvergenceDecisionExpectation<'_>,
+    observed: &ScenarioTrace,
+    mismatches: &mut Vec<ExpectationFailure>,
+) {
+    let settled: Vec<&ConvergenceDecisionObservation> = match expectation.client {
+        Some(client) => match client_observation(observed, client) {
+            Some(observation) => settled_decision(&observation.convergence_decisions)
+                .into_iter()
+                .collect(),
+            None => {
+                mismatches.push(ExpectationFailure {
+                    kind: "missing_client_observation".into(),
+                    message: format!("missing observation for client {client}"),
+                    expected: expectation.expected_json(),
+                    actual: Value::Null,
+                });
+                return;
+            }
+        },
+        None => observed
+            .observations
+            .iter()
+            .filter_map(|observation| settled_decision(&observation.convergence_decisions))
+            .collect(),
+    };
+    if settled.iter().any(|decision| expectation.matches(decision)) {
+        return;
+    }
+    mismatches.push(ExpectationFailure {
+        kind: "missing_convergence_decision".into(),
+        message: "no settled convergence decision matched the expectation".into(),
+        expected: expectation.expected_json(),
+        actual: json!(settled),
+    });
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioTrace {
     pub name: String,
@@ -510,6 +646,11 @@ pub struct ClientObservation {
     #[serde(default)]
     pub app_invalidations: Vec<AppInvalidationObservation>,
     pub recoveries: Vec<ForkRecoveryObservation>,
+    /// Convergence decisions the engine emitted, captured via the forensic
+    /// recorder (no `GroupEvent` carries them). Defaulted for backward
+    /// compatibility with serialized traces that predate the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub convergence_decisions: Vec<ConvergenceDecisionObservation>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,8 +716,69 @@ pub struct RecoveryOrderingKeyObservation {
     pub commit_digest: String,
 }
 
+/// A convergence decision projected from an
+/// [`AuditEventKind::ConvergenceDecision`] down to the scalar facts a vector can
+/// assert on. The raw audit event carries free-form `serde_json::Value` rule
+/// traces that are not `Eq`; this projection stays comparable and
+/// implementation-neutral.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergenceDecisionObservation {
+    pub current_tip_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_tip_epoch: Option<u64>,
+    /// `rule_name` of the selector rule the engine marked decisive, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisive_rule: Option<String>,
+    /// Whether the winning branch met the app-witness quorum.
+    #[serde(default)]
+    pub witness_quorum_met: bool,
+    /// App-witness score of the winning branch, when the selector scored one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_app_witness_score: Option<u64>,
+    pub candidate_count: usize,
+}
+
+fn observe_convergence_decision(kind: &AuditEventKind) -> Option<ConvergenceDecisionObservation> {
+    let AuditEventKind::ConvergenceDecision {
+        current_tip_epoch,
+        candidates,
+        rule_trace,
+        selected_branch_id,
+        selected_tip_epoch,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    let selected_score = selected_branch_id
+        .as_ref()
+        .and_then(|id| {
+            candidates
+                .iter()
+                .find(|candidate| &candidate.branch_id == id)
+        })
+        .and_then(|candidate| candidate.score.as_ref());
+    Some(ConvergenceDecisionObservation {
+        current_tip_epoch: *current_tip_epoch,
+        selected_branch_id: selected_branch_id.clone(),
+        selected_tip_epoch: *selected_tip_epoch,
+        decisive_rule: rule_trace
+            .iter()
+            .find(|rule| rule.decisive == Some(true))
+            .map(|rule| rule.rule_name.clone()),
+        witness_quorum_met: selected_score
+            .and_then(|score| score.witness_quorum_met)
+            .unwrap_or(false),
+        selected_app_witness_score: selected_score.and_then(|score| score.app_witness_score),
+        candidate_count: candidates.len(),
+    })
+}
+
 pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> ClientObservation {
     let events = client.drain_events();
+    let captured_decisions = client.drain_convergence_decisions();
     let event_counts = ClientEventCounts {
         message_received: events
             .iter()
@@ -702,6 +904,10 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
                 _ => None,
             })
             .collect(),
+        convergence_decisions: captured_decisions
+            .iter()
+            .filter_map(observe_convergence_decision)
+            .collect(),
     }
 }
 
@@ -760,6 +966,7 @@ mod tests {
             epoch_changes: Vec::new(),
             app_invalidations: Vec::new(),
             recoveries: Vec::new(),
+            convergence_decisions: Vec::new(),
         }
     }
 
@@ -770,6 +977,24 @@ mod tests {
             errors: Vec::new(),
             admin_policies: Vec::new(),
             observations,
+        }
+    }
+
+    fn convergence_decision(
+        selected_branch_id: &str,
+        selected_tip_epoch: u64,
+        decisive_rule: &str,
+        witness_quorum_met: bool,
+        selected_app_witness_score: u64,
+    ) -> ConvergenceDecisionObservation {
+        ConvergenceDecisionObservation {
+            current_tip_epoch: selected_tip_epoch.saturating_sub(1),
+            selected_branch_id: Some(selected_branch_id.into()),
+            selected_tip_epoch: Some(selected_tip_epoch),
+            decisive_rule: Some(decisive_rule.into()),
+            witness_quorum_met,
+            selected_app_witness_score: Some(selected_app_witness_score),
+            candidate_count: 2,
         }
     }
 
@@ -881,5 +1106,273 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn observe_convergence_decision_projects_selected_branch_scalars() {
+        use marmot_forensics::{ConvergenceCandidate, ConvergenceRuleEvaluation, ConvergenceScore};
+
+        let scored = |branch: &str, quorum: bool, app_witnesses: u64| ConvergenceCandidate {
+            branch_id: branch.into(),
+            tip_epoch: 2,
+            score: Some(ConvergenceScore {
+                witness_quorum_met: Some(quorum),
+                app_witness_score: Some(app_witnesses),
+                ..ConvergenceScore::default()
+            }),
+            ..ConvergenceCandidate::default()
+        };
+        let kind = AuditEventKind::ConvergenceDecision {
+            current_tip_epoch: 1,
+            max_rewind_commits: 5,
+            candidates: vec![scored("winner", true, 2), scored("loser", false, 0)],
+            rule_trace: vec![ConvergenceRuleEvaluation {
+                rule_name: "witness_quorum_met".into(),
+                scope: None,
+                candidate_branch_id: None,
+                other_candidate_branch_id: None,
+                inputs: None,
+                result: Value::Null,
+                decisive: Some(true),
+                selected_branch_id: None,
+                rejected_branch_id: None,
+            }],
+            selected_branch_id: Some("winner".into()),
+            selected_fork_epoch: Some(1),
+            selected_tip_epoch: Some(2),
+            losing_branch_ids: vec!["loser".into()],
+            error_kinds: Vec::new(),
+        };
+
+        let projected = observe_convergence_decision(&kind).expect("projects a decision");
+        assert_eq!(projected.selected_branch_id.as_deref(), Some("winner"));
+        assert_eq!(projected.selected_tip_epoch, Some(2));
+        assert_eq!(
+            projected.decisive_rule.as_deref(),
+            Some("witness_quorum_met")
+        );
+        assert!(
+            projected.witness_quorum_met,
+            "winner met the app-witness quorum"
+        );
+        assert_eq!(projected.selected_app_witness_score, Some(2));
+        assert_eq!(projected.candidate_count, 2);
+    }
+
+    #[test]
+    fn observe_convergence_decision_ignores_unrelated_kind() {
+        let kind = AuditEventKind::RecorderStarted {
+            recorder: "test".into(),
+        };
+        assert!(observe_convergence_decision(&kind).is_none());
+    }
+
+    #[test]
+    fn convergence_decision_expectation_distinguishes_witness_win_from_tiebreak() {
+        let mut carol = observation("carol", 2, 4);
+        carol.convergence_decisions = vec![convergence_decision(
+            "witnessed",
+            2,
+            "witness_quorum_met",
+            true,
+            2,
+        )];
+        let observed = trace(vec![carol]);
+
+        // The witness-decided winner is asserted through the new expectation.
+        let matched = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: Some("carol".into()),
+                selected_branch_id: Some("witnessed".into()),
+                selected_tip_epoch: Some(2),
+                decisive_rule: Some("witness_quorum_met".into()),
+                witness_quorum_met: Some(true),
+                min_app_witness_score: Some(2),
+            }],
+            &observed,
+        );
+        assert!(matched.is_empty(), "witness win should match: {matched:#?}");
+
+        // The same decision must NOT satisfy a digest-tiebreak expectation — the
+        // decisive rule and quorum flag are what tell the two apart.
+        let mismatch = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: Some("carol".into()),
+                selected_branch_id: None,
+                selected_tip_epoch: None,
+                decisive_rule: Some("tip_digest".into()),
+                witness_quorum_met: Some(false),
+                min_app_witness_score: None,
+            }],
+            &observed,
+        );
+        assert_eq!(
+            mismatch.len(),
+            1,
+            "digest expectation must not match: {mismatch:#?}"
+        );
+        assert_eq!(mismatch[0].kind, "missing_convergence_decision");
+    }
+
+    #[test]
+    fn convergence_decision_min_app_witness_score_is_a_threshold() {
+        let mut carol = observation("carol", 2, 4);
+        carol.convergence_decisions = vec![convergence_decision(
+            "winner",
+            2,
+            "app_witness_score",
+            true,
+            3,
+        )];
+        let observed = trace(vec![carol]);
+
+        let at_threshold = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: None,
+                selected_branch_id: None,
+                selected_tip_epoch: None,
+                decisive_rule: None,
+                witness_quorum_met: None,
+                min_app_witness_score: Some(3),
+            }],
+            &observed,
+        );
+        assert!(
+            at_threshold.is_empty(),
+            "score 3 meets min 3: {at_threshold:#?}"
+        );
+
+        let above_threshold = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: None,
+                selected_branch_id: None,
+                selected_tip_epoch: None,
+                decisive_rule: None,
+                witness_quorum_met: None,
+                min_app_witness_score: Some(4),
+            }],
+            &observed,
+        );
+        assert_eq!(above_threshold.len(), 1, "score 3 is below min 4");
+    }
+
+    #[test]
+    fn convergence_decision_expectation_reports_missing_client() {
+        let mut carol = observation("carol", 2, 4);
+        carol.convergence_decisions =
+            vec![convergence_decision("winner", 2, "tip_committer", false, 0)];
+        let observed = trace(vec![carol]);
+
+        let failures = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: Some("dave".into()),
+                selected_branch_id: None,
+                selected_tip_epoch: None,
+                decisive_rule: None,
+                witness_quorum_met: None,
+                min_app_witness_score: None,
+            }],
+            &observed,
+        );
+        assert_eq!(failures.len(), 1, "missing client must fail: {failures:#?}");
+        assert_eq!(failures[0].kind, "missing_client_observation");
+    }
+
+    #[test]
+    fn convergence_decision_expectation_matches_settled_not_superseded() {
+        // The engine emits a decision per settle pass. An early pass selected a
+        // single-candidate branch; a later pass, once the competing commit
+        // arrived, superseded it (committer-decided among two). The expectation
+        // must bind to the settled decision, never the superseded intermediate.
+        let superseded = ConvergenceDecisionObservation {
+            current_tip_epoch: 1,
+            selected_branch_id: Some("superseded".into()),
+            selected_tip_epoch: Some(2),
+            decisive_rule: None,
+            witness_quorum_met: false,
+            selected_app_witness_score: Some(0),
+            candidate_count: 1,
+        };
+        let settled = convergence_decision("settled", 2, "tip_committer", false, 0);
+        let mut carol = observation("carol", 2, 4);
+        carol.convergence_decisions = vec![superseded, settled];
+        let observed = trace(vec![carol]);
+
+        let matched = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: Some("carol".into()),
+                selected_branch_id: Some("settled".into()),
+                selected_tip_epoch: Some(2),
+                decisive_rule: Some("tip_committer".into()),
+                witness_quorum_met: Some(false),
+                min_app_witness_score: None,
+            }],
+            &observed,
+        );
+        assert!(
+            matched.is_empty(),
+            "settled decision should match: {matched:#?}"
+        );
+
+        let superseded_match = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: Some("carol".into()),
+                selected_branch_id: Some("superseded".into()),
+                selected_tip_epoch: None,
+                decisive_rule: None,
+                witness_quorum_met: None,
+                min_app_witness_score: None,
+            }],
+            &observed,
+        );
+        assert_eq!(
+            superseded_match.len(),
+            1,
+            "a superseded intermediate must not match: {superseded_match:#?}"
+        );
+        assert_eq!(superseded_match[0].kind, "missing_convergence_decision");
+    }
+
+    #[test]
+    fn convergence_decision_expectation_skips_trailing_empty_pass() {
+        // A settled selection followed by a no-candidate convergence pass: the
+        // settled decision is the one that evaluated candidates, not the trailer.
+        let settled = convergence_decision("settled", 2, "tip_committer", false, 0);
+        let trailing_empty = ConvergenceDecisionObservation {
+            current_tip_epoch: 2,
+            selected_branch_id: None,
+            selected_tip_epoch: None,
+            decisive_rule: None,
+            witness_quorum_met: false,
+            selected_app_witness_score: None,
+            candidate_count: 0,
+        };
+        let mut carol = observation("carol", 2, 4);
+        carol.convergence_decisions = vec![settled, trailing_empty];
+        let observed = trace(vec![carol]);
+
+        let matched = compare_trace_expectations(
+            None,
+            &[TraceExpectation::ConvergenceDecision {
+                client: Some("carol".into()),
+                selected_branch_id: None,
+                selected_tip_epoch: None,
+                decisive_rule: Some("tip_committer".into()),
+                witness_quorum_met: None,
+                min_app_witness_score: None,
+            }],
+            &observed,
+        );
+        assert!(
+            matched.is_empty(),
+            "must skip the empty trailing pass and match the settled decision: {matched:#?}"
+        );
     }
 }

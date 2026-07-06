@@ -104,6 +104,18 @@
       "next": "Extend the trace format so the selected branch member identity can be asserted portably."
     },
     {
+      "id": "convergence-committer-selected/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "convergence-committer-selected.v1.json",
+      "coverage": [
+        "observer-side convergence decision (not fork recovery)",
+        "committer-identity decisive rule",
+        "settled convergence_decision assertion"
+      ],
+      "next": "Add a witness-decided companion vector once engine-driven app-witness quorum is stageable in the harness."
+    },
+    {
       "id": "drop-queued/v1",
       "kind": "scenario_vector",
       "status": "portable",
