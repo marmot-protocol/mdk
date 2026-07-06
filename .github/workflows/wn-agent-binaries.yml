@@ -414,12 +414,12 @@ jobs:
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "WN Agent $version" --notes-file "$notes" --prerelease
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "v$version - wn-agent" --notes-file "$notes" --prerelease
           else
             gh release create "$tag" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
-              --title "WN Agent $version" \
+              --title "v$version - wn-agent" \
               --notes-file "$notes" \
               --prerelease
           fi

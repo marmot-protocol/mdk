@@ -285,10 +285,10 @@ jobs:
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "MarmotKit $version" --notes-file "$notes"
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "v$version - MarmotKit" --notes-file "$notes"
           else
             gh release create "$tag" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "MarmotKit $version" \
+              --title "v$version - MarmotKit" \
               --notes-file "$notes"
           fi

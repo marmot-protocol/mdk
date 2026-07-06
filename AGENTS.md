@@ -77,6 +77,8 @@ The canonical protocol specification lives in
 - Keep multi-step state changes torn-write-free: validate before mutating, compensate every applied step on the error
   path, record intent before external side effects, and never confirm work that reached no one. See
   `docs/marmot-architecture/overview/multi-step-state-changes.md`.
+- Title GitHub Releases with the version first so release lists group by cohort: whole-workspace `v<version> - MDK`,
+  WN Agent `v<version> - wn-agent`, and MarmotKit `v<version> - MarmotKit`.
 - When adding an `AGENTS.md`, create a sibling `CLAUDE.md` symlink to it.
 
 ## Verification

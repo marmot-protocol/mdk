@@ -54,6 +54,12 @@ Use the same version number in:
 The tag prefix names the artifact track. The numeric version names the compatibility cohort. It is fine for one track to
 skip versions when it has no changed artifact to publish. Do not reuse the same track/version tag for a different commit.
 
+Title GitHub Releases with the version first so release lists group artifacts by compatibility cohort:
+
+- whole-workspace source releases: `v0.9.2 - MDK`;
+- WN Agent releases: `v0.9.2 - wn-agent`;
+- MarmotKit binding releases: `v0.9.2 - MarmotKit`.
+
 Use a new version when public behavior changes. That includes:
 
 - UniFFI records, enums, object methods, async methods, or error variants;
