@@ -5,7 +5,7 @@ All notable changes to `wn-cli` (previously `darkmatter-cli`) are tracked here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This crate uses semantic
 versioning through the workspace version in the root `Cargo.toml`.
 
-## [Unreleased]
+## [0.9.2] - 2026-07-06
 
 ### Changed
 
