@@ -187,13 +187,20 @@ mod tests {
         // Uppercase + surrounding whitespace canonicalize to lowercase hex so the
         // case-sensitive storage match and live filter compare against the same form.
         assert_eq!(
-            optional_group_id_hex(Some(format!(" {} ", "AB".repeat(32)))).unwrap(),
-            Some("ab".repeat(32))
+            optional_group_id_hex(Some(format!(" {} ", "AB".repeat(16)))).unwrap(),
+            Some("ab".repeat(16))
+        );
+        // MLS group ids are opaque variable-length bytes. MDK-created OpenMLS
+        // ids are 16 bytes today, but the FFI boundary must not reject other
+        // non-empty lengths before storage/runtime can resolve them.
+        assert_eq!(
+            optional_group_id_hex(Some("ABCD".into())).unwrap(),
+            Some("abcd".into())
         );
         // Invalid hex is rejected rather than silently yielding empty history.
         assert!(optional_group_id_hex(Some("nothex".into())).is_err());
-        // Hex that decodes but is not a Marmot 32-byte group id is rejected at
-        // the FFI boundary instead of surfacing later as UnknownGroup.
-        assert!(optional_group_id_hex(Some("abcd".into())).is_err());
+        // Absurdly large group ids are rejected at the FFI boundary instead of
+        // allocating arbitrary host input.
+        assert!(optional_group_id_hex(Some("ab".repeat(1025))).is_err());
     }
 }
