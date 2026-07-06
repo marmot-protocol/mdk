@@ -7,7 +7,9 @@ use agent_control::{
     AgentControlAccount, AgentControlEnvelope, AgentControlError, AgentControlRequest,
     AgentControlResponse, encode_frame, read_envelope,
 };
-use marmot_app::{nprofile_for_account_id, npub_for_account_id, validate_relay_urls};
+use marmot_app::{
+    account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
+};
 use rand::RngCore;
 use serde::Serialize;
 use thiserror::Error;
@@ -31,6 +33,7 @@ pub struct BootstrapOptions {
     pub auth_token: Option<String>,
     pub relays: Vec<String>,
     pub quic_candidates: Vec<String>,
+    pub allow_welcomers: Vec<String>,
     pub create_if_missing: bool,
     pub publish_key_package: bool,
     pub wait_for_socket: Duration,
@@ -49,6 +52,7 @@ pub struct BootstrapResult {
     pub socket: String,
     pub relays: Vec<String>,
     pub quic_candidates: Vec<String>,
+    pub welcomer_account_ids_hex: Vec<String>,
     pub npub: String,
     pub nprofile: String,
     pub qr_payload: String,
@@ -83,6 +87,8 @@ pub enum BootstrapError {
     ResponseIdMismatch,
     #[error("key package published for unexpected account: expected {expected}, got {actual}")]
     KeyPackageAccountMismatch { expected: String, actual: String },
+    #[error("allowlist updated for unexpected account: expected {expected}, got {actual}")]
+    AllowlistAccountMismatch { expected: String, actual: String },
     #[error("{code}: {message}")]
     ControlRejected { code: String, message: String },
     #[error(transparent)]
@@ -113,6 +119,13 @@ pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult,
     )
     .await?;
 
+    let welcomer_account_ids_hex = bootstrap_allowlist(
+        &client,
+        &account_state.account_id_hex,
+        options.allow_welcomers.clone(),
+    )
+    .await?;
+
     let npub = npub_for_account_id(&account_state.account_id_hex)?;
     let nprofile = nprofile_for_account_id(&account_state.account_id_hex, &options.relays)?;
     let result = BootstrapResult {
@@ -125,6 +138,7 @@ pub async fn run_bootstrap(options: BootstrapOptions) -> Result<BootstrapResult,
         socket: options.socket.display().to_string(),
         relays: options.relays.clone(),
         quic_candidates: options.quic_candidates.clone(),
+        welcomer_account_ids_hex,
         npub,
         nprofile: nprofile.clone(),
         qr_payload: nprofile,
@@ -288,6 +302,40 @@ async fn bootstrap_agent_account(
     })
 }
 
+async fn bootstrap_allowlist(
+    client: &ControlClient,
+    account_id_hex: &str,
+    welcomers: Vec<String>,
+) -> Result<Vec<String>, BootstrapError> {
+    let welcomers = normalize_welcomer_refs(welcomers)?;
+    let mut current = Vec::new();
+    for welcomer_account_id_hex in welcomers {
+        let added = client
+            .request(AgentControlRequest::AllowlistAdd {
+                account_id_hex: account_id_hex.to_owned(),
+                welcomer_account_id_hex,
+            })
+            .await?;
+        ensure_response_type(&added, "allowlist")?;
+        let AgentControlResponse::Allowlist {
+            account_id_hex: echoed_account_id_hex,
+            welcomer_account_ids_hex,
+        } = added.payload
+        else {
+            return Err(unexpected_response("allowlist", &added.payload));
+        };
+        let echoed_account_id_hex = normalize_account_id_hex(&echoed_account_id_hex)?;
+        if echoed_account_id_hex != account_id_hex {
+            return Err(BootstrapError::AllowlistAccountMismatch {
+                expected: account_id_hex.to_owned(),
+                actual: echoed_account_id_hex,
+            });
+        }
+        current = welcomer_account_ids_hex;
+    }
+    Ok(current)
+}
+
 fn local_signing_accounts(accounts: Vec<AgentControlAccount>) -> Vec<AgentControlAccount> {
     accounts
         .into_iter()
@@ -341,6 +389,16 @@ pub fn normalize_account_id_hex(value: &str) -> Result<String, BootstrapError> {
         return Err(BootstrapError::InvalidAccountIdLength(raw.len()));
     }
     Ok(normalized)
+}
+
+pub fn normalize_welcomer_refs(values: Vec<String>) -> Result<Vec<String>, BootstrapError> {
+    let mut values = values
+        .into_iter()
+        .map(|value| account_id_hex_from_ref(&value).map_err(BootstrapError::App))
+        .collect::<Result<Vec<_>, _>>()?;
+    values.sort();
+    values.dedup();
+    Ok(values)
 }
 
 async fn wait_for_socket(socket_path: &Path, wait_for: Duration) -> Result<(), BootstrapError> {
@@ -543,6 +601,7 @@ mod tests {
     use super::*;
 
     const ACCOUNT_ID: &str = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+    const WELCOMER_ID: &str = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b5";
 
     #[tokio::test]
     async fn bootstrap_creates_agent_account_when_none_exists() {
@@ -689,6 +748,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_adds_allowlisted_welcomers_from_hex_and_npub() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("wn-agent.sock");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server =
+            spawn_mock_server(
+                socket_path.clone(),
+                requests.clone(),
+                |request| match request {
+                    AgentControlRequest::AccountList => AgentControlResponse::AccountList {
+                        accounts: vec![AgentControlAccount {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            label: DEFAULT_BOOTSTRAP_LABEL.to_owned(),
+                            local_signing: true,
+                        }],
+                    },
+                    AgentControlRequest::AccountPublishKeyPackage { account_id_hex } => {
+                        assert_eq!(account_id_hex, ACCOUNT_ID);
+                        AgentControlResponse::KeyPackagePublished {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            key_package_bytes: 1234,
+                        }
+                    }
+                    AgentControlRequest::AllowlistAdd {
+                        account_id_hex,
+                        welcomer_account_id_hex,
+                    } => {
+                        assert_eq!(account_id_hex, ACCOUNT_ID);
+                        assert_eq!(welcomer_account_id_hex, WELCOMER_ID);
+                        AgentControlResponse::Allowlist {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            welcomer_account_ids_hex: vec![WELCOMER_ID.to_owned()],
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                },
+            )
+            .await;
+
+        let mut options = test_options(socket_path);
+        options.allow_welcomers = vec![
+            WELCOMER_ID.to_uppercase(),
+            marmot_app::npub_for_account_id(WELCOMER_ID).unwrap(),
+        ];
+        let result = run_bootstrap(options).await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            result.welcomer_account_ids_hex,
+            vec![WELCOMER_ID.to_owned()]
+        );
+        let recorded = requests.lock().await;
+        assert_eq!(recorded.len(), 3);
+        assert!(matches!(recorded[0], AgentControlRequest::AccountList));
+        assert!(matches!(
+            recorded[1],
+            AgentControlRequest::AccountPublishKeyPackage { .. }
+        ));
+        assert!(matches!(
+            recorded[2],
+            AgentControlRequest::AllowlistAdd { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn bootstrap_rejects_invalid_relay_before_account_ops() {
         let dir = tempfile::tempdir().unwrap();
         let mut options = test_options(dir.path().join("wn-agent.sock"));
@@ -750,6 +874,7 @@ mod tests {
                 .map(|relay| (*relay).to_owned())
                 .collect(),
             quic_candidates: vec![DEFAULT_QUIC_CANDIDATE.to_owned()],
+            allow_welcomers: Vec::new(),
             create_if_missing: true,
             publish_key_package: true,
             wait_for_socket: Duration::from_millis(100),

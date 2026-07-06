@@ -78,35 +78,58 @@ Versioned WN Agent builds publish the `wn-agent` binary, the Hermes Marmot plugi
 Releases under `wn-agent-v*` tags. Hermes itself must already be installed.
 
 ```sh
-WN_AGENT_VERSION=0.9.0
+WN_AGENT_VERSION=0.9.2
 curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
 ```
 
-To install and immediately run `wn-agent bootstrap --qr`:
+For repeatable noninteractive setup:
 
 ```sh
-WN_AGENT_VERSION=0.9.0
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash -s -- --bootstrap
+WN_AGENT_VERSION=0.9.2
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
 ```
 
 The installer puts `wn-agent` in `~/.local/bin`, extracts the Hermes plugin to `~/.hermes/plugins/marmot`, and enables
-the plugin when the `hermes` launcher is on `PATH`.
+the plugin when the `hermes` launcher is on `PATH`. It also starts a same-user `wn-agent` service where supported,
+bootstraps or reuses `~/.marmot-agent`, and patches only Marmot-specific Hermes config entries so existing connectors
+continue to work.
 
 Hermes-specific setup, development helpers, and phone-test commands live in
 [`integrations/hermes/marmot/README.md`](../../integrations/hermes/marmot/README.md).
+
+## OpenClaw Install
+
+The same WN Agent release publishes the OpenClaw Marmot channel plugin and installer:
+
+```sh
+WN_AGENT_VERSION=0.9.2
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
+```
+
+For repeatable noninteractive setup:
+
+```sh
+WN_AGENT_VERSION=0.9.2
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
+```
+
+The OpenClaw installer uses the same `wn-agent` setup path, installs/enables the OpenClaw plugin, and updates only
+`channels.marmot` in OpenClaw config so existing channels continue to work.
 
 ## Cutting A WN Agent Release
 
 After the release commit is merged to `master`, cut a WN Agent release tag with:
 
 ```sh
-just release-wn-agent 0.9.0
+just release-wn-agent 0.9.2
 ```
 
 For a dry run:
 
 ```sh
-just release-wn-agent-dry-run 0.9.0
+just release-wn-agent-dry-run 0.9.2
 ```
 
 The helper checks that:

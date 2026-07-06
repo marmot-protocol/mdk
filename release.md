@@ -162,20 +162,20 @@ Before a WN Agent release, run the normal preflight plus:
 
 ```sh
 cargo test -p agent-connector
-bash scripts/install-hermes-marmot.sh --dry-run
-bash scripts/install-openclaw-marmot.sh --dry-run
+bash scripts/install-hermes-marmot.sh --dry-run --yes
+bash scripts/install-openclaw-marmot.sh --dry-run --yes
 ```
 
 Cut the release tag from the current `origin/master` commit:
 
 ```sh
-just release-wn-agent 0.9.0
+just release-wn-agent 0.9.2
 ```
 
 For a dry run:
 
 ```sh
-just release-wn-agent-dry-run 0.9.0
+just release-wn-agent-dry-run 0.9.2
 ```
 
 The helper checks that the workspace version matches, the working tree is clean, `HEAD` matches `origin/master`, and the
@@ -206,9 +206,9 @@ The installer assets are generated during the release and default to their own `
 
 ```sh
 # Hermes gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.0/install-hermes-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-hermes-marmot.sh | bash
 # OpenClaw gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.0/install-openclaw-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-openclaw-marmot.sh | bash
 ```
 
 ## MarmotKit Binding Release

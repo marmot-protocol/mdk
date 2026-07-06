@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,28 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised on hosts with
 
 VALID_TOOL_PROGRESS = {"off", "new", "all", "verbose"}
 VALID_STREAMING_TRANSPORT = {"auto", "draft", "edit", "off"}
+
+
+def _yaml_string_needs_quotes(text: str) -> bool:
+    if not text:
+        return True
+    lowered = text.lower()
+    return (
+        lowered in {"true", "false", "null", "~", "yes", "no", "on", "off"}
+        or re.fullmatch(r"-?[0-9]+", text) is not None
+        or re.fullmatch(r"-?[0-9]+\.[0-9]+", text) is not None
+    )
+
+
+if yaml is not None:
+    class _MarmotSafeDumper(yaml.SafeDumper):  # type: ignore[misc, name-defined]
+        pass
+
+    def _represent_str(dumper: Any, data: str) -> Any:
+        style = "'" if _yaml_string_needs_quotes(data) else None
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+    _MarmotSafeDumper.add_representer(str, _represent_str)
 
 
 def parse_bool(value: str, *, name: str) -> bool:
@@ -102,6 +126,8 @@ def _format_scalar(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     text = str(value)
+    if _yaml_string_needs_quotes(text):
+        return "'" + text.replace("'", "''") + "'"
     if text and re.fullmatch(r"[A-Za-z0-9_./:@,+-]+", text):
         return text
     return "'" + text.replace("'", "''") + "'"
@@ -110,12 +136,24 @@ def _format_scalar(value: Any) -> str:
 def _simple_yaml_dump(data: dict[str, Any]) -> str:
     lines: list[str] = []
 
+    def emit_sequence(sequence: list[Any], indent: int) -> None:
+        prefix = " " * indent
+        for item in sequence:
+            if isinstance(item, dict):
+                lines.append(f"{prefix}-")
+                emit_mapping(item, indent + 2)
+            else:
+                lines.append(f"{prefix}- {_format_scalar(item)}")
+
     def emit_mapping(mapping: dict[str, Any], indent: int) -> None:
         prefix = " " * indent
         for key, value in mapping.items():
             if isinstance(value, dict):
                 lines.append(f"{prefix}{key}:")
                 emit_mapping(value, indent + 2)
+            elif isinstance(value, list):
+                lines.append(f"{prefix}{key}:")
+                emit_sequence(value, indent + 2)
             else:
                 lines.append(f"{prefix}{key}: {_format_scalar(value)}")
 
@@ -138,7 +176,12 @@ def load_config(path: Path) -> dict[str, Any]:
 
 def dump_config(config: dict[str, Any]) -> str:
     if yaml is not None:
-        return yaml.safe_dump(config, sort_keys=False, default_flow_style=False)
+        return yaml.dump(
+            config,
+            Dumper=_MarmotSafeDumper,
+            sort_keys=False,
+            default_flow_style=False,
+        )
     return _simple_yaml_dump(config)
 
 
@@ -151,6 +194,22 @@ def _ensure_mapping(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return replacement
 
 
+def _clean_list(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    cleaned = [value.strip() for value in values if value and value.strip()]
+    return sorted(dict.fromkeys(cleaned))
+
+
+def _create_backup(config_path: Path) -> Path | None:
+    if not config_path.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = config_path.with_name(f"{config_path.name}.{stamp}.{os.getpid()}.bak")
+    shutil.copy2(config_path, backup_path)
+    return backup_path
+
+
 def configure_gateway_config(
     *,
     hermes_home: Path,
@@ -161,6 +220,13 @@ def configure_gateway_config(
     interim_assistant_messages: bool,
     long_running_notifications: bool,
     busy_ack_detail: bool,
+    agent_home: Path | None = None,
+    socket_path: Path | None = None,
+    account_id_hex: str | None = None,
+    welcomer_allowlist: list[str] | None = None,
+    profile_name_onboarding: bool | None = None,
+    configure_global_streaming: bool = False,
+    backup: bool = True,
 ) -> Path:
     if streaming_transport not in VALID_STREAMING_TRANSPORT:
         valid = ", ".join(sorted(VALID_STREAMING_TRANSPORT))
@@ -174,9 +240,25 @@ def configure_gateway_config(
     config = load_config(config_path)
     effective_streaming = streaming_enabled and streaming_transport != "off"
 
-    streaming = _ensure_mapping(config, "streaming")
-    streaming["enabled"] = streaming_enabled
-    streaming["transport"] = streaming_transport
+    if configure_global_streaming:
+        streaming = _ensure_mapping(config, "streaming")
+        streaming["enabled"] = streaming_enabled
+        streaming["transport"] = streaming_transport
+
+    platform_entries = _ensure_mapping(config, "platforms")
+    platform_entry = _ensure_mapping(platform_entries, platform)
+    extra = _ensure_mapping(platform_entry, "extra")
+    if agent_home is not None:
+        extra["home"] = str(agent_home)
+    if socket_path is not None:
+        extra["socket_path"] = str(socket_path)
+    if account_id_hex:
+        extra["account_id_hex"] = account_id_hex.strip()
+    cleaned_allowlist = _clean_list(welcomer_allowlist)
+    if cleaned_allowlist:
+        extra["welcomer_allowlist"] = ",".join(cleaned_allowlist)
+    if profile_name_onboarding is not None:
+        extra["profile_name_onboarding"] = profile_name_onboarding
 
     display = _ensure_mapping(config, "display")
     platforms = _ensure_mapping(display, "platforms")
@@ -187,6 +269,8 @@ def configure_gateway_config(
     platform_config["long_running_notifications"] = long_running_notifications
     platform_config["busy_ack_detail"] = busy_ack_detail
 
+    if backup:
+        _create_backup(config_path)
     tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
     tmp_path.write_text(dump_config(config), encoding="utf-8")
     os.replace(tmp_path, config_path)
@@ -197,7 +281,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", default=os.environ.get("HERMES_HOME", "~/.hermes"))
     parser.add_argument("--platform", default="marmot")
-    parser.add_argument("--streaming", default=os.environ.get("HERMES_MARMOT_STREAMING", "1"))
+    parser.add_argument("--agent-home", default=os.environ.get("MARMOT_HOME"))
+    parser.add_argument("--socket-path", default=os.environ.get("MARMOT_AGENT_SOCKET"))
+    parser.add_argument("--account-id-hex", default=os.environ.get("MARMOT_ACCOUNT_ID_HEX"))
+    parser.add_argument(
+        "--welcomer-allowlist",
+        action="append",
+        default=[],
+        help="Welcomer account id/npub allowlist entry; may be repeated or comma-separated",
+    )
+    parser.add_argument(
+        "--profile-name-onboarding",
+        default=os.environ.get("MARMOT_PROFILE_NAME_ONBOARDING"),
+    )
+    parser.add_argument("--streaming", default=os.environ.get("HERMES_MARMOT_STREAMING", "0"))
     parser.add_argument(
         "--transport",
         default=os.environ.get("HERMES_MARMOT_STREAMING_TRANSPORT", "auto"),
@@ -220,6 +317,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--busy-ack-detail",
         default=os.environ.get("HERMES_MARMOT_BUSY_ACK_DETAIL", "0"),
     )
+    parser.add_argument(
+        "--configure-global-streaming",
+        action="store_true",
+        help="Also update Hermes' global streaming block; off by default to preserve other connectors",
+    )
+    parser.add_argument("--no-backup", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -239,6 +342,22 @@ def main(argv: list[str] | None = None) -> int:
             name="long-running notifications",
         )
         busy_ack_detail = parse_bool(args.busy_ack_detail, name="busy ack detail")
+        profile_name_onboarding = (
+            None
+            if args.profile_name_onboarding is None
+            else parse_bool(
+                args.profile_name_onboarding,
+                name="profile name onboarding",
+            )
+        )
+        welcomer_allowlist = []
+        env_allowlist = os.environ.get("MARMOT_WELCOMER_ALLOWLIST") or os.environ.get(
+            "MARMOT_DM_ALLOW_FROM"
+        )
+        if env_allowlist:
+            welcomer_allowlist.extend(env_allowlist.split(","))
+        for value in args.welcomer_allowlist:
+            welcomer_allowlist.extend(value.split(","))
         config_path = configure_gateway_config(
             hermes_home=Path(args.home).expanduser(),
             platform=args.platform,
@@ -248,6 +367,13 @@ def main(argv: list[str] | None = None) -> int:
             interim_assistant_messages=interim_assistant_messages,
             long_running_notifications=long_running_notifications,
             busy_ack_detail=busy_ack_detail,
+            agent_home=Path(args.agent_home).expanduser() if args.agent_home else None,
+            socket_path=Path(args.socket_path).expanduser() if args.socket_path else None,
+            account_id_hex=args.account_id_hex,
+            welcomer_allowlist=welcomer_allowlist,
+            profile_name_onboarding=profile_name_onboarding,
+            configure_global_streaming=args.configure_global_streaming,
+            backup=not args.no_backup,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -263,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             f" interim_messages={str(interim_assistant_messages).lower()}"
             f" long_running_notifications={str(long_running_notifications).lower()}"
             f" busy_ack_detail={str(busy_ack_detail).lower()}"
+            f" global_streaming={str(args.configure_global_streaming).lower()}"
         )
     return 0
 

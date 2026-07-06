@@ -101,14 +101,25 @@ else
     exit 1
 fi
 
-marmot-configure-hermes-gateway \
-    --home "$HERMES_HOME" \
-    --streaming "$HERMES_MARMOT_STREAMING" \
-    --transport "$HERMES_MARMOT_STREAMING_TRANSPORT" \
-    --tool-progress "$HERMES_MARMOT_TOOL_PROGRESS" \
-    --interim-messages "$HERMES_MARMOT_INTERIM_MESSAGES" \
-    --long-running-notifications "$HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS" \
+configure_args=(
+    --home "$HERMES_HOME"
+    --agent-home "$MARMOT_HOME"
+    --socket-path "$MARMOT_AGENT_SOCKET"
+    --account-id-hex "${MARMOT_ACCOUNT_ID_HEX:-}"
+    --profile-name-onboarding "$MARMOT_PROFILE_NAME_ONBOARDING"
+    --streaming "$HERMES_MARMOT_STREAMING"
+    --transport "$HERMES_MARMOT_STREAMING_TRANSPORT"
+    --tool-progress "$HERMES_MARMOT_TOOL_PROGRESS"
+    --interim-messages "$HERMES_MARMOT_INTERIM_MESSAGES"
+    --long-running-notifications "$HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS"
     --busy-ack-detail "$HERMES_MARMOT_BUSY_ACK_DETAIL"
+)
+case "$HERMES_MARMOT_STREAMING" in
+    1|true|TRUE|yes|YES|on|ON)
+        configure_args+=(--configure-global-streaming)
+        ;;
+esac
+marmot-configure-hermes-gateway "${configure_args[@]}"
 
 if [ "$HERMES_MARMOT_START_GATEWAY" = "0" ]; then
     echo "Hermes gateway disabled; wn-agent is running."
