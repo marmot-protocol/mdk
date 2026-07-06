@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
-use nostr::{EventBuilder, JsonUtil, Kind, Tag, Timestamp as NostrTimestamp};
+use nostr::{EventBuilder, JsonUtil, Kind, NostrSigner, Tag, Timestamp as NostrTimestamp};
 use serde::Deserialize;
 use url::{Host, Url};
 
@@ -28,12 +28,12 @@ pub(crate) async fn upload_blossom_blob(
     server: &str,
     encrypted: &[u8],
     encrypted_hash_hex: &str,
-    signing_keys: &nostr::Keys,
+    signer: &dyn NostrSigner,
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
     let (upload_url, server_host) = blossom_upload_endpoint(server)?;
     let authorization =
-        blossom_authorization_header(signing_keys, &server_host, encrypted_hash_hex)?;
+        blossom_authorization_header(signer, &server_host, encrypted_hash_hex).await?;
     let client = media_http_client_for_url(&upload_url, allow_loopback_http).await?;
     let response = client
         .put(upload_url)
@@ -319,8 +319,8 @@ pub(crate) fn blossom_content_hash_from_url(url: &str) -> Option<String> {
     })
 }
 
-fn blossom_authorization_header(
-    keys: &nostr::Keys,
+async fn blossom_authorization_header(
+    signer: &dyn NostrSigner,
     server_host: &str,
     encrypted_hash_hex: &str,
 ) -> Result<String, AppError> {
@@ -335,11 +335,18 @@ fn blossom_authorization_header(
     .into_iter()
     .collect::<Result<Vec<_>, _>>()
     .map_err(|err| AppError::BlobStore(format!("failed to build Blossom auth tag: {err}")))?;
-    let event = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
+    let public_key = signer
+        .get_public_key()
+        .await
+        .map_err(|err| crate::external_signer_error(err, "Blossom auth public key"))?;
+    let unsigned = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
         .tags(tags)
         .custom_created_at(NostrTimestamp::from(now))
-        .sign_with_keys(keys)
-        .map_err(|err| AppError::BlobStore(format!("failed to sign Blossom auth: {err}")))?;
+        .build(public_key);
+    let event = signer
+        .sign_event(unsigned)
+        .await
+        .map_err(|err| crate::external_signer_error(err, "Blossom auth"))?;
     Ok(format!(
         "Nostr {}",
         BASE64_URL_SAFE_NO_PAD.encode(event.as_json())

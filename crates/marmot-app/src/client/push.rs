@@ -16,10 +16,8 @@ impl AppClient {
         if !settings.native_push_enabled {
             return Ok(0);
         }
-        let keys = self
-            .app
-            .account_home()
-            .load_signing_keys(&self.state.label)?;
+        let signer = self.app.account_signer_for_summary(&account)?;
+        let nostr_signer = signer.as_nostr_signer();
         let mut shared = 0_usize;
         for group in self.state.groups.clone() {
             let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
@@ -34,8 +32,9 @@ impl AppClient {
                 member_id_hex,
                 leaf_index,
                 &registration,
-                &keys,
-            )?;
+                nostr_signer.as_ref(),
+            )
+            .await?;
             self.app.upsert_group_push_token(&account.label, &record)?;
             let content = serde_json::to_string(&payload)?;
             match self
@@ -65,10 +64,8 @@ impl AppClient {
         registration: crate::PushRegistration,
     ) -> Result<usize, AppError> {
         let account = self.app.account_home().account(&self.state.label)?;
-        let keys = self
-            .app
-            .account_home()
-            .load_signing_keys(&self.state.label)?;
+        let signer = self.app.account_signer_for_summary(&account)?;
+        let nostr_signer = signer.as_nostr_signer();
         let mut removed = 0_usize;
         for group in self.state.groups.clone() {
             let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
@@ -83,8 +80,9 @@ impl AppClient {
                 member_id_hex,
                 leaf_index,
                 &registration,
-                &keys,
-            )?;
+                nostr_signer.as_ref(),
+            )
+            .await?;
             let content = serde_json::to_string(&payload)?;
             match self
                 .send_app_event(&group_id, AppMessageIntent::PushTokenRemoval { content })
@@ -139,10 +137,8 @@ impl AppClient {
         if by_server.is_empty() {
             return Ok(());
         }
-        let keys = self
-            .app
-            .account_home()
-            .load_signing_keys(&self.state.label)?;
+        let signer = self.app.account_signer_for_summary(&account)?;
+        let nostr_signer = signer.as_nostr_signer();
         for (server_pubkey_hex, records) in by_server {
             let encrypted_tokens = records
                 .iter()
@@ -160,7 +156,7 @@ impl AppClient {
                 notifications::build_notification_gift_wrap(&server_pubkey_hex, &encrypted_tokens)
                     .await?;
             self.app
-                .relay_client_for_endpoints(&keys, &endpoints)
+                .relay_client_for_endpoints(nostr_signer.clone(), &endpoints)
                 .publish_event(&endpoints, &event, 1)
                 .await
                 .map_err(AppError::Transport)?;

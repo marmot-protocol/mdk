@@ -339,19 +339,20 @@ impl MarmotApp {
         profile: UserProfileMetadata,
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
-        let keys = self.account_home().load_signing_keys(label)?;
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
         let endpoints = self.outbox_endpoints(
-            &keys.public_key().to_hex(),
+            &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
         let content = serde_json::to_string(&profile_content_json(&profile))?;
         let event = NostrTransportEvent::new_unsigned(
-            keys.public_key().to_hex(),
+            account.account_id_hex,
             KIND_NOSTR_METADATA,
             Vec::new(),
             content,
         );
-        self.relay_client_for_endpoints(&keys, &endpoints)
+        self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
             .publish_event(&endpoints, &event, 1)
             .await?;
         Ok(())
@@ -363,9 +364,10 @@ impl MarmotApp {
         follows: &[&str],
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<(), AppError> {
-        let keys = self.account_home().load_signing_keys(label)?;
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
         let endpoints = self.outbox_endpoints(
-            &keys.public_key().to_hex(),
+            &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
         let tags = follows
@@ -375,12 +377,12 @@ impl MarmotApp {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let event = NostrTransportEvent::new_unsigned(
-            keys.public_key().to_hex(),
+            account.account_id_hex,
             KIND_NOSTR_CONTACT_LIST,
             tags,
             String::new(),
         );
-        self.relay_client_for_endpoints(&keys, &endpoints)
+        self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
             .publish_event(&endpoints, &event, 1)
             .await?;
         Ok(())
@@ -1024,14 +1026,23 @@ impl MarmotApp {
             method = "directory_cache_for_account"
         )
         .entered();
-        let keys = self.account_home().load_signing_keys(&account.label)?;
         let path = self.directory_cache_path(&account.label);
-        let key = self.sqlcipher_key(
-            &account.label,
-            &keys,
-            &path,
-            SqlcipherDatabaseKind::DirectoryCache,
-        )?;
+        let key = if account.local_signing {
+            let keys = self.account_home().load_signing_keys(&account.label)?;
+            self.sqlcipher_key(
+                &account.label,
+                &keys,
+                &path,
+                SqlcipherDatabaseKind::DirectoryCache,
+            )?
+        } else {
+            self.external_sqlcipher_key(
+                &account.label,
+                &account.account_id_hex,
+                &path,
+                SqlcipherDatabaseKind::DirectoryCache,
+            )?
+        };
         let cache = DirectoryCache::open(path, &key)?;
         #[cfg(test)]
         self.directory_cache_open_count

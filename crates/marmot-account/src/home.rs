@@ -71,6 +71,10 @@ pub struct AccountSummary {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    /// The account signs through a host-provided external signer instead of a
+    /// local nsec. Public/tracked accounts keep both signing flags false.
+    #[serde(default)]
+    pub external_signing: bool,
     /// Durable local runtime state for reversible sign-out. A signed-out
     /// account keeps its local signing secret and account directory but must not
     /// be auto-started by runtime reconciliation until an explicit sign-in
@@ -80,6 +84,14 @@ pub struct AccountSummary {
 }
 
 impl AccountSummary {
+    pub fn can_sign(&self) -> bool {
+        self.local_signing || self.external_signing
+    }
+
+    pub fn is_active_signing(&self) -> bool {
+        self.can_sign() && !self.signed_out
+    }
+
     pub fn is_active_local_signing(&self) -> bool {
         self.local_signing && !self.signed_out
     }
@@ -169,6 +181,34 @@ impl AccountHome {
             label: account_id_hex.clone(),
             account_id_hex,
             local_signing: false,
+            external_signing: false,
+            signed_out: false,
+        };
+        self.write_account_record(&account)?;
+        Ok(account)
+    }
+
+    pub fn add_external_signer_account(
+        &self,
+        public_key: &str,
+    ) -> AccountHomeResult<AccountSummary> {
+        let account_id_hex = Self::account_id_for_public_key(public_key)?;
+        if self.account_record_path(&account_id_hex).exists() {
+            let mut account = self.account(&account_id_hex)?;
+            if account.local_signing {
+                return Err(AccountHomeError::AccountExists(account_id_hex));
+            }
+            if !account.external_signing {
+                account.external_signing = true;
+                self.write_account_record(&account)?;
+            }
+            return Ok(account);
+        }
+        let account = AccountSummary {
+            label: account_id_hex.clone(),
+            account_id_hex,
+            local_signing: false,
+            external_signing: true,
             signed_out: false,
         };
         self.write_account_record(&account)?;
@@ -247,7 +287,7 @@ impl AccountHome {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut account = self.account(account_ref)?;
-        if !account.local_signing {
+        if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
         }
         if account.signed_out == signed_out {
@@ -517,6 +557,7 @@ impl AccountHome {
             label,
             account_id_hex,
             local_signing: true,
+            external_signing: false,
             signed_out: false,
         };
         self.secret_store.write_secret(&account, keys)?;

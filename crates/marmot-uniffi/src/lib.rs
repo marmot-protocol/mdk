@@ -25,11 +25,13 @@ use marmot_app::{MarmotApp, MarmotAppRuntime, TimelineMessageQuery, TimelinePagi
 mod commands;
 mod conversions;
 mod errors;
+mod external_signer;
 mod markdown;
 mod subscriptions;
 
 use conversions::group_id_from_hex;
 pub use errors::MarmotKitError;
+pub use external_signer::ExternalAccountSignerFfi;
 pub use markdown::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
     MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownListItemFfi, MarkdownListKindFfi,

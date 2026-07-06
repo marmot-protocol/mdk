@@ -14,7 +14,7 @@ pub enum AppError {
     #[error(transparent)]
     Storage(#[from] cgka_traits::storage::StorageError),
     #[error(transparent)]
-    Transport(#[from] TransportAdapterError),
+    Transport(TransportAdapterError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -47,6 +47,12 @@ pub enum AppError {
     RelayDirectory(String),
     #[error("invalid Nostr public key")]
     InvalidPublicKey,
+    #[error("external signer unavailable for account")]
+    ExternalSignerUnavailable(String),
+    #[error("external signer public key does not match account")]
+    ExternalSignerMismatch,
+    #[error("external signer request was rejected or cancelled by the user")]
+    ExternalSignerRejected,
     #[error("invalid Marmot KeyPackage event: {0}")]
     InvalidKeyPackageEvent(String),
     #[error("no directory entry for account")]
@@ -93,6 +99,16 @@ pub enum AppError {
     TransportClosed,
 }
 
+impl From<TransportAdapterError> for AppError {
+    fn from(error: TransportAdapterError) -> Self {
+        if error.to_string().contains(crate::EXTERNAL_SIGNER_REJECTED) {
+            Self::ExternalSignerRejected
+        } else {
+            Self::Transport(error)
+        }
+    }
+}
+
 impl AppError {
     pub(crate) fn privacy_safe_kind(&self) -> &'static str {
         match self {
@@ -117,6 +133,9 @@ impl AppError {
             Self::MissingRelayLists(_) => "missing_relay_lists",
             Self::RelayDirectory(_) => "relay_directory",
             Self::InvalidPublicKey => "invalid_public_key",
+            Self::ExternalSignerUnavailable(_) => "external_signer_unavailable",
+            Self::ExternalSignerMismatch => "external_signer_mismatch",
+            Self::ExternalSignerRejected => "external_signer_rejected",
             Self::InvalidKeyPackageEvent(_) => "invalid_key_package_event",
             Self::MissingDirectoryEntry(_) => "missing_directory_entry",
             Self::InvalidDirectorySearch(_) => "invalid_directory_search",

@@ -21,6 +21,7 @@ use crate::{AppError, MarmotApp};
 
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
+const EXTERNAL_SQLCIPHER_SECRET_FILE: &str = ".external-sqlcipher-secret";
 const SQLCIPHER_SALT_LEN: usize = 32;
 const SQLCIPHER_KEY_LEN: usize = 32;
 
@@ -60,6 +61,60 @@ impl MarmotApp {
         Ok(SqlCipherKey::new(derive_sqlcipher_key_material(
             label, keys, &salt, kind,
         )?)?)
+    }
+
+    pub(crate) fn external_sqlcipher_key(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+        db_path: &Path,
+        kind: SqlcipherDatabaseKind,
+    ) -> Result<SqlCipherKey, AppError> {
+        let salt = self.external_sqlcipher_salt(db_path)?;
+        let secret = self.external_sqlcipher_secret(label)?;
+        Ok(SqlCipherKey::new(derive_external_sqlcipher_key_material(
+            label,
+            account_id_hex,
+            &secret,
+            &salt,
+            kind,
+        )?)?)
+    }
+
+    fn external_sqlcipher_secret(
+        &self,
+        label: &str,
+    ) -> Result<Zeroizing<[u8; SQLCIPHER_KEY_LEN]>, AppError> {
+        let path = self.account_dir(label).join(EXTERNAL_SQLCIPHER_SECRET_FILE);
+        if path.exists() {
+            let raw = fs::read_to_string(&path)?;
+            let bytes = hex::decode(raw.trim())?;
+            let secret: [u8; SQLCIPHER_KEY_LEN] = bytes.try_into().map_err(|_| {
+                AppError::SqlcipherKeyDerivation(format!(
+                    "invalid external SQLCipher secret length in {}",
+                    path.display()
+                ))
+            })?;
+            return Ok(Zeroizing::new(secret));
+        }
+        let mut secret = [0_u8; SQLCIPHER_KEY_LEN];
+        OsRng.fill_bytes(&mut secret);
+        atomic_write(&path, hex::encode(secret).as_bytes())?;
+        Ok(Zeroizing::new(secret))
+    }
+
+    fn external_sqlcipher_salt(
+        &self,
+        db_path: &Path,
+    ) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
+        let salt_path = sqlcipher_salt_path(db_path);
+        if salt_path.exists() {
+            return read_sqlcipher_salt(&salt_path);
+        }
+        let mut salt = [0_u8; SQLCIPHER_SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        write_sqlcipher_salt(&salt_path, &salt)?;
+        Ok(salt)
     }
 
     fn sqlcipher_salt(
@@ -266,6 +321,26 @@ fn derive_sqlcipher_key_material(
     encode_hkdf_part(&mut info, kind.hkdf_info_label());
     encode_hkdf_part(&mut info, label.as_bytes());
     encode_hkdf_part(&mut info, keys.public_key().to_bytes().as_slice());
+    let mut output = Zeroizing::new([0_u8; SQLCIPHER_KEY_LEN]);
+    hkdf.expand(&info, output.as_mut())
+        .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".to_owned()))?;
+    Ok(hex::encode(&output))
+}
+
+fn derive_external_sqlcipher_key_material(
+    label: &str,
+    account_id_hex: &str,
+    secret: &[u8; SQLCIPHER_KEY_LEN],
+    salt: &[u8; SQLCIPHER_SALT_LEN],
+    kind: SqlcipherDatabaseKind,
+) -> Result<String, AppError> {
+    let account_id = hex::decode(account_id_hex)?;
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), secret);
+    let mut info = Vec::new();
+    encode_hkdf_part(&mut info, b"marmot-app-external-signer-sqlcipher-key");
+    encode_hkdf_part(&mut info, kind.hkdf_info_label());
+    encode_hkdf_part(&mut info, label.as_bytes());
+    encode_hkdf_part(&mut info, &account_id);
     let mut output = Zeroizing::new([0_u8; SQLCIPHER_KEY_LEN]);
     hkdf.expand(&info, output.as_mut())
         .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".to_owned()))?;

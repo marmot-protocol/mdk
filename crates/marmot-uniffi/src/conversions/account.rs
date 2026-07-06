@@ -10,6 +10,7 @@ pub struct AccountSummaryFfi {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
 }

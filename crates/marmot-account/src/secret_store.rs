@@ -302,6 +302,7 @@ mod tests {
             label: "scrub-me".to_owned(),
             account_id_hex: keys.public_key().to_hex(),
             local_signing: true,
+            external_signing: false,
             signed_out: false,
         };
 

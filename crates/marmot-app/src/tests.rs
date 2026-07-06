@@ -25,6 +25,79 @@ use crate::key_package_records::{
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 
+#[derive(Clone, Debug)]
+struct TestExternalAccountSigner {
+    keys: nostr::Keys,
+}
+
+impl nostr::NostrSigner for TestExternalAccountSigner {
+    fn backend(&self) -> nostr::signer::SignerBackend<'_> {
+        self.keys.backend()
+    }
+
+    fn get_public_key(
+        &self,
+    ) -> nostr::util::BoxedFuture<'_, Result<nostr::PublicKey, nostr::SignerError>> {
+        self.keys.get_public_key()
+    }
+
+    fn sign_event(
+        &self,
+        unsigned: nostr::UnsignedEvent,
+    ) -> nostr::util::BoxedFuture<'_, Result<nostr::Event, nostr::SignerError>> {
+        self.keys.sign_event(unsigned)
+    }
+
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip04_encrypt(public_key, content)
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        encrypted_content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip04_decrypt(public_key, encrypted_content)
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        content: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip44_encrypt(public_key, content)
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::PublicKey,
+        payload: &'a str,
+    ) -> nostr::util::BoxedFuture<'a, Result<String, nostr::SignerError>> {
+        self.keys.nip44_decrypt(public_key, payload)
+    }
+}
+
+impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for TestExternalAccountSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &cgka_engine::account_identity_proof::AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match test signer".into());
+        }
+        let event = request.proof_event().and_then(|event| {
+            event
+                .sign_with_keys(&self.keys)
+                .map_err(|err| err.to_string())
+        })?;
+        request.signature_from_signed_event(event)
+    }
+}
+
 #[test]
 fn legacy_projection_update_json_defaults_new_streaming_fields() {
     let update: AppProjectionUpdate = serde_json::from_str(
@@ -501,6 +574,56 @@ fn warm_directory_storage_opens_shared_and_local_directory_handles() {
         app.directory_cache_open_count_for_test(),
         open_count_after_warm
     );
+}
+
+#[tokio::test]
+async fn register_external_signer_requires_matching_external_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let keys = nostr::Keys::generate();
+    let wrong_keys = nostr::Keys::generate();
+    let account = home
+        .add_external_signer_account(&keys.public_key().to_hex())
+        .unwrap();
+    let local_account = home.create_nostr_account().unwrap();
+    let public_account = home
+        .add_public_account(&nostr::Keys::generate().public_key().to_hex())
+        .unwrap();
+    let app = MarmotApp::with_relays_and_account_home(
+        dir.path(),
+        vec!["wss://relay.example".into()],
+        home,
+    );
+
+    let wrong_signer = TestExternalAccountSigner { keys: wrong_keys };
+    assert!(matches!(
+        app.register_external_signer(&account.account_id_hex, wrong_signer)
+            .await,
+        Err(AppError::ExternalSignerMismatch)
+    ));
+    assert!(!app.has_external_signer(&account.account_id_hex));
+
+    let local_signer = TestExternalAccountSigner { keys: keys.clone() };
+    assert!(matches!(
+        app.register_external_signer(&local_account.account_id_hex, local_signer)
+            .await,
+        Err(AppError::ExternalSignerUnavailable(account))
+            if account == local_account.account_id_hex
+    ));
+
+    let public_signer = TestExternalAccountSigner { keys: keys.clone() };
+    assert!(matches!(
+        app.register_external_signer(&public_account.account_id_hex, public_signer)
+            .await,
+        Err(AppError::ExternalSignerUnavailable(account))
+            if account == public_account.account_id_hex
+    ));
+
+    let signer = TestExternalAccountSigner { keys };
+    app.register_external_signer(&account.account_id_hex, signer)
+        .await
+        .unwrap();
+    assert!(app.has_external_signer(&account.account_id_hex));
 }
 
 #[test]

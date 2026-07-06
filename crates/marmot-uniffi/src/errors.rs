@@ -79,6 +79,21 @@ pub enum MarmotKitError {
     /// runtime faults.
     #[error("io error: {details}")]
     Io { details: String },
+    /// The account is configured for external signing, but this runtime has no
+    /// registered callback for it yet. Typed so clients can prompt the user to
+    /// reconnect Amber instead of surfacing a generic runtime failure.
+    #[error("external signer unavailable for account {account}")]
+    ExternalSignerUnavailable { account: String },
+    /// The external signer returned a different public key than the account it
+    /// was registered for. Typed so clients can treat this as a hard account
+    /// mismatch rather than a retryable runtime error.
+    #[error("external signer public key does not match account")]
+    ExternalSignerMismatch,
+    /// The user rejected/cancelled an external signer prompt. Typed separately
+    /// from runtime failures so clients can keep the user in the flow or offer a
+    /// retry without treating the account as broken.
+    #[error("external signer request was rejected or cancelled")]
+    ExternalSignerRejected,
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
 }
@@ -147,6 +162,11 @@ impl From<AppError> for MarmotKitError {
             AppError::Storage(ref storage_err) if storage_err.is_transient() => Self::StorageBusy {
                 details: storage_err.to_string(),
             },
+            AppError::ExternalSignerUnavailable(account) => {
+                Self::ExternalSignerUnavailable { account }
+            }
+            AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
+            AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
             other => Self::Runtime {
                 details: other.to_string(),
             },

@@ -257,9 +257,9 @@ impl MarmotRelayPlane {
     /// it) is one per plane: with multiple accounts the most recently opened
     /// account's keys win, which matches the one-account-per-process apps.
     /// No-op for planes built on a custom relay client.
-    pub async fn set_transport_signer(&self, keys: nostr::Keys) {
+    pub async fn set_transport_signer(&self, signer: Arc<dyn nostr::NostrSigner>) {
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
-            sdk_relay_client.client().set_signer(keys).await;
+            sdk_relay_client.client().set_signer(signer).await;
         }
     }
 

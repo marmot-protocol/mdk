@@ -7,18 +7,23 @@
 
 use cgka_traits::error::EngineError;
 use cgka_traits::types::MemberId;
+use nostr::prelude::JsonUtil;
+use nostr::{
+    Event, EventBuilder, Kind, PublicKey, Tag, TagKind, Timestamp, UnsignedEvent,
+    secp256k1::schnorr::Signature,
+};
 use openmls::extensions::{Extension, ExtensionType, UnknownExtension};
 use openmls::group::{MlsGroup, StagedCommit};
 use openmls::prelude::{BasicCredential, LeafNode, SignatureScheme};
 use openmls_traits::types::Ciphersuite;
-use sha2::{Digest, Sha256};
 
 /// Marmot custom LeafNode extension:
-/// `marmot.account-identity-proof.v1`.
+/// `marmot.account-identity-proof.v2`.
 pub const ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE: u16 = 0xF2F1;
+pub const ACCOUNT_IDENTITY_PROOF_EVENT_KIND: u16 = 450;
 
-const ACCOUNT_IDENTITY_PROOF_VERSION: u8 = 1;
-const ACCOUNT_IDENTITY_PROOF_DOMAIN: &[u8] = b"marmot.account-identity-proof.v1";
+const ACCOUNT_IDENTITY_PROOF_VERSION: u8 = 2;
+const ACCOUNT_IDENTITY_PROOF_DOMAIN: &str = "marmot.account-identity-proof.v2";
 const SCHNORR_SIGNATURE_LEN: usize = 64;
 
 /// Values a Marmot account key signs to bind an MLS leaf to that account.
@@ -45,33 +50,77 @@ impl AccountIdentityProofRequest {
         }
     }
 
-    /// Nostr-style BIP-340 message digest signed by the Marmot account key.
-    pub fn signing_digest(&self) -> [u8; 32] {
-        let message = self.canonical_message();
-        let digest = Sha256::digest(&message);
-        digest.into()
+    pub fn proof_event(&self) -> Result<UnsignedEvent, String> {
+        let public_key = PublicKey::from_slice(&self.account_identity)
+            .map_err(|err| format!("invalid account identity public key: {err}"))?;
+        let tags = [
+            Tag::custom(
+                TagKind::custom("d"),
+                [ACCOUNT_IDENTITY_PROOF_DOMAIN.to_string()],
+            ),
+            Tag::custom(
+                TagKind::custom("extension"),
+                [format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}")],
+            ),
+            Tag::custom(
+                TagKind::custom("version"),
+                [ACCOUNT_IDENTITY_PROOF_VERSION.to_string()],
+            ),
+            Tag::custom(
+                TagKind::custom("ciphersuite"),
+                [self.ciphersuite.to_string()],
+            ),
+            Tag::custom(
+                TagKind::custom("signature_scheme"),
+                [self.signature_scheme.to_string()],
+            ),
+            Tag::custom(
+                TagKind::custom("mls_signature_key"),
+                [hex::encode(&self.mls_signature_public_key)],
+            ),
+        ];
+        Ok(
+            EventBuilder::new(Kind::Custom(ACCOUNT_IDENTITY_PROOF_EVENT_KIND), "")
+                .tags(tags)
+                .custom_created_at(Timestamp::zero())
+                .build(public_key),
+        )
     }
 
-    fn canonical_message(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(ACCOUNT_IDENTITY_PROOF_DOMAIN);
-        out.push(0);
-        out.extend_from_slice(&ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE.to_be_bytes());
-        out.push(ACCOUNT_IDENTITY_PROOF_VERSION);
-        out.extend_from_slice(&self.ciphersuite.to_be_bytes());
-        out.extend_from_slice(&self.signature_scheme.to_be_bytes());
-        out.extend_from_slice(&(self.account_identity.len() as u16).to_be_bytes());
-        out.extend_from_slice(&self.account_identity);
-        out.extend_from_slice(&(self.mls_signature_public_key.len() as u16).to_be_bytes());
-        out.extend_from_slice(&self.mls_signature_public_key);
-        out
+    pub fn proof_event_json(&self) -> Result<String, String> {
+        self.proof_event().map(|event| event.as_json())
+    }
+
+    pub fn proof_event_id(&self) -> Result<[u8; 32], String> {
+        self.proof_event()?
+            .id
+            .map(|id| id.to_bytes())
+            .ok_or_else(|| "proof event id was not set".to_string())
+    }
+
+    pub fn signature_from_signed_event(&self, event: Event) -> Result<[u8; 64], String> {
+        let proof_event = self.proof_event()?;
+        if event.pubkey.to_bytes().as_slice() != self.account_identity.as_slice() {
+            return Err("proof event signer does not match account identity".into());
+        }
+        let proof_event_id = proof_event
+            .id
+            .ok_or_else(|| "proof event id was not set".to_string())?;
+        if event.id != proof_event_id {
+            return Err("signed proof event does not match proof request".into());
+        }
+        event
+            .verify()
+            .map_err(|err| format!("invalid signed proof event: {err}"))?;
+        Ok(event.sig.serialize())
     }
 }
 
 /// Account-key signing hook supplied by the account/session layer.
 ///
-/// Implementations sign `request.signing_digest()` with the private key whose
-/// x-only public key is `request.account_identity`.
+/// Implementations sign `request.proof_event()` with the private key whose
+/// x-only public key is `request.account_identity`, then return the event
+/// signature bytes. The event is canonical and unpublished.
 pub trait AccountIdentityProofSigner: Send + Sync {
     fn sign_account_identity_proof(
         &self,
@@ -122,7 +171,7 @@ pub(crate) fn validate_leaf_account_identity_proof(
         .unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)
     else {
         return Err(EngineError::InvalidAccountIdentityProof(
-            "missing marmot.account-identity-proof.v1 LeafNode extension".into(),
+            "missing marmot.account-identity-proof.v2 LeafNode extension".into(),
         ));
     };
     let proof = decode_proof(&raw.0)?;
@@ -148,28 +197,20 @@ pub(crate) fn validate_leaf_account_identity_proof(
         ));
     }
 
-    let verifying_key =
-        k256::schnorr::VerifyingKey::from_bytes(account_identity).map_err(|_| {
-            EngineError::InvalidCredentialIdentity(
-                "credential identity is not a valid x-only secp256k1 public key".to_string(),
-            )
-        })?;
-    let signature =
-        k256::schnorr::Signature::try_from(proof.signature.as_slice()).map_err(|_| {
-            EngineError::InvalidAccountIdentityProof(
-                "proof signature is not a BIP-340 signature".into(),
-            )
-        })?;
-    k256::schnorr::signature::hazmat::PrehashVerifier::verify_prehash(
-        &verifying_key,
-        &proof.request.signing_digest(),
-        &signature,
-    )
-    .map_err(|_| {
+    let signature = Signature::from_slice(&proof.signature).map_err(|_| {
+        EngineError::InvalidAccountIdentityProof(
+            "proof signature is not a Nostr Schnorr signature".into(),
+        )
+    })?;
+    let proof_event = proof.request.proof_event().map_err(|err| {
+        EngineError::InvalidAccountIdentityProof(format!("invalid proof event: {err}"))
+    })?;
+    proof_event.add_signature(signature).map_err(|_| {
         EngineError::InvalidAccountIdentityProof(
             "proof signature does not verify for credential identity".into(),
         )
-    })
+    })?;
+    Ok(())
 }
 
 pub(crate) fn validate_leaf_account_identity_proof_for_member(
@@ -303,4 +344,60 @@ fn read_exact<'a>(cursor: &mut &'a [u8], len: usize, field: &str) -> Result<&'a 
     let (head, tail) = cursor.split_at(len);
     *cursor = tail;
     Ok(head)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(keys: &nostr::Keys, leaf_key: &[u8]) -> AccountIdentityProofRequest {
+        AccountIdentityProofRequest {
+            account_identity: keys.public_key().to_bytes().to_vec(),
+            mls_signature_public_key: leaf_key.to_vec(),
+            ciphersuite: 1,
+            signature_scheme: 0x0807,
+        }
+    }
+
+    #[test]
+    fn proof_event_is_canonical_unpublished_kind_450() {
+        let keys = nostr::Keys::generate();
+        let request = request(&keys, b"leaf-key");
+        let event = request.proof_event().unwrap();
+
+        assert_eq!(event.pubkey, keys.public_key());
+        assert_eq!(event.kind, Kind::Custom(ACCOUNT_IDENTITY_PROOF_EVENT_KIND));
+        assert_eq!(event.created_at, Timestamp::zero());
+        assert_eq!(event.content, "");
+        assert!(event.id.is_some());
+        assert!(event.tags.iter().any(|tag| {
+            tag.as_slice() == ["d".to_owned(), ACCOUNT_IDENTITY_PROOF_DOMAIN.to_owned()]
+        }));
+        assert!(event.tags.iter().any(|tag| {
+            tag.as_slice()
+                == [
+                    "version".to_owned(),
+                    ACCOUNT_IDENTITY_PROOF_VERSION.to_string(),
+                ]
+        }));
+    }
+
+    #[test]
+    fn proof_signature_must_match_the_exact_request_event() {
+        let keys = nostr::Keys::generate();
+        let original = request(&keys, b"leaf-key-a");
+        let tampered = request(&keys, b"leaf-key-b");
+        let signed_tampered = tampered
+            .proof_event()
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            original
+                .signature_from_signed_event(signed_tampered)
+                .is_err(),
+            "a proof signature for another leaf key must not verify for this request"
+        );
+    }
 }

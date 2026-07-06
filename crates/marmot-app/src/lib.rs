@@ -12,13 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_engine::{
-    FeatureRegistry,
-    account_identity_proof::{
-        ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE, AccountIdentityProofRequest,
-        AccountIdentityProofSigner,
-    },
-    canonicalization::CanonicalizationPolicy,
-    key_package::key_package_metadata,
+    FeatureRegistry, account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+    canonicalization::CanonicalizationPolicy, key_package::key_package_metadata,
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
@@ -47,7 +42,7 @@ use cgka_traits::{
     GroupId, MemberId, TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
 };
 use marmot_account::{
-    AccountDeviceRuntime, AccountHome, AccountSummary, KeyPackagePublication,
+    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
     KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{Client as NostrSdkClient, PublicKey};
@@ -75,6 +70,7 @@ mod config;
 mod conversions;
 mod directory;
 mod error;
+mod external_signer;
 mod groups;
 mod ids;
 mod key_package_records;
@@ -87,6 +83,8 @@ mod relay_telemetry_export;
 mod runtime;
 mod sqlcipher;
 
+use external_signer::{AccountSigner, RegisteredExternalSigner};
+pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
@@ -401,6 +399,7 @@ pub struct MarmotApp {
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
+    external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -817,7 +816,7 @@ struct OpenAppAccount {
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
     state: AccountState,
-    signing_keys: nostr::Keys,
+    signer: Arc<dyn nostr::NostrSigner>,
 }
 
 impl MarmotApp {
@@ -945,6 +944,7 @@ impl MarmotApp {
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            external_signers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -988,6 +988,7 @@ impl MarmotApp {
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            external_signers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1048,9 +1049,7 @@ impl MarmotApp {
         // withhold gift-wrapped welcomes from unauthenticated subscribers,
         // and the catch-up REQ gets no error back — the events are simply
         // absent.
-        relay_plane
-            .set_transport_signer(open.signing_keys.clone())
-            .await;
+        relay_plane.set_transport_signer(open.signer.clone()).await;
         let rebuild_since =
             relay_plane_for_rebuild.subscription_rebuild_since(open.state.last_transport_timestamp);
         open.runtime.activate_transport(rebuild_since).await?;
@@ -1250,9 +1249,10 @@ impl MarmotApp {
         if bootstrap.default_relays.is_empty() {
             return Err(AppError::MissingDefaultRelays);
         }
-        let keys = self.account_home().load_signing_keys(label)?;
-        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
-        let account_id_hex = keys.public_key().to_hex();
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let account_id_hex = account.account_id_hex;
         // Outbox routing: publish relay-list events to the account's own NIP-65
         // write relays; fall back to the bootstrap/seed relays on first publish
         // (no NIP-65 yet). The declared list (content) is `default_relays`, but
@@ -1273,7 +1273,7 @@ impl MarmotApp {
                 endpoints.push(endpoint);
             }
         }
-        let relay_client = self.relay_client_for_endpoints(&keys, &endpoints);
+        let relay_client = self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints);
         for list_kind in list_kinds {
             let publication = NostrAccountRelayListPublication {
                 account_id: account_id.clone(),
@@ -1939,12 +1939,22 @@ impl MarmotApp {
         relay_plane: &MarmotRelayPlane,
     ) -> Result<OpenAppAccount, AppError> {
         let state = self.load_state(label)?;
-        let keys = self.account_home().load_signing_keys(label)?;
-        let account_id = MemberId::new(keys.public_key().to_bytes());
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(keys.clone());
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let nostr_signer = signer.as_nostr_signer();
+        let peeler = NostrMlsPeeler::new().with_welcome_signer(nostr_signer.clone());
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
-        let session_key =
-            self.sqlcipher_key(label, &keys, &session_path, SqlcipherDatabaseKind::Session)?;
+        let session_key = if let AccountSigner::Local(keys) = &signer {
+            self.sqlcipher_key(label, keys, &session_path, SqlcipherDatabaseKind::Session)?
+        } else {
+            self.external_sqlcipher_key(
+                label,
+                &account.account_id_hex,
+                &session_path,
+                SqlcipherDatabaseKind::Session,
+            )?
+        };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
         // `<account_dir>/audit-<engine_id>.jsonl`. Sensitive mode — raw values.
@@ -1956,9 +1966,7 @@ impl MarmotApp {
             account_id.as_slice().to_vec(),
             Box::new(peeler),
         )
-        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-            keys: keys.clone(),
-        }))
+        .account_identity_proof_signer(signer.as_proof_signer())
         .feature_registry(app_feature_registry())
         .supported_app_components(self.supported_app_component_ids());
         // Production uses the protocol-pinned convergence policy (SessionConfig's
@@ -1987,13 +1995,14 @@ impl MarmotApp {
         }
         let session = AccountDeviceSession::open(session_config)?;
 
-        let publish_client = self.relay_client_for_endpoints(&keys, &self.relay_endpoints());
+        let publish_client =
+            self.relay_client_for_endpoints(nostr_signer.clone(), &self.relay_endpoints());
         let adapter = relay_plane.account_adapter(account_id.clone(), publish_client);
 
         let key_packages = AppKeyPackagePublisher {
             app: self.clone(),
             account_label: label.to_owned(),
-            keys: keys.clone(),
+            signer: signer.clone(),
             app_components: self.supported_app_component_tags(),
         };
         let routing = self.routing_for(&state)?;
@@ -2004,7 +2013,7 @@ impl MarmotApp {
             adapter,
             routing,
             state,
-            signing_keys: keys,
+            signer: nostr_signer,
         })
     }
 
@@ -2083,8 +2092,8 @@ impl MarmotApp {
         label: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
-        let keys = self.account_home().load_signing_keys(label)?;
-        let account_id_hex = keys.public_key().to_hex();
+        let account = self.account_home().account(label)?;
+        let account_id_hex = account.account_id_hex;
         let mut packages = self.local_key_package_records(label)?;
 
         let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
@@ -2155,8 +2164,9 @@ impl MarmotApp {
         source_relays: Vec<TransportEndpoint>,
     ) -> Result<usize, AppError> {
         let event_id_hex = parse_key_package_event_id_hex(event_id_hex)?;
-        let keys = self.account_home().load_signing_keys(label)?;
-        let account_id_hex = keys.public_key().to_hex();
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id_hex = account.account_id_hex;
         let mut endpoints = source_relays;
         if endpoints.is_empty() {
             let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
@@ -2178,7 +2188,7 @@ impl MarmotApp {
             String::new(),
         );
         let outcome = self
-            .relay_client_for_endpoints(&keys, &endpoints)
+            .relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints)
             .publish_event(&endpoints, &event, 1)
             .await?;
 
@@ -2238,8 +2248,9 @@ impl MarmotApp {
         label: &str,
         key_package: KeyPackage,
     ) -> Result<KeyPackage, AppError> {
-        let keys = self.account_home().load_signing_keys(label)?;
-        let account_id_hex = keys.public_key().to_hex();
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id_hex = account.account_id_hex;
         let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
         if relay_lists.nip65.relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
@@ -2249,12 +2260,12 @@ impl MarmotApp {
         let publisher = AppKeyPackagePublisher {
             app: self.clone(),
             account_label: label.to_owned(),
-            keys: keys.clone(),
+            signer,
             app_components: self.supported_app_component_tags(),
         };
         publisher
             .publish_key_package(KeyPackagePublication {
-                account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
+                account_id: MemberId::new(hex::decode(account_id_hex)?),
                 key_package: key_package.clone(),
                 endpoints: self.key_package_endpoints(&relay_lists),
             })
@@ -2665,9 +2676,19 @@ impl MarmotApp {
             method = "account_storage"
         )
         .entered();
-        let keys = self.account_home().load_signing_keys(label)?;
         let path = self.account_storage_path(label);
-        let key = self.sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)?;
+        let account = self.account_home().account(label)?;
+        let key = if account.local_signing {
+            let keys = self.account_home().load_signing_keys(label)?;
+            self.sqlcipher_key(label, &keys, &path, SqlcipherDatabaseKind::Session)?
+        } else {
+            self.external_sqlcipher_key(
+                label,
+                &account.account_id_hex,
+                &path,
+                SqlcipherDatabaseKind::Session,
+            )?
+        };
         let storage = SqliteAccountStorage::open_encrypted(&path, &key)?;
         let mut storages = self
             .account_storages
@@ -2859,14 +2880,24 @@ impl MarmotApp {
         &self,
         label: &str,
     ) -> Result<LegacyAccountProjectionDb, AppError> {
-        let keys = self.account_home().load_signing_keys(label)?;
         let path = self.legacy_account_projection_path(label);
-        let key = self.sqlcipher_key(
-            label,
-            &keys,
-            &path,
-            SqlcipherDatabaseKind::AccountProjection,
-        )?;
+        let account = self.account_home().account(label)?;
+        let key = if account.local_signing {
+            let keys = self.account_home().load_signing_keys(label)?;
+            self.sqlcipher_key(
+                label,
+                &keys,
+                &path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )?
+        } else {
+            self.external_sqlcipher_key(
+                label,
+                &account.account_id_hex,
+                &path,
+                SqlcipherDatabaseKind::AccountProjection,
+            )?
+        };
         LegacyAccountProjectionDb::open(path, &key)
     }
 
@@ -2962,12 +2993,72 @@ impl MarmotApp {
 
     fn relay_client_for_endpoints(
         &self,
-        keys: &nostr::Keys,
+        signer: Arc<dyn nostr::NostrSigner>,
         endpoints: &[TransportEndpoint],
     ) -> Arc<dyn NostrRelayClient> {
         let _ = endpoints;
-        let client = NostrSdkClient::builder().signer(keys.clone()).build();
+        let client = NostrSdkClient::builder().signer(signer).build();
         Arc::new(NostrSdkRelayClient::new(client))
+    }
+
+    pub async fn register_external_signer<S>(
+        &self,
+        account_ref: &str,
+        signer: S,
+    ) -> Result<(), AppError>
+    where
+        S: ExternalAccountSigner + 'static,
+    {
+        let account = self.account_home().account(account_ref)?;
+        if !account.external_signing {
+            return Err(AppError::ExternalSignerUnavailable(account.account_id_hex));
+        }
+        let signer = Arc::new(signer);
+        let public_key = signer
+            .get_public_key()
+            .await
+            .map_err(external_signer_public_key_error)?;
+        if public_key.to_hex() != account.account_id_hex {
+            return Err(AppError::ExternalSignerMismatch);
+        }
+        self.external_signers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                account.account_id_hex,
+                RegisteredExternalSigner::new(public_key, signer),
+            );
+        Ok(())
+    }
+
+    fn account_signer_for_summary(
+        &self,
+        account: &AccountSummary,
+    ) -> Result<AccountSigner, AppError> {
+        if account.local_signing {
+            return Ok(AccountSigner::Local(
+                self.account_home().load_signing_keys(&account.label)?,
+            ));
+        }
+        if account.external_signing {
+            return self
+                .external_signers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&account.account_id_hex)
+                .map(RegisteredExternalSigner::account_signer)
+                .ok_or_else(|| {
+                    AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
+                });
+        }
+        Err(AccountHomeError::SecretNotFound(account.account_id_hex.clone()).into())
+    }
+
+    pub(crate) fn has_external_signer(&self, account_id_hex: &str) -> bool {
+        self.external_signers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(account_id_hex)
     }
 
     fn account_home(&self) -> AccountHome {
@@ -2994,6 +3085,18 @@ impl MarmotApp {
         OsRng.fill_bytes(&mut nostr_group_id);
         let relays = self.relay_urls.clone();
         NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
+    }
+}
+
+pub(crate) fn external_signer_public_key_error(error: nostr::SignerError) -> AppError {
+    external_signer_error(error, "external signer public key")
+}
+
+pub(crate) fn external_signer_error(error: nostr::SignerError, context: &str) -> AppError {
+    if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
+        AppError::ExternalSignerRejected
+    } else {
+        AppError::Publish(format!("{context}: {error}"))
     }
 }
 
@@ -3162,26 +3265,8 @@ impl TransportRoutingPolicy for AppTransportRouting {
 struct AppKeyPackagePublisher {
     app: MarmotApp,
     account_label: String,
-    keys: nostr::Keys,
+    signer: AccountSigner,
     app_components: Vec<String>,
-}
-
-#[derive(Clone)]
-struct NostrAccountIdentityProofSigner {
-    keys: nostr::Keys,
-}
-
-impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
-    fn sign_account_identity_proof(
-        &self,
-        request: &AccountIdentityProofRequest,
-    ) -> Result<[u8; 64], String> {
-        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
-            return Err("request account identity does not match local Nostr key".into());
-        }
-        let message = nostr::secp256k1::Message::from_digest(request.signing_digest());
-        Ok(self.keys.sign_schnorr(&message).serialize())
-    }
 }
 
 #[async_trait]
@@ -3209,7 +3294,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         let key_package_ref_hex = metadata.key_package_ref_hex;
         let relay_client = self
             .app
-            .relay_client_for_endpoints(&self.keys, &publication.endpoints);
+            .relay_client_for_endpoints(self.signer.as_nostr_signer(), &publication.endpoints);
         let nostr_publication = NostrKeyPackagePublication {
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),

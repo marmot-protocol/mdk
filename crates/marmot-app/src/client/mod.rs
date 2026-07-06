@@ -1387,17 +1387,16 @@ impl AppClient {
             endpoints
         };
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
-        let keys = self
-            .app
-            .account_home()
-            .load_signing_keys(&self.state.label)?;
+        let account = self.app.account_home().account(&self.state.label)?;
+        let signer = self.app.account_signer_for_summary(&account)?;
+        let nostr_signer = signer.as_nostr_signer();
         let should_send = request.send;
         let caption = request.caption.clone();
         let mut result = upload_encrypted_media(
             request,
             source_epoch,
             media_secret.as_ref(),
-            &keys,
+            nostr_signer.as_ref(),
             &default_endpoints,
             &policy.allowed_locator_kinds,
             allow_loopback,

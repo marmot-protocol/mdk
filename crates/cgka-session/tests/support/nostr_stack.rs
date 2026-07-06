@@ -433,8 +433,12 @@ impl AccountIdentityProofSigner for NostrAccountIdentityProofSigner {
         if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
             return Err("request account identity does not match Nostr stack key".into());
         }
-        let message = nostr::secp256k1::Message::from_digest(request.signing_digest());
-        Ok(self.keys.sign_schnorr(&message).serialize())
+        let event = request.proof_event().and_then(|event| {
+            event
+                .sign_with_keys(&self.keys)
+                .map_err(|err| err.to_string())
+        })?;
+        request.signature_from_signed_event(event)
     }
 }
 

@@ -345,7 +345,7 @@ mod tests {
         ) -> Result<[u8; 64], String> {
             let signature = self
                 .0
-                .sign_prehash(&request.signing_digest())
+                .sign_prehash(&request.proof_event_id()?)
                 .map_err(|e| e.to_string())?;
             Ok(signature.to_bytes())
         }

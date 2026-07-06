@@ -187,6 +187,54 @@ fn account_home_can_store_public_nostr_identity_without_secret() {
 }
 
 #[test]
+fn account_home_can_store_external_signer_identity_without_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let public_key = nostr::Keys::generate().public_key().to_hex();
+
+    let account = home.add_external_signer_account(&public_key).unwrap();
+
+    assert_eq!(account.account_id_hex, public_key);
+    assert!(!account.local_signing);
+    assert!(account.external_signing);
+    assert!(account.can_sign());
+    assert!(account.is_active_signing());
+    assert!(!account.is_active_local_signing());
+    assert_eq!(home.account(&public_key).unwrap(), account);
+    assert!(matches!(
+        home.load_signing_keys(&public_key),
+        Err(AccountHomeError::SecretNotFound(_))
+    ));
+}
+
+#[test]
+fn account_home_upgrades_public_identity_to_external_signer_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let public_key = nostr::Keys::generate().public_key().to_hex();
+    let public = home.add_public_account(&public_key).unwrap();
+
+    let external = home.add_external_signer_account(&public_key).unwrap();
+
+    assert_eq!(external.account_id_hex, public.account_id_hex);
+    assert!(!external.local_signing);
+    assert!(external.external_signing);
+    assert_eq!(home.accounts().unwrap(), vec![external]);
+}
+
+#[test]
+fn account_home_rejects_external_signer_upgrade_for_local_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_nostr_account().unwrap();
+
+    assert!(matches!(
+        home.add_external_signer_account(&account.account_id_hex),
+        Err(AccountHomeError::AccountExists(existing)) if existing == account.account_id_hex
+    ));
+}
+
+#[test]
 fn account_home_can_use_an_injected_secret_store() {
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(MemorySecretStore::default());
@@ -245,6 +293,30 @@ fn account_home_persists_reversible_sign_out_marker() {
         .unwrap();
     assert!(!reactivated.signed_out);
     assert!(reactivated.is_active_local_signing());
+}
+
+#[test]
+fn account_home_persists_reversible_external_signer_sign_out_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let public_key = nostr::Keys::generate().public_key().to_hex();
+
+    let created = home.add_external_signer_account(&public_key).unwrap();
+    assert!(created.external_signing);
+    assert!(!created.signed_out);
+    assert!(created.is_active_signing());
+
+    let signed_out = home
+        .set_account_signed_out(&created.account_id_hex, true)
+        .unwrap();
+    assert!(signed_out.signed_out);
+    assert!(!signed_out.is_active_signing());
+
+    let reactivated = home
+        .set_account_signed_out(&created.account_id_hex, false)
+        .unwrap();
+    assert!(!reactivated.signed_out);
+    assert!(reactivated.is_active_signing());
 }
 
 #[test]
@@ -346,6 +418,7 @@ fn account_home_keychain_keeps_shared_credential_for_surviving_signing_record() 
         label: "label-two".to_owned(),
         account_id_hex: account_id.clone(),
         local_signing: true,
+        external_signing: false,
         signed_out: false,
     };
     let twin_dir = dir.path().join("accounts").join(&twin.label);

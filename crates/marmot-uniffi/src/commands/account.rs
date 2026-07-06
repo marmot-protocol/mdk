@@ -4,6 +4,7 @@ use marmot_app::{AccountSetupRequest, UserProfileMetadata};
 
 use crate::conversions::{AccountSummaryFfi, UserProfileMetadataFfi};
 use crate::errors::MarmotKitError;
+use crate::external_signer::{ExternalAccountSignerAdapter, ExternalAccountSignerFfi};
 use crate::{Marmot, conversions, endpoints};
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -23,6 +24,7 @@ impl Marmot {
                 label: m.label,
                 account_id_hex: m.account_id_hex,
                 local_signing: m.local_signing,
+                external_signing: m.external_signing,
                 signed_out: m.signed_out,
                 running: m.running,
             })
@@ -33,8 +35,9 @@ impl Marmot {
     /// (mdk#461). Each entry's `unread_count` is read from that
     /// account's materialized chat-list projection, so this does not require
     /// switching into, or loading a full session/timeline for, any account —
-    /// non-active (not-`running`) accounts are reported too. Only
-    /// local-signing accounts are included, matching `list_accounts`.
+    /// non-active (not-`running`) accounts are reported too. Sign-capable
+    /// local and external-signer accounts are included, matching
+    /// `list_accounts`.
     pub fn account_unread_summary(
         &self,
     ) -> Result<Vec<conversions::AccountUnreadFfi>, MarmotKitError> {
@@ -111,6 +114,7 @@ impl Marmot {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
             local_signing: result.account.local_signing,
+            external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
         })
@@ -137,9 +141,62 @@ impl Marmot {
             label: result.account.label,
             account_id_hex: result.account.account_id_hex,
             local_signing: result.account.local_signing,
+            external_signing: result.account.external_signing,
             signed_out: result.account.signed_out,
             running: true,
         })
+    }
+
+    /// Log in with an external account signer such as Amber/NIP-55.
+    ///
+    /// MDK stores only the account public key and device-local database
+    /// encryption material. All Nostr signing/decryption and MLS
+    /// account-identity proof signing are routed through `signer`; apps must
+    /// call this again after process restart before the external account can
+    /// publish, decrypt welcomes, or start its worker.
+    pub async fn login_external_signer(
+        &self,
+        public_key: String,
+        signer: std::sync::Arc<dyn ExternalAccountSignerFfi>,
+        default_relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+    ) -> Result<AccountSummaryFfi, MarmotKitError> {
+        let request = AccountSetupRequest {
+            identity: None,
+            default_relays: endpoints(&default_relays),
+            bootstrap_relays: endpoints(&bootstrap_relays),
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+        };
+        let signer = ExternalAccountSignerAdapter::new(signer);
+        let result = self
+            .runtime
+            .login_external_signer(public_key, signer, request)
+            .await?;
+        Ok(AccountSummaryFfi {
+            label: result.account.label,
+            account_id_hex: result.account.account_id_hex,
+            local_signing: result.account.local_signing,
+            external_signing: result.account.external_signing,
+            signed_out: result.account.signed_out,
+            running: true,
+        })
+    }
+
+    /// Re-register an external signer for an already-known external account.
+    ///
+    /// This is the restore path after app/process restart. It does not create a
+    /// new account; it only installs the signer callback so runtime work can
+    /// resume for the account.
+    pub async fn register_external_signer(
+        &self,
+        account_ref: String,
+        signer: std::sync::Arc<dyn ExternalAccountSignerFfi>,
+    ) -> Result<(), MarmotKitError> {
+        self.runtime
+            .register_external_signer(&account_ref, ExternalAccountSignerAdapter::new(signer))
+            .await?;
+        Ok(())
     }
 
     /// Re-activate a non-destructively signed-out local account. This clears
@@ -155,6 +212,7 @@ impl Marmot {
             label: account.label,
             account_id_hex: account.account_id_hex,
             local_signing: account.local_signing,
+            external_signing: account.external_signing,
             signed_out: account.signed_out,
             running: account.running,
         })

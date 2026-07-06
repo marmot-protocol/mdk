@@ -7,11 +7,12 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use nostr::{
-    EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, UnsignedEvent,
+    Event, EventBuilder, Keys, Kind, NostrSigner, PublicKey, Tag, TagKind, Timestamp,
+    UnsignedEvent,
     base64::Engine as _,
     base64::engine::general_purpose::STANDARD as BASE64_STANDARD,
     secp256k1::{
-        Message, Parity, PublicKey as SecpPublicKey, SECP256K1, SecretKey, XOnlyPublicKey, ecdh,
+        Parity, PublicKey as SecpPublicKey, SecretKey, XOnlyPublicKey, ecdh,
         schnorr::Signature as SchnorrSignature,
     },
 };
@@ -45,9 +46,12 @@ const PUSH_HKDF_SALT: &[u8] = b"marmot-push-token-v1";
 const PUSH_HKDF_INFO: &[u8] = b"marmot-push-token-encryption";
 /// Owner-signature domain tags from the push-notifications spec's "Owner
 /// authentication" section. Token entries (447/448) and removals (449) sign
-/// distinct preimages so a signature cannot be cross-applied between them.
-const PUSH_RECORD_DOMAIN: &[u8] = b"marmot-push-token-record-v1";
-const PUSH_REMOVAL_DOMAIN: &[u8] = b"marmot-push-token-removal-v1";
+/// distinct unpublished Nostr events so a signature cannot be cross-applied
+/// between them and external signers can produce the proof without raw digest
+/// access.
+const PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
+const PUSH_RECORD_DOMAIN: &str = "marmot-push-token-record-v1";
+const PUSH_REMOVAL_DOMAIN: &str = "marmot-push-token-removal-v1";
 const NOTIFICATION_VERSION_TAG: &str = "v";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -540,30 +544,93 @@ fn push_digest(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Verify a BIP-340 Schnorr signature by `member_id_hex` over `digest`. Returns
-/// false on any malformed input rather than erroring, so a bad entry is dropped.
-fn verify_push_owner_sig(member_id_hex: &str, owner_sig_hex: &str, digest: [u8; 32]) -> bool {
-    let Ok(member_bytes) = hex::decode(member_id_hex) else {
-        return false;
-    };
-    let Ok(xonly) = XOnlyPublicKey::from_slice(&member_bytes) else {
-        return false;
-    };
+fn push_owner_proof_event(
+    domain: &str,
+    group_id_hex: &str,
+    member_id_hex: &str,
+    leaf_index: u32,
+    platform: PushPlatform,
+    server_pubkey_hex: &str,
+    token_fingerprint: &str,
+    owner_ts: i64,
+    relay_hint: Option<&str>,
+    encrypted_token: Option<&[u8]>,
+) -> Result<UnsignedEvent, AppError> {
+    let member_pubkey = PublicKey::parse(member_id_hex)
+        .map_err(|_| AppError::InvalidPushGossip("member id must be a Nostr pubkey".into()))?;
+    let relay = relay_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .unwrap_or("");
+    let mut tags = vec![
+        Tag::custom(TagKind::custom("d"), [domain.to_owned()]),
+        Tag::custom(TagKind::custom("group_id"), [group_id_hex.to_owned()]),
+        Tag::custom(TagKind::custom("member_id"), [member_id_hex.to_owned()]),
+        Tag::custom(TagKind::custom("leaf_index"), [leaf_index.to_string()]),
+        Tag::custom(TagKind::custom("platform"), [platform.as_str().to_owned()]),
+        Tag::custom(
+            TagKind::custom("server_pubkey"),
+            [server_pubkey_hex.to_owned()],
+        ),
+        Tag::custom(
+            TagKind::custom("token_fingerprint"),
+            [token_fingerprint.to_owned()],
+        ),
+        Tag::custom(TagKind::custom("owner_ts"), [owner_ts.to_string()]),
+        Tag::custom(TagKind::custom("relay_hint"), [relay.to_owned()]),
+    ];
+    if encrypted_token.is_some() {
+        tags.push(Tag::custom(
+            TagKind::custom("encrypted_token_encoding"),
+            ["base64".to_owned()],
+        ));
+    }
+    let content = encrypted_token
+        .map(|token| BASE64_STANDARD.encode(token))
+        .unwrap_or_default();
+    Ok(
+        EventBuilder::new(Kind::Custom(PUSH_OWNER_PROOF_EVENT_KIND), content)
+            .tags(tags)
+            .custom_created_at(Timestamp::zero())
+            .build(member_pubkey),
+    )
+}
+
+fn push_owner_sig_from_signed_event(
+    expected: &UnsignedEvent,
+    signed: Event,
+) -> Result<String, AppError> {
+    let expected_id = expected
+        .id
+        .ok_or_else(|| AppError::Publish("push owner proof event id was not set".into()))?;
+    if signed.id != expected_id || signed.pubkey != expected.pubkey {
+        return Err(AppError::Publish(
+            "push owner proof signature does not match record".into(),
+        ));
+    }
+    signed
+        .verify()
+        .map_err(|err| AppError::Publish(format!("invalid push owner proof signature: {err}")))?;
+    Ok(hex::encode(signed.sig.serialize()))
+}
+
+/// Verify a Nostr event signature by `member_id_hex` over the canonical,
+/// unpublished owner-proof event. Returns false on malformed input rather than
+/// erroring, so a bad entry is dropped.
+fn verify_push_owner_sig(proof_event: UnsignedEvent, owner_sig_hex: &str) -> bool {
     let Ok(sig_bytes) = hex::decode(owner_sig_hex) else {
         return false;
     };
     let Ok(sig) = SchnorrSignature::from_slice(&sig_bytes) else {
         return false;
     };
-    SECP256K1
-        .verify_schnorr(&sig, &Message::from_digest(digest), &xonly)
-        .is_ok()
+    proof_event.add_signature(sig).is_ok()
 }
 
 impl GroupPushTokenRecord {
     fn signing_digest(&self) -> Result<[u8; 32], AppError> {
         let bytes = push_signed_record_bytes(
-            PUSH_RECORD_DOMAIN,
+            PUSH_RECORD_DOMAIN.as_bytes(),
             &self.group_id_hex,
             &self.member_id_hex,
             self.leaf_index,
@@ -582,18 +649,49 @@ impl GroupPushTokenRecord {
         Ok(hex::encode(self.signing_digest()?))
     }
 
+    fn owner_proof_event(&self) -> Result<UnsignedEvent, AppError> {
+        push_owner_proof_event(
+            PUSH_RECORD_DOMAIN,
+            &self.group_id_hex,
+            &self.member_id_hex,
+            self.leaf_index,
+            self.platform,
+            &self.server_pubkey_hex,
+            &self.token_fingerprint,
+            self.owner_ts,
+            self.relay_hint.as_deref(),
+            Some(&self.encrypted_token),
+        )
+    }
+
     /// Sign this record with the owner account `keys`, populating `owner_sig`.
+    #[cfg(test)]
     pub(crate) fn sign_owner(&mut self, keys: &Keys) -> Result<(), AppError> {
-        let digest = self.signing_digest()?;
-        let sig = keys.sign_schnorr(&Message::from_digest(digest));
-        self.owner_sig = hex::encode(sig.serialize());
+        let proof_event = self.owner_proof_event()?;
+        let signed = proof_event
+            .sign_with_keys(keys)
+            .map_err(|err| AppError::Publish(format!("push owner proof: {err}")))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&self.owner_proof_event()?, signed)?;
         Ok(())
     }
 
-    /// True when `owner_sig` is a valid BIP-340 signature by `member_id_hex`.
+    pub(crate) async fn sign_owner_with_signer(
+        &mut self,
+        signer: &dyn NostrSigner,
+    ) -> Result<(), AppError> {
+        let proof_event = self.owner_proof_event()?;
+        let signed = signer
+            .sign_event(proof_event.clone())
+            .await
+            .map_err(|err| crate::external_signer_error(err, "push owner proof"))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed)?;
+        Ok(())
+    }
+
+    /// True when `owner_sig` is a valid Nostr signature by `member_id_hex`.
     pub(crate) fn verify_owner_sig(&self) -> bool {
-        match self.signing_digest() {
-            Ok(digest) => verify_push_owner_sig(&self.member_id_hex, &self.owner_sig, digest),
+        match self.owner_proof_event() {
+            Ok(proof_event) => verify_push_owner_sig(proof_event, &self.owner_sig),
             Err(_) => false,
         }
     }
@@ -602,7 +700,7 @@ impl GroupPushTokenRecord {
 impl PushTokenRemovalRecord {
     fn signing_digest(&self, group_id_hex: &str) -> Result<[u8; 32], AppError> {
         let bytes = push_signed_record_bytes(
-            PUSH_REMOVAL_DOMAIN,
+            PUSH_REMOVAL_DOMAIN.as_bytes(),
             group_id_hex,
             &self.member_id_hex,
             self.leaf_index,
@@ -620,16 +718,49 @@ impl PushTokenRemovalRecord {
         Ok(hex::encode(self.signing_digest(group_id_hex)?))
     }
 
+    fn owner_proof_event(&self, group_id_hex: &str) -> Result<UnsignedEvent, AppError> {
+        push_owner_proof_event(
+            PUSH_REMOVAL_DOMAIN,
+            group_id_hex,
+            &self.member_id_hex,
+            self.leaf_index,
+            self.platform,
+            &self.server_pubkey_hex,
+            &self.token_fingerprint,
+            self.owner_ts,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn sign_owner(&mut self, group_id_hex: &str, keys: &Keys) -> Result<(), AppError> {
-        let digest = self.signing_digest(group_id_hex)?;
-        let sig = keys.sign_schnorr(&Message::from_digest(digest));
-        self.owner_sig = hex::encode(sig.serialize());
+        let proof_event = self.owner_proof_event(group_id_hex)?;
+        let signed = proof_event
+            .clone()
+            .sign_with_keys(keys)
+            .map_err(|err| AppError::Publish(format!("push removal owner proof: {err}")))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed)?;
+        Ok(())
+    }
+
+    pub(crate) async fn sign_owner_with_signer(
+        &mut self,
+        group_id_hex: &str,
+        signer: &dyn NostrSigner,
+    ) -> Result<(), AppError> {
+        let proof_event = self.owner_proof_event(group_id_hex)?;
+        let signed = signer
+            .sign_event(proof_event.clone())
+            .await
+            .map_err(|err| crate::external_signer_error(err, "push removal owner proof"))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed)?;
         Ok(())
     }
 
     pub(crate) fn verify_owner_sig(&self, group_id_hex: &str) -> bool {
-        match self.signing_digest(group_id_hex) {
-            Ok(digest) => verify_push_owner_sig(&self.member_id_hex, &self.owner_sig, digest),
+        match self.owner_proof_event(group_id_hex) {
+            Ok(proof_event) => verify_push_owner_sig(proof_event, &self.owner_sig),
             Err(_) => false,
         }
     }
@@ -675,12 +806,12 @@ pub async fn build_notification_gift_wrap(
         .map_err(|err| AppError::Publish(format!("notification event: {err}")))
 }
 
-pub(crate) fn local_token_gossip_payload(
+pub(crate) async fn local_token_gossip_payload(
     group_id_hex: String,
     member_id_hex: String,
     leaf_index: u32,
     registration: &StoredPushRegistration,
-    keys: &Keys,
+    signer: &dyn NostrSigner,
 ) -> Result<(PushTokenGossipPayload, GroupPushTokenRecord), AppError> {
     let encrypted_token = encrypted_push_token(
         registration.registration.platform,
@@ -705,7 +836,7 @@ pub(crate) fn local_token_gossip_payload(
         owner_sig: String::new(),
         updated_at_ms: now,
     };
-    record.sign_owner(keys)?;
+    record.sign_owner_with_signer(signer).await?;
     let payload = PushTokenGossipPayload {
         v: PUSH_VERSION.to_owned(),
         tokens: vec![PushTokenGossipEntry::from_record(&record)],
@@ -713,12 +844,12 @@ pub(crate) fn local_token_gossip_payload(
     Ok((payload, record))
 }
 
-pub(crate) fn local_token_removal_payload(
+pub(crate) async fn local_token_removal_payload(
     group_id_hex: &str,
     member_id_hex: String,
     leaf_index: u32,
     registration: &PushRegistration,
-    keys: &Keys,
+    signer: &dyn NostrSigner,
 ) -> Result<(PushTokenRemovalPayload, PushTokenRemovalRecord), AppError> {
     let mut record = PushTokenRemovalRecord {
         member_id_hex,
@@ -729,7 +860,7 @@ pub(crate) fn local_token_removal_payload(
         owner_ts: unix_now_ms(),
         owner_sig: String::new(),
     };
-    record.sign_owner(group_id_hex, keys)?;
+    record.sign_owner_with_signer(group_id_hex, signer).await?;
     let payload = PushTokenRemovalPayload {
         v: PUSH_VERSION.to_owned(),
         removals: vec![PushTokenRemovalEntry {

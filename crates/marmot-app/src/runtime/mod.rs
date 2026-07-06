@@ -529,6 +529,7 @@ pub struct ManagedAccount {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
 }
@@ -2418,6 +2419,33 @@ impl MarmotAppRuntime {
         self.accounts.create_or_import_account(request).await
     }
 
+    pub async fn login_external_signer<S>(
+        &self,
+        public_key: impl Into<String>,
+        signer: S,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.accounts
+            .login_external_signer(public_key.into(), signer, request)
+            .await
+    }
+
+    pub async fn register_external_signer<S>(
+        &self,
+        account_ref: impl AsRef<str>,
+        signer: S,
+    ) -> Result<(), AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.accounts
+            .register_external_signer(account_ref.as_ref(), signer)
+            .await
+    }
+
     pub async fn create_or_import_account(
         &self,
         request: AccountSetupRequest,
@@ -2478,12 +2506,13 @@ impl AccountManager {
             .account_home()
             .accounts()?
             .into_iter()
-            .filter(|account| account.local_signing)
+            .filter(|account| account.can_sign())
             .map(|account| ManagedAccount {
                 running: running.contains(&account.account_id_hex),
                 label: account.label,
                 account_id_hex: account.account_id_hex,
                 local_signing: account.local_signing,
+                external_signing: account.external_signing,
                 signed_out: account.signed_out,
             })
             .collect())
@@ -2568,6 +2597,7 @@ impl AccountManager {
             label: account.label,
             account_id_hex: account.account_id_hex,
             local_signing: account.local_signing,
+            external_signing: account.external_signing,
             signed_out: account.signed_out,
             running,
         })
@@ -2582,7 +2612,12 @@ impl AccountManager {
                 .account_home()
                 .accounts()?
                 .into_iter()
-                .filter(|account| account.is_active_local_signing())
+                .filter(|account| {
+                    account.is_active_local_signing()
+                        || (account.external_signing
+                            && !account.signed_out
+                            && self.app.has_external_signer(&account.account_id_hex))
+                })
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -2881,7 +2916,7 @@ impl AccountManager {
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        if !account.local_signing {
+        if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
         if account.signed_out {
@@ -2992,6 +3027,84 @@ impl AccountManager {
         })
     }
 
+    pub async fn login_external_signer<S>(
+        &self,
+        public_key: String,
+        signer: S,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.shared.lifecycle().ensure_running()?;
+        let signer_public_key = signer
+            .get_public_key()
+            .await
+            .map_err(crate::external_signer_public_key_error)?;
+        let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
+        if signer_public_key.to_hex() != account_id_hex {
+            return Err(AppError::ExternalSignerMismatch);
+        }
+        let mut account = self
+            .app
+            .account_home()
+            .add_external_signer_account(&public_key)?;
+        self.app
+            .register_external_signer(&account.account_id_hex, signer)
+            .await?;
+
+        let relay_lists = self
+            .setup_relay_lists_for_account(&account, &request, false, false)
+            .await?;
+
+        let key_package_bytes = if request.publish_initial_key_package {
+            Some(
+                self.publish_initial_key_package_for_account(&account)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
+        let _ = self
+            .app
+            .refresh_user_directory_for_account_id(
+                &account.account_id_hex,
+                directory_bootstrap_relays,
+            )
+            .await;
+        if account.signed_out {
+            account = self
+                .app
+                .account_home()
+                .set_account_signed_out(&account.label, false)?;
+        }
+        self.reconcile().await?;
+
+        Ok(AccountSetupResult {
+            account,
+            relay_lists,
+            key_package_bytes,
+            profile: None,
+        })
+    }
+
+    pub async fn register_external_signer<S>(
+        &self,
+        account_ref: &str,
+        signer: S,
+    ) -> Result<(), AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.shared.lifecycle().ensure_running()?;
+        self.app
+            .register_external_signer(account_ref, signer)
+            .await?;
+        self.reconcile().await
+    }
+
     async fn publish_default_profile_for_account(
         &self,
         account: &AccountSummary,
@@ -3026,7 +3139,7 @@ impl AccountManager {
         imports_private_key: bool,
         creates_new_private_key: bool,
     ) -> Result<AccountRelayListStatus, AppError> {
-        if account.local_signing {
+        if account.can_sign() {
             if creates_new_private_key && request.default_relays.is_empty() {
                 return Err(AppError::MissingDefaultRelays);
             }
