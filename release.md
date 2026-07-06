@@ -211,6 +211,11 @@ curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-openclaw-marmot.sh | bash
 ```
 
+These one-liners perform full setup by default: they install `wn-agent`, install/enable the matching gateway plugin,
+start a same-user `wn-agent` service where supported, bootstrap or reuse the default Marmot agent home, and patch only
+the Marmot-specific gateway config. Use `--no-service`, `--no-start-wn-agent`, `--no-configure-hermes`, or
+`--no-configure-openclaw` when you need a partial/manual install.
+
 ## MarmotKit Binding Release
 
 Use this when app repos need pinned generated bindings instead of a local MDK checkout.

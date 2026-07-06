@@ -114,8 +114,9 @@ configure_args=(
     --long-running-notifications "$HERMES_MARMOT_LONG_RUNNING_NOTIFICATIONS"
     --busy-ack-detail "$HERMES_MARMOT_BUSY_ACK_DETAIL"
 )
-case "$HERMES_MARMOT_STREAMING" in
-    1|true|TRUE|yes|YES|on|ON)
+streaming_normalized="$(printf '%s' "$HERMES_MARMOT_STREAMING" | tr '[:upper:]' '[:lower:]')"
+case "$streaming_normalized" in
+    1|true|yes|on)
         configure_args+=(--configure-global-streaming)
         ;;
 esac

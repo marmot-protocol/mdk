@@ -44,6 +44,7 @@ CLI_RELAYS=0
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_JSON_PATH=""
 BOOTSTRAP_WELCOMER_ALLOWLIST_CSV=""
+WN_AGENT_TEMP_PID=""
 
 RELAYS=()
 ALLOW_WELCOMERS=()
@@ -103,6 +104,7 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "missing required command
 append_csv() {
     local value="$1"
     local item
+    local -a _items
     IFS=',' read -r -a _items <<<"$value"
     for item in "${_items[@]}"; do
         item="${item#"${item%%[![:space:]]*}"}"
@@ -149,6 +151,35 @@ prompt_yes_no() {
             n | no) return 1 ;;
             *) printf 'Please answer yes or no.\n' >/dev/tty ;;
         esac
+    done
+}
+
+is_welcomer_ref_syntax() {
+    local value normalized
+    value="${1#"${1%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    normalized="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+    case "$normalized" in
+        npub1*)
+            [[ "$normalized" =~ ^npub1[023456789acdefghjklmnpqrstuvwxyz]+$ ]]
+            ;;
+        *)
+            [[ "$normalized" =~ ^[0-9a-f]{64}$ ]]
+            ;;
+    esac
+}
+
+validate_welcomer_inputs() {
+    local welcomer
+    if [ "${#ALLOW_WELCOMERS[@]}" -eq 0 ]; then
+        return 0
+    fi
+    for welcomer in "${ALLOW_WELCOMERS[@]}"; do
+        if ! is_welcomer_ref_syntax "$welcomer"; then
+            echo "error: invalid welcomer allowlist value: $welcomer" >&2
+            echo "expected a Nostr npub or 64-character hex account id" >&2
+            exit 1
+        fi
     done
 }
 
@@ -314,7 +345,7 @@ install_macos_service() {
         return 0
     fi
 
-    run mkdir -p "$plist_dir" "$logs_dir"
+    run mkdir -p "$plist_dir" "$logs_dir" || return 1
     {
         printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
         printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">'
@@ -344,10 +375,13 @@ install_macos_service() {
         plist_string "$logs_dir/wn-agent.err.log"
         printf '%s\n' '</dict>'
         printf '%s\n' '</plist>'
-    } >"$plist"
+    } >"$plist" || return 1
 
     launchctl bootout "gui/$UID" "$plist" >/dev/null 2>&1 || true
-    run launchctl bootstrap "gui/$UID" "$plist"
+    if ! run launchctl bootstrap "gui/$UID" "$plist"; then
+        warn "launchctl bootstrap failed for $label; falling back to a temporary wn-agent process"
+        return 1
+    fi
     launchctl kickstart -k "gui/$UID/$label" >/dev/null 2>&1 || true
     log "installed and started LaunchAgent: $label"
 }
@@ -365,25 +399,31 @@ install_linux_user_service() {
         return 0
     fi
 
-    run mkdir -p "$service_dir" "$MARMOT_HOME/logs"
+    run mkdir -p "$service_dir" "$MARMOT_HOME/logs" || return 1
     {
         printf '%s\n' '[Unit]'
         printf '%s\n' 'Description=Marmot wn-agent connector'
         printf '%s\n' 'After=network-online.target'
-        printf '%s\n'
+        printf '\n'
         printf '%s\n' '[Service]'
         printf 'ExecStart=%q --home %q --socket %q' "$program" "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
         for relay in "${RELAYS[@]}"; do printf ' --relay %q' "$relay"; done
         printf '\n'
         printf '%s\n' 'Restart=always'
         printf '%s\n' 'RestartSec=2'
-        printf '%s\n'
+        printf '\n'
         printf '%s\n' '[Install]'
         printf '%s\n' 'WantedBy=default.target'
-    } >"$service"
+    } >"$service" || return 1
 
-    run systemctl --user daemon-reload
-    run systemctl --user enable --now wn-agent.service
+    if ! run systemctl --user daemon-reload; then
+        warn "systemctl --user daemon-reload failed; falling back to a temporary wn-agent process"
+        return 1
+    fi
+    if ! run systemctl --user enable --now wn-agent.service; then
+        warn "systemctl --user enable --now wn-agent.service failed; falling back to a temporary wn-agent process"
+        return 1
+    fi
     log "installed and started systemd user service: wn-agent.service"
 }
 
@@ -422,6 +462,8 @@ start_temp_agent() {
     for relay in "${RELAYS[@]}"; do args+=(--relay "$relay"); done
     log "starting temporary wn-agent for bootstrap"
     wn-agent "${args[@]}" &
+    WN_AGENT_TEMP_PID="$!"
+    log "temporary wn-agent pid: $WN_AGENT_TEMP_PID"
 }
 
 bootstrap_agent() {
@@ -556,6 +598,13 @@ Marmot agent:
   socket: $MARMOT_AGENT_SOCKET
   account: $BOOTSTRAP_ACCOUNT_ID_HEX
   bootstrap JSON: $BOOTSTRAP_JSON_PATH
+EOF
+    if [ -n "${WN_AGENT_TEMP_PID:-}" ]; then
+        cat <<EOF
+  temporary process: pid $WN_AGENT_TEMP_PID (stop with: kill $WN_AGENT_TEMP_PID)
+EOF
+    fi
+    cat <<EOF
 
 OpenClaw:
   home: $OPENCLAW_HOME
@@ -627,6 +676,8 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     fi
 fi
 
+validate_welcomer_inputs
+
 need_cmd curl
 need_cmd tar
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -639,7 +690,14 @@ fi
 
 platform="$(detect_platform)"
 tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+cleanup() {
+    local status=$?
+    rm -rf "$tmpdir"
+    if [ "$status" -ne 0 ] && [ -n "${WN_AGENT_TEMP_PID:-}" ]; then
+        kill "$WN_AGENT_TEMP_PID" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
 
 log "platform=$platform repo=$MARMOT_RELEASE_REPO tag=$MARMOT_RELEASE_TAG version=$WN_AGENT_VERSION"
 log "OpenClaw home: $OPENCLAW_HOME"

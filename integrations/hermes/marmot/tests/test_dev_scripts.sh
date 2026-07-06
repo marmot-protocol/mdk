@@ -103,6 +103,12 @@ installer_stdin_dry_run="$(
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     bash -s -- --dry-run --yes < "$repo_root/scripts/install-hermes-marmot.sh"
 )"
+installer_bad_welcomer_status=0
+WN_AGENT_SHA="9.9.9" \
+    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --allow-welcomer not-a-key \
+    >/dev/null 2>&1 || installer_bad_welcomer_status=$?
+[ "$installer_bad_welcomer_status" -ne 0 ]
 case "$installer_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "Hermes installer dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
@@ -118,6 +124,14 @@ esac
 case "$installer_stdin_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "Hermes installer stdin dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
+esac
+case "$installer_stdin_dry_run" in
+    *"hermes-marmot-plugin-9.9.9.tar.gz"* ) ;;
+    *) echo "Hermes installer stdin dry-run did not use expected plugin asset" >&2; exit 1;;
+esac
+case "$installer_stdin_dry_run" in
+    *"wn-agent-v9.9.9-test"* ) ;;
+    *) echo "Hermes installer stdin dry-run did not use requested release tag" >&2; exit 1;;
 esac
 
 echo "dev script test passed"

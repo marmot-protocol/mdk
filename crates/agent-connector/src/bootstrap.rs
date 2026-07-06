@@ -308,6 +308,15 @@ async fn bootstrap_allowlist(
     welcomers: Vec<String>,
 ) -> Result<Vec<String>, BootstrapError> {
     let welcomers = normalize_welcomer_refs(welcomers)?;
+    if welcomers.is_empty() {
+        let listed = client
+            .request(AgentControlRequest::AllowlistList {
+                account_id_hex: account_id_hex.to_owned(),
+            })
+            .await?;
+        return allowlist_from_response(listed, account_id_hex);
+    }
+
     let mut current = Vec::new();
     for welcomer_account_id_hex in welcomers {
         let added = client
@@ -316,24 +325,31 @@ async fn bootstrap_allowlist(
                 welcomer_account_id_hex,
             })
             .await?;
-        ensure_response_type(&added, "allowlist")?;
-        let AgentControlResponse::Allowlist {
-            account_id_hex: echoed_account_id_hex,
-            welcomer_account_ids_hex,
-        } = added.payload
-        else {
-            return Err(unexpected_response("allowlist", &added.payload));
-        };
-        let echoed_account_id_hex = normalize_account_id_hex(&echoed_account_id_hex)?;
-        if echoed_account_id_hex != account_id_hex {
-            return Err(BootstrapError::AllowlistAccountMismatch {
-                expected: account_id_hex.to_owned(),
-                actual: echoed_account_id_hex,
-            });
-        }
-        current = welcomer_account_ids_hex;
+        current = allowlist_from_response(added, account_id_hex)?;
     }
     Ok(current)
+}
+
+fn allowlist_from_response(
+    envelope: AgentControlEnvelope<AgentControlResponse>,
+    account_id_hex: &str,
+) -> Result<Vec<String>, BootstrapError> {
+    ensure_response_type(&envelope, "allowlist")?;
+    let (echoed_account_id_hex, welcomer_account_ids_hex) = match envelope.payload {
+        AgentControlResponse::Allowlist {
+            account_id_hex,
+            welcomer_account_ids_hex,
+        } => (account_id_hex, welcomer_account_ids_hex),
+        other => return Err(unexpected_response("allowlist", &other)),
+    };
+    let echoed_account_id_hex = normalize_account_id_hex(&echoed_account_id_hex)?;
+    if echoed_account_id_hex != account_id_hex {
+        return Err(BootstrapError::AllowlistAccountMismatch {
+            expected: account_id_hex.to_owned(),
+            actual: echoed_account_id_hex,
+        });
+    }
+    Ok(welcomer_account_ids_hex)
 }
 
 fn local_signing_accounts(accounts: Vec<AgentControlAccount>) -> Vec<AgentControlAccount> {
@@ -630,6 +646,13 @@ mod tests {
                             },
                         }
                     }
+                    AgentControlRequest::AllowlistList { account_id_hex } => {
+                        assert_eq!(account_id_hex, ACCOUNT_ID);
+                        AgentControlResponse::Allowlist {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            welcomer_account_ids_hex: Vec::new(),
+                        }
+                    }
                     other => panic!("unexpected request: {other:?}"),
                 },
             )
@@ -640,6 +663,7 @@ mod tests {
 
         assert!(result.created);
         assert_eq!(result.account_id_hex, ACCOUNT_ID);
+        assert!(result.welcomer_account_ids_hex.is_empty());
         assert_eq!(
             result.npub,
             "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
@@ -647,11 +671,15 @@ mod tests {
         assert!(result.nprofile.starts_with("nprofile1"));
         assert!(!result.qr_payload.contains("quic://"));
         let recorded = requests.lock().await;
-        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded.len(), 3);
         assert!(matches!(recorded[0], AgentControlRequest::AccountList));
         assert!(matches!(
             recorded[1],
             AgentControlRequest::AccountCreate { .. }
+        ));
+        assert!(matches!(
+            recorded[2],
+            AgentControlRequest::AllowlistList { .. }
         ));
     }
 
@@ -679,6 +707,13 @@ mod tests {
                             key_package_bytes: 1234,
                         }
                     }
+                    AgentControlRequest::AllowlistList { account_id_hex } => {
+                        assert_eq!(account_id_hex, ACCOUNT_ID);
+                        AgentControlResponse::Allowlist {
+                            account_id_hex: ACCOUNT_ID.to_owned(),
+                            welcomer_account_ids_hex: vec![WELCOMER_ID.to_owned()],
+                        }
+                    }
                     other => panic!("unexpected request: {other:?}"),
                 },
             )
@@ -690,11 +725,19 @@ mod tests {
         assert!(!result.created);
         assert!(result.key_package_published);
         assert_eq!(result.key_package_bytes, Some(1234));
+        assert_eq!(
+            result.welcomer_account_ids_hex,
+            vec![WELCOMER_ID.to_owned()]
+        );
         let recorded = requests.lock().await;
-        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded.len(), 3);
         assert!(matches!(
             recorded[1],
             AgentControlRequest::AccountPublishKeyPackage { .. }
+        ));
+        assert!(matches!(
+            recorded[2],
+            AgentControlRequest::AllowlistList { .. }
         ));
     }
 
@@ -717,6 +760,13 @@ mod tests {
                     AgentControlResponse::KeyPackagePublished {
                         account_id_hex: ACCOUNT_ID.to_owned(),
                         key_package_bytes: 12,
+                    }
+                }
+                AgentControlRequest::AllowlistList { account_id_hex } => {
+                    assert_eq!(account_id_hex, ACCOUNT_ID);
+                    AgentControlResponse::Allowlist {
+                        account_id_hex: ACCOUNT_ID.to_owned(),
+                        welcomer_account_ids_hex: Vec::new(),
                     }
                 }
                 other => panic!("unexpected request: {other:?}"),
