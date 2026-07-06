@@ -2953,10 +2953,14 @@ impl AccountManager {
         let rollback_on_setup_failure = !reactivating_existing;
 
         if imports_private_key || reactivating_existing || !account.local_signing {
+            // Resolve a pre-existing identity's profile from public indexers, not
+            // the app's own messaging relays, where its outbox metadata does not
+            // live. Runs before the relay-list setup below so discovery never
+            // clobbers, or is clobbered by, the publish-missing-relay-lists step.
             let _ = self
                 .preflight_existing_account_directory(
                     &account.account_id_hex,
-                    directory_bootstrap_relays.clone(),
+                    directory_discovery_relays_for_setup(&request),
                 )
                 .await;
         }
@@ -3071,10 +3075,14 @@ impl AccountManager {
         }
 
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
+        // An external-signer account is pre-existing by definition, so resolve
+        // its profile from public indexers (its outbox metadata does not live on
+        // the app's messaging relays). Runs before the relay-list setup so
+        // discovery keeps its anti-clobber ordering.
         let _ = self
             .preflight_existing_account_directory(
                 &account.account_id_hex,
-                directory_bootstrap_relays.clone(),
+                directory_discovery_relays_for_setup(&request),
             )
             .await;
 
@@ -3156,8 +3164,9 @@ impl AccountManager {
             Ok(status) => status,
             Err(err) => {
                 tracing::debug!(
-                    account_id_hex,
-                    error = %err,
+                    target: "marmot_app::runtime",
+                    method = "preflight_existing_account_directory",
+                    error_kind = err.privacy_safe_kind(),
                     "existing account relay discovery failed during setup preflight"
                 );
                 return None;
@@ -3180,8 +3189,9 @@ impl AccountManager {
             .await
         {
             tracing::debug!(
-                account_id_hex,
-                error = %err,
+                target: "marmot_app::runtime",
+                method = "preflight_existing_account_directory",
+                error_kind = err.privacy_safe_kind(),
                 "existing account profile discovery failed during setup preflight"
             );
         }
@@ -3386,6 +3396,40 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
     } else {
         request.bootstrap_relays.clone()
     }
+}
+
+/// Public indexer relays used to resolve a pre-existing identity's outbox
+/// metadata during setup.
+///
+/// A brand-new external-signer account (or an imported nsec) keeps its NIP-65
+/// relay list (kind:10002) and profile (kind:0) on public indexers, not on the
+/// app's own messaging relays. Discovering an existing profile against the
+/// app's relays therefore finds nothing and the display name never resolves —
+/// the exact bug the external-signer work exists to fix. These indexers give
+/// the directory preflight a discovery set distinct from the operational
+/// messaging relays. They are used only to read the outbox list and profile,
+/// they are never adopted as the account's messaging relays.
+const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[
+    "wss://purplepag.es",
+    "wss://relay.nostr.band",
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+];
+
+/// Discovery relay set for the existing-account directory preflight.
+///
+/// Unions the caller-supplied setup relays with the default public indexers so
+/// discovery reaches wherever a pre-existing identity actually published its
+/// kind:10002/kind:0, without dropping any indexers a caller passes explicitly.
+fn directory_discovery_relays_for_setup(request: &AccountSetupRequest) -> Vec<TransportEndpoint> {
+    let mut relays = directory_bootstrap_relays_for_setup(request);
+    for indexer in DEFAULT_DISCOVERY_INDEXER_RELAYS {
+        let endpoint = TransportEndpoint((*indexer).to_string());
+        if !relays.contains(&endpoint) {
+            relays.push(endpoint);
+        }
+    }
+    relays
 }
 
 pub(crate) async fn account_worker_response<T>(

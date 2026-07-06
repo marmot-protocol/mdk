@@ -4,6 +4,20 @@
 //! signature key is a separate leaf key. This extension binds those two public
 //! keys with a Nostr-account Schnorr signature so account-scoped policy, such
 //! as admin authorization, can safely trust the credential identity.
+//!
+//! TODO(mdk#755, layering): this module currently depends on the `nostr` crate
+//! (EventBuilder construction, `Event::from_json`, `add_signature`), which
+//! breaks the cgka-engine "no Nostr SDK types" invariant (see this crate's
+//! AGENTS.md). The engine should keep a neutral contract — canonical event
+//! bytes/JSON plus the 32-byte event id and the 64-byte Schnorr signature — and
+//! the event construction plus signature verification should move to the
+//! app/session signer adapter boundary (marmot-app / marmot-uniffi), which
+//! already depend on nostr. This was left as follow-up because verification
+//! runs deep in the engine ingest paths (staged-commit and KeyPackage
+//! validation) and must recompute the canonical event id from the request
+//! fields, so a sound move needs either a proof-message-computer callback
+//! threaded through those paths or an in-engine NIP-01 canonicalization that
+//! does not pull in the SDK — neither is a clean lift.
 
 use cgka_traits::error::EngineError;
 use cgka_traits::types::MemberId;

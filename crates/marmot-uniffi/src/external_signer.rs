@@ -166,11 +166,23 @@ impl AccountIdentityProofSigner for ExternalAccountSignerAdapter {
         &self,
         request: &AccountIdentityProofRequest,
     ) -> Result<[u8; 64], String> {
+        // The proof is signed through the same foreign `sign_event` callback as
+        // every other Nostr signature, so a cancelled Amber prompt must survive
+        // as the typed rejection rather than a generic string. The trait method
+        // is synchronous, so it cannot `spawn_blocking(...).await` like the
+        // `NostrSigner` methods above — but it does not need to. The engine
+        // builds this proof once, synchronously, inside `AccountDevice::open`,
+        // which the app already runs under `blocking_app_task` (spawn_blocking),
+        // so the interactive prompt runs on a blocking thread and never parks a
+        // Tokio worker. We therefore only need to preserve the rejection type:
+        // map it to the `EXTERNAL_SIGNER_REJECTED` sentinel — mirroring
+        // `callback_signer_error` — so the app layer can recover
+        // `AppError::ExternalSignerRejected` end to end.
         let unsigned_event_json = request.proof_event_json()?;
         let signed_event_json = self
             .signer
             .sign_event(unsigned_event_json)
-            .map_err(|err| err.to_string())?;
+            .map_err(callback_proof_signer_error)?;
         let signed_event = Event::from_json(signed_event_json).map_err(|err| err.to_string())?;
         request.signature_from_signed_event(signed_event)
     }
@@ -182,6 +194,18 @@ fn callback_signer_error(error: MarmotKitError) -> SignerError {
             SignerError::from(marmot_app::EXTERNAL_SIGNER_REJECTED)
         }
         other => SignerError::from(other.to_string()),
+    }
+}
+
+/// Preserve a cancelled proof prompt across the `String`-typed proof-signer
+/// trait boundary. A rejected callback becomes the `EXTERNAL_SIGNER_REJECTED`
+/// sentinel string so the app layer can map it back to the typed
+/// `AppError::ExternalSignerRejected`, matching `callback_signer_error` on the
+/// async signer paths.
+fn callback_proof_signer_error(error: MarmotKitError) -> String {
+    match error {
+        MarmotKitError::ExternalSignerRejected => marmot_app::EXTERNAL_SIGNER_REJECTED.to_string(),
+        other => other.to_string(),
     }
 }
 
