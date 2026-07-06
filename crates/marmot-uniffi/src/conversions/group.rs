@@ -27,6 +27,10 @@ pub struct AppGroupRecordFfi {
     pub avatar_url: Option<String>,
     pub avatar_dim: Option<String>,
     pub avatar_thumbhash: Option<String>,
+    /// Content hash of the encrypted Blossom avatar
+    /// (`marmot.group.blossom.image.v1`), `None` when absent. Doubles as a
+    /// cache key; fetch + decrypt via `Marmot::download_group_image`.
+    pub image_hash_hex: Option<String>,
     pub encrypted_media: AppGroupEncryptedMediaComponentFfi,
     /// Per-group disappearing-message retention in seconds
     /// (`marmot.group.message-retention.v1`). `0` means messages never expire.
@@ -64,6 +68,8 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             avatar_url: avatar.present.then_some(avatar.url),
             avatar_dim: avatar.dim,
             avatar_thumbhash: avatar.thumbhash,
+            image_hash_hex: (value.image.present && !value.image.image_hash_hex.is_empty())
+                .then(|| value.image.image_hash_hex.clone()),
             encrypted_media: value.encrypted_media.into(),
             disappearing_message_secs,
             archived: value.archived,

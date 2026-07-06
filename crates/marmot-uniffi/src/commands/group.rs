@@ -403,6 +403,25 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Fetch and decrypt the group's encrypted Blossom avatar
+    /// (`marmot.group.blossom.image.v1`) into raw image bytes (PNG/JPEG/…).
+    /// Errors when the group has no Blossom image set. Presence and the
+    /// content hash (for caching) are on `AppGroupRecordFfi::image_hash_hex`;
+    /// when the group also carries a URL avatar, the URL takes precedence
+    /// for rendering.
+    pub async fn download_group_image(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Vec<u8>, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let bytes = self
+            .runtime
+            .download_group_image(&account_ref, &group_id)
+            .await?;
+        Ok(bytes)
+    }
+
     /// Set (or clear, with `url = None`) the group's URL-based avatar
     /// (`marmot.group.avatar-url.v1`). The URL is validated (https-only, no
     /// localhost/private hosts) and normalized before it is committed.
