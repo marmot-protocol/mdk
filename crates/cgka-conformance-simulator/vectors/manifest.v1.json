@@ -113,7 +113,20 @@
         "committer-identity decisive rule",
         "settled convergence_decision assertion"
       ],
-      "next": "Add a witness-decided companion vector once engine-driven app-witness quorum is stageable in the harness."
+      "next": "See convergence-witness-selected/v1 for the witness-decided companion."
+    },
+    {
+      "id": "convergence-witness-selected/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "convergence-witness-selected.v1.json",
+      "coverage": [
+        "observer-side witness-decided convergence",
+        "app-witness quorum overrides the committer tiebreak",
+        "witness weight retained across a post-delivery fork reorg",
+        "delivered app payloads not re-delivered on reorg"
+      ],
+      "next": "Use as the witness-decided convergence contract; source of the convergence incident-replay witness path."
     },
     {
       "id": "drop-queued/v1",

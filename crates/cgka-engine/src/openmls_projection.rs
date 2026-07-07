@@ -114,6 +114,10 @@ pub struct OpenMlsCanonicalizationBatch {
     pub state: CanonicalizationState,
     pub candidate_paths: Vec<OpenMlsCandidatePath>,
     pub pending_messages: Vec<TransportMessage>,
+    /// Hex ids of app messages in `pending_messages` already applied on a prior
+    /// pass (stored `Processed`), re-admitted for witness scoring only — never
+    /// re-delivered. Empty for callers that pass only fresh messages.
+    pub already_delivered_app_ids: BTreeSet<String>,
     pub outbound_intents: Vec<OutboundIntent>,
     pub policy: CanonicalizationPolicy,
     pub now_ms: u64,
@@ -209,6 +213,9 @@ struct StoredOpenMlsCanonicalizationWork {
     state: CanonicalizationState,
     commit_messages: Vec<StoredCommitMessage>,
     pending_messages: Vec<TransportMessage>,
+    /// App ids in `pending_messages` re-admitted for witness scoring only (stored
+    /// `Processed`). See [`OpenMlsCanonicalizationBatch::already_delivered_app_ids`].
+    already_delivered_app_ids: BTreeSet<String>,
     outbound_intents: Vec<OutboundIntent>,
     policy: CanonicalizationPolicy,
     now_ms: u64,
@@ -633,6 +640,7 @@ fn canonicalize_openmls_batch_with_materialized(
     let pending_messages = project_pending_canonicalization_messages(
         group_id,
         &batch.pending_messages,
+        &batch.already_delivered_app_ids,
         &proposal_branch_by_id,
         &app_messages_by_id,
     )?;
@@ -668,6 +676,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
     let mut commit_messages = Vec::new();
     let mut pending_messages = Vec::new();
+    let mut already_delivered_app_ids = BTreeSet::new();
     let mut stale_commit_drops = Vec::new();
     let mut own_commits = PrevalidatedOwnCommits::default();
 
@@ -714,10 +723,27 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                     state: record.state,
                 });
             }
-            OpenMlsContentKind::Proposal | OpenMlsContentKind::Application
+            OpenMlsContentKind::Proposal
                 if record_state_is_canonicalization_input(record.state)
                     && source_epoch.is_some_and(|epoch| epoch >= state.retained_anchor_epoch) =>
             {
+                pending_messages.push(message)
+            }
+            // App messages within the retained window are admitted for scoring
+            // when fresh (`Created`/`Retryable`/`Sent`, to be delivered) AND when
+            // already `Processed` on a prior pass. A `Processed` app is re-admitted
+            // for witness scoring only (tracked in `already_delivered_app_ids` so
+            // it is never re-delivered): without it, a same-epoch fork resolved
+            // *after* the app was delivered loses that app's witness weight, so
+            // branch selection would depend on local arrival order (the
+            // convergence contract requires order-independence).
+            OpenMlsContentKind::Application
+                if record_state_can_contribute_to_openmls_graph(record.state)
+                    && source_epoch.is_some_and(|epoch| epoch >= state.retained_anchor_epoch) =>
+            {
+                if record.state == MessageState::Processed {
+                    already_delivered_app_ids.insert(hex::encode(message.id.as_slice()));
+                }
                 pending_messages.push(message)
             }
             OpenMlsContentKind::Welcome | OpenMlsContentKind::Other => {}
@@ -744,6 +770,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                 state,
                 commit_messages,
                 pending_messages,
+                already_delivered_app_ids,
                 outbound_intents,
                 policy,
                 now_ms,
@@ -762,6 +789,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
             state,
             commit_messages,
             pending_messages,
+            already_delivered_app_ids,
             outbound_intents,
             policy,
             now_ms,
@@ -824,6 +852,31 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     result
 }
 
+/// Whether the pass may reuse the candidates the BFS already materialized instead
+/// of a second full replay (#635).
+///
+/// Reuse is sound only with **no pending application messages**: the BFS probes
+/// fold pending proposals but not applications, so with pending apps the reused
+/// candidate would lack the `ApplicationProcessed` observations the
+/// canonicalization core consumes (for delivery *and* app-witness scoring), so the
+/// pass falls back to a fresh full materialize.
+///
+/// Perf note: re-admitting already-delivered (`Processed`) app messages as
+/// witnesses (see `canonicalize_stored_openmls_messages`) means `has_pending_apps`
+/// is true on any pass where a delivered app is still inside the retained window —
+/// so those passes pay the full-materialize cost instead of reusing. The cost is
+/// bounded by `max_rewind_commits` and convergence is not the per-message hot path,
+/// so it is negligible for small groups. If a benchmark ever shows it matters for
+/// large, busy groups, gate the witness re-admission on the presence of a contested
+/// fork (competing branches) rather than on any retained app.
+fn can_reuse_bfs_materialization(
+    has_pending_apps: bool,
+    materialized_len: usize,
+    candidate_paths_len: usize,
+) -> bool {
+    !has_pending_apps && materialized_len == candidate_paths_len
+}
+
 fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -839,19 +892,18 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         &work.own_commits,
     )?;
 
-    // Reuse the candidates the BFS already materialized instead of replaying every completed
-    // path a second time — but ONLY when the pass has no pending application messages. The BFS
-    // probes fold pending proposals but not applications, so with pending apps the reused
-    // candidate would be missing the ApplicationProcessed observations the canonicalization
-    // core consumes; that case falls back to a fresh full materialize (#635).
     let has_pending_apps = pending_messages_contain_application(&work.pending_messages)?;
-    let can_reuse_materialized =
-        !has_pending_apps && path_result.materialized.len() == path_result.candidate_paths.len();
+    let can_reuse_materialized = can_reuse_bfs_materialization(
+        has_pending_apps,
+        path_result.materialized.len(),
+        path_result.candidate_paths.len(),
+    );
 
     let batch = OpenMlsCanonicalizationBatch {
         state: work.state,
         candidate_paths: path_result.candidate_paths,
         pending_messages: work.pending_messages,
+        already_delivered_app_ids: work.already_delivered_app_ids,
         outbound_intents: work.outbound_intents,
         policy: work.policy,
         now_ms: work.now_ms,
@@ -1674,6 +1726,7 @@ fn app_messages_by_id(
 fn project_pending_canonicalization_messages(
     group_id: &GroupId,
     messages: &[TransportMessage],
+    already_delivered_app_ids: &BTreeSet<String>,
     proposal_branch_by_id: &BTreeMap<String, String>,
     app_messages_by_id: &BTreeMap<String, AppMessageBranches>,
 ) -> Result<Vec<PeeledMessage>, OpenMlsProjectionError> {
@@ -1702,6 +1755,7 @@ fn project_pending_canonicalization_messages(
                         .unwrap_or_default(),
                     decrypted_payload_ref: observed
                         .map(|observed| observed.decrypted_payload_ref.clone()),
+                    already_delivered: already_delivered_app_ids.contains(&message_id),
                 }
             }
             OpenMlsContentKind::Commit
@@ -2229,5 +2283,32 @@ mod replay_budget_tests {
                 .consume()
                 .expect("unlimited budget never fails closed");
         }
+    }
+}
+
+#[cfg(test)]
+mod reuse_scope_tests {
+    use super::can_reuse_bfs_materialization;
+
+    #[test]
+    fn app_free_pass_reuses_bfs_materialization() {
+        // has_pending_apps == false ⇒ reuse the #635 BFS materialization, so the
+        // witness re-admission's full-materialize cost is scoped to app-bearing
+        // passes and never taxes an app-free convergence.
+        assert!(can_reuse_bfs_materialization(false, 3, 3));
+    }
+
+    #[test]
+    fn pending_apps_force_full_materialize() {
+        // A pending app — fresh, or a re-admitted already-delivered witness —
+        // bypasses reuse so its ApplicationProcessed observations are recomputed.
+        assert!(!can_reuse_bfs_materialization(true, 3, 3));
+    }
+
+    #[test]
+    fn incomplete_bfs_materialization_does_not_reuse() {
+        // Reuse also requires the BFS to have materialized every candidate path;
+        // a partial materialization falls back to a full replay even app-free.
+        assert!(!can_reuse_bfs_materialization(false, 2, 3));
     }
 }

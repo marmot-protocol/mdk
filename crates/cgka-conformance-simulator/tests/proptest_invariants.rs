@@ -515,6 +515,7 @@ fn app_message(id: &str, sender: u8, decrypts_on_branch: &str) -> PeeledMessage 
             epoch: 3,
             decrypts_on_branches: vec![decrypts_on_branch.into()],
             decrypted_payload_ref: Some(format!("payload-{id}")),
+            already_delivered: false,
         },
     }
 }

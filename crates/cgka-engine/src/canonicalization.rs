@@ -98,6 +98,14 @@ pub enum PeeledMessageKind {
         epoch: u64,
         decrypts_on_branches: Vec<String>,
         decrypted_payload_ref: Option<String>,
+        /// This message was already applied/delivered on a prior convergence
+        /// pass (its stored record is `Processed`). It is re-admitted so it can
+        /// still witness its branch during scoring — a same-epoch fork resolved
+        /// *after* the message was delivered must not lose the message's witness
+        /// weight (that would make branch selection depend on local arrival
+        /// order, violating the convergence contract's order-independence). It is
+        /// never re-delivered: [`handle_app_message`] resolves it as already-seen.
+        already_delivered: bool,
     },
 }
 
@@ -222,7 +230,19 @@ fn canonicalize_internal(
     let mut unique_messages = Vec::new();
 
     for message in input.pending_messages.iter() {
-        if !observed_ids.insert(message.message_id.clone()) {
+        // An already-delivered app is intentionally in `seen_message_ids`, but it
+        // must still reach materialization + `attach_app_witnesses` to witness its
+        // branch. Exempt it from the seen-dedup here; `handle_app_message` resolves
+        // it as already-seen so it is counted (not `Resolving`) yet never
+        // re-delivered.
+        let readmitted_witness = matches!(
+            message.kind,
+            PeeledMessageKind::AppMessage {
+                already_delivered: true,
+                ..
+            }
+        );
+        if !readmitted_witness && !observed_ids.insert(message.message_id.clone()) {
             already_seen.push(AlreadySeen {
                 message_id: message.message_id.clone(),
                 kind: message.kind_name(),
@@ -344,6 +364,7 @@ fn canonicalize_internal(
                 epoch,
                 decrypts_on_branches,
                 decrypted_payload_ref,
+                already_delivered,
             } => handle_app_message(
                 &mut result,
                 &input,
@@ -351,6 +372,7 @@ fn canonicalize_internal(
                 *epoch,
                 decrypts_on_branches,
                 decrypted_payload_ref.clone(),
+                *already_delivered,
             ),
         }
     }
@@ -701,7 +723,19 @@ fn handle_app_message(
     epoch: u64,
     decrypts_on_branches: &[String],
     decrypted_payload_ref: Option<String>,
+    already_delivered: bool,
 ) {
+    // A message applied on a prior pass is re-admitted only so it can witness its
+    // branch again (see `attach_app_witnesses`). It must never be re-delivered or
+    // re-invalidated, so it takes no delivery disposition — it resolves as
+    // already-seen (which keeps the pass out of `Resolving`).
+    if already_delivered {
+        result.already_seen.push(AlreadySeen {
+            message_id: message.message_id.clone(),
+            kind: message.kind_name(),
+        });
+        return;
+    }
     if epoch < input.state.retained_anchor_epoch {
         result.invalidated_app_messages.push(invalidated_app(
             message,

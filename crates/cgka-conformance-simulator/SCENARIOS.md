@@ -87,6 +87,19 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: two competing privileged commits reach Carol at once, so her convergence selector — not the fork-recovery seam — picks the canonical branch.
 - Expected: Carol's settled `convergence_decision` selects the branch by authenticated committer identity (`tip_committer`) at tip epoch 2, with no app-witness quorum.
 
+### `convergence-witness-selected/v1`
+
+- File: `vectors/convergence-witness-selected.v1.json`
+- Setup: Alice and Bob are both admins; each invites a different member from the same epoch. Carol is a passive
+  observer. Two distinct senders post app messages on Alice's branch, and Carol delivers (applies) them before Bob's
+  competing same-epoch commit reaches her.
+- Pressure: Carol has already delivered the app messages on Alice's branch when Bob's competing commit arrives, forcing
+  a fork reorg. The app-witness quorum must survive that reorg and override the committer tiebreak — the case that
+  matches real convergence-driven traffic.
+- Expected: Carol's settled `convergence_decision` selects the witnessed branch at tip epoch 2 with `witness_quorum_met`
+  and an app-witness score of 2 (decisive rule `effective_commit_depth`), and each app payload is delivered exactly once
+  (no re-delivery on the reorg).
+
 ### `drop-queued/v1`
 
 - File: `vectors/drop-queued.v1.json`

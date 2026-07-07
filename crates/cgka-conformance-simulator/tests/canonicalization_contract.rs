@@ -201,6 +201,7 @@ fn app_message(
                 .map(|branch| (*branch).to_owned())
                 .collect(),
             decrypted_payload_ref: payload_ref.map(str::to_owned),
+            already_delivered: false,
         },
     }
 }
