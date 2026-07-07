@@ -34,6 +34,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   `bootstrap-agent.sh` helper and syntax-checking every generated helper script in its contract test.
 - WN Agent release assets now include Hermes and OpenClaw one-line installers that perform guided full setup for
   `wn-agent`, gateway plugin config, and same-user service startup while preserving existing gateway connectors/channels.
+- WN Agent release assets now include the `wn-opencode` Marmot harness and `install-opencode-marmot.sh`, providing a
+  service-backed setup path for machines that already have `opencode` installed.
 
 ### Security
 
