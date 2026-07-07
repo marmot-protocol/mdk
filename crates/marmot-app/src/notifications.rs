@@ -12,7 +12,7 @@ use nostr::{
     base64::Engine as _,
     base64::engine::general_purpose::STANDARD as BASE64_STANDARD,
     secp256k1::{
-        Parity, PublicKey as SecpPublicKey, SecretKey, XOnlyPublicKey, ecdh,
+        Message, Parity, PublicKey as SecpPublicKey, SECP256K1, SecretKey, XOnlyPublicKey, ecdh,
         schnorr::Signature as SchnorrSignature,
     },
 };
@@ -640,6 +640,35 @@ fn verify_push_owner_sig(proof_event: UnsignedEvent, owner_sig_hex: &str) -> boo
     proof_event.add_signature(sig).is_ok()
 }
 
+/// Verify the legacy owner signature — a BIP-340 Schnorr signature by
+/// `member_id_hex` over `SHA-256(SignedRecord)` (`digest`), rather than over the
+/// owner-proof event id. Older clients, and `group_push_tokens` rows already
+/// persisted before the event-shaped proof landed, signed this digest, so
+/// accepting it keeps the unchanged `owner_sig` wire and storage contract
+/// backward compatible. Returns false on malformed input.
+fn verify_push_owner_sig_legacy(
+    digest: [u8; 32],
+    member_id_hex: &str,
+    owner_sig_hex: &str,
+) -> bool {
+    let Ok(member_bytes) = hex::decode(member_id_hex) else {
+        return false;
+    };
+    let Ok(member_pubkey) = XOnlyPublicKey::from_slice(&member_bytes) else {
+        return false;
+    };
+    let Ok(sig_bytes) = hex::decode(owner_sig_hex) else {
+        return false;
+    };
+    let Ok(sig) = SchnorrSignature::from_slice(&sig_bytes) else {
+        return false;
+    };
+    let message = Message::from_digest(digest);
+    SECP256K1
+        .verify_schnorr(&sig, &message, &member_pubkey)
+        .is_ok()
+}
+
 impl GroupPushTokenRecord {
     fn signing_digest(&self) -> Result<[u8; 32], AppError> {
         let bytes = push_signed_record_bytes(
@@ -703,8 +732,18 @@ impl GroupPushTokenRecord {
 
     /// True when `owner_sig` is a valid Nostr signature by `member_id_hex`.
     pub(crate) fn verify_owner_sig(&self) -> bool {
-        match self.owner_proof_event() {
-            Ok(proof_event) => verify_push_owner_sig(proof_event, &self.owner_sig),
+        if let Ok(proof_event) = self.owner_proof_event()
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        // Legacy fallback (see verify_push_owner_sig_legacy): tokens signed by
+        // older clients, and rows already persisted before the event-shaped
+        // proof, carry a signature over SHA-256(SignedRecord), not the event id.
+        match self.signing_digest() {
+            Ok(digest) => {
+                verify_push_owner_sig_legacy(digest, &self.member_id_hex, &self.owner_sig)
+            }
             Err(_) => false,
         }
     }
@@ -772,8 +811,18 @@ impl PushTokenRemovalRecord {
     }
 
     pub(crate) fn verify_owner_sig(&self, group_id_hex: &str) -> bool {
-        match self.owner_proof_event(group_id_hex) {
-            Ok(proof_event) => verify_push_owner_sig(proof_event, &self.owner_sig),
+        if let Ok(proof_event) = self.owner_proof_event(group_id_hex)
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        // Legacy fallback (see verify_push_owner_sig_legacy): older clients, and
+        // rows already persisted before the event-shaped proof, signed over
+        // SHA-256(SignedRecord), not the event id.
+        match self.signing_digest(group_id_hex) {
+            Ok(digest) => {
+                verify_push_owner_sig_legacy(digest, &self.member_id_hex, &self.owner_sig)
+            }
             Err(_) => false,
         }
     }

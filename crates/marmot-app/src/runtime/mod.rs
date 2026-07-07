@@ -3059,7 +3059,14 @@ impl AccountManager {
         if signer_public_key.to_hex() != account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
-        let created_account = self.app.account_home().account(&account_id_hex).is_err();
+        let existing_account = self.app.account_home().account(&account_id_hex).ok();
+        let created_account = existing_account.is_none();
+        // add_external_signer_account below promotes a pre-existing tracked
+        // (public) account to external_signing, so a later setup failure must
+        // revert that promotion — not skip cleanup and leave a torn account.
+        // Created accounts are deleted, already-external accounts are left as-is.
+        let upgraded_public_account = existing_account
+            .is_some_and(|account| !account.external_signing && !account.local_signing);
         let mut account = self
             .app
             .account_home()
@@ -3069,10 +3076,12 @@ impl AccountManager {
             .register_external_signer(&account.account_id_hex, signer)
             .await
         {
-            if created_account {
-                return self.rollback_account_after_setup_failure(&account.label, err);
-            }
-            return Err(err);
+            return self.rollback_external_signer_setup(
+                &account.label,
+                created_account,
+                upgraded_public_account,
+                err,
+            );
         }
 
         let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
@@ -3093,10 +3102,12 @@ impl AccountManager {
         {
             Ok(relay_lists) => relay_lists,
             Err(err) => {
-                if created_account {
-                    return self.rollback_account_after_setup_failure(&account.label, err);
-                }
-                return Err(err);
+                return self.rollback_external_signer_setup(
+                    &account.label,
+                    created_account,
+                    upgraded_public_account,
+                    err,
+                );
             }
         };
 
@@ -3104,10 +3115,12 @@ impl AccountManager {
             match self.publish_initial_key_package_for_account(&account).await {
                 Ok(bytes) => Some(bytes),
                 Err(err) => {
-                    if created_account {
-                        return self.rollback_account_after_setup_failure(&account.label, err);
-                    }
-                    return Err(err);
+                    return self.rollback_external_signer_setup(
+                        &account.label,
+                        created_account,
+                        upgraded_public_account,
+                        err,
+                    );
                 }
             }
         } else {
@@ -3348,6 +3361,30 @@ impl AccountManager {
             Some(value) => Ok(account_home.add_public_account(&value)?),
             None => Ok(account_home.create_nostr_account()?),
         }
+    }
+
+    /// Undo a failed external-signer setup — delete a freshly created account, or
+    /// revert the external_signing promotion on a pre-existing tracked account,
+    /// then surface the original error. Without this, a failed public→external
+    /// login leaves a torn account: the promotion applied, but the relay-list and
+    /// KeyPackage setup that should follow it did not.
+    fn rollback_external_signer_setup<T>(
+        &self,
+        label: &str,
+        created_account: bool,
+        upgraded_public_account: bool,
+        err: AppError,
+    ) -> Result<T, AppError> {
+        if created_account {
+            return self.rollback_account_after_setup_failure(label, err);
+        }
+        if upgraded_public_account {
+            let _ = self
+                .app
+                .account_home()
+                .revert_external_signer_upgrade(label);
+        }
+        Err(err)
     }
 
     fn rollback_account_after_setup_failure<T>(

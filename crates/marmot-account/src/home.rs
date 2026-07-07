@@ -220,6 +220,24 @@ impl AccountHome {
         Ok(account)
     }
 
+    /// Undo the `external_signing` promotion that [`Self::add_external_signer_account`]
+    /// applies to a pre-existing public/tracked account, so a failed external-signer
+    /// setup restores that account to its prior tracked state instead of leaving it
+    /// half-configured. A no-op for local accounts, and for accounts that were
+    /// already external (nothing was promoted).
+    pub fn revert_external_signer_upgrade(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut account = self.account(account_ref)?;
+        if account.external_signing && !account.local_signing {
+            account.external_signing = false;
+            self.write_account_record(&account)?;
+        }
+        Ok(())
+    }
+
     pub fn account_id_for_secret(secret_key: &str) -> AccountHomeResult<String> {
         let keys =
             nostr::Keys::parse(secret_key).map_err(|_| AccountHomeError::InvalidSecretKey)?;
