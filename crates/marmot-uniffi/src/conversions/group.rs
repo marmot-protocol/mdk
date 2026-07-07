@@ -29,7 +29,7 @@ pub struct AppGroupRecordFfi {
     pub avatar_thumbhash: Option<String>,
     /// Content hash of the encrypted Blossom avatar
     /// (`marmot.group.blossom.image.v1`), `None` when absent. Doubles as a
-    /// cache key; fetch + decrypt via `Marmot::download_group_image`.
+    /// cache key; fetch + decrypt via `Marmot::download_group_blossom_image`.
     pub image_hash_hex: Option<String>,
     pub encrypted_media: AppGroupEncryptedMediaComponentFfi,
     /// Per-group disappearing-message retention in seconds

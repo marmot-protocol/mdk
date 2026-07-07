@@ -409,7 +409,7 @@ impl Marmot {
     /// content hash (for caching) are on `AppGroupRecordFfi::image_hash_hex`;
     /// when the group also carries a URL avatar, the URL takes precedence
     /// for rendering.
-    pub async fn download_group_image(
+    pub async fn download_group_blossom_image(
         &self,
         account_ref: String,
         group_id_hex: String,
@@ -417,7 +417,7 @@ impl Marmot {
         let group_id = group_id_from_hex(&group_id_hex)?;
         let bytes = self
             .runtime
-            .download_group_image(&account_ref, &group_id)
+            .download_group_blossom_image(&account_ref, &group_id)
             .await?;
         Ok(bytes)
     }

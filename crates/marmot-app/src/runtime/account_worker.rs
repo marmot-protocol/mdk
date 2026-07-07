@@ -1043,7 +1043,7 @@ async fn handle_account_worker_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::DownloadGroupImage { group_id, respond } => {
-            let result = client.download_group_image(&group_id).await;
+            let result = client.download_group_blossom_image(&group_id).await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::SendMessage {

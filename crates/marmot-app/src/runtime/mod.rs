@@ -1231,13 +1231,13 @@ impl MarmotAppRuntime {
             .await
     }
 
-    pub async fn download_group_image(
+    pub async fn download_group_blossom_image(
         &self,
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Vec<u8>, AppError> {
         self.accounts
-            .download_group_image(account_ref, group_id)
+            .download_group_blossom_image(account_ref, group_id)
             .await
     }
 
