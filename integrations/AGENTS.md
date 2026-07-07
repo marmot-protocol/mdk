@@ -10,7 +10,7 @@ systems to Marmot through `wn-agent`.
 
 - `hermes/marmot` - Hermes platform plugin.
 - `openclaw/marmot` - OpenClaw channel plugin.
-- `opencode/marmot` - `wn-opencode` harness binary.
+- `opencode/marmot` - `wn-opencode` OpenCode harness binary.
 
 The shared boundary is the `marmot.agent-control.v1` NDJSON protocol over a
 local Unix socket. `wn-agent` owns Marmot account state, MLS state, Nostr
@@ -34,9 +34,10 @@ deletes, invite policy, and local storage.
   or local sensitive paths.
 - Preserve host-runtime configuration outside the Marmot section. Installers and
   setup scripts should patch only the Marmot plugin/channel entries they own.
-- Default release installs share one `wn-agent` service, one `MARMOT_HOME`, one
-  socket, and one Marmot/Nostr identity. Document and test any departure from
-  that model.
+- Default Hermes and OpenClaw release installs use connector-specific
+  `wn-agent` homes, sockets, services, bootstrap labels, and Marmot/Nostr
+  identities. Shared-account deployments are opt-in and must be documented
+  alongside the required service/socket overrides.
 
 ## Gateway Versus Harness
 
@@ -45,9 +46,9 @@ runtime to Marmot and may own activation policy, message-tool routing, live
 preview adaptation, media staging policy, profile onboarding, and gateway
 session behavior.
 
-`wn-opencode` is a pure harness. It subscribes to allowed Marmot prompts and
-invokes `opencode`; it should stay narrower than the gateway integrations unless
-there is a concrete product reason to broaden it.
+`wn-opencode` is a pure OpenCode harness. It subscribes to allowed Marmot
+prompts and invokes the `opencode` binary; it should stay narrower than the
+gateway integrations unless there is a concrete product reason to broaden it.
 
 Do not force every feature from Hermes/OpenClaw onto harnesses. Borrow shared
 hardening patterns where they fit: strict account selection, socket auth,
@@ -56,10 +57,15 @@ idempotent sends, installer safety, and privacy-safe diagnostics.
 
 ## Coexistence Model
 
-Multiple integrations can run on the same machine and connect to the same
-`wn-agent` socket. The socket supports multiple clients and `SubscribeInbound`
-streams. There is no global dispatch lease or "one integration claimed this
-message" mechanism.
+Multiple integrations can run on the same machine. The default Hermes and
+OpenClaw installers give each connector its own `wn-agent` process, local home,
+socket, service identity, and Marmot/Nostr identity, so their chats are isolated
+from each other.
+
+Multiple integrations may also be configured to connect to the same `wn-agent`
+socket. The socket supports multiple clients and `SubscribeInbound` streams.
+There is no global dispatch lease or "one integration claimed this message"
+mechanism.
 
 Each integration must make its own activation decision. If two integrations are
 eligible for the same inbound message, both may reply. Design activation
@@ -70,9 +76,10 @@ defaults conservatively:
 - `wn-opencode` currently supports only always-on activation for explicitly
   allowed senders.
 
-When changing activation or allowlist semantics, reason about shared installs
-first: Hermes, OpenClaw, and opencode may all be installed on the same host,
-using the same account and group stream.
+When changing activation or allowlist semantics, reason about both default
+isolated installs and explicit shared-account installs: Hermes, OpenClaw, and
+OpenCode may all be installed on the same host, and advanced operators can point
+them at the same account and group stream.
 
 ## Allowlists
 
@@ -101,16 +108,18 @@ Installer expectations:
 - Use bounded curl/network timeouts.
 - Start same-user services where supported, with private service files and
   owner-only connector state.
-- Use the shared default home/socket unless the user explicitly overrides them.
+- Use connector-specific default homes, sockets, service names, and bootstrap
+  labels unless a shared deployment is intentionally configured.
 - Preserve existing host-runtime config outside the Marmot section.
 - Do not restart Hermes or OpenClaw gateways automatically; print restart
   guidance instead.
 - Make dry-runs useful enough to validate release-asset names and config intent.
 
-The default service names are shared (`wn-agent.service`,
-`org.marmot.wn-agent`) and are not suitable for multiple isolated identities on
-the same login. For isolated identities, document separate homes, sockets,
-account ids, and service names.
+The default Hermes and OpenClaw service names are connector-specific
+(`wn-agent-hermes.service`, `wn-agent-openclaw.service`,
+`org.marmot.wn-agent.hermes`, and `org.marmot.wn-agent.openclaw`). If you add a
+new production installer, choose names that can coexist with the existing
+integrations on the same login.
 
 ## Tests And Validation
 
@@ -145,5 +154,5 @@ New integrations should follow the existing shape:
 - share installer/release conventions with the existing scripts;
 - document whether the integration is a gateway/channel plugin or a pure
   harness;
-- document coexistence with Hermes, OpenClaw, and opencode before landing
+- document coexistence with Hermes, OpenClaw, and OpenCode before landing
   production install support.

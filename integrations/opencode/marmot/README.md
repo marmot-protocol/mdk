@@ -1,6 +1,6 @@
 # wn-opencode
 
-`wn-opencode` is a dedicated Marmot harness for [opencode](https://opencode.ai/).
+`wn-opencode` is a dedicated Marmot harness for [OpenCode](https://opencode.ai/).
 It joins Marmot groups through the local `wn-agent` connector and sends every
 message from an allowed sender to `opencode run --format json`.
 
@@ -10,7 +10,7 @@ Hermes and OpenClaw gateway integrations: it has no mention activation, media
 handling, profile onboarding, or live previews. It is a pure harness for an
 authorized operator.
 
-## Install (opencode Already Installed)
+## Install (OpenCode Already Installed)
 
 Versioned `wn-agent` builds publish the `wn-agent` binary, this harness binary,
 and an installer under [`wn-agent-v*`](https://github.com/marmot-protocol/mdk/releases)
@@ -18,7 +18,7 @@ GitHub pre-releases.
 
 Prerequisites:
 
-- `opencode` installed locally and runnable on `PATH`, or an executable path set
+- OpenCode installed locally and runnable on `PATH`, or an executable path set
   with `WN_OPENCODE_BIN` / `--opencode-bin`
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
@@ -85,11 +85,11 @@ Configure with environment variables:
 | `MARMOT_AGENT_SOCKET` | `$MARMOT_HOME/dev/wn-agent.sock` | Unix control socket |
 | `MARMOT_AGENT_AUTH_TOKEN_FILE` | unset | Optional bearer-token file for group-readable socket setups |
 | `MARMOT_AGENT_AUTH_TOKEN` | unset | Optional bearer token value |
-| `WN_OPENCODE_ALLOWED_SENDERS_HEX` | required | Comma-separated sender account ids allowed to prompt opencode |
+| `WN_OPENCODE_ALLOWED_SENDERS_HEX` | required | Comma-separated sender account ids allowed to prompt OpenCode |
 | `WN_OPENCODE_ADMIN_HEX` | unset | Legacy alias for `WN_OPENCODE_ALLOWED_SENDERS_HEX` |
 | `WN_OPENCODE_ACCOUNT_ID_HEX` | first local account | Specific `wn-agent` account to use |
-| `WN_OPENCODE_BIN` | `opencode` | opencode binary or executable path |
-| `WN_OPENCODE_TIMEOUT_SECS` | `300` | Hard timeout for each opencode invocation |
+| `WN_OPENCODE_BIN` | `opencode` | OpenCode binary or executable path |
+| `WN_OPENCODE_TIMEOUT_SECS` | `300` | Hard timeout for each OpenCode invocation |
 | `WN_OPENCODE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for each control-socket request |
 | `WN_OPENCODE_MAX_REPLY_BYTES` | `30000` | UTF-8 byte limit for each durable Marmot reply chunk |
 | `WN_OPENCODE_MAX_PENDING_PER_GROUP` | `4` | Per-group in-flight/queued prompt cap |
@@ -104,7 +104,7 @@ newline, then space boundaries and never splits a UTF-8 code point.
 ## Workdir Picker
 
 On the first message in a new Marmot group, a leading `/<name>` selects
-`~/<name>` as the opencode working directory if it is a direct child directory of
+`~/<name>` as the OpenCode working directory if it is a direct child directory of
 `$HOME`.
 
 Examples:
@@ -124,7 +124,7 @@ for the next prompt.
 - The same allowlist controls invite acceptance in `wn-agent` and prompt
   execution in `wn-opencode`.
 - Logs are structured and privacy-safe: no account ids, group ids, message ids,
-  local paths, prompt text, opencode output, relay URLs, pubkeys, ciphertext, or
+  local paths, prompt text, OpenCode output, relay URLs, pubkeys, ciphertext, or
   key material.
 - Prompt text is passed to `opencode run` as a process argument. Run this
   harness only on trusted single-user hosts or hosts with equivalent local

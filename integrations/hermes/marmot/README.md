@@ -50,9 +50,9 @@ wn-agent --version
 
 The installer puts `wn-agent` in `~/.local/bin`, extracts the plugin to
 `~/.hermes/plugins/marmot`, enables the Marmot plugin, starts a same-user
-`wn-agent` service where supported, bootstraps or reuses `~/.marmot-agent`, and
-patches only Marmot-specific Hermes config entries. Existing Hermes connectors
-such as Telegram are preserved.
+`wn-agent-hermes` service where supported, bootstraps or reuses
+`~/.marmot-agents/hermes`, and patches only Marmot-specific Hermes config
+entries. Existing Hermes connectors such as Telegram are preserved.
 
 Supported platforms: Linux x86_64, Linux arm64, macOS Apple Silicon, macOS Intel.
 Both install scripts verify SHA256 checksums for downloaded release assets.
@@ -63,14 +63,15 @@ not restart Hermes automatically.
 Manual equivalent:
 
 ```sh
-export MARMOT_HOME="$HOME/.marmot-agent"
+export MARMOT_HOME="$HOME/.marmot-agents/hermes"
 export PATH="$HOME/.local/bin:$PATH"
 
 wn-agent --home "$MARMOT_HOME" \
+  --socket "$MARMOT_HOME/dev/wn-agent.sock" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
-wn-agent bootstrap --home "$MARMOT_HOME" --qr
+wn-agent bootstrap --home "$MARMOT_HOME" --label hermes-agent --qr
 hermes gateway run
 ```
 
@@ -249,7 +250,7 @@ Start the connector first with the same public Nostr relay set the phone uses:
 
 ```sh
 cargo run -p agent-connector --bin wn-agent -- \
-  --home ~/.marmot-agent \
+  --home ~/.marmot-agents/hermes \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 ```
@@ -258,7 +259,8 @@ Bootstrap or reuse the agent account through the running connector:
 
 ```sh
 wn-agent bootstrap \
-  --home ~/.marmot-agent \
+  --home ~/.marmot-agents/hermes \
+  --label hermes-agent \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
   --qr
@@ -267,7 +269,7 @@ wn-agent bootstrap \
 Then configure Hermes with environment variables:
 
 ```sh
-export MARMOT_HOME="$HOME/.marmot-agent"
+export MARMOT_HOME="$HOME/.marmot-agents/hermes"
 export MARMOT_ACCOUNT_ID_HEX="<agent-account-pubkey-hex>"
 export MARMOT_QUIC_CANDIDATES="quic://quic-broker.ipf.dev:4450"
 ```
@@ -281,19 +283,19 @@ The default control socket is same-UID only: parent directory `0700`, socket
 users, use a token file and group-readable socket modes:
 
 ```sh
-install -d -m 0750 ~/.marmot-agent
-openssl rand -hex 32 > ~/.marmot-agent/control.token
-chmod 0600 ~/.marmot-agent/control.token
+install -d -m 0750 ~/.marmot-agents/hermes
+openssl rand -hex 32 > ~/.marmot-agents/hermes/control.token
+chmod 0600 ~/.marmot-agents/hermes/control.token
 
 cargo run -p agent-connector --bin wn-agent -- \
-  --home ~/.marmot-agent \
+  --home ~/.marmot-agents/hermes \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat \
-  --auth-token-file ~/.marmot-agent/control.token \
+  --auth-token-file ~/.marmot-agents/hermes/control.token \
   --socket-dir-mode 0770 \
   --socket-mode 0660
 
-export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agent/control.token"
+export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agents/hermes/control.token"
 ```
 
 `MARMOT_AGENT_AUTH_TOKEN` is also supported for launcher-managed secrets. Prefer

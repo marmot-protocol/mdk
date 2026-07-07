@@ -104,17 +104,20 @@ source "$default_root/env.sh"
 
 [ -x "$repo_root/scripts/install-openclaw-marmot.sh" ]
 installer_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     "$repo_root/scripts/install-openclaw-marmot.sh" --dry-run --yes
 )"
 installer_stdin_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     bash -s -- --dry-run --yes < "$repo_root/scripts/install-openclaw-marmot.sh"
 )"
 installer_bad_welcomer_status=0
-WN_AGENT_SHA="9.9.9" \
+env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+    WN_AGENT_SHA="9.9.9" \
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     "$repo_root/scripts/install-openclaw-marmot.sh" --dry-run --yes --allow-welcomer not-a-key \
     >/dev/null 2>&1 || installer_bad_welcomer_status=$?
@@ -131,6 +134,22 @@ case "$installer_dry_run" in
     *"wn-agent-v9.9.9-test"* ) ;;
     *) echo "OpenClaw installer dry-run did not use requested release tag" >&2; exit 1;;
 esac
+case "$installer_dry_run" in
+    *"Marmot home: $HOME/.marmot-agents/openclaw"* ) ;;
+    *) echo "OpenClaw installer dry-run did not use isolated default Marmot home" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"Marmot socket: $HOME/.marmot-agents/openclaw/dev/wn-agent.sock"* ) ;;
+    *) echo "OpenClaw installer dry-run did not derive the socket from the isolated home" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"--label openclaw-agent"* ) ;;
+    *) echo "OpenClaw installer dry-run did not pass the OpenClaw bootstrap label" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"wn-agent-openclaw.service"* | *"org.marmot.wn-agent.openclaw.plist"* ) ;;
+    *) echo "OpenClaw installer dry-run did not use the OpenClaw-specific service identity" >&2; exit 1;;
+esac
 case "$installer_stdin_dry_run" in
     *"openclaw-marmot-plugin-9.9.9.tgz"* ) ;;
     *) echo "OpenClaw installer stdin dry-run did not use expected plugin asset" >&2; exit 1;;
@@ -142,6 +161,14 @@ esac
 case "$installer_stdin_dry_run" in
     *"wn-agent-v9.9.9-test"* ) ;;
     *) echo "OpenClaw installer stdin dry-run did not use requested release tag" >&2; exit 1;;
+esac
+case "$installer_stdin_dry_run" in
+    *"Marmot home: $HOME/.marmot-agents/openclaw"* ) ;;
+    *) echo "OpenClaw installer stdin dry-run did not use isolated default Marmot home" >&2; exit 1;;
+esac
+case "$installer_stdin_dry_run" in
+    *"--label openclaw-agent"* ) ;;
+    *) echo "OpenClaw installer stdin dry-run did not pass the OpenClaw bootstrap label" >&2; exit 1;;
 esac
 
 echo "OpenClaw dev script test passed"

@@ -26,8 +26,11 @@ MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-$MARMOT_RELEASE_TAG_DEFAULT}"
 MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
 HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
 MARMOT_PLUGIN_DIR_OVERRIDE="${MARMOT_PLUGIN_DIR:-}"
-MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agent}"
+MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agents/hermes}"
 MARMOT_AGENT_SOCKET_OVERRIDE="${MARMOT_AGENT_SOCKET:-}"
+MARMOT_AGENT_LABEL="${MARMOT_AGENT_LABEL:-hermes-agent}"
+MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-hermes}"
+MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.hermes}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
 
 ASSUME_YES=0
@@ -58,7 +61,7 @@ Hermes itself must already be installed.
 Options:
   --bootstrap              Compatibility alias; guided bootstrap is the default
   --yes, --non-interactive Use defaults and do not prompt
-  --home PATH              Marmot agent home (default: ~/.marmot-agent)
+  --home PATH              Marmot agent home (default: ~/.marmot-agents/hermes)
   --hermes-home PATH       Hermes home (default: $HERMES_HOME or ~/.hermes)
   --allow-welcomer VALUE   Allow invites from this npub or hex pubkey; may repeat
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
@@ -80,8 +83,11 @@ Environment:
   MARMOT_INSTALL_PREFIX    Install root for wn-agent (default: ~/.local)
   HERMES_HOME              Hermes home (default: ~/.hermes)
   MARMOT_PLUGIN_DIR        Hermes plugin path (default: $HERMES_HOME/plugins/marmot)
-  MARMOT_HOME              wn-agent home (default: ~/.marmot-agent)
+  MARMOT_HOME              wn-agent home (default: ~/.marmot-agents/hermes)
   MARMOT_AGENT_SOCKET      wn-agent socket (default: $MARMOT_HOME/dev/wn-agent.sock)
+  MARMOT_AGENT_LABEL       Account label used by bootstrap (default: hermes-agent)
+  MARMOT_AGENT_SERVICE_NAME Linux systemd user service name (default: wn-agent-hermes)
+  MARMOT_AGENT_LAUNCHD_LABEL macOS LaunchAgent label (default: org.marmot.wn-agent.hermes)
   MARMOT_RELAYS            Relay CSV used by wn-agent and bootstrap
   MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
 
@@ -414,7 +420,7 @@ plist_string() {
 
 install_macos_service() {
     local plist_dir plist label program logs_dir relay
-    label="org.marmot.wn-agent"
+    label="$MARMOT_AGENT_LAUNCHD_LABEL"
     plist_dir="$HOME/Library/LaunchAgents"
     plist="$plist_dir/$label.plist"
     program="$(wn_agent_path)"
@@ -473,12 +479,12 @@ install_linux_user_service() {
         return 1
     fi
     service_dir="$HOME/.config/systemd/user"
-    service="$service_dir/wn-agent.service"
+    service="$service_dir/$MARMOT_AGENT_SERVICE_NAME.service"
     program="$(wn_agent_path)"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now wn-agent.service"
+        log "would run: systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service"
         return 0
     fi
 
@@ -505,11 +511,11 @@ install_linux_user_service() {
         warn "systemctl --user daemon-reload failed; falling back to a temporary wn-agent process"
         return 1
     fi
-    if ! run systemctl --user enable --now wn-agent.service; then
-        warn "systemctl --user enable --now wn-agent.service failed; falling back to a temporary wn-agent process"
+    if ! run systemctl --user enable --now "$MARMOT_AGENT_SERVICE_NAME.service"; then
+        warn "systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service failed; falling back to a temporary wn-agent process"
         return 1
     fi
-    log "installed and started systemd user service: wn-agent.service"
+    log "installed and started systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
 }
 
 install_user_service() {
@@ -575,7 +581,13 @@ bootstrap_agent() {
         warn "wn-agent socket did not appear before bootstrap wait; bootstrap will keep waiting briefly"
     fi
 
-    local -a args=(bootstrap --json --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET")
+    local -a args=(
+        bootstrap
+        --json
+        --home "$MARMOT_HOME"
+        --socket "$MARMOT_AGENT_SOCKET"
+        --label "$MARMOT_AGENT_LABEL"
+    )
     local relay
     for relay in "${RELAYS[@]}"; do
         args+=(--relay "$relay")
@@ -663,8 +675,10 @@ print_next_steps() {
 Install complete.
 
 Marmot agent:
+  label: $MARMOT_AGENT_LABEL
   home: $MARMOT_HOME
   socket: $MARMOT_AGENT_SOCKET
+  service: $MARMOT_AGENT_SERVICE_NAME.service (Linux) / $MARMOT_AGENT_LAUNCHD_LABEL (macOS)
   account: $BOOTSTRAP_ACCOUNT_ID_HEX
   bootstrap JSON: $BOOTSTRAP_JSON_PATH
 EOF
@@ -837,6 +851,7 @@ log "platform=$platform repo=$MARMOT_RELEASE_REPO tag=$MARMOT_RELEASE_TAG versio
 log "Hermes home: $HERMES_HOME"
 log "Marmot home: $MARMOT_HOME"
 log "Marmot socket: $MARMOT_AGENT_SOCKET"
+log "Marmot agent label: $MARMOT_AGENT_LABEL"
 install_wn_agent "$platform" "$tmpdir"
 install_plugin "$tmpdir"
 enable_hermes_plugin

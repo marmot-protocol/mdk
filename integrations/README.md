@@ -7,7 +7,7 @@ Current integrations:
 
 - [`hermes/marmot`](hermes/marmot) - Hermes platform plugin.
 - [`openclaw/marmot`](openclaw/marmot) - OpenClaw channel plugin.
-- [`opencode/marmot`](opencode/marmot) - `wn-opencode` harness binary.
+- [`opencode/marmot`](opencode/marmot) - `wn-opencode` OpenCode harness binary.
 
 All three are intentionally thin at the Marmot boundary. They do not own MLS
 state, Nostr transport, local account storage, relay access, QUIC preview
@@ -23,12 +23,19 @@ The release installers are published with the `wn-agent-v*` release family:
 - `scripts/install-openclaw-marmot.sh`
 - `scripts/install-opencode-marmot.sh`
 
-By default they all use the same local connector deployment:
+By default the production-shaped installs create separate local agent identities
+per connector:
 
-- `MARMOT_HOME=$HOME/.marmot-agent`
-- `MARMOT_AGENT_SOCKET=$MARMOT_HOME/dev/wn-agent.sock`
-- same-user `wn-agent` service where the platform supports it
-- public relay defaults shared with the phone app pilot setup
+| Integration | Home | Same-user service |
+| --- | --- | --- |
+| Hermes | `$HOME/.marmot-agents/hermes` | `wn-agent-hermes.service` / `org.marmot.wn-agent.hermes` |
+| OpenClaw | `$HOME/.marmot-agents/openclaw` | `wn-agent-openclaw.service` / `org.marmot.wn-agent.openclaw` |
+| OpenCode | `$HOME/.marmot-agent` | `wn-agent.service` plus `wn-opencode.service` |
+
+Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
+uses the public relay defaults shared with the phone app pilot setup. The
+OpenCode harness still uses the legacy `~/.marmot-agent` home while the terminal
+harness model is being generalized.
 
 Hermes and OpenClaw install or patch their host-runtime plugin configuration and
 then print restart guidance for the existing gateway. They do not restart the
@@ -38,8 +45,13 @@ plugin loaded by an existing gateway.
 
 ## Identity Model
 
-The default topology shares one Marmot account and therefore one Nostr identity.
-`wn-agent bootstrap` lists local-signing accounts in `MARMOT_HOME` and reuses one
+The default topology creates or reuses one Marmot account per connector home,
+which means Hermes, OpenClaw, and OpenCode present as separate Nostr identities
+when installed with default options. This matches how users reason about them:
+Hermes is one chat agent, OpenClaw is another, and the terminal harness is
+another.
+
+Within each home, `wn-agent bootstrap` lists local-signing accounts and reuses one
 when selection is unambiguous. If no local account exists, bootstrap creates one.
 If more than one local-signing account exists, production integrations should
 require an explicit account id instead of guessing.
@@ -50,13 +62,12 @@ The installers persist the selected account into connector-specific config:
 - OpenClaw uses `channels.marmot.accountIdHex` or `MARMOT_ACCOUNT_ID_HEX`.
 - `wn-opencode` uses `WN_OPENCODE_ACCOUNT_ID_HEX`.
 
-So installing Hermes, OpenClaw, and opencode on one machine with default options
-does not create three Marmot identities. It creates or reuses one `wn-agent`
-identity and has each integration connect to it.
+So installing Hermes, OpenClaw, and OpenCode on one machine with default options
+creates distinct agent identities and distinct chat/group memberships.
 
 ## What Is Shared
 
-When integrations point at the same `MARMOT_HOME` and socket, they share:
+Within one connector home, the host integration and its `wn-agent` share:
 
 - the local Marmot account and Nostr public key;
 - the local MLS/group state and app runtime projection;
@@ -67,8 +78,12 @@ When integrations point at the same `MARMOT_HOME` and socket, they share:
   `wn-agent`;
 - the inbound event stream exposed by `SubscribeInbound`.
 
-The control socket supports multiple clients. Multiple integrations can
-subscribe to inbound events for the same account at the same time.
+Across different default connector homes, those items are not shared.
+
+Advanced deployments can still point multiple integrations at the same
+`MARMOT_HOME` and socket. The control socket supports multiple clients, and
+multiple integrations can subscribe to inbound events for the same account at the
+same time.
 
 ## What Is Separate
 
@@ -91,16 +106,17 @@ Each integration also makes its own activation decision:
   media, profile onboarding, or live-preview behavior.
 
 Because activation is per integration, there is no global "claim this message"
-lease. If several integrations subscribe to the same account and group, every
-eligible integration can reply. For example, a direct message from an allowlisted
-sender could trigger Hermes/OpenClaw and `wn-opencode` if all are running and
-configured for that account.
+lease in shared-account deployments. If several integrations subscribe to the
+same account and group, every eligible integration can reply. For example, a
+direct message from an allowlisted sender could trigger Hermes/OpenClaw and
+`wn-opencode` if all are running and configured for that account.
 
 ## Allowlist Behavior
 
-The `wn-agent` welcomer allowlist is account-scoped, not integration-scoped.
-That is a good fit for the default shared identity model, but it matters when
-several integrations manage the same account.
+The `wn-agent` welcomer allowlist is account-scoped, not integration-scoped. In
+the default installer topology that means each connector has its own allowlist.
+It matters most when several integrations are intentionally configured to manage
+the same account.
 
 Hermes and OpenClaw can mirror configured `allowFrom`/welcomer entries into
 `wn-agent`. Their sync path is config-driven and may reconcile the connector
@@ -108,27 +124,31 @@ allowlist to the configured set. `wn-opencode` requires at least one allowed
 sender and installs those senders into both the prompt allowlist and the
 `wn-agent` welcomer allowlist.
 
-For shared deployments, prefer one explicit source of truth for the account's
-allowed welcomers, or configure every integration with the same intended union.
+For shared-account deployments, prefer one explicit source of truth for the
+account's allowed welcomers, or configure every integration with the same
+intended union.
 
-## Isolation Options
+## Sharing Options
 
-Run the default installers when you want one machine identity shared by the
-available gateways and harnesses.
+Run the default installers when you want each connector to appear as its own
+agent identity.
 
-Use explicit isolation when you want separate Marmot identities:
+Use an explicit shared deployment when you want one Marmot identity behind
+several integrations:
 
-- separate `MARMOT_HOME` values;
-- separate `MARMOT_AGENT_SOCKET` paths;
+- one shared `MARMOT_HOME`;
+- one shared `MARMOT_AGENT_SOCKET`;
+- one `wn-agent` service owning that socket;
 - explicit account ids in each integration config;
-- separate service units or LaunchAgents with distinct names;
-- separate host-runtime homes such as `HERMES_HOME` and `OPENCLAW_HOME`.
+- `--no-service` for secondary installers, or manual service units with a single
+  owner for the shared socket;
+- separate host-runtime homes such as `HERMES_HOME` and `OPENCLAW_HOME` if the
+  gateway runtimes themselves should stay isolated.
 
-The current release installers are optimized for the shared default and use
-fixed service labels such as `wn-agent.service`, `org.marmot.wn-agent`, and
-`wn-opencode.service`. For multiple isolated identities on the same login, use
-manual service units or the dev setup scripts as a template rather than running
-the default installer repeatedly with only a different home path.
+The current Hermes and OpenClaw release installers are optimized for isolated
+defaults. They also expose `MARMOT_HOME`, `MARMOT_AGENT_SOCKET`,
+`MARMOT_AGENT_SERVICE_NAME`, and `MARMOT_AGENT_LAUNCHD_LABEL` overrides for
+advanced layouts.
 
 If `wn-agent` and a host gateway run as different local users, keep the socket
 Unix-domain only and use the existing socket mode plus bearer-token options:
