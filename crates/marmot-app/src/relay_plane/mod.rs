@@ -10,8 +10,8 @@ use cgka_traits::{
     TransportPublishRequest,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, Filter, Kind, PublicKey, RelayMessage, RelayPoolNotification,
-    RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, ClientOptions, Connection, Filter, Kind, PublicKey, RelayMessage,
+    RelayPoolNotification, RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -22,7 +22,7 @@ use transport_nostr_adapter::{
     NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
 };
 
-use crate::config::RelayTelemetryExportConfig;
+use crate::config::{RelayConnectionMode, RelayTelemetryExportConfig};
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::DirectorySyncPlan;
@@ -112,9 +112,26 @@ pub struct RelayPlaneHealth {
     pub directory_subscriptions_removed: usize,
 }
 
+/// Build the relay plane's underlying Nostr client, applying the configured
+/// [`RelayConnectionMode`] (direct, or a SOCKS5 proxy) to its options. The same
+/// client backs both the relay transport and the user-directory fetcher, so a
+/// proxy set here routes every relay connection this plane makes.
+fn build_sdk_client(connection: &RelayConnectionMode) -> NostrSdkClient {
+    match connection {
+        RelayConnectionMode::Direct => NostrSdkClient::builder().build(),
+        RelayConnectionMode::Socks5(addr) => NostrSdkClient::builder()
+            .opts(ClientOptions::new().connection(Connection::new().proxy(*addr)))
+            .build(),
+    }
+}
+
 impl MarmotRelayPlane {
     pub fn runtime_default(subscription_rebuild_lookback: Duration) -> Self {
-        Self::from_sdk(Some(subscription_rebuild_lookback), false)
+        Self::from_sdk(
+            Some(subscription_rebuild_lookback),
+            false,
+            &RelayConnectionMode::Direct,
+        )
     }
 
     /// Production runtime plane whose relay-safety chokepoint admits loopback
@@ -123,23 +140,27 @@ impl MarmotRelayPlane {
     pub fn runtime_default_with_loopback(
         subscription_rebuild_lookback: Duration,
         allow_loopback: bool,
+        connection: &RelayConnectionMode,
     ) -> Self {
-        Self::from_sdk(Some(subscription_rebuild_lookback), allow_loopback)
+        Self::from_sdk(Some(subscription_rebuild_lookback), allow_loopback, connection)
     }
 
     pub fn full_history() -> Self {
-        Self::from_sdk(None, false)
+        Self::from_sdk(None, false, &RelayConnectionMode::Direct)
     }
 
     /// Full-history plane whose relay-safety chokepoint admits loopback
     /// endpoints only when `allow_loopback` is set
     /// (`MarmotAppConfig::allow_loopback_relay_endpoints`, off by default).
-    pub fn full_history_with_loopback(allow_loopback: bool) -> Self {
-        Self::from_sdk(None, allow_loopback)
+    pub fn full_history_with_loopback(
+        allow_loopback: bool,
+        connection: &RelayConnectionMode,
+    ) -> Self {
+        Self::from_sdk(None, allow_loopback, connection)
     }
 
     pub fn with_subscription_rebuild_lookback(lookback: Duration) -> Self {
-        Self::from_sdk(Some(lookback), false)
+        Self::from_sdk(Some(lookback), false, &RelayConnectionMode::Direct)
     }
 
     pub fn new(
@@ -157,8 +178,12 @@ impl MarmotRelayPlane {
         )
     }
 
-    fn from_sdk(subscription_rebuild_lookback: Option<Duration>, allow_loopback: bool) -> Self {
-        let client = NostrSdkClient::builder().build();
+    fn from_sdk(
+        subscription_rebuild_lookback: Option<Duration>,
+        allow_loopback: bool,
+        connection: &RelayConnectionMode,
+    ) -> Self {
+        let client = build_sdk_client(connection);
         let relay_client = NostrSdkRelayClient::new(client.clone());
         let adapter = NostrTransportAdapter::new(Arc::new(relay_client.clone()));
         Self::from_adapter(

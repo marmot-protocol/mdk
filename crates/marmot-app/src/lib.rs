@@ -118,8 +118,8 @@ pub use audit_log::{
 pub use client::AppClient;
 pub use config::{
     AuditLogTrackerConfig, AuditLogUploadSource, MarmotAppConfig, MarmotServiceEndpoints,
-    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings,
+    RelayConnectionMode, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
@@ -927,6 +927,7 @@ impl MarmotApp {
         let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
+            &config.relay_connection,
         );
         Self {
             account_home: AccountHome::open(&root),
@@ -970,6 +971,7 @@ impl MarmotApp {
         let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
+            &config.relay_connection,
         );
         Self {
             root: root.as_ref().to_path_buf(),
@@ -1006,6 +1008,7 @@ impl MarmotApp {
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
         let relay_plane = MarmotRelayPlane::full_history_with_loopback(
             self.config.allow_loopback_relay_endpoints,
+            &self.config.relay_connection,
         );
         self.client_with_relay_plane(label, &relay_plane, None)
             .await

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,26 @@ const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
     option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
 const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
     option_env!("MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS");
+
+/// How the relay plane's underlying Nostr client dials relays.
+///
+/// Defaults to [`RelayConnectionMode::Direct`]. Selecting
+/// [`RelayConnectionMode::Socks5`] routes all relay WebSocket traffic (and the
+/// user-directory fetch client, which shares the same underlying Nostr client)
+/// through a SOCKS5 proxy — e.g. a local Tor daemon's SOCKS port, or any SOCKS5
+/// forward — which is what lets a client reach relays on a network that tears
+/// down direct WebSocket connections. The proxy socket is dialed by the Nostr
+/// client itself and is deliberately outside the relay-host safety chokepoint
+/// (`relay_plane/safety.rs`), which still validates the *relay* URL; the proxy
+/// is an explicit, user-configured egress akin to a system VPN.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum RelayConnectionMode {
+    /// Connect to relays directly (the default).
+    #[default]
+    Direct,
+    /// Route all relay connections through a SOCKS5 proxy at this address.
+    Socks5(SocketAddr),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
@@ -38,6 +59,9 @@ pub struct MarmotAppConfig {
     /// value (spec/implementation-model.md, "Convergence Policy Overrides").
     /// Test harnesses set `Some(0)` for deterministic, instant settlement.
     pub dev_settlement_quiescence_ms: Option<u64>,
+    /// How the relay plane dials relays: directly (default) or through a SOCKS5
+    /// proxy. See [`RelayConnectionMode`].
+    pub relay_connection: RelayConnectionMode,
 }
 
 /// Compiled or app-level default service URLs for production telemetry export
@@ -63,6 +87,7 @@ impl Default for MarmotAppConfig {
             allow_loopback_blob_endpoints: false,
             allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
+            relay_connection: RelayConnectionMode::Direct,
         }
     }
 }
@@ -99,6 +124,14 @@ impl MarmotAppConfig {
     /// must leave this unset. Test harnesses set `0` for instant settlement.
     pub fn with_dev_settlement_quiescence_ms(mut self, ms: u64) -> Self {
         self.dev_settlement_quiescence_ms = Some(ms);
+        self
+    }
+
+    /// Route relay connections through a SOCKS5 proxy (e.g. a local Tor SOCKS
+    /// port) instead of dialing relays directly. Defaults to
+    /// [`RelayConnectionMode::Direct`].
+    pub fn with_relay_connection(mut self, mode: RelayConnectionMode) -> Self {
+        self.relay_connection = mode;
         self
     }
 }
