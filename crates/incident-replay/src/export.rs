@@ -75,10 +75,16 @@ pub enum EventKind {
         invalidated_msg_id: Option<String>,
     },
     /// `select_canonical_branch` evaluated a candidate set. Contested iff a
-    /// branch actually lost (or more than one candidate was in play).
+    /// branch actually lost (or more than one candidate was in play). Extraction
+    /// (Phase 4) also reads which selector rule was decisive and the winning
+    /// branch's witness quorum, to decide whether the decision is reproducible.
     ConvergenceDecision {
         #[serde(default)]
-        candidates: Vec<serde_json::Value>,
+        selected_branch_id: Option<String>,
+        #[serde(default)]
+        candidates: Vec<ConvergenceCandidate>,
+        #[serde(default)]
+        rule_trace: Vec<ConvergenceRule>,
         #[serde(default)]
         losing_branch_ids: Vec<String>,
     },
@@ -107,6 +113,34 @@ pub enum EventKind {
     Other,
 }
 
+/// One branch the convergence selector evaluated. Only the fields extraction
+/// reads are modelled; every other field the export carries is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConvergenceCandidate {
+    #[serde(default)]
+    pub branch_id: String,
+    #[serde(default)]
+    pub score: Option<ConvergenceScore>,
+}
+
+/// The selector's score for a candidate. Only the witness-quorum flag is read:
+/// a winner that met the app-witness quorum needs the (not-yet-wired) harness
+/// witness path to reproduce, so it fail-closes at extraction.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConvergenceScore {
+    #[serde(default)]
+    pub witness_quorum_met: Option<bool>,
+}
+
+/// One selector-rule evaluation. Extraction reads which rule was decisive.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConvergenceRule {
+    #[serde(default)]
+    pub rule_name: String,
+    #[serde(default)]
+    pub decisive: Option<bool>,
+}
+
 /// The role that won a fork resolution. `MissingSnapshot` means the winner's
 /// pre-commit snapshot was unavailable, so the incident is unreproducible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -124,7 +158,7 @@ impl EventKind {
     pub fn is_contested_convergence(&self) -> bool {
         matches!(
             self,
-            EventKind::ConvergenceDecision { candidates, losing_branch_ids }
+            EventKind::ConvergenceDecision { candidates, losing_branch_ids, .. }
                 if !losing_branch_ids.is_empty() || candidates.len() >= 2
         )
     }

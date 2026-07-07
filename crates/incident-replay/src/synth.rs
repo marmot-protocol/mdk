@@ -10,6 +10,7 @@
 
 use cgka_conformance_simulator::{ScenarioSpec, ScenarioStep, TraceExpectation, VectorFixture};
 
+use crate::convergence::{ConvergenceDecisionKind, RecoveredConvergence};
 use crate::fork::{ForkCommitKind, RecoveredFork};
 
 /// The group name the winning branch commits; its survival after convergence is
@@ -101,4 +102,192 @@ pub fn synthesize(fork: &RecoveredFork, name: &str, winner: &str, loser: &str) -
             },
         ],
     }
+}
+
+/// The observer that runs the convergence selector over the competing branches.
+const OBSERVER: &str = "carol";
+/// The two admins that raise competing commits from the same epoch.
+const COMMITTER_A: &str = "alice";
+const COMMITTER_B: &str = "bob";
+/// The new members each competing branch adds (an invite race is the proven way
+/// to create two competing stored branches the observer must converge).
+const INVITEE_A: &str = "david";
+const INVITEE_B: &str = "eve";
+
+/// Build the convergence vector for a recovered decision.
+///
+/// Both shapes start from the validated `convergence-committer-selected/v1`
+/// blueprint: two admins raise competing invite commits from the same epoch and a
+/// passive observer runs the convergence selector over both stored branches. The
+/// selector's outcome is content-independent for the reproduced rules, so the
+/// invite race reproduces the recorded convergence regardless of what the real
+/// branches committed (outcome-equivalence). The assertion is winner-agnostic —
+/// the recorded decisive rule and witness-quorum status, not which branch won —
+/// so no label search is needed.
+pub fn synthesize_convergence(conv: &RecoveredConvergence, name: &str) -> VectorFixture {
+    match conv.kind {
+        ConvergenceDecisionKind::CommitterDecided => synthesize_committer_decided(conv, name),
+        ConvergenceDecisionKind::WitnessDecided => synthesize_witness_decided(conv, name),
+    }
+}
+
+/// The setup both shapes share: a two-admin group with a passive observer, then
+/// two competing same-epoch invite commits (confirmed, not yet delivered).
+fn convergence_preamble() -> Vec<ScenarioStep> {
+    vec![
+        ScenarioStep::CreateGroup {
+            creator: COMMITTER_A.to_owned(),
+            name: "replay".to_owned(),
+            invitees: vec![COMMITTER_B.to_owned(), OBSERVER.to_owned()],
+            required_features: Vec::new(),
+            // Both committers must be admins to raise competing commits.
+            initial_admins: Some(vec![COMMITTER_B.to_owned()]),
+            pending: "create".to_owned(),
+        },
+        ScenarioStep::ConfirmPending {
+            client: COMMITTER_A.to_owned(),
+            pending: "create".to_owned(),
+        },
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec![COMMITTER_B.to_owned(), OBSERVER.to_owned()],
+        },
+        ScenarioStep::ClearEvents {
+            clients: vec![
+                COMMITTER_A.to_owned(),
+                COMMITTER_B.to_owned(),
+                OBSERVER.to_owned(),
+            ],
+        },
+        // Competing commits from the same epoch — the contested branches.
+        ScenarioStep::InviteMembers {
+            inviter: COMMITTER_A.to_owned(),
+            invitees: vec![INVITEE_A.to_owned()],
+            pending: "invite-a".to_owned(),
+        },
+        ScenarioStep::InviteMembers {
+            inviter: COMMITTER_B.to_owned(),
+            invitees: vec![INVITEE_B.to_owned()],
+            pending: "invite-b".to_owned(),
+        },
+        ScenarioStep::ConfirmPending {
+            client: COMMITTER_A.to_owned(),
+            pending: "invite-a".to_owned(),
+        },
+        ScenarioStep::ConfirmPending {
+            client: COMMITTER_B.to_owned(),
+            pending: "invite-b".to_owned(),
+        },
+    ]
+}
+
+/// Wrap `steps` and the winner-agnostic convergence assertion into a fixture.
+fn convergence_fixture(
+    name: &str,
+    steps: Vec<ScenarioStep>,
+    expected: TraceExpectation,
+) -> VectorFixture {
+    VectorFixture {
+        scenario_name: name.to_owned(),
+        vector_version: "1".to_owned(),
+        conformance_version: env!("CARGO_PKG_VERSION").to_owned(),
+        seed: None,
+        scenario: ScenarioSpec {
+            name: name.to_owned(),
+            spec_version: "1".to_owned(),
+            clients: [COMMITTER_A, COMMITTER_B, OBSERVER, INVITEE_A, INVITEE_B]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            steps,
+        },
+        expected_trace: None,
+        expected_outcomes: vec![expected],
+    }
+}
+
+/// Committer-decided: both branches reach the observer at once and the
+/// `tip_committer` tiebreak picks the winner (no witnesses).
+fn synthesize_committer_decided(conv: &RecoveredConvergence, name: &str) -> VectorFixture {
+    let mut steps = convergence_preamble();
+    steps.extend([
+        ScenarioStep::DeliverAll,
+        // Convergence runs on Tick, not DeliverAll.
+        ScenarioStep::Tick {
+            clients: vec![OBSERVER.to_owned()],
+        },
+        ScenarioStep::Observe {
+            clients: vec![OBSERVER.to_owned()],
+        },
+    ]);
+    convergence_fixture(
+        name,
+        steps,
+        TraceExpectation::ConvergenceDecision {
+            client: Some(OBSERVER.to_owned()),
+            selected_branch_id: None,
+            selected_tip_epoch: Some(2),
+            decisive_rule: Some(conv.decisive_rule.clone()),
+            witness_quorum_met: Some(false),
+            min_app_witness_score: None,
+        },
+    )
+}
+
+/// Witness-decided: the observer delivers two distinct senders' app messages on
+/// one branch *before* the competing commit arrives, so on the reorg the
+/// app-witness quorum overrides the committer tiebreak. Holding the competing
+/// commit (`DelayQueued`/`ReleaseDelayed`) is what stages the "delivered, then
+/// contested" ordering; the second observer `Tick` after release is the reorg.
+fn synthesize_witness_decided(conv: &RecoveredConvergence, name: &str) -> VectorFixture {
+    let mut steps = convergence_preamble();
+    steps.extend([
+        // Hold the competing branch-B commit (queue index 3: welcome-a, commit-a,
+        // welcome-b, commit-b) so only branch A reaches the observer first.
+        ScenarioStep::DelayQueued {
+            index: 3,
+            delayed: "held-b".to_owned(),
+        },
+        ScenarioStep::DeliverAll,
+        // The invitee joins branch A so it can be the second witness sender.
+        ScenarioStep::Tick {
+            clients: vec![INVITEE_A.to_owned()],
+        },
+        ScenarioStep::SendAppMessage {
+            sender: COMMITTER_A.to_owned(),
+            payload: "witness-a-1".to_owned(),
+        },
+        ScenarioStep::SendAppMessage {
+            sender: INVITEE_A.to_owned(),
+            payload: "witness-a-2".to_owned(),
+        },
+        ScenarioStep::DeliverAll,
+        // The observer delivers (applies) both branch-A app messages.
+        ScenarioStep::Tick {
+            clients: vec![OBSERVER.to_owned()],
+        },
+        // The competing branch-B commit now arrives, forcing a reorg.
+        ScenarioStep::ReleaseDelayed {
+            delayed: "held-b".to_owned(),
+        },
+        ScenarioStep::DeliverAll,
+        ScenarioStep::Tick {
+            clients: vec![OBSERVER.to_owned()],
+        },
+        ScenarioStep::Observe {
+            clients: vec![OBSERVER.to_owned()],
+        },
+    ]);
+    convergence_fixture(
+        name,
+        steps,
+        TraceExpectation::ConvergenceDecision {
+            client: Some(OBSERVER.to_owned()),
+            selected_branch_id: None,
+            selected_tip_epoch: Some(2),
+            decisive_rule: Some(conv.decisive_rule.clone()),
+            witness_quorum_met: Some(true),
+            min_app_witness_score: Some(2),
+        },
+    )
 }

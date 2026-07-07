@@ -1,10 +1,10 @@
 {
-  "scenario_name": "convergence-committer-selected/v1",
+  "scenario_name": "convergence-incident/v1",
   "vector_version": "1",
   "conformance_version": "0.9.3",
   "seed": null,
   "scenario": {
-    "name": "convergence-committer-selected/v1",
+    "name": "convergence-incident/v1",
     "spec_version": "1",
     "clients": [
       "alice",
@@ -17,7 +17,7 @@
       {
         "type": "create_group",
         "creator": "alice",
-        "name": "convergence",
+        "name": "replay",
         "invitees": [
           "bob",
           "carol"
@@ -57,7 +57,7 @@
         "invitees": [
           "david"
         ],
-        "pending": "alice-invite"
+        "pending": "invite-a"
       },
       {
         "type": "invite_members",
@@ -65,17 +65,17 @@
         "invitees": [
           "eve"
         ],
-        "pending": "bob-invite"
+        "pending": "invite-b"
       },
       {
         "type": "confirm_pending",
         "client": "alice",
-        "pending": "alice-invite"
+        "pending": "invite-a"
       },
       {
         "type": "confirm_pending",
         "client": "bob",
-        "pending": "bob-invite"
+        "pending": "invite-b"
       },
       {
         "type": "deliver_all"
@@ -101,20 +101,6 @@
       "selected_tip_epoch": 2,
       "decisive_rule": "tip_committer",
       "witness_quorum_met": false
-    },
-    {
-      "type": "pending_resolution",
-      "step_index": 1,
-      "client": "alice",
-      "pending": "create",
-      "resolution": "confirmed"
-    },
-    {
-      "type": "client_state",
-      "client": "carol",
-      "epoch": 2,
-      "member_count": 4,
-      "received_payloads": []
     }
   ]
 }

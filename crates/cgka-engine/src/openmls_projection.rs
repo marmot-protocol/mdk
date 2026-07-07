@@ -17,7 +17,7 @@ use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
-use openmls::group::{MlsGroup, ProcessMessageError, ValidationError};
+use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError, ValidationError};
 use openmls::messages::proposals::{AppDataUpdateOperation, Proposal, ProposalOrRef};
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
@@ -1870,14 +1870,22 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             Ok(processed) => processed,
             Err(err) if projection.kind == OpenMlsContentKind::Application => {
                 // App-message replay against a candidate state is best-
-                // effort: an app message that doesn't decrypt on this
-                // branch is just evidence that it belongs to a different
-                // branch, not a fatal error. ValidationError covers the
-                // expected failure modes (WrongEpoch, decryption fail,
-                // sender-membership, etc.). LibraryError or any other
-                // structural failure is a real bug — propagate so we
-                // don't silently mask malformed input.
-                if matches!(err, ProcessMessageError::ValidationError(_)) {
+                // effort: an app message that doesn't apply on this branch is
+                // just evidence that it belongs elsewhere, not a fatal error.
+                // ValidationError covers the expected failure modes (WrongEpoch,
+                // decryption fail, sender-membership, etc.); GroupStateError's
+                // UseAfterEviction covers a re-admitted witness (a `Processed`
+                // app, see `canonicalize_stored_openmls_messages`) whose sender
+                // was evicted on this branch — it simply isn't a witness here.
+                // LibraryError or any other structural failure is a real bug —
+                // propagate so we don't silently mask malformed input.
+                if matches!(
+                    err,
+                    ProcessMessageError::ValidationError(_)
+                        | ProcessMessageError::GroupStateError(
+                            MlsGroupStateError::UseAfterEviction
+                        )
+                ) {
                     observations.push(OpenMlsReplayObservation::Ignored {
                         message_id,
                         kind: projection.kind,

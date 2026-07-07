@@ -2,15 +2,16 @@
 
 use cgka_conformance_simulator::{VectorFixture, run_scenario_spec};
 
+use crate::convergence::RecoveredConvergence;
 use crate::fork::RecoveredFork;
-use crate::synth::{WINNER_BRANCH, synthesize};
+use crate::synth::{WINNER_BRANCH, synthesize, synthesize_convergence};
 
 /// Why an accept attempt produced no vector (fail-closed).
 #[derive(Debug, thiserror::Error)]
 pub enum AcceptError {
     #[error("the simulator could not be driven: {0}")]
     Run(String),
-    #[error("run-and-compare did not reproduce the recorded winner in {tries} label orderings")]
+    #[error("run-and-compare did not reproduce the recorded outcome after {tries} attempt(s)")]
     NotReproduced { tries: usize },
 }
 
@@ -48,4 +49,31 @@ pub fn accept(fork: &RecoveredFork, name: &str) -> Result<VectorFixture, AcceptE
     Err(AcceptError::NotReproduced {
         tries: LABEL_ORDERINGS.len(),
     })
+}
+
+/// Synthesize and verify a vector for a recovered convergence decision.
+///
+/// A single run-and-compare: the committer-decided decision is winner-agnostic
+/// (`tip_committer` is decisive whichever committer key wins), so unlike the fork
+/// path there is no label search. Accept iff the synthesized scenario reproduces
+/// the recorded convergence decision (decisive rule + no witness quorum).
+pub fn accept_convergence(
+    conv: &RecoveredConvergence,
+    name: &str,
+) -> Result<VectorFixture, AcceptError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|err| AcceptError::Run(err.to_string()))?;
+
+    let vector = synthesize_convergence(conv, name);
+    let trace = runtime
+        .block_on(run_scenario_spec(&vector.scenario))
+        .map_err(|err| AcceptError::Run(err.to_string()))?;
+
+    if vector.compare_observed_trace(&trace).is_empty() {
+        Ok(vector)
+    } else {
+        Err(AcceptError::NotReproduced { tries: 1 })
+    }
 }

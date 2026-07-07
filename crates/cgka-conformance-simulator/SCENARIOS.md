@@ -150,6 +150,17 @@ the top-level portable-vector test (Phase 5 wires the directory into CI).
 - Expected: the engine fork-recovers on delivery, the designated winner's branch survives, and both clients converge at
   epoch 2 with the full recovery summary matching the recorded incident.
 
+### `convergence-incident/v1`
+
+- File: `vectors/incidents/convergence-incident.v1.json`
+- Setup: two admins create a group with a passive observer, then raise competing invite commits from the same epoch —
+  the committer-decided convergence shape the adapter derives from a convergence incident.
+- Pressure: two competing same-epoch branches reach the observer, whose convergence selector — not the fork-recovery
+  seam — picks the canonical branch.
+- Expected: the observer's settled `convergence_decision` is decided by the authenticated-committer tiebreak
+  (`tip_committer`) at tip epoch 2 with no app-witness quorum. Witness-decided convergence (the real-traffic case) is a
+  documented follow-up: the harness does not yet count app-message witnesses through the stored-convergence path.
+
 ## Rust-Only Harness Scenarios
 
 These are real simulator scenarios that are still tied to Rust harness details.

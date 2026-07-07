@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "incident-replay"
-version = "0.9.1"
+version = "0.9.3"
 dependencies = [
  "cgka-conformance-simulator",
  "serde",

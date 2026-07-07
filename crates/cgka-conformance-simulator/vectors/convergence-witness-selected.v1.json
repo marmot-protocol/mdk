@@ -1,7 +1,7 @@
 {
   "scenario_name": "convergence-witness-selected/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.1",
+  "conformance_version": "0.9.3",
   "seed": null,
   "scenario": {
     "name": "convergence-witness-selected/v1",
@@ -41,6 +41,23 @@
       "selected_tip_epoch": 2,
       "witness_quorum_met": true,
       "min_app_witness_score": 2
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "carol",
+      "epoch": 2,
+      "member_count": 4,
+      "received_payloads": [
+        "wA-1",
+        "wA-2"
+      ]
     }
   ]
 }

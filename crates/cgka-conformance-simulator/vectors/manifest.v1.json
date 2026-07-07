@@ -203,6 +203,19 @@
       "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
     },
     {
+      "id": "convergence-incident/v1",
+      "kind": "scenario_vector",
+      "status": "incident_replay",
+      "artifact": "incidents/convergence-incident.v1.json",
+      "coverage": [
+        "Goggles forensic export replayed as a conformance vector",
+        "observer-side committer-decided convergence selection",
+        "tip-committer decisive rule with no witness quorum",
+        "settled convergence-decision reproduction"
+      ],
+      "next": "Extend to witness-decided convergence once the harness counts app-message witnesses (Phase 4 follow-up)."
+    },
+    {
       "id": "convergence-e2e-group-events/v1",
       "kind": "scenario",
       "status": "rust_only_bridge",

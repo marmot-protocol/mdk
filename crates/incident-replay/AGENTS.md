@@ -2,8 +2,8 @@
 
 Goggles `agent-state.json` forensic export → CGKA conformance-vector adapter. The
 pipeline is **parse → classify → recover → synthesize → accept**: a fork-recovery
-incident becomes a vector only if the simulator reproduces the recorded outcome
-(fail-closed). Convergence-selected incidents route to a later phase.
+or convergence incident becomes a vector only if the simulator reproduces the
+recorded outcome (fail-closed).
 
 ## Pieces
 
@@ -22,21 +22,34 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     (source epoch, commit kind, and the designated winner recovered tier-b from
     the invalidated message's publisher), or a `ForkRecoveryError` when it cannot
     be replayed. Only metadata (group-data) forks are supported today.
+- **Module:** `src/convergence.rs`
+  - **Role:** `recover_convergence` turns a convergence-selected export into a
+    `RecoveredConvergence` (the decisive rule + a `ConvergenceDecisionKind`), or a
+    `ConvergenceRecoveryError`. It reproduces the **committer-decided** case
+    (`tip_committer` decisive, no quorum) and the **witness-decided** case
+    (`effective_commit_depth` decisive, winner met the app-witness quorum — the
+    real-traffic case). Any other shape (a committer tiebreak that itself met a
+    quorum, or a priority/digest/differing-depth rule) fail-closes.
 - **Module:** `src/synth.rs`
-  - **Role:** `synthesize` builds the concurrent-fork `VectorFixture`: two
-    committers raise competing group-data commits from the same epoch (no
-    `SetPartition` — the commits are concurrent), with real epochs normalised to
-    the simulator's `1 → 2` range and synthetic client labels the caller assigns.
+  - **Role:** `synthesize` builds the concurrent-fork `VectorFixture` (two
+    committers race group-data commits, no `SetPartition`). `synthesize_convergence`
+    dispatches on `ConvergenceDecisionKind`: the committer-decided vector (two
+    admins race invite commits observed by a passive third client) or the
+    witness-decided vector (the observer delivers two senders' app messages on one
+    branch, then a held competing commit is released — the app-witness quorum
+    overrides the committer tiebreak on the reorg). Both normalise real epochs to
+    the simulator's `1 → 2` range; the convergence assertion is winner-agnostic.
 - **Module:** `src/accept.rs`
-  - **Role:** `accept` run-and-compares: it tries both label orderings, and
-    returns the vector only when the full `RecoverySummary` matches **and** the
-    designated winner's branch survives. The summary is the gate; branch survival
-    only selects the correct ordering. No reproduction ⇒ `AcceptError` (no vector).
+  - **Role:** `accept` (fork) tries both label orderings and returns the vector
+    only when the full `RecoverySummary` matches **and** the designated winner's
+    branch survives. `accept_convergence` is a single run-and-compare (winner-agnostic
+    ⇒ no label search) that returns the vector only when the recorded convergence
+    decision reproduces. No reproduction ⇒ `AcceptError` (no vector).
 - **Module:** `src/main.rs`
-  - **Role:** CLI — classify one export file; for a fork-recovery incident, run
-    the recover → accept → write pipeline. Exits 0 for any classification
-    (healthy, quarantine, and accepted are all valid), 2 on usage/IO/parse/write
-    failure.
+  - **Role:** CLI — classify one export file; for a fork-recovery or convergence
+    incident, run the recover → accept → write pipeline. Exits 0 for any
+    classification (healthy, quarantine, and accepted are all valid), 2 on
+    usage/IO/parse/write failure.
 
 ## Classification rules (verified against real Goggles exports)
 

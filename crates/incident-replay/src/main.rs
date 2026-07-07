@@ -9,10 +9,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use cgka_conformance_simulator::VectorFixture;
-use incident_replay::{AgentStateExport, Verdict, accept, classify, parse, recover_fork};
+use incident_replay::{
+    AgentStateExport, Verdict, accept, accept_convergence, classify, parse, recover_convergence,
+    recover_fork,
+};
 
 /// Vector name for a fork-recovery incident (one incident per export today).
 const INCIDENT_NAME: &str = "fork-recovery-incident/v1";
+/// Vector name for a convergence incident.
+const CONVERGENCE_NAME: &str = "convergence-incident/v1";
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -43,10 +48,7 @@ fn main() -> ExitCode {
             println!("healthy: 0 vectors");
             ExitCode::SUCCESS
         }
-        Verdict::ConvergenceSelected => {
-            println!("convergence_selected: routes to the Phase 4 convergence path");
-            ExitCode::SUCCESS
-        }
+        Verdict::ConvergenceSelected => run_convergence(&export, out_dir.as_deref()),
         Verdict::Quarantine { reason } => {
             println!("quarantine: {reason:?}");
             ExitCode::SUCCESS
@@ -57,20 +59,36 @@ fn main() -> ExitCode {
 fn run_fork_recovery(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitCode {
     let fork = match recover_fork(export) {
         Ok(fork) => fork,
-        Err(err) => {
-            println!("quarantine: {err}");
-            return ExitCode::SUCCESS;
-        }
+        Err(err) => return quarantine(&err),
     };
-    let vector = match accept(&fork, INCIDENT_NAME) {
-        Ok(vector) => vector,
-        Err(err) => {
-            println!("quarantine: {err}");
-            return ExitCode::SUCCESS;
-        }
+    match accept(&fork, INCIDENT_NAME) {
+        Ok(vector) => persist_or_report(&vector, out_dir),
+        Err(err) => quarantine(&err),
+    }
+}
+
+fn run_convergence(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitCode {
+    let conv = match recover_convergence(export) {
+        Ok(conv) => conv,
+        Err(err) => return quarantine(&err),
     };
+    match accept_convergence(&conv, CONVERGENCE_NAME) {
+        Ok(vector) => persist_or_report(&vector, out_dir),
+        Err(err) => quarantine(&err),
+    }
+}
+
+/// Report a fail-closed quarantine and exit cleanly: producing no vector is a
+/// valid outcome, so it is not an error exit.
+fn quarantine(reason: &dyn std::fmt::Display) -> ExitCode {
+    println!("quarantine: {reason}");
+    ExitCode::SUCCESS
+}
+
+/// Write the accepted vector to `out_dir`, or print it when no dir was given.
+fn persist_or_report(vector: &VectorFixture, out_dir: Option<&Path>) -> ExitCode {
     match out_dir {
-        Some(dir) => match write_vector(&vector, dir) {
+        Some(dir) => match write_vector(vector, dir) {
             Ok(path) => {
                 println!("accepted: wrote {}", path.display());
                 ExitCode::SUCCESS
