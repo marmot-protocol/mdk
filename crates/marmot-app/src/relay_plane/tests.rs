@@ -1,5 +1,5 @@
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{
@@ -94,7 +94,9 @@ async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
         "a fresh plane must not have a signer"
     );
 
-    plane.set_transport_signer(nostr::Keys::generate()).await;
+    plane
+        .set_transport_signer(Arc::new(nostr::Keys::generate()))
+        .await;
 
     assert!(
         sdk.client().signer().await.is_ok(),

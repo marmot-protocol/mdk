@@ -529,6 +529,7 @@ pub struct ManagedAccount {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
 }
@@ -676,6 +677,7 @@ pub struct AccountSetupRequest {
     pub identity: Option<String>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    pub discovery_relays: Vec<TransportEndpoint>,
     pub publish_missing_relay_lists: bool,
     pub publish_initial_key_package: bool,
 }
@@ -2418,6 +2420,33 @@ impl MarmotAppRuntime {
         self.accounts.create_or_import_account(request).await
     }
 
+    pub async fn login_external_signer<S>(
+        &self,
+        public_key: impl Into<String>,
+        signer: S,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.accounts
+            .login_external_signer(public_key.into(), signer, request)
+            .await
+    }
+
+    pub async fn register_external_signer<S>(
+        &self,
+        account_ref: impl AsRef<str>,
+        signer: S,
+    ) -> Result<(), AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.accounts
+            .register_external_signer(account_ref.as_ref(), signer)
+            .await
+    }
+
     pub async fn create_or_import_account(
         &self,
         request: AccountSetupRequest,
@@ -2478,12 +2507,13 @@ impl AccountManager {
             .account_home()
             .accounts()?
             .into_iter()
-            .filter(|account| account.local_signing)
+            .filter(|account| account.can_sign())
             .map(|account| ManagedAccount {
                 running: running.contains(&account.account_id_hex),
                 label: account.label,
                 account_id_hex: account.account_id_hex,
                 local_signing: account.local_signing,
+                external_signing: account.external_signing,
                 signed_out: account.signed_out,
             })
             .collect())
@@ -2568,6 +2598,7 @@ impl AccountManager {
             label: account.label,
             account_id_hex: account.account_id_hex,
             local_signing: account.local_signing,
+            external_signing: account.external_signing,
             signed_out: account.signed_out,
             running,
         })
@@ -2582,7 +2613,12 @@ impl AccountManager {
                 .account_home()
                 .accounts()?
                 .into_iter()
-                .filter(|account| account.is_active_local_signing())
+                .filter(|account| {
+                    account.is_active_local_signing()
+                        || (account.external_signing
+                            && !account.signed_out
+                            && self.app.has_external_signer(&account.account_id_hex))
+                })
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -2881,7 +2917,7 @@ impl AccountManager {
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        if !account.local_signing {
+        if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
         if account.signed_out {
@@ -2916,6 +2952,19 @@ impl AccountManager {
         };
         let reactivating_existing = account.signed_out;
         let rollback_on_setup_failure = !reactivating_existing;
+
+        if imports_private_key || reactivating_existing || !account.local_signing {
+            // Resolve a pre-existing identity's profile from public indexers, not
+            // the app's own messaging relays, where its outbox metadata does not
+            // live. Runs before the relay-list setup below so discovery never
+            // clobbers, or is clobbered by, the publish-missing-relay-lists step.
+            let _ = self
+                .preflight_existing_account_directory(
+                    &account.account_id_hex,
+                    directory_discovery_relays_for_setup(&request),
+                )
+                .await;
+        }
 
         let relay_lists = match self
             .setup_relay_lists_for_account(
@@ -2992,6 +3041,178 @@ impl AccountManager {
         })
     }
 
+    pub async fn login_external_signer<S>(
+        &self,
+        public_key: String,
+        signer: S,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.shared.lifecycle().ensure_running()?;
+        let signer_public_key = signer
+            .get_public_key()
+            .await
+            .map_err(crate::external_signer_public_key_error)?;
+        let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
+        if signer_public_key.to_hex() != account_id_hex {
+            return Err(AppError::ExternalSignerMismatch);
+        }
+        let existing_account = self.app.account_home().account(&account_id_hex).ok();
+        let created_account = existing_account.is_none();
+        // add_external_signer_account below promotes a pre-existing tracked
+        // (public) account to external_signing, so a later setup failure must
+        // revert that promotion — not skip cleanup and leave a torn account.
+        // Created accounts are deleted, already-external accounts are left as-is.
+        let upgraded_public_account = existing_account
+            .is_some_and(|account| !account.external_signing && !account.local_signing);
+        let mut account = self
+            .app
+            .account_home()
+            .add_external_signer_account(&public_key)?;
+        if let Err(err) = self
+            .app
+            .register_external_signer(&account.account_id_hex, signer)
+            .await
+        {
+            return self.rollback_external_signer_setup(
+                &account.label,
+                created_account,
+                upgraded_public_account,
+                err,
+            );
+        }
+
+        let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
+        // An external-signer account is pre-existing by definition, so resolve
+        // its profile from public indexers (its outbox metadata does not live on
+        // the app's messaging relays). Runs before the relay-list setup so
+        // discovery keeps its anti-clobber ordering.
+        let _ = self
+            .preflight_existing_account_directory(
+                &account.account_id_hex,
+                directory_discovery_relays_for_setup(&request),
+            )
+            .await;
+
+        let relay_lists = match self
+            .setup_relay_lists_for_account(&account, &request, true, false)
+            .await
+        {
+            Ok(relay_lists) => relay_lists,
+            Err(err) => {
+                return self.rollback_external_signer_setup(
+                    &account.label,
+                    created_account,
+                    upgraded_public_account,
+                    err,
+                );
+            }
+        };
+
+        let key_package_bytes = if request.publish_initial_key_package {
+            match self.publish_initial_key_package_for_account(&account).await {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    return self.rollback_external_signer_setup(
+                        &account.label,
+                        created_account,
+                        upgraded_public_account,
+                        err,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let _ = self
+            .app
+            .refresh_user_directory_for_account_id(
+                &account.account_id_hex,
+                directory_bootstrap_relays,
+            )
+            .await;
+        if account.signed_out {
+            account = self
+                .app
+                .account_home()
+                .set_account_signed_out(&account.label, false)?;
+        }
+        self.reconcile().await?;
+
+        Ok(AccountSetupResult {
+            account,
+            relay_lists,
+            key_package_bytes,
+            profile: None,
+        })
+    }
+
+    pub async fn register_external_signer<S>(
+        &self,
+        account_ref: &str,
+        signer: S,
+    ) -> Result<(), AppError>
+    where
+        S: crate::ExternalAccountSigner + 'static,
+    {
+        self.shared.lifecycle().ensure_running()?;
+        self.app
+            .register_external_signer(account_ref, signer)
+            .await?;
+        self.reconcile().await
+    }
+
+    async fn preflight_existing_account_directory(
+        &self,
+        account_id_hex: &str,
+        discovery_relays: Vec<TransportEndpoint>,
+    ) -> Option<AccountRelayListStatus> {
+        let status = match self
+            .app
+            .fetch_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
+            .await
+        {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::debug!(
+                    target: "marmot_app::runtime",
+                    method = "preflight_existing_account_directory",
+                    error_kind = err.privacy_safe_kind(),
+                    "existing account relay discovery failed during setup preflight"
+                );
+                return None;
+            }
+        };
+
+        let profile_relays = status
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        if profile_relays.is_empty() {
+            return Some(status);
+        }
+        if let Err(err) = self
+            .app
+            .refresh_profile_for_account_id(account_id_hex, profile_relays)
+            .await
+        {
+            tracing::debug!(
+                target: "marmot_app::runtime",
+                method = "preflight_existing_account_directory",
+                error_kind = err.privacy_safe_kind(),
+                "existing account profile discovery failed during setup preflight"
+            );
+        }
+
+        Some(status)
+    }
+
     async fn publish_default_profile_for_account(
         &self,
         account: &AccountSummary,
@@ -3026,7 +3247,7 @@ impl AccountManager {
         imports_private_key: bool,
         creates_new_private_key: bool,
     ) -> Result<AccountRelayListStatus, AppError> {
-        if account.local_signing {
+        if account.can_sign() {
             if creates_new_private_key && request.default_relays.is_empty() {
                 return Err(AppError::MissingDefaultRelays);
             }
@@ -3142,6 +3363,30 @@ impl AccountManager {
         }
     }
 
+    /// Undo a failed external-signer setup — delete a freshly created account, or
+    /// revert the external_signing promotion on a pre-existing tracked account,
+    /// then surface the original error. Without this, a failed public→external
+    /// login leaves a torn account: the promotion applied, but the relay-list and
+    /// KeyPackage setup that should follow it did not.
+    fn rollback_external_signer_setup<T>(
+        &self,
+        label: &str,
+        created_account: bool,
+        upgraded_public_account: bool,
+        err: AppError,
+    ) -> Result<T, AppError> {
+        if created_account {
+            return self.rollback_account_after_setup_failure(label, err);
+        }
+        if upgraded_public_account {
+            let _ = self
+                .app
+                .account_home()
+                .revert_external_signer_upgrade(label);
+        }
+        Err(err)
+    }
+
     fn rollback_account_after_setup_failure<T>(
         &self,
         account: &str,
@@ -3189,6 +3434,46 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
     } else {
         request.bootstrap_relays.clone()
     }
+}
+
+/// Public indexer relays used to resolve a pre-existing identity's outbox
+/// metadata during setup.
+///
+/// A brand-new external-signer account (or an imported nsec) keeps its NIP-65
+/// relay list (kind:10002) and profile (kind:0) on public indexers, not on the
+/// app's own messaging relays. Discovering an existing profile against the
+/// app's relays therefore finds nothing and the display name never resolves —
+/// the exact bug the external-signer work exists to fix. These indexers give
+/// the directory preflight a discovery set distinct from the operational
+/// messaging relays. They are used only to read the outbox list and profile,
+/// they are never adopted as the account's messaging relays.
+const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[
+    "wss://purplepag.es",
+    "wss://relay.nostr.band",
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+];
+
+pub fn default_directory_discovery_relays() -> Vec<TransportEndpoint> {
+    DEFAULT_DISCOVERY_INDEXER_RELAYS
+        .iter()
+        .map(|relay| TransportEndpoint((*relay).to_string()))
+        .collect()
+}
+
+/// Discovery relay set for the existing-account directory preflight.
+///
+/// Unions the caller-supplied setup relays with an explicit discovery set so
+/// discovery reaches wherever a pre-existing identity actually published its
+/// kind:10002/kind:0, without dropping any indexers a caller passes explicitly.
+fn directory_discovery_relays_for_setup(request: &AccountSetupRequest) -> Vec<TransportEndpoint> {
+    let mut relays = directory_bootstrap_relays_for_setup(request);
+    for endpoint in &request.discovery_relays {
+        if !relays.contains(endpoint) {
+            relays.push(endpoint.clone());
+        }
+    }
+    relays
 }
 
 pub(crate) async fn account_worker_response<T>(

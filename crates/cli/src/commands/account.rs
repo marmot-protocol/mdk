@@ -174,12 +174,14 @@ pub(crate) async fn create_or_import_account_command(
 
     let default_relays = relay_endpoints(default_relays)?;
     let bootstrap_relays = relay_endpoints(bootstrap_relays)?;
+    let discovery_relays = bootstrap_relays.clone();
     let setup = app
         .runtime()
         .create_or_import_account(AccountSetupRequest {
             identity,
             default_relays,
             bootstrap_relays,
+            discovery_relays,
             publish_missing_relay_lists,
             publish_initial_key_package,
         })

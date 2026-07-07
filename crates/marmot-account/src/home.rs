@@ -20,6 +20,7 @@ const ACCOUNT_RECORD_FILE: &str = "account.json";
 /// byte, never key material, so it is written with public file permissions.
 const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
+pub const EXTERNAL_SQLCIPHER_SECRET_FILE: &str = ".external-sqlcipher-secret";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
 pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.whitenoise";
 const TRACE_TARGET: &str = "marmot_account::home";
@@ -71,6 +72,10 @@ pub struct AccountSummary {
     pub label: String,
     pub account_id_hex: String,
     pub local_signing: bool,
+    /// The account signs through a host-provided external signer instead of a
+    /// local nsec. Public/tracked accounts keep both signing flags false.
+    #[serde(default)]
+    pub external_signing: bool,
     /// Durable local runtime state for reversible sign-out. A signed-out
     /// account keeps its local signing secret and account directory but must not
     /// be auto-started by runtime reconciliation until an explicit sign-in
@@ -80,6 +85,14 @@ pub struct AccountSummary {
 }
 
 impl AccountSummary {
+    pub fn can_sign(&self) -> bool {
+        self.local_signing || self.external_signing
+    }
+
+    pub fn is_active_signing(&self) -> bool {
+        self.can_sign() && !self.signed_out
+    }
+
     pub fn is_active_local_signing(&self) -> bool {
         self.local_signing && !self.signed_out
     }
@@ -169,10 +182,60 @@ impl AccountHome {
             label: account_id_hex.clone(),
             account_id_hex,
             local_signing: false,
+            external_signing: false,
             signed_out: false,
         };
         self.write_account_record(&account)?;
         Ok(account)
+    }
+
+    pub fn add_external_signer_account(
+        &self,
+        public_key: &str,
+    ) -> AccountHomeResult<AccountSummary> {
+        let account_id_hex = Self::account_id_for_public_key(public_key)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.account_record_path(&account_id_hex).exists() {
+            let mut account = self.account(&account_id_hex)?;
+            if account.local_signing {
+                return Err(AccountHomeError::AccountExists(account_id_hex));
+            }
+            if !account.external_signing {
+                account.external_signing = true;
+                self.write_account_record(&account)?;
+            }
+            return Ok(account);
+        }
+        let account = AccountSummary {
+            label: account_id_hex.clone(),
+            account_id_hex,
+            local_signing: false,
+            external_signing: true,
+            signed_out: false,
+        };
+        self.write_account_record(&account)?;
+        Ok(account)
+    }
+
+    /// Undo the `external_signing` promotion that [`Self::add_external_signer_account`]
+    /// applies to a pre-existing public/tracked account, so a failed external-signer
+    /// setup restores that account to its prior tracked state instead of leaving it
+    /// half-configured. A no-op for local accounts, and for accounts that were
+    /// already external (nothing was promoted).
+    pub fn revert_external_signer_upgrade(&self, account_ref: &str) -> AccountHomeResult<()> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut account = self.account(account_ref)?;
+        if account.external_signing && !account.local_signing {
+            account.external_signing = false;
+            self.write_account_record(&account)?;
+        }
+        Ok(())
     }
 
     pub fn account_id_for_secret(secret_key: &str) -> AccountHomeResult<String> {
@@ -247,7 +310,7 @@ impl AccountHome {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut account = self.account(account_ref)?;
-        if !account.local_signing {
+        if !account.can_sign() {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex));
         }
         if account.signed_out == signed_out {
@@ -322,6 +385,14 @@ impl AccountHome {
                     target: TRACE_TARGET,
                     method = "remove_account",
                     "failed to scrub tombstoned local signing secret before directory deletion"
+                );
+            }
+            let external_secret_path = tombstone.join(EXTERNAL_SQLCIPHER_SECRET_FILE);
+            if scrub_and_remove_local_secret_file(&external_secret_path).is_err() {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "remove_account",
+                    "failed to scrub tombstoned external SQLCipher secret before directory deletion"
                 );
             }
         }
@@ -517,6 +588,7 @@ impl AccountHome {
             label,
             account_id_hex,
             local_signing: true,
+            external_signing: false,
             signed_out: false,
         };
         self.secret_store.write_secret(&account, keys)?;

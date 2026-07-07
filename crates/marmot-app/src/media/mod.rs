@@ -3,6 +3,7 @@ use cgka_traits::app_components::{
 };
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use nostr::NostrSigner;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
@@ -214,7 +215,7 @@ pub(crate) async fn upload_encrypted_media(
     request: MediaUploadRequest,
     source_epoch: u64,
     media_secret: &[u8],
-    signing_keys: &nostr::Keys,
+    signer: &dyn NostrSigner,
     default_endpoints: &[BlobStoreEndpointV1],
     allowed_locator_kinds: &[String],
     allow_loopback_http: bool,
@@ -243,7 +244,7 @@ pub(crate) async fn upload_encrypted_media(
                 attachment,
                 source_epoch,
                 media_secret,
-                signing_keys,
+                signer,
                 &upload_servers,
                 allowed_locator_kinds,
                 allow_loopback_http,
@@ -261,7 +262,7 @@ async fn upload_encrypted_media_attachment(
     request: MediaUploadAttachmentRequest,
     source_epoch: u64,
     media_secret: &[u8],
-    signing_keys: &nostr::Keys,
+    signer: &dyn NostrSigner,
     upload_servers: &[String],
     allowed_locator_kinds: &[String],
     allow_loopback_http: bool,
@@ -300,7 +301,7 @@ async fn upload_encrypted_media_attachment(
         upload_servers,
         &encrypted,
         &ciphertext_sha256,
-        signing_keys,
+        signer,
         allow_loopback_http,
     )
     .await?;
@@ -334,7 +335,7 @@ async fn upload_blossom_blob_with_fallback(
     servers: &[String],
     encrypted: &[u8],
     encrypted_hash_hex: &str,
-    signing_keys: &nostr::Keys,
+    signer: &dyn NostrSigner,
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
     let mut failures = Vec::new();
@@ -343,12 +344,13 @@ async fn upload_blossom_blob_with_fallback(
             server,
             encrypted,
             encrypted_hash_hex,
-            signing_keys,
+            signer,
             allow_loopback_http,
         )
         .await
         {
             Ok(url) => return Ok(url),
+            Err(AppError::ExternalSignerRejected) => return Err(AppError::ExternalSignerRejected),
             Err(err) => failures.push(format!(
                 "server {}: {}",
                 idx + 1,
