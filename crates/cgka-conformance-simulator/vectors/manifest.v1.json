@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-05-13",
+  "updated": "2026-07-06",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -175,6 +175,19 @@
         "single app payload emission after replay"
       ],
       "next": "Use as the restart-plus-delivery-fault fixture."
+    },
+    {
+      "id": "fork-recovery-incident/v1",
+      "kind": "scenario_vector",
+      "status": "incident_replay",
+      "artifact": "incidents/fork-recovery-incident.v1.json",
+      "coverage": [
+        "Goggles forensic export replayed as a conformance vector",
+        "same-epoch group-data fork recovery",
+        "designated-winner branch survival",
+        "full recovery-summary reproduction"
+      ],
+      "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
     },
     {
       "id": "convergence-e2e-group-events/v1",

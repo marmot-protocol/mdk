@@ -122,6 +122,21 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: Bob's message is delayed, Alice restarts, and the released message is duplicated and reordered.
 - Expected: Alice hydrates the stable group after restart and receives Bob's payload once.
 
+## Incident-Replay Vectors
+
+These vectors are synthesized from Goggles `agent-state.json` forensic exports by the `incident-replay` adapter, then
+verified against the simulator before they are committed. They live under `vectors/incidents/` and are not yet part of
+the top-level portable-vector test (Phase 5 wires the directory into CI).
+
+### `fork-recovery-incident/v1`
+
+- File: `vectors/incidents/fork-recovery-incident.v1.json`
+- Setup: two clients create a group, then raise competing group-data commits from the same epoch — the concurrent-fork
+  shape the adapter derives from a fork-recovery incident.
+- Pressure: same-epoch group-data commit race with deferred delivery (no partition needed; the commits are concurrent).
+- Expected: the engine fork-recovers on delivery, the designated winner's branch survives, and both clients converge at
+  epoch 2 with the full recovery summary matching the recorded incident.
+
 ## Rust-Only Harness Scenarios
 
 These are real simulator scenarios that are still tied to Rust harness details.

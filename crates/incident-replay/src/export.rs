@@ -37,10 +37,26 @@ pub struct Pagination {
     pub has_more: bool,
 }
 
-/// One forensic audit event. Only its `kind` matters to the classifier.
+/// One forensic audit event. The classifier reads only `kind`; extraction also
+/// uses the event-level `account_ref` (the acting account).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditEvent {
+    #[serde(default)]
+    pub account_ref: Option<String>,
     pub kind: EventKind,
+}
+
+impl AuditEvent {
+    /// The `msg_id` this event reports publishing, if it is a publish event.
+    /// Paired with `account_ref`, it attributes a message to its publisher.
+    pub fn published_msg_id(&self) -> Option<&str> {
+        match &self.kind {
+            EventKind::PublishOutcome { msg_id } | EventKind::PublishAttempt { msg_id } => {
+                msg_id.as_deref()
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The event kinds the classifier reasons about. Every other kind maps to
@@ -48,8 +64,16 @@ pub struct AuditEvent {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
-    /// `ForkRecoveryManager` resolved a same-epoch commit race.
-    ForkResolution { winner: ForkWinner },
+    /// `ForkRecoveryManager` resolved a same-epoch commit race. `source_epoch`
+    /// is the epoch the branches forked *from*; the racers land at
+    /// `source_epoch + 1`. `invalidated_msg_id` is the losing branch's commit.
+    ForkResolution {
+        winner: ForkWinner,
+        #[serde(default)]
+        source_epoch: Option<u64>,
+        #[serde(default)]
+        invalidated_msg_id: Option<String>,
+    },
     /// `select_canonical_branch` evaluated a candidate set. Contested iff a
     /// branch actually lost (or more than one candidate was in play).
     ConvergenceDecision {
@@ -57,6 +81,27 @@ pub enum EventKind {
         candidates: Vec<serde_json::Value>,
         #[serde(default)]
         losing_branch_ids: Vec<String>,
+    },
+    /// A commit changed canonical group state (membership, admin set, profile).
+    /// Extraction reads the actor and epoch to find the committers at the
+    /// contested tip and the kind of commit they raced with.
+    GroupStateChanged {
+        #[serde(default)]
+        epoch: Option<u64>,
+        #[serde(default)]
+        change_kind: Option<String>,
+        #[serde(default)]
+        actor_member_ref: Option<String>,
+    },
+    /// A publish attempt/outcome carrying the `msg_id`; with the event-level
+    /// `account_ref` this attributes a message to the account that published it.
+    PublishOutcome {
+        #[serde(default)]
+        msg_id: Option<String>,
+    },
+    PublishAttempt {
+        #[serde(default)]
+        msg_id: Option<String>,
     },
     #[serde(other)]
     Other,
@@ -89,7 +134,8 @@ impl EventKind {
         matches!(
             self,
             EventKind::ForkResolution {
-                winner: ForkWinner::MissingSnapshot
+                winner: ForkWinner::MissingSnapshot,
+                ..
             }
         )
     }
