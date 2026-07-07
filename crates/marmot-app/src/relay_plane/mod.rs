@@ -154,7 +154,11 @@ impl MarmotRelayPlane {
         allow_loopback: bool,
         connection: &RelayConnectionMode,
     ) -> Self {
-        Self::from_sdk(Some(subscription_rebuild_lookback), allow_loopback, connection)
+        Self::from_sdk(
+            Some(subscription_rebuild_lookback),
+            allow_loopback,
+            connection,
+        )
     }
 
     pub fn full_history() -> Self {
