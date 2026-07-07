@@ -45,8 +45,8 @@ pub use app_components::{
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_components_list,
-    decode_nostr_routing_v1, decode_quic_varint, default_group_components,
+    NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, SAFE_AAD_COMPONENT_ID,
+    decode_components_list, decode_nostr_routing_v1, decode_quic_varint, default_group_components,
     encode_component_vectors, encode_components_list, encode_nostr_routing_v1,
 };
 pub use app_event::{

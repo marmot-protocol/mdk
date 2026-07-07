@@ -7,9 +7,9 @@ use cgka_traits::app_components::{
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, decode_components_list, decode_encrypted_media_policy_v1,
-    decode_group_avatar_url_v1, decode_nostr_routing_v1, decode_quic_varint,
-    encode_component_vectors, encode_components_list,
+    NostrRoutingV1, SAFE_AAD_COMPONENT_ID, decode_components_list,
+    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
+    decode_quic_varint, encode_component_vectors, encode_components_list,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
@@ -32,9 +32,15 @@ pub(crate) fn leaf_app_components_extension(
     supported: &AppComponentSet,
 ) -> Result<Extension, EngineError> {
     let mut dict = AppDataDictionary::new();
+    let mut advertised = supported.ids.clone();
+    advertised.insert(APP_COMPONENTS_COMPONENT_ID);
     dict.insert(
         APP_COMPONENTS_COMPONENT_ID,
-        encode_components_list(&supported.ids),
+        encode_components_list(&advertised),
+    );
+    dict.insert(
+        SAFE_AAD_COMPONENT_ID,
+        encode_components_list(&BTreeSet::new()),
     );
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
@@ -674,6 +680,7 @@ fn app_component_bytes(mls_group: &MlsGroup, component_id: AppComponentId) -> Op
 fn validate_initial_app_component(component: &AppComponentData) -> Result<(), EngineError> {
     match component.component_id {
         APP_COMPONENTS_COMPONENT_ID
+        | SAFE_AAD_COMPONENT_ID
         | GROUP_PROFILE_COMPONENT_ID
         | GROUP_ADMIN_POLICY_COMPONENT_ID => Err(EngineError::Other(
             "group creation request cannot override engine-owned app components".into(),
@@ -697,6 +704,9 @@ pub(crate) fn validate_app_component_update(
         APP_COMPONENTS_COMPONENT_ID => decode_components_list(&component.data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid app_components component: {e}"))),
+        SAFE_AAD_COMPONENT_ID => Err(EngineError::Other(
+            "safe_aad group-component state is not supported yet".into(),
+        )),
         GROUP_PROFILE_COMPONENT_ID => decode_group_profile(&component.data).map(|_| ()),
         GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(&component.data).map(|_| ()),
         NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
@@ -718,6 +728,11 @@ pub(crate) fn validate_app_component_remove(
     if component_id == APP_COMPONENTS_COMPONENT_ID {
         return Err(EngineError::Other(
             "app_components component cannot be removed".into(),
+        ));
+    }
+    if component_id == SAFE_AAD_COMPONENT_ID {
+        return Err(EngineError::Other(
+            "safe_aad group-component state is not supported yet".into(),
         ));
     }
     if required_app_components_of_group(mls_group)?.contains(component_id) {
@@ -860,6 +875,7 @@ fn decode_var_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgka_traits::app_components::default_group_components;
 
     /// Build the group-creation `app_data_dictionary` for `required` with no
     /// initial component bytes, then assert that every entry the engine writes
@@ -912,6 +928,73 @@ mod tests {
         .into_iter()
         .collect();
         assert_creation_state_self_validates(AppComponentSet::from(ids));
+    }
+
+    #[test]
+    fn leaf_dictionary_advertises_app_components_and_understands_safe_aad() {
+        let mut supported = AppComponentSet::from(default_group_components());
+        supported.insert(NOSTR_ROUTING_COMPONENT_ID);
+
+        let ext = leaf_app_components_extension(&supported).unwrap();
+        let Extension::AppDataDictionary(ext) = ext else {
+            panic!("expected an AppDataDictionary extension");
+        };
+        let dictionary = ext.dictionary();
+
+        let advertised = decode_components_list(
+            dictionary
+                .get(&APP_COMPONENTS_COMPONENT_ID)
+                .expect("leaf has app_components entry"),
+        )
+        .unwrap();
+        assert!(advertised.contains(&APP_COMPONENTS_COMPONENT_ID));
+        assert!(advertised.contains(&GROUP_PROFILE_COMPONENT_ID));
+        assert!(advertised.contains(&GROUP_ADMIN_POLICY_COMPONENT_ID));
+        assert!(advertised.contains(&NOSTR_ROUTING_COMPONENT_ID));
+
+        let safe_aad = decode_components_list(
+            dictionary
+                .get(&SAFE_AAD_COMPONENT_ID)
+                .expect("leaf has safe_aad support entry"),
+        )
+        .unwrap();
+        assert!(
+            safe_aad.is_empty(),
+            "MDK understands safe_aad but does not yet use SafeAAD components"
+        );
+    }
+
+    #[test]
+    fn group_creation_dictionary_does_not_enable_safe_aad_framing() {
+        let required = AppComponentSet::from(default_group_components());
+        let initial = InitialComponentState {
+            name: "name".to_string(),
+            description: "desc".to_string(),
+            admins: vec![[7u8; 32]],
+            app_components: Vec::new(),
+        };
+
+        let ext = app_data_dictionary_extension_for_group(&required, &initial)
+            .expect("creation dictionary should build");
+        let Extension::AppDataDictionary(ext) = ext else {
+            panic!("expected an AppDataDictionary extension");
+        };
+
+        assert!(
+            ext.dictionary().get(&SAFE_AAD_COMPONENT_ID).is_none(),
+            "a GroupContext safe_aad entry would require SafeAAD-framed authenticated_data"
+        );
+    }
+
+    #[test]
+    fn safe_aad_group_state_is_rejected_until_aad_framing_exists() {
+        let component = AppComponentData {
+            component_id: SAFE_AAD_COMPONENT_ID,
+            data: encode_components_list(&BTreeSet::new()),
+        };
+
+        assert!(validate_initial_app_component(&component).is_err());
+        assert!(validate_app_component_update(&component).is_err());
     }
 
     #[test]

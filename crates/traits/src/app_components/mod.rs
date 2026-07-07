@@ -52,6 +52,9 @@ pub type AppComponentId = u16;
 /// Upstream MLS extensions draft component that carries supported/required
 /// application component ids in an `AppDataDictionary` entry.
 pub const APP_COMPONENTS_COMPONENT_ID: AppComponentId = 0x0001;
+/// Upstream MLS extensions draft component that advertises SafeAAD component
+/// usage in LeafNodes and requires SafeAAD framing in GroupContexts.
+pub const SAFE_AAD_COMPONENT_ID: AppComponentId = 0x0002;
 
 pub const GROUP_PROFILE_COMPONENT_ID: AppComponentId = 0x8001;
 pub const GROUP_BLOSSOM_IMAGE_COMPONENT_ID: AppComponentId = 0x8002;
