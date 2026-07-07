@@ -26,14 +26,13 @@ Prerequisites:
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | bash
 ```
 
 The installer puts `wn-agent` in `~/.local/bin`, downloads and verifies the plugin
 tarball, runs `openclaw plugins install`, enables the `marmot` channel, starts a
-same-user `wn-agent` service where supported, bootstraps or reuses
-`~/.marmot-agent`, and patches only `channels.marmot` in OpenClaw config.
+same-user `wn-agent-openclaw` service where supported, bootstraps or reuses
+`~/.marmot-agents/openclaw`, and patches only `channels.marmot` in OpenClaw config.
 Supported platforms match the Hermes installer.
 Set `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`, and `WN_AGENT_VERSION` (or the
 legacy `WN_AGENT_SHA` alias) to install a non-default release asset, matching
@@ -43,19 +42,20 @@ For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
 an `npub` or raw hex public key:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
+
+Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
 
 The installer prints restart guidance for your existing OpenClaw gateway. It
 does not restart OpenClaw automatically. Manual equivalent:
 
 ```sh
-wn-agent --home ~/.marmot-agent \
+wn-agent --home ~/.marmot-agents/openclaw \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
-wn-agent bootstrap --home ~/.marmot-agent --qr
+wn-agent bootstrap --home ~/.marmot-agents/openclaw --label openclaw-agent --qr
 openclaw gateway run
 ```
 
@@ -151,8 +151,8 @@ against a real phone; omit it for the default `block` mode.
 ## Configuration
 
 Configure under `channels.marmot` in the OpenClaw config, or via `MARMOT_*`
-environment variables (config wins). Keys mirror the Hermes plugin so one
-`wn-agent` deployment can serve both gateways:
+environment variables (config wins). Keys mirror the Hermes plugin so an
+advanced shared deployment can point both gateways at one `wn-agent`:
 
 | Key (config) | Env | Default |
 | --- | --- | --- |

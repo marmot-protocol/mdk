@@ -80,33 +80,35 @@ fn production_tracing_calls_are_structured_and_privacy_safe() {
     let repo = workspace_root();
     let mut failures = Vec::new();
 
-    for file in rust_source_files(&repo.join("crates")) {
-        let Ok(contents) = fs::read_to_string(&file) else {
-            continue;
-        };
+    for root in production_source_roots(&repo) {
+        for file in rust_source_files(&root) {
+            let Ok(contents) = fs::read_to_string(&file) else {
+                continue;
+            };
 
-        for invocation in tracing_invocations(&contents) {
-            if !invocation.body.contains("target:") {
-                failures.push(format!(
-                    "{}:{} tracing call is missing an explicit target",
-                    file.display(),
-                    invocation.line
-                ));
-            }
-            if !invocation.body.contains("method =") {
-                failures.push(format!(
-                    "{}:{} tracing call is missing a method field",
-                    file.display(),
-                    invocation.line
-                ));
-            }
-            for token in FORBIDDEN_TRACE_TOKENS {
-                if invocation.body.contains(token) {
+            for invocation in tracing_invocations(&contents) {
+                if !invocation.body.contains("target:") {
                     failures.push(format!(
-                        "{}:{} tracing call contains forbidden token `{token}`",
+                        "{}:{} tracing call is missing an explicit target",
                         file.display(),
                         invocation.line
                     ));
+                }
+                if !invocation.body.contains("method =") {
+                    failures.push(format!(
+                        "{}:{} tracing call is missing a method field",
+                        file.display(),
+                        invocation.line
+                    ));
+                }
+                for token in FORBIDDEN_TRACE_TOKENS {
+                    if invocation.body.contains(token) {
+                        failures.push(format!(
+                            "{}:{} tracing call contains forbidden token `{token}`",
+                            file.display(),
+                            invocation.line
+                        ));
+                    }
                 }
             }
         }
@@ -124,20 +126,22 @@ fn production_tracing_calls_do_not_interpolate_raw_errors() {
     let repo = workspace_root();
     let mut failures = Vec::new();
 
-    for file in rust_source_files(&repo.join("crates")) {
-        let Ok(contents) = fs::read_to_string(&file) else {
-            continue;
-        };
+    for root in production_source_roots(&repo) {
+        for file in rust_source_files(&root) {
+            let Ok(contents) = fs::read_to_string(&file) else {
+                continue;
+            };
 
-        for invocation in tracing_invocations(&contents) {
-            for token in FORBIDDEN_ERROR_INTERPOLATIONS {
-                if invocation.body.contains(token) {
-                    failures.push(format!(
-                        "{}:{} tracing call interpolates a raw error via `{token}`; \
-                         log a privacy-safe error kind instead",
-                        file.display(),
-                        invocation.line
-                    ));
+            for invocation in tracing_invocations(&contents) {
+                for token in FORBIDDEN_ERROR_INTERPOLATIONS {
+                    if invocation.body.contains(token) {
+                        failures.push(format!(
+                            "{}:{} tracing call interpolates a raw error via `{token}`; \
+                             log a privacy-safe error kind instead",
+                            file.display(),
+                            invocation.line
+                        ));
+                    }
                 }
             }
         }
@@ -155,23 +159,25 @@ fn production_library_sources_do_not_write_direct_output() {
     let repo = workspace_root();
     let mut failures = Vec::new();
 
-    for file in rust_source_files(&repo.join("crates")) {
-        if is_cli_binary(&file) {
-            continue;
-        }
+    for root in production_source_roots(&repo) {
+        for file in rust_source_files(&root) {
+            if is_cli_binary(&file) {
+                continue;
+            }
 
-        let Ok(contents) = fs::read_to_string(&file) else {
-            continue;
-        };
+            let Ok(contents) = fs::read_to_string(&file) else {
+                continue;
+            };
 
-        for (index, line) in contents.lines().enumerate() {
-            for output_macro in DIRECT_OUTPUT_MACROS {
-                if line.contains(output_macro) {
-                    failures.push(format!(
-                        "{}:{} production library source writes direct output with `{output_macro}`",
-                        file.display(),
-                        index + 1
-                    ));
+            for (index, line) in contents.lines().enumerate() {
+                for output_macro in DIRECT_OUTPUT_MACROS {
+                    if line.contains(output_macro) {
+                        failures.push(format!(
+                            "{}:{} production library source writes direct output with `{output_macro}`",
+                            file.display(),
+                            index + 1
+                        ));
+                    }
                 }
             }
         }
@@ -205,6 +211,77 @@ fn workspace_root() -> PathBuf {
         .nth(2)
         .expect("conformance crate lives two levels below workspace root")
         .to_path_buf()
+}
+
+fn production_source_roots(repo: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![repo.join("crates")];
+    roots.extend(workspace_integration_source_roots(repo));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn workspace_integration_source_roots(repo: &Path) -> Vec<PathBuf> {
+    let Ok(contents) = fs::read_to_string(repo.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    parse_workspace_members(&contents)
+        .into_iter()
+        .filter(|member| member.starts_with("integrations/"))
+        .map(|member| repo.join(member).join("src"))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn parse_workspace_members(contents: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    let mut in_workspace = false;
+    let mut in_members = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_workspace = trimmed == "[workspace]";
+            in_members = false;
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+
+        if in_members {
+            collect_quoted_strings(trimmed, &mut members);
+            if trimmed.contains(']') {
+                in_members = false;
+            }
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "members" {
+            in_members = true;
+            collect_quoted_strings(value, &mut members);
+            if value.contains(']') {
+                in_members = false;
+            }
+        }
+    }
+
+    members
+}
+
+fn collect_quoted_strings(line: &str, values: &mut Vec<String>) {
+    let mut rest = line;
+    while let Some(start) = rest.find('"') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('"') else {
+            break;
+        };
+        values.push(after_start[..end].to_owned());
+        rest = &after_start[end + 1..];
+    }
 }
 
 fn rust_source_files(root: &Path) -> Vec<PathBuf> {
@@ -274,4 +351,30 @@ fn tracing_invocations(contents: &str) -> Vec<TraceInvocation> {
     }
 
     invocations
+}
+
+#[test]
+fn parse_workspace_members_reads_multiline_workspace_array() {
+    let manifest = r#"
+[package]
+name = "outside"
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/one",
+    "integrations/opencode/marmot",
+]
+
+[profile.release]
+debug = 1
+"#;
+
+    assert_eq!(
+        parse_workspace_members(manifest),
+        vec![
+            "crates/one".to_owned(),
+            "integrations/opencode/marmot".to_owned()
+        ]
+    );
 }

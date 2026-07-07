@@ -94,17 +94,20 @@ source "$default_root/env.sh"
 
 [ -x "$repo_root/scripts/install-hermes-marmot.sh" ]
 installer_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes
 )"
 installer_stdin_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     bash -s -- --dry-run --yes < "$repo_root/scripts/install-hermes-marmot.sh"
 )"
 installer_bad_welcomer_status=0
-WN_AGENT_SHA="9.9.9" \
+env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+    WN_AGENT_SHA="9.9.9" \
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     "$repo_root/scripts/install-hermes-marmot.sh" --dry-run --yes --allow-welcomer not-a-key \
     >/dev/null 2>&1 || installer_bad_welcomer_status=$?
@@ -121,6 +124,22 @@ case "$installer_dry_run" in
     *"wn-agent-v9.9.9-test"* ) ;;
     *) echo "Hermes installer dry-run did not use requested release tag" >&2; exit 1;;
 esac
+case "$installer_dry_run" in
+    *"Marmot home: $HOME/.marmot-agents/hermes"* ) ;;
+    *) echo "Hermes installer dry-run did not use isolated default Marmot home" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"Marmot socket: $HOME/.marmot-agents/hermes/dev/wn-agent.sock"* ) ;;
+    *) echo "Hermes installer dry-run did not derive the socket from the isolated home" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"--label hermes-agent"* ) ;;
+    *) echo "Hermes installer dry-run did not pass the Hermes bootstrap label" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"wn-agent-hermes.service"* | *"org.marmot.wn-agent.hermes.plist"* ) ;;
+    *) echo "Hermes installer dry-run did not use the Hermes-specific service identity" >&2; exit 1;;
+esac
 case "$installer_stdin_dry_run" in
     *"wn-agent-"*"9.9.9.tar.gz"* ) ;;
     *) echo "Hermes installer stdin dry-run did not use WN_AGENT_SHA asset suffix" >&2; exit 1;;
@@ -132,6 +151,14 @@ esac
 case "$installer_stdin_dry_run" in
     *"wn-agent-v9.9.9-test"* ) ;;
     *) echo "Hermes installer stdin dry-run did not use requested release tag" >&2; exit 1;;
+esac
+case "$installer_stdin_dry_run" in
+    *"Marmot home: $HOME/.marmot-agents/hermes"* ) ;;
+    *) echo "Hermes installer stdin dry-run did not use isolated default Marmot home" >&2; exit 1;;
+esac
+case "$installer_stdin_dry_run" in
+    *"--label hermes-agent"* ) ;;
+    *) echo "Hermes installer stdin dry-run did not pass the Hermes bootstrap label" >&2; exit 1;;
 esac
 
 echo "dev script test passed"

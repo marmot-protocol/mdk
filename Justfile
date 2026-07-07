@@ -141,6 +141,12 @@ openclaw-dev-test:
 openclaw-dev-script-test:
     integrations/openclaw/marmot/test/dev-scripts.sh
 
+opencode-installer-test:
+    integrations/opencode/marmot/tests/test_installer.sh
+
+opencode-dev-e2e-connector:
+    cargo test -p wn-opencode --test e2e_connector -- --ignored --nocapture
+
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash
     set -euo pipefail

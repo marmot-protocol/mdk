@@ -351,6 +351,9 @@ if [ "$push" -eq 1 ] && [ "$wait" -eq 1 ]; then
 
     verify_release "$mdk_tag" "v$version - MDK" "$([ "$draft" -eq 1 ] && echo true || echo false)" false 0
     verify_release "$wn_tag" "v$version - wn-agent" "$([ "$draft" -eq 1 ] && echo true || echo false)" true 14
+    if [ "$draft" -eq 0 ]; then
+        verify_release "wn-agent-latest" "Latest WN Agent installers" false true 3
+    fi
     verify_release "$marmotkit_tag" "v$version - MarmotKit" "$([ "$draft" -eq 1 ] && echo true || echo false)" false 4
 elif [ "$push" -eq 1 ]; then
     echo "pushed release tags; artifact workflows will finish asynchronously"

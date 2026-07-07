@@ -52,6 +52,9 @@ Primary implementation areas:
 - `crates/agent-stream-compose` - reusable live-preview stream composition over the QUIC broker publisher.
 - `crates/agent-connector` - local `wn-agent` connector daemon bridging agent control and stream composition.
 - `crates/cli` - CLI app surface plus `wnd` daemon and `wn tui`.
+- `integrations/hermes/marmot` - Hermes gateway plugin for the local `wn-agent` control socket.
+- `integrations/openclaw/marmot` - OpenClaw channel plugin for the local `wn-agent` control socket.
+- `integrations/opencode/marmot` - OpenCode terminal harness for the local `wn-agent` control socket.
 
 Reference and model support:
 

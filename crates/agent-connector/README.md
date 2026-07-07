@@ -4,12 +4,14 @@ This crate ships the `wn-agent` binary: the local White Noise agent connector.
 
 `wn-agent` is the headless Marmot process that lets an agent runtime appear as a normal Marmot member. It owns the
 Marmot account home, MLS state, Nostr relay IO, invite allowlists, durable encrypted sends, and live QUIC preview
-composition. Agent runtimes such as Hermes, and later OpenClaw, stay thin: they run models and tools, then talk to
+composition. Agent runtimes such as Hermes and OpenClaw stay thin: they run models and tools, then talk to
 `wn-agent` through the local agent-control socket.
 
 Hermes is the first supported adapter. OpenClaw is the second: a TypeScript channel plugin at
 [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
-connector.
+connector. `wn-opencode` is a pure Rust harness at
+[`integrations/opencode/marmot`](../../integrations/opencode/marmot) for routing allowed Marmot messages to
+OpenCode.
 
 ## Names
 
@@ -75,25 +77,27 @@ wn-agent --version
 ## Hermes Install
 
 Versioned WN Agent builds publish the `wn-agent` binary, the Hermes Marmot plugin, and an installer script on GitHub
-Releases under `wn-agent-v*` tags. Hermes itself must already be installed.
+Releases under `wn-agent-v*` tags. The `wn-agent-latest` release contains installer scripts that are refreshed to the
+newest WN Agent release. Hermes itself must already be installed.
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | bash
 ```
 
 For repeatable noninteractive setup:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
 
+Use a versioned `wn-agent-v<version>` release URL when you need a pinned install for reproducible testing.
+
 The installer puts `wn-agent` in `~/.local/bin`, extracts the Hermes plugin to `~/.hermes/plugins/marmot`, and enables
-the plugin when the `hermes` launcher is on `PATH`. It also starts a same-user `wn-agent` service where supported,
-bootstraps or reuses `~/.marmot-agent`, and patches only Marmot-specific Hermes config entries so existing connectors
-continue to work.
+the plugin when the `hermes` launcher is on `PATH`. It also starts a same-user connector service where supported,
+bootstraps or reuses `~/.marmot-agents/hermes`, and patches only Marmot-specific Hermes config entries so existing
+connectors continue to work. The default service identity is connector-specific:
+`wn-agent-hermes.service` on Linux or `org.marmot.wn-agent.hermes` on macOS.
 
 Hermes-specific setup, development helpers, and phone-test commands live in
 [`integrations/hermes/marmot/README.md`](../../integrations/hermes/marmot/README.md).
@@ -103,20 +107,41 @@ Hermes-specific setup, development helpers, and phone-test commands live in
 The same WN Agent release publishes the OpenClaw Marmot channel plugin and installer:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | bash
 ```
 
 For repeatable noninteractive setup:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
 
-The OpenClaw installer uses the same `wn-agent` setup path, installs/enables the OpenClaw plugin, and updates only
-`channels.marmot` in OpenClaw config so existing channels continue to work.
+The OpenClaw installer follows the same release flow, but uses its own default connector home and service identity:
+`~/.marmot-agents/openclaw`, `wn-agent-openclaw.service` on Linux, or `org.marmot.wn-agent.openclaw` on macOS. It
+installs/enables the OpenClaw plugin and updates only `channels.marmot` in OpenClaw config so existing channels
+continue to work.
+
+## OpenCode Harness Install
+
+The same WN Agent release publishes the `wn-opencode` harness binary and installer. OpenCode itself must already be
+installed.
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | bash
+```
+
+For repeatable noninteractive setup:
+
+```sh
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
+```
+
+The OpenCode installer creates or reuses the terminal-harness agent home at `~/.marmot-agents/harnesses`, writes a
+private `wn-opencode.env`, and starts a same-user `wn-opencode` service where supported. The backing `wn-agent` service
+uses `wn-agent-harnesses.service` on Linux or `org.marmot.wn-agent.harnesses` on macOS. `WN_OPENCODE_MAX_REPLY_BYTES`
+defaults to 30000 bytes per Marmot reply chunk.
 
 ## Cutting A WN Agent Release
 
@@ -186,6 +211,7 @@ Use the narrow checks first:
 cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 bash scripts/install-hermes-marmot.sh --dry-run
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
 integrations/hermes/marmot/tests/test_dev_scripts.sh
 ```
 

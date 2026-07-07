@@ -14,8 +14,8 @@ Current tracks:
 - Whole-workspace releases use tags like `v0.9.0`. These identify a versioned source snapshot of the protocol draft,
   Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate. MDK
   `0.9.0` is the unifying workspace bump above the previous `0.8.0` release.
-- WN Agent releases use tags like `wn-agent-v0.9.0`. These publish the `wn-agent` connector binary plus adapter
-  install assets, starting with the Hermes Marmot plugin and installer.
+- WN Agent releases use tags like `wn-agent-v0.9.0`. These publish the `wn-agent` connector binary plus adapter and
+  harness install assets, including Hermes, OpenClaw, and OpenCode.
 - MarmotKit binding releases use tags like `marmotkit-v0.9.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
 
@@ -177,8 +177,9 @@ GitHub-generated source archives are the downloadable artifacts.
 ## WN Agent Release
 
 Use this for the White Noise agent connector entry point. The release publishes `wn-agent` binaries for supported
-platforms plus adapter install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, and the OpenClaw Marmot
-channel plugin + `install-openclaw-marmot.sh`. The track can grow other agent-system assets later.
+platforms plus adapter/harness install assets: the Hermes Marmot plugin + `install-hermes-marmot.sh`, the OpenClaw
+Marmot channel plugin + `install-openclaw-marmot.sh`, and the `wn-opencode` harness +
+`install-opencode-marmot.sh`. The track can grow other agent-system assets later.
 
 The workflow lives at:
 
@@ -194,8 +195,10 @@ Before a WN Agent release, run the normal preflight plus:
 
 ```sh
 cargo test -p agent-connector
+cargo test -p wn-opencode
 bash scripts/install-hermes-marmot.sh --dry-run --yes
 bash scripts/install-openclaw-marmot.sh --dry-run --yes
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
 ```
 
 Cut the release tag from the current `origin/master` commit:
@@ -226,30 +229,47 @@ The release job creates these assets:
 - `wn-agent-darwin-aarch64-<version>.tar.gz.sha256`
 - `wn-agent-darwin-x86_64-<version>.tar.gz`
 - `wn-agent-darwin-x86_64-<version>.tar.gz.sha256`
+- `wn-opencode-linux-x86_64-<version>.tar.gz`
+- `wn-opencode-linux-x86_64-<version>.tar.gz.sha256`
+- `wn-opencode-linux-aarch64-<version>.tar.gz`
+- `wn-opencode-linux-aarch64-<version>.tar.gz.sha256`
+- `wn-opencode-darwin-aarch64-<version>.tar.gz`
+- `wn-opencode-darwin-aarch64-<version>.tar.gz.sha256`
+- `wn-opencode-darwin-x86_64-<version>.tar.gz`
+- `wn-opencode-darwin-x86_64-<version>.tar.gz.sha256`
 - `hermes-marmot-plugin-<version>.tar.gz`
 - `hermes-marmot-plugin-<version>.tar.gz.sha256`
 - `openclaw-marmot-plugin-<version>.tgz`
 - `openclaw-marmot-plugin-<version>.tgz.sha256`
 - `install-hermes-marmot.sh`
 - `install-openclaw-marmot.sh`
+- `install-opencode-marmot.sh`
 
-Each plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and workspace
-version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
+Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
+workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
 
 The installer assets are generated during the release and default to their own `wn-agent-v<version>` release tag and
-`<version>` asset suffix. A release install looks like:
+`<version>` asset suffix. When a non-draft WN Agent release completes, the workflow also refreshes a
+`wn-agent-latest` prerelease containing only installer scripts; those scripts are baked to the newest immutable
+`wn-agent-v<version>` assets. A latest-by-default install looks like:
 
 ```sh
 # Hermes gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-hermes-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
 # OpenClaw gateway
-curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-openclaw-marmot.sh | bash
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
+# OpenCode terminal harness
+curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
 ```
 
-These one-liners perform full setup by default: they install `wn-agent`, install/enable the matching gateway plugin,
-start a same-user `wn-agent` service where supported, bootstrap or reuse the default Marmot agent home, and patch only
-the Marmot-specific gateway config. Use `--no-service`, `--no-start-wn-agent`, `--no-configure-hermes`, or
-`--no-configure-openclaw` when you need a partial/manual install.
+Use the versioned `wn-agent-v<version>` release URLs instead when you need a pinned install for repeatable testing or
+bug reports.
+
+These one-liners perform full setup by default: they install `wn-agent`, install/enable the matching gateway plugin or
+harness binary, start same-user services where supported, bootstrap or reuse the default connector-specific Marmot
+agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
+`--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
+partial/manual install.
 
 ## MarmotKit Binding Release
 
