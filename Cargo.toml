@@ -20,6 +20,7 @@ members = [
     "crates/marmot-app",
     "crates/marmot-uniffi",
     "crates/cli",
+    "integrations/opencode/marmot",
 ]
 
 [workspace.package]

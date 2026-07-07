@@ -9,7 +9,9 @@ composition. Agent runtimes such as Hermes, and later OpenClaw, stay thin: they 
 
 Hermes is the first supported adapter. OpenClaw is the second: a TypeScript channel plugin at
 [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot) that speaks the same agent-control protocol to this
-connector.
+connector. `wn-opencode` is a pure Rust harness at
+[`integrations/opencode/marmot`](../../integrations/opencode/marmot) for routing allowed Marmot messages to
+`opencode`.
 
 ## Names
 
@@ -118,6 +120,27 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v$
 The OpenClaw installer uses the same `wn-agent` setup path, installs/enables the OpenClaw plugin, and updates only
 `channels.marmot` in OpenClaw config so existing channels continue to work.
 
+## opencode Harness Install
+
+The same WN Agent release publishes the `wn-opencode` harness binary and installer. opencode itself must already be
+installed.
+
+```sh
+WN_AGENT_VERSION=0.9.2
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-opencode-marmot.sh" | bash
+```
+
+For repeatable noninteractive setup:
+
+```sh
+WN_AGENT_VERSION=0.9.2
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-opencode-marmot.sh" | \
+  bash -s -- --yes --allow-welcomer npub1...
+```
+
+The opencode installer uses the same `wn-agent` setup path, writes a private `wn-opencode.env`, and starts a same-user
+`wn-opencode` service where supported. `WN_OPENCODE_MAX_REPLY_BYTES` defaults to 30000 bytes per Marmot reply chunk.
+
 ## Cutting A WN Agent Release
 
 After the release commit is merged to `master`, cut a WN Agent release tag with:
@@ -186,6 +209,7 @@ Use the narrow checks first:
 cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 bash scripts/install-hermes-marmot.sh --dry-run
+bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$(printf '11%.0s' {1..32})" --opencode-bin /bin/echo
 integrations/hermes/marmot/tests/test_dev_scripts.sh
 ```
 

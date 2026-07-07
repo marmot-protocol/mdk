@@ -8,6 +8,8 @@ on:
       - integrations/hermes/marmot/**
       - scripts/install-openclaw-marmot.sh
       - integrations/openclaw/marmot/**
+      - scripts/install-opencode-marmot.sh
+      - integrations/opencode/marmot/**
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
@@ -45,7 +47,7 @@ env:
 
 jobs:
   build:
-    name: Build wn-agent (${{ matrix.target }})
+    name: Build wn-agent and wn-opencode (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -89,6 +91,12 @@ jobs:
 
       - name: Smoke test wn-agent
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help
+
+      - name: Build wn-opencode
+        run: cargo build --locked --release -p wn-opencode --bin wn-opencode --target "${{ matrix.rust_target }}"
+
+      - name: Smoke test wn-opencode
+        run: ./target/${{ matrix.rust_target }}/release/wn-opencode --help
 
       - name: Package wn-agent bundle
         shell: bash
@@ -153,6 +161,71 @@ jobs:
         with:
           name: wn-agent-${{ matrix.target }}
           path: dist/wn-agent-${{ matrix.target }}/*
+          if-no-files-found: error
+
+      - name: Package wn-opencode bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          rust_target="${{ matrix.rust_target }}"
+          sha_short="${GITHUB_SHA::12}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          release_tag=""
+          artifact_version="$sha_short"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            release_tag="$GITHUB_REF_NAME"
+            if [[ ! "$release_tag" =~ ^wn-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: wn-agent releases must use a version tag like wn-agent-v0.1.0" >&2
+              exit 1
+            fi
+            artifact_version="${release_tag#wn-agent-v}"
+            if [ "$artifact_version" != "$workspace_version" ]; then
+              echo "error: wn-agent release version $artifact_version does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
+          fi
+          lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          stage_parent="$RUNNER_TEMP/wn-opencode-stage"
+          bundle_dir="$stage_parent/wn-opencode-$target"
+          asset="$RUNNER_TEMP/wn-opencode-$target-$artifact_version.tar.gz"
+
+          rm -rf "$stage_parent" "$asset" "$asset.sha256"
+          mkdir -p "$bundle_dir"
+          install -m 0755 "target/$rust_target/release/wn-opencode" "$bundle_dir/wn-opencode"
+
+          cat > "$bundle_dir/manifest.json" <<EOF
+          {
+            "name": "wn-opencode",
+            "target": "$target",
+            "rust_target": "$rust_target",
+            "release_tag": "$release_tag",
+            "artifact_version": "$artifact_version",
+            "source_sha": "$GITHUB_SHA",
+            "workspace_version": "$workspace_version",
+            "cargo_lock_sha256": "$lock_sha",
+            "rustc": "$(rustc --version)",
+            "cargo": "$(cargo --version)",
+            "contents": [
+              "wn-opencode",
+              "manifest.json"
+            ]
+          }
+          EOF
+
+          (
+            cd "$stage_parent"
+            tar -czf "$asset" "wn-opencode-$target"
+          )
+          shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
+          mkdir -p "dist/wn-opencode-$target"
+          cp "$asset" "$asset.sha256" "dist/wn-opencode-$target/"
+
+      - name: Upload wn-opencode bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wn-opencode-${{ matrix.target }}
+          path: dist/wn-opencode-${{ matrix.target }}/*
           if-no-files-found: error
 
   plugin:
@@ -292,7 +365,11 @@ jobs:
             ( cd integrations/openclaw/marmot && npm pkg set version="$artifact_version" )
           fi
           ( cd integrations/openclaw/marmot && pnpm pack --pack-destination "$packed_dir" )
-          packed="$(ls "$packed_dir"/*.tgz | head -n 1)"
+          packed="$(find "$packed_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          if [ -z "$packed" ]; then
+            echo "error: pnpm pack did not produce a tarball" >&2
+            exit 1
+          fi
           asset="$RUNNER_TEMP/openclaw-marmot-plugin-$artifact_version.tgz"
           mv "$packed" "$asset"
           shasum -a 256 "$asset" | awk -v name="$(basename "$asset")" '{print $1 "  " name}' > "$asset.sha256"
@@ -331,11 +408,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/plugin
+          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-x86_64 --dir dist/linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-aarch64 --dir dist/linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-aarch64 --dir dist/darwin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-x86_64 --dir dist/darwin-intel
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-linux-x86_64 --dir dist/opencode-linux
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-linux-aarch64 --dir dist/opencode-linux-arm
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-darwin-aarch64 --dir dist/opencode-darwin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-opencode-darwin-x86_64 --dir dist/opencode-darwin-intel
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name hermes-marmot-plugin --dir dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name openclaw-marmot-plugin --dir dist/plugin
 
@@ -366,6 +447,11 @@ jobs:
             -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
             scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
           chmod 0755 dist/install/install-openclaw-marmot.sh
+          sed \
+            -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
+            -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
+            scripts/install-opencode-marmot.sh > dist/install/install-opencode-marmot.sh
+          chmod 0755 dist/install/install-opencode-marmot.sh
 
       - name: Create or update wn-agent release
         shell: bash
@@ -383,14 +469,17 @@ jobs:
 
           \`\`\`sh
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-hermes-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-opencode-marmot.sh | bash
           \`\`\`
 
           Assets:
           - \`wn-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
+          - \`wn-opencode-<platform>-$version.tar.gz\`: opencode harness binary bundle.
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
           - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
+          - \`install-opencode-marmot.sh\`: installer for testers with opencode already installed.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -404,12 +493,21 @@ jobs:
             dist/darwin/wn-agent-darwin-aarch64-"$version".tar.gz.sha256
             dist/darwin-intel/wn-agent-darwin-x86_64-"$version".tar.gz
             dist/darwin-intel/wn-agent-darwin-x86_64-"$version".tar.gz.sha256
+            dist/opencode-linux/wn-opencode-linux-x86_64-"$version".tar.gz
+            dist/opencode-linux/wn-opencode-linux-x86_64-"$version".tar.gz.sha256
+            dist/opencode-linux-arm/wn-opencode-linux-aarch64-"$version".tar.gz
+            dist/opencode-linux-arm/wn-opencode-linux-aarch64-"$version".tar.gz.sha256
+            dist/opencode-darwin/wn-opencode-darwin-aarch64-"$version".tar.gz
+            dist/opencode-darwin/wn-opencode-darwin-aarch64-"$version".tar.gz.sha256
+            dist/opencode-darwin-intel/wn-opencode-darwin-x86_64-"$version".tar.gz
+            dist/opencode-darwin-intel/wn-opencode-darwin-x86_64-"$version".tar.gz.sha256
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz.sha256
             dist/plugin/openclaw-marmot-plugin-"$version".tgz
             dist/plugin/openclaw-marmot-plugin-"$version".tgz.sha256
             dist/install/install-hermes-marmot.sh
             dist/install/install-openclaw-marmot.sh
+            dist/install/install-opencode-marmot.sh
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
