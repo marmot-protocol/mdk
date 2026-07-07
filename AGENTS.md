@@ -46,6 +46,7 @@ The canonical protocol specification lives in
 | Agent control protocol DTOs / framing | `crates/agent-control/AGENTS.md` |
 | Agent stream composition | `crates/agent-stream-compose/AGENTS.md` |
 | `wn-agent` connector daemon | `crates/agent-connector/AGENTS.md` |
+| Host integrations / connector coexistence | `integrations/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
