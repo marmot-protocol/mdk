@@ -9,30 +9,34 @@ allow_hex="$(printf '11%.0s' {1..32})"
 bash -n "$installer"
 
 installer_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    WN_OPENCODE_BIN="/bin/echo" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_OPENCODE_BIN="/bin/echo" \
     "$installer" --dry-run --yes --no-service --allow-welcomer "$allow_hex"
 )"
 
 installer_service_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    WN_OPENCODE_BIN="/bin/echo" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_OPENCODE_BIN="/bin/echo" \
     "$installer" --dry-run --yes --allow-welcomer "$allow_hex"
 )"
 
 installer_no_start_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    WN_OPENCODE_BIN="/bin/echo" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_OPENCODE_BIN="/bin/echo" \
     "$installer" --dry-run --yes --no-start-wn-opencode --allow-welcomer "$allow_hex"
 )"
 
 installer_stdin_dry_run="$(
-    WN_AGENT_SHA="9.9.9" \
-    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
-    WN_OPENCODE_BIN="/bin/echo" \
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="9.9.9" \
+        MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+        WN_OPENCODE_BIN="/bin/echo" \
     bash -s -- --dry-run --yes --no-service --allow-welcomer "$allow_hex" < "$installer"
 )"
 
@@ -44,14 +48,16 @@ installer_custom_socket_dry_run="$(
 )"
 
 missing_allowlist_status=0
-WN_AGENT_SHA="9.9.9" \
+env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+    WN_AGENT_SHA="9.9.9" \
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     WN_OPENCODE_BIN="/bin/echo" \
     "$installer" --dry-run --yes --no-service >/dev/null 2>&1 || missing_allowlist_status=$?
 [ "$missing_allowlist_status" -ne 0 ]
 
 bad_allowlist_status=0
-WN_AGENT_SHA="9.9.9" \
+env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+    WN_AGENT_SHA="9.9.9" \
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
     WN_OPENCODE_BIN="/bin/echo" \
     "$installer" --dry-run --yes --no-service --allow-welcomer not-a-key \
@@ -74,9 +80,25 @@ case "$installer_dry_run" in
     *"bootstrap"*"--allow-welcomer"* ) ;;
     *) echo "opencode installer dry-run did not bootstrap with allowlist" >&2; exit 1;;
 esac
+case "$installer_dry_run" in
+    *"Terminal harness agent:"*"home: $HOME/.marmot-agents/harnesses"* ) ;;
+    *) echo "opencode installer dry-run did not use terminal harness Marmot home" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"--socket $HOME/.marmot-agents/harnesses/dev/wn-agent.sock"* ) ;;
+    *) echo "opencode installer dry-run did not derive the terminal harness socket" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"--label terminal-harness-agent"* ) ;;
+    *) echo "opencode installer dry-run did not pass the terminal harness bootstrap label" >&2; exit 1;;
+esac
 case "$installer_stdin_dry_run" in
     *"wn-opencode-"*"9.9.9.tar.gz"* ) ;;
     *) echo "opencode installer stdin dry-run did not use expected wn-opencode asset" >&2; exit 1;;
+esac
+case "$installer_stdin_dry_run" in
+    *"home: $HOME/.marmot-agents/harnesses"* ) ;;
+    *) echo "opencode installer stdin dry-run did not use terminal harness Marmot home" >&2; exit 1;;
 esac
 case "$installer_custom_socket_dry_run" in
     *"--socket /tmp/custom-wn-agent.sock"* ) ;;
@@ -93,14 +115,14 @@ case "$installer_service_dry_run" in
     *) echo "opencode installer service dry-run did not write env file" >&2; exit 1;;
 esac
 case "$installer_service_dry_run" in
-    *"would require opencode binary: /bin/echo"* ) ;;
-    *) echo "opencode installer service dry-run did not validate opencode binary" >&2; exit 1;;
+    *"would require OpenCode binary: /bin/echo"* ) ;;
+    *) echo "opencode installer service dry-run did not validate OpenCode binary" >&2; exit 1;;
 esac
 case "$(uname -s)" in
     Darwin)
         case "$installer_service_dry_run" in
-            *"would install LaunchAgent"*"org.marmot.wn-agent.plist"* ) ;;
-            *) echo "opencode installer service dry-run did not plan wn-agent LaunchAgent" >&2; exit 1;;
+            *"would install LaunchAgent"*"org.marmot.wn-agent.harnesses.plist"* ) ;;
+            *) echo "opencode installer service dry-run did not plan terminal harness wn-agent LaunchAgent" >&2; exit 1;;
         esac
         case "$installer_service_dry_run" in
             *"would install LaunchAgent"*"org.marmot.wn-opencode.plist"* ) ;;
@@ -109,8 +131,8 @@ case "$(uname -s)" in
         ;;
     Linux)
         case "$installer_service_dry_run" in
-            *"would install systemd user unit"*"wn-agent.service"* ) ;;
-            *) echo "opencode installer service dry-run did not plan wn-agent systemd unit" >&2; exit 1;;
+            *"would install systemd user unit"*"wn-agent-harnesses.service"* ) ;;
+            *) echo "opencode installer service dry-run did not plan terminal harness wn-agent systemd unit" >&2; exit 1;;
         esac
         case "$installer_service_dry_run" in
             *"would install systemd user unit"*"wn-opencode.service"* ) ;;

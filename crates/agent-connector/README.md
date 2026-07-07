@@ -141,9 +141,10 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v$
   bash -s -- --yes --allow-welcomer npub1...
 ```
 
-The OpenCode installer uses the current harness `wn-agent` setup path, writes a private `wn-opencode.env`, and starts
-a same-user `wn-opencode` service where supported. `WN_OPENCODE_MAX_REPLY_BYTES` defaults to 30000 bytes per Marmot
-reply chunk.
+The OpenCode installer creates or reuses the terminal-harness agent home at `~/.marmot-agents/harnesses`, writes a
+private `wn-opencode.env`, and starts a same-user `wn-opencode` service where supported. The backing `wn-agent` service
+uses `wn-agent-harnesses.service` on Linux or `org.marmot.wn-agent.harnesses` on macOS. `WN_OPENCODE_MAX_REPLY_BYTES`
+defaults to 30000 bytes per Marmot reply chunk.
 
 ## Cutting A WN Agent Release
 

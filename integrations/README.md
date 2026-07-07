@@ -30,12 +30,13 @@ per connector:
 | --- | --- | --- |
 | Hermes | `$HOME/.marmot-agents/hermes` | `wn-agent-hermes.service` / `org.marmot.wn-agent.hermes` |
 | OpenClaw | `$HOME/.marmot-agents/openclaw` | `wn-agent-openclaw.service` / `org.marmot.wn-agent.openclaw` |
-| OpenCode | `$HOME/.marmot-agent` | `wn-agent.service` plus `wn-opencode.service` |
+| Terminal harnesses | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` |
 
 Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
 uses the public relay defaults shared with the phone app pilot setup. The
-OpenCode harness still uses the legacy `~/.marmot-agent` home while the terminal
-harness model is being generalized.
+terminal-harness home currently runs OpenCode through `wn-opencode`; future
+terminal harnesses can share this same Marmot identity and route by harness-level
+commands.
 
 Hermes and OpenClaw install or patch their host-runtime plugin configuration and
 then print restart guidance for the existing gateway. They do not restart the
@@ -46,10 +47,10 @@ plugin loaded by an existing gateway.
 ## Identity Model
 
 The default topology creates or reuses one Marmot account per connector home,
-which means Hermes, OpenClaw, and OpenCode present as separate Nostr identities
-when installed with default options. This matches how users reason about them:
-Hermes is one chat agent, OpenClaw is another, and the terminal harness is
-another.
+which means Hermes, OpenClaw, and the terminal-harness agent present as separate
+Nostr identities when installed with default options. This matches how users
+reason about them: Hermes is one chat agent, OpenClaw is another, and the
+terminal harness is another.
 
 Within each home, `wn-agent bootstrap` lists local-signing accounts and reuses one
 when selection is unambiguous. If no local account exists, bootstrap creates one.
@@ -62,8 +63,9 @@ The installers persist the selected account into connector-specific config:
 - OpenClaw uses `channels.marmot.accountIdHex` or `MARMOT_ACCOUNT_ID_HEX`.
 - `wn-opencode` uses `WN_OPENCODE_ACCOUNT_ID_HEX`.
 
-So installing Hermes, OpenClaw, and OpenCode on one machine with default options
-creates distinct agent identities and distinct chat/group memberships.
+So installing Hermes, OpenClaw, and the OpenCode-backed terminal harness on one
+machine with default options creates distinct agent identities and distinct
+chat/group memberships.
 
 ## What Is Shared
 
@@ -145,10 +147,10 @@ several integrations:
 - separate host-runtime homes such as `HERMES_HOME` and `OPENCLAW_HOME` if the
   gateway runtimes themselves should stay isolated.
 
-The current Hermes and OpenClaw release installers are optimized for isolated
-defaults. They also expose `MARMOT_HOME`, `MARMOT_AGENT_SOCKET`,
-`MARMOT_AGENT_SERVICE_NAME`, and `MARMOT_AGENT_LAUNCHD_LABEL` overrides for
-advanced layouts.
+The current Hermes, OpenClaw, and terminal-harness release installers are
+optimized for isolated defaults. They also expose `MARMOT_HOME`,
+`MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_SERVICE_NAME`, and
+`MARMOT_AGENT_LAUNCHD_LABEL` overrides for advanced layouts.
 
 If `wn-agent` and a host gateway run as different local users, keep the socket
 Unix-domain only and use the existing socket mode plus bearer-token options:

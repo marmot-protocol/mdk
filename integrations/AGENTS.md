@@ -34,10 +34,10 @@ deletes, invite policy, and local storage.
   or local sensitive paths.
 - Preserve host-runtime configuration outside the Marmot section. Installers and
   setup scripts should patch only the Marmot plugin/channel entries they own.
-- Default Hermes and OpenClaw release installs use connector-specific
-  `wn-agent` homes, sockets, services, bootstrap labels, and Marmot/Nostr
-  identities. Shared-account deployments are opt-in and must be documented
-  alongside the required service/socket overrides.
+- Default Hermes, OpenClaw, and terminal-harness release installs use
+  connector-specific `wn-agent` homes, sockets, services, bootstrap labels, and
+  Marmot/Nostr identities. Shared-account deployments are opt-in and must be
+  documented alongside the required service/socket overrides.
 
 ## Gateway Versus Harness
 
@@ -57,10 +57,10 @@ idempotent sends, installer safety, and privacy-safe diagnostics.
 
 ## Coexistence Model
 
-Multiple integrations can run on the same machine. The default Hermes and
-OpenClaw installers give each connector its own `wn-agent` process, local home,
-socket, service identity, and Marmot/Nostr identity, so their chats are isolated
-from each other.
+Multiple integrations can run on the same machine. The default Hermes,
+OpenClaw, and terminal-harness installers give each connector its own
+`wn-agent` process, local home, socket, service identity, and Marmot/Nostr
+identity, so their chats are isolated from each other.
 
 Multiple integrations may also be configured to connect to the same `wn-agent`
 socket. The socket supports multiple clients and `SubscribeInbound` streams.
@@ -78,8 +78,8 @@ defaults conservatively:
 
 When changing activation or allowlist semantics, reason about both default
 isolated installs and explicit shared-account installs: Hermes, OpenClaw, and
-OpenCode may all be installed on the same host, and advanced operators can point
-them at the same account and group stream.
+terminal harnesses may all be installed on the same host, and advanced operators
+can point them at the same account and group stream.
 
 ## Allowlists
 
@@ -115,10 +115,12 @@ Installer expectations:
   guidance instead.
 - Make dry-runs useful enough to validate release-asset names and config intent.
 
-The default Hermes and OpenClaw service names are connector-specific
+The default Hermes, OpenClaw, and terminal-harness service names are
+connector-specific
 (`wn-agent-hermes.service`, `wn-agent-openclaw.service`,
-`org.marmot.wn-agent.hermes`, and `org.marmot.wn-agent.openclaw`). If you add a
-new production installer, choose names that can coexist with the existing
+`wn-agent-harnesses.service`, `org.marmot.wn-agent.hermes`,
+`org.marmot.wn-agent.openclaw`, and `org.marmot.wn-agent.harnesses`). If you
+add a new production installer, choose names that can coexist with the existing
 integrations on the same login.
 
 ## Tests And Validation

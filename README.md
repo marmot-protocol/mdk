@@ -54,7 +54,7 @@ Primary implementation areas:
 - `crates/cli` - CLI app surface plus `wnd` daemon and `wn tui`.
 - `integrations/hermes/marmot` - Hermes gateway plugin for the local `wn-agent` control socket.
 - `integrations/openclaw/marmot` - OpenClaw channel plugin for the local `wn-agent` control socket.
-- `integrations/opencode/marmot` - pure `opencode` harness for the local `wn-agent` control socket.
+- `integrations/opencode/marmot` - OpenCode terminal harness for the local `wn-agent` control socket.
 
 Reference and model support:
 

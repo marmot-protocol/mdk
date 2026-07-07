@@ -15,7 +15,7 @@ Current tracks:
   Rust workspace, CLI, daemon, TUI, app runtime, storage, transports, agent crates, and binding source crate. MDK
   `0.9.0` is the unifying workspace bump above the previous `0.8.0` release.
 - WN Agent releases use tags like `wn-agent-v0.9.0`. These publish the `wn-agent` connector binary plus adapter and
-  harness install assets, including Hermes, OpenClaw, and opencode.
+  harness install assets, including Hermes, OpenClaw, and OpenCode.
 - MarmotKit binding releases use tags like `marmotkit-v0.9.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
 
@@ -256,14 +256,15 @@ The installer assets are generated during the release and default to their own `
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-hermes-marmot.sh | bash
 # OpenClaw gateway
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-openclaw-marmot.sh | bash
-# opencode harness
+# OpenCode terminal harness
 curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-opencode-marmot.sh | bash
 ```
 
 These one-liners perform full setup by default: they install `wn-agent`, install/enable the matching gateway plugin or
-harness binary, start same-user services where supported, bootstrap or reuse the default Marmot agent home, and patch
-only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`, `--no-start-wn-agent`,
-`--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a partial/manual install.
+harness binary, start same-user services where supported, bootstrap or reuse the default connector-specific Marmot
+agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
+`--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
+partial/manual install.
 
 ## MarmotKit Binding Release
 

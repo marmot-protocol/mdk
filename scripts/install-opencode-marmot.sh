@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Install wn-agent and the wn-opencode harness from a WN Agent GitHub release.
-# opencode itself must already be installed.
+# OpenCode itself must already be installed.
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
@@ -24,8 +24,12 @@ WN_AGENT_VERSION="${WN_AGENT_VERSION:-${WN_AGENT_SHA:-$WN_AGENT_VERSION_DEFAULT}
 MARMOT_RELEASE_TAG_DEFAULT="${MARMOT_RELEASE_TAG_DEFAULT:-wn-agent-v${WN_AGENT_VERSION}}"
 MARMOT_RELEASE_TAG="${MARMOT_RELEASE_TAG:-$MARMOT_RELEASE_TAG_DEFAULT}"
 MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
-MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agent}"
-MARMOT_AGENT_SOCKET="${MARMOT_AGENT_SOCKET:-$MARMOT_HOME/dev/wn-agent.sock}"
+MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agents/harnesses}"
+MARMOT_AGENT_SOCKET_OVERRIDE="${MARMOT_AGENT_SOCKET:-}"
+MARMOT_AGENT_SOCKET="${MARMOT_AGENT_SOCKET_OVERRIDE:-$MARMOT_HOME/dev/wn-agent.sock}"
+MARMOT_AGENT_LABEL="${MARMOT_AGENT_LABEL:-terminal-harness-agent}"
+MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-harnesses}"
+MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.harnesses}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
 WN_OPENCODE_BIN="${WN_OPENCODE_BIN:-opencode}"
 WN_OPENCODE_TIMEOUT_SECS="${WN_OPENCODE_TIMEOUT_SECS:-300}"
@@ -44,6 +48,9 @@ WN_AGENT_TEMP_PID=""
 BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_ALLOWED_SENDERS_HEX=""
 MARMOT_AGENT_SOCKET_SET=0
+if [ -n "$MARMOT_AGENT_SOCKET_OVERRIDE" ]; then
+    MARMOT_AGENT_SOCKET_SET=1
+fi
 
 RELAYS=()
 ALLOW_WELCOMERS=()
@@ -52,18 +59,18 @@ usage() {
     cat <<'USAGE'
 Usage: install-opencode-marmot.sh [options]
 
-Install wn-agent and wn-opencode from a WN Agent GitHub release. opencode
+Install wn-agent and wn-opencode from a WN Agent GitHub release. OpenCode
 itself must already be installed.
 
 Options:
   --bootstrap              Compatibility alias; guided bootstrap is the default
   --yes, --non-interactive Use defaults and do not prompt
-  --home PATH              Marmot agent home (default: ~/.marmot-agent)
+  --home PATH              Marmot terminal harness agent home (default: ~/.marmot-agents/harnesses)
   --socket PATH            wn-agent socket (default: $MARMOT_HOME/dev/wn-agent.sock)
   --allow-welcomer VALUE   Allow invites/prompts from this npub or hex pubkey; may repeat
   --allow-sender VALUE     Alias for --allow-welcomer
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
-  --opencode-bin PATH      opencode binary or command name (default: opencode)
+  --opencode-bin PATH      OpenCode binary or command name (default: opencode)
   --no-service             Do not install/start LaunchAgents or systemd user units
   --no-start-wn-agent      Do not start wn-agent before bootstrap
   --no-start-wn-opencode   Install but do not start wn-opencode
@@ -77,12 +84,15 @@ Environment:
   WN_AGENT_VERSION         Asset version suffix (release assets default to their own version)
   WN_AGENT_SHA             Legacy alias for WN_AGENT_VERSION
   MARMOT_INSTALL_PREFIX    Install root for binaries (default: ~/.local)
-  MARMOT_HOME              wn-agent home (default: ~/.marmot-agent)
+  MARMOT_HOME              wn-agent home (default: ~/.marmot-agents/harnesses)
   MARMOT_AGENT_SOCKET      wn-agent socket (default: $MARMOT_HOME/dev/wn-agent.sock)
+  MARMOT_AGENT_LABEL       Account label used by bootstrap (default: terminal-harness-agent)
+  MARMOT_AGENT_SERVICE_NAME Linux systemd user service name (default: wn-agent-harnesses)
+  MARMOT_AGENT_LAUNCHD_LABEL macOS LaunchAgent label (default: org.marmot.wn-agent.harnesses)
   MARMOT_RELAYS            Relay CSV used by wn-agent and bootstrap
   MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
   WN_OPENCODE_ALLOWED_SENDERS_HEX Comma-separated hex values for prompt senders
-  WN_OPENCODE_BIN          opencode binary or command name
+  WN_OPENCODE_BIN          OpenCode binary or command name
 
 Example:
   curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-opencode-marmot.sh | bash
@@ -284,7 +294,7 @@ install_binary_bundle() {
 
 resolve_opencode_bin() {
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "would require opencode binary: $WN_OPENCODE_BIN"
+        log "would require OpenCode binary: $WN_OPENCODE_BIN"
         return 0
     fi
     if [[ "$WN_OPENCODE_BIN" == */* ]]; then
@@ -300,12 +310,12 @@ resolve_opencode_bin() {
     fi
     local opencode_home_bin="$HOME/.opencode/bin/$WN_OPENCODE_BIN"
     if [ ! -x "$opencode_home_bin" ]; then
-        echo "error: opencode binary not found: $WN_OPENCODE_BIN" >&2
-        echo "install opencode first or set WN_OPENCODE_BIN/--opencode-bin" >&2
+        echo "error: OpenCode binary not found: $WN_OPENCODE_BIN" >&2
+        echo "install OpenCode first or set WN_OPENCODE_BIN/--opencode-bin" >&2
         exit 1
     fi
     WN_OPENCODE_BIN="$opencode_home_bin"
-    log "found opencode binary: $WN_OPENCODE_BIN"
+    log "found OpenCode binary: $WN_OPENCODE_BIN"
 }
 
 ensure_path() {
@@ -348,7 +358,7 @@ plist_env_entry() {
 
 install_macos_wn_agent_service() {
     local plist_dir plist label program logs_dir relay
-    label="org.marmot.wn-agent"
+    label="$MARMOT_AGENT_LAUNCHD_LABEL"
     plist_dir="$HOME/Library/LaunchAgents"
     plist="$plist_dir/$label.plist"
     program="$(wn_agent_path)"
@@ -466,12 +476,12 @@ systemd_quote() {
 install_linux_wn_agent_service() {
     local service_dir service program relay
     service_dir="$HOME/.config/systemd/user"
-    service="$service_dir/wn-agent.service"
+    service="$service_dir/$MARMOT_AGENT_SERVICE_NAME.service"
     program="$(wn_agent_path)"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now wn-agent.service"
+        log "would run: systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service"
         return 0
     fi
 
@@ -500,8 +510,8 @@ install_linux_wn_agent_service() {
     chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
-    run systemctl --user enable --now wn-agent.service || return 1
-    log "installed and started systemd user service: wn-agent.service"
+    run systemctl --user enable --now "$MARMOT_AGENT_SERVICE_NAME.service" || return 1
+    log "installed and started systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
 }
 
 install_linux_opencode_service() {
@@ -524,8 +534,8 @@ install_linux_opencode_service() {
     {
         printf '%s\n' '[Unit]'
         printf '%s\n' 'Description=Marmot wn-opencode harness'
-        printf '%s\n' 'After=wn-agent.service'
-        printf '%s\n' 'Requires=wn-agent.service'
+        printf '%s\n' "After=$MARMOT_AGENT_SERVICE_NAME.service"
+        printf '%s\n' "Requires=$MARMOT_AGENT_SERVICE_NAME.service"
         printf '\n'
         printf '%s\n' '[Service]'
         printf 'Environment=%s\n' "$(systemd_quote "MARMOT_HOME=$MARMOT_HOME")"
@@ -617,7 +627,14 @@ bootstrap_agent() {
         warn "wn-agent socket did not appear before bootstrap wait; bootstrap will keep waiting briefly"
     fi
 
-    local -a args=(bootstrap --json --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" --no-quic)
+    local -a args=(
+        bootstrap
+        --json
+        --home "$MARMOT_HOME"
+        --socket "$MARMOT_AGENT_SOCKET"
+        --label "$MARMOT_AGENT_LABEL"
+        --no-quic
+    )
     local relay
     for relay in "${RELAYS[@]}"; do
         args+=(--relay "$relay")
@@ -688,6 +705,12 @@ print_next_steps() {
     cat <<EOF
 
 Install complete.
+
+Terminal harness agent:
+  label: $MARMOT_AGENT_LABEL
+  home: $MARMOT_HOME
+  socket: $MARMOT_AGENT_SOCKET
+  service: $MARMOT_AGENT_SERVICE_NAME.service (Linux) / $MARMOT_AGENT_LAUNCHD_LABEL (macOS)
 
 Next steps:
   1. Ensure binaries are on your PATH ($(install_dir))

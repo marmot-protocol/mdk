@@ -1,8 +1,8 @@
 # wn-opencode
 
-`wn-opencode` is a dedicated Marmot harness for [OpenCode](https://opencode.ai/).
-It joins Marmot groups through the local `wn-agent` connector and sends every
-message from an allowed sender to `opencode run --format json`.
+`wn-opencode` is the first terminal-harness backend for Marmot. It runs
+[OpenCode](https://opencode.ai/) through the local `wn-agent` connector and
+sends every message from an allowed sender to `opencode run --format json`.
 
 `wn-agent` owns the Marmot account, MLS state, Nostr transport, invite allowlist,
 and durable encrypted sends. `wn-opencode` is intentionally thinner than the
@@ -40,10 +40,10 @@ curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v$
 ```
 
 The installer puts `wn-agent` and `wn-opencode` in `~/.local/bin`, starts a
-same-user `wn-agent` service where supported, bootstraps or reuses
-`~/.marmot-agent`, mirrors the allowlist into `wn-agent`, writes
-`~/.marmot-agent/dev/wn-opencode.env`, and starts a same-user `wn-opencode`
-service where supported.
+same-user terminal-harness `wn-agent` service where supported, bootstraps or
+reuses `~/.marmot-agents/harnesses`, mirrors the allowlist into `wn-agent`,
+writes `~/.marmot-agents/harnesses/dev/wn-opencode.env`, and starts a same-user
+`wn-opencode` service where supported.
 
 Use the exact release version when reporting bugs:
 
@@ -55,7 +55,7 @@ wn-opencode --version
 Manual equivalent:
 
 ```sh
-export MARMOT_HOME="$HOME/.marmot-agent"
+export MARMOT_HOME="$HOME/.marmot-agents/harnesses"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
 export WN_OPENCODE_ALLOWED_SENDERS_HEX="..."
 
@@ -67,6 +67,7 @@ wn-agent --home "$MARMOT_HOME" \
 wn-agent bootstrap \
   --home "$MARMOT_HOME" \
   --socket "$MARMOT_AGENT_SOCKET" \
+  --label terminal-harness-agent \
   --allow-welcomer "$WN_OPENCODE_ALLOWED_SENDERS_HEX" \
   --qr
 
@@ -81,7 +82,7 @@ Configure with environment variables:
 
 | Env | Default | Meaning |
 | --- | --- | --- |
-| `MARMOT_HOME` | `~/.marmot-agent` | `wn-agent` data directory |
+| `MARMOT_HOME` | `~/.marmot-agents/harnesses` | terminal-harness `wn-agent` data directory |
 | `MARMOT_AGENT_SOCKET` | `$MARMOT_HOME/dev/wn-agent.sock` | Unix control socket |
 | `MARMOT_AGENT_AUTH_TOKEN_FILE` | unset | Optional bearer-token file for group-readable socket setups |
 | `MARMOT_AGENT_AUTH_TOKEN` | unset | Optional bearer token value |
