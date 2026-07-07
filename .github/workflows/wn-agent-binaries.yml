@@ -465,21 +465,30 @@ jobs:
           cat > "$notes" <<EOF
           WN Agent \`$version\` from MDK commit \`$GITHUB_SHA\`.
 
-          Install with:
+          Install the latest WN Agent release with:
+
+          \`\`\`sh
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-openclaw-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
+          \`\`\`
+
+          Install this exact WN Agent release with:
 
           \`\`\`sh
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-hermes-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-openclaw-marmot.sh | bash
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install-opencode-marmot.sh | bash
           \`\`\`
 
           Assets:
           - \`wn-agent-<platform>-$version.tar.gz\`: versioned binary bundle.
-          - \`wn-opencode-<platform>-$version.tar.gz\`: opencode harness binary bundle.
+          - \`wn-opencode-<platform>-$version.tar.gz\`: OpenCode harness binary bundle.
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
           - \`install-openclaw-marmot.sh\`: installer for testers with OpenClaw already installed.
-          - \`install-opencode-marmot.sh\`: installer for testers with opencode already installed.
+          - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -520,4 +529,65 @@ jobs:
               --title "v$version - wn-agent" \
               --notes-file "$notes" \
               --prerelease
+          fi
+
+      - name: Create or update latest installer release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#wn-agent-v}"
+          latest_tag="wn-agent-latest"
+          latest_notes="$RUNNER_TEMP/latest-installer-release-notes.md"
+
+          if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "true" ]; then
+            echo "versioned release $tag is still draft; leaving $latest_tag unchanged"
+            exit 0
+          fi
+
+          cat > "$latest_notes" <<EOF
+          Latest WN Agent installers. These scripts install WN Agent \`$version\` from immutable release \`$tag\`.
+
+          \`\`\`sh
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-hermes-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-openclaw-marmot.sh | bash
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$latest_tag/install-opencode-marmot.sh | bash
+          \`\`\`
+
+          Use the versioned \`$tag\` release URLs when you need a pinned install.
+          EOF
+
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$latest_tag" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$latest_tag" \
+              -f sha="$GITHUB_SHA" \
+              -F force=true >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$latest_tag" \
+              -f sha="$GITHUB_SHA" >/dev/null
+          fi
+
+          assets=(
+            dist/install/install-hermes-marmot.sh
+            dist/install/install-openclaw-marmot.sh
+            dist/install/install-opencode-marmot.sh
+          )
+
+          if gh release view "$latest_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$latest_tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$latest_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Latest WN Agent installers" \
+              --notes-file "$latest_notes" \
+              --prerelease \
+              --latest=false
+          else
+            gh release create "$latest_tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Latest WN Agent installers" \
+              --notes-file "$latest_notes" \
+              --prerelease \
+              --latest=false
           fi

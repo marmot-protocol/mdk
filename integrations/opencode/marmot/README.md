@@ -26,18 +26,18 @@ Prerequisites:
 One-line install:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-opencode-marmot.sh" | bash
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | bash
 ```
 
 For repeatable noninteractive setup, pass the allowed inviter and prompt sender
 as either an `npub` or raw hex public key:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-opencode-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
+
+Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
 
 The installer puts `wn-agent` and `wn-opencode` in `~/.local/bin`, starts a
 same-user terminal-harness `wn-agent` service where supported, bootstraps or

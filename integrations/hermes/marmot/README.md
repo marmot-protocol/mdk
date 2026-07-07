@@ -29,18 +29,18 @@ Prerequisites:
 One-line install:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | bash
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | bash
 ```
 
 For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
 an `npub` or raw hex public key:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-hermes-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
+
+Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
 
 Use the exact release version when reporting bugs:
 

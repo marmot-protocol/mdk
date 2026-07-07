@@ -26,8 +26,7 @@ Prerequisites:
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | bash
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | bash
 ```
 
 The installer puts `wn-agent` in `~/.local/bin`, downloads and verifies the plugin
@@ -43,10 +42,11 @@ For repeatable noninteractive setup, pass the allowed inviter/welcomer as either
 an `npub` or raw hex public key:
 
 ```sh
-WN_AGENT_VERSION=0.9.2
-curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v${WN_AGENT_VERSION}/install-openclaw-marmot.sh" | \
+curl -fsSL "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-openclaw-marmot.sh" | \
   bash -s -- --yes --allow-welcomer npub1...
 ```
+
+Use a versioned `wn-agent-v<version>` release URL when you need a pinned install.
 
 The installer prints restart guidance for your existing OpenClaw gateway. It
 does not restart OpenClaw automatically. Manual equivalent:

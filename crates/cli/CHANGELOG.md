@@ -40,6 +40,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   service-backed setup path for machines that already have OpenCode installed.
 - The OpenCode installer uses the terminal-harness agent home (`~/.marmot-agents/harnesses`) and connector-specific
   `wn-agent` service identity by default, leaving room for future terminal harness backends to share that agent.
+- Non-draft WN Agent releases now refresh a `wn-agent-latest` installer-only release so curl setup commands can default
+  to the latest connector/harness installers while versioned releases remain available for pinned installs.
 
 ### Security
 

@@ -95,7 +95,7 @@ Environment:
   WN_OPENCODE_BIN          OpenCode binary or command name
 
 Example:
-  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-opencode-marmot.sh | bash
+  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-opencode-marmot.sh | bash
 
   curl -fsSL .../install-opencode-marmot.sh | bash -s -- --yes --allow-welcomer npub1...
 USAGE

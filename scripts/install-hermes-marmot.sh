@@ -92,7 +92,7 @@ Environment:
   MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
 
 Example:
-  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.9.2/install-hermes-marmot.sh | bash
+  curl -fsSL https://github.com/marmot-protocol/mdk/releases/download/wn-agent-latest/install-hermes-marmot.sh | bash
 
   curl -fsSL .../install-hermes-marmot.sh | bash -s -- --yes --allow-welcomer npub1...
 USAGE
