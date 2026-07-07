@@ -112,17 +112,29 @@ pub struct RelayPlaneHealth {
     pub directory_subscriptions_removed: usize,
 }
 
+/// The `nostr-sdk` client options for a given [`RelayConnectionMode`] — default
+/// options for `Direct`, or a SOCKS5 proxy connection for `Socks5`. Shared by
+/// every place MDK builds a relay-facing client so the configured proxy is
+/// applied uniformly: the relay plane here, and the per-account publish client
+/// in `lib.rs` (`relay_client_for_endpoints`). Missing either one leaves a
+/// connection dialing directly.
+pub(crate) fn relay_client_options(connection: &RelayConnectionMode) -> ClientOptions {
+    match connection {
+        RelayConnectionMode::Direct => ClientOptions::new(),
+        RelayConnectionMode::Socks5(addr) => {
+            ClientOptions::new().connection(Connection::new().proxy(*addr))
+        }
+    }
+}
+
 /// Build the relay plane's underlying Nostr client, applying the configured
 /// [`RelayConnectionMode`] (direct, or a SOCKS5 proxy) to its options. The same
 /// client backs both the relay transport and the user-directory fetcher, so a
 /// proxy set here routes every relay connection this plane makes.
 fn build_sdk_client(connection: &RelayConnectionMode) -> NostrSdkClient {
-    match connection {
-        RelayConnectionMode::Direct => NostrSdkClient::builder().build(),
-        RelayConnectionMode::Socks5(addr) => NostrSdkClient::builder()
-            .opts(ClientOptions::new().connection(Connection::new().proxy(*addr)))
-            .build(),
-    }
+    NostrSdkClient::builder()
+        .opts(relay_client_options(connection))
+        .build()
 }
 
 impl MarmotRelayPlane {
