@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_control::AgentControlEvent;
@@ -13,12 +14,13 @@ use crate::config::{Config, dirs_home};
 use crate::control::ControlClient;
 use crate::error::{HarnessError, Result};
 use crate::opencode::{Invocation, Outcome, RunnerEvent};
-use crate::repo_picker::{parse_repo_picker, resolve_repo};
+use crate::repo_picker::{parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{SessionRecord, SessionStore};
 
 pub(crate) const TRACE_TARGET: &str = "wn_opencode";
 
 const DEDUPE_LIMIT: usize = 2048;
+const GROUP_QUEUE_LIMIT: usize = 4096;
 const RECONNECT_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const SEND_RETRY_ATTEMPTS: usize = 3;
@@ -76,7 +78,7 @@ async fn subscribe_loop(ctx: Arc<BridgeContext>) -> Result<()> {
                 reconnect = RECONNECT_INITIAL;
                 match drain_events(ctx.clone(), &mut events).await? {
                     DrainOutcome::Shutdown => return Ok(()),
-                    DrainOutcome::Disconnected => {}
+                    DrainOutcome::Reconnect => {}
                 }
             }
             Err(err) => {
@@ -96,7 +98,7 @@ async fn subscribe_loop(ctx: Arc<BridgeContext>) -> Result<()> {
 
 enum DrainOutcome {
     Shutdown,
-    Disconnected,
+    Reconnect,
 }
 
 async fn drain_events(
@@ -131,12 +133,20 @@ async fn drain_events(
                         event = "channel_closed",
                         "inbound event channel closed"
                     );
-                    return Ok(DrainOutcome::Disconnected);
+                    return Ok(DrainOutcome::Reconnect);
                 };
-                dispatch_event(ctx.clone(), event).await;
+                match dispatch_event(ctx.clone(), event).await {
+                    DispatchOutcome::Continue => {}
+                    DispatchOutcome::Reconnect => return Ok(DrainOutcome::Reconnect),
+                }
             }
         }
     }
+}
+
+enum DispatchOutcome {
+    Continue,
+    Reconnect,
 }
 
 #[cfg(unix)]
@@ -156,7 +166,7 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) {
+async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> DispatchOutcome {
     match event {
         AgentControlEvent::InboundMessage {
             account_id_hex,
@@ -166,36 +176,24 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) {
             text,
             ..
         } => {
-            if sender_account_id_hex == ctx.account_ref {
+            let sender_ref = sender_account_id_hex.to_ascii_lowercase();
+            if sender_ref == ctx.account_ref {
                 debug!(
                     target: TRACE_TARGET,
                     method = "dispatch_event",
                     event = "self_echo",
                     "ignoring inbound event"
                 );
-                return;
+                return DispatchOutcome::Continue;
             }
-            if !ctx
-                .cfg
-                .allowed_senders
-                .contains(&sender_account_id_hex.to_ascii_lowercase())
-            {
+            if !ctx.cfg.allowed_senders.contains(&sender_ref) {
                 warn!(
                     target: TRACE_TARGET,
                     method = "dispatch_event",
                     event = "sender_rejected",
                     "ignoring inbound event from unauthorized sender"
                 );
-                return;
-            }
-            if !ctx.dedupe.insert(message_id_hex.clone()).await {
-                debug!(
-                    target: TRACE_TARGET,
-                    method = "dispatch_event",
-                    event = "duplicate",
-                    "ignoring duplicate inbound event"
-                );
-                return;
+                return DispatchOutcome::Continue;
             }
             let Some(permit) = ctx.queues.try_enter(&group_id_hex).await else {
                 warn!(
@@ -216,8 +214,17 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) {
                     )
                     .await;
                 });
-                return;
+                return DispatchOutcome::Continue;
             };
+            if !ctx.dedupe.insert(message_id_hex.clone()).await {
+                debug!(
+                    target: TRACE_TARGET,
+                    method = "dispatch_event",
+                    event = "duplicate",
+                    "ignoring duplicate inbound event"
+                );
+                return DispatchOutcome::Continue;
+            }
 
             let inbound = InboundPrompt {
                 account_ref: account_id_hex,
@@ -226,6 +233,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) {
                 text,
             };
             tokio::spawn(handle_message(ctx, inbound, permit));
+            DispatchOutcome::Continue
         }
         AgentControlEvent::GroupInvite { .. } => {
             info!(
@@ -234,6 +242,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) {
                 event = "group_invite",
                 "group invite observed"
             );
+            DispatchOutcome::Continue
         }
         AgentControlEvent::ResyncRequired { dropped_events, .. } => {
             warn!(
@@ -241,8 +250,9 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) {
                 method = "dispatch_event",
                 event = "resync_required",
                 dropped_events,
-                "inbound event resync required"
+                "inbound event resync required; reconnecting subscription"
             );
+            DispatchOutcome::Reconnect
         }
         _ => {
             debug!(
@@ -251,11 +261,11 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) {
                 event = "ignored",
                 "ignoring unsupported event"
             );
+            DispatchOutcome::Continue
         }
     }
 }
 
-#[derive(Debug)]
 struct InboundPrompt {
     account_ref: String,
     group_ref: String,
@@ -265,7 +275,7 @@ struct InboundPrompt {
 
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit: GroupPermit) {
     let _serial = permit.serial.lock().await;
-    let known_session = ctx.sessions.get(&inbound.group_ref);
+    let known_session = ctx.sessions.get(&inbound.group_ref).await;
     let (cwd, prompt) = match resolve_cwd_and_prompt(&ctx, &inbound, known_session.as_ref()).await {
         Ok(Some(value)) => value,
         Ok(None) => return,
@@ -312,9 +322,14 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let (tx, mut rx) = mpsc::channel(16);
     let runner = tokio::spawn(crate::opencode::run(invocation, tx));
     let mut chunk_index = 0usize;
+    let mut delivered_chunks = 0usize;
+    let mut delivery_failed = false;
     while let Some(event) = rx.recv().await {
         match event {
             RunnerEvent::Text(text) => {
+                if delivery_failed {
+                    continue;
+                }
                 for chunk in split_reply_chunks(&text, ctx.cfg.max_reply_bytes) {
                     chunk_index += 1;
                     if let Err(err) = send_reply(
@@ -333,6 +348,10 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                             error_kind = err.privacy_safe_kind(),
                             "failed to send opencode reply chunk"
                         );
+                        delivery_failed = true;
+                        break;
+                    } else {
+                        delivered_chunks += 1;
                     }
                 }
             }
@@ -341,7 +360,19 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
 
     match runner.await {
         Ok(Ok(outcome)) => {
-            finish_success(ctx, inbound, known_session, cwd, outcome, chunk_index).await;
+            finish_success(
+                ctx,
+                inbound,
+                known_session,
+                cwd,
+                outcome,
+                DeliveryReport {
+                    chunk_count: delivered_chunks,
+                    failed: delivery_failed,
+                    failure_chunk_index: chunk_index + 1,
+                },
+            )
+            .await;
         }
         Ok(Err(err)) => {
             warn!(
@@ -377,6 +408,15 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 error_kind = err.privacy_safe_kind(),
                 "opencode task join failed"
             );
+            let _ = send_reply(
+                &ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                &inbound.message_ref,
+                "[wn-opencode] opencode failed while completing this prompt.",
+                0,
+            )
+            .await;
         }
     }
 }
@@ -387,26 +427,30 @@ async fn finish_success(
     known_session: Option<SessionRecord>,
     cwd: PathBuf,
     outcome: Outcome,
-    chunk_count: usize,
+    delivery: DeliveryReport,
 ) {
     info!(
         target: TRACE_TARGET,
         method = "opencode_run",
-        chunk_count,
+        chunk_count = delivery.chunk_count,
         elapsed_ms = outcome.elapsed_ms,
         exit_code = outcome.exit_code.unwrap_or(-1),
         observed_session = outcome.observed_session.is_some(),
+        stderr_bytes = outcome.stderr.len(),
+        delivery_failed = delivery.failed,
         "opencode invocation completed"
     );
 
     let needs_persist = known_session
         .as_ref()
         .is_none_or(|record| record.session_id.is_empty());
-    if needs_persist
+    if !delivery.failed
+        && needs_persist
         && let Some(session_id) = outcome.observed_session
         && let Err(err) = ctx
             .sessions
             .set(&inbound.group_ref, SessionRecord { session_id, cwd })
+            .await
     {
         warn!(
             target: TRACE_TARGET,
@@ -416,7 +460,17 @@ async fn finish_success(
         );
     }
 
-    if chunk_count == 0 {
+    if delivery.failed {
+        let _ = send_reply(
+            &ctx,
+            &inbound.account_ref,
+            &inbound.group_ref,
+            &inbound.message_ref,
+            "[wn-opencode] failed to deliver the complete opencode response; some chunks may be missing.",
+            delivery.failure_chunk_index,
+        )
+        .await;
+    } else if delivery.chunk_count == 0 {
         let mut message = match outcome.error_summary {
             Some(summary) => format!("[wn-opencode] opencode reported {summary}"),
             None => String::from("[wn-opencode] opencode produced no text output"),
@@ -426,12 +480,7 @@ async fn finish_success(
         {
             message.push_str(&format!(" (exit {code})"));
         }
-        if outcome.stderr.is_empty() {
-            message.push('.');
-        } else {
-            message.push_str(":\n");
-            message.push_str(&outcome.stderr);
-        }
+        message.push('.');
         let _ = send_reply(
             &ctx,
             &inbound.account_ref,
@@ -444,13 +493,20 @@ async fn finish_success(
     }
 }
 
+struct DeliveryReport {
+    chunk_count: usize,
+    failed: bool,
+    failure_chunk_index: usize,
+}
+
 async fn resolve_cwd_and_prompt(
     ctx: &BridgeContext,
     inbound: &InboundPrompt,
     known_session: Option<&SessionRecord>,
 ) -> Result<Option<(PathBuf, String)>> {
     if let Some(record) = known_session {
-        return Ok(Some((record.cwd.clone(), inbound.text.clone())));
+        let cwd = validate_session_cwd(&record.cwd, &dirs_home()).await?;
+        return Ok(Some((cwd, inbound.text.clone())));
     }
 
     let Some((name, rest)) = parse_repo_picker(&inbound.text) else {
@@ -473,13 +529,15 @@ async fn resolve_cwd_and_prompt(
         }
     };
     if rest.is_empty() {
-        ctx.sessions.set(
-            &inbound.group_ref,
-            SessionRecord {
-                session_id: String::new(),
-                cwd,
-            },
-        )?;
+        ctx.sessions
+            .set(
+                &inbound.group_ref,
+                SessionRecord {
+                    session_id: String::new(),
+                    cwd,
+                },
+            )
+            .await?;
         send_reply(
             ctx,
             &inbound.account_ref,
@@ -513,12 +571,9 @@ async fn resolve_account(client: &ControlClient, preferred: Option<&str>) -> Res
         ));
     }
     if accounts.len() > 1 {
-        warn!(
-            target: TRACE_TARGET,
-            method = "account_list",
-            count = accounts.len(),
-            "multiple accounts available; using first"
-        );
+        return Err(HarnessError::Config(
+            "multiple local accounts are present; set WN_OPENCODE_ACCOUNT_ID_HEX".to_owned(),
+        ));
     }
     Ok(accounts[0].account_id_hex.clone())
 }
@@ -577,9 +632,11 @@ struct GroupQueues {
 struct GroupQueue {
     serial: Arc<Mutex<()>>,
     pending: Arc<Semaphore>,
+    active: AtomicUsize,
 }
 
 struct GroupPermit {
+    queue: Arc<GroupQueue>,
     serial: Arc<Mutex<()>>,
     _pending: OwnedSemaphorePermit,
 }
@@ -593,23 +650,36 @@ impl GroupQueues {
     }
 
     async fn try_enter(&self, group_ref: &str) -> Option<GroupPermit> {
-        let queue = {
-            let mut inner = self.inner.lock().await;
-            inner
-                .entry(group_ref.to_owned())
-                .or_insert_with(|| {
-                    Arc::new(GroupQueue {
-                        serial: Arc::new(Mutex::new(())),
-                        pending: Arc::new(Semaphore::new(self.limit)),
-                    })
+        let mut inner = self.inner.lock().await;
+        if inner.len() >= GROUP_QUEUE_LIMIT {
+            inner.retain(|_, queue| queue.active.load(Ordering::Relaxed) != 0);
+        }
+        if inner.len() >= GROUP_QUEUE_LIMIT && !inner.contains_key(group_ref) {
+            return None;
+        }
+        let queue = inner
+            .entry(group_ref.to_owned())
+            .or_insert_with(|| {
+                Arc::new(GroupQueue {
+                    serial: Arc::new(Mutex::new(())),
+                    pending: Arc::new(Semaphore::new(self.limit)),
+                    active: AtomicUsize::new(0),
                 })
-                .clone()
-        };
+            })
+            .clone();
         let pending = queue.pending.clone().try_acquire_owned().ok()?;
+        queue.active.fetch_add(1, Ordering::Relaxed);
         Some(GroupPermit {
+            queue: queue.clone(),
             serial: queue.serial.clone(),
             _pending: pending,
         })
+    }
+}
+
+impl Drop for GroupPermit {
+    fn drop(&mut self) {
+        self.queue.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

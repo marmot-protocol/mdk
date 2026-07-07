@@ -41,7 +41,9 @@ NO_START_WN_AGENT=0
 NO_START_WN_OPENCODE=0
 SYSTEM_INSTALL=0
 WN_AGENT_TEMP_PID=""
+BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_ALLOWED_SENDERS_HEX=""
+MARMOT_AGENT_SOCKET_SET=0
 
 RELAYS=()
 ALLOW_WELCOMERS=()
@@ -211,7 +213,7 @@ download_asset() {
         log "url: $url"
         return 0
     fi
-    curl -fsSL "$url" -o "$dest"
+    curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$dest"
 }
 
 verify_sha256() {
@@ -389,6 +391,7 @@ install_macos_wn_agent_service() {
         printf '%s\n' '</dict>'
         printf '%s\n' '</plist>'
     } >"$plist" || return 1
+    chmod 600 "$plist" || return 1
 
     launchctl bootout "gui/$UID" "$plist" >/dev/null 2>&1 || true
     run launchctl bootstrap "gui/$UID" "$plist" || return 1
@@ -426,6 +429,7 @@ install_macos_opencode_service() {
         printf '%s\n' '  <dict>'
         plist_env_entry "MARMOT_HOME" "$MARMOT_HOME"
         plist_env_entry "MARMOT_AGENT_SOCKET" "$MARMOT_AGENT_SOCKET"
+        plist_env_entry "WN_OPENCODE_ACCOUNT_ID_HEX" "$BOOTSTRAP_ACCOUNT_ID_HEX"
         plist_env_entry "WN_OPENCODE_ALLOWED_SENDERS_HEX" "$BOOTSTRAP_ALLOWED_SENDERS_HEX"
         plist_env_entry "WN_OPENCODE_BIN" "$WN_OPENCODE_BIN"
         plist_env_entry "WN_OPENCODE_TIMEOUT_SECS" "$WN_OPENCODE_TIMEOUT_SECS"
@@ -444,6 +448,7 @@ install_macos_opencode_service() {
         printf '%s\n' '</dict>'
         printf '%s\n' '</plist>'
     } >"$plist" || return 1
+    chmod 600 "$plist" || return 1
 
     launchctl bootout "gui/$UID" "$plist" >/dev/null 2>&1 || true
     run launchctl bootstrap "gui/$UID" "$plist" || return 1
@@ -492,6 +497,7 @@ install_linux_wn_agent_service() {
         printf '%s\n' '[Install]'
         printf '%s\n' 'WantedBy=default.target'
     } >"$service" || return 1
+    chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
     run systemctl --user enable --now wn-agent.service || return 1
@@ -524,6 +530,7 @@ install_linux_opencode_service() {
         printf '%s\n' '[Service]'
         printf 'Environment=%s\n' "$(systemd_quote "MARMOT_HOME=$MARMOT_HOME")"
         printf 'Environment=%s\n' "$(systemd_quote "MARMOT_AGENT_SOCKET=$MARMOT_AGENT_SOCKET")"
+        printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_ACCOUNT_ID_HEX=$BOOTSTRAP_ACCOUNT_ID_HEX")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_ALLOWED_SENDERS_HEX=$BOOTSTRAP_ALLOWED_SENDERS_HEX")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_BIN=$WN_OPENCODE_BIN")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_TIMEOUT_SECS=$WN_OPENCODE_TIMEOUT_SECS")"
@@ -537,6 +544,7 @@ install_linux_opencode_service() {
         printf '%s\n' '[Install]'
         printf '%s\n' 'WantedBy=default.target'
     } >"$service" || return 1
+    chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
     run systemctl --user enable --now wn-opencode.service || return 1
@@ -624,6 +632,7 @@ bootstrap_agent() {
         printf '[dry-run] wn-agent'
         printf ' %q' "${args[@]}"
         printf '\n'
+        BOOTSTRAP_ACCOUNT_ID_HEX="<account-id-from-bootstrap>"
         BOOTSTRAP_ALLOWED_SENDERS_HEX="<allowlist-from-bootstrap>"
         return 0
     fi
@@ -632,10 +641,18 @@ bootstrap_agent() {
     local bootstrap_json
     bootstrap_json="$(wn-agent "${args[@]}")"
     printf '%s\n' "$bootstrap_json" >"$MARMOT_HOME/bootstrap.json"
+    BOOTSTRAP_ACCOUNT_ID_HEX="$(
+        printf '%s\n' "$bootstrap_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["account_id_hex"])'
+    )"
     BOOTSTRAP_ALLOWED_SENDERS_HEX="$(
         printf '%s\n' "$bootstrap_json" |
             python3 -c 'import json, sys; print(",".join(json.load(sys.stdin).get("welcomer_account_ids_hex", [])))'
     )"
+    if [ -z "$BOOTSTRAP_ACCOUNT_ID_HEX" ]; then
+        echo "error: bootstrap did not return an account id" >&2
+        exit 1
+    fi
     if [ -z "$BOOTSTRAP_ALLOWED_SENDERS_HEX" ]; then
         echo "error: bootstrap did not return any allowlisted sender hex ids" >&2
         exit 1
@@ -655,6 +672,7 @@ write_opencode_env() {
         {
             printf 'MARMOT_HOME=%q\n' "$MARMOT_HOME"
             printf 'MARMOT_AGENT_SOCKET=%q\n' "$MARMOT_AGENT_SOCKET"
+            printf 'WN_OPENCODE_ACCOUNT_ID_HEX=%q\n' "$BOOTSTRAP_ACCOUNT_ID_HEX"
             printf 'WN_OPENCODE_ALLOWED_SENDERS_HEX=%q\n' "$BOOTSTRAP_ALLOWED_SENDERS_HEX"
             printf 'WN_OPENCODE_BIN=%q\n' "$WN_OPENCODE_BIN"
             printf 'WN_OPENCODE_TIMEOUT_SECS=%q\n' "$WN_OPENCODE_TIMEOUT_SECS"
@@ -701,11 +719,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         --home)
             MARMOT_HOME="${2:?missing value for --home}"
-            MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+            if [ "$MARMOT_AGENT_SOCKET_SET" -eq 0 ]; then
+                MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+            fi
             shift 2
             ;;
         --socket)
             MARMOT_AGENT_SOCKET="${2:?missing value for --socket}"
+            MARMOT_AGENT_SOCKET_SET=1
             shift 2
             ;;
         --allow-welcomer | --allow-sender)

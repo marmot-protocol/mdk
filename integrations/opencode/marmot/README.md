@@ -126,6 +126,9 @@ for the next prompt.
 - Logs are structured and privacy-safe: no account ids, group ids, message ids,
   local paths, prompt text, opencode output, relay URLs, pubkeys, ciphertext, or
   key material.
+- Prompt text is passed to `opencode run` as a process argument. Run this
+  harness only on trusted single-user hosts or hosts with equivalent local
+  process isolation.
 - The session map is written through `fs-private` with owner-only file and
   directory modes.
 

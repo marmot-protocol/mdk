@@ -1,9 +1,9 @@
 #![cfg(unix)]
 
 use std::env;
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,7 @@ const SENDER_ACCOUNT_ID_HEX: &str =
     "4444444444444444444444444444444444444444444444444444444444444444";
 const INBOUND_TEXT: &str = "ping from connector";
 const MAX_REPLY_BYTES: usize = 64;
+const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test]
 #[ignore = "spawns real wn-agent and wn-opencode processes"]
@@ -32,7 +33,7 @@ async fn debug_inbound_reaches_fake_opencode_and_records_chunked_finals() {
     let state_path = temp.path().join("wn-opencode-state").join("sessions.json");
     let fake_opencode = write_fake_opencode(temp.path());
 
-    let agent = ChildGuard::new(spawn_wn_agent(&marmot_home, &socket));
+    let agent = ChildGuard::new(spawn_wn_agent(&marmot_home, &socket, temp.path()));
 
     wait_for_agent(&socket).await;
     let account = create_account(&socket).await;
@@ -42,6 +43,7 @@ async fn debug_inbound_reaches_fake_opencode_and_records_chunked_finals() {
         &state_path,
         &fake_opencode,
         &account.account_id_hex,
+        temp.path(),
     ));
 
     let expected_text = expected_reply_text();
@@ -86,8 +88,19 @@ fn repo_root() -> &'static Path {
         .expect("repo root")
 }
 
-fn spawn_wn_agent(home: &Path, socket: &Path) -> Child {
-    Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
+struct SpawnedChild {
+    name: &'static str,
+    child: Child,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+fn spawn_wn_agent(home: &Path, socket: &Path, log_root: &Path) -> SpawnedChild {
+    let stdout_path = log_root.join("wn-agent.out.log");
+    let stderr_path = log_root.join("wn-agent.err.log");
+    let stdout = File::create(&stdout_path).expect("create wn-agent stdout log");
+    let stderr = File::create(&stderr_path).expect("create wn-agent stderr log");
+    let child = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
         .args([
             "run",
             "-q",
@@ -108,10 +121,16 @@ fn spawn_wn_agent(home: &Path, socket: &Path) -> Child {
             env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_owned()),
         )
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
-        .expect("spawn wn-agent")
+        .expect("spawn wn-agent");
+    SpawnedChild {
+        name: "wn-agent",
+        child,
+        stdout_path,
+        stderr_path,
+    }
 }
 
 fn spawn_wn_opencode(
@@ -119,8 +138,13 @@ fn spawn_wn_opencode(
     state_path: &Path,
     fake_opencode: &Path,
     account_id_hex: &str,
-) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_wn-opencode"))
+    log_root: &Path,
+) -> SpawnedChild {
+    let stdout_path = log_root.join("wn-opencode.out.log");
+    let stderr_path = log_root.join("wn-opencode.err.log");
+    let stdout = File::create(&stdout_path).expect("create wn-opencode stdout log");
+    let stderr = File::create(&stderr_path).expect("create wn-opencode stderr log");
+    let child = Command::new(env!("CARGO_BIN_EXE_wn-opencode"))
         .env("MARMOT_AGENT_SOCKET", socket)
         .env("WN_OPENCODE_ACCOUNT_ID_HEX", account_id_hex)
         .env("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER_ACCOUNT_ID_HEX)
@@ -131,10 +155,16 @@ fn spawn_wn_opencode(
         .env("WN_OPENCODE_REQUEST_TIMEOUT_SECS", "5")
         .env("RUST_LOG", "warn,wn_opencode=info")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
-        .expect("spawn wn-opencode")
+        .expect("spawn wn-opencode");
+    SpawnedChild {
+        name: "wn-opencode",
+        child,
+        stdout_path,
+        stderr_path,
+    }
 }
 
 fn write_fake_opencode(root: &Path) -> std::path::PathBuf {
@@ -147,7 +177,21 @@ if [ "${1:-}" != "run" ] || [ "${2:-}" != "--format" ] || [ "${3:-}" != "json" ]
   echo "unexpected opencode args: $*" >&2
   exit 64
 fi
-prompt="${*: -1}"
+found_delimiter=0
+prompt=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    found_delimiter=1
+    shift
+    prompt="${1:-}"
+    break
+  fi
+  shift
+done
+if [ "$found_delimiter" -ne 1 ]; then
+  echo "missing prompt delimiter: $*" >&2
+  exit 64
+fi
 tail=""
 for _ in $(seq 1 40); do
   tail="${tail}chunk "
@@ -183,7 +227,7 @@ async fn wait_for_agent(socket: &Path) {
             )
         },
         "wn-agent debug control socket",
-        Duration::from_secs(60),
+        AGENT_READY_TIMEOUT,
     )
     .await;
 }
@@ -318,17 +362,41 @@ fn stop_process(child: &mut Child) {
 }
 
 struct ChildGuard {
+    name: &'static str,
     child: Child,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
 }
 
 impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self { child }
+    fn new(spawned: SpawnedChild) -> Self {
+        Self {
+            name: spawned.name,
+            child: spawned.child,
+            stdout_path: spawned.stdout_path,
+            stderr_path: spawned.stderr_path,
+        }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         stop_process(&mut self.child);
+        if std::thread::panicking() {
+            dump_child_log(self.name, "stdout", &self.stdout_path);
+            dump_child_log(self.name, "stderr", &self.stderr_path);
+        }
+    }
+}
+
+fn dump_child_log(process: &str, stream: &str, path: &Path) {
+    match fs::read_to_string(path) {
+        Ok(contents) if !contents.trim().is_empty() => {
+            eprintln!(
+                "----- {process} {stream}: {} -----\n{contents}",
+                path.display()
+            );
+        }
+        _ => {}
     }
 }

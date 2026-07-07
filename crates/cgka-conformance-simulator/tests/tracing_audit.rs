@@ -214,10 +214,74 @@ fn workspace_root() -> PathBuf {
 }
 
 fn production_source_roots(repo: &Path) -> Vec<PathBuf> {
-    vec![
-        repo.join("crates"),
-        repo.join("integrations/opencode/marmot/src"),
-    ]
+    let mut roots = vec![repo.join("crates")];
+    roots.extend(workspace_integration_source_roots(repo));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn workspace_integration_source_roots(repo: &Path) -> Vec<PathBuf> {
+    let Ok(contents) = fs::read_to_string(repo.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    parse_workspace_members(&contents)
+        .into_iter()
+        .filter(|member| member.starts_with("integrations/"))
+        .map(|member| repo.join(member).join("src"))
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn parse_workspace_members(contents: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    let mut in_workspace = false;
+    let mut in_members = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_workspace = trimmed == "[workspace]";
+            in_members = false;
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+
+        if in_members {
+            collect_quoted_strings(trimmed, &mut members);
+            if trimmed.contains(']') {
+                in_members = false;
+            }
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "members" {
+            in_members = true;
+            collect_quoted_strings(value, &mut members);
+            if value.contains(']') {
+                in_members = false;
+            }
+        }
+    }
+
+    members
+}
+
+fn collect_quoted_strings(line: &str, values: &mut Vec<String>) {
+    let mut rest = line;
+    while let Some(start) = rest.find('"') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('"') else {
+            break;
+        };
+        values.push(after_start[..end].to_owned());
+        rest = &after_start[end + 1..];
+    }
 }
 
 fn rust_source_files(root: &Path) -> Vec<PathBuf> {
@@ -287,4 +351,30 @@ fn tracing_invocations(contents: &str) -> Vec<TraceInvocation> {
     }
 
     invocations
+}
+
+#[test]
+fn parse_workspace_members_reads_multiline_workspace_array() {
+    let manifest = r#"
+[package]
+name = "outside"
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/one",
+    "integrations/opencode/marmot",
+]
+
+[profile.release]
+debug = 1
+"#;
+
+    assert_eq!(
+        parse_workspace_members(manifest),
+        vec![
+            "crates/one".to_owned(),
+            "integrations/opencode/marmot".to_owned()
+        ]
+    );
 }

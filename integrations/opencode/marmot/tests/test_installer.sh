@@ -36,6 +36,13 @@ installer_stdin_dry_run="$(
     bash -s -- --dry-run --yes --no-service --allow-welcomer "$allow_hex" < "$installer"
 )"
 
+installer_custom_socket_dry_run="$(
+    WN_AGENT_SHA="9.9.9" \
+    MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
+    WN_OPENCODE_BIN="/bin/echo" \
+    "$installer" --dry-run --yes --no-service --socket /tmp/custom-wn-agent.sock --home /tmp/custom-marmot-home --allow-welcomer "$allow_hex"
+)"
+
 missing_allowlist_status=0
 WN_AGENT_SHA="9.9.9" \
     MARMOT_RELEASE_TAG="wn-agent-v9.9.9-test" \
@@ -70,6 +77,16 @@ esac
 case "$installer_stdin_dry_run" in
     *"wn-opencode-"*"9.9.9.tar.gz"* ) ;;
     *) echo "opencode installer stdin dry-run did not use expected wn-opencode asset" >&2; exit 1;;
+esac
+case "$installer_custom_socket_dry_run" in
+    *"--socket /tmp/custom-wn-agent.sock"* ) ;;
+    *) echo "opencode installer dry-run did not preserve explicit socket after --home" >&2; exit 1;;
+esac
+case "$installer_custom_socket_dry_run" in
+    *"/tmp/custom-marmot-home/dev/wn-agent.sock"* )
+        echo "opencode installer dry-run overwrote explicit socket when --home followed --socket" >&2
+        exit 1
+        ;;
 esac
 case "$installer_service_dry_run" in
     *"would write private env file"* ) ;;

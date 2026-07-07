@@ -226,12 +226,23 @@ async fn capture_stderr(stderr: tokio::process::ChildStderr) -> String {
         if captured.len() < STDERR_CAPTURE_BYTES {
             captured.push_str(&String::from_utf8_lossy(&buf));
             if captured.len() > STDERR_CAPTURE_BYTES {
-                captured.truncate(STDERR_CAPTURE_BYTES);
+                truncate_to_char_boundary(&mut captured, STDERR_CAPTURE_BYTES);
             }
         }
         buf.clear();
     }
     captured
+}
+
+fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
 }
 
 pub(crate) fn strip_ansi(input: &str) -> String {
@@ -307,6 +318,16 @@ mod tests {
     #[test]
     fn strip_ansi_removes_csi_sequences() {
         assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m"), "red");
+    }
+
+    #[test]
+    fn truncate_to_char_boundary_keeps_valid_utf8() {
+        let mut value = "a".repeat(STDERR_CAPTURE_BYTES - 1);
+        value.push('é');
+        value.push_str("tail");
+        truncate_to_char_boundary(&mut value, STDERR_CAPTURE_BYTES);
+        assert!(value.is_char_boundary(value.len()));
+        assert_eq!(value.len(), STDERR_CAPTURE_BYTES - 1);
     }
 
     #[cfg(unix)]

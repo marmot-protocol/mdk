@@ -50,6 +50,27 @@ pub(crate) async fn resolve_repo(name: &str, home: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+pub(crate) async fn validate_session_cwd(cwd: &Path, home: &Path) -> Result<PathBuf> {
+    let canonical = tokio::fs::canonicalize(cwd)
+        .await
+        .map_err(|_| repo_error("Stored session workdir cannot be read."))?;
+    let home_canonical = tokio::fs::canonicalize(home)
+        .await
+        .map_err(|_| repo_error("Cannot read $HOME."))?;
+    if canonical != home_canonical && canonical.parent() != Some(&home_canonical) {
+        return Err(repo_error(
+            "Stored session workdir resolves outside $HOME; refusing.",
+        ));
+    }
+    let metadata = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|_| repo_error("Stored session workdir cannot be read."))?;
+    if !metadata.is_dir() {
+        return Err(repo_error("Stored session workdir is not a directory."));
+    }
+    Ok(canonical)
+}
+
 fn repo_error(message: impl Into<String>) -> HarnessError {
     HarnessError::Config(message.into())
 }
@@ -90,5 +111,31 @@ mod tests {
     fn parse_repo_picker_ignores_non_picker_text() {
         assert_eq!(parse_repo_picker("hello"), None);
         assert_eq!(parse_repo_picker(" hello"), None);
+    }
+
+    #[tokio::test]
+    async fn validate_session_cwd_allows_home_or_direct_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("repo");
+        std::fs::create_dir(&child).unwrap();
+
+        assert_eq!(
+            validate_session_cwd(dir.path(), dir.path()).await.unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            validate_session_cwd(&child, dir.path()).await.unwrap(),
+            child.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_session_cwd_rejects_outside_home() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let err = validate_session_cwd(outside.path(), home.path())
+            .await
+            .unwrap_err();
+        assert_eq!(err.privacy_safe_kind(), "config");
     }
 }

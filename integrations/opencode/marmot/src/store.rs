@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::error::Result;
 
@@ -59,42 +59,40 @@ impl SessionStore {
         })
     }
 
-    pub(crate) fn get(&self, group_key: &str) -> Option<SessionRecord> {
-        self.map
-            .lock()
-            .expect("session store lock poisoned")
-            .get(group_key)
-            .cloned()
+    pub(crate) async fn get(&self, group_key: &str) -> Option<SessionRecord> {
+        self.map.lock().await.get(group_key).cloned()
     }
 
-    pub(crate) fn set(&self, group_key: &str, record: SessionRecord) -> Result<()> {
-        let mut map = self.map.lock().expect("session store lock poisoned");
+    pub(crate) async fn set(&self, group_key: &str, record: SessionRecord) -> Result<()> {
+        let mut map = self.map.lock().await;
         let mut next = map.clone();
         next.insert(group_key.to_owned(), record);
-        self.write_snapshot(&next)?;
+        let path = self.path.clone();
+        let snapshot = next.clone();
+        tokio::task::spawn_blocking(move || write_snapshot(&path, &snapshot)).await??;
         *map = next;
         Ok(())
     }
+}
 
-    fn write_snapshot(&self, snapshot: &HashMap<String, SessionRecord>) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs_private::create_dir_all_private(parent)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(snapshot)?;
-        fs_private::write_private(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &self.path)?;
-        fs_private::tighten_existing_private_file(&self.path)?;
-        Ok(())
+fn write_snapshot(path: &Path, snapshot: &HashMap<String, SessionRecord>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_private::create_dir_all_private(parent)?;
     }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(snapshot)?;
+    fs_private::write_private(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    fs_private::tighten_existing_private_file(path)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn session_store_persists_and_reloads_records() {
+    #[tokio::test]
+    async fn session_store_persists_and_reloads_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state").join("sessions.json");
         let home = dir.path().to_path_buf();
@@ -105,17 +103,17 @@ mod tests {
                 session_id: "ses_abc123".to_owned(),
                 cwd: home.join("proj"),
             };
-            store.set("group1", record).unwrap();
+            store.set("group1", record).await.unwrap();
         }
 
         let store = SessionStore::load(path.clone(), &home).unwrap();
-        let record = store.get("group1").expect("record persisted");
+        let record = store.get("group1").await.expect("record persisted");
         assert_eq!(record.session_id, "ses_abc123");
         assert_eq!(record.cwd, home.join("proj"));
     }
 
-    #[test]
-    fn session_store_accepts_bare_string_legacy_format() {
+    #[tokio::test]
+    async fn session_store_accepts_bare_string_legacy_format() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         let home = dir.path().to_path_buf();
@@ -123,14 +121,14 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let store = SessionStore::load(path, &home).unwrap();
-        let record = store.get("group1").expect("legacy record");
+        let record = store.get("group1").await.expect("legacy record");
         assert_eq!(record.session_id, "ses_legacy");
         assert_eq!(record.cwd, home);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn session_store_creates_private_parent_and_file_modes() {
+    #[tokio::test]
+    async fn session_store_creates_private_parent_and_file_modes() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -145,6 +143,7 @@ mod tests {
                     cwd: home,
                 },
             )
+            .await
             .unwrap();
 
         let parent_mode = path
