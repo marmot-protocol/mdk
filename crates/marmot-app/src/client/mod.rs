@@ -1492,7 +1492,10 @@ impl AppClient {
     }
 
     /// Fetch + decrypt the group's avatar. Errors when the group has no image set.
-    pub async fn download_group_image(&mut self, group_id: &GroupId) -> Result<Vec<u8>, AppError> {
+    pub async fn download_group_blossom_image(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<Vec<u8>, AppError> {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let input = self.image_for_group(group_id);

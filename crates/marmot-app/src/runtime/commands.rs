@@ -439,7 +439,7 @@ impl AccountManager {
         Ok(summary)
     }
 
-    pub async fn download_group_image(
+    pub async fn download_group_blossom_image(
         &self,
         account_ref: &str,
         group_id: &GroupId,

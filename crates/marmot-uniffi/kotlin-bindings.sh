@@ -188,16 +188,25 @@ rm -rf "$OUT_DIR"
 mkdir -p "$KOTLIN_OUT_DIR" "$JNI_OUT_DIR"
 
 echo "==> Building host dylib (used for binding generation)"
-cargo build --release -p "$CRATE_NAME" "${FEATURE_ARGS[@]}"
+# The host dylib must keep its symbol table: uniffi-bindgen's library mode
+# reads the uniffi metadata through it, and with RUSTFLAGS="-C strip=symbols"
+# (release.sh sets it for the Android .so's) bindgen exits 0 while emitting
+# NOTHING. Strip only the Android target builds below, never this one.
+RUSTFLAGS="" cargo build --release -p "$CRATE_NAME" "${FEATURE_ARGS[@]}"
 
 echo "==> Generating Kotlin bindings"
-cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
+RUSTFLAGS="" cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
   generate \
   --library "$(host_dylib_path)" \
   --language kotlin \
   --config "$CRATE_DIR/uniffi.toml" \
   --no-format \
   --out-dir "$KOTLIN_OUT_DIR"
+
+if [[ ! -f "$KOTLIN_OUT_DIR/dev/ipf/marmotkit/${LIB_BASENAME}.kt" ]]; then
+  echo "error: uniffi-bindgen produced no Kotlin binding (host dylib missing uniffi metadata?)" >&2
+  exit 1
+fi
 
 echo "==> Copying hand-written Android Kotlin support (ndk-context init bridge)"
 # kotlin-support/ mirrors the Kotlin package layout, so copying its contents into

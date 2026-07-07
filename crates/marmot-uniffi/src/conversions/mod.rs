@@ -60,6 +60,7 @@ mod tests {
             avatar_url: None,
             avatar_dim: None,
             avatar_thumbhash: None,
+            image_hash_hex: None,
             encrypted_media: AppGroupEncryptedMediaComponentFfi {
                 component_id: 0x8008,
                 component: "marmot.group.encrypted-media.v1".into(),
