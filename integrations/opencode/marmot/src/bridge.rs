@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_control::AgentControlEvent;
+use agent_control::{AgentControlAccount, AgentControlEvent};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -91,7 +91,27 @@ async fn subscribe_loop(ctx: Arc<BridgeContext>) -> Result<()> {
             }
         }
 
-        sleep(reconnect).await;
+        let mut shutdown = Box::pin(shutdown_signal());
+        tokio::select! {
+            _ = sleep(reconnect) => {}
+            result = &mut shutdown => {
+                if let Err(err) = result {
+                    warn!(
+                        target: TRACE_TARGET,
+                        method = "shutdown",
+                        error_kind = err.privacy_safe_kind(),
+                        "shutdown signal handler failed"
+                    );
+                    return Err(err);
+                }
+                info!(
+                    target: TRACE_TARGET,
+                    method = "shutdown",
+                    "shutdown signal received"
+                );
+                return Ok(());
+            }
+        }
         reconnect = (reconnect * 2).min(RECONNECT_MAX);
     }
 }
@@ -204,7 +224,7 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                 );
                 let ctx_for_reply = ctx.clone();
                 tokio::spawn(async move {
-                    let _ = send_reply(
+                    if let Err(err) = send_reply(
                         &ctx_for_reply,
                         &account_id_hex,
                         &group_id_hex,
@@ -212,7 +232,15 @@ async fn dispatch_event(ctx: Arc<BridgeContext>, event: AgentControlEvent) -> Di
                         "[wn-opencode] too many prompts are already queued for this group; try again shortly.",
                         0,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(
+                            target: TRACE_TARGET,
+                            method = "queue_full_reply",
+                            error_kind = err.privacy_safe_kind(),
+                            "failed to send queue-full reply"
+                        );
+                    }
                 });
                 return DispatchOutcome::Continue;
             };
@@ -555,11 +583,8 @@ async fn resolve_cwd_and_prompt(
 async fn resolve_account(client: &ControlClient, preferred: Option<&str>) -> Result<String> {
     let accounts = client.account_list().await?;
     if let Some(preferred) = preferred {
-        if accounts
-            .iter()
-            .any(|account| account.account_id_hex == preferred)
-        {
-            return Ok(preferred.to_owned());
+        if let Some(account_ref) = find_account_ref(&accounts, preferred) {
+            return Ok(account_ref);
         }
         return Err(HarnessError::Config(
             "configured account id is not present in wn-agent".to_owned(),
@@ -576,6 +601,13 @@ async fn resolve_account(client: &ControlClient, preferred: Option<&str>) -> Res
         ));
     }
     Ok(accounts[0].account_id_hex.clone())
+}
+
+fn find_account_ref(accounts: &[AgentControlAccount], preferred: &str) -> Option<String> {
+    accounts
+        .iter()
+        .find(|account| account.account_id_hex.eq_ignore_ascii_case(preferred))
+        .map(|account| account.account_id_hex.clone())
 }
 
 async fn install_allowlist(
@@ -738,5 +770,18 @@ mod tests {
         assert!(queues.try_enter("g").await.is_none());
         drop(first);
         assert!(queues.try_enter("g").await.is_some());
+    }
+
+    #[test]
+    fn find_account_ref_matches_case_insensitively() {
+        let account = AgentControlAccount {
+            account_id_hex: "AA".repeat(32),
+            label: "terminal-harness-agent".to_owned(),
+            local_signing: true,
+        };
+        assert_eq!(
+            find_account_ref(&[account], &"aa".repeat(32)),
+            Some("AA".repeat(32))
+        );
     }
 }

@@ -124,7 +124,9 @@ Hermes and OpenClaw can mirror configured `allowFrom`/welcomer entries into
 `wn-agent`. Their sync path is config-driven and may reconcile the connector
 allowlist to the configured set. `wn-opencode` requires at least one allowed
 sender and installs those senders into both the prompt allowlist and the
-`wn-agent` welcomer allowlist.
+`wn-agent` welcomer allowlist. Its startup mirroring is additive: removing a
+sender only from `wn-agent` is not a full OpenCode revoke while
+`WN_OPENCODE_ALLOWED_SENDERS_HEX` still contains that sender.
 
 For shared-account deployments, prefer one explicit source of truth for the
 account's allowed welcomers, or configure every integration with the same

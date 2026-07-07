@@ -41,7 +41,7 @@ impl Config {
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let home = lookup("MARMOT_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| dirs_home().join(".marmot-agent"));
+            .unwrap_or_else(default_marmot_home);
         let socket = lookup("MARMOT_AGENT_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("dev").join("wn-agent.sock"));
@@ -143,6 +143,10 @@ pub(crate) fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+fn default_marmot_home() -> PathBuf {
+    dirs_home().join(".marmot-agents").join("harnesses")
+}
+
 fn parse_hex_csv(name: &'static str, raw: &str) -> Result<HashSet<String>> {
     let mut values = HashSet::new();
     for item in raw.split(',') {
@@ -216,6 +220,19 @@ mod tests {
         let cfg = Config::from_pairs(&[("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER)]).unwrap();
         assert!(cfg.allowed_senders.contains(SENDER));
         assert_eq!(cfg.max_reply_bytes, DEFAULT_MAX_REPLY_BYTES);
+    }
+
+    #[test]
+    fn config_uses_terminal_harness_home_default() {
+        let cfg = Config::from_pairs(&[("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER)]).unwrap();
+        assert_eq!(
+            cfg.socket,
+            dirs_home()
+                .join(".marmot-agents")
+                .join("harnesses")
+                .join("dev")
+                .join("wn-agent.sock")
+        );
     }
 
     #[test]

@@ -124,6 +124,12 @@ for the next prompt.
   socket mode and bearer-token options for shared local-user setups.
 - The same allowlist controls invite acceptance in `wn-agent` and prompt
   execution in `wn-opencode`.
+- On startup, `wn-opencode` adds any configured prompt senders that are missing
+  from the `wn-agent` welcomer allowlist. This mirroring is additive: it does not
+  remove extra `wn-agent` welcomers. To revoke OpenCode execution, remove the
+  sender from `WN_OPENCODE_ALLOWED_SENDERS_HEX` and restart the harness; remove
+  the sender from `wn-agent` separately if you also want to revoke invite
+  acceptance.
 - Logs are structured and privacy-safe: no account ids, group ids, message ids,
   local paths, prompt text, OpenCode output, relay URLs, pubkeys, ciphertext, or
   key material.
