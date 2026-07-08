@@ -256,6 +256,14 @@ mod tests {
     }
 
     #[test]
+    fn free_guard_swallows_panics() {
+        // A panic in a free/Drop path must never escape (unwinding into C is
+        // UB). free_guard catches it; the test passing means it did not
+        // propagate.
+        free_guard(|| panic!("boom in a free path"));
+    }
+
+    #[test]
     fn empty_vec_is_null_without_allocation() {
         let _guard = crate::memory::audit::test_lock();
         let (ptr, len) = owned_vec::<u64>(Vec::new());

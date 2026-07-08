@@ -1734,3 +1734,81 @@ pub(crate) unsafe fn free_plain<T>(ptr: *mut T) {
     crate::memory::audit::on_free();
     drop(unsafe { Box::from_raw(ptr) });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+    }
+
+    #[test]
+    fn block_next_returns_data() {
+        let rt = runtime();
+        let core = SubscriptionCore::new(rt.handle().clone());
+        assert_eq!(core.block_next(0, async { Some(42u32) }), Ok(Some(42)));
+    }
+
+    #[test]
+    fn block_next_reports_closed_stream() {
+        let rt = runtime();
+        let core = SubscriptionCore::new(rt.handle().clone());
+        let result: Result<Option<u32>, _> = core.block_next(0, async { None });
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn block_next_times_out() {
+        let rt = runtime();
+        let core = SubscriptionCore::new(rt.handle().clone());
+        let result: Result<Option<u32>, _> = core.block_next(10, std::future::pending());
+        assert_eq!(result, Err(MarmotStatus::Timeout));
+    }
+
+    #[test]
+    fn install_reserves_slot_before_spawning() {
+        let rt = runtime();
+        let core = SubscriptionCore::new(rt.handle().clone());
+
+        // First install occupies the slot with a task that never finishes.
+        let first = core.install(|handle| handle.spawn(std::future::pending::<()>()));
+        assert_eq!(first, MarmotStatus::Ok);
+
+        // A second install must be rejected AND must not run its spawn
+        // closure (the whole point of reserving before spawning).
+        let spawned = AtomicBool::new(false);
+        let second = core.install(|handle| {
+            spawned.store(true, Ordering::SeqCst);
+            handle.spawn(async {})
+        });
+        assert_eq!(second, MarmotStatus::Runtime);
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "spawn closure must not run when a callback is already installed"
+        );
+
+        core.clear();
+    }
+
+    #[test]
+    fn install_accepts_again_after_clear() {
+        let rt = runtime();
+        let core = SubscriptionCore::new(rt.handle().clone());
+        assert_eq!(
+            core.install(|handle| handle.spawn(std::future::pending::<()>())),
+            MarmotStatus::Ok
+        );
+        core.clear();
+        assert_eq!(
+            core.install(|handle| handle.spawn(std::future::pending::<()>())),
+            MarmotStatus::Ok
+        );
+        core.clear();
+    }
+}
