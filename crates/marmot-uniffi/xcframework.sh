@@ -54,13 +54,13 @@ rm -rf "$BUILD_DIR" "$OUT_DIR/$FRAMEWORK_NAME.xcframework" "$OUT_DIR/$FRAMEWORK_
 mkdir -p "$BUILD_DIR/headers" "$OUT_DIR"
 
 echo "==> Building host dylib (used for binding generation)"
-cargo build --release -p "$CRATE_NAME" "${FEATURE_ARGS[@]}"
+cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Building iOS device target (aarch64-apple-ios)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios "${FEATURE_ARGS[@]}"
+cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Building iOS simulator target (aarch64-apple-ios-sim)"
-cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios-sim "${FEATURE_ARGS[@]}"
+cargo build --release -p "$CRATE_NAME" --target aarch64-apple-ios-sim ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Generating Swift bindings"
 cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
