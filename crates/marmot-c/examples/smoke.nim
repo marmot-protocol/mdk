@@ -176,12 +176,14 @@ proc check(status: MarmotStatus, context: string) =
     raise e
 
 proc open(root: string, relays: openArray[string]): Marmot =
-  var cstrs = newSeq[cstring](relays.len)
-  for i, r in relays:
-    cstrs[i] = r.cstring
-  let arr = if relays.len == 0: nil else: addr cstrs[0]
+  # `allocCStringArray` copies each URL into C-owned memory that outlives the
+  # call. Borrowing `r.cstring` from the loop variable would dangle once the
+  # temporary Nim string is freed under ARC/ORC.
+  let arr = allocCStringArray(relays)
+  defer: deallocCStringArray(arr)
   var client: ptr MarmotClient = nil
-  check(marmot_client_new(root.cstring, arr, csize_t(relays.len), addr client), "client_new")
+  check(marmot_client_new(root.cstring, cast[ptr cstring](arr), csize_t(relays.len), addr client),
+        "client_new")
   result.client = client
 
 proc isStopping(m: Marmot): bool =
@@ -269,13 +271,13 @@ proc revealNsec(m: Marmot, accountRef: string): string =
 # Best-effort identity publish: returns the account id hex online, or raises
 # the typed error offline/rejected.
 proc createIdentity(m: Marmot, relays: openArray[string]): string =
-  var cstrs = newSeq[cstring](relays.len)
-  for i, r in relays:
-    cstrs[i] = r.cstring
-  let arr = if relays.len == 0: nil else: addr cstrs[0]
+  # Owned C-string copies that outlive the call (see `open`).
+  let arr = allocCStringArray(relays)
+  defer: deallocCStringArray(arr)
+  let relayPtr = cast[ptr cstring](arr)
   var summary: ptr MarmotAccountSummary = nil
-  check(marmot_create_identity(m.client, arr, csize_t(relays.len),
-                               arr, csize_t(relays.len), addr summary),
+  check(marmot_create_identity(m.client, relayPtr, csize_t(relays.len),
+                               relayPtr, csize_t(relays.len), addr summary),
         "create_identity")
   result = if summary.account_id_hex != nil: $summary.account_id_hex else: ""
   marmot_account_summary_free(summary)

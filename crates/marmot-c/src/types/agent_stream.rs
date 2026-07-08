@@ -53,7 +53,7 @@ impl CFree for MarmotAgentStreamStart {
 /// `start` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_agent_stream_start_free(start: *mut MarmotAgentStreamStart) {
-    unsafe { free_boxed(start) };
+    crate::memory::free_guard(|| unsafe { free_boxed(start) });
 }
 
 /// One update from a live agent-text-stream watch. `Chunk.text` is an
@@ -151,7 +151,7 @@ impl CFree for MarmotAgentStreamUpdate {
 /// `update` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_agent_stream_update_free(update: *mut MarmotAgentStreamUpdate) {
-    unsafe { free_boxed(update) };
+    crate::memory::free_guard(|| unsafe { free_boxed(update) });
 }
 
 #[cfg(test)]
@@ -161,7 +161,6 @@ mod tests {
 
     #[test]
     fn agent_stream_start_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -188,7 +187,6 @@ mod tests {
 
     #[test]
     fn agent_stream_update_all_variants_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -286,7 +284,6 @@ mod tests {
 
     #[test]
     fn empty_message_ids_convert_to_null() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         let mirror: MarmotAgentStreamStart = AgentStreamStartFfi {
             stream_id_hex: "00".into(),

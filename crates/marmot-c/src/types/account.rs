@@ -71,7 +71,7 @@ impl CFree for MarmotAccountSummaryList {
 /// `list` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_account_summary_list_free(list: *mut MarmotAccountSummaryList) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// Free a single account summary root. NULL is a no-op.
@@ -80,7 +80,7 @@ pub unsafe extern "C" fn marmot_account_summary_list_free(list: *mut MarmotAccou
 /// `summary` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_account_summary_free(summary: *mut MarmotAccountSummary) {
-    unsafe { free_boxed(summary) };
+    crate::memory::free_guard(|| unsafe { free_boxed(summary) });
 }
 
 /// Per-account unread aggregate for the account-switcher badge.
@@ -138,7 +138,7 @@ impl CFree for MarmotAccountUnreadList {
 /// `list` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_account_unread_list_free(list: *mut MarmotAccountUnreadList) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// Publish outcome for send-shaped operations.
@@ -178,7 +178,7 @@ impl CFree for MarmotSendSummary {
 /// `summary` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_send_summary_free(summary: *mut MarmotSendSummary) {
-    unsafe { free_boxed(summary) };
+    crate::memory::free_guard(|| unsafe { free_boxed(summary) });
 }
 
 /// One published (or locally known) MLS KeyPackage.
@@ -264,7 +264,7 @@ impl CFree for MarmotAccountKeyPackageList {
 pub unsafe extern "C" fn marmot_account_key_package_list_free(
     list: *mut MarmotAccountKeyPackageList,
 ) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// Nostr user profile metadata. All fields nullable. Used both as a
@@ -334,7 +334,7 @@ impl CFree for MarmotUserProfileMetadata {
 pub unsafe extern "C" fn marmot_user_profile_metadata_free(
     profile: *mut MarmotUserProfileMetadata,
 ) {
-    unsafe { free_boxed(profile) };
+    crate::memory::free_guard(|| unsafe { free_boxed(profile) });
 }
 
 /// Per-group leave failure inside a wipe outcome. Best-effort: the wipe
@@ -469,7 +469,7 @@ impl CFree for MarmotWipeOutcome {
 /// `outcome` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_wipe_outcome_free(outcome: *mut MarmotWipeOutcome) {
-    unsafe { free_boxed(outcome) };
+    crate::memory::free_guard(|| unsafe { free_boxed(outcome) });
 }
 
 /// Structured result of the non-destructive sign-out.
@@ -516,7 +516,7 @@ impl CFree for MarmotSignOutOutcome {
 /// `outcome` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_sign_out_outcome_free(outcome: *mut MarmotSignOutOutcome) {
-    unsafe { free_boxed(outcome) };
+    crate::memory::free_guard(|| unsafe { free_boxed(outcome) });
 }
 
 #[cfg(test)]

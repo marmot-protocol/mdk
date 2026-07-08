@@ -217,7 +217,7 @@ impl CFree for MarmotAppGroupRecord {
 /// `record` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_app_group_record_free(record: *mut MarmotAppGroupRecord) {
-    unsafe { free_boxed(record) };
+    crate::memory::free_guard(|| unsafe { free_boxed(record) });
 }
 
 /// Owned list of group records (chats subscription snapshots).
@@ -246,7 +246,7 @@ impl CFree for MarmotAppGroupRecordList {
 /// `list` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_app_group_record_list_free(list: *mut MarmotAppGroupRecordList) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// One row of the group membership roster.
@@ -306,7 +306,7 @@ impl CFree for MarmotAppGroupMemberRecordList {
 pub unsafe extern "C" fn marmot_app_group_member_record_list_free(
     list: *mut MarmotAppGroupMemberRecordList,
 ) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// A normalized member reference (`marmot_normalize_member_ref`): the
@@ -344,7 +344,7 @@ impl CFree for MarmotMemberRef {
 /// `member_ref` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_member_ref_free(member_ref: *mut MarmotMemberRef) {
-    unsafe { free_boxed(member_ref) };
+    crate::memory::free_guard(|| unsafe { free_boxed(member_ref) });
 }
 
 /// One enriched member row for the group-detail screen: roster data plus
@@ -423,7 +423,7 @@ impl CFree for MarmotGroupDetails {
 /// `details` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_group_details_free(details: *mut MarmotGroupDetails) {
-    unsafe { free_boxed(details) };
+    crate::memory::free_guard(|| unsafe { free_boxed(details) });
 }
 
 /// Per-member action availability for the group-management UI.
@@ -504,7 +504,7 @@ impl CFree for MarmotGroupManagementState {
 pub unsafe extern "C" fn marmot_group_management_state_free(
     state: *mut MarmotGroupManagementState,
 ) {
-    unsafe { free_boxed(state) };
+    crate::memory::free_guard(|| unsafe { free_boxed(state) });
 }
 
 /// Combined result of a `*_detailed` group mutation: the publish summary
@@ -542,7 +542,7 @@ impl CFree for MarmotGroupMutationResult {
 /// `result` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_group_mutation_result_free(result: *mut MarmotGroupMutationResult) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// Result of declining a group invite: the updated group record plus the
@@ -579,7 +579,7 @@ impl CFree for MarmotGroupInviteDeclineResult {
 pub unsafe extern "C" fn marmot_group_invite_decline_result_free(
     result: *mut MarmotGroupInviteDeclineResult,
 ) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// MLS-level group state for the conversation's developer/debug view: the
@@ -626,7 +626,7 @@ impl CFree for MarmotAppGroupMlsState {
 /// `state` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_app_group_mls_state_free(state: *mut MarmotAppGroupMlsState) {
-    unsafe { free_boxed(state) };
+    crate::memory::free_guard(|| unsafe { free_boxed(state) });
 }
 
 /// Coarse, privacy-safe reason a stored group failed session-open hydration
@@ -724,7 +724,7 @@ impl CFree for MarmotAppQuarantinedGroupList {
 pub unsafe extern "C" fn marmot_app_quarantined_group_list_free(
     list: *mut MarmotAppQuarantinedGroupList,
 ) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 #[cfg(test)]
@@ -820,7 +820,6 @@ mod tests {
 
     #[test]
     fn group_record_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -847,7 +846,6 @@ mod tests {
 
     #[test]
     fn blob_endpoint_input_roundtrips_borrowed_fields() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -868,7 +866,6 @@ mod tests {
 
     #[test]
     fn group_member_record_list_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -893,7 +890,6 @@ mod tests {
 
     #[test]
     fn member_ref_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -917,7 +913,6 @@ mod tests {
 
     #[test]
     fn group_details_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -937,7 +932,6 @@ mod tests {
 
     #[test]
     fn group_management_state_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -958,7 +952,6 @@ mod tests {
 
     #[test]
     fn group_mutation_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -982,7 +975,6 @@ mod tests {
 
     #[test]
     fn group_invite_decline_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -1003,7 +995,6 @@ mod tests {
 
     #[test]
     fn group_mls_state_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -1028,7 +1019,6 @@ mod tests {
 
     #[test]
     fn quarantined_group_list_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -1093,7 +1083,6 @@ mod tests {
 
     #[test]
     fn empty_vecs_and_nones_convert_to_null() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
 
         let mut record = sample_group_record();

@@ -176,6 +176,13 @@ pub(crate) unsafe fn free_boxed<T: CFree>(ptr: *mut T) {
     drop(boxed);
 }
 
+/// Run a deep-free at the ABI boundary under `catch_unwind`, so a panic in a
+/// `Drop`/free path never unwinds into C (which is undefined behavior). Frees
+/// return `void` and cannot report a status, so a caught panic is swallowed.
+pub(crate) fn free_guard(body: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+}
+
 /// Convert an optional record into a nullable owned pointer.
 pub(crate) fn boxed_opt<T>(value: Option<T>) -> *mut T {
     value.map_or(std::ptr::null_mut(), boxed)

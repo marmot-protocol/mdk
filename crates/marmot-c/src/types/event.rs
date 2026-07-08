@@ -423,7 +423,7 @@ unsafe impl Send for MarmotEvent {}
 /// `event` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_event_free(event: *mut MarmotEvent) {
-    unsafe { free_boxed(event) };
+    crate::memory::free_guard(|| unsafe { free_boxed(event) });
 }
 
 #[cfg(test)]

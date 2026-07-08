@@ -70,7 +70,7 @@ impl CFree for MarmotMessageTag {
 /// `tag` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_message_tag_free(tag: *mut MarmotMessageTag) {
-    unsafe { free_boxed(tag) };
+    crate::memory::free_guard(|| unsafe { free_boxed(tag) });
 }
 
 /// Owned list of plain strings. Shared root for every command that returns
@@ -100,7 +100,7 @@ impl CFree for MarmotStringList {
 /// `list` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_string_list_free(list: *mut MarmotStringList) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 #[cfg(test)]

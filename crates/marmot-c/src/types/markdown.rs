@@ -61,7 +61,7 @@ impl CFree for MarmotMarkdownDocument {
 /// `document` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_markdown_document_free(document: *mut MarmotMarkdownDocument) {
-    unsafe { free_boxed(document) };
+    crate::memory::free_guard(|| unsafe { free_boxed(document) });
 }
 
 /// One block-level Markdown node. Child blocks and inlines are owned
@@ -717,7 +717,6 @@ mod tests {
 
     #[test]
     fn document_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -866,7 +865,6 @@ mod tests {
 
     #[test]
     fn inline_variants_roundtrip_including_nested_emphasis() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();

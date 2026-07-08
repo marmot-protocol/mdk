@@ -434,7 +434,7 @@ impl CFree for MarmotTimelineMessageRecord {
 pub unsafe extern "C" fn marmot_timeline_message_record_free(
     record: *mut MarmotTimelineMessageRecord,
 ) {
-    unsafe { free_boxed(record) };
+    crate::memory::free_guard(|| unsafe { free_boxed(record) });
 }
 
 /// One page of timeline messages (`marmot_timeline_messages`, subscription
@@ -472,7 +472,7 @@ impl CFree for MarmotTimelinePage {
 /// `page` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_timeline_page_free(page: *mut MarmotTimelinePage) {
-    unsafe { free_boxed(page) };
+    crate::memory::free_guard(|| unsafe { free_boxed(page) });
 }
 
 /// Why the timeline subscription raised an upsert.
@@ -706,7 +706,7 @@ impl CFree for MarmotTimelineSubscriptionUpdate {
 pub unsafe extern "C" fn marmot_timeline_subscription_update_free(
     update: *mut MarmotTimelineSubscriptionUpdate,
 ) {
-    unsafe { free_boxed(update) };
+    crate::memory::free_guard(|| unsafe { free_boxed(update) });
 }
 
 #[cfg(test)]
@@ -870,7 +870,6 @@ mod tests {
 
     #[test]
     fn timeline_message_record_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -910,7 +909,6 @@ mod tests {
 
     #[test]
     fn timeline_page_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -933,7 +931,6 @@ mod tests {
 
     #[test]
     fn subscription_update_roundtrips_both_variants() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -1013,7 +1010,6 @@ mod tests {
 
     #[test]
     fn query_input_roundtrips_borrowed_fields() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -1045,7 +1041,6 @@ mod tests {
 
     #[test]
     fn empty_and_none_fields_convert_to_null() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();

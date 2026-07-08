@@ -89,7 +89,7 @@ impl CFree for MarmotAuditLogFile {
 /// `file` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_audit_log_file_free(file: *mut MarmotAuditLogFile) {
-    unsafe { free_boxed(file) };
+    crate::memory::free_guard(|| unsafe { free_boxed(file) });
 }
 
 /// Owned list of audit log files (`marmot_audit_log_files`).
@@ -118,7 +118,7 @@ impl CFree for MarmotAuditLogFileList {
 /// `list` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_audit_log_file_list_free(list: *mut MarmotAuditLogFileList) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// Result of POSTing one JSONL audit log to a forensic analyzer endpoint.
@@ -154,7 +154,7 @@ impl CFree for MarmotAuditLogUploadResult {
 pub unsafe extern "C" fn marmot_audit_log_upload_result_free(
     result: *mut MarmotAuditLogUploadResult,
 ) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// Result of deleting one local JSONL audit log file.
@@ -186,7 +186,7 @@ impl CFree for MarmotAuditLogDeleteResult {
 pub unsafe extern "C" fn marmot_audit_log_delete_result_free(
     result: *mut MarmotAuditLogDeleteResult,
 ) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// Result of POSTing all local audit logs to the configured tracker.
@@ -231,7 +231,7 @@ impl CFree for MarmotAuditLogTrackerUpdateResult {
 pub unsafe extern "C" fn marmot_audit_log_tracker_update_result_free(
     result: *mut MarmotAuditLogTrackerUpdateResult,
 ) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// Local forensic audit-log recording settings. Recording is opt-in. Used
@@ -276,7 +276,7 @@ impl CFree for MarmotAuditLogSettings {
 /// `settings` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_audit_log_settings_free(settings: *mut MarmotAuditLogSettings) {
-    unsafe { free_boxed(settings) };
+    crate::memory::free_guard(|| unsafe { free_boxed(settings) });
 }
 
 /// Optional human source labels attached to tracker uploads. All fields
@@ -383,7 +383,7 @@ impl CFree for MarmotAuditLogTrackerConfig {
 pub unsafe extern "C" fn marmot_audit_log_tracker_config_free(
     config: *mut MarmotAuditLogTrackerConfig,
 ) {
-    unsafe { free_boxed(config) };
+    crate::memory::free_guard(|| unsafe { free_boxed(config) });
 }
 
 #[cfg(test)]
@@ -393,7 +393,6 @@ mod tests {
 
     #[test]
     fn audit_log_file_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -419,7 +418,6 @@ mod tests {
 
     #[test]
     fn audit_log_file_list_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -445,7 +443,6 @@ mod tests {
 
     #[test]
     fn upload_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -467,7 +464,6 @@ mod tests {
 
     #[test]
     fn delete_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -486,7 +482,6 @@ mod tests {
 
     #[test]
     fn tracker_update_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -520,7 +515,6 @@ mod tests {
 
     #[test]
     fn settings_roundtrip_both_modes() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -561,7 +555,6 @@ mod tests {
 
     #[test]
     fn tracker_config_deep_roundtrip_and_borrowed_read() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();

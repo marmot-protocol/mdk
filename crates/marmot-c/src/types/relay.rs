@@ -58,7 +58,7 @@ impl CFree for MarmotRelayTelemetrySettings {
 pub unsafe extern "C" fn marmot_relay_telemetry_settings_free(
     settings: *mut MarmotRelayTelemetrySettings,
 ) {
-    unsafe { free_boxed(settings) };
+    crate::memory::free_guard(|| unsafe { free_boxed(settings) });
 }
 
 /// OTLP resource attributes supplied by the platform shell. Nested inside
@@ -131,7 +131,7 @@ impl CFree for MarmotRelayTelemetryResource {
 pub unsafe extern "C" fn marmot_relay_telemetry_resource_free(
     resource: *mut MarmotRelayTelemetryResource,
 ) {
-    unsafe { free_boxed(resource) };
+    crate::memory::free_guard(|| unsafe { free_boxed(resource) });
 }
 
 /// Non-persisted OTLP runtime metadata supplied by the host app: optional
@@ -201,7 +201,7 @@ impl CFree for MarmotRelayTelemetryRuntimeConfig {
 pub unsafe extern "C" fn marmot_relay_telemetry_runtime_config_free(
     config: *mut MarmotRelayTelemetryRuntimeConfig,
 ) {
-    unsafe { free_boxed(config) };
+    crate::memory::free_guard(|| unsafe { free_boxed(config) });
 }
 
 /// One published relay list (NIP-65 or Marmot inbox) for an account.
@@ -326,7 +326,7 @@ impl CFree for MarmotAccountRelayLists {
 /// `lists` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_account_relay_lists_free(lists: *mut MarmotAccountRelayLists) {
-    unsafe { free_boxed(lists) };
+    crate::memory::free_guard(|| unsafe { free_boxed(lists) });
 }
 
 /// Live relay-plane connection health for the diagnostics view
@@ -376,7 +376,7 @@ impl CFree for MarmotRelayHealth {
 /// `health` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_relay_health_free(health: *mut MarmotRelayHealth) {
-    unsafe { free_boxed(health) };
+    crate::memory::free_guard(|| unsafe { free_boxed(health) });
 }
 
 #[cfg(test)]

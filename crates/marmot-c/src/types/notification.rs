@@ -142,7 +142,7 @@ impl CFree for MarmotNotificationSettings {
 pub unsafe extern "C" fn marmot_notification_settings_free(
     settings: *mut MarmotNotificationSettings,
 ) {
-    unsafe { free_boxed(settings) };
+    crate::memory::free_guard(|| unsafe { free_boxed(settings) });
 }
 
 /// A user referenced by a notification (sender or receiver).
@@ -260,7 +260,7 @@ impl CFree for MarmotNotificationUpdate {
 /// `update` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_notification_update_free(update: *mut MarmotNotificationUpdate) {
-    unsafe { free_boxed(update) };
+    crate::memory::free_guard(|| unsafe { free_boxed(update) });
 }
 
 /// Result of a background collection pass
@@ -304,7 +304,7 @@ impl CFree for MarmotBackgroundNotificationCollection {
 pub unsafe extern "C" fn marmot_background_notification_collection_free(
     collection: *mut MarmotBackgroundNotificationCollection,
 ) {
-    unsafe { free_boxed(collection) };
+    crate::memory::free_guard(|| unsafe { free_boxed(collection) });
 }
 
 #[cfg(test)]
@@ -344,7 +344,6 @@ mod tests {
 
     #[test]
     fn notification_settings_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -369,7 +368,6 @@ mod tests {
 
     #[test]
     fn notification_update_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -393,7 +391,6 @@ mod tests {
 
     #[test]
     fn background_collection_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -417,7 +414,6 @@ mod tests {
 
     #[test]
     fn empty_vec_and_none_convert_to_null() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         let mirror: MarmotBackgroundNotificationCollection = BackgroundNotificationCollectionFfi {
             status: NotificationCollectionStatusFfi::NoData,

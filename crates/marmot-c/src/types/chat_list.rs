@@ -186,7 +186,7 @@ impl CFree for MarmotChatListRow {
 /// `row` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_chat_list_row_free(row: *mut MarmotChatListRow) {
-    unsafe { free_boxed(row) };
+    crate::memory::free_guard(|| unsafe { free_boxed(row) });
 }
 
 /// Owned list of chat-list rows (`marmot_chat_list` and the chat-list
@@ -216,7 +216,7 @@ impl CFree for MarmotChatListRowList {
 /// `list` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_chat_list_row_list_free(list: *mut MarmotChatListRowList) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// Why a chat-list subscription update fired.
@@ -308,7 +308,7 @@ impl CFree for MarmotChatListSubscriptionUpdate {
 pub unsafe extern "C" fn marmot_chat_list_subscription_update_free(
     update: *mut MarmotChatListSubscriptionUpdate,
 ) {
-    unsafe { free_boxed(update) };
+    crate::memory::free_guard(|| unsafe { free_boxed(update) });
 }
 
 #[cfg(test)]
@@ -380,7 +380,6 @@ mod tests {
 
     #[test]
     fn chat_list_row_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -436,7 +435,6 @@ mod tests {
 
     #[test]
     fn chat_list_row_list_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -455,7 +453,6 @@ mod tests {
 
     #[test]
     fn subscription_update_row_variant_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -481,7 +478,6 @@ mod tests {
 
     #[test]
     fn subscription_update_remove_row_variant_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();

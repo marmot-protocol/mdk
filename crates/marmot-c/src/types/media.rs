@@ -371,7 +371,7 @@ impl CFree for MarmotMediaUploadResult {
 /// `result` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_media_upload_result_free(result: *mut MarmotMediaUploadResult) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// Result of `marmot_download_media`: the decrypted plaintext plus its
@@ -418,7 +418,7 @@ impl CFree for MarmotMediaDownloadResult {
 /// `result` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_media_download_result_free(result: *mut MarmotMediaDownloadResult) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// One media attachment projected from group message history. The embedded
@@ -494,7 +494,7 @@ impl CFree for MarmotMediaRecordList {
 /// `list` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_media_record_list_free(list: *mut MarmotMediaRecordList) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 #[cfg(test)]
@@ -523,7 +523,6 @@ mod tests {
 
     #[test]
     fn media_upload_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -562,7 +561,6 @@ mod tests {
 
     #[test]
     fn media_download_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -587,7 +585,6 @@ mod tests {
 
     #[test]
     fn media_record_list_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -619,7 +616,6 @@ mod tests {
 
     #[test]
     fn attachment_reference_input_roundtrips_borrowed_fields() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -643,7 +639,6 @@ mod tests {
 
     #[test]
     fn upload_request_input_roundtrips_borrowed_fields() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -690,7 +685,6 @@ mod tests {
 
     #[test]
     fn empty_vecs_and_none_convert_to_null() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
 
         let mirror: MarmotMediaUploadResult = MediaUploadResultFfi {

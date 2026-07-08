@@ -102,9 +102,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::EncryptionFailed { .. } => MarmotStatus::EncryptionFailed,
         MarmotKitError::Io { .. } => MarmotStatus::Io,
         MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
-        MarmotKitError::ExternalSignerUnavailable { .. } => {
-            MarmotStatus::ExternalSignerUnavailable
-        }
+        MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
         MarmotKitError::ExternalSignerMismatch => MarmotStatus::ExternalSignerMismatch,
         MarmotKitError::ExternalSignerRejected => MarmotStatus::ExternalSignerRejected,
     }

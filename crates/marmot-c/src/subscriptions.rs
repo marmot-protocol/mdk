@@ -118,19 +118,20 @@ impl SubscriptionCore {
         }
     }
 
-    /// Install `task` as the handle's callback loop; refuses a second
-    /// install while one is active.
-    fn install(&self, task: JoinHandle<()>) -> MarmotStatus {
+    /// Reserve the callback slot, then spawn the pump under the lock. Taking
+    /// the slot before spawning means a rejected second install never starts
+    /// a pump that races the receiver (and immediately gets aborted). The
+    /// `spawn` closure receives the runtime handle to spawn onto.
+    fn install(&self, spawn: impl FnOnce(&Handle) -> JoinHandle<()>) -> MarmotStatus {
         let mut slot = self
             .callback_task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.as_ref().is_some_and(|t| !t.is_finished()) {
-            task.abort();
             set_last_error("a callback is already installed on this subscription");
             return MarmotStatus::Runtime;
         }
-        *slot = Some(task);
+        *slot = Some(spawn(&self.runtime));
         MarmotStatus::Ok
     }
 
@@ -252,9 +253,13 @@ pub unsafe extern "C" fn marmot_subscribe_events(
             core: SubscriptionCore::new(client.runtime.handle().clone()),
             inner: client.marmot.subscribe_events(),
         };
-        match unsafe { write_out(out_sub, boxed(handle)) } {
+        let raw = boxed(handle);
+        match unsafe { write_out(out_sub, raw) } {
             Ok(()) => MarmotStatus::Ok,
-            Err(status) => status,
+            Err(status) => {
+                unsafe { free_plain(raw) };
+                status
+            }
         }
     })
 }
@@ -310,16 +315,12 @@ pub unsafe extern "C" fn marmot_events_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 
@@ -415,9 +416,13 @@ pub unsafe extern "C" fn marmot_subscribe_timeline_messages(
                     core: SubscriptionCore::new(client.runtime.handle().clone()),
                     inner,
                 };
-                match unsafe { write_out(out_sub, boxed(handle)) } {
+                let raw = boxed(handle);
+                match unsafe { write_out(out_sub, raw) } {
                     Ok(()) => MarmotStatus::Ok,
-                    Err(status) => status,
+                    Err(status) => {
+                        unsafe { free_plain(raw) };
+                        status
+                    }
                 }
             }
             Err(err) => status_from_error(&err),
@@ -576,16 +581,12 @@ pub unsafe extern "C" fn marmot_timeline_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 
@@ -658,9 +659,13 @@ pub unsafe extern "C" fn marmot_subscribe_notifications(
                     core: SubscriptionCore::new(client.runtime.handle().clone()),
                     inner,
                 };
-                match unsafe { write_out(out_sub, boxed(handle)) } {
+                let raw = boxed(handle);
+                match unsafe { write_out(out_sub, raw) } {
                     Ok(()) => MarmotStatus::Ok,
-                    Err(status) => status,
+                    Err(status) => {
+                        unsafe { free_plain(raw) };
+                        status
+                    }
                 }
             }
             Err(err) => status_from_error(&err),
@@ -716,16 +721,12 @@ pub unsafe extern "C" fn marmot_notifications_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 
@@ -809,9 +810,13 @@ pub unsafe extern "C" fn marmot_subscribe_chats(
                     core: SubscriptionCore::new(client.runtime.handle().clone()),
                     inner,
                 };
-                match unsafe { write_out(out_sub, boxed(handle)) } {
+                let raw = boxed(handle);
+                match unsafe { write_out(out_sub, raw) } {
                     Ok(()) => MarmotStatus::Ok,
-                    Err(status) => status,
+                    Err(status) => {
+                        unsafe { free_plain(raw) };
+                        status
+                    }
                 }
             }
             Err(err) => status_from_error(&err),
@@ -890,16 +895,12 @@ pub unsafe extern "C" fn marmot_chats_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 
@@ -986,9 +987,13 @@ pub unsafe extern "C" fn marmot_subscribe_chat_list(
                     core: SubscriptionCore::new(client.runtime.handle().clone()),
                     inner,
                 };
-                match unsafe { write_out(out_sub, boxed(handle)) } {
+                let raw = boxed(handle);
+                match unsafe { write_out(out_sub, raw) } {
                     Ok(()) => MarmotStatus::Ok,
-                    Err(status) => status,
+                    Err(status) => {
+                        unsafe { free_plain(raw) };
+                        status
+                    }
                 }
             }
             Err(err) => status_from_error(&err),
@@ -1090,16 +1095,12 @@ pub unsafe extern "C" fn marmot_chat_list_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 
@@ -1192,9 +1193,13 @@ pub unsafe extern "C" fn marmot_subscribe_messages(
                     core: SubscriptionCore::new(client.runtime.handle().clone()),
                     inner,
                 };
-                match unsafe { write_out(out_sub, boxed(handle)) } {
+                let raw = boxed(handle);
+                match unsafe { write_out(out_sub, raw) } {
                     Ok(()) => MarmotStatus::Ok,
-                    Err(status) => status,
+                    Err(status) => {
+                        unsafe { free_plain(raw) };
+                        status
+                    }
                 }
             }
             Err(err) => status_from_error(&err),
@@ -1274,16 +1279,12 @@ pub unsafe extern "C" fn marmot_messages_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 
@@ -1366,9 +1367,13 @@ pub unsafe extern "C" fn marmot_subscribe_group_state(
                     core: SubscriptionCore::new(client.runtime.handle().clone()),
                     inner,
                 };
-                match unsafe { write_out(out_sub, boxed(handle)) } {
+                let raw = boxed(handle);
+                match unsafe { write_out(out_sub, raw) } {
                     Ok(()) => MarmotStatus::Ok,
-                    Err(status) => status,
+                    Err(status) => {
+                        unsafe { free_plain(raw) };
+                        status
+                    }
                 }
             }
             Err(err) => status_from_error(&err),
@@ -1450,16 +1455,12 @@ pub unsafe extern "C" fn marmot_group_state_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 
@@ -1581,9 +1582,13 @@ pub unsafe extern "C" fn marmot_watch_agent_text_stream(
                     core: SubscriptionCore::new(client.runtime.handle().clone()),
                     inner,
                 };
-                match unsafe { write_out(out_sub, boxed(handle)) } {
+                let raw = boxed(handle);
+                match unsafe { write_out(out_sub, raw) } {
                     Ok(()) => MarmotStatus::Ok,
-                    Err(status) => status,
+                    Err(status) => {
+                        unsafe { free_plain(raw) };
+                        status
+                    }
                 }
             }
             Err(err) => status_from_error(&err),
@@ -1663,16 +1668,12 @@ pub unsafe extern "C" fn marmot_agent_stream_subscription_set_callback(
             return MarmotStatus::NullPointer;
         };
         let inner = sub.inner.clone();
-        let task = spawn_callback_pump(
-            &sub.core.runtime,
-            CallbackCtx { user_data },
-            callback,
-            move || {
+        sub.core.install(|runtime| {
+            spawn_callback_pump(runtime, CallbackCtx { user_data }, callback, move || {
                 let inner = inner.clone();
                 async move { inner.next().await }
-            },
-        );
-        sub.core.install(task)
+            })
+        })
     })
 }
 

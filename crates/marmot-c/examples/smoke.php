@@ -298,9 +298,11 @@ final class Marmot
         $count = max(count($strings), 1); // char*[0] is not a valid type
         $array = $ffi->new("char*[$count]");
         foreach (array_values($strings) as $i => $s) {
-            $buf = $ffi->new('char[' . (strlen($s) + 1) . ']', false);
+            // Owned buffers (PHP frees them when $buffers is collected); the
+            // caller keeps $buffers alive across the FFI call.
+            $buf = $ffi->new('char[' . (strlen($s) + 1) . ']');
             FFI::memcpy($buf, $s, strlen($s));
-            $buffers[] = $buf; // keep alive across the call
+            $buffers[] = $buf;
             $array[$i] = FFI::cast('char*', FFI::addr($buf));
         }
         return $array;

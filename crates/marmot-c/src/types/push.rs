@@ -105,7 +105,7 @@ impl CFree for MarmotPushRegistration {
 /// library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_push_registration_free(registration: *mut MarmotPushRegistration) {
-    unsafe { free_boxed(registration) };
+    crate::memory::free_guard(|| unsafe { free_boxed(registration) });
 }
 
 /// Local-member registration state inside a group push-debug snapshot.
@@ -240,7 +240,7 @@ impl CFree for MarmotGroupPushDebugInfo {
 /// `info` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_group_push_debug_info_free(info: *mut MarmotGroupPushDebugInfo) {
-    unsafe { free_boxed(info) };
+    crate::memory::free_guard(|| unsafe { free_boxed(info) });
 }
 
 #[cfg(test)]
@@ -308,7 +308,6 @@ mod tests {
 
     #[test]
     fn push_registration_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -328,7 +327,6 @@ mod tests {
 
     #[test]
     fn group_push_debug_info_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -353,7 +351,6 @@ mod tests {
 
     #[test]
     fn none_and_empty_convert_to_null() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         let mirror: MarmotPushRegistration = PushRegistrationFfi {
             relay_hint: None,

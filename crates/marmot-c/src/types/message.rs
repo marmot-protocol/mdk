@@ -82,7 +82,7 @@ impl CFree for MarmotAppMessageRecord {
 /// `record` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_app_message_record_free(record: *mut MarmotAppMessageRecord) {
-    unsafe { free_boxed(record) };
+    crate::memory::free_guard(|| unsafe { free_boxed(record) });
 }
 
 /// Owned list of message records (`marmot_messages`).
@@ -113,7 +113,7 @@ impl CFree for MarmotAppMessageRecordList {
 pub unsafe extern "C" fn marmot_app_message_record_list_free(
     list: *mut MarmotAppMessageRecordList,
 ) {
-    unsafe { free_boxed(list) };
+    crate::memory::free_guard(|| unsafe { free_boxed(list) });
 }
 
 /// Result of pruning expired disappearing messages: the number of rows
@@ -163,7 +163,7 @@ impl CFree for MarmotSecureDeleteExpiredResult {
 pub unsafe extern "C" fn marmot_secure_delete_expired_result_free(
     result: *mut MarmotSecureDeleteExpiredResult,
 ) {
-    unsafe { free_boxed(result) };
+    crate::memory::free_guard(|| unsafe { free_boxed(result) });
 }
 
 /// One freshly delivered MLS application message.
@@ -259,7 +259,7 @@ impl CFree for MarmotRuntimeMessageReceived {
 pub unsafe extern "C" fn marmot_runtime_message_received_free(
     received: *mut MarmotRuntimeMessageReceived,
 ) {
-    unsafe { free_boxed(received) };
+    crate::memory::free_guard(|| unsafe { free_boxed(received) });
 }
 
 /// A unified update from a messages subscription. Each variant carries enough
@@ -310,7 +310,7 @@ impl CFree for MarmotMessageUpdate {
 /// `update` must be NULL or an unfreed pointer returned by this library.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_message_update_free(update: *mut MarmotMessageUpdate) {
-    unsafe { free_boxed(update) };
+    crate::memory::free_guard(|| unsafe { free_boxed(update) });
 }
 
 #[cfg(test)]
@@ -389,7 +389,6 @@ mod tests {
 
     #[test]
     fn app_message_record_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -418,7 +417,6 @@ mod tests {
 
     #[test]
     fn app_message_record_list_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -437,7 +435,6 @@ mod tests {
 
     #[test]
     fn secure_delete_expired_result_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -463,7 +460,6 @@ mod tests {
 
     #[test]
     fn runtime_message_received_deep_roundtrip() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
@@ -485,7 +481,6 @@ mod tests {
 
     #[test]
     fn message_update_roundtrips_both_variants() {
-        #[cfg(feature = "alloc-audit")]
         let _guard = crate::memory::audit::test_lock();
         #[cfg(feature = "alloc-audit")]
         let start = crate::memory::audit::live_allocations();
