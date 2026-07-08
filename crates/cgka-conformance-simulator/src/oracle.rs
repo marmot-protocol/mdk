@@ -52,6 +52,7 @@ pub enum OracleBehavior {
     MemberRemoved,
     EpochChanged,
     ForkRecovered,
+    ConvergenceDecisionObserved,
     AppInvalidated,
     LargeGroupObserved,
     SelectorDeterminism,
@@ -78,6 +79,7 @@ pub struct BehaviorEvidenceSummary {
     pub epoch_changes: usize,
     pub app_invalidations: usize,
     pub recoveries: usize,
+    pub convergence_decisions: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +374,9 @@ pub fn trace_behaviors(trace: &ScenarioTrace) -> Vec<OracleBehavior> {
     if evidence.recoveries > 0 {
         behaviors.insert(OracleBehavior::ForkRecovered);
     }
+    if evidence.convergence_decisions > 0 {
+        behaviors.insert(OracleBehavior::ConvergenceDecisionObserved);
+    }
     if evidence.max_member_count >= 20 {
         behaviors.insert(OracleBehavior::LargeGroupObserved);
     }
@@ -412,6 +417,7 @@ pub fn behavior_evidence(trace: &ScenarioTrace) -> BehaviorEvidenceSummary {
         evidence.epoch_changes += observation.epoch_changes.len();
         evidence.app_invalidations += observation.app_invalidations.len();
         evidence.recoveries += observation.recoveries.len();
+        evidence.convergence_decisions += observation.convergence_decisions.len();
     }
     evidence
 }
@@ -477,6 +483,9 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
         }
         TraceExpectation::ClientRecoveries { .. } | TraceExpectation::RecoverySummary { .. } => {
             behaviors.insert(OracleBehavior::ForkRecovered);
+        }
+        TraceExpectation::ConvergenceDecision { .. } => {
+            behaviors.insert(OracleBehavior::ConvergenceDecisionObserved);
         }
     }
     behaviors
@@ -614,6 +623,7 @@ mod tests {
             epoch_changes: Vec::new(),
             app_invalidations: Vec::new(),
             recoveries: Vec::new(),
+            convergence_decisions: Vec::new(),
         }
     }
 

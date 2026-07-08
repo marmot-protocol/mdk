@@ -2,6 +2,7 @@
 //! attachment. Provides scenario-level affordances: `send`, `tick`,
 //! `confirm_all_pending`, `assert_at_epoch`.
 
+use crate::audit_capture::{AuditCapture, CapturingRecorder};
 use crate::bus::{ClientId, TransportBus};
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
@@ -50,6 +51,9 @@ pub struct HarnessClient {
     /// automatically after the first create/join.
     default_group: Option<GroupId>,
     app_event_counter: u64,
+    /// Shared in-memory capture of the engine's forensic audit events, used to
+    /// observe decisions no `GroupEvent` exposes (e.g. `convergence_decision`).
+    audit_capture: AuditCapture,
 }
 
 pub struct ClientBuilder {
@@ -124,17 +128,14 @@ impl ClientBuilder {
 
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let (storage, storage_dir) = self.storage_mode.open().expect("storage opens");
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(self.signer.clone());
-        let engine = EngineBuilder::new(storage.clone())
-            .identity(self.identity.clone())
-            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-                keys: self.signer.clone(),
-            }))
-            .feature_registry(self.registry.clone())
-            .supported_app_components(harness_supported_app_components())
-            .peeler(Box::new(peeler))
-            .build()
-            .expect("engine builds");
+        let audit_capture = AuditCapture::default();
+        let engine = build_harness_engine(
+            &storage,
+            &self.identity,
+            &self.signer,
+            &self.registry,
+            &audit_capture,
+        );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
         HarnessClient {
             engine,
@@ -148,8 +149,34 @@ impl ClientBuilder {
             pending_events: Vec::new(),
             default_group: None,
             app_event_counter: 0,
+            audit_capture,
         }
     }
+}
+
+/// Build an engine wired the way every harness client needs it, including the
+/// [`CapturingRecorder`] that retains forensic events. `attach` and `restart`
+/// both go through here so a rebuilt engine keeps recording into the same shared
+/// buffer — otherwise a restart would silently drop captured decisions.
+fn build_harness_engine(
+    storage: &SqliteAccountStorage,
+    identity: &[u8],
+    signer: &nostr::Keys,
+    registry: &FeatureRegistry,
+    audit_capture: &AuditCapture,
+) -> Engine<SqliteAccountStorage> {
+    let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
+    EngineBuilder::new(storage.clone())
+        .identity(identity.to_vec())
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: signer.clone(),
+        }))
+        .feature_registry(registry.clone())
+        .supported_app_components(harness_supported_app_components())
+        .peeler(Box::new(peeler))
+        .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())))
+        .build()
+        .expect("engine builds")
 }
 
 fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {
@@ -270,22 +297,36 @@ impl HarnessClient {
     }
 
     pub fn restart(&mut self) {
-        let peeler = NostrMlsPeeler::new().with_welcome_signer(self.signer.clone());
-        let mut engine = EngineBuilder::new(self.storage.clone())
-            .identity(self.identity.clone())
-            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
-                keys: self.signer.clone(),
-            }))
-            .feature_registry(self.registry.clone())
-            .supported_app_components(harness_supported_app_components())
-            .peeler(Box::new(peeler))
-            .build()
-            .expect("engine rebuilds");
+        let mut engine = build_harness_engine(
+            &self.storage,
+            &self.identity,
+            &self.signer,
+            &self.registry,
+            &self.audit_capture,
+        );
         engine
             .hydrate_stable_groups_from_storage()
             .expect("engine hydrates from storage");
         self.engine = engine;
         self.pending_events.clear();
+    }
+
+    /// Drain the `convergence_decision` events the engine has emitted since the
+    /// last call.
+    ///
+    /// The engine surfaces these only through its forensic recorder, so — unlike
+    /// fork recoveries — no `GroupEvent` carries them and [`Self::drain_events`]
+    /// never sees them. Returns them oldest-first; other captured audit records
+    /// are left in place.
+    pub fn drain_convergence_decisions(&mut self) -> Vec<marmot_forensics::AuditEventKind> {
+        crate::audit_capture::drain_convergence_decisions(&self.audit_capture)
+    }
+
+    /// Discard captured convergence decisions, resetting the observation window.
+    /// Mirrors what `ScenarioStep::ClearEvents` does for `GroupEvent`s so a
+    /// scenario can isolate a decision that happens after setup.
+    pub fn clear_audit_capture(&mut self) {
+        crate::audit_capture::clear(&self.audit_capture);
     }
 
     pub fn member_id(&self) -> MemberId {

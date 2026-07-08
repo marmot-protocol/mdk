@@ -368,6 +368,7 @@ async fn openmls_canonicalization_maps_consumed_proposal_refs_to_pending_proposa
                 messages: vec![commit_msg.clone()],
             }],
             pending_messages: vec![proposal_msg.clone()],
+            already_delivered_app_ids: BTreeSet::new(),
             outbound_intents: vec![],
             policy: CanonicalizationPolicy {
                 convergence: ConvergencePolicy {
@@ -483,6 +484,7 @@ async fn openmls_canonicalization_uses_app_messages_as_branch_witnesses() {
                 },
             ],
             pending_messages: vec![app_msg.clone()],
+            already_delivered_app_ids: BTreeSet::new(),
             outbound_intents: vec![],
             policy: CanonicalizationPolicy {
                 convergence: ConvergencePolicy {

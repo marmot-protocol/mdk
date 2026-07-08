@@ -20,6 +20,7 @@ This repo owns the Rust implementation workspace for Marmot:
 - UniFFI bindings for the app runtime,
 - CLI surface, daemon, and TUI,
 - conformance simulator and vector fixtures,
+- Goggles-incident replay adapter (agent-state export parse + classify),
 - Tamarin models for distributed convergence,
 - architecture notes and CGKA contracts.
 
@@ -51,6 +52,7 @@ The canonical protocol specification lives in
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
+| Goggles incident replay adapter | `crates/incident-replay/AGENTS.md` |
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 

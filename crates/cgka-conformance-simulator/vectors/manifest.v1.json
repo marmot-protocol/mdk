@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-05-13",
+  "updated": "2026-07-06",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -104,6 +104,31 @@
       "next": "Extend the trace format so the selected branch member identity can be asserted portably."
     },
     {
+      "id": "convergence-committer-selected/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "convergence-committer-selected.v1.json",
+      "coverage": [
+        "observer-side convergence decision (not fork recovery)",
+        "committer-identity decisive rule",
+        "settled convergence_decision assertion"
+      ],
+      "next": "See convergence-witness-selected/v1 for the witness-decided companion."
+    },
+    {
+      "id": "convergence-witness-selected/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "convergence-witness-selected.v1.json",
+      "coverage": [
+        "observer-side witness-decided convergence",
+        "app-witness quorum overrides the committer tiebreak",
+        "witness weight retained across a post-delivery fork reorg",
+        "delivered app payloads not re-delivered on reorg"
+      ],
+      "next": "Use as the witness-decided convergence contract; source of the convergence incident-replay witness path."
+    },
+    {
       "id": "drop-queued/v1",
       "kind": "scenario_vector",
       "status": "portable",
@@ -163,6 +188,32 @@
         "single app payload emission after replay"
       ],
       "next": "Use as the restart-plus-delivery-fault fixture."
+    },
+    {
+      "id": "fork-recovery-incident/v1",
+      "kind": "scenario_vector",
+      "status": "incident_replay",
+      "artifact": "incidents/fork-recovery-incident.v1.json",
+      "coverage": [
+        "Goggles forensic export replayed as a conformance vector",
+        "same-epoch group-data fork recovery",
+        "designated-winner branch survival",
+        "full recovery-summary reproduction"
+      ],
+      "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
+    },
+    {
+      "id": "convergence-incident/v1",
+      "kind": "scenario_vector",
+      "status": "incident_replay",
+      "artifact": "incidents/convergence-incident.v1.json",
+      "coverage": [
+        "Goggles forensic export replayed as a conformance vector",
+        "observer-side committer-decided convergence selection",
+        "tip-committer decisive rule with no witness quorum",
+        "settled convergence-decision reproduction"
+      ],
+      "next": "Extend to witness-decided convergence once the harness counts app-message witnesses (Phase 4 follow-up)."
     },
     {
       "id": "convergence-e2e-group-events/v1",

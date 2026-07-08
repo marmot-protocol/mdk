@@ -1,0 +1,104 @@
+{
+  "scenario_name": "fork-recovery-incident/v1",
+  "vector_version": "1",
+  "conformance_version": "0.9.3",
+  "seed": null,
+  "scenario": {
+    "name": "fork-recovery-incident/v1",
+    "spec_version": "1",
+    "clients": [
+      "bob",
+      "alice"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "bob",
+        "name": "replay",
+        "invitees": [
+          "alice"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "bob",
+          "alice"
+        ]
+      },
+      {
+        "type": "update_group_data",
+        "client": "bob",
+        "name": "winner-branch",
+        "pending": "w"
+      },
+      {
+        "type": "update_group_data",
+        "client": "alice",
+        "name": "loser-branch",
+        "pending": "l"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "w"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "l"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "alice"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "bob",
+          "alice"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "recovery_summary",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    },
+    {
+      "type": "clients_converged",
+      "clients": [
+        "bob",
+        "alice"
+      ],
+      "epoch": 2,
+      "member_count": 2
+    }
+  ]
+}

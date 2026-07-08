@@ -1,0 +1,18 @@
+[package]
+name = "incident-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Goggles agent-state export → conformance-vector adapter: parse forensic incident exports and classify them for replay in the CGKA conformance simulator."
+
+[dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+cgka-conformance-simulator.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[[bin]]
+name = "incident-replay"
+path = "src/main.rs"

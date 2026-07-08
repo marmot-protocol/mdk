@@ -14,6 +14,7 @@ conformance-slow = []
 [dependencies]
 cgka-traits.workspace = true
 cgka-engine.workspace = true
+marmot-forensics.workspace = true
 storage-sqlite.workspace = true
 transport-nostr-peeler.workspace = true
 openmls.workspace = true

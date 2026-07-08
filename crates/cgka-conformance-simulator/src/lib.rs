@@ -18,6 +18,7 @@
 //!
 //! See [`tests/`](../../tests/) in this crate for canonical scenarios.
 
+mod audit_capture;
 pub mod bus;
 pub mod client;
 pub mod family;
@@ -54,9 +55,9 @@ pub use scenario::{
     run_vector_fixture_report,
 };
 pub use vector::{
-    AppInvalidationObservation, ClientEventCounts, ClientObservation, EpochChangeObservation,
-    ExpectationFailure, ForkRecoveryObservation, PendingResolutionObservation,
-    RecoveryOrderingKeyObservation, ScenarioAdminPolicyObservation, ScenarioErrorObservation,
-    ScenarioTrace, TraceExpectation, VectorFixture, VectorMismatch, compare_trace_expectations,
-    observe_client,
+    AppInvalidationObservation, ClientEventCounts, ClientObservation,
+    ConvergenceDecisionObservation, EpochChangeObservation, ExpectationFailure,
+    ForkRecoveryObservation, PendingResolutionObservation, RecoveryOrderingKeyObservation,
+    ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioTrace, TraceExpectation,
+    VectorFixture, VectorMismatch, compare_trace_expectations, observe_client,
 };

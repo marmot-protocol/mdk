@@ -763,6 +763,7 @@ dependencies = [
  "cgka-engine",
  "cgka-traits",
  "hex",
+ "marmot-forensics",
  "nostr",
  "openmls",
  "openmls_rust_crypto",
@@ -2208,6 +2209,17 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "incident-replay"
+version = "0.9.3"
+dependencies = [
+ "cgka-conformance-simulator",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

@@ -80,6 +80,26 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: same-epoch invite commit race.
 - Expected: one invite branch wins, the other is invalidated, and active clients converge on the same member set.
 
+### `convergence-committer-selected/v1`
+
+- File: `vectors/convergence-committer-selected.v1.json`
+- Setup: Alice and Bob are both admins; each invites a different member from the same epoch. Carol is a passive observer who commits nothing.
+- Pressure: two competing privileged commits reach Carol at once, so her convergence selector — not the fork-recovery seam — picks the canonical branch.
+- Expected: Carol's settled `convergence_decision` selects the branch by authenticated committer identity (`tip_committer`) at tip epoch 2, with no app-witness quorum.
+
+### `convergence-witness-selected/v1`
+
+- File: `vectors/convergence-witness-selected.v1.json`
+- Setup: Alice and Bob are both admins; each invites a different member from the same epoch. Carol is a passive
+  observer. Two distinct senders post app messages on Alice's branch, and Carol delivers (applies) them before Bob's
+  competing same-epoch commit reaches her.
+- Pressure: Carol has already delivered the app messages on Alice's branch when Bob's competing commit arrives, forcing
+  a fork reorg. The app-witness quorum must survive that reorg and override the committer tiebreak — the case that
+  matches real convergence-driven traffic.
+- Expected: Carol's settled `convergence_decision` selects the witnessed branch at tip epoch 2 with `witness_quorum_met`
+  and an app-witness score of 2 (decisive rule `effective_commit_depth`), and each app payload is delivered exactly once
+  (no re-delivery on the reorg).
+
 ### `drop-queued/v1`
 
 - File: `vectors/drop-queued.v1.json`
@@ -114,6 +134,32 @@ These are the scenarios another implementation should be able to load from JSON 
 - Setup: Alice creates a group with Bob and Carol. Bob sends Alice an app message.
 - Pressure: Bob's message is delayed, Alice restarts, and the released message is duplicated and reordered.
 - Expected: Alice hydrates the stable group after restart and receives Bob's payload once.
+
+## Incident-Replay Vectors
+
+These vectors are synthesized from Goggles `agent-state.json` forensic exports by the `incident-replay` adapter, then
+verified against the simulator before they are committed. They live under `vectors/incidents/` and are not yet part of
+the top-level portable-vector test (Phase 5 wires the directory into CI).
+
+### `fork-recovery-incident/v1`
+
+- File: `vectors/incidents/fork-recovery-incident.v1.json`
+- Setup: two clients create a group, then raise competing group-data commits from the same epoch — the concurrent-fork
+  shape the adapter derives from a fork-recovery incident.
+- Pressure: same-epoch group-data commit race with deferred delivery (no partition needed; the commits are concurrent).
+- Expected: the engine fork-recovers on delivery, the designated winner's branch survives, and both clients converge at
+  epoch 2 with the full recovery summary matching the recorded incident.
+
+### `convergence-incident/v1`
+
+- File: `vectors/incidents/convergence-incident.v1.json`
+- Setup: two admins create a group with a passive observer, then raise competing invite commits from the same epoch —
+  the committer-decided convergence shape the adapter derives from a convergence incident.
+- Pressure: two competing same-epoch branches reach the observer, whose convergence selector — not the fork-recovery
+  seam — picks the canonical branch.
+- Expected: the observer's settled `convergence_decision` is decided by the authenticated-committer tiebreak
+  (`tip_committer`) at tip epoch 2 with no app-witness quorum. Witness-decided convergence (the real-traffic case) is a
+  documented follow-up: the harness does not yet count app-message witnesses through the stored-convergence path.
 
 ## Rust-Only Harness Scenarios
 

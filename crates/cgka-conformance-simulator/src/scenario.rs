@@ -469,6 +469,7 @@ async fn run_scenario_report_inner(
                 for label in labels {
                     let client = client_mut(&mut clients, label, step_index)?;
                     client.drain_events();
+                    client.clear_audit_capture();
                 }
             }
             ScenarioStep::DropQueued { index } => {
