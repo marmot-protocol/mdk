@@ -207,6 +207,9 @@ const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
+/// Cap for advisory account-setup steps (directory discovery/refresh): their
+/// results are best-effort, so a slow indexer must not stall login.
+pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
 const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
 /// Maximum amount the persisted transport cursor may run ahead of local
