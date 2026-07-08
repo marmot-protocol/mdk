@@ -125,6 +125,54 @@ fn stamped_profile_wins_over_stale_relay_copy_in_if_newer_check() {
     assert!(zero_cache.created_at > stale_relay_copy.created_at);
 }
 
+#[test]
+fn merge_user_profile_update_preserves_unknown_kind0_fields() {
+    let current = UserProfileMetadata {
+        name: Some("old-name".to_owned()),
+        display_name: Some("Old Name".to_owned()),
+        picture: Some("https://example.test/old.png".to_owned()),
+        created_at: 123,
+        source_relays: vec!["wss://relay.example".to_owned()],
+        extra: std::collections::BTreeMap::from([
+            (
+                "website".to_owned(),
+                serde_json::json!("https://example.test"),
+            ),
+            ("bot".to_owned(), serde_json::json!(false)),
+            (
+                "custom".to_owned(),
+                serde_json::json!({"source": "other-client"}),
+            ),
+        ]),
+        ..UserProfileMetadata::default()
+    };
+    let update = UserProfileMetadata {
+        name: Some("new-name".to_owned()),
+        display_name: Some("New Name".to_owned()),
+        about: Some("updated about".to_owned()),
+        picture: None,
+        created_at: 0,
+        source_relays: Vec::new(),
+        ..UserProfileMetadata::default()
+    };
+
+    let merged = merge_user_profile_update(current, update);
+
+    assert_eq!(merged.name.as_deref(), Some("new-name"));
+    assert_eq!(merged.display_name.as_deref(), Some("New Name"));
+    assert_eq!(merged.about.as_deref(), Some("updated about"));
+    assert_eq!(merged.picture, None);
+    assert_eq!(
+        merged.extra.get("website"),
+        Some(&serde_json::json!("https://example.test"))
+    );
+    assert_eq!(merged.extra.get("bot"), Some(&serde_json::json!(false)));
+    assert_eq!(
+        merged.extra.get("custom"),
+        Some(&serde_json::json!({"source": "other-client"}))
+    );
+}
+
 #[tokio::test]
 async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout() {
     let (commands, _commands_rx) = mpsc::channel(1);

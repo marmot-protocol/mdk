@@ -61,6 +61,8 @@ pub struct UserProfileMetadata {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_relays: Vec<String>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,8 +256,35 @@ pub(crate) fn profile_from_record(
             lud16: string_field(&content, "lud16"),
             created_at: record.event.created_at,
             source_relays: source_relays_from_record(&record),
+            extra: extra_profile_fields(&content),
         },
     ))
+}
+
+fn extra_profile_fields(content: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
+    let Some(object) = content.as_object() else {
+        return BTreeMap::new();
+    };
+    object
+        .iter()
+        .filter(|(key, _)| !is_known_profile_field(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn is_known_profile_field(field: &str) -> bool {
+    matches!(
+        field,
+        "name"
+            | "display_name"
+            | "displayName"
+            | "about"
+            | "picture"
+            | "nip05"
+            | "lud16"
+            | "created_at"
+            | "source_relays"
+    )
 }
 
 /// Defensive cap on any single ingested profile field. Nostr kind:0 content
@@ -363,6 +392,11 @@ pub(crate) fn field_rank(field: &str) -> u8 {
 
 pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
     let mut value = serde_json::Map::new();
+    for (key, extra_value) in &profile.extra {
+        if !is_known_profile_field(key) {
+            value.insert(key.clone(), extra_value.clone());
+        }
+    }
     if let Some(name) = profile.name.as_ref().filter(|value| !value.is_empty()) {
         value.insert("name".to_owned(), serde_json::Value::String(name.clone()));
     }

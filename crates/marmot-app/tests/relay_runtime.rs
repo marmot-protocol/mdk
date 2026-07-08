@@ -557,6 +557,93 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
 }
 
 #[tokio::test]
+async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let bootstrap = AccountRelayListBootstrap::new(vec![endpoint(&url)], vec![endpoint(&url)]);
+
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+
+    runtime
+        .publish_user_profile(
+            &created.account.label,
+            UserProfileMetadata {
+                name: Some("first".to_owned()),
+                display_name: Some("First".to_owned()),
+                extra: std::collections::BTreeMap::from([
+                    (
+                        "website".to_owned(),
+                        serde_json::json!("https://example.test"),
+                    ),
+                    (
+                        "banner".to_owned(),
+                        serde_json::json!("https://example.test/banner.png"),
+                    ),
+                    ("bot".to_owned(), serde_json::json!(false)),
+                ]),
+                ..UserProfileMetadata::default()
+            },
+            bootstrap.clone(),
+        )
+        .await
+        .unwrap();
+
+    let updated = runtime
+        .publish_user_profile(
+            &created.account.label,
+            UserProfileMetadata {
+                name: Some("second".to_owned()),
+                about: Some("known-field edit".to_owned()),
+                ..UserProfileMetadata::default()
+            },
+            bootstrap,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.name.as_deref(), Some("second"));
+    assert_eq!(updated.about.as_deref(), Some("known-field edit"));
+    assert_eq!(
+        updated.extra.get("website"),
+        Some(&serde_json::json!("https://example.test"))
+    );
+    assert_eq!(
+        updated.extra.get("banner"),
+        Some(&serde_json::json!("https://example.test/banner.png"))
+    );
+    assert_eq!(updated.extra.get("bot"), Some(&serde_json::json!(false)));
+
+    let fetched = app
+        .fetch_current_user_profile_for_account_id(
+            &created.account.account_id_hex,
+            vec![endpoint(&url)],
+        )
+        .await
+        .unwrap()
+        .expect("profile on relay");
+    assert_eq!(fetched.name.as_deref(), Some("second"));
+    assert_eq!(
+        fetched.extra.get("website"),
+        Some(&serde_json::json!("https://example.test"))
+    );
+    assert_eq!(
+        fetched.extra.get("banner"),
+        Some(&serde_json::json!("https://example.test/banner.png"))
+    );
+    assert_eq!(fetched.extra.get("bot"), Some(&serde_json::json!(false)));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn app_runtime_reuses_initial_key_package_when_republishing() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -4434,6 +4521,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             lud16: None,
             created_at: 0,
             source_relays: Vec::new(),
+            extra: Default::default(),
         },
         bootstrap.clone(),
     )
@@ -4450,6 +4538,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
             lud16: None,
             created_at: 0,
             source_relays: Vec::new(),
+            extra: Default::default(),
         },
         bootstrap.clone(),
     )

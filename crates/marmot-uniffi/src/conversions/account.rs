@@ -121,6 +121,7 @@ impl From<UserProfileMetadataFfi> for UserProfileMetadata {
             lud16: value.lud16,
             created_at: 0,
             source_relays: vec![],
+            extra: Default::default(),
         }
     }
 }

@@ -2153,6 +2153,12 @@ impl MarmotAppRuntime {
         bootstrap: AccountRelayListBootstrap,
     ) -> Result<UserProfileMetadata, AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        if let Some(current) = self
+            .latest_known_user_profile_for_publish(&account.account_id_hex, &bootstrap)
+            .await?
+        {
+            profile = merge_user_profile_update(current, profile);
+        }
         // Stamp the just-published profile with the current time before caching
         // it. The published kind-0 event is authored with `now`, so the cached
         // own-account entry must carry a matching `created_at`. Callers that
@@ -2172,6 +2178,38 @@ impl MarmotAppRuntime {
             .app
             .remember_directory_profile(&account.account_id_hex, &profile)?;
         Ok(profile)
+    }
+
+    async fn latest_known_user_profile_for_publish(
+        &self,
+        account_id_hex: &str,
+        bootstrap: &AccountRelayListBootstrap,
+    ) -> Result<Option<UserProfileMetadata>, AppError> {
+        let cached = self
+            .accounts
+            .app
+            .directory_entry_for_account_id(account_id_hex)?
+            .and_then(|entry| entry.profile);
+        match self
+            .accounts
+            .app
+            .fetch_current_user_profile_for_account_id(
+                account_id_hex,
+                bootstrap.bootstrap_relays.clone(),
+            )
+            .await
+        {
+            Ok(Some(profile)) => Ok(Some(profile)),
+            Ok(None) => Ok(cached),
+            Err(error) => {
+                tracing::debug!(
+                    account_id_hex,
+                    error = %error,
+                    "falling back to cached profile before publish"
+                );
+                Ok(cached)
+            }
+        }
     }
 
     pub async fn publish_account_follow_list(
@@ -3551,6 +3589,24 @@ fn stamp_published_profile_created_at(profile: &mut UserProfileMetadata, now: u6
     if profile.created_at == 0 {
         profile.created_at = now;
     }
+}
+
+fn merge_user_profile_update(
+    mut current: UserProfileMetadata,
+    update: UserProfileMetadata,
+) -> UserProfileMetadata {
+    current.name = update.name;
+    current.display_name = update.display_name;
+    current.about = update.about;
+    current.picture = update.picture;
+    current.nip05 = update.nip05;
+    current.lud16 = update.lud16;
+    current.created_at = update.created_at;
+    current.source_relays = update.source_relays;
+    if !update.extra.is_empty() {
+        current.extra = update.extra;
+    }
+    current
 }
 
 #[cfg(test)]

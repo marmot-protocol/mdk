@@ -16,7 +16,9 @@ use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
 use crate::conversions::{app_group_from_stored_group, stored_group_from_app_group};
-use crate::directory::records::{FetchedFollowList, public_directory_user_record};
+use crate::directory::records::{
+    FetchedFollowList, profile_content_json, public_directory_user_record,
+};
 use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
     relay_list_queries, require_key_package_tag, require_multi_value_key_package_tag,
@@ -266,6 +268,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
                     lud16: None,
                     created_at: 0,
                     source_relays: Vec::new(),
+                    extra: Default::default(),
                 }),
                 follows: Vec::new(),
                 follow_source_relays: Vec::new(),
@@ -323,6 +326,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
                     lud16: None,
                     created_at: 1_700_000_001,
                     source_relays: Vec::new(),
+                    extra: Default::default(),
                 }),
                 follows: Some(Vec::new()),
                 metadata_updated_at: Some(1_700_000_001),
@@ -365,12 +369,40 @@ fn test_directory_record(account_id_hex: &str, name: &str, created_at: u64) -> U
             lud16: None,
             created_at,
             source_relays: Vec::new(),
+            extra: Default::default(),
         }),
         follows: Vec::new(),
         follow_source_relays: Vec::new(),
         relay_lists: AccountRelayListStatus::empty(),
         key_package: None,
     }
+}
+
+#[test]
+fn profile_content_json_preserves_unknown_kind0_fields() {
+    let profile = UserProfileMetadata {
+        name: Some("alice".to_owned()),
+        extra: std::collections::BTreeMap::from([
+            (
+                "website".to_owned(),
+                serde_json::json!("https://example.test"),
+            ),
+            (
+                "banner".to_owned(),
+                serde_json::json!("https://example.test/banner.png"),
+            ),
+            ("bot".to_owned(), serde_json::json!(false)),
+            ("name".to_owned(), serde_json::json!("spoofed-extra-name")),
+        ]),
+        ..UserProfileMetadata::default()
+    };
+
+    let content = profile_content_json(&profile);
+
+    assert_eq!(content["name"], "alice");
+    assert_eq!(content["website"], "https://example.test");
+    assert_eq!(content["banner"], "https://example.test/banner.png");
+    assert_eq!(content["bot"], false);
 }
 
 #[test]
