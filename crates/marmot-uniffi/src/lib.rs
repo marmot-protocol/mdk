@@ -23,11 +23,13 @@ use cgka_traits::TransportEndpoint;
 use marmot_app::{MarmotApp, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination};
 
 mod commands;
-mod conversions;
+// Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so
+// the C ABI can never drift from the Swift/Kotlin surface.
+pub mod conversions;
 mod errors;
 mod external_signer;
 mod markdown;
-mod subscriptions;
+pub mod subscriptions;
 
 use conversions::group_id_from_hex;
 pub use errors::MarmotKitError;

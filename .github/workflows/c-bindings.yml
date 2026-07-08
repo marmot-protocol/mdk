@@ -1,0 +1,152 @@
+name: Marmot C Bindings
+
+on:
+  push:
+    tags:
+      - marmotc-v*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marmot-c-bindings-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  linux-bindings:
+    name: Build Linux C bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^marmotc-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: C binding releases must use a version tag like marmotc-v0.1.0" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+
+      - name: Build C bindings
+        shell: bash
+        run: ./crates/marmot-c/c-bindings.sh
+
+      - name: Smoke-test against gcc and clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          ./crates/marmot-c/c-smoke.sh gcc clang
+
+      - name: Package bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#marmotc-v}"
+          workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          lock_sha="$(sha256sum Cargo.lock | awk '{print $1}')"
+
+          stage_parent="build/marmot-c-stage"
+          stage="$stage_parent/marmot-c-$version"
+          asset="marmot-c-linux-x86_64-$version.zip"
+          rm -rf "$stage_parent" "$asset" "$asset.sha256"
+          mkdir -p "$stage" dist
+
+          cp -R crates/marmot-c/output/. "$stage/"
+          cp crates/marmot-c/README.md "$stage/"
+          cat > "$stage/manifest.json" <<EOF
+          {
+            "artifact": "marmot-c",
+            "version": "$version",
+            "workspace_version": "$workspace_version",
+            "cargo_lock_sha256": "$lock_sha",
+            "commit": "$GITHUB_SHA",
+            "target": "x86_64-unknown-linux-gnu"
+          }
+          EOF
+
+          (cd "$stage_parent" && zip -r "../../$asset" "marmot-c-$version")
+          sha256sum "$asset" | awk -v name="$asset" '{print $1 "  " name}' > "$asset.sha256"
+          cp "$asset" "$asset.sha256" dist/
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: marmot-c-linux
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - linux-bindings
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download binding artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name marmot-c-linux --dir dist
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="${tag#marmotc-v}"
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          Marmot C bindings generated from MDK commit \`$GITHUB_SHA\`.
+
+          Assets:
+          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README.
+
+          Verify downloads with the accompanying \`.sha256\` files.
+          EOF
+
+          assets=(
+            "dist/marmot-c-linux-x86_64-$version.zip"
+            "dist/marmot-c-linux-x86_64-$version.zip.sha256"
+          )
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "v$version - Marmot C" --notes-file "$notes"
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "v$version - Marmot C" \
+              --notes-file "$notes"
+          fi

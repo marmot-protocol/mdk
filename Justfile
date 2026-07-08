@@ -265,6 +265,14 @@ dead-code-audit:
 naming-gate:
     ./scripts/check_legacy_naming.sh
 
+# Regenerate the checked-in C header from crates/marmot-c (CI diff-gates it).
+c-header:
+    cbindgen --config crates/marmot-c/cbindgen.toml --crate marmot-c --output crates/marmot-c/include/marmot.h crates/marmot-c
+
+# Build marmot-c and compile+run the C smoke test (valgrind when available).
+c-smoke:
+    ./crates/marmot-c/c-smoke.sh
+
 # Fast local pre-push gate: mechanical/static checks only. GitHub CI runs the
 # full `just ci` suite (including the workspace test matrix).
 fast-ci: fmt-check naming-gate check clippy
