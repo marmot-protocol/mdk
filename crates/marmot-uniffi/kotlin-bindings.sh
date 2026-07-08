@@ -192,7 +192,7 @@ echo "==> Building host dylib (used for binding generation)"
 # reads the uniffi metadata through it, and with RUSTFLAGS="-C strip=symbols"
 # (release.sh sets it for the Android .so's) bindgen exits 0 while emitting
 # NOTHING. Strip only the Android target builds below, never this one.
-RUSTFLAGS="" cargo build --release -p "$CRATE_NAME" "${FEATURE_ARGS[@]}"
+RUSTFLAGS="" cargo build --release -p "$CRATE_NAME" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "==> Generating Kotlin bindings"
 RUSTFLAGS="" cargo run --release -p "$CRATE_NAME" --features "$BINDGEN_FEATURES" --bin uniffi-bindgen -- \
@@ -218,7 +218,7 @@ for abi in $ANDROID_ABIS; do
   target="$(abi_to_target "$abi")"
   echo "==> Building Android target $target ($abi)"
   configure_android_toolchain "$NDK_DIR" "$HOST_TAG" "$target"
-  cargo build --release -p "$CRATE_NAME" --target "$target" "${FEATURE_ARGS[@]}"
+  cargo build --release -p "$CRATE_NAME" --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
   mkdir -p "$JNI_OUT_DIR/$abi"
   cp "$TARGET_DIR/$target/release/lib${LIB_BASENAME}.so" "$JNI_OUT_DIR/$abi/"
 done
