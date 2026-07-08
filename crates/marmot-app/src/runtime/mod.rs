@@ -3026,13 +3026,18 @@ impl AccountManager {
         };
 
         self.shared.lifecycle().ensure_running()?;
-        let _ = self
-            .app
-            .refresh_user_directory_for_account_id(
+        // Advisory refresh, bounded like the matching step in
+        // login_external_signer.
+        let _ = bounded_advisory_step(
+            &self.shared.app_performance_telemetry(),
+            ACCOUNT_SETUP_ADVISORY_WAIT,
+            "import_directory_refresh",
+            self.app.refresh_user_directory_for_account_id(
                 &account.account_id_hex,
                 directory_bootstrap_relays.clone(),
-            )
-            .await;
+            ),
+        )
+        .await;
         if account.signed_out {
             account = self
                 .app
