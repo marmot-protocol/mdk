@@ -105,19 +105,22 @@ newline, then space boundaries and never splits a UTF-8 code point.
 
 ## Workdir Picker
 
-On the first message in a new Marmot group, a leading `/<name>` selects
-`~/<name>` as the OpenCode working directory if it is a direct child directory of
-`$HOME`.
+On the first message in a new Marmot group, a leading `/<path>` selects
+`~/<path>` as the OpenCode working directory if the canonical target is inside
+`$HOME`. Path segments are separated by `/` and each segment must be
+ASCII-alphanumeric or `.`, `_`, `-`; empty, `.`, and `..` segments are rejected.
 
 Examples:
 
 ```text
 /mdk fix the failing test
 /mdk
+/projects/mdk fix the failing test
 ```
 
 When the message is only the picker, `wn-opencode` stores the workdir and asks
-for the next prompt.
+for the next prompt. Symlinks that resolve outside `$HOME` are rejected after
+canonicalization.
 
 ## Security Notes
 
