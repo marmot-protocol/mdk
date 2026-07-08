@@ -463,6 +463,42 @@ fn sqlite_file_requires_key_for_test(path: &Path) -> bool {
 }
 
 #[tokio::test]
+async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    // A discovery endpoint that accepts TCP and then never speaks: the
+    // advisory directory preflight against it can only end via its time cap.
+    let stall = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stall_url = format!("ws://{}", stall.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = stall.accept().await {
+            held.push(socket);
+        }
+    });
+
+    use nostr::prelude::ToBech32;
+    let secret = nostr::Keys::generate().secret_key().to_bech32().unwrap();
+    let imported = timeout(
+        Duration::from_secs(40),
+        runtime.create_or_import_account(AccountSetupRequest {
+            identity: Some(secret),
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            discovery_relays: vec![endpoint(&stall_url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+        }),
+    )
+    .await
+    .expect("import must not hang on a stalled discovery endpoint")
+    .expect("import should succeed without the advisory preflight");
+    assert!(imported.account.local_signing);
+}
+
+#[tokio::test]
 async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;

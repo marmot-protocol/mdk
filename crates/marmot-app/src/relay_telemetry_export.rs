@@ -139,6 +139,14 @@ pub mod metric_names {
     pub const APP_ACCOUNT_SYNC_SUCCESSES: &str = "app_account_sync_successes";
     /// Failed per-account syncs.
     pub const APP_ACCOUNT_SYNC_FAILURES: &str = "app_account_sync_failures";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_DURATION: &str =
+        "app_account_setup_advisory_step_duration_ms";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_ATTEMPTS: &str =
+        "app_account_setup_advisory_step_attempts";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_SUCCESSES: &str =
+        "app_account_setup_advisory_step_successes";
+    pub const APP_ACCOUNT_SETUP_ADVISORY_STEP_FAILURES: &str =
+        "app_account_setup_advisory_step_failures";
     /// One-sided outbound message send duration histogram.
     pub const APP_OUTBOUND_MESSAGE_SEND_DURATION: &str = "app_outbound_message_send_duration_ms";
     /// One-sided outbound message send attempts.
@@ -586,6 +594,14 @@ fn append_app_performance_points(
         metric_names::APP_ACCOUNT_SYNC_ATTEMPTS,
         metric_names::APP_ACCOUNT_SYNC_SUCCESSES,
         metric_names::APP_ACCOUNT_SYNC_FAILURES,
+    );
+    append_app_operation_points(
+        points,
+        &app_performance.account_setup_advisory_step,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_DURATION,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_ATTEMPTS,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_SUCCESSES,
+        metric_names::APP_ACCOUNT_SETUP_ADVISORY_STEP_FAILURES,
     );
     append_app_operation_points(
         points,

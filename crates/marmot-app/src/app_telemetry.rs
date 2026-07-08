@@ -6,7 +6,7 @@
 //! key material.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use transport_nostr_adapter::{DurationHistogramSnapshot, HistogramBucket};
@@ -24,6 +24,7 @@ pub(crate) enum AppPerformanceOperation {
     AccountOpen,
     AccountCatchUp,
     AccountSync,
+    AccountSetupAdvisoryStep,
     OutboundMessageSend,
     GroupInviteMembers,
     GroupInviteKeyPackageLookup,
@@ -60,6 +61,7 @@ pub struct AppPerformanceSnapshot {
     pub account_open: AppPerformanceOperationSnapshot,
     pub account_catch_up: AppPerformanceOperationSnapshot,
     pub account_sync: AppPerformanceOperationSnapshot,
+    pub account_setup_advisory_step: AppPerformanceOperationSnapshot,
     pub outbound_message_send: AppPerformanceOperationSnapshot,
     #[serde(default)]
     pub group_invite_members: AppPerformanceOperationSnapshot,
@@ -100,6 +102,7 @@ struct AppPerformanceTelemetryInner {
     account_open: AppPerformanceOperationTelemetry,
     account_catch_up: AppPerformanceOperationTelemetry,
     account_sync: AppPerformanceOperationTelemetry,
+    account_setup_advisory_step: AppPerformanceOperationTelemetry,
     outbound_message_send: AppPerformanceOperationTelemetry,
     group_invite_members: AppPerformanceOperationTelemetry,
     group_invite_key_package_lookup: AppPerformanceOperationTelemetry,
@@ -211,6 +214,9 @@ impl AppPerformanceTelemetry {
                 inner.account_catch_up.record(duration, success);
             }
             AppPerformanceOperation::AccountSync => inner.account_sync.record(duration, success),
+            AppPerformanceOperation::AccountSetupAdvisoryStep => {
+                inner.account_setup_advisory_step.record(duration, success)
+            }
             AppPerformanceOperation::OutboundMessageSend => {
                 inner.outbound_message_send.record(duration, success);
             }
@@ -272,6 +278,7 @@ impl AppPerformanceTelemetry {
             account_open: inner.account_open.snapshot(),
             account_catch_up: inner.account_catch_up.snapshot(),
             account_sync: inner.account_sync.snapshot(),
+            account_setup_advisory_step: inner.account_setup_advisory_step.snapshot(),
             outbound_message_send: inner.outbound_message_send.snapshot(),
             group_invite_members: inner.group_invite_members.snapshot(),
             group_invite_key_package_lookup: inner.group_invite_key_package_lookup.snapshot(),
@@ -288,6 +295,45 @@ impl AppPerformanceTelemetry {
             group_mls_state_read: inner.group_mls_state_read.snapshot(),
             media_upload: inner.media_upload.snapshot(),
             media_download: inner.media_download.snapshot(),
+        }
+    }
+}
+
+/// Run a best-effort account-setup step under a hard time cap. A capped step
+/// behaves exactly like its error path — the caller proceeds without it — and
+/// the cap firing is traced and recorded as a failed
+/// [`AppPerformanceOperation::AccountSetupAdvisoryStep`] sample, so the cap
+/// value can be validated against the fleet rather than the one device it was
+/// tuned on.
+pub(crate) async fn bounded_advisory_step<F: std::future::Future>(
+    telemetry: &AppPerformanceTelemetry,
+    cap: Duration,
+    step: &'static str,
+    future: F,
+) -> Option<F::Output> {
+    let started = Instant::now();
+    match tokio::time::timeout(cap, future).await {
+        Ok(value) => {
+            telemetry.record(
+                AppPerformanceOperation::AccountSetupAdvisoryStep,
+                started.elapsed(),
+                true,
+            );
+            Some(value)
+        }
+        Err(_) => {
+            tracing::debug!(
+                target: "marmot_app::app_telemetry",
+                step,
+                cap_ms = cap.as_millis() as u64,
+                "advisory account-setup step hit its time cap"
+            );
+            telemetry.record(
+                AppPerformanceOperation::AccountSetupAdvisoryStep,
+                started.elapsed(),
+                false,
+            );
+            None
         }
     }
 }
@@ -334,5 +380,35 @@ mod tests {
                 .any(|bucket| bucket.upper_bound_ms == 50 && bucket.count == 1)
         );
         assert_eq!(snapshot.app_start.duration_ms.overflow_count, 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_advisory_step_returns_the_value_and_records_success() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let value =
+            bounded_advisory_step(&telemetry, Duration::from_secs(5), "test_step", async { 7 })
+                .await;
+        assert_eq!(value, Some(7));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_setup_advisory_step.attempts, 1);
+        assert_eq!(snapshot.account_setup_advisory_step.successes, 1);
+        assert_eq!(snapshot.account_setup_advisory_step.failures, 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_advisory_step_caps_a_stalled_future_and_records_the_cap() {
+        let telemetry = AppPerformanceTelemetry::default();
+        let value: Option<()> = bounded_advisory_step(
+            &telemetry,
+            Duration::from_millis(50),
+            "test_step",
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(value, None);
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.account_setup_advisory_step.attempts, 1);
+        assert_eq!(snapshot.account_setup_advisory_step.successes, 0);
+        assert_eq!(snapshot.account_setup_advisory_step.failures, 1);
     }
 }
