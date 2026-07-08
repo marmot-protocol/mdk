@@ -8,11 +8,13 @@
 //!
 //! Two reproducible shapes are recovered: the **committer-decided** case (the
 //! selector reached the authenticated-committer tiebreak with no app-witness
-//! quorum) and the **witness-decided** case (an app-witness quorum won by greater
-//! effective depth) — the case that matches real convergence traffic. Anything
-//! else (a committer tiebreak that itself met a quorum, or a priority/digest/
-//! differing-depth rule) fail-closes rather than synthesize a vector that would
-//! silently assert the wrong outcome.
+//! quorum) and the **witness-decided** case (two equal-depth branches where an
+//! app-witness quorum's boost broke the tie) — the case that matches real
+//! convergence traffic. Anything else fail-closes rather than synthesize a
+//! vector that would silently assert the wrong outcome: a committer tiebreak that
+//! itself met a quorum, a witness winner whose branches were *not* at equal depth
+//! (so it won on raw commit depth, not the quorum boost), indistinguishable
+//! candidate branches, or a priority/digest rule.
 
 use crate::export::{AgentStateExport, ConvergenceCandidate, ConvergenceRule, EventKind};
 
@@ -57,6 +59,8 @@ pub enum ConvergenceRecoveryError {
     NoConvergenceDecision,
     #[error("expected exactly two contested branches, found {0}")]
     AmbiguousCandidates(usize),
+    #[error("the two candidates do not have distinct, non-empty branch ids")]
+    IndistinctCandidates,
     #[error("the convergence_decision recorded no decisive selector rule")]
     NoDecisiveRule,
     #[error(
@@ -76,6 +80,12 @@ pub enum ConvergenceRecoveryError {
          won by commit depth, which the witness-decided vector cannot reproduce"
     )]
     WitnessQuorumUnconfirmed,
+    #[error(
+        "the effective-depth winner's quorum boost is not provably decisive: the two branches are \
+         not recorded at equal valid commit depth, so a deeper branch could have won on raw depth, \
+         which the equal-depth witness-decided vector cannot reproduce"
+    )]
+    WitnessBoostNotDecisive,
 }
 
 /// Recover the convergence decision, or return the fail-closed reason it can't
@@ -109,8 +119,20 @@ pub fn recover_convergence(
         ));
     }
 
+    // A faithful two-branch race needs two distinguishable branches. A missing
+    // (empty) or duplicated branch id means the export did not actually record two
+    // distinct branches — `selected_branch_id` could not pick a unique winner and
+    // the loser would be ambiguous — so fail closed rather than reproduce a
+    // fictional race.
+    if candidates[0].branch_id.is_empty()
+        || candidates[1].branch_id.is_empty()
+        || candidates[0].branch_id == candidates[1].branch_id
+    {
+        return Err(ConvergenceRecoveryError::IndistinctCandidates);
+    }
+
     let decisive = decisive_rule(rule_trace).ok_or(ConvergenceRecoveryError::NoDecisiveRule)?;
-    let winner = winning_candidate(selected_branch_id, candidates)
+    let (winner, loser) = winner_and_loser(selected_branch_id, candidates)
         .ok_or(ConvergenceRecoveryError::MissingSelectedBranch)?;
     let quorum_met = winner
         .score
@@ -122,16 +144,21 @@ pub fn recover_convergence(
     // - `tip_committer` is committer-decided only with *no* quorum; a committer
     //   tiebreak that met (or might have met) a quorum can't be reproduced by the
     //   no-witness committer vector.
-    // - `effective_commit_depth` is witness-decided only with a *met* quorum (which
-    //   implies an app-witness score at the quorum threshold); without one the
-    //   winner won by raw commit depth (a differing-depth branch), which the
-    //   equal-depth witness vector can't reproduce. The rule is supported here — the
-    //   quorum status is what is not — so this is a quorum error, not an
-    //   `UnsupportedDecisiveRule`.
-    // - any other rule (priority, digest, valid-depth) has no v1 vector shape.
+    // - `effective_commit_depth` is witness-decided only with a *met* quorum whose
+    //   boost was decisive. It won by `effective = valid_commit_depth + boost`, so a
+    //   winner that is simply deeper wins on raw depth whether or not it has a
+    //   quorum; only when both branches sit at equal valid depth did the quorum
+    //   boost break the tie — the shape the equal-depth witness vector reproduces.
+    //   No met quorum ⇒ `WitnessQuorumUnconfirmed`; a met quorum on unequal (or
+    //   unrecorded) depths ⇒ `WitnessBoostNotDecisive`. The rule is supported in
+    //   both, so neither is an `UnsupportedDecisiveRule`.
+    // - any other rule (priority, digest) has no v1 vector shape.
     let kind = match (decisive, quorum_met) {
         (TIP_COMMITTER_RULE, Some(false)) => ConvergenceDecisionKind::CommitterDecided,
-        (EFFECTIVE_COMMIT_DEPTH_RULE, Some(true)) => ConvergenceDecisionKind::WitnessDecided,
+        (EFFECTIVE_COMMIT_DEPTH_RULE, Some(true)) => {
+            confirm_witness_boost_decisive(winner, loser)?;
+            ConvergenceDecisionKind::WitnessDecided
+        }
         (TIP_COMMITTER_RULE, _) => return Err(ConvergenceRecoveryError::WitnessQuorumUnsupported),
         (EFFECTIVE_COMMIT_DEPTH_RULE, _) => {
             return Err(ConvergenceRecoveryError::WitnessQuorumUnconfirmed);
@@ -157,13 +184,42 @@ fn decisive_rule(rule_trace: &[ConvergenceRule]) -> Option<&str> {
         .map(|rule| rule.rule_name.as_str())
 }
 
-/// The candidate the decision selected, matched by `selected_branch_id`.
-fn winning_candidate<'a>(
+/// The (winner, loser) pair for a two-candidate decision, matched by
+/// `selected_branch_id`. Returns `None` if the selected id matches no candidate.
+/// The caller guarantees exactly two candidates with distinct branch ids, so the
+/// loser is the candidate the selected id does not name.
+fn winner_and_loser<'a>(
     selected_branch_id: Option<&str>,
     candidates: &'a [ConvergenceCandidate],
-) -> Option<&'a ConvergenceCandidate> {
+) -> Option<(&'a ConvergenceCandidate, &'a ConvergenceCandidate)> {
     let selected = selected_branch_id?;
-    candidates
+    let winner = candidates
         .iter()
-        .find(|candidate| candidate.branch_id == selected)
+        .find(|candidate| candidate.branch_id == selected)?;
+    let loser = candidates
+        .iter()
+        .find(|candidate| candidate.branch_id != selected)?;
+    Some((winner, loser))
+}
+
+/// Confirm the app-witness quorum boost — not raw commit depth — won the
+/// `effective_commit_depth` comparison. The selector ranks on `effective =
+/// valid_commit_depth + boost`, so the witness-decided vector (which races two
+/// equal-depth branches) only reproduces a win where both branches sit at the
+/// same valid commit depth and the winner's quorum boost broke the tie. A deeper
+/// winner, or an export that did not record both depths, fail-closes.
+fn confirm_witness_boost_decisive(
+    winner: &ConvergenceCandidate,
+    loser: &ConvergenceCandidate,
+) -> Result<(), ConvergenceRecoveryError> {
+    let depth = |candidate: &ConvergenceCandidate| {
+        candidate
+            .score
+            .as_ref()
+            .and_then(|score| score.valid_commit_depth)
+    };
+    match (depth(winner), depth(loser)) {
+        (Some(winner_depth), Some(loser_depth)) if winner_depth == loser_depth => Ok(()),
+        _ => Err(ConvergenceRecoveryError::WitnessBoostNotDecisive),
+    }
 }

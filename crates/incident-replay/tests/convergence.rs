@@ -41,7 +41,8 @@ fn recovers_a_committer_decided_two_branch_convergence() {
 }
 
 /// A witness-decided contested convergence: `effective_commit_depth` decisive
-/// (the witnessed branch's quorum boost) and the winner met the quorum.
+/// because both branches sit at equal valid depth and the winner's quorum boost
+/// broke the tie.
 const WITNESS_DECIDED: &str = r#"{
   "events": [
     {
@@ -49,8 +50,8 @@ const WITNESS_DECIDED: &str = r#"{
         "type": "convergence_decision",
         "selected_branch_id": "win",
         "candidates": [
-          { "branch_id": "win", "score": { "witness_quorum_met": true } },
-          { "branch_id": "lose", "score": { "witness_quorum_met": false } }
+          { "branch_id": "win", "score": { "witness_quorum_met": true, "valid_commit_depth": 1 } },
+          { "branch_id": "lose", "score": { "witness_quorum_met": false, "valid_commit_depth": 1 } }
         ],
         "rule_trace": [
           { "rule_name": "effective_commit_depth", "decisive": true },
@@ -76,12 +77,39 @@ fn an_effective_depth_win_without_a_quorum_is_quarantined() {
     // witness vector cannot reproduce. The rule *is* supported, so the reason is a
     // quorum error — not `UnsupportedDecisiveRule` (which would be self-contradictory).
     let json = WITNESS_DECIDED.replace(
-        r#"{ "branch_id": "win", "score": { "witness_quorum_met": true } }"#,
-        r#"{ "branch_id": "win", "score": { "witness_quorum_met": false } }"#,
+        r#"{ "branch_id": "win", "score": { "witness_quorum_met": true, "valid_commit_depth": 1 } }"#,
+        r#"{ "branch_id": "win", "score": { "witness_quorum_met": false, "valid_commit_depth": 1 } }"#,
     );
     assert_eq!(
         recover(&json),
         Err(ConvergenceRecoveryError::WitnessQuorumUnconfirmed)
+    );
+}
+
+#[test]
+fn a_witness_win_from_raw_commit_depth_is_quarantined() {
+    // `effective_commit_depth` decided it and the winner met a quorum, but the
+    // winner sits at *greater* valid commit depth than the loser — so it would win
+    // on raw depth regardless of witnesses. The quorum boost was incidental, not
+    // decisive, and the equal-depth witness vector would assert the wrong shape.
+    let json = WITNESS_DECIDED.replace(
+        r#"{ "branch_id": "win", "score": { "witness_quorum_met": true, "valid_commit_depth": 1 } }"#,
+        r#"{ "branch_id": "win", "score": { "witness_quorum_met": true, "valid_commit_depth": 2 } }"#,
+    );
+    assert_eq!(
+        recover(&json),
+        Err(ConvergenceRecoveryError::WitnessBoostNotDecisive)
+    );
+}
+
+#[test]
+fn a_witness_win_without_recorded_depths_is_quarantined() {
+    // The winner met a quorum, but neither branch recorded its valid commit
+    // depth, so the boost cannot be proven decisive over a raw-depth win.
+    let json = WITNESS_DECIDED.replace(r#", "valid_commit_depth": 1"#, "");
+    assert_eq!(
+        recover(&json),
+        Err(ConvergenceRecoveryError::WitnessBoostNotDecisive)
     );
 }
 
@@ -136,6 +164,34 @@ fn more_than_two_candidates_is_quarantined() {
     assert_eq!(
         recover(&json),
         Err(ConvergenceRecoveryError::AmbiguousCandidates(3))
+    );
+}
+
+#[test]
+fn duplicate_candidate_branch_ids_are_quarantined() {
+    // Both candidates carry the same id, so `selected_branch_id` cannot name a
+    // unique winner and the loser is ambiguous — not a real two-branch race.
+    let json = COMMITTER_DECIDED.replace(
+        r#"{ "branch_id": "lose", "score": { "witness_quorum_met": false } }"#,
+        r#"{ "branch_id": "win", "score": { "witness_quorum_met": false } }"#,
+    );
+    assert_eq!(
+        recover(&json),
+        Err(ConvergenceRecoveryError::IndistinctCandidates)
+    );
+}
+
+#[test]
+fn an_empty_candidate_branch_id_is_quarantined() {
+    // A candidate with a missing (empty) branch id is a malformed entry, not a
+    // distinguishable branch.
+    let json = COMMITTER_DECIDED.replace(
+        r#"{ "branch_id": "lose", "score": { "witness_quorum_met": false } }"#,
+        r#"{ "branch_id": "", "score": { "witness_quorum_met": false } }"#,
+    );
+    assert_eq!(
+        recover(&json),
+        Err(ConvergenceRecoveryError::IndistinctCandidates)
     );
 }
 

@@ -27,9 +27,12 @@ recorded outcome (fail-closed).
     `RecoveredConvergence` (the decisive rule + a `ConvergenceDecisionKind`), or a
     `ConvergenceRecoveryError`. It reproduces the **committer-decided** case
     (`tip_committer` decisive, no quorum) and the **witness-decided** case
-    (`effective_commit_depth` decisive, winner met the app-witness quorum — the
-    real-traffic case). Any other shape (a committer tiebreak that itself met a
-    quorum, or a priority/digest/differing-depth rule) fail-closes.
+    (`effective_commit_depth` decisive between two *equal-depth* branches, where
+    the winner's app-witness quorum boost broke the tie — the real-traffic case).
+    Any other shape fail-closes: a committer tiebreak that itself met a quorum, a
+    witness winner whose branches were not at equal `valid_commit_depth` (so it won
+    on raw commit depth, not the boost), indistinct candidate branch ids, or a
+    priority/digest rule.
 - **Module:** `src/synth.rs`
   - **Role:** `synthesize` builds the concurrent-fork `VectorFixture` (two
     committers race group-data commits, no `SetPartition`). `synthesize_convergence`

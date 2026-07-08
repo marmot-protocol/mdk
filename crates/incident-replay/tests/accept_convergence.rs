@@ -28,8 +28,10 @@ const COMMITTER_DECIDED_CONVERGENCE: &str = r#"{
   ]
 }"#;
 
-/// Witness-decided: `effective_commit_depth` decisive with the winner meeting an
-/// app-witness quorum — the case that matches real convergence traffic.
+/// Witness-decided: `effective_commit_depth` decisive because both branches
+/// forked from epoch 30 to tip 31 (equal `valid_commit_depth`) and the winner's
+/// app-witness quorum boost broke the tie — the case that matches real
+/// convergence traffic.
 const WITNESS_DECIDED_CONVERGENCE: &str = r#"{
   "events": [
     {
@@ -38,8 +40,8 @@ const WITNESS_DECIDED_CONVERGENCE: &str = r#"{
         "current_tip_epoch": 30,
         "selected_branch_id": "win",
         "candidates": [
-          { "branch_id": "win", "score": { "witness_quorum_met": true } },
-          { "branch_id": "lose", "score": { "witness_quorum_met": false } }
+          { "branch_id": "win", "score": { "witness_quorum_met": true, "valid_commit_depth": 1 } },
+          { "branch_id": "lose", "score": { "witness_quorum_met": false, "valid_commit_depth": 1 } }
         ],
         "rule_trace": [
           { "rule_name": "effective_commit_depth", "decisive": true },

@@ -123,13 +123,18 @@ pub struct ConvergenceCandidate {
     pub score: Option<ConvergenceScore>,
 }
 
-/// The selector's score for a candidate. Only the witness-quorum flag is read:
-/// a winner that met the app-witness quorum needs the (not-yet-wired) harness
-/// witness path to reproduce, so it fail-closes at extraction.
+/// The selector's score for a candidate. Extraction reads two fields: the
+/// witness-quorum flag (which distinguishes the committer- and witness-decided
+/// shapes) and the valid commit depth (the branch's `tip_epoch - fork_epoch`,
+/// before any witness boost). The witness-decided shape reproduces only an
+/// *equal-depth* race, so extraction compares the two branches' `valid_commit_depth`
+/// to confirm the quorum boost — not raw depth — is what won.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ConvergenceScore {
     #[serde(default)]
     pub witness_quorum_met: Option<bool>,
+    #[serde(default)]
+    pub valid_commit_depth: Option<u64>,
 }
 
 /// One selector-rule evaluation. Extraction reads which rule was decisive.
