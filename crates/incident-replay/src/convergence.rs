@@ -105,6 +105,7 @@ pub fn recover_convergence(
                 candidates,
                 rule_trace,
                 losing_branch_ids,
+                ..
             } if !losing_branch_ids.is_empty() || candidates.len() >= 2 => {
                 Some((selected_branch_id.as_deref(), candidates, rule_trace))
             }

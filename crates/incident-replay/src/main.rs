@@ -1,5 +1,9 @@
-//! `incident-replay` CLI: classify a Goggles `agent-state.json` export and, for a
-//! fork-recovery incident, synthesize and verify a conformance vector.
+//! `incident-replay` CLI: classify a Goggles export — either an
+//! `agent-state.json` document or a streamed NDJSON group export — and, for a
+//! fork-recovery or convergence incident, synthesize and verify a conformance
+//! vector. The format is recognised from the content: a stream leads with its
+//! `manifest` line (the `goggles-group-export/v1` contract), anything else is
+//! parsed as `agent-state.json`.
 //!
 //! Prints a human-readable outcome and exits 0 for any successful classification
 //! (healthy, quarantine, and accepted are all valid outcomes). Exits 2 on usage,
@@ -10,8 +14,8 @@ use std::process::ExitCode;
 
 use cgka_conformance_simulator::VectorFixture;
 use incident_replay::{
-    AgentStateExport, Verdict, accept, accept_convergence, classify, parse, recover_convergence,
-    recover_fork,
+    AgentStateExport, Verdict, accept, accept_convergence, classify, is_stream, parse,
+    parse_stream, recover_convergence, recover_fork,
 };
 
 /// Vector name for a fork-recovery incident (one incident per export today).
@@ -22,7 +26,7 @@ const CONVERGENCE_NAME: &str = "convergence-incident/v1";
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: incident-replay <agent-state.json> [out-dir]");
+        eprintln!("usage: incident-replay <agent-state.json | group-export.ndjson> [out-dir]");
         return ExitCode::from(2);
     };
     let out_dir = args.next().map(PathBuf::from);
@@ -34,11 +38,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let export = match parse(&json) {
-        Ok(export) => export,
-        Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::from(2);
+    let export = if is_stream(&json) {
+        match parse_stream(&json) {
+            Ok(export) => export,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        match parse(&json) {
+            Ok(export) => export,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::from(2);
+            }
         }
     };
 
@@ -49,10 +63,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Verdict::ConvergenceSelected => run_convergence(&export, out_dir.as_deref()),
-        Verdict::Quarantine { reason } => {
-            println!("quarantine: {reason:?}");
-            ExitCode::SUCCESS
-        }
+        Verdict::Quarantine { reason } => quarantine(&reason),
     }
 }
 

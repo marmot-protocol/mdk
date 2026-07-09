@@ -1,9 +1,10 @@
 //! Synthesize a conformance vector from a recovered fork.
 //!
-//! The shape is the validated exp-06 blueprint: the two committers raise
-//! competing metadata commits at the same epoch and the engine fork-recovers on
-//! delivery — no `SetPartition` fault is needed, because the commits are
-//! concurrent (neither is delivered before the other is staged). Epochs are
+//! The shape follows the blueprint validated by replaying a real two-committer
+//! fork incident: the two committers raise competing metadata commits at the
+//! same epoch and the engine fork-recovers on delivery — no `SetPartition`
+//! fault is needed, because the commits are concurrent (neither is delivered
+//! before the other is staged). Epochs are
 //! normalized to the simulator's range (real `N → N+1` becomes `1 → 2`) by
 //! outcome-equivalence, and the committer identities are synthetic labels the
 //! caller assigns so the designated winner's branch wins.

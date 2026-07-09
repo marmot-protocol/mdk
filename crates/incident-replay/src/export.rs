@@ -37,12 +37,18 @@ pub struct Pagination {
     pub has_more: bool,
 }
 
-/// One forensic audit event. The classifier reads only `kind`; extraction also
-/// uses the event-level `account_ref` (the acting account).
+/// One forensic audit event. The classifier reads `kind` plus the envelope's
+/// `engine_id` and `wall_time_ms` (the liveness gates aggregate per-engine
+/// activity from them); extraction also uses the event-level `account_ref`
+/// (the acting account).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditEvent {
     #[serde(default)]
     pub account_ref: Option<String>,
+    #[serde(default)]
+    pub engine_id: Option<String>,
+    #[serde(default)]
+    pub wall_time_ms: Option<u64>,
     pub kind: EventKind,
 }
 
@@ -87,6 +93,15 @@ pub enum EventKind {
         rule_trace: Vec<ConvergenceRule>,
         #[serde(default)]
         losing_branch_ids: Vec<String>,
+        /// The canonical tip the selector started from and the tip it adopted:
+        /// both are epochs the engine has locally materialized, so they feed
+        /// the epoch high-water mark. (Real case: an engine whose final acts
+        /// before going dark were convergence selections would otherwise read
+        /// older than it was.)
+        #[serde(default)]
+        current_tip_epoch: Option<u64>,
+        #[serde(default)]
+        selected_tip_epoch: Option<u64>,
     },
     /// A commit changed canonical group state (membership, admin set, profile).
     /// Extraction reads the actor and epoch to find the committers at the
@@ -109,8 +124,43 @@ pub enum EventKind {
         #[serde(default)]
         msg_id: Option<String>,
     },
+    /// The engine handled a message while at `epoch`. The densest per-engine
+    /// epoch signal in real exports; feeds the epoch high-water mark.
+    MessageStateChanged {
+        #[serde(default)]
+        epoch: Option<u64>,
+    },
+    /// The engine's epoch machine moved (commit confirmed, group hydrated, …).
+    EpochStateChanged {
+        #[serde(default)]
+        epoch: Option<u64>,
+    },
+    /// A snapshot of the group as the engine sees it; its epoch is the
+    /// engine's own current epoch.
+    GroupContext {
+        #[serde(default)]
+        context: GroupContextSnapshot,
+    },
+    /// A user-visible action; `epoch_changed` observations carry the epoch the
+    /// engine advanced to.
+    HumanAction {
+        #[serde(default)]
+        to_epoch: Option<u64>,
+    },
     #[serde(other)]
     Other,
+}
+
+/// The group snapshot inside a `group_context` event. Only the epoch is
+/// modelled: it is the engine's own view, so the liveness gate reads it. The
+/// snapshot's member count is deliberately *not* a gate input — audit is
+/// opt-in, so real groups routinely have more members than exporting engines
+/// (a real six-member group exported from only two engines) and a coverage gate
+/// would quarantine them all, permanently.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct GroupContextSnapshot {
+    #[serde(default)]
+    pub epoch: Option<u64>,
 }
 
 /// One branch the convergence selector evaluated. Only the fields extraction
@@ -182,6 +232,26 @@ impl EventKind {
     /// Any fork resolution, regardless of winner.
     pub fn is_fork_resolution(&self) -> bool {
         matches!(self, EventKind::ForkResolution { .. })
+    }
+
+    /// The group epoch this event reports the engine itself to be at, if it
+    /// reports one. The liveness gates fold these into a per-engine epoch
+    /// high-water mark, so only kinds that reflect the engine's *own* state
+    /// contribute — kinds describing another engine's traffic do not.
+    pub fn observed_epoch(&self) -> Option<u64> {
+        match self {
+            EventKind::GroupStateChanged { epoch, .. }
+            | EventKind::MessageStateChanged { epoch }
+            | EventKind::EpochStateChanged { epoch } => *epoch,
+            EventKind::GroupContext { context } => context.epoch,
+            EventKind::HumanAction { to_epoch } => *to_epoch,
+            EventKind::ConvergenceDecision {
+                current_tip_epoch,
+                selected_tip_epoch,
+                ..
+            } => (*current_tip_epoch).max(*selected_tip_epoch),
+            _ => None,
+        }
     }
 }
 

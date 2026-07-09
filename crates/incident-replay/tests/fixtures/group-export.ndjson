@@ -1,0 +1,7 @@
+{"t": "manifest", "schema_version": "goggles-group-export/v1", "group": {"slug": "synthetic-group", "summary": {"event_count": 3}}}
+{"t": "source", "id": 1, "source_platform": "synthetic", "validation_status": "valid"}
+{"t": "event", "engine_id": "engine-a", "wall_time_ms": 1000000000000, "kind": {"type": "epoch_state_changed", "epoch": 2, "new_state": "stable"}}
+{"t": "event", "engine_id": "engine-b", "wall_time_ms": 1000000060000, "kind": {"type": "message_state_changed", "epoch": 2, "new_state": "processed"}}
+{"t": "event", "engine_id": "engine-a", "wall_time_ms": 1000000120000, "kind": {"type": "group_context", "context": {"epoch": 2, "member_count": 2}}}
+{"t": "delivery_artifact", "artifact_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
+{"t": "eof", "complete": true, "counts": {"source": 1, "event": 3, "delivery_artifact": 1, "state_delta": 0}}

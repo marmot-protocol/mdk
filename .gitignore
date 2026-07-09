@@ -13,3 +13,6 @@ reviews/
 
 # Local Docker relay state.
 dev/data/
+
+# Project specific optional env-vars
+.env
