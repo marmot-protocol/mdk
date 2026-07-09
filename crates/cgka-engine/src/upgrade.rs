@@ -167,7 +167,14 @@ impl<S: StorageProvider> Engine<S> {
         // do NOT call `merge_pending_commit` here — the merge + Marmot
         // record's required capability update both defer to
         // `do_confirm_published` (which reads the post-merge group state).
+        let leaf_refresh = crate::account_identity_proof::own_leaf_refresh_parameters(
+            &mls_group,
+            &self.identity.account_identity_proof_extension,
+        );
         let mut commit_builder = mls_group.commit_builder();
+        if let Some(leaf_refresh) = leaf_refresh {
+            commit_builder = commit_builder.leaf_node_parameters(leaf_refresh);
+        }
         if let Some(new_extensions) = new_extensions {
             commit_builder = commit_builder
                 .propose_group_context_extensions(new_extensions)

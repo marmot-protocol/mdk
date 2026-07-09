@@ -53,7 +53,22 @@ pub(crate) fn cache_self_capabilities<S: StorageProvider>(
     ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
     if let Some(leaf) = mls_group.own_leaf_node() {
-        crate::account_identity_proof::validate_leaf_account_identity_proof(leaf, ciphersuite)?;
+        // A legacy-version proof on our OWN leaf is tolerated: the retired
+        // format cannot be re-validated by current code, the account trusts
+        // itself, and the next commit this member produces replaces the leaf
+        // with a current proof (own_leaf_refresh_parameters). Every other
+        // member's proof stays strictly validated.
+        if crate::account_identity_proof::leaf_account_identity_proof_version(leaf)
+            == Some(crate::account_identity_proof::LEGACY_ACCOUNT_IDENTITY_PROOF_VERSION)
+        {
+            tracing::warn!(
+                target: "cgka_engine::capability_manager",
+                method = "cache_self_capabilities",
+                "own leaf carries a legacy account identity proof; tolerating until a commit refreshes it"
+            );
+        } else {
+            crate::account_identity_proof::validate_leaf_account_identity_proof(leaf, ciphersuite)?;
+        }
         let caps = capabilities_of_leaf(leaf);
         let bc = BasicCredential::try_from(leaf.credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;

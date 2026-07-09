@@ -784,9 +784,10 @@ impl<S: StorageProvider> Engine<S> {
             _ => false,
         };
         if !already_validated {
-            crate::group_lifecycle::validate_member_credentials_and_account_proofs(
+            crate::group_lifecycle::validate_member_credentials_and_account_proofs_with_policy(
                 &mls_group,
                 self.ciphersuite,
+                true,
             )
             .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
             // Validation passed for this tree state; persist the marker so the

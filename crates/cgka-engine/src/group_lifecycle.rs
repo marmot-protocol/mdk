@@ -887,6 +887,20 @@ pub(crate) fn validate_member_credentials_and_account_proofs(
     group: &MlsGroup,
     ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
+    validate_member_credentials_and_account_proofs_with_policy(group, ciphersuite, false)
+}
+
+/// `tolerate_legacy_proofs` applies ONLY to re-opening a group this client is
+/// already a member of: leaves whose proof carries exactly the legacy version
+/// were validated under the rules in force when they joined, and group
+/// membership continuity is enforced by MLS itself. Join ingress (Welcome)
+/// keeps the strict form — no new trust is extended to a proof the current
+/// code cannot verify. Every other proof defect still fails validation.
+pub(crate) fn validate_member_credentials_and_account_proofs_with_policy(
+    group: &MlsGroup,
+    ciphersuite: Ciphersuite,
+    tolerate_legacy_proofs: bool,
+) -> Result<(), EngineError> {
     validate_member_credentials(group)?;
     let tree = group.export_ratchet_tree();
     let value = serde_json::to_value(tree)
@@ -895,6 +909,17 @@ pub(crate) fn validate_member_credentials_and_account_proofs(
         .map_err(|e| EngineError::Backend(format!("decode exported ratchet tree: {e}")))?;
     for node in nodes {
         if let Some(Node::LeafNode(leaf)) = node {
+            if tolerate_legacy_proofs
+                && crate::account_identity_proof::leaf_account_identity_proof_version(&leaf)
+                    == Some(crate::account_identity_proof::LEGACY_ACCOUNT_IDENTITY_PROOF_VERSION)
+            {
+                tracing::warn!(
+                    target: "cgka_engine::group_lifecycle",
+                    method = "validate_member_credentials_and_account_proofs_with_policy",
+                    "tolerating a member leaf with a legacy account identity proof on group re-open"
+                );
+                continue;
+            }
             crate::account_identity_proof::validate_leaf_account_identity_proof(
                 &leaf,
                 ciphersuite,

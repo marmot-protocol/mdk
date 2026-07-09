@@ -37,6 +37,11 @@ pub const ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE: u16 = 0xF2F1;
 pub const ACCOUNT_IDENTITY_PROOF_EVENT_KIND: u16 = 450;
 
 const ACCOUNT_IDENTITY_PROOF_VERSION: u8 = 2;
+/// Proof format shipped before the kind:450 event-signing rework. Member
+/// leaves created under it still exist in long-lived groups; only leaves that
+/// carry exactly this version are eligible for legacy tolerance, and only on
+/// surfaces that re-open a group this client is already a member of.
+pub(crate) const LEGACY_ACCOUNT_IDENTITY_PROOF_VERSION: u8 = 1;
 const ACCOUNT_IDENTITY_PROOF_DOMAIN: &str = "marmot.account-identity-proof.v2";
 const SCHNORR_SIGNATURE_LEN: usize = 64;
 
@@ -300,6 +305,49 @@ fn encode_proof(proof: &AccountIdentityProof) -> Vec<u8> {
     out
 }
 
+/// Version byte of a leaf's identity-proof extension, if one is present.
+pub(crate) fn leaf_account_identity_proof_version(leaf: &LeafNode) -> Option<u8> {
+    leaf.extensions()
+        .unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)
+        .and_then(|raw| raw.0.first().copied())
+}
+
+/// Committer leaf parameters that replace a stale identity proof with the
+/// engine's current one. `None` when the own leaf already carries the current
+/// version, or has no proof extension at all (that is a validation failure on
+/// other surfaces, not a refresh case). A commit re-signs the committer's
+/// leaf anyway, so riding the next commit heals the leaf without an extra
+/// epoch, and the MLS signature key is unchanged so the cached proof stays
+/// valid.
+pub(crate) fn own_leaf_refresh_parameters(
+    mls_group: &MlsGroup,
+    current_proof_extension: &Extension,
+) -> Option<openmls::treesync::LeafNodeParameters> {
+    let leaf = mls_group.own_leaf_node()?;
+    let version = leaf_account_identity_proof_version(leaf)?;
+    if version == ACCOUNT_IDENTITY_PROOF_VERSION {
+        return None;
+    }
+    let mut extensions: Vec<Extension> = leaf
+        .extensions()
+        .iter()
+        .filter(|ext| {
+            !matches!(
+                ext,
+                Extension::Unknown(ext_type, _) if *ext_type == ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE
+            )
+        })
+        .cloned()
+        .collect();
+    extensions.push(current_proof_extension.clone());
+    let extensions = openmls::extensions::Extensions::from_vec(extensions).ok()?;
+    Some(
+        openmls::treesync::LeafNodeParameters::builder()
+            .with_extensions(extensions)
+            .build(),
+    )
+}
+
 fn decode_proof(bytes: &[u8]) -> Result<AccountIdentityProof, EngineError> {
     let mut cursor = bytes;
     let version = read_u8(&mut cursor, "version")?;
@@ -394,6 +442,31 @@ mod tests {
                     ACCOUNT_IDENTITY_PROOF_VERSION.to_string(),
                 ]
         }));
+    }
+
+    #[test]
+    fn encoded_proofs_carry_the_current_version_and_reject_the_legacy_one() {
+        let keys = nostr::Keys::generate();
+        let req = request(&keys, b"leaf-key-a");
+        let signed = req.proof_event().unwrap().sign_with_keys(&keys).unwrap();
+        let signature = req.signature_from_signed_event(signed).unwrap();
+        let proof = AccountIdentityProof {
+            request: req,
+            signature,
+        };
+
+        let mut bytes = encode_proof(&proof);
+        assert_eq!(bytes[0], ACCOUNT_IDENTITY_PROOF_VERSION);
+        assert!(decode_proof(&bytes).is_ok());
+
+        // A legacy proof must fail decoding with the version error the
+        // tolerance surfaces key on — not a generic parse failure.
+        bytes[0] = LEGACY_ACCOUNT_IDENTITY_PROOF_VERSION;
+        let err = decode_proof(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported proof version 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
