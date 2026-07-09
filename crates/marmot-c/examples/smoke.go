@@ -47,9 +47,10 @@ func (e *MarmotError) Error() string {
 }
 
 // check turns a raw MarmotStatus into an idiomatic error, draining the
-// thread-local last-error detail on failure.
-func check(status uint32, op string) error {
-	if status == uint32(C.MARMOT_STATUS_OK) {
+// thread-local last-error detail on failure. Typed as C.MarmotStatus so it
+// stays correct whether cgo maps the enum to a signed or unsigned width.
+func check(status C.MarmotStatus, op string) error {
+	if status == C.MARMOT_STATUS_OK {
 		return nil
 	}
 	detail := ""
@@ -246,7 +247,7 @@ func main() {
 	// --- argument validation paths (no client) --------------------------
 	var raw *C.MarmotClient
 	st := C.marmot_client_new(nil, nil, 0, &raw)
-	if st != uint32(C.MARMOT_STATUS_NULL_POINTER) {
+	if st != C.MARMOT_STATUS_NULL_POINTER {
 		fail("NULL root_path should be rejected", nil)
 	}
 	ok("NULL root_path rejected")
