@@ -2203,8 +2203,9 @@ impl MarmotAppRuntime {
             Ok(None) => Ok(cached),
             Err(error) => {
                 tracing::debug!(
-                    account_id_hex,
-                    error = %error,
+                    target: "marmot_app::runtime",
+                    method = "latest_known_user_profile_for_publish",
+                    error_kind = error.privacy_safe_kind(),
                     "falling back to cached profile before publish"
                 );
                 Ok(cached)
