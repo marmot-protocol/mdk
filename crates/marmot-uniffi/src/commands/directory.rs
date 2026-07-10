@@ -50,6 +50,25 @@ impl Marmot {
         Ok(entry.and_then(|record| record.profile).map(Into::into))
     }
 
+    /// Cached Nostr kind:0 `website` metadata for an account id, when it is a
+    /// string. The generic profile record intentionally exposes the fields the
+    /// host can publish; this read-only accessor preserves arbitrary kind:0
+    /// metadata while still making the standard website field available to
+    /// profile presentation surfaces.
+    pub fn user_profile_website(
+        &self,
+        account_id_hex: String,
+    ) -> Result<Option<String>, MarmotKitError> {
+        let entry = self.app.directory_entry_for_account_id(&account_id_hex)?;
+        Ok(entry.and_then(|record| record.profile).and_then(|profile| {
+            profile
+                .extra
+                .get("website")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        }))
+    }
+
     /// Fetch and cache an account's own Nostr kind:0 profile from `relays`.
     /// After this resolves, `user_profile` / `display_name` return the
     /// freshly-fetched metadata (name, picture, etc.) for that account.

@@ -48,6 +48,8 @@ mod migration_0023_chat_list_projection_version;
 mod migration_0024_pending_welcome_delivery;
 #[path = "migrations/0025_chat_notification_settings.rs"]
 mod migration_0025_chat_notification_settings;
+#[path = "migrations/0026_message_drafts.rs"]
+mod migration_0026_message_drafts;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -184,6 +186,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 25,
         name: "0025_chat_notification_settings",
         apply: migration_0025_chat_notification_settings::apply,
+    },
+    Migration {
+        version: 26,
+        name: "0026_message_drafts",
+        apply: migration_0026_message_drafts::apply,
     },
 ];
 
@@ -414,6 +421,18 @@ mod tests {
             &conn,
             "chat_notification_settings",
             "muted_until_ms"
+        ));
+    }
+
+    #[test]
+    fn message_drafts_tables_are_migrated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        assert!(connection_has_column(&conn, "message_drafts", "content"));
+        assert!(connection_has_column(
+            &conn,
+            "message_draft_attachments",
+            "plaintext"
         ));
     }
 

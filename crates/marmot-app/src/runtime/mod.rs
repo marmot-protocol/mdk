@@ -36,12 +36,12 @@ use crate::{
     BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
     GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
     MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, NotificationCollectionStatus, NotificationSettings, NotificationUpdate,
-    NotificationWakeSource, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    ReceivedMessage, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    MediaUploadResult, MessageDraft, MessageDraftAttachment, NotificationCollectionStatus,
+    NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
+    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary,
+    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1402,6 +1402,45 @@ impl MarmotAppRuntime {
         self.accounts
             .app
             .chat_notification_settings(account_ref, group_id_hex)
+    }
+
+    pub fn message_drafts(&self, account_ref: &str) -> Result<Vec<MessageDraft>, AppError> {
+        self.accounts.app.message_drafts(account_ref)
+    }
+
+    pub fn message_draft(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<MessageDraft>, AppError> {
+        self.accounts.app.message_draft(account_ref, group_id_hex)
+    }
+
+    pub fn save_message_draft(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        content: &str,
+        reply_to_message_id_hex: Option<&str>,
+        media_attachments: Vec<MessageDraftAttachment>,
+    ) -> Result<MessageDraft, AppError> {
+        self.accounts.app.save_message_draft(
+            account_ref,
+            group_id_hex,
+            content,
+            reply_to_message_id_hex,
+            media_attachments,
+        )
+    }
+
+    pub fn delete_message_draft(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .app
+            .delete_message_draft(account_ref, group_id_hex)
     }
 
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {

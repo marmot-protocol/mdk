@@ -12,6 +12,7 @@ mod agent_stream;
 mod audit;
 mod chat_list;
 mod directory;
+mod draft;
 mod group;
 mod media;
 mod message;

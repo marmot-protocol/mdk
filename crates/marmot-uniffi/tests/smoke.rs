@@ -14,8 +14,8 @@ use marmot_account::AccountHome;
 use marmot_uniffi::{
     AuditDataModeFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi,
     Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
-    MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, NotificationWakeSourceFfi,
-    PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
+    MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
+    NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -774,6 +774,49 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
         Err(err) => err,
     };
     assert!(format!("{subscribe_error}").contains("missing"));
+}
+
+#[test]
+fn message_draft_binding_methods_are_public_and_validate_inputs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    let attachment = MessageDraftAttachmentFfi {
+        id: "attachment-1".into(),
+        file_name: "note.txt".into(),
+        media_type: "text/plain".into(),
+        plaintext: b"draft attachment".to_vec(),
+        dim: None,
+        thumbhash: None,
+        duration_seconds: None,
+        waveform_samples: Vec::new(),
+    };
+
+    let missing_account = kit
+        .message_drafts("missing".into())
+        .expect_err("missing account should fail");
+    assert!(format!("{missing_account}").contains("missing"));
+
+    for invalid_group in [
+        kit.message_draft("missing".into(), "not-hex".into())
+            .map(|_| ()),
+        kit.save_message_draft(
+            "missing".into(),
+            "not-hex".into(),
+            "draft".into(),
+            None,
+            vec![attachment],
+        )
+        .map(|_| ()),
+        kit.delete_message_draft("missing".into(), "not-hex".into()),
+    ] {
+        let error = invalid_group.expect_err("invalid group hex should fail before account lookup");
+        assert!(format!("{error}").contains("invalid hex"));
+    }
 }
 
 #[tokio::test]
