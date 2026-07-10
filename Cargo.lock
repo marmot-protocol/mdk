@@ -2889,6 +2889,7 @@ dependencies = [
  "marmot-app",
  "marmot-markdown",
  "nostr",
+ "nostr-relay-builder",
  "rand 0.8.6",
  "serde_json",
  "tempfile",

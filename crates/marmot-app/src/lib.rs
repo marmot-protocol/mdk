@@ -125,7 +125,9 @@ pub use directory::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
     UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
 };
-pub use drafts::{MessageDraft, MessageDraftAttachment};
+pub use drafts::{
+    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftSummary,
+};
 pub use error::AppError;
 pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppGroupAdminPolicyComponent,

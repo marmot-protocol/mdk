@@ -9,9 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
-- MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with list, load, upsert, and delete
-  operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation metadata in
-  the account's SQLCipher database.
+- MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
+  and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
+  metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.
 - MarmotKit/UniFFI now exposes the cached Nostr Kind 0 `website` field through a read-only profile accessor so app
   profile surfaces can display it without widening the writable profile record.
 

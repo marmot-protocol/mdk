@@ -10,6 +10,9 @@ pub enum MarmotKitError {
     UnknownAccount { account_ref: String },
     #[error("unknown group: {group_id_hex}")]
     UnknownGroup { group_id_hex: String },
+    /// Host-supplied draft attachment metadata is malformed.
+    #[error("invalid message draft: {details}")]
+    InvalidMessageDraft { details: String },
     #[error("invalid hex: {details}")]
     InvalidHex { details: String },
     #[error("invalid nostr identity: {details}")]
@@ -144,6 +147,7 @@ impl From<AppError> for MarmotKitError {
                 details: err.to_string(),
             },
             AppError::UnknownGroup(group_id_hex) => Self::UnknownGroup { group_id_hex },
+            AppError::InvalidMessageDraft(details) => Self::InvalidMessageDraft { details },
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },

@@ -33,7 +33,10 @@ pub use connection::{
     SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteJournalMode,
     SqliteStorageOptions, SqliteSynchronous, open_hardened_sqlcipher,
 };
-pub use message_drafts::{StoredMessageDraft, StoredMessageDraftAttachment};
+pub use message_drafts::{
+    StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary,
+    StoredMessageDraftSummary,
+};
 pub use openmls_storage::SqliteOpenMlsStorageError;
 pub use pending_welcome_delivery::PendingWelcomeDeliveryRecord;
 pub use shared::{

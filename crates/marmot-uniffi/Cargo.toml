@@ -34,6 +34,7 @@ zeroize.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 keyring-core.workspace = true
+nostr-relay-builder.workspace = true
 
 [[bin]]
 name = "uniffi-bindgen"

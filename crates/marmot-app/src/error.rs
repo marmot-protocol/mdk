@@ -27,6 +27,9 @@ pub enum AppError {
     MissingKeyPackage(String),
     #[error("unknown local group")]
     UnknownGroup(String),
+    /// Host-supplied draft attachment metadata failed validation before storage.
+    #[error("invalid message draft: {0}")]
+    InvalidMessageDraft(String),
     #[error("no agent text stream start found for this group")]
     AgentStreamMissingStart,
     #[error("agent text stream start has no confirmed message id yet")]
@@ -123,6 +126,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage(_) => "missing_key_package",
             Self::UnknownGroup(_) => "unknown_group",
+            Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
             Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
             Self::AgentStreamUnsupportedRoute => "agent_stream_unsupported_route",

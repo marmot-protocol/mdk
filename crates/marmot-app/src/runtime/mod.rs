@@ -36,12 +36,12 @@ use crate::{
     BackgroundNotificationCollection, ChatListRow, ChatNotificationSettings,
     GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
     MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, NotificationCollectionStatus,
-    NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
-    PushPlatform, PushRegistration, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary,
-    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
-    default_profile_pseudonym, unix_now_seconds,
+    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
+    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, ReceivedMessage,
+    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
+    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelinePage,
+    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1404,7 +1404,7 @@ impl MarmotAppRuntime {
             .chat_notification_settings(account_ref, group_id_hex)
     }
 
-    pub fn message_drafts(&self, account_ref: &str) -> Result<Vec<MessageDraft>, AppError> {
+    pub fn message_drafts(&self, account_ref: &str) -> Result<Vec<MessageDraftSummary>, AppError> {
         self.accounts.app.message_drafts(account_ref)
     }
 
