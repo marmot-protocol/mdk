@@ -48,6 +48,12 @@ pub enum AppError {
     MissingRelayLists(Vec<MissingRelayListKind>),
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
+    /// An account worker's transport catch-up failed (sync error or timeout).
+    /// Deliberately distinct from [`AppError::RelayDirectory`]: catch-up
+    /// failures were once wrapped as relay-directory errors, which sent the
+    /// first commit-loss investigation chasing the wrong subsystem.
+    #[error("account catch-up failed: {0}")]
+    AccountCatchUp(String),
     #[error("invalid Nostr public key")]
     InvalidPublicKey,
     #[error("external signer unavailable for account")]
@@ -136,6 +142,7 @@ impl AppError {
             Self::MissingDefaultRelays => "missing_default_relays",
             Self::MissingRelayLists(_) => "missing_relay_lists",
             Self::RelayDirectory(_) => "relay_directory",
+            Self::AccountCatchUp(_) => "account_catch_up",
             Self::InvalidPublicKey => "invalid_public_key",
             Self::ExternalSignerUnavailable(_) => "external_signer_unavailable",
             Self::ExternalSignerMismatch => "external_signer_mismatch",
@@ -221,5 +228,24 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::Busy(_) => "storage_busy",
         StorageError::Backend(_) => "storage_backend",
         StorageError::Serialization(_) => "storage_serialization",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+
+    // Kind strings leave the runtime: `account_error_message` interpolates
+    // them into messages the CLI daemon persists and host apps log. Pin the
+    // catch-up kind so the wire-visible string cannot drift silently — it is
+    // the label operators will grep for after the RelayDirectory mislabel.
+    #[test]
+    fn account_catch_up_kind_is_stable() {
+        let err = AppError::AccountCatchUp("runtime catch-up failed: account_session".into());
+        assert_eq!(err.privacy_safe_kind(), "account_catch_up");
+        assert_eq!(
+            err.to_string(),
+            "account catch-up failed: runtime catch-up failed: account_session"
+        );
     }
 }
