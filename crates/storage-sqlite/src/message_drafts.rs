@@ -505,6 +505,8 @@ mod tests {
     use super::*;
     use crate::{SelfMembership, StoredAccountGroup, StoredAccountState};
 
+    const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
+
     fn group(group_id_hex: &str) -> StoredAccountGroup {
         StoredAccountGroup {
             group_id_hex: group_id_hex.to_owned(),
@@ -556,6 +558,7 @@ mod tests {
                     groups: vec![group(&group_id_hex)],
                 },
                 100,
+                MAX_FUTURE_SKEW_SECS,
             )
             .unwrap();
 
@@ -635,6 +638,7 @@ mod tests {
                     groups: vec![],
                 },
                 100,
+                MAX_FUTURE_SKEW_SECS,
             )
             .unwrap();
         assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
@@ -653,6 +657,7 @@ mod tests {
                     groups: vec![group(&group_id_hex)],
                 },
                 100,
+                MAX_FUTURE_SKEW_SECS,
             )
             .unwrap();
         let first = StoredMessageDraftAttachment {

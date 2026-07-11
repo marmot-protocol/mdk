@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
+use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -574,16 +575,20 @@ pub(crate) fn is_own_relay_echo(
 /// here instead of being preserved forever by the monotonic max. A benign
 /// in-range timestamp is unaffected; the skew margin tolerates ordinary sender
 /// clock drift.
+///
+/// The clamp itself is [`storage_sqlite::clamp_to_max_future_skew`] — the one
+/// definition shared with the save-time durable-cursor merge in
+/// `save_account_projection_state`, so ingest and persistence can never
+/// disagree on the ceiling.
 fn clamped_transport_cursor(
     current: Option<u64>,
     candidate: u64,
     now: u64,
     max_future_skew_secs: u64,
 ) -> u64 {
-    let max_allowed = now.saturating_add(max_future_skew_secs);
-    let clamped = candidate.min(max_allowed);
+    let clamped = clamp_to_max_future_skew(candidate, now, max_future_skew_secs);
     current
-        .map(|current| current.min(max_allowed).max(clamped))
+        .map(|current| clamp_to_max_future_skew(current, now, max_future_skew_secs).max(clamped))
         .unwrap_or(clamped)
 }
 

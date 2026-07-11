@@ -5,6 +5,11 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_TAG,
 };
 
+/// Test twin of the app layer's transport-cursor future-skew policy (five
+/// minutes). The storage layer treats it as an injected bound, so any value
+/// works; mirroring production keeps the cursor tests realistic.
+const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
+
 fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
     false
 }
@@ -150,7 +155,9 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
         groups: vec![group("aa", "alpha")],
     };
 
-    store.save_account_projection_state(&state, 1).unwrap();
+    store
+        .save_account_projection_state(&state, 1, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
 
     let restored = store.load_account_projection_state("alice", 16).unwrap();
     assert_eq!(restored.seen_events, vec!["kept"]);
@@ -190,10 +197,222 @@ fn account_projection_state_refreshes_reseen_event_recency_before_pruning() {
         last_transport_timestamp: None,
         groups: Vec::new(),
     };
-    store.save_account_projection_state(&state, 2).unwrap();
+    store
+        .save_account_projection_state(&state, 2, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
 
     let restored = store.load_account_projection_state("alice", 16).unwrap();
     assert_eq!(restored.seen_events, vec!["stale-b", "repeat"]);
+}
+
+#[test]
+fn account_projection_state_keeps_max_cursor_across_racing_saves() {
+    // Two runtimes over the same account database race their saves; whichever
+    // order the writes land in, the durable cursor must end at the max — a
+    // stale writer must never lower an advanced cursor.
+    let ahead = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: Some(1_700_000_200),
+        groups: Vec::new(),
+    };
+    let behind = StoredAccountState {
+        last_transport_timestamp: Some(1_700_000_100),
+        ..ahead.clone()
+    };
+
+    for saves in [[&ahead, &behind], [&behind, &ahead]] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        for state in saves {
+            store
+                .save_account_projection_state(state, 16, MAX_FUTURE_SKEW_SECS)
+                .unwrap();
+        }
+        let restored = store.load_account_projection_state("alice", 16).unwrap();
+        assert_eq!(restored.last_transport_timestamp, Some(1_700_000_200));
+    }
+}
+
+#[test]
+fn account_projection_state_save_without_cursor_preserves_stored_cursor() {
+    // A runtime that never learned a cursor (fresh process, no deliveries yet)
+    // still saves other state; that save must never wipe an advanced stored
+    // cursor back to NULL.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let advanced = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: Some(1_700_000_200),
+        groups: Vec::new(),
+    };
+    store
+        .save_account_projection_state(&advanced, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+
+    let never_learned = StoredAccountState {
+        last_transport_timestamp: None,
+        ..advanced
+    };
+    store
+        .save_account_projection_state(&never_learned, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+
+    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    assert_eq!(restored.last_transport_timestamp, Some(1_700_000_200));
+}
+
+#[test]
+fn account_projection_state_heals_poisoned_stored_cursor_on_save() {
+    // A stored cursor poisoned above `now + skew` (persisted by a version that
+    // predates the write-side clamp) must come out of the merge healed down to
+    // save-time `now + skew`, not preserved forever by the monotonic max —
+    // the save-side twin of the app layer's ingest-time heal.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let now_before = unix_now_seconds();
+    let poisoned = now_before + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+    store.ensure_account_projection("alice").unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE account_state SET last_transport_timestamp = ?1 WHERE label = ?2",
+            params![i64::try_from(poisoned).unwrap(), "alice"],
+        )
+        .unwrap();
+
+    let honest = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: Some(now_before),
+        groups: Vec::new(),
+    };
+    store
+        .save_account_projection_state(&honest, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    let now_after = unix_now_seconds();
+
+    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    let cursor = restored
+        .last_transport_timestamp
+        .expect("cursor must survive the save");
+    assert!(
+        (now_before + MAX_FUTURE_SKEW_SECS..=now_after + MAX_FUTURE_SKEW_SECS).contains(&cursor),
+        "poisoned stored cursor must heal to save-time now + skew, got {cursor}"
+    );
+}
+
+/// Fixed merge-time "now" for the pure cursor-merge tests below.
+const MERGE_NOW: u64 = 1_800_000_000;
+
+#[test]
+fn merged_transport_timestamp_is_explicit_over_missing_sides() {
+    assert_eq!(
+        merged_transport_timestamp(None, None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
+        None
+    );
+    // A fresh store adopts whatever the runtime learned.
+    assert_eq!(
+        merged_transport_timestamp(None, Some(MERGE_NOW), MERGE_NOW, MAX_FUTURE_SKEW_SECS),
+        Some(MERGE_NOW)
+    );
+    // A runtime that never learned a cursor must never wipe the stored one.
+    assert_eq!(
+        merged_transport_timestamp(Some(MERGE_NOW), None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
+        Some(MERGE_NOW)
+    );
+}
+
+#[test]
+fn merged_transport_timestamp_takes_max_of_in_range_sides() {
+    assert_eq!(
+        merged_transport_timestamp(
+            Some(MERGE_NOW - 100),
+            Some(MERGE_NOW),
+            MERGE_NOW,
+            MAX_FUTURE_SKEW_SECS
+        ),
+        Some(MERGE_NOW)
+    );
+    assert_eq!(
+        merged_transport_timestamp(
+            Some(MERGE_NOW),
+            Some(MERGE_NOW - 100),
+            MERGE_NOW,
+            MAX_FUTURE_SKEW_SECS
+        ),
+        Some(MERGE_NOW)
+    );
+}
+
+#[test]
+fn merged_transport_timestamp_clamps_both_sides_before_max() {
+    let poisoned = MERGE_NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+    // A poisoned stored side is healed to the ceiling instead of winning the
+    // max forever.
+    assert_eq!(
+        merged_transport_timestamp(
+            Some(poisoned),
+            Some(MERGE_NOW),
+            MERGE_NOW,
+            MAX_FUTURE_SKEW_SECS
+        ),
+        Some(MERGE_NOW + MAX_FUTURE_SKEW_SECS)
+    );
+    // A poisoned snapshot side is bounded the same way (defense in depth; the
+    // ingest path already clamps before the value reaches a save).
+    assert_eq!(
+        merged_transport_timestamp(
+            Some(MERGE_NOW),
+            Some(poisoned),
+            MERGE_NOW,
+            MAX_FUTURE_SKEW_SECS
+        ),
+        Some(MERGE_NOW + MAX_FUTURE_SKEW_SECS)
+    );
+}
+
+#[test]
+fn merged_transport_timestamp_is_cursor_neutral_without_snapshot() {
+    // Without a snapshot cursor there is nothing to merge against: the stored
+    // value passes through byte-identical, even when poisoned. Healing waits
+    // for the next save that learned a cursor, so a cursor-less save never
+    // moves the durable value in either direction.
+    let poisoned = MERGE_NOW + 10 * 365 * 24 * 60 * 60;
+    assert_eq!(
+        merged_transport_timestamp(Some(poisoned), None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
+        Some(poisoned)
+    );
+}
+
+#[test]
+fn clamp_to_max_future_skew_bounds_only_future_values() {
+    // In-range values pass through unchanged.
+    assert_eq!(
+        clamp_to_max_future_skew(MERGE_NOW - 1, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
+        MERGE_NOW - 1
+    );
+    assert_eq!(
+        clamp_to_max_future_skew(
+            MERGE_NOW + MAX_FUTURE_SKEW_SECS,
+            MERGE_NOW,
+            MAX_FUTURE_SKEW_SECS
+        ),
+        MERGE_NOW + MAX_FUTURE_SKEW_SECS
+    );
+    // Values beyond the ceiling are pulled back to it.
+    assert_eq!(
+        clamp_to_max_future_skew(
+            MERGE_NOW + MAX_FUTURE_SKEW_SECS + 1,
+            MERGE_NOW,
+            MAX_FUTURE_SKEW_SECS
+        ),
+        MERGE_NOW + MAX_FUTURE_SKEW_SECS
+    );
+    // The ceiling saturates instead of overflowing.
+    assert_eq!(
+        clamp_to_max_future_skew(MERGE_NOW, u64::MAX, MAX_FUTURE_SKEW_SECS),
+        MERGE_NOW
+    );
 }
 
 #[test]
@@ -205,13 +424,17 @@ fn account_projection_state_deletes_groups_removed_from_snapshot() {
         last_transport_timestamp: None,
         groups: vec![group("aa", "alpha"), group("bb", "beta")],
     };
-    store.save_account_projection_state(&state, 16).unwrap();
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
 
     let updated = StoredAccountState {
         groups: vec![group("bb", "beta")],
         ..state
     };
-    store.save_account_projection_state(&updated, 16).unwrap();
+    store
+        .save_account_projection_state(&updated, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
 
     let restored = store.load_account_projection_state("alice", 16).unwrap();
     assert_eq!(restored.groups.len(), 1);
@@ -237,7 +460,9 @@ fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
         last_transport_timestamp: None,
         groups: vec![group("aa", "alpha")],
     };
-    store.save_account_projection_state(&state, 16).unwrap();
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute_batch(
@@ -273,7 +498,9 @@ fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
 
     let mut updated = state;
     updated.seen_events.push("event-after".to_owned());
-    store.save_account_projection_state(&updated, 16).unwrap();
+    store
+        .save_account_projection_state(&updated, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
 
     let writes: i64 = store
         .lock()
@@ -447,6 +674,7 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
                 groups: vec![group("aa", "alpha")],
             },
             16,
+            MAX_FUTURE_SKEW_SECS,
         )
         .unwrap();
     let mut old = app_event("old-disk", "aa", 10);
@@ -586,6 +814,7 @@ fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
                 groups: vec![group("aa", "alpha")],
             },
             16,
+            MAX_FUTURE_SKEW_SECS,
         )
         .unwrap();
     let mut old = app_event("old-aa", "aa", 10);
@@ -994,6 +1223,7 @@ fn chat_notification_settings_track_timed_forever_and_cleared_mutes() {
                 groups: vec![group("aa", "Muted")],
             },
             1,
+            MAX_FUTURE_SKEW_SECS,
         )
         .unwrap();
 
@@ -1075,7 +1305,9 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         last_transport_timestamp: Some(1_700_000_001),
         groups: vec![group("aa", "alpha"), group("bb", "beta")],
     };
-    store.save_account_projection_state(&state, 16).unwrap();
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
     store
         .record_app_event(&app_event("msg-aa", "aa", 10))
         .unwrap();
@@ -1161,7 +1393,9 @@ fn delete_local_group_data_rolls_back_all_tables_on_failure() {
         last_transport_timestamp: None,
         groups: vec![group("aa", "alpha")],
     };
-    store.save_account_projection_state(&state, 16).unwrap();
+    store
+        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
     store
         .record_app_event(&app_event("msg-aa", "aa", 10))
         .unwrap();
