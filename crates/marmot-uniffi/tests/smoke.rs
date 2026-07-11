@@ -305,6 +305,38 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
 }
 
 #[tokio::test]
+async fn create_group_rejects_malformed_member_as_invalid_identity() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .expect("open account home")
+        .create_nostr_account()
+        .expect("create local account");
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("open marmot kit");
+    kit.start().await.expect("start marmot kit");
+
+    let error = kit
+        .create_group(
+            account.label,
+            "invalid member".into(),
+            vec!["not-a-member-ref".into()],
+            None,
+        )
+        .await
+        .expect_err("malformed member reference should fail");
+
+    assert!(
+        matches!(error, MarmotKitError::InvalidIdentity { .. }),
+        "malformed member reference must remain invalid input, got {error:?}"
+    );
+    kit.shutdown().await;
+}
+
+#[tokio::test]
 async fn delete_group_local_binding_is_public_and_validates_group_hex() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");

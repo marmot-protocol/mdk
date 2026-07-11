@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_key_package_event_crosses_ffi_as_typed_variant() {
+    fn invalid_key_package_event_maps_to_typed_variant() {
         let app_err = AppError::InvalidKeyPackageEvent("unsupported cipher suite".to_string());
         let ffi: MarmotKitError = app_err.into();
         assert!(
