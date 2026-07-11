@@ -4,7 +4,9 @@ use cgka_traits::app_components::{
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
 };
-use marmot_forensics::{AuditEventContext, AuditEventKind, AuditHumanActionContext};
+use marmot_forensics::{
+    AuditEventContext, AuditEventKind, AuditHumanActionContext, RelayRegistration,
+};
 
 use crate::messages::AppMessageIntent;
 use crate::{AppError, AppGroupRecord};
@@ -128,6 +130,58 @@ impl AppClient {
             audit_message_ids_from_effects(effects),
             None,
             None,
+        );
+    }
+
+    /// Record a `subscription_rebuild` forensic audit row for the just-completed
+    /// relay-plane activation: the `since` floor requested (`since_secs`; `None`
+    /// = full-history replay), the lookback subtracted from the durable cursor
+    /// to derive it, and the per-relay registration outcome. Drains the relay
+    /// plane's registration log, so each rebuild's relays land on exactly one
+    /// row. Account-scoped (no group), so `group_ref` is `None`.
+    pub(crate) async fn record_subscription_rebuild(&self, since_secs: Option<u64>) {
+        let relay_results = self
+            .relay_plane
+            .take_subscription_registrations()
+            .await
+            .into_iter()
+            .map(|outcome| RelayRegistration {
+                relay_url: outcome.relay_url,
+                accepted: outcome.accepted,
+            })
+            .collect();
+        self.runtime.session().record_audit_event(
+            None,
+            None,
+            AuditEventKind::SubscriptionRebuild {
+                since_secs,
+                lookback_secs: self.relay_plane.subscription_rebuild_lookback_secs(),
+                relay_results,
+            },
+        );
+    }
+
+    /// Record a `sync_drain` forensic audit row at the drain-loop exit: how long
+    /// the drain ran (`duration_ms`, wall-clock), how many deliveries it ingested
+    /// (`deliveries`), and the durable transport cursor immediately before and
+    /// after the drain (Nostr second-granular). Account-scoped, so `group_ref`
+    /// is `None`.
+    pub(crate) fn record_sync_drain(
+        &self,
+        duration_ms: u64,
+        deliveries: u64,
+        cursor_before_secs: Option<u64>,
+        cursor_after_secs: Option<u64>,
+    ) {
+        self.runtime.session().record_audit_event(
+            None,
+            None,
+            AuditEventKind::SyncDrain {
+                duration_ms,
+                deliveries,
+                cursor_before_secs,
+                cursor_after_secs,
+            },
         );
     }
 

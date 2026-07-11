@@ -57,8 +57,16 @@ impl AppClient {
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
+        // Capture the derived `since` floor before it is moved into activation;
+        // the forensic `subscription_rebuild` row records it alongside the
+        // per-relay registration outcome the activation produces.
+        let rebuild_since_secs = rebuild_since.map(|timestamp| timestamp.0);
         self.runtime.activate_transport(rebuild_since).await?;
         self.sync_runtime_groups().await?;
+        // Both the inbox/group activation and the group-subscription refresh
+        // have now registered on relays; emit the rebuild audit row from the
+        // drained registration log before draining inbound deliveries.
+        self.record_subscription_rebuild(rebuild_since_secs).await;
         let mut summary = self.sync_sdk_relay().await?;
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
@@ -227,6 +235,13 @@ impl AppClient {
             .cloned()
             .collect::<HashSet<_>>();
         let mut first_wait = true;
+        // Forensic drain accounting: wall-clock span, count of deliveries
+        // actually ingested (echoes and already-seen duplicates are skipped and
+        // not counted), and the durable cursor before/after so an analyzer can
+        // compare the persisted floor against the ingested `created_at`s.
+        let drain_started = std::time::Instant::now();
+        let cursor_before_secs = self.state.last_transport_timestamp;
+        let mut deliveries: u64 = 0;
 
         loop {
             let wait = if first_wait {
@@ -252,8 +267,15 @@ impl AppClient {
             remember_seen_event(&mut seen, &mut self.state, event_id);
             self.ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
+            deliveries = deliveries.saturating_add(1);
         }
 
+        self.record_sync_drain(
+            drain_started.elapsed().as_millis() as u64,
+            deliveries,
+            cursor_before_secs,
+            self.state.last_transport_timestamp,
+        );
         self.app.save_state(&self.state)?;
         Ok(summary)
     }

@@ -70,12 +70,35 @@ pub struct NostrSdkRelayHealth {
     pub connection_successes: usize,
 }
 
+/// One relay's subscription-registration outcome, surfaced to the app so it can
+/// be recorded in the forensic audit log's `subscription_rebuild` row.
+///
+/// `relay_url` is the caller-supplied subscription endpoint (the app already
+/// holds it — it is not a reverse-mapped [`crate::RelayIndex`], so this crosses
+/// no new identity over the boundary); `accepted` is whether the relay pool
+/// acknowledged the subscription registration. This is only returned to the
+/// caller — the adapter never logs the URL (the privacy invariant applies to
+/// tracing, not to this return value).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayRegistrationOutcome {
+    pub relay_url: String,
+    pub accepted: bool,
+}
+
 /// `nostr-sdk` backed implementation of [`NostrRelayClient`].
 #[derive(Clone)]
 pub struct NostrSdkRelayClient {
     client: Client,
     account_subscriptions: Arc<RwLock<HashMap<MemberId, Vec<SubscriptionId>>>>,
     publish_relay_refs: Arc<Mutex<HashMap<RelayUrl, usize>>>,
+    /// Per-relay subscription-registration outcomes accumulated since the last
+    /// [`take_subscription_registrations`](Self::take_subscription_registrations)
+    /// drain, keyed by endpoint. Merged monotonically (a relay counts as
+    /// registered once any subscription lands on it) so the app can attribute
+    /// one rebuild's registration results to a single audit row. Shared via
+    /// `Arc` so the clone the adapter drives during activation and the clone the
+    /// app holds observe the same log.
+    registration_log: Arc<Mutex<HashMap<RelayUrl, bool>>>,
 }
 
 impl NostrSdkRelayClient {
@@ -84,6 +107,7 @@ impl NostrSdkRelayClient {
             client,
             account_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             publish_relay_refs: Arc::new(Mutex::new(HashMap::new())),
+            registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -101,6 +125,26 @@ impl NostrSdkRelayClient {
             health.record_status(relay.status());
         }
         health
+    }
+
+    /// Drain the per-relay subscription-registration outcomes accumulated since
+    /// the previous drain, sorted by relay URL for stable audit output.
+    ///
+    /// Draining attributes each outcome to exactly one caller (one
+    /// `subscription_rebuild` audit row); a subsequent rebuild starts from an
+    /// empty log. Returns an empty vec when no subscription has been registered
+    /// since the last drain.
+    pub async fn take_subscription_registrations(&self) -> Vec<RelayRegistrationOutcome> {
+        let mut log = self.registration_log.lock().await;
+        let mut outcomes: Vec<RelayRegistrationOutcome> = log
+            .drain()
+            .map(|(relay, accepted)| RelayRegistrationOutcome {
+                relay_url: relay.to_string(),
+                accepted,
+            })
+            .collect();
+        outcomes.sort_by(|a, b| a.relay_url.cmp(&b.relay_url));
+        outcomes
     }
 
     /// Start forwarding `nostr-sdk` notifications into the adapter's delivery
@@ -546,6 +590,16 @@ impl NostrRelayClient for NostrSdkRelayClient {
             "SDK relay subscription registered"
         );
 
+        // Record which of the requested endpoints acknowledged the registration
+        // so the app can surface it in the `subscription_rebuild` audit row.
+        // Only reached on the success path (>=1 relay registered): a total
+        // failure returned above, aborting activation before any audit row.
+        let outcomes = plan
+            .endpoints
+            .iter()
+            .map(|endpoint| (endpoint.clone(), output.success.contains(endpoint)));
+        merge_registration_log(&mut *self.registration_log.lock().await, outcomes);
+
         self.account_subscriptions
             .write()
             .await
@@ -782,6 +836,24 @@ impl<T: PartialEq> PushUnique<T> for Vec<T> {
     }
 }
 
+/// Fold one subscribe attempt's per-endpoint outcomes into the running
+/// registration log.
+///
+/// A relay counts as registered for the rebuild if it acknowledged *any*
+/// subscription (monotonic OR), so a group subscription that lands on a relay
+/// after a transient inbox miss still marks that relay accepted for the rebuild
+/// as a whole. Kept as a free function so the merge is unit-testable without a
+/// live relay pool.
+fn merge_registration_log(
+    log: &mut HashMap<RelayUrl, bool>,
+    outcomes: impl IntoIterator<Item = (RelayUrl, bool)>,
+) {
+    for (relay, accepted) in outcomes {
+        let entry = log.entry(relay).or_insert(false);
+        *entry = *entry || accepted;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +939,74 @@ mod tests {
             serde_json::json!([hex::encode(&transport_group_id)])
         );
         assert_eq!(json["since"], serde_json::json!(1_700_000_000));
+    }
+
+    fn relay(url: &str) -> RelayUrl {
+        RelayUrl::parse(url).expect("relay url")
+    }
+
+    #[test]
+    fn registration_log_pairs_each_endpoint_with_its_acceptance() {
+        let one = relay("wss://one.example");
+        let two = relay("wss://two.example");
+        let mut log = HashMap::new();
+        // The requested endpoints are the authoritative key set: `two` failed
+        // to register (absent from the success set), `one` succeeded.
+        let success: HashSet<RelayUrl> = [one.clone()].into_iter().collect();
+        merge_registration_log(
+            &mut log,
+            [&one, &two]
+                .into_iter()
+                .map(|endpoint| (endpoint.clone(), success.contains(endpoint))),
+        );
+        assert_eq!(log.get(&one), Some(&true));
+        assert_eq!(log.get(&two), Some(&false));
+    }
+
+    #[test]
+    fn registration_log_merge_is_monotonic_ok() {
+        let one = relay("wss://one.example");
+        let mut log = HashMap::new();
+        // A first subscription misses the relay, a second lands on it: the
+        // relay counts as registered for the rebuild as a whole.
+        merge_registration_log(&mut log, [(one.clone(), false)]);
+        merge_registration_log(&mut log, [(one.clone(), true)]);
+        assert_eq!(log.get(&one), Some(&true));
+        // A later miss must not flip an already-accepted relay back to failed.
+        merge_registration_log(&mut log, [(one.clone(), false)]);
+        assert_eq!(log.get(&one), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn take_subscription_registrations_drains_sorted_and_resets() {
+        let client = Client::builder().build();
+        let sdk = NostrSdkRelayClient::new(client);
+        // Seed the log directly (the network subscribe path is exercised by the
+        // MockRelay tests below); this pins the drain/sort/reset contract the
+        // app relies on for one audit row per rebuild.
+        merge_registration_log(
+            &mut *sdk.registration_log.lock().await,
+            [
+                (relay("wss://b.example"), true),
+                (relay("wss://a.example"), false),
+            ],
+        );
+        let outcomes = sdk.take_subscription_registrations().await;
+        assert_eq!(
+            outcomes,
+            vec![
+                RelayRegistrationOutcome {
+                    relay_url: "wss://a.example".into(),
+                    accepted: false,
+                },
+                RelayRegistrationOutcome {
+                    relay_url: "wss://b.example".into(),
+                    accepted: true,
+                },
+            ]
+        );
+        // Draining resets: a subsequent rebuild starts from an empty log.
+        assert!(sdk.take_subscription_registrations().await.is_empty());
     }
 
     #[test]

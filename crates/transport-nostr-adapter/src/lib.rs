@@ -68,7 +68,9 @@ pub use relay_list::{
     NostrAccountRelayListPublication,
 };
 #[cfg(feature = "sdk")]
-pub use sdk_client::{NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan};
+pub use sdk_client::{
+    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
+};
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
     RelayDeliveryTelemetry, RelayExportConsent, RelayIndex, RelayIndexRegistry,
