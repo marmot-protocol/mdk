@@ -14,6 +14,11 @@ pub enum MarmotKitError {
     InvalidHex { details: String },
     #[error("invalid nostr identity: {details}")]
     InvalidIdentity { details: String },
+    /// A fetched Nostr event exists for the recipient but cannot be used as a
+    /// valid Marmot KeyPackage. Kept distinct from malformed recipient input so
+    /// host apps can present a setup/invite state without string matching.
+    #[error("invalid key package event: {details}")]
+    InvalidKeyPackageEvent { details: String },
     #[error("missing key package for {account}")]
     MissingKeyPackage { account: String },
     #[error("publish failed: {details}")]
@@ -151,7 +156,7 @@ impl From<AppError> for MarmotKitError {
             AppError::InvalidPublicKey => Self::InvalidIdentity {
                 details: "invalid nostr public key".into(),
             },
-            AppError::InvalidKeyPackageEvent(details) => Self::InvalidIdentity { details },
+            AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent { details },
             AppError::Publish(details) => Self::Publish { details },
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeStopping => Self::RuntimeStopping,
@@ -329,6 +334,20 @@ mod tests {
         assert!(
             matches!(wrapped, MarmotKitError::Io { .. }),
             "AccountHome IO failure must map to Io, got {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_key_package_event_crosses_ffi_as_typed_variant() {
+        let app_err = AppError::InvalidKeyPackageEvent("unsupported cipher suite".to_string());
+        let ffi: MarmotKitError = app_err.into();
+        assert!(
+            matches!(
+                ffi,
+                MarmotKitError::InvalidKeyPackageEvent { ref details }
+                    if details == "unsupported cipher suite"
+            ),
+            "invalid KeyPackage events must not be flattened into InvalidIdentity, got {ffi:?}"
         );
     }
 
