@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use cgka_traits::TransportEndpoint;
-use marmot_app::{MarmotApp, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination};
+use marmot_app::{
+    MarmotApp, MarmotAppConfig, MarmotAppRuntime, TimelineMessageQuery, TimelinePagination,
+};
 
 mod commands;
 mod conversions;
@@ -45,14 +47,15 @@ pub use conversions::{
     AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
     AuditLogTrackerUpdateResultFfi, AuditLogUploadResultFfi, AuditLogUploadSourceFfi,
     BackgroundNotificationCollectionFfi, ChatListAvatarFfi, ChatListMessagePreviewFfi,
-    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, GroupPushDebugInfoFfi,
-    GroupPushTokenDebugEntryFfi, GroupSystemEventFfi, LocalPushRegistrationDebugFfi,
-    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi,
-    MediaUploadAttachmentRequestFfi, MediaUploadAttachmentResultFfi, MediaUploadRequestFfi,
-    MediaUploadResultFfi, MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi,
-    MessageDraftFfi, MessageDraftSummaryFfi, NotificationCollectionStatusFfi,
-    NotificationSettingsFfi, NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi, RelayTelemetryResourceFfi,
+    ChatListRowFfi, ChatListSubscriptionUpdateFfi, ChatListUpdateTriggerFfi, CursorPersistenceFfi,
+    GroupPushDebugInfoFfi, GroupPushTokenDebugEntryFfi, GroupSystemEventFfi,
+    LocalPushRegistrationDebugFfi, MediaAttachmentReferenceFfi, MediaDownloadResultFfi,
+    MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
+    MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
+    MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
+    MessageDraftSummaryFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
+    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
+    PushPlatformFfi, PushRegistrationFfi, RelayTelemetryResourceFfi,
     RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
     SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
     TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
@@ -138,11 +141,34 @@ impl Marmot {
     /// events.
     #[uniffi::constructor]
     pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError> {
-        let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
-            .map_err(marmot_app::AppError::from)?;
-        let app = MarmotApp::with_relays_and_account_home(&root_path, relay_urls, account_home);
-        let runtime = app.runtime();
-        Ok(Arc::new(Self { app, runtime }))
+        Self::open(root_path, relay_urls, MarmotAppConfig::default())
+    }
+
+    /// Open the Marmot app with an explicit durable transport-cursor policy.
+    /// Identical to [`Marmot::new`] except for the policy; `new` itself is
+    /// [`CursorPersistenceFfi::Advance`].
+    ///
+    /// Wake-collection processes — the iOS NSE constructing one `Marmot` per
+    /// push around [`Marmot::collect_notifications_after_wake`], and the
+    /// notification reply/mark-read action paths — construct with
+    /// [`CursorPersistenceFfi::Frozen`]: the pass still ingests, decrypts, and
+    /// projects everything, but a sub-second drain on cold sockets can never
+    /// ratchet the durable `since` floor past events it did not receive (the
+    /// commit-loss trigger). Foreground app processes keep [`Marmot::new`].
+    // Construction-surface addition: binding regeneration and the workspace
+    // version bump ride the release per this crate's lockstep invariant — do
+    // not bump versions here.
+    #[uniffi::constructor]
+    pub fn new_with_cursor_persistence(
+        root_path: String,
+        relay_urls: Vec<String>,
+        cursor_persistence: CursorPersistenceFfi,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        Self::open(
+            root_path,
+            relay_urls,
+            MarmotAppConfig::default().with_cursor_persistence(cursor_persistence.into()),
+        )
     }
 
     /// Bring the runtime online: reconcile known accounts, start workers,
@@ -164,6 +190,27 @@ impl Marmot {
     /// the background.
     pub fn is_stopping(&self) -> bool {
         self.runtime.is_stopping()
+    }
+}
+
+impl Marmot {
+    /// Shared open path behind the exported constructors: keychain-backed
+    /// account home, app configured by `config`, runtime pair.
+    fn open(
+        root_path: String,
+        relay_urls: Vec<String>,
+        config: MarmotAppConfig,
+    ) -> Result<Arc<Self>, MarmotKitError> {
+        let account_home = marmot_account::AccountHome::open_with_default_keychain(&root_path)
+            .map_err(marmot_app::AppError::from)?;
+        let app = MarmotApp::with_relays_and_account_home_and_config(
+            &root_path,
+            relay_urls,
+            account_home,
+            config,
+        );
+        let runtime = app.runtime();
+        Ok(Arc::new(Self { app, runtime }))
     }
 }
 

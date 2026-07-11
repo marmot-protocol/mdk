@@ -117,9 +117,9 @@ pub use audit_log::{
 };
 pub use client::AppClient;
 pub use config::{
-    AuditLogTrackerConfig, AuditLogUploadSource, MarmotAppConfig, MarmotServiceEndpoints,
-    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings,
+    AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
+    MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
@@ -878,6 +878,12 @@ impl MarmotApp {
     /// upload/download act paths.
     pub(crate) fn allow_loopback_blob_endpoints(&self) -> bool {
         self.config.allow_loopback_blob_endpoints
+    }
+
+    /// The construction-time durable transport-cursor policy every client
+    /// opened from this app applies (see [`CursorPersistence`]).
+    pub(crate) fn cursor_persistence(&self) -> CursorPersistence {
+        self.config.cursor_persistence
     }
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {

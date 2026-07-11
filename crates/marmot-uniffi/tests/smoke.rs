@@ -13,7 +13,7 @@ use std::sync::{Arc, Once};
 use marmot_account::AccountHome;
 use marmot_uniffi::{
     AuditDataModeFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi,
-    Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
+    CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
     NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
 };
@@ -456,6 +456,38 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
         .subscribe_notifications()
         .await
         .expect("empty notification subscription should be valid");
+}
+
+#[tokio::test]
+async fn frozen_cursor_persistence_constructor_opens_and_collects() {
+    // The NSE construction surface (commit-loss Phase 4): a per-push process
+    // opens the kit with the Frozen policy and runs a wake collection. The
+    // cursor semantics themselves are covered in marmot-app
+    // (`tests/cursor_persistence.rs`); the job here is to prove the FFI
+    // constructor + enum cross the boundary and drive the wake path.
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kit = Marmot::new_with_cursor_persistence(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+        CursorPersistenceFfi::Frozen,
+    )
+    .expect("open frozen marmot kit");
+    let collected = kit
+        .collect_notifications_after_wake(1, NotificationWakeSourceFfi::ApnsNse)
+        .await
+        .expect("empty frozen wake collection should be valid");
+    assert!(collected.notifications.is_empty());
+    kit.shutdown().await;
+
+    // The same store reopens under the default constructor (Advance): the
+    // policy is a per-construction posture, not persisted store state.
+    let reopened = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".to_string()],
+    )
+    .expect("reopen marmot kit with the default Advance policy");
+    assert!(!reopened.is_stopping());
 }
 
 #[tokio::test]

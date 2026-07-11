@@ -84,6 +84,22 @@ mod tests {
     }
 
     #[test]
+    fn cursor_persistence_ffi_preserves_each_variant() {
+        use marmot_app::CursorPersistence;
+        // The FFI enum mirrors the app policy 1:1; a swapped variant here
+        // would hand a wake-collection process the Advance posture and
+        // silently reintroduce the NSE cursor ratchet (commit-loss Phase 4).
+        assert!(matches!(
+            CursorPersistence::from(CursorPersistenceFfi::Advance),
+            CursorPersistence::Advance
+        ));
+        assert!(matches!(
+            CursorPersistence::from(CursorPersistenceFfi::Frozen),
+            CursorPersistence::Frozen
+        ));
+    }
+
+    #[test]
     fn self_membership_ffi_preserves_each_variant() {
         use marmot_app::SelfMembership;
         // The FFI enum mirrors the app enum 1:1; a swapped Left/Removed here

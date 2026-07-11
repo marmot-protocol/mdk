@@ -10,10 +10,50 @@ const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
 const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
     option_env!("MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS");
 
+/// Policy for advancing the account's durable transport cursor
+/// (`last_transport_timestamp`) from ingested deliveries.
+///
+/// A runtime-construction policy, not a per-call switch: it is fixed on
+/// [`MarmotAppConfig`] and applies to every account client the resulting
+/// `MarmotApp`/`MarmotAppRuntime` opens for that construction's lifetime.
+///
+/// * [`Advance`](Self::Advance) — the default, normal posture: every ingested
+///   kind-445 advances the in-memory cursor (clamp-then-monotonic-max, see
+///   `client/sync.rs`) and `save_state` persists the advance.
+/// * [`Frozen`](Self::Frozen) — the wake-collection posture (iOS NSE,
+///   notification reply/mark-read actions: full runtimes with a sub-second
+///   drain budget on cold sockets). A `Frozen` pass still ingests, decrypts,
+///   and projects everything; it only cannot move the durable floor. The
+///   in-memory cursor never advances, so every `save_state` writes back the
+///   loaded value, and the save-time clamp-then-max merge in
+///   `storage_sqlite::save_account_projection_state` guarantees that write can
+///   never lower a cursor a concurrent `Advance` runtime has moved. The cursor
+///   is still *loaded* and still derives the subscription `since` floor —
+///   `Frozen` means "never advance", not "no cursor". Worst case is bounded
+///   redelivery on the next `Advance` catch-up, absorbed by seen-id dedup.
+///
+/// `Frozen` severs the commit-loss cursor ratchet at its confirmed trigger:
+/// a wake pass that drains for a fraction of a second on cold sockets must
+/// not persist a floor above events it never had time to receive
+/// (`plan.md` Phase 4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorPersistence {
+    /// Ingested deliveries advance the durable cursor (default).
+    #[default]
+    Advance,
+    /// The durable cursor never advances; the pass still ingests and projects.
+    Frozen,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
     pub directory_max_future_skew: Duration,
     pub service_endpoints: MarmotServiceEndpoints,
+    /// Durable transport-cursor persistence policy. Defaults to
+    /// [`CursorPersistence::Advance`]; wake-collection runtimes (NSE,
+    /// notification actions) opt in to [`CursorPersistence::Frozen`] at
+    /// construction. See the enum docs for the full semantics.
+    pub cursor_persistence: CursorPersistence,
     /// Dev/test gate for loopback-HTTP blob endpoints. A loopback-HTTP endpoint
     /// (e.g. `http://127.0.0.1:PORT`) is VALID component state for everyone, but
     /// per group-encrypted-media-v1.md a client MUST NOT upload to or download
@@ -60,6 +100,7 @@ impl Default for MarmotAppConfig {
         Self {
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             service_endpoints: MarmotServiceEndpoints::compiled(),
+            cursor_persistence: CursorPersistence::Advance,
             allow_loopback_blob_endpoints: false,
             allow_loopback_relay_endpoints: false,
             dev_settlement_quiescence_ms: None,
@@ -75,6 +116,16 @@ impl MarmotAppConfig {
 
     pub fn with_service_endpoints(mut self, endpoints: MarmotServiceEndpoints) -> Self {
         self.service_endpoints = endpoints.normalize();
+        self
+    }
+
+    /// Set the durable transport-cursor persistence policy. Defaults to
+    /// [`CursorPersistence::Advance`]; wake-collection runtimes (NSE,
+    /// notification actions) construct with [`CursorPersistence::Frozen`] so a
+    /// sub-second drain can never ratchet the durable `since` floor past
+    /// events it did not receive.
+    pub fn with_cursor_persistence(mut self, policy: CursorPersistence) -> Self {
+        self.cursor_persistence = policy;
         self
     }
 
@@ -516,6 +567,23 @@ fn host_is_loopback(host: url::Host<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_persistence_defaults_to_advance_and_is_opt_in() {
+        // Only wake-collection runtimes (NSE, notification actions) may opt in
+        // to the frozen posture; every other construction must keep advancing
+        // the durable cursor or catch-up floors would stop tracking delivery.
+        assert_eq!(
+            MarmotAppConfig::default().cursor_persistence,
+            CursorPersistence::Advance
+        );
+        assert_eq!(
+            MarmotAppConfig::default()
+                .with_cursor_persistence(CursorPersistence::Frozen)
+                .cursor_persistence,
+            CursorPersistence::Frozen
+        );
+    }
 
     #[test]
     fn allow_loopback_blob_endpoints_defaults_off_and_is_opt_in() {
