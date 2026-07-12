@@ -118,6 +118,14 @@ case "$installer_service_dry_run" in
     *"would require OpenCode binary: /bin/echo"* ) ;;
     *) echo "opencode installer service dry-run did not validate OpenCode binary" >&2; exit 1;;
 esac
+case "$installer_service_dry_run" in
+    *"WN_OPENCODE_TIMEOUT_SECS"*3600* ) ;;
+    *) echo "opencode installer service dry-run did not set 3600s total timeout" >&2; exit 1;;
+esac
+case "$installer_service_dry_run" in
+    *"WN_OPENCODE_IDLE_TIMEOUT_SECS"*120* ) ;;
+    *) echo "opencode installer service dry-run did not set 120s idle timeout" >&2; exit 1;;
+esac
 case "$(uname -s)" in
     Darwin)
         case "$installer_service_dry_run" in

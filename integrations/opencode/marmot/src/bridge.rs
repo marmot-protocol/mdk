@@ -13,7 +13,7 @@ use crate::chunking::split_reply_chunks;
 use crate::config::{Config, dirs_home};
 use crate::control::ControlClient;
 use crate::error::{HarnessError, Result};
-use crate::opencode::{Invocation, Outcome, RunnerEvent};
+use crate::opencode::{Invocation, Outcome, RunFailure, RunnerEvent};
 use crate::repo_picker::{parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{SessionRecord, SessionStore};
 
@@ -343,6 +343,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
     let invocation = Invocation {
         bin: ctx.cfg.opencode_bin.clone(),
         timeout: ctx.cfg.opencode_timeout,
+        idle_timeout: ctx.cfg.opencode_idle_timeout,
         cwd: cwd.clone(),
         session_id,
         prompt,
@@ -402,7 +403,26 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
             )
             .await;
         }
-        Ok(Err(err)) => {
+        Ok(Err(RunFailure {
+            error: err,
+            observed_session,
+        })) => {
+            if let Err(store_err) = persist_observed_session_if_unset(
+                &ctx.sessions,
+                &inbound.group_ref,
+                known_session.as_ref(),
+                cwd,
+                observed_session,
+            )
+            .await
+            {
+                warn!(
+                    target: TRACE_TARGET,
+                    method = "session_store",
+                    error_kind = store_err.privacy_safe_kind(),
+                    "failed to persist opencode session"
+                );
+            }
             warn!(
                 target: TRACE_TARGET,
                 method = "opencode_run",
@@ -410,20 +430,25 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
                 "opencode invocation failed"
             );
             let text = match err {
+                HarnessError::OpencodeIdle => format!(
+                    "[wn-opencode] opencode went silent for {}s without producing output; killing the invocation.",
+                    ctx.cfg.opencode_idle_timeout.as_secs()
+                ),
                 HarnessError::OpencodeTimedOut => {
                     "[wn-opencode] opencode timed out before producing a complete response."
+                        .to_owned()
                 }
                 HarnessError::OpencodeSpawn => {
-                    "[wn-opencode] failed to start opencode; check WN_OPENCODE_BIN."
+                    "[wn-opencode] failed to start opencode; check WN_OPENCODE_BIN.".to_owned()
                 }
-                _ => "[wn-opencode] opencode failed while streaming its response.",
+                _ => "[wn-opencode] opencode failed while streaming its response.".to_owned(),
             };
             let _ = send_reply(
                 &ctx,
                 &inbound.account_ref,
                 &inbound.group_ref,
                 &inbound.message_ref,
-                text,
+                &text,
                 0,
             )
             .await;
@@ -475,10 +500,14 @@ async fn finish_success(
     if !delivery.failed
         && needs_persist
         && let Some(session_id) = outcome.observed_session
-        && let Err(err) = ctx
-            .sessions
-            .set(&inbound.group_ref, SessionRecord { session_id, cwd })
-            .await
+        && let Err(err) = persist_observed_session_if_unset(
+            &ctx.sessions,
+            &inbound.group_ref,
+            known_session.as_ref(),
+            cwd,
+            Some(session_id),
+        )
+        .await
     {
         warn!(
             target: TRACE_TARGET,
@@ -525,6 +554,24 @@ struct DeliveryReport {
     chunk_count: usize,
     failed: bool,
     failure_chunk_index: usize,
+}
+
+async fn persist_observed_session_if_unset(
+    sessions: &SessionStore,
+    group_ref: &str,
+    known_session: Option<&SessionRecord>,
+    cwd: PathBuf,
+    observed_session: Option<String>,
+) -> Result<()> {
+    let needs_persist = known_session
+        .as_ref()
+        .is_none_or(|record| record.session_id.is_empty());
+    if needs_persist && let Some(session_id) = observed_session {
+        sessions
+            .set(group_ref, SessionRecord { session_id, cwd })
+            .await?;
+    }
+    Ok(())
 }
 
 async fn resolve_cwd_and_prompt(
@@ -753,6 +800,7 @@ impl InboundDedupe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SessionStore;
 
     #[tokio::test]
     async fn dedupe_rejects_repeated_message_refs() {
@@ -783,5 +831,79 @@ mod tests {
             find_account_ref(&[account], &"aa".repeat(32)),
             Some("AA".repeat(32))
         );
+    }
+
+    #[tokio::test]
+    async fn persist_observed_session_only_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let home = dir.path().to_path_buf();
+        let store = SessionStore::load(path.clone(), &home).unwrap();
+        let cwd = home.join("proj");
+
+        persist_observed_session_if_unset(
+            &store,
+            "group1",
+            None,
+            cwd.clone(),
+            Some("ses_new".to_owned()),
+        )
+        .await
+        .unwrap();
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.session_id, "ses_new");
+        assert_eq!(record.cwd, cwd);
+
+        persist_observed_session_if_unset(
+            &store,
+            "group1",
+            Some(&record),
+            cwd.clone(),
+            Some("ses_other".to_owned()),
+        )
+        .await
+        .unwrap();
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.session_id, "ses_new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backpressured_runner_failure_session_can_be_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let store = SessionStore::load(home.join("sessions.json"), &home).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let failure = crate::opencode::run(
+            Invocation {
+                bin: concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/mock-opencode.sh"
+                )
+                .to_owned(),
+                timeout: Duration::from_millis(200),
+                idle_timeout: Duration::from_secs(5),
+                cwd: home.clone(),
+                session_id: None,
+                prompt: "session-backpressure".to_owned(),
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(failure.error, HarnessError::OpencodeTimedOut));
+        persist_observed_session_if_unset(
+            &store,
+            "group1",
+            None,
+            home.clone(),
+            failure.observed_session,
+        )
+        .await
+        .unwrap();
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.session_id, "ses_backpressure");
+        assert_eq!(record.cwd, home);
     }
 }

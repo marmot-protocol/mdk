@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::task::JoinHandle;
+use tokio::time::{timeout, timeout_at};
 use tracing::debug;
 
 use crate::bridge::TRACE_TARGET;
@@ -18,6 +19,7 @@ const STDERR_CAPTURE_BYTES: usize = 4096;
 pub(crate) struct Invocation {
     pub(crate) bin: String,
     pub(crate) timeout: Duration,
+    pub(crate) idle_timeout: Duration,
     pub(crate) cwd: PathBuf,
     pub(crate) session_id: Option<String>,
     pub(crate) prompt: String,
@@ -33,6 +35,12 @@ pub(crate) struct Outcome {
 }
 
 #[derive(Debug)]
+pub(crate) struct RunFailure {
+    pub(crate) error: HarnessError,
+    pub(crate) observed_session: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RunnerEvent {
     Text(String),
 }
@@ -74,7 +82,10 @@ struct OpencodeErrorData {
     status_code: Option<u16>,
 }
 
-pub(crate) async fn run(invocation: Invocation, tx: mpsc::Sender<RunnerEvent>) -> Result<Outcome> {
+pub(crate) async fn run(
+    invocation: Invocation,
+    tx: mpsc::Sender<RunnerEvent>,
+) -> std::result::Result<Outcome, RunFailure> {
     let mut command = Command::new(&invocation.bin);
     command
         .args(build_run_args(
@@ -87,28 +98,58 @@ pub(crate) async fn run(invocation: Invocation, tx: mpsc::Sender<RunnerEvent>) -
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = command.spawn().map_err(|_| HarnessError::OpencodeSpawn)?;
-    let stdout = child.stdout.take().ok_or(HarnessError::OpencodeSpawn)?;
-    let stderr = child.stderr.take().ok_or(HarnessError::OpencodeSpawn)?;
+    let mut child = command.spawn().map_err(|_| RunFailure {
+        error: HarnessError::OpencodeSpawn,
+        observed_session: None,
+    })?;
+    let total_deadline = tokio::time::Instant::now() + invocation.timeout;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_and_reap(&mut child).await;
+            return Err(RunFailure {
+                error: HarnessError::OpencodeSpawn,
+                observed_session: None,
+            });
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            kill_and_reap(&mut child).await;
+            return Err(RunFailure {
+                error: HarnessError::OpencodeSpawn,
+                observed_session: None,
+            });
+        }
+    };
     let mut lines = BufReader::new(stdout).lines();
-    let stderr_task = tokio::spawn(capture_stderr(stderr));
+    let mut stderr_task = tokio::spawn(capture_stderr(stderr));
     let start = Instant::now();
     let mut observed_session: Option<String> = None;
     let mut error_summary: Option<String> = None;
 
-    let stream_result = timeout(invocation.timeout, async {
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .map_err(|_| HarnessError::OpencodeStream)?
-        {
+    let lifecycle_result = timeout_at(total_deadline, async {
+        loop {
+            let line = match timeout(invocation.idle_timeout, lines.next_line()).await {
+                Err(_) => return Err(HarnessError::OpencodeIdle),
+                Ok(Err(_)) => return Err(HarnessError::OpencodeStream),
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(line))) => line,
+            };
+
             if line.is_empty() {
                 continue;
             }
             match parse_event_line(&line) {
                 Ok(Some(ParsedEvent::Text(text))) => {
-                    if !text.trim().is_empty() && tx.send(RunnerEvent::Text(text)).await.is_err() {
-                        break;
+                    if !text.trim().is_empty() {
+                        // The idle clock measures actual stdout reads, not time intentionally
+                        // spent applying bounded reply-channel backpressure. The total deadline
+                        // still caps both operations.
+                        tx.send(RunnerEvent::Text(text))
+                            .await
+                            .map_err(|_| HarnessError::OpencodeStream)?;
                     }
                 }
                 Ok(Some(ParsedEvent::Session(session_id))) => {
@@ -120,8 +161,10 @@ pub(crate) async fn run(invocation: Invocation, tx: mpsc::Sender<RunnerEvent>) -
                     session_id,
                     summary,
                 })) => {
-                    if observed_session.is_none() {
-                        observed_session = session_id;
+                    if let Some(session_id) = session_id
+                        && observed_session.is_none()
+                    {
+                        observed_session = Some(session_id);
                     }
                     if error_summary.is_none() {
                         error_summary = Some(summary);
@@ -138,31 +181,49 @@ pub(crate) async fn run(invocation: Invocation, tx: mpsc::Sender<RunnerEvent>) -
                 }
             }
         }
-        Ok::<(), HarnessError>(())
+
+        let status = child.wait().await.map_err(HarnessError::from)?;
+        let stderr = (&mut stderr_task).await.map_err(HarnessError::from)?;
+        Ok::<Outcome, HarnessError>(Outcome {
+            observed_session: observed_session.clone(),
+            exit_code: status.code(),
+            error_summary,
+            stderr: strip_ansi(stderr.trim()),
+            elapsed_ms: start.elapsed().as_millis(),
+        })
     })
     .await;
 
-    match stream_result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            let _ = child.kill().await;
-            return Err(err);
+    match lifecycle_result {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(error)) => {
+            cleanup_failed_run(&mut child, &mut stderr_task).await;
+            Err(RunFailure {
+                error,
+                observed_session,
+            })
         }
         Err(_) => {
-            let _ = child.kill().await;
-            return Err(HarnessError::OpencodeTimedOut);
+            cleanup_failed_run(&mut child, &mut stderr_task).await;
+            Err(RunFailure {
+                error: HarnessError::OpencodeTimedOut,
+                observed_session,
+            })
         }
     }
+}
 
-    let status = child.wait().await?;
-    let stderr = stderr_task.await?;
-    Ok(Outcome {
-        observed_session,
-        exit_code: status.code(),
-        error_summary,
-        stderr: strip_ansi(stderr.trim()),
-        elapsed_ms: start.elapsed().as_millis(),
-    })
+async fn cleanup_failed_run(child: &mut Child, stderr_task: &mut JoinHandle<String>) {
+    stderr_task.abort();
+    kill_and_reap(child).await;
+    if !stderr_task.is_finished() {
+        let _ = stderr_task.await;
+    }
+}
+
+async fn kill_and_reap(child: &mut Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 pub(crate) fn build_run_args(session_id: Option<&str>, prompt: &str) -> Vec<String> {
@@ -266,12 +327,24 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
     use tokio::sync::mpsc;
 
     use super::*;
+
+    fn mock_invocation(dir: &tempfile::TempDir, scenario: &str) -> Invocation {
+        Invocation {
+            bin: concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/mock-opencode.sh"
+            )
+            .to_owned(),
+            timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_millis(500),
+            cwd: dir.path().to_path_buf(),
+            session_id: None,
+            prompt: scenario.to_owned(),
+        }
+    }
 
     #[test]
     fn build_run_args_separates_prompt_from_flags() {
@@ -334,32 +407,8 @@ mod tests {
     #[tokio::test]
     async fn run_streams_text_from_mock_binary() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("mock-opencode");
-        fs::write(
-            &script,
-            r#"#!/usr/bin/env bash
-printf '%s\n' '{"type":"step_start","sessionID":"ses_mock"}'
-printf '%s\n' '{"type":"text","part":{"text":"hello"}}'
-"#,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-
         let (tx, mut rx) = mpsc::channel(4);
-        let outcome = run(
-            Invocation {
-                bin: script.display().to_string(),
-                timeout: Duration::from_secs(5),
-                cwd: dir.path().to_path_buf(),
-                session_id: None,
-                prompt: "prompt".to_owned(),
-            },
-            tx,
-        )
-        .await
-        .unwrap();
+        let outcome = run(mock_invocation(&dir, "stream-text"), tx).await.unwrap();
         assert_eq!(outcome.observed_session, Some("ses_mock".to_owned()));
         assert_eq!(outcome.exit_code, Some(0));
         assert_eq!(outcome.error_summary, None);
@@ -368,5 +417,100 @@ printf '%s\n' '{"type":"text","part":{"text":"hello"}}'
             Some(RunnerEvent::Text(text)) if text == "hello"
         ));
         assert!(rx.recv().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_idle_timeout_fires_after_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let failure = run(
+            Invocation {
+                idle_timeout: Duration::from_millis(200),
+                ..mock_invocation(&dir, "idle")
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure.error, HarnessError::OpencodeIdle));
+        assert_eq!(failure.observed_session.as_deref(), Some("ses_idle"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_ongoing_output_extends_past_old_wall_clock_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let outcome = run(mock_invocation(&dir, "streaming"), tx).await.unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        let mut chunks = Vec::new();
+        while let Some(RunnerEvent::Text(text)) = rx.recv().await {
+            chunks.push(text);
+        }
+        assert_eq!(chunks.len(), 5);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_total_cap_fires_despite_ongoing_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let failure = run(
+            Invocation {
+                timeout: Duration::from_millis(1_500),
+                idle_timeout: Duration::from_secs(1),
+                ..mock_invocation(&dir, "total-cap")
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(failure.error, HarnessError::OpencodeTimedOut),
+            "expected total timeout, got {failure:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_total_cap_includes_child_wait_after_stdout_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let started = Instant::now();
+        let failure = run(
+            Invocation {
+                timeout: Duration::from_millis(200),
+                idle_timeout: Duration::from_secs(5),
+                ..mock_invocation(&dir, "stdout-close-live")
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure.error, HarnessError::OpencodeTimedOut));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_failure_keeps_session_despite_channel_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let failure = run(
+            Invocation {
+                timeout: Duration::from_millis(200),
+                idle_timeout: Duration::from_secs(5),
+                ..mock_invocation(&dir, "session-backpressure")
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure.error, HarnessError::OpencodeTimedOut));
+        assert_eq!(
+            failure.observed_session.as_deref(),
+            Some("ses_backpressure")
+        );
     }
 }
