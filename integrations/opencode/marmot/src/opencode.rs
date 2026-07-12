@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, timeout_at};
+use tokio::time::timeout_at;
 use tracing::debug;
 
 use crate::bridge::TRACE_TARGET;
@@ -128,17 +128,16 @@ pub(crate) async fn run(
     let start = Instant::now();
     let mut observed_session: Option<String> = None;
     let mut error_summary: Option<String> = None;
+    let mut idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
 
     let lifecycle_result = timeout_at(total_deadline, async {
         loop {
-            let line = match timeout(invocation.idle_timeout, lines.next_line()).await {
-                Err(_) => return Err(HarnessError::OpencodeIdle),
-                Ok(Err(_)) => return Err(HarnessError::OpencodeStream),
-                Ok(Ok(None)) => break,
-                Ok(Ok(Some(line))) => line,
+            let Some(line) = next_stdout_line(&mut lines, idle_deadline).await? else {
+                break;
             };
 
             if line.is_empty() {
+                idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
                 continue;
             }
             match parse_event_line(&line) {
@@ -180,10 +179,19 @@ pub(crate) async fn run(
                     );
                 }
             }
+            idle_deadline = tokio::time::Instant::now() + invocation.idle_timeout;
         }
 
-        let status = child.wait().await.map_err(HarnessError::from)?;
-        let stderr = (&mut stderr_task).await.map_err(HarnessError::from)?;
+        let (status, stderr) = match timeout_at(idle_deadline, async {
+            let status = child.wait().await.map_err(HarnessError::from)?;
+            let stderr = (&mut stderr_task).await.map_err(HarnessError::from)?;
+            Ok::<_, HarnessError>((status, stderr))
+        })
+        .await
+        {
+            Err(_) => return Err(HarnessError::OpencodeIdle),
+            Ok(result) => result?,
+        };
         Ok::<Outcome, HarnessError>(Outcome {
             observed_session: observed_session.clone(),
             exit_code: status.code(),
@@ -210,6 +218,17 @@ pub(crate) async fn run(
                 observed_session,
             })
         }
+    }
+}
+
+async fn next_stdout_line(
+    lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
+    idle_deadline: tokio::time::Instant,
+) -> std::result::Result<Option<String>, HarnessError> {
+    match timeout_at(idle_deadline, lines.next_line()).await {
+        Err(_) => Err(HarnessError::OpencodeIdle),
+        Ok(Err(_)) => Err(HarnessError::OpencodeStream),
+        Ok(Ok(line)) => Ok(line),
     }
 }
 
@@ -437,18 +456,47 @@ mod tests {
         assert_eq!(failure.observed_session.as_deref(), Some("ses_idle"));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_ongoing_output_extends_past_old_wall_clock_deadline() {
-        let dir = tempfile::tempdir().unwrap();
-        let (tx, mut rx) = mpsc::channel(8);
-        let outcome = run(mock_invocation(&dir, "streaming"), tx).await.unwrap();
-        assert_eq!(outcome.exit_code, Some(0));
-        let mut chunks = Vec::new();
-        while let Some(RunnerEvent::Text(text)) = rx.recv().await {
-            chunks.push(text);
-        }
-        assert_eq!(chunks.len(), 5);
+    #[tokio::test(start_paused = true)]
+    async fn stdout_lines_reset_idle_past_old_wall_clock_deadline() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::sleep;
+
+        const IDLE: Duration = Duration::from_secs(120);
+        const GAP: Duration = Duration::from_secs(70);
+        const TOTAL: Duration = Duration::from_secs(3600);
+        const LINE_COUNT: usize = 6;
+
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let producer = tokio::spawn(async move {
+            for index in 0..LINE_COUNT {
+                if index != 0 {
+                    sleep(GAP).await;
+                }
+                writer.write_all(b"line\n").await.unwrap();
+            }
+        });
+        let mut lines = BufReader::new(reader).lines();
+        let started = tokio::time::Instant::now();
+        let received = tokio::time::timeout(TOTAL, async {
+            let mut count = 0;
+            let mut idle_deadline = tokio::time::Instant::now() + IDLE;
+            while next_stdout_line(&mut lines, idle_deadline)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                count += 1;
+                idle_deadline = tokio::time::Instant::now() + IDLE;
+            }
+            count
+        })
+        .await
+        .unwrap();
+
+        producer.await.unwrap();
+        assert_eq!(received, LINE_COUNT);
+        assert!(started.elapsed() > Duration::from_secs(300));
+        assert!(started.elapsed() < TOTAL);
     }
 
     #[cfg(unix)]
@@ -469,6 +517,49 @@ mod tests {
         assert!(
             matches!(failure.error, HarnessError::OpencodeTimedOut),
             "expected total timeout, got {failure:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_idle_timeout_fires_after_stdout_eof_with_live_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let started = Instant::now();
+        let failure = run(
+            Invocation {
+                timeout: Duration::from_secs(10),
+                idle_timeout: Duration::from_millis(200),
+                ..mock_invocation(&dir, "stdout-close-live")
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure.error, HarnessError::OpencodeIdle));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_eof_keeps_remaining_idle_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let started = Instant::now();
+        let failure = run(
+            Invocation {
+                timeout: Duration::from_secs(10),
+                idle_timeout: Duration::from_secs(1),
+                ..mock_invocation(&dir, "stdout-close-near-idle")
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure.error, HarnessError::OpencodeIdle));
+        assert!(
+            started.elapsed() < Duration::from_millis(1_350),
+            "stdout EOF must not reset the existing idle deadline"
         );
     }
 

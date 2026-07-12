@@ -28,6 +28,11 @@ case "$scenario" in
         exec 1>&-
         exec sleep 2
         ;;
+    stdout-close-near-idle)
+        sleep 0.6
+        exec 1>&-
+        exec sleep 3
+        ;;
     session-backpressure)
         printf '%s\n' '{"type":"step_start","sessionID":"ses_backpressure"}'
         printf '%s\n' '{"type":"text","part":{"text":"first"}}'

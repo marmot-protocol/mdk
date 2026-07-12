@@ -403,46 +403,22 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, permit:
             )
             .await;
         }
-        Ok(Err(RunFailure {
-            error: err,
-            observed_session,
-        })) => {
-            if let Err(store_err) = persist_observed_session_if_unset(
+        Ok(Err(failure)) => {
+            warn!(
+                target: TRACE_TARGET,
+                method = "opencode_run",
+                error_kind = failure.error.privacy_safe_kind(),
+                "opencode invocation failed"
+            );
+            let text = handle_opencode_run_failure(
                 &ctx.sessions,
                 &inbound.group_ref,
                 known_session.as_ref(),
                 cwd,
-                observed_session,
+                &failure,
+                ctx.cfg.opencode_idle_timeout,
             )
-            .await
-            {
-                warn!(
-                    target: TRACE_TARGET,
-                    method = "session_store",
-                    error_kind = store_err.privacy_safe_kind(),
-                    "failed to persist opencode session"
-                );
-            }
-            warn!(
-                target: TRACE_TARGET,
-                method = "opencode_run",
-                error_kind = err.privacy_safe_kind(),
-                "opencode invocation failed"
-            );
-            let text = match err {
-                HarnessError::OpencodeIdle => format!(
-                    "[wn-opencode] opencode went silent for {}s without producing output; killing the invocation.",
-                    ctx.cfg.opencode_idle_timeout.as_secs()
-                ),
-                HarnessError::OpencodeTimedOut => {
-                    "[wn-opencode] opencode timed out before producing a complete response."
-                        .to_owned()
-                }
-                HarnessError::OpencodeSpawn => {
-                    "[wn-opencode] failed to start opencode; check WN_OPENCODE_BIN.".to_owned()
-                }
-                _ => "[wn-opencode] opencode failed while streaming its response.".to_owned(),
-            };
+            .await;
             let _ = send_reply(
                 &ctx,
                 &inbound.account_ref,
@@ -554,6 +530,46 @@ struct DeliveryReport {
     chunk_count: usize,
     failed: bool,
     failure_chunk_index: usize,
+}
+
+async fn handle_opencode_run_failure(
+    sessions: &SessionStore,
+    group_ref: &str,
+    known_session: Option<&SessionRecord>,
+    cwd: PathBuf,
+    failure: &RunFailure,
+    idle_timeout: Duration,
+) -> String {
+    if let Err(store_err) = persist_observed_session_if_unset(
+        sessions,
+        group_ref,
+        known_session,
+        cwd,
+        failure.observed_session.clone(),
+    )
+    .await
+    {
+        warn!(
+            target: TRACE_TARGET,
+            method = "session_store",
+            error_kind = store_err.privacy_safe_kind(),
+            "failed to persist opencode session"
+        );
+    }
+
+    match &failure.error {
+        HarnessError::OpencodeIdle => format!(
+            "[wn-opencode] opencode went silent for {}s without producing output; killing the invocation.",
+            idle_timeout.as_secs()
+        ),
+        HarnessError::OpencodeTimedOut => {
+            "[wn-opencode] opencode timed out before producing a complete response.".to_owned()
+        }
+        HarnessError::OpencodeSpawn => {
+            "[wn-opencode] failed to start opencode; check WN_OPENCODE_BIN.".to_owned()
+        }
+        _ => "[wn-opencode] opencode failed while streaming its response.".to_owned(),
+    }
 }
 
 async fn persist_observed_session_if_unset(
@@ -867,43 +883,32 @@ mod tests {
         assert_eq!(record.session_id, "ses_new");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn backpressured_runner_failure_session_can_be_persisted() {
+    async fn run_failure_path_persists_first_session_and_selects_idle_reply() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
         let store = SessionStore::load(home.join("sessions.json"), &home).unwrap();
-        let (tx, _rx) = mpsc::channel(1);
-        let failure = crate::opencode::run(
-            Invocation {
-                bin: concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/mock-opencode.sh"
-                )
-                .to_owned(),
-                timeout: Duration::from_millis(200),
-                idle_timeout: Duration::from_secs(5),
-                cwd: home.clone(),
-                session_id: None,
-                prompt: "session-backpressure".to_owned(),
-            },
-            tx,
-        )
-        .await
-        .unwrap_err();
+        let failure = RunFailure {
+            error: HarnessError::OpencodeIdle,
+            observed_session: Some("ses_idle".to_owned()),
+        };
 
-        assert!(matches!(failure.error, HarnessError::OpencodeTimedOut));
-        persist_observed_session_if_unset(
+        let reply = handle_opencode_run_failure(
             &store,
             "group1",
             None,
             home.clone(),
-            failure.observed_session,
+            &failure,
+            Duration::from_secs(45),
         )
-        .await
-        .unwrap();
+        .await;
+
         let record = store.get("group1").await.unwrap();
-        assert_eq!(record.session_id, "ses_backpressure");
+        assert_eq!(record.session_id, "ses_idle");
         assert_eq!(record.cwd, home);
+        assert_eq!(
+            reply,
+            "[wn-opencode] opencode went silent for 45s without producing output; killing the invocation."
+        );
     }
 }
