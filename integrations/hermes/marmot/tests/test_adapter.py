@@ -3009,6 +3009,61 @@ class WelcomerAllowlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["removed"], ["44" * 32])
         self.assertEqual(sorted(current), sorted(["22" * 32, "33" * 32]))
 
+    async def test_normalize_welcomer_id_decodes_npub(self):
+        npub = "npub1dhuvgjv64n0ym4frpvjkv393nrlknrsnmqkcxm6vufluq290h99sd9u900"
+        expected = "6df8c4499aacde4dd5230b256644b198ff698e13d82d836f4ce27fc028afb94b"
+        self.assertEqual(self.adapter_module.normalize_welcomer_id(npub), expected)
+        # raw hex passes through (lowercased)
+        self.assertEqual(
+            self.adapter_module.normalize_welcomer_id(expected.upper()), expected
+        )
+        # a malformed npub is returned as-is (lowercased) for the caller's hex check
+        self.assertEqual(
+            self.adapter_module.normalize_welcomer_id("npub1invalid"), "npub1invalid"
+        )
+
+    async def test_sync_allowlist_accepts_npub(self):
+        npub = "npub1dhuvgjv64n0ym4frpvjkv393nrlknrsnmqkcxm6vufluq290h99sd9u900"
+        hexid = "6df8c4499aacde4dd5230b256644b198ff698e13d82d836f4ce27fc028afb94b"
+        current: list[str] = []
+
+        class FakeClient:
+            async def allowlist_list(self, account_id_hex):
+                return {"type": "allowlist", "welcomer_account_ids_hex": list(current)}
+
+            async def allowlist_add(self, account_id_hex, welcomer_account_id_hex):
+                current.append(welcomer_account_id_hex)
+
+            async def allowlist_remove(self, account_id_hex, welcomer_account_id_hex):
+                current.remove(welcomer_account_id_hex)
+
+        result = await self.adapter_module.sync_allowlist(
+            FakeClient(), "11" * 32, [npub]
+        )
+        self.assertEqual(result["added"], [hexid])
+        self.assertEqual(current, [hexid])
+
+    async def test_sync_allowlist_does_not_wipe_on_unparseable_desired(self):
+        # If every desired entry fails to parse (e.g. an npub that cannot be
+        # decoded), the existing hex entries must be preserved, not wiped.
+        current = ["33" * 32]
+
+        class FakeClient:
+            async def allowlist_list(self, account_id_hex):
+                return {"type": "allowlist", "welcomer_account_ids_hex": list(current)}
+
+            async def allowlist_add(self, account_id_hex, welcomer_account_id_hex):
+                current.append(welcomer_account_id_hex)
+
+            async def allowlist_remove(self, account_id_hex, welcomer_account_id_hex):
+                current.remove(welcomer_account_id_hex)
+
+        result = await self.adapter_module.sync_allowlist(
+            FakeClient(), "11" * 32, ["not-a-valid-key"]
+        )
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(current, ["33" * 32])
+
 
 class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

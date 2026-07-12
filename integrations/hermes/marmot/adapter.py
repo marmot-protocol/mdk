@@ -415,8 +415,88 @@ def group_state_change_sentence(change: str, detail: Optional[str] = None) -> st
     return "The group state changed."
 
 
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _bech32_polymod(values: list[int]) -> int:
+    generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ value
+        for i in range(5):
+            chk ^= generators[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def _bech32_decode(bech: str) -> Tuple[Optional[str], Optional[list[int]]]:
+    if any(ord(ch) < 33 or ord(ch) > 126 for ch in bech):
+        return None, None
+    if bech.lower() != bech and bech.upper() != bech:
+        return None, None
+    bech = bech.lower()
+    pos = bech.rfind("1")
+    if pos < 1 or pos + 7 > len(bech):
+        return None, None
+    if any(ch not in _BECH32_CHARSET for ch in bech[pos + 1:]):
+        return None, None
+    hrp = bech[:pos]
+    data = [_BECH32_CHARSET.find(ch) for ch in bech[pos + 1:]]
+    expanded = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    if _bech32_polymod(expanded + data) != 1:
+        return None, None
+    return hrp, data[:-6]
+
+
+def _bech32_convertbits(data: list[int], frombits: int, tobits: int) -> Optional[list[int]]:
+    acc = 0
+    bits = 0
+    ret: list[int] = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    # npub packs a 32-byte payload evenly, so no padding bits may remain.
+    if bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+
+def npub_to_hex(value: str) -> Optional[str]:
+    """Decode a bech32 ``npub1...`` public key into 64-char lowercase hex.
+
+    Returns ``None`` for anything that is not a well-formed npub (wrong hrp,
+    bad checksum, wrong length) so callers can fall back to treating the input
+    as a raw hex id.
+    """
+    hrp, data = _bech32_decode(value)
+    if hrp != "npub" or data is None:
+        return None
+    decoded = _bech32_convertbits(data, 5, 8)
+    if decoded is None or len(decoded) != 32:
+        return None
+    return bytes(decoded).hex()
+
+
 def normalize_welcomer_id(entry: str | int) -> str:
-    return str(entry).strip().lower().removeprefix("0x")
+    """Normalize a welcomer account reference to canonical lowercase hex.
+
+    Accepts either a 64-char hex account id or a bech32 ``npub1...`` key (the
+    form the installer's ``--allow-welcomer`` flag documents and the White
+    Noise app hands out). npub inputs are decoded to hex; anything else is
+    lowercased/stripped and returned for the caller's hex check.
+    """
+    text = str(entry).strip()
+    if text[:5].lower() == "npub1":
+        decoded = npub_to_hex(text)
+        if decoded is not None:
+            return decoded
+    return text.lower().removeprefix("0x")
 
 
 async def sync_allowlist(
@@ -425,11 +505,22 @@ async def sync_allowlist(
     desired: Iterable[str | int],
 ) -> Dict[str, list[str]]:
     """Reconcile wn-agent's welcomer allowlist to exactly ``desired`` hex ids."""
-    want = {
-        normalize_welcomer_id(entry)
-        for entry in desired
-        if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(normalize_welcomer_id(entry))
-    }
+    want: set[str] = set()
+    dropped: list[str] = []
+    for entry in desired:
+        normalized = normalize_welcomer_id(entry)
+        if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(normalized):
+            want.add(normalized)
+        else:
+            dropped.append(str(entry))
+    if dropped:
+        logger.warning(
+            "Marmot welcomer allowlist: ignoring %d unparseable entr%s "
+            "(expected 64-char hex or npub1...): %s",
+            len(dropped),
+            "y" if len(dropped) == 1 else "ies",
+            ", ".join(dropped),
+        )
     current = await client.allowlist_list(account_id_hex)
     have = {
         normalize_welcomer_id(entry)
@@ -443,10 +534,16 @@ async def sync_allowlist(
         if entry not in have:
             await client.allowlist_add(account_id_hex, entry)
             added.append(entry)
-    for entry in have:
-        if entry not in want:
-            await client.allowlist_remove(account_id_hex, entry)
-            removed.append(entry)
+    # Guard against wiping the entire allowlist when every desired entry failed
+    # to parse (e.g. an npub that could not be decoded). Removing everything on
+    # a parse error silently disables the agent, which then declines all group
+    # welcomes. A genuinely empty desired list (nothing dropped) still clears
+    # the allowlist as before.
+    if want or not dropped:
+        for entry in have:
+            if entry not in want:
+                await client.allowlist_remove(account_id_hex, entry)
+                removed.append(entry)
     return {"added": added, "removed": removed}
 
 
