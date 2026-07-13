@@ -2292,7 +2292,7 @@ impl MarmotApp {
             return self.latest_key_package(&account.label);
         }
         let account_id = PublicKey::parse(member_ref)
-            .map_err(|_| AppError::MissingKeyPackage(member_ref.to_owned()))?
+            .map_err(|_| AppError::InvalidPublicKey)?
             .to_hex();
         if let Some(entry) = self.directory_entry_for_account_id(&account_id)? {
             if let Some(key_package) = entry.key_package {
