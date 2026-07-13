@@ -566,6 +566,10 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "invalid_hex",
             "message": err.to_string(),
         }),
+        AppError::AccountCatchUp(_) => json!({
+            "code": "account_catch_up",
+            "message": err.to_string(),
+        }),
         other => json!({
             "code": "command_failed",
             "message": other.to_string(),

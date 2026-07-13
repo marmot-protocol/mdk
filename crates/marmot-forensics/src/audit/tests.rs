@@ -309,6 +309,91 @@ fn audit_event_round_trips_through_serde() {
     assert_eq!(parsed, event);
 }
 
+#[test]
+fn subscription_rebuild_round_trips_through_serde() {
+    let kind = AuditEventKind::SubscriptionRebuild {
+        since_secs: Some(1_699_999_880),
+        lookback_secs: Some(120),
+        relay_results: vec![
+            RelayRegistration {
+                relay_url: "wss://relay.example".into(),
+                accepted: true,
+            },
+            RelayRegistration {
+                relay_url: "wss://down.example".into(),
+                accepted: false,
+            },
+        ],
+    };
+    let event = AuditEvent {
+        schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+        seq: 11,
+        wall_time_ms: 1_700_000_000_000,
+        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
+        recorder_session_id: Some("recorder-1".into()),
+        account_ref: None,
+        engine_id: "engine-xyz".into(),
+        group_ref: None,
+        context: None,
+        kind: kind.clone(),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.kind, kind);
+    // Full-history replay: `None` since floor is omitted, not serialized as null.
+    let replay = AuditEventKind::SubscriptionRebuild {
+        since_secs: None,
+        lookback_secs: Some(120),
+        relay_results: Vec::new(),
+    };
+    let replay_json = serde_json::to_string(&replay).unwrap();
+    assert!(!replay_json.contains("since_secs"));
+    assert!(!replay_json.contains("relay_results"));
+    assert_eq!(
+        serde_json::from_str::<AuditEventKind>(&replay_json).unwrap(),
+        replay
+    );
+}
+
+#[test]
+fn sync_drain_round_trips_through_serde() {
+    let kind = AuditEventKind::SyncDrain {
+        duration_ms: 250,
+        deliveries: 3,
+        cursor_before_secs: Some(1_699_999_880),
+        cursor_after_secs: Some(1_700_000_000),
+    };
+    let event = AuditEvent {
+        schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+        seq: 12,
+        wall_time_ms: 1_700_000_000_000,
+        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
+        recorder_session_id: Some("recorder-1".into()),
+        account_ref: None,
+        engine_id: "engine-xyz".into(),
+        group_ref: None,
+        context: None,
+        kind: kind.clone(),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.kind, kind);
+    // A drain before any cursor advance omits both cursor fields.
+    let empty = AuditEventKind::SyncDrain {
+        duration_ms: 8,
+        deliveries: 0,
+        cursor_before_secs: None,
+        cursor_after_secs: None,
+    };
+    let empty_json = serde_json::to_string(&empty).unwrap();
+    assert!(!empty_json.contains("cursor_before_secs"));
+    assert!(!empty_json.contains("cursor_after_secs"));
+    assert_eq!(
+        serde_json::from_str::<AuditEventKind>(&empty_json).unwrap(),
+        empty
+    );
+}
+
 fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
     vec![
         AuditEventKind::RecorderStarted {
@@ -698,6 +783,26 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
         AuditEventKind::Rejection {
             msg_id: "m".into(),
             reason: "unattributable_sender".into(),
+        },
+        AuditEventKind::SubscriptionRebuild {
+            since_secs: Some(1_700_000_000),
+            lookback_secs: Some(120),
+            relay_results: vec![
+                RelayRegistration {
+                    relay_url: "wss://relay.example".into(),
+                    accepted: true,
+                },
+                RelayRegistration {
+                    relay_url: "wss://down.example".into(),
+                    accepted: false,
+                },
+            ],
+        },
+        AuditEventKind::SyncDrain {
+            duration_ms: 250,
+            deliveries: 3,
+            cursor_before_secs: Some(1_699_999_880),
+            cursor_after_secs: Some(1_700_000_000),
         },
     ]
 }

@@ -2838,10 +2838,10 @@ impl AccountManager {
             for response in responses {
                 match timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, response).await {
                     Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(message))) => return Err(AppError::RelayDirectory(message)),
+                    Ok(Ok(Err(message))) => return Err(AppError::AccountCatchUp(message)),
                     Ok(Err(_)) => return Err(AppError::TransportClosed),
                     Err(_) => {
-                        return Err(AppError::RelayDirectory(
+                        return Err(AppError::AccountCatchUp(
                             "account worker catch-up timed out".into(),
                         ));
                     }

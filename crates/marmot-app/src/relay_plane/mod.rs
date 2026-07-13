@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrSdkRelayClient, NostrSdkRelayHealth,
-    NostrTransportAdapter, RelayExportConsent, RelayLabelResolution,
+    NostrTransportAdapter, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -246,6 +246,42 @@ impl MarmotRelayPlane {
         Some(Timestamp(
             last_transport_timestamp.saturating_sub(lookback.as_secs()),
         ))
+    }
+
+    /// The subscription-rebuild lookback in seconds, if this plane rebuilds
+    /// from the durable cursor. `None` means the plane rebuilds with full
+    /// history (no `since` floor). Surfaced for the `subscription_rebuild`
+    /// forensic audit row so an analyzer sees the window subtracted from the
+    /// cursor to derive the `since` floor.
+    pub fn subscription_rebuild_lookback_secs(&self) -> Option<u64> {
+        self.inner
+            .subscription_rebuild_lookback
+            .map(|lookback| lookback.as_secs())
+    }
+
+    /// Drain the per-relay subscription-registration outcomes `account`
+    /// accumulated since its previous drain, for its `subscription_rebuild`
+    /// forensic audit row.
+    ///
+    /// Delegates to the SDK relay client, which records each subscribe's
+    /// per-endpoint acceptance bucketed by account. The drain is account-scoped
+    /// so concurrent account workers sharing this one relay plane each attribute
+    /// their own registrations to their own audit row; a group shared across
+    /// accounts registers once, attributed to whichever account's client
+    /// subscribed (an acceptable diagnostic attribution). A plane built on a
+    /// custom (non-SDK) relay client does not track registration outcomes, so
+    /// this returns empty for it — the audit row then carries `since`/`lookback`
+    /// without relay rows.
+    pub async fn take_subscription_registrations(
+        &self,
+        account: &MemberId,
+    ) -> Vec<RelayRegistrationOutcome> {
+        if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
+            return sdk_relay_client
+                .take_subscription_registrations(account)
+                .await;
+        }
+        Vec::new()
     }
 
     /// Attach an account's signing keys to the shared transport client so it
@@ -735,6 +771,17 @@ fn spawn_relay_notification_forwarder(
             })
             .await;
     })
+}
+
+impl MarmotRelayPlaneAccountAdapter {
+    /// The account this adapter is bound to — the `MemberId` every subscription
+    /// issued through it carries (activation and group sync reject any other
+    /// id), and the key its registrations bucket under on the shared relay
+    /// plane. Draining the `subscription_rebuild` row uses this so a rebuild is
+    /// attributed to exactly the account whose subscribes produced it.
+    pub(crate) fn account_id(&self) -> &MemberId {
+        &self.account_id
+    }
 }
 
 #[async_trait]

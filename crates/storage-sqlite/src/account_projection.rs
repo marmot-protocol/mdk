@@ -1,6 +1,6 @@
 use crate::{
     SqliteAccountStorage, SqliteResultExt, bool_i64, connection::retry_on_busy, tags_from_json,
-    unix_now_ms, unix_now_seconds_i64, usize_to_i64,
+    unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
@@ -360,14 +360,63 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Persist one account-projection snapshot.
+    ///
+    /// # Cross-process semantics
+    ///
+    /// Multiple runtimes may save over the same account database concurrently
+    /// (for example a main app process and a short-lived notification-wake
+    /// process). The transaction is `BEGIN IMMEDIATE`, so everything below is
+    /// atomic against concurrent writers, and the write is shaped so a stale
+    /// or fresh writer can never regress durable delivery state:
+    ///
+    /// - `last_transport_timestamp` is merged, never overwritten: the stored
+    ///   cursor is read back inside the transaction and folded with the
+    ///   snapshot cursor via [`merged_transport_timestamp`]. When both sides
+    ///   are present they are each clamped to `now + max_future_skew_secs` and
+    ///   the max wins, so a stored value poisoned above the ceiling comes out
+    ///   healed instead of winning the max forever. A snapshot that never
+    ///   learned a cursor (`None`) is cursor-neutral and preserves the stored
+    ///   value unchanged; a fresh store adopts the snapshot side clamped to the
+    ///   same ceiling. Known residual: a skew-inflated but still within-clamp
+    ///   value persists until wall clock passes it (bounded by
+    ///   `max_future_skew_secs`). Any future deliberate cursor reset must be a
+    ///   dedicated, named API — a raw save cannot lower the merged value.
+    /// - `seen_events` is a `seen_at`-refreshing union pruned to the newest
+    ///   `max_seen_events` rows, so a re-seen event outlives rows whose only
+    ///   sighting is old. It only narrows cross-restart redelivery;
+    ///   engine-level dedup stays the authoritative duplicate guard.
+    /// - Group and component rows are snapshot-replaced (last writer wins).
+    ///   Full multi-writer reconciliation is an explicit non-goal.
+    ///
+    /// `max_future_skew_secs` is caller policy (the app layer passes its
+    /// transport-cursor skew); this crate only enforces the column merge rule.
     pub fn save_account_projection_state(
         &self,
         state: &StoredAccountState,
         max_seen_events: usize,
+        max_future_skew_secs: u64,
     ) -> StorageResult<()> {
-        let now = unix_now_seconds_i64();
+        let now = unix_now_seconds();
+        let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let stored_cursor = conn
+                .query_row(
+                    "SELECT last_transport_timestamp FROM account_state WHERE label = ?1",
+                    params![&state.label],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()
+                .storage()?
+                .flatten()
+                .and_then(|value| u64::try_from(value).ok());
+            let last_transport_timestamp = merged_transport_timestamp(
+                stored_cursor,
+                state.last_transport_timestamp,
+                now,
+                max_future_skew_secs,
+            );
             conn.execute(
                 "INSERT INTO account_state (label, updated_at, last_transport_timestamp)
                  VALUES (?1, ?2, ?3)
@@ -376,10 +425,8 @@ impl SqliteAccountStorage {
                     last_transport_timestamp = excluded.last_transport_timestamp",
                 params![
                     &state.label,
-                    now,
-                    state
-                        .last_transport_timestamp
-                        .and_then(|value| i64::try_from(value).ok()),
+                    now_i64,
+                    last_transport_timestamp.and_then(|value| i64::try_from(value).ok()),
                 ],
             )
             .storage()?;
@@ -391,7 +438,7 @@ impl SqliteAccountStorage {
                      VALUES (?1, ?2)
                      ON CONFLICT(event_id) DO UPDATE SET
                         seen_at = excluded.seen_at",
-                    params![event_id, now],
+                    params![event_id, now_i64],
                 )
                 .storage()?;
             }
@@ -478,14 +525,14 @@ impl SqliteAccountStorage {
                         bool_i64(group.pending_confirmation),
                         &group.welcomer_account_id_hex,
                         &group.via_welcome_message_id_hex,
-                        now
+                        now_i64
                     ],
                 )
                 .storage()?;
 
                 delete_stale_group_components(&conn, &group.group_id_hex, &group.components)?;
                 for component in &group.components {
-                    upsert_group_component(&conn, &group.group_id_hex, component, now)?;
+                    upsert_group_component(&conn, &group.group_id_hex, component, now_i64)?;
                 }
             }
             Ok(())
@@ -1283,6 +1330,60 @@ impl SqliteAccountStorage {
             )
             .storage()?;
         Ok(())
+    }
+}
+
+/// Clamp a cursor timestamp to `now + max_future_skew_secs`.
+///
+/// This is the single definition of the future-skew clamp for the persisted
+/// `last_transport_timestamp` column: the app layer applies it at ingest time
+/// (marmot-app's `clamped_transport_cursor`) and
+/// [`merged_transport_timestamp`] applies it to both sides of the save-time
+/// merge. The bound is caller policy; this crate only enforces the arithmetic.
+pub fn clamp_to_max_future_skew(timestamp: u64, now: u64, max_future_skew_secs: u64) -> u64 {
+    timestamp.min(now.saturating_add(max_future_skew_secs))
+}
+
+/// Merge the stored and snapshot `last_transport_timestamp` into the value a
+/// save may persist. Every arm is deliberate:
+///
+/// - `(None, None)` — nothing to persist; stays `None`.
+/// - `(None, Some(snapshot))` — a fresh store adopts the snapshot cursor,
+///   clamped to `now + max_future_skew_secs`. The clamp is load-bearing here:
+///   the legacy-import migration (marmot-app's
+///   `migrate_legacy_account_projection_if_needed`) writes a legacy-loaded
+///   state into a brand-new store through this arm, and a pre-clamp-era legacy
+///   projection can carry a cursor poisoned above the ceiling (mdk#182).
+///   Adopting it raw would persist that poison.
+/// - `(Some(stored), None)` — a save that never learned a cursor is
+///   cursor-neutral: the stored value passes through unchanged, never clamped
+///   or otherwise moved. Healing a poisoned stored value is the job of a save
+///   that *did* learn a cursor (the arm below); a cursor-less save must not
+///   move durable state at all.
+/// - `(Some(stored), Some(snapshot))` — both sides are clamped to
+///   `now + max_future_skew_secs` via [`clamp_to_max_future_skew`], then the
+///   max wins. Clamping the *stored* side at save-time `now` is what heals a
+///   cursor poisoned above the ceiling instead of letting it win the max
+///   forever.
+fn merged_transport_timestamp(
+    stored: Option<u64>,
+    snapshot: Option<u64>,
+    now: u64,
+    max_future_skew_secs: u64,
+) -> Option<u64> {
+    match (stored, snapshot) {
+        (None, None) => None,
+        (None, Some(snapshot)) => Some(clamp_to_max_future_skew(
+            snapshot,
+            now,
+            max_future_skew_secs,
+        )),
+        (Some(stored), None) => Some(stored),
+        (Some(stored), Some(snapshot)) => Some(
+            clamp_to_max_future_skew(stored, now, max_future_skew_secs).max(
+                clamp_to_max_future_skew(snapshot, now, max_future_skew_secs),
+            ),
+        ),
     }
 }
 

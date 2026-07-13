@@ -14,6 +14,7 @@ use cgka_traits::app_event::{
 const LOCAL: &str = "aa";
 const REMOTE: &str = "bb";
 const GROUP: &str = "11";
+const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 fn group() -> StoredAccountGroup {
     StoredAccountGroup {
@@ -107,6 +108,7 @@ fn setup_store_with_group(group: StoredAccountGroup) -> SqliteAccountStorage {
                 ..StoredAccountState::default()
             },
             256,
+            MAX_FUTURE_SKEW_SECS,
         )
         .unwrap();
     store
@@ -1044,6 +1046,7 @@ fn set_group_self_membership_survives_projection_resave() {
                 ..StoredAccountState::default()
             },
             256,
+            MAX_FUTURE_SKEW_SECS,
         )
         .unwrap();
 
@@ -1071,6 +1074,7 @@ fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
                 ..StoredAccountState::default()
             },
             256,
+            MAX_FUTURE_SKEW_SECS,
         )
         .unwrap();
 

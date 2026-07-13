@@ -30,6 +30,13 @@ pub enum MarmotKitError {
     TransportClosed,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
+    /// An account worker's transport catch-up failed (sync error or timeout).
+    /// Distinct, typed variant — separate from [`MarmotKitError::Runtime`] —
+    /// so hosts (notably the NSE wake path) can tell a catch-up failure from
+    /// a generic runtime error; the untyped bucket is what sent an earlier
+    /// investigation chasing the wrong subsystem.
+    #[error("account catch-up failed: {details}")]
+    AccountCatchUp { details: String },
     #[error("local account is not an admin of group {group_id_hex}")]
     NotGroupAdmin { group_id_hex: String },
     #[error("admin must self-demote before leaving group {group_id_hex}")]
@@ -164,6 +171,7 @@ impl From<AppError> for MarmotKitError {
             AppError::Publish(details) => Self::Publish { details },
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeStopping => Self::RuntimeStopping,
+            AppError::AccountCatchUp(details) => Self::AccountCatchUp { details },
             // #484: a transient storage busy error can also surface directly at
             // the app layer (not only wrapped in an EngineError). Classify it
             // as the typed transient variant here too, so Android never sees
@@ -228,6 +236,25 @@ mod tests {
     // boundary as the typed `StorageBusy` variant — never the untyped `Runtime`
     // bucket — so Android can distinguish transient contention from a fatal
     // failure without string-parsing "database is locked".
+    // An account catch-up failure must cross the UniFFI
+    // boundary as the typed `AccountCatchUp` variant — never the untyped
+    // `Runtime` bucket, and never `RelayDirectory` (the mislabel that sent an
+    // earlier investigation chasing the wrong subsystem).
+    #[test]
+    fn account_catch_up_crosses_ffi_as_typed_variant() {
+        let app_err = AppError::AccountCatchUp("runtime catch-up failed: account_session".into());
+        let ffi: MarmotKitError = app_err.into();
+        match ffi {
+            MarmotKitError::AccountCatchUp { details } => {
+                assert!(
+                    details.contains("account_session"),
+                    "typed AccountCatchUp should carry the worker detail, got: {details}"
+                );
+            }
+            other => panic!("expected AccountCatchUp, got {other:?}"),
+        }
+    }
+
     #[test]
     fn storage_busy_crosses_ffi_as_typed_variant_via_engine() {
         // Send path: storage Busy wrapped in EngineError, wrapped in AppError

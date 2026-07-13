@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use cgka_traits::TransportAdapter;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::ingest::IngestOutcome;
+use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -56,8 +57,16 @@ impl AppClient {
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
+        // Capture the derived `since` floor before it is moved into activation;
+        // the forensic `subscription_rebuild` row records it alongside the
+        // per-relay registration outcome the activation produces.
+        let rebuild_since_secs = rebuild_since.map(|timestamp| timestamp.0);
         self.runtime.activate_transport(rebuild_since).await?;
         self.sync_runtime_groups().await?;
+        // Both the inbox/group activation and the group-subscription refresh
+        // have now registered on relays; emit the rebuild audit row from the
+        // drained registration log before draining inbound deliveries.
+        self.record_subscription_rebuild(rebuild_since_secs).await;
         let mut summary = self.sync_sdk_relay().await?;
         // Surface engine events queued without an inbound delivery — most
         // importantly `GroupHydrationQuarantined`, queued during session
@@ -226,6 +235,13 @@ impl AppClient {
             .cloned()
             .collect::<HashSet<_>>();
         let mut first_wait = true;
+        // Forensic drain accounting: wall-clock span, count of deliveries
+        // actually ingested (echoes and already-seen duplicates are skipped and
+        // not counted), and the durable cursor before/after so an analyzer can
+        // compare the persisted floor against the ingested `created_at`s.
+        let drain_started = std::time::Instant::now();
+        let cursor_before_secs = self.state.last_transport_timestamp;
+        let mut deliveries: u64 = 0;
 
         loop {
             let wait = if first_wait {
@@ -251,8 +267,15 @@ impl AppClient {
             remember_seen_event(&mut seen, &mut self.state, event_id);
             self.ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
+            deliveries = deliveries.saturating_add(1);
         }
 
+        self.record_sync_drain(
+            drain_started.elapsed().as_millis() as u64,
+            deliveries,
+            cursor_before_secs,
+            self.state.last_transport_timestamp,
+        );
         self.app.save_state(&self.state)?;
         Ok(summary)
     }
@@ -527,7 +550,10 @@ impl AppClient {
         Ok(())
     }
 
-    /// Advance the persisted transport cursor from an inbound message.
+    /// Advance the persisted transport cursor from an inbound message —
+    /// unless this runtime was constructed with
+    /// [`CursorPersistence::Frozen`](crate::CursorPersistence), in which case
+    /// this is a no-op and the cursor stays at the value loaded from the store.
     ///
     /// `timestamp` is the sender-controlled Nostr `created_at` of the outer
     /// kind-445 event and is never validated upstream. The cursor is a
@@ -538,12 +564,13 @@ impl AppClient {
     /// wall-clock plus a bounded skew so a hostile or clock-skewed sender can
     /// move the cursor no further than `now + TRANSPORT_CURSOR_MAX_FUTURE_SKEW`.
     fn remember_transport_cursor(&mut self, timestamp: u64) {
-        self.state.last_transport_timestamp = Some(clamped_transport_cursor(
+        self.state.last_transport_timestamp = next_transport_cursor(
+            self.app.cursor_persistence(),
             self.state.last_transport_timestamp,
             timestamp,
             unix_now_seconds(),
             TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
-        ));
+        );
     }
 }
 
@@ -561,6 +588,40 @@ pub(crate) fn is_own_relay_echo(
         .is_some_and(|event| event.pubkey == local_account_id_hex)
 }
 
+/// Apply the runtime's [`CursorPersistence`] policy to a candidate inbound
+/// timestamp: the policy seam behind `remember_transport_cursor`.
+///
+/// Under [`CursorPersistence::Frozen`] (the wake-collection posture — see the
+/// enum docs in `config.rs` for the full semantics) the cursor is returned
+/// unchanged, `None` included: the pass still ingests, decrypts, and projects
+/// everything, but the durable `since` floor never ratchets, so `save_state`
+/// writes back the loaded value and the storage-side clamp-then-max merge
+/// keeps a concurrent `Advance` runtime's progress intact. Deliberate
+/// consequences visible in the forensic audit rows: a frozen pass's
+/// `sync_drain` records `cursor_before == cursor_after`, and its
+/// `subscription_rebuild` rows keep recording the loaded floor — exactly the
+/// evidence that a wake pass did not move the floor.
+///
+/// Under [`CursorPersistence::Advance`] this delegates to
+/// [`clamped_transport_cursor`] unchanged.
+fn next_transport_cursor(
+    policy: crate::CursorPersistence,
+    current: Option<u64>,
+    candidate: u64,
+    now: u64,
+    max_future_skew_secs: u64,
+) -> Option<u64> {
+    match policy {
+        crate::CursorPersistence::Frozen => current,
+        crate::CursorPersistence::Advance => Some(clamped_transport_cursor(
+            current,
+            candidate,
+            now,
+            max_future_skew_secs,
+        )),
+    }
+}
+
 /// Compute the next persisted transport cursor from a candidate inbound
 /// timestamp.
 ///
@@ -574,16 +635,20 @@ pub(crate) fn is_own_relay_echo(
 /// here instead of being preserved forever by the monotonic max. A benign
 /// in-range timestamp is unaffected; the skew margin tolerates ordinary sender
 /// clock drift.
+///
+/// The clamp itself is [`storage_sqlite::clamp_to_max_future_skew`] — the one
+/// definition shared with the save-time durable-cursor merge in
+/// `save_account_projection_state`, so ingest and persistence can never
+/// disagree on the ceiling.
 fn clamped_transport_cursor(
     current: Option<u64>,
     candidate: u64,
     now: u64,
     max_future_skew_secs: u64,
 ) -> u64 {
-    let max_allowed = now.saturating_add(max_future_skew_secs);
-    let clamped = candidate.min(max_allowed);
+    let clamped = clamp_to_max_future_skew(candidate, now, max_future_skew_secs);
     current
-        .map(|current| current.min(max_allowed).max(clamped))
+        .map(|current| clamp_to_max_future_skew(current, now, max_future_skew_secs).max(clamped))
         .unwrap_or(clamped)
 }
 
@@ -646,10 +711,62 @@ mod membership_change_tests {
 
 #[cfg(test)]
 mod transport_cursor_tests {
-    use super::clamped_transport_cursor;
+    use super::{clamped_transport_cursor, next_transport_cursor};
+    use crate::CursorPersistence;
 
     const SKEW: u64 = 5 * 60;
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn frozen_policy_never_moves_the_cursor() {
+        // A wake-collection runtime ingests but must
+        // not ratchet the durable floor. Under `Frozen` the cursor is exactly
+        // the loaded value regardless of what the delivery carries — a newer
+        // in-range timestamp, an older one, or a far-future one.
+        let loaded = Some(NOW - 100);
+        assert_eq!(
+            next_transport_cursor(CursorPersistence::Frozen, loaded, NOW, NOW, SKEW),
+            loaded,
+            "a newer in-range delivery must not advance a frozen cursor"
+        );
+        assert_eq!(
+            next_transport_cursor(CursorPersistence::Frozen, loaded, NOW - 500, NOW, SKEW),
+            loaded,
+            "an older delivery must not move a frozen cursor either"
+        );
+        // A store that has never advanced stays `None`: `Frozen` means "never
+        // advance", not "initialize". The save-time merge treats a `None`
+        // in-memory side as "keep stored", so this can never wipe a
+        // concurrently-advanced durable cursor.
+        assert_eq!(
+            next_transport_cursor(CursorPersistence::Frozen, None, NOW, NOW, SKEW),
+            None,
+            "a frozen cursor that never existed must stay absent"
+        );
+    }
+
+    #[test]
+    fn advance_policy_is_the_unchanged_clamped_monotonic_max() {
+        // `Advance` is byte-for-byte the historical behavior: delegate to
+        // `clamped_transport_cursor` (monotonic max with the mdk#182
+        // future-skew clamp and poison heal, pinned by the tests below).
+        assert_eq!(
+            next_transport_cursor(CursorPersistence::Advance, Some(NOW - 100), NOW, NOW, SKEW),
+            Some(NOW),
+            "an in-range delivery advances the cursor under Advance"
+        );
+        assert_eq!(
+            next_transport_cursor(CursorPersistence::Advance, None, NOW, NOW, SKEW),
+            Some(NOW),
+            "a first delivery initializes the cursor under Advance"
+        );
+        let poisoned = NOW + 10 * 365 * 24 * 60 * 60;
+        assert_eq!(
+            next_transport_cursor(CursorPersistence::Advance, Some(NOW), poisoned, NOW, SKEW),
+            Some(NOW + SKEW),
+            "the future-skew clamp still bounds a hostile created_at"
+        );
+    }
 
     #[test]
     fn in_range_timestamp_advances_cursor_unchanged() {

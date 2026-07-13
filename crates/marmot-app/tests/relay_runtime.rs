@@ -5291,6 +5291,81 @@ async fn runtime_data_mode_toggle_rotates_live_recorder_with_boundary() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
+    // A scripted sync produces the two forensic diagnostic rows a field export
+    // relies on — the subscription rebuild's `since` floor + per-relay
+    // registration, and the drain's cursor before/after — so the
+    // persisted-cursor-vs-missed-`created_at` mismatch is evident in any export.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    // Enable recording before the runtime starts so the live worker records.
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = runtime.create_identity(setup).await.unwrap();
+    // Force a completed sync so the rebuild + drain rows are flushed to disk.
+    runtime.catch_up_accounts().await.unwrap();
+
+    let files = app.audit_log_files().unwrap();
+    let alice_file = files
+        .iter()
+        .find(|file| file.account_ref == alice.account.label)
+        .expect("alice has a live audit file");
+    let events = std::fs::read_to_string(&alice_file.path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    // subscription_rebuild: exact wire tag, the lookback recorded, and the mock
+    // relay registered. A successful catch-up implies subscribe registered on
+    // >= 1 relay (the adapter hard-errors on 0-of-N), so with the single mock
+    // relay the SDK-backed plane must have marked it accepted.
+    let rebuild = events
+        .iter()
+        .find(|event| event["kind"]["type"] == "subscription_rebuild")
+        .expect("a subscription_rebuild row is emitted per rebuild");
+    assert!(
+        rebuild["kind"]["lookback_secs"].is_u64(),
+        "rebuild records the lookback: {rebuild}"
+    );
+    let relay_results = rebuild["kind"]["relay_results"]
+        .as_array()
+        .expect("relay_results is an array");
+    assert!(
+        relay_results.iter().any(|entry| {
+            entry["relay_url"]
+                .as_str()
+                .is_some_and(|relay_url| relay_url.contains("127.0.0.1"))
+                && entry["accepted"] == true
+        }),
+        "the mock relay registered the subscription: {rebuild}"
+    );
+
+    // sync_drain: exact wire tag and scalar drain accounting present. A fresh
+    // account drains no inbound 445s, so `deliveries` is 0 and the cursor
+    // fields stay absent (no delivery advanced the cursor) — both valid.
+    let drain = events
+        .iter()
+        .find(|event| event["kind"]["type"] == "sync_drain")
+        .expect("a sync_drain row is emitted at the drain exit");
+    assert!(drain["kind"]["duration_ms"].is_u64(), "{drain}");
+    assert!(drain["kind"]["deliveries"].is_u64(), "{drain}");
+
+    runtime.shutdown().await;
+}
+
 /// mdk#352 review follow-up: the welcome re-delivery surface is reachable end
 /// to end through the runtime worker. A create whose welcome delivered leaves
 /// nothing pending, and re-delivering an unknown welcome id is a clean error

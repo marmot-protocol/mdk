@@ -10,5 +10,5 @@ pub use audit::{
     GroupRefHex, GroupStateValue, JsonlRecorder, MemberRefHex, MembershipChangeSource,
     MessageArtifactKind, MessageAuthor, MessageRefHex, NoopRecorder, OutboundMessage,
     PeelerOutcomeKind, PublishRelayFailure, RecipientExpectation, RecipientScope,
-    default_jsonl_path,
+    RelayRegistration, default_jsonl_path,
 };

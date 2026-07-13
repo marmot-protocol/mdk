@@ -117,9 +117,9 @@ pub use audit_log::{
 };
 pub use client::AppClient;
 pub use config::{
-    AuditLogTrackerConfig, AuditLogUploadSource, MarmotAppConfig, MarmotServiceEndpoints,
-    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings,
+    AuditLogTrackerConfig, AuditLogUploadSource, CursorPersistence, MarmotAppConfig,
+    MarmotServiceEndpoints, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
 };
 pub use directory::{
     DirectoryKeyPackage, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
@@ -878,6 +878,12 @@ impl MarmotApp {
     /// upload/download act paths.
     pub(crate) fn allow_loopback_blob_endpoints(&self) -> bool {
         self.config.allow_loopback_blob_endpoints
+    }
+
+    /// The construction-time durable transport-cursor policy every client
+    /// opened from this app applies (see [`CursorPersistence`]).
+    pub(crate) fn cursor_persistence(&self) -> CursorPersistence {
+        self.config.cursor_persistence
     }
 
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
@@ -2486,11 +2492,24 @@ impl MarmotApp {
         )
     }
 
+    /// Persist the account snapshot. Concurrent runtimes (the main app and a
+    /// short-lived notification-wake process) may save over the same account
+    /// database; the durable transport cursor is merged clamp-then-max inside
+    /// the save transaction (see `save_account_projection_state` in
+    /// storage-sqlite for the full cross-process semantics), so a stale or
+    /// cursor-less save can never lower or wipe an advanced cursor, and a
+    /// stored value poisoned above `now + TRANSPORT_CURSOR_MAX_FUTURE_SKEW` is
+    /// healed down on the next save that learned a cursor. Known residual: a
+    /// skew-inflated but within-clamp cursor persists until wall clock passes
+    /// it — bounded exposure, ~180s beyond the 120s
+    /// `APP_RUNTIME_RELAY_REBUILD_LOOKBACK`. A deliberate cursor reset must be
+    /// a dedicated named API; a raw save cannot lower the merged value.
     fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
         self.account_storage(&state.label)?
             .save_account_projection_state(
                 &stored_state_from_account_state(state),
                 MAX_SEEN_EVENT_IDS,
+                TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
             )?;
         self.chat_list_projection_stale
             .lock()
@@ -2852,6 +2871,7 @@ impl MarmotApp {
         storage.save_account_projection_state(
             &stored_state_from_account_state(&state),
             MAX_SEEN_EVENT_IDS,
+            TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
         )?;
         for message in legacy.messages(AppMessageQuery::default())? {
             if message.message_id_hex.is_empty() {

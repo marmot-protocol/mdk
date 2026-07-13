@@ -948,6 +948,60 @@ pub enum AuditEventKind {
         msg_id: MessageRefHex,
         reason: String,
     },
+    /// The account's Nostr subscription plane was rebuilt with a `since` floor.
+    /// Records the floor actually requested (`since_secs`; `None` means a
+    /// full-history replay because the durable cursor was absent or detectably
+    /// corrupt), the lookback subtracted from the durable cursor to derive it
+    /// (`lookback_secs`), and the per-relay registration outcome
+    /// (`relay_results`). Together with [`AuditEventKind::SyncDrain`] these rows
+    /// let an analyzer reconstruct the decisive
+    /// persisted-cursor-vs-missed-`created_at` evidence from any export,
+    /// including NSE wake sessions.
+    ///
+    /// Units: the durable transport cursor is advanced from inbound event
+    /// `created_at`, which is Nostr second-granular, so the derived floor and
+    /// lookback are `_secs` — deliberately not the `_ms` used by wall-clock
+    /// rows elsewhere in this schema.
+    ///
+    /// Privacy: `relay_results` carries relay URLs. This is deliberate and
+    /// mirrors the existing publish-path kinds — [`AuditEventKind::PublishAttempt`]
+    /// and [`AuditEventKind::PublishOutcome`] already carry `relay_url` /
+    /// `relay_urls` / `accepted_relay_urls`, and [`scrub_full_data_fields`]
+    /// leaves those relay fields untouched even in obfuscated mode. The forensic
+    /// audit channel is a consented, sensitivity-classified surface, distinct
+    /// from the tracing/logging invariant that forbids relay URLs in logs; so
+    /// rebuild rows carry the same relay identifiers the publish rows already do
+    /// rather than being the odd kind out. The URLs are caller-supplied
+    /// subscription endpoints, never a new identity minted at the transport
+    /// boundary.
+    SubscriptionRebuild {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lookback_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        relay_results: Vec<RelayRegistration>,
+    },
+    /// The transport drain loop (`sync_sdk_relay`) finished draining inbound
+    /// deliveries and is about to persist state. Records how long the drain ran
+    /// (`duration_ms`, true wall-clock), how many deliveries it ingested
+    /// (`deliveries`), and the durable transport cursor immediately before and
+    /// after the drain (`cursor_before_secs` / `cursor_after_secs`; `None`
+    /// before any delivery has ever advanced the cursor).
+    ///
+    /// Units: the cursor is a Nostr second-granular timestamp, so those fields
+    /// are `_secs`; `duration_ms` is a genuine millisecond wall-clock duration.
+    ///
+    /// Privacy: scalar counts and timestamps only — no relay URLs, ids, or
+    /// payloads — so nothing here needs scrubbing in either data mode.
+    SyncDrain {
+        duration_ms: u64,
+        deliveries: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_before_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_after_secs: Option<u64>,
+    },
 }
 
 impl AuditEventKind {
@@ -996,6 +1050,8 @@ impl AuditEventKind {
             AuditEventKind::AutoCommitDecision { .. } => "auto_commit_decision",
             AuditEventKind::MessageStateChanged { .. } => "message_state_changed",
             AuditEventKind::Rejection { .. } => "rejection",
+            AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
+            AuditEventKind::SyncDrain { .. } => "sync_drain",
         }
     }
 }
@@ -1012,6 +1068,17 @@ pub enum ForkWinner {
 pub struct PublishRelayFailure {
     pub relay_url: String,
     pub reason: String,
+}
+
+/// One relay's registration outcome during a subscription rebuild, on
+/// [`AuditEventKind::SubscriptionRebuild`]. `relay_url` is the caller-supplied
+/// subscription endpoint; `accepted` is whether the relay acknowledged the
+/// subscription registration. See the kind doc for why the relay URL is carried
+/// here (publish-kind precedent, not scrubbed in obfuscated mode).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayRegistration {
+    pub relay_url: String,
+    pub accepted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

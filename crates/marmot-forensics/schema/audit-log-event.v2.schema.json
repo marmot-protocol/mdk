@@ -679,6 +679,19 @@
         }
       }
     },
+    "relayRegistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relay_url", "accepted"],
+      "properties": {
+        "relay_url": {
+          "type": "string"
+        },
+        "accepted": {
+          "type": "boolean"
+        }
+      }
+    },
     "peelerOutcomeKind": {
       "enum": ["success", "decrypt_failed", "stale_epoch", "malformed", "other"]
     },
@@ -1580,6 +1593,50 @@
             },
             "reason": {
               "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "const": "subscription_rebuild"
+            },
+            "since_secs": {
+              "$ref": "#/$defs/u64"
+            },
+            "lookback_secs": {
+              "$ref": "#/$defs/u64"
+            },
+            "relay_results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/relayRegistration"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "duration_ms", "deliveries"],
+          "properties": {
+            "type": {
+              "const": "sync_drain"
+            },
+            "duration_ms": {
+              "$ref": "#/$defs/u64"
+            },
+            "deliveries": {
+              "$ref": "#/$defs/u64"
+            },
+            "cursor_before_secs": {
+              "$ref": "#/$defs/u64"
+            },
+            "cursor_after_secs": {
+              "$ref": "#/$defs/u64"
             }
           }
         }
