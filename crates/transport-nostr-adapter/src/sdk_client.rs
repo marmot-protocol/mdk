@@ -91,14 +91,18 @@ pub struct NostrSdkRelayClient {
     client: Client,
     account_subscriptions: Arc<RwLock<HashMap<MemberId, Vec<SubscriptionId>>>>,
     publish_relay_refs: Arc<Mutex<HashMap<RelayUrl, usize>>>,
-    /// Per-relay subscription-registration outcomes accumulated since the last
+    /// Per-account, per-relay subscription-registration outcomes accumulated
+    /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
-    /// drain, keyed by endpoint. Merged monotonically (a relay counts as
-    /// registered once any subscription lands on it) so the app can attribute
-    /// one rebuild's registration results to a single audit row. Shared via
-    /// `Arc` so the clone the adapter drives during activation and the clone the
-    /// app holds observe the same log.
-    registration_log: Arc<Mutex<HashMap<RelayUrl, bool>>>,
+    /// drain, bucketed by account then keyed by endpoint. Within an account's
+    /// bucket a relay is merged monotonically (it counts as registered once any
+    /// of that account's subscriptions lands on it) so the app can attribute one
+    /// rebuild's registration results to a single audit row. Bucketing by
+    /// account keeps concurrent account workers on the one shared relay plane
+    /// from draining each other's registrations. Shared via `Arc` so the clone
+    /// the adapter drives during activation and the clone the app holds observe
+    /// the same log.
+    registration_log: Arc<Mutex<HashMap<MemberId, HashMap<RelayUrl, bool>>>>,
 }
 
 impl NostrSdkRelayClient {
@@ -127,17 +131,28 @@ impl NostrSdkRelayClient {
         health
     }
 
-    /// Drain the per-relay subscription-registration outcomes accumulated since
-    /// the previous drain, sorted by relay URL for stable audit output.
+    /// Drain the per-relay subscription-registration outcomes `account`
+    /// accumulated since its previous drain, sorted by relay URL for stable
+    /// audit output.
     ///
-    /// Draining attributes each outcome to exactly one caller (one
-    /// `subscription_rebuild` audit row); a subsequent rebuild starts from an
-    /// empty log. Returns an empty vec when no subscription has been registered
-    /// since the last drain.
-    pub async fn take_subscription_registrations(&self) -> Vec<RelayRegistrationOutcome> {
+    /// Draining is account-scoped: it removes and returns only `account`'s
+    /// bucket, so concurrent account workers sharing this one relay plane each
+    /// attribute their own registrations to their own `subscription_rebuild`
+    /// audit row. Each outcome lands on exactly one row for that account; a
+    /// subsequent rebuild for the same account starts from an empty bucket.
+    /// Returns an empty vec when `account` has registered no subscription since
+    /// its last drain. A group shared across accounts registers once, attributed
+    /// to whichever account's client subscribed (an acceptable diagnostic
+    /// attribution).
+    pub async fn take_subscription_registrations(
+        &self,
+        account: &MemberId,
+    ) -> Vec<RelayRegistrationOutcome> {
         let mut log = self.registration_log.lock().await;
         let mut outcomes: Vec<RelayRegistrationOutcome> = log
-            .drain()
+            .remove(account)
+            .unwrap_or_default()
+            .into_iter()
             .map(|(relay, accepted)| RelayRegistrationOutcome {
                 relay_url: relay.to_string(),
                 accepted,
@@ -598,7 +613,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .endpoints
             .iter()
             .map(|endpoint| (endpoint.clone(), output.success.contains(endpoint)));
-        merge_registration_log(&mut *self.registration_log.lock().await, outcomes);
+        merge_registration_log(
+            self.registration_log
+                .lock()
+                .await
+                .entry(plan.account_id.clone())
+                .or_default(),
+            outcomes,
+        );
 
         self.account_subscriptions
             .write()
@@ -836,14 +858,15 @@ impl<T: PartialEq> PushUnique<T> for Vec<T> {
     }
 }
 
-/// Fold one subscribe attempt's per-endpoint outcomes into the running
-/// registration log.
+/// Fold one subscribe attempt's per-endpoint outcomes into one account's
+/// registration bucket.
 ///
-/// A relay counts as registered for the rebuild if it acknowledged *any*
-/// subscription (monotonic OR), so a group subscription that lands on a relay
-/// after a transient inbox miss still marks that relay accepted for the rebuild
-/// as a whole. Kept as a free function so the merge is unit-testable without a
-/// live relay pool.
+/// A relay counts as registered for that account's rebuild if it acknowledged
+/// *any* of the account's subscriptions (monotonic OR), so a group subscription
+/// that lands on a relay after a transient inbox miss still marks that relay
+/// accepted for the rebuild as a whole. Kept as a free function operating on a
+/// single account's bucket so the merge is unit-testable without a live relay
+/// pool.
 fn merge_registration_log(
     log: &mut HashMap<RelayUrl, bool>,
     outcomes: impl IntoIterator<Item = (RelayUrl, bool)>,
@@ -981,17 +1004,22 @@ mod tests {
     async fn take_subscription_registrations_drains_sorted_and_resets() {
         let client = Client::builder().build();
         let sdk = NostrSdkRelayClient::new(client);
+        let account = MemberId::new(vec![0xA1; 32]);
         // Seed the log directly (the network subscribe path is exercised by the
         // MockRelay tests below); this pins the drain/sort/reset contract the
         // app relies on for one audit row per rebuild.
         merge_registration_log(
-            &mut *sdk.registration_log.lock().await,
+            sdk.registration_log
+                .lock()
+                .await
+                .entry(account.clone())
+                .or_default(),
             [
                 (relay("wss://b.example"), true),
                 (relay("wss://a.example"), false),
             ],
         );
-        let outcomes = sdk.take_subscription_registrations().await;
+        let outcomes = sdk.take_subscription_registrations(&account).await;
         assert_eq!(
             outcomes,
             vec![
@@ -1006,7 +1034,70 @@ mod tests {
             ]
         );
         // Draining resets: a subsequent rebuild starts from an empty log.
-        assert!(sdk.take_subscription_registrations().await.is_empty());
+        assert!(
+            sdk.take_subscription_registrations(&account)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn take_subscription_registrations_is_scoped_to_the_draining_account() {
+        // The one relay plane per app shares this log across every account while
+        // account workers subscribe concurrently. A drain must return only the
+        // draining account's registrations: a global drain lets account A's
+        // rebuild row absorb account B's relays and leaves B's own drain empty —
+        // a misattribution in a trust-critical forensic channel (PR #825).
+        let client = Client::builder().build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let account_a = MemberId::new(vec![0xA1; 32]);
+        let account_b = MemberId::new(vec![0xB2; 32]);
+        // Interleave two accounts' subscribe outcomes, each landing on its own
+        // relay, into the shared log.
+        merge_registration_log(
+            sdk.registration_log
+                .lock()
+                .await
+                .entry(account_a.clone())
+                .or_default(),
+            [(relay("wss://a.example"), true)],
+        );
+        merge_registration_log(
+            sdk.registration_log
+                .lock()
+                .await
+                .entry(account_b.clone())
+                .or_default(),
+            [(relay("wss://b.example"), true)],
+        );
+
+        // A's drain returns only A's relay...
+        assert_eq!(
+            sdk.take_subscription_registrations(&account_a).await,
+            vec![RelayRegistrationOutcome {
+                relay_url: "wss://a.example".into(),
+                accepted: true,
+            }]
+        );
+        // ...leaving B's registration intact for B's own rebuild row.
+        assert_eq!(
+            sdk.take_subscription_registrations(&account_b).await,
+            vec![RelayRegistrationOutcome {
+                relay_url: "wss://b.example".into(),
+                accepted: true,
+            }]
+        );
+        // Each account's bucket resets independently on its own drain.
+        assert!(
+            sdk.take_subscription_registrations(&account_a)
+                .await
+                .is_empty()
+        );
+        assert!(
+            sdk.take_subscription_registrations(&account_b)
+                .await
+                .is_empty()
+        );
     }
 
     #[test]

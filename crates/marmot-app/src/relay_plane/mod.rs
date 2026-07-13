@@ -259,16 +259,27 @@ impl MarmotRelayPlane {
             .map(|lookback| lookback.as_secs())
     }
 
-    /// Drain the per-relay subscription-registration outcomes accumulated since
-    /// the previous drain, for the `subscription_rebuild` forensic audit row.
+    /// Drain the per-relay subscription-registration outcomes `account`
+    /// accumulated since its previous drain, for its `subscription_rebuild`
+    /// forensic audit row.
     ///
     /// Delegates to the SDK relay client, which records each subscribe's
-    /// per-endpoint acceptance. A plane built on a custom (non-SDK) relay
-    /// client does not track registration outcomes, so this returns empty for
-    /// it — the audit row then carries `since`/`lookback` without relay rows.
-    pub async fn take_subscription_registrations(&self) -> Vec<RelayRegistrationOutcome> {
+    /// per-endpoint acceptance bucketed by account. The drain is account-scoped
+    /// so concurrent account workers sharing this one relay plane each attribute
+    /// their own registrations to their own audit row; a group shared across
+    /// accounts registers once, attributed to whichever account's client
+    /// subscribed (an acceptable diagnostic attribution). A plane built on a
+    /// custom (non-SDK) relay client does not track registration outcomes, so
+    /// this returns empty for it — the audit row then carries `since`/`lookback`
+    /// without relay rows.
+    pub async fn take_subscription_registrations(
+        &self,
+        account: &MemberId,
+    ) -> Vec<RelayRegistrationOutcome> {
         if let Some(sdk_relay_client) = &self.inner.transport.sdk_relay_client {
-            return sdk_relay_client.take_subscription_registrations().await;
+            return sdk_relay_client
+                .take_subscription_registrations(account)
+                .await;
         }
         Vec::new()
     }
@@ -760,6 +771,17 @@ fn spawn_relay_notification_forwarder(
             })
             .await;
     })
+}
+
+impl MarmotRelayPlaneAccountAdapter {
+    /// The account this adapter is bound to — the `MemberId` every subscription
+    /// issued through it carries (activation and group sync reject any other
+    /// id), and the key its registrations bucket under on the shared relay
+    /// plane. Draining the `subscription_rebuild` row uses this so a rebuild is
+    /// attributed to exactly the account whose subscribes produced it.
+    pub(crate) fn account_id(&self) -> &MemberId {
+        &self.account_id
+    }
 }
 
 #[async_trait]

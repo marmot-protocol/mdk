@@ -136,13 +136,17 @@ impl AppClient {
     /// Record a `subscription_rebuild` forensic audit row for the just-completed
     /// relay-plane activation: the `since` floor requested (`since_secs`; `None`
     /// = full-history replay), the lookback subtracted from the durable cursor
-    /// to derive it, and the per-relay registration outcome. Drains the relay
-    /// plane's registration log, so each rebuild's relays land on exactly one
-    /// row. Account-scoped (no group), so `group_ref` is `None`.
+    /// to derive it, and the per-relay registration outcome. Drains this
+    /// account's registration bucket from the shared relay plane — keyed by the
+    /// adapter's bound account id, the same `MemberId` every subscription this
+    /// account issued was planned with — so each rebuild's relays land on
+    /// exactly one row for this account and never absorb a concurrently-syncing
+    /// account's registrations. Account-scoped (no group), so `group_ref` is
+    /// `None`.
     pub(crate) async fn record_subscription_rebuild(&self, since_secs: Option<u64>) {
         let relay_results = self
             .relay_plane
-            .take_subscription_registrations()
+            .take_subscription_registrations(self.adapter.account_id())
             .await
             .into_iter()
             .map(|outcome| RelayRegistration {
