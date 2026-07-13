@@ -372,15 +372,16 @@ impl SqliteAccountStorage {
     ///
     /// - `last_transport_timestamp` is merged, never overwritten: the stored
     ///   cursor is read back inside the transaction and folded with the
-    ///   snapshot cursor via [`merged_transport_timestamp`] — both sides
-    ///   clamped to `now + max_future_skew_secs`, then the max wins. A
-    ///   snapshot that never learned a cursor (`None`) preserves an advanced
-    ///   stored one, and a stored value poisoned above the clamp ceiling comes
-    ///   out healed instead of winning the max forever. Known residual: a
-    ///   skew-inflated but still within-clamp value persists until wall clock
-    ///   passes it (bounded by `max_future_skew_secs`). Any future deliberate
-    ///   cursor reset must be a dedicated, named API — a raw save cannot lower
-    ///   the merged value.
+    ///   snapshot cursor via [`merged_transport_timestamp`]. When both sides
+    ///   are present they are each clamped to `now + max_future_skew_secs` and
+    ///   the max wins, so a stored value poisoned above the ceiling comes out
+    ///   healed instead of winning the max forever. A snapshot that never
+    ///   learned a cursor (`None`) is cursor-neutral and preserves the stored
+    ///   value unchanged; a fresh store adopts the snapshot side clamped to the
+    ///   same ceiling. Known residual: a skew-inflated but still within-clamp
+    ///   value persists until wall clock passes it (bounded by
+    ///   `max_future_skew_secs`). Any future deliberate cursor reset must be a
+    ///   dedicated, named API — a raw save cannot lower the merged value.
     /// - `seen_events` is a `seen_at`-refreshing union pruned to the newest
     ///   `max_seen_events` rows, so a re-seen event outlives rows whose only
     ///   sighting is old. It only narrows cross-restart redelivery;
@@ -1344,16 +1345,26 @@ pub fn clamp_to_max_future_skew(timestamp: u64, now: u64, max_future_skew_secs: 
 }
 
 /// Merge the stored and snapshot `last_transport_timestamp` into the value a
-/// save may persist: the monotonic max of both sides, each first clamped to
-/// `now + max_future_skew_secs` via [`clamp_to_max_future_skew`].
+/// save may persist. Every arm is deliberate:
 ///
-/// The `Option` cases are deliberate:
-/// - `(None, snapshot)` — a fresh store adopts whatever the runtime learned.
-/// - `(stored, None)` — a runtime that never learned a cursor is
-///   cursor-neutral: it must never wipe (or otherwise move) the stored value.
-/// - `(Some, Some)` — clamp-then-max: clamping the *stored* side at save-time
-///   `now` is what heals a cursor poisoned above the ceiling instead of
-///   letting it win the max forever.
+/// - `(None, None)` — nothing to persist; stays `None`.
+/// - `(None, Some(snapshot))` — a fresh store adopts the snapshot cursor,
+///   clamped to `now + max_future_skew_secs`. The clamp is load-bearing here:
+///   the legacy-import migration (marmot-app's
+///   `migrate_legacy_account_projection_if_needed`) writes a legacy-loaded
+///   state into a brand-new store through this arm, and a pre-clamp-era legacy
+///   projection can carry a cursor poisoned above the ceiling (mdk#182).
+///   Adopting it raw would persist that poison.
+/// - `(Some(stored), None)` — a save that never learned a cursor is
+///   cursor-neutral: the stored value passes through unchanged, never clamped
+///   or otherwise moved. Healing a poisoned stored value is the job of a save
+///   that *did* learn a cursor (the arm below); a cursor-less save must not
+///   move durable state at all.
+/// - `(Some(stored), Some(snapshot))` — both sides are clamped to
+///   `now + max_future_skew_secs` via [`clamp_to_max_future_skew`], then the
+///   max wins. Clamping the *stored* side at save-time `now` is what heals a
+///   cursor poisoned above the ceiling instead of letting it win the max
+///   forever.
 fn merged_transport_timestamp(
     stored: Option<u64>,
     snapshot: Option<u64>,
@@ -1361,8 +1372,13 @@ fn merged_transport_timestamp(
     max_future_skew_secs: u64,
 ) -> Option<u64> {
     match (stored, snapshot) {
-        (None, snapshot) => snapshot,
-        (stored, None) => stored,
+        (None, None) => None,
+        (None, Some(snapshot)) => Some(clamp_to_max_future_skew(
+            snapshot,
+            now,
+            max_future_skew_secs,
+        )),
+        (Some(stored), None) => Some(stored),
         (Some(stored), Some(snapshot)) => Some(
             clamp_to_max_future_skew(stored, now, max_future_skew_secs).max(
                 clamp_to_max_future_skew(snapshot, now, max_future_skew_secs),

@@ -1286,6 +1286,67 @@ fn legacy_account_projection_imports_once_into_account_storage() {
 }
 
 #[test]
+fn legacy_account_projection_clamps_poisoned_transport_cursor_on_import() {
+    // mdk#182 end-to-end: a pre-clamp-era legacy account projection can carry a
+    // transport cursor poisoned far above `now + skew`. The one-shot import
+    // (`migrate_legacy_account_projection_if_needed`) writes that legacy state
+    // into a brand-new account store through `save_account_projection_state`,
+    // which must clamp the adopted cursor to `now + skew` instead of persisting
+    // the poison. The storage-layer twin
+    // (`account_projection_state_clamps_poisoned_snapshot_into_fresh_store`)
+    // covers the same save arm directly; this test drives the real migration.
+    let now_secs = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let legacy_path = app.legacy_account_projection_path("alice");
+    let legacy_key = app
+        .sqlcipher_key(
+            "alice",
+            &keys,
+            &legacy_path,
+            SqlcipherDatabaseKind::AccountProjection,
+        )
+        .unwrap();
+    let mut legacy = LegacyAccountProjectionDb::open(legacy_path.clone(), &legacy_key).unwrap();
+
+    let now_before = now_secs();
+    let poisoned = now_before + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+    legacy
+        .save_state(&AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: Some(poisoned),
+            groups: Vec::new(),
+        })
+        .unwrap();
+
+    // First account access runs the one-shot legacy import.
+    app.groups("alice").unwrap();
+    let now_after = now_secs();
+
+    let skew = TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs();
+    let cursor = app
+        .account_storage("alice")
+        .unwrap()
+        .load_account_projection_state("alice", MAX_SEEN_EVENT_IDS)
+        .unwrap()
+        .last_transport_timestamp
+        .expect("imported cursor must survive the migration save");
+    assert!(
+        (now_before + skew..=now_after + skew).contains(&cursor),
+        "legacy import must clamp a poisoned transport cursor to now + skew, got {cursor}"
+    );
+}
+
+#[test]
 fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     use nostr::base64::Engine as _;
     use nostr::base64::engine::general_purpose::STANDARD as B64;

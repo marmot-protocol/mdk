@@ -301,6 +301,44 @@ fn account_projection_state_heals_poisoned_stored_cursor_on_save() {
     );
 }
 
+#[test]
+fn account_projection_state_clamps_poisoned_snapshot_into_fresh_store() {
+    // Legacy-import shape (mdk#182): the marmot-app migration
+    // (`migrate_legacy_account_projection_if_needed`) writes a legacy-loaded
+    // state into a brand-new account store through this same
+    // `save_account_projection_state`. A pre-clamp-era legacy projection can
+    // carry a transport cursor poisoned above `now + skew`; adopting it into the
+    // fresh store (the `stored = None` arm) must clamp it to save-time
+    // `now + skew`, never persist the poison. Because the migration routes
+    // through this exact save, a fresh-store save with a poisoned snapshot is
+    // the faithful reproduction of that path — no separate migration fixture is
+    // needed for the storage layer. A true end-to-end counterpart that drives
+    // the migration itself lives in marmot-app
+    // (`legacy_account_projection_clamps_poisoned_transport_cursor_on_import`).
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let now_before = unix_now_seconds();
+    let poisoned = now_before + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+    let imported = StoredAccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: Some(poisoned),
+        groups: Vec::new(),
+    };
+    store
+        .save_account_projection_state(&imported, 16, MAX_FUTURE_SKEW_SECS)
+        .unwrap();
+    let now_after = unix_now_seconds();
+
+    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    let cursor = restored
+        .last_transport_timestamp
+        .expect("cursor must survive the save");
+    assert!(
+        (now_before + MAX_FUTURE_SKEW_SECS..=now_after + MAX_FUTURE_SKEW_SECS).contains(&cursor),
+        "poisoned snapshot adopted into a fresh store must clamp to save-time now + skew, got {cursor}"
+    );
+}
+
 /// Fixed merge-time "now" for the pure cursor-merge tests below.
 const MERGE_NOW: u64 = 1_800_000_000;
 
@@ -381,6 +419,20 @@ fn merged_transport_timestamp_is_cursor_neutral_without_snapshot() {
     assert_eq!(
         merged_transport_timestamp(Some(poisoned), None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
         Some(poisoned)
+    );
+}
+
+#[test]
+fn merged_transport_timestamp_clamps_snapshot_adopted_into_fresh_store() {
+    // A fresh store (`stored = None`) adopts the snapshot cursor, but must clamp
+    // it on the way in rather than adopt it raw. The legacy-import migration can
+    // carry a pre-clamp-era transport cursor poisoned above `now + skew` into a
+    // brand-new store through exactly this arm, so the adopted value has to be
+    // bounded to the ceiling.
+    let poisoned = MERGE_NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
+    assert_eq!(
+        merged_transport_timestamp(None, Some(poisoned), MERGE_NOW, MAX_FUTURE_SKEW_SECS),
+        Some(MERGE_NOW + MAX_FUTURE_SKEW_SECS)
     );
 }
 
