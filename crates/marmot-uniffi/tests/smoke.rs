@@ -460,7 +460,7 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
 
 #[tokio::test]
 async fn frozen_cursor_persistence_constructor_opens_and_collects() {
-    // The NSE construction surface (commit-loss Phase 4): a per-push process
+    // The NSE construction surface: a per-push process
     // opens the kit with the Frozen policy and runs a wake collection. The
     // cursor semantics themselves are covered in marmot-app
     // (`tests/cursor_persistence.rs`); the job here is to prove the FFI

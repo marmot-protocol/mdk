@@ -1,5 +1,4 @@
-//! Characterization test for the since-floor commit-loss defect
-//! (`plan.md`, "The defect, in two sentences"):
+//! Characterization test for the since-floor defect. In two sentences:
 //!
 //! > `last_transport_timestamp` is one account-wide durable cursor advanced
 //! > from the sender-controlled `created_at` of every ingested kind-445
@@ -11,13 +10,13 @@
 //! falls below the rebuilt subscription's `since` floor is never delivered to
 //! the runtime, while a sibling event just above the floor is delivered —
 //! and the miss survives a cold restart because the floor is derived from a
-//! durable, monotonic cursor. It is deliberately independent of Phases 1-6:
-//! Phase 4 (frozen wake-collection cursor) does not change this outcome (a
+//! durable, monotonic cursor. It is deliberately independent of the other
+//! fixes: the frozen wake-collection cursor does not change this outcome (a
 //! `Frozen` wake between the two probe events still leaves the same floor in
-//! place), and Phases 5/6 (EOSE-gated cursor completeness, epoch-gap
-//! backfill) are the fixes that are expected to flip these assertions —
-//! when they land, the below-floor probe should start arriving (via
-//! backfill) and this file's expectations must be updated accordingly.
+//! place), and EOSE-gated cursor completeness and epoch-gap backfill are the
+//! fixes that are expected to flip these assertions — when they land, the
+//! below-floor probe should start arriving (via backfill) and this file's
+//! expectations must be updated accordingly.
 //!
 //! # Why one account per store
 //!
@@ -27,7 +26,7 @@
 //! routing index. Two accounts opened from the *same* store would therefore
 //! share delivery plumbing, and an unrelated account's still-open, unfloored
 //! subscription can mask the very floor this test exists to pin (a
-//! documented harness pitfall — see `plan.md` Phase 7 and the handoff notes).
+//! known harness pitfall).
 //! This test gives the probed account (`bob`) its own store; `alice` — who
 //! only needs to create the group and send one ordinary message — gets a
 //! second, independent store pointed at the same relay.
@@ -52,7 +51,7 @@
 //! nostr-sdk documents as terminal ("the `RelayPool` can no longer be used").
 //!
 //! So this test drives the rebuild the way the confirmed iOS trigger actually
-//! does it (`plan.md`: "a full runtime per push"): it shuts a fully-live
+//! does it — a full runtime per push: it shuts a fully-live
 //! runtime down for good, publishes the probe events while `bob` has no
 //! store-side app instance running at all, then opens a *brand new*
 //! `MarmotApp`/`MarmotAppRuntime` pair against the same on-disk store. That
@@ -191,11 +190,11 @@ async fn inbound_events_delivered(app: &MarmotApp) -> usize {
 /// Publish a kind-445 group-message event at the wire level with a fresh,
 /// arbitrary (non-member) ephemeral signing key and a caller-chosen
 /// `created_at`. This is legitimate wire traffic, not a forged event: real
-/// kind-445 senders are always a fresh per-event key, never the account
-/// identity (spec/transports/nostr.md:64-66; mirrors the existing
-/// `signed_group_event_dto` precedent in
-/// `transport-nostr-adapter/src/sdk_client.rs`'s own tests). The content is
-/// undecryptable garbage — this test exercises delivery, not decryption.
+/// kind-445 senders are always a fresh per-event key, never the sender's
+/// Marmot account identity. This mirrors the existing `signed_group_event_dto`
+/// precedent in `transport-nostr-adapter/src/sdk_client.rs`'s own tests. The
+/// content is undecryptable garbage — this test exercises delivery, not
+/// decryption.
 async fn publish_garbage_group_message_at(
     relay_url: &str,
     nostr_group_id_hex: &str,
@@ -334,8 +333,7 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
         legitimate_delivery_count + 1,
         "only the above-floor sibling should reach ingest on a cold boot; the \
          below-floor probe must be silently dropped by the rebuilt \
-         subscription's since floor (plan.md Phase 7 / 'the defect, in two \
-         sentences')",
+         subscription's since floor",
     );
     runtime_bob_boot2.shutdown().await;
 
@@ -354,7 +352,7 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
         legitimate_delivery_count + 1,
         "a second, independent cold restart must still never deliver the \
          below-floor probe: the miss is permanent, not a one-off timing \
-         fluke (plan.md Phase 7 permanence property)",
+         fluke (the permanent-drop property)",
     );
     runtime_bob_boot3.shutdown().await;
 }

@@ -154,7 +154,7 @@ impl Marmot {
     /// [`CursorPersistenceFfi::Frozen`]: the pass still ingests, decrypts, and
     /// projects everything, but a sub-second drain on cold sockets can never
     /// ratchet the durable `since` floor past events it did not receive (the
-    /// commit-loss trigger). Foreground app processes keep [`Marmot::new`].
+    /// wake-collection trigger). Foreground app processes keep [`Marmot::new`].
     // Construction-surface addition: binding regeneration and the workspace
     // version bump ride the release per this crate's lockstep invariant — do
     // not bump versions here.

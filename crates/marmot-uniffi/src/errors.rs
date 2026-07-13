@@ -28,8 +28,8 @@ pub enum MarmotKitError {
     /// An account worker's transport catch-up failed (sync error or timeout).
     /// Distinct, typed variant — separate from [`MarmotKitError::Runtime`] —
     /// so hosts (notably the NSE wake path) can tell a catch-up failure from
-    /// a generic runtime error; the untyped bucket is what sent the first
-    /// commit-loss investigation chasing the wrong subsystem.
+    /// a generic runtime error; the untyped bucket is what sent an earlier
+    /// investigation chasing the wrong subsystem.
     #[error("account catch-up failed: {details}")]
     AccountCatchUp { details: String },
     #[error("local account is not an admin of group {group_id_hex}")]
@@ -231,10 +231,10 @@ mod tests {
     // boundary as the typed `StorageBusy` variant — never the untyped `Runtime`
     // bucket — so Android can distinguish transient contention from a fatal
     // failure without string-parsing "database is locked".
-    // Commit-loss follow-up: an account catch-up failure must cross the UniFFI
+    // An account catch-up failure must cross the UniFFI
     // boundary as the typed `AccountCatchUp` variant — never the untyped
-    // `Runtime` bucket, and never `RelayDirectory` (the mislabel that sent the
-    // first commit-loss investigation chasing the wrong subsystem).
+    // `Runtime` bucket, and never `RelayDirectory` (the mislabel that sent an
+    // earlier investigation chasing the wrong subsystem).
     #[test]
     fn account_catch_up_crosses_ffi_as_typed_variant() {
         let app_err = AppError::AccountCatchUp("runtime catch-up failed: account_session".into());

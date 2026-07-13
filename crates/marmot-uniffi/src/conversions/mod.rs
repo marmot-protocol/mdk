@@ -88,7 +88,7 @@ mod tests {
         use marmot_app::CursorPersistence;
         // The FFI enum mirrors the app policy 1:1; a swapped variant here
         // would hand a wake-collection process the Advance posture and
-        // silently reintroduce the NSE cursor ratchet (commit-loss Phase 4).
+        // silently reintroduce the NSE cursor ratchet.
         assert!(matches!(
             CursorPersistence::from(CursorPersistenceFfi::Advance),
             CursorPersistence::Advance

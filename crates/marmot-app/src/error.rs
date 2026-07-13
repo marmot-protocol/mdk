@@ -50,8 +50,8 @@ pub enum AppError {
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
     /// Deliberately distinct from [`AppError::RelayDirectory`]: catch-up
-    /// failures were once wrapped as relay-directory errors, which sent the
-    /// first commit-loss investigation chasing the wrong subsystem.
+    /// failures were once wrapped as relay-directory errors, which sent an
+    /// earlier investigation chasing the wrong subsystem.
     #[error("account catch-up failed: {0}")]
     AccountCatchUp(String),
     #[error("invalid Nostr public key")]

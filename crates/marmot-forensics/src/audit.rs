@@ -954,8 +954,9 @@ pub enum AuditEventKind {
     /// corrupt), the lookback subtracted from the durable cursor to derive it
     /// (`lookback_secs`), and the per-relay registration outcome
     /// (`relay_results`). Together with [`AuditEventKind::SyncDrain`] these rows
-    /// let an analyzer reconstruct the persisted-cursor-vs-missed-`created_at`
-    /// smoking gun from any export, including NSE wake sessions.
+    /// let an analyzer reconstruct the decisive
+    /// persisted-cursor-vs-missed-`created_at` evidence from any export,
+    /// including NSE wake sessions.
     ///
     /// Units: the durable transport cursor is advanced from inbound event
     /// `created_at`, which is Nostr second-granular, so the derived floor and

@@ -5293,11 +5293,10 @@ async fn runtime_data_mode_toggle_rotates_live_recorder_with_boundary() {
 
 #[tokio::test]
 async fn runtime_sync_emits_subscription_rebuild_and_sync_drain_audit_rows() {
-    // Phase 3: a scripted sync produces the two forensic diagnostic rows the
-    // commit-loss investigation depends on — the subscription rebuild's `since`
-    // floor + per-relay registration, and the drain's cursor before/after — so
-    // the persisted-cursor-vs-missed-`created_at` smoking gun falls out of any
-    // export.
+    // A scripted sync produces the two forensic diagnostic rows a field export
+    // relies on — the subscription rebuild's `since` floor + per-relay
+    // registration, and the drain's cursor before/after — so the
+    // persisted-cursor-vs-missed-`created_at` mismatch is evident in any export.
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
     // Enable recording before the runtime starts so the live worker records.

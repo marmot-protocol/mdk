@@ -1,4 +1,4 @@
-//! Integration test for `CursorPersistence` (`plan.md` Phase 4, commit-loss):
+//! Integration test for `CursorPersistence`:
 //! a `Frozen` (wake-collection) runtime still ingests, decrypts, and projects
 //! a delivered message, but the durable transport cursor it persists is
 //! byte-identical to the one it loaded — and a subsequent `Advance` runtime
@@ -20,7 +20,7 @@
 //! # Cursor observable
 //!
 //! The persisted cursor has no public accessor by design; the observation
-//! channel is the forensic audit rows Phase 3 added for exactly this
+//! channel is the forensic audit rows added for exactly this
 //! comparison. A `sync_drain` row records the in-memory cursor before/after
 //! each drain, and the *first* drain of a cold boot records the
 //! freshly-loaded persisted value as `cursor_before_secs` — so the frozen
@@ -315,8 +315,8 @@ async fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
         "the frozen boot's catch-up drain — not a live tail — must have \
          ingested the offline-published delivery: {boot2_drains:?}"
     );
-    // Design point (plan.md Phase 4 step 4): frozen rebuilds keep deriving
-    // the subscription `since` floor from the loaded cursor — the audit rows
+    // Frozen rebuilds keep deriving the subscription `since` floor from the
+    // loaded cursor — the audit rows
     // themselves show wake passes not moving the floor.
     let boot2_rebuilds = rows_of_kind(&boot2_rows, "subscription_rebuild");
     assert!(!boot2_rebuilds.is_empty());
@@ -385,7 +385,7 @@ async fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
 
     let boot3_rows = audit_rows.new_rows(&app_bob_boot3, "bob");
     let boot3_drains = rows_of_kind(&boot3_rows, "sync_drain");
-    // THE Phase 4 assertion: the Advance boot loaded a persisted cursor
+    // Core assertion: the Advance boot loaded a persisted cursor
     // byte-identical to the pre-frozen baseline — the frozen pass's
     // save_state never moved the durable floor — and a fresh delivery
     // advanced it normally in the same drain.

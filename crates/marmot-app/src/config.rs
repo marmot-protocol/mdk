@@ -32,10 +32,9 @@ const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
 ///   `Frozen` means "never advance", not "no cursor". Worst case is bounded
 ///   redelivery on the next `Advance` catch-up, absorbed by seen-id dedup.
 ///
-/// `Frozen` severs the commit-loss cursor ratchet at its confirmed trigger:
+/// `Frozen` severs the cursor ratchet at the wake-collection trigger:
 /// a wake pass that drains for a fraction of a second on cold sockets must
-/// not persist a floor above events it never had time to receive
-/// (`plan.md` Phase 4).
+/// not persist a floor above events it never had time to receive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CursorPersistence {
     /// Ingested deliveries advance the durable cursor (default).

@@ -719,7 +719,7 @@ mod transport_cursor_tests {
 
     #[test]
     fn frozen_policy_never_moves_the_cursor() {
-        // Phase 4 (commit-loss): a wake-collection runtime ingests but must
+        // A wake-collection runtime ingests but must
         // not ratchet the durable floor. Under `Frozen` the cursor is exactly
         // the loaded value regardless of what the delivery carries — a newer
         // in-range timestamp, an older one, or a far-future one.
@@ -747,7 +747,7 @@ mod transport_cursor_tests {
 
     #[test]
     fn advance_policy_is_the_unchanged_clamped_monotonic_max() {
-        // `Advance` is byte-for-byte the pre-Phase-4 behavior: delegate to
+        // `Advance` is byte-for-byte the historical behavior: delegate to
         // `clamped_transport_cursor` (monotonic max with the mdk#182
         // future-skew clamp and poison heal, pinned by the tests below).
         assert_eq!(
