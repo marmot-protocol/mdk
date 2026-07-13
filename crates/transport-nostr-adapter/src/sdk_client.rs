@@ -657,6 +657,12 @@ impl NostrRelayClient for NostrSdkRelayClient {
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
+        // Drop the account's undrained registration bucket along with its
+        // subscriptions: a sign-out between a subscribe and the next sync's
+        // drain would otherwise orphan the bucket, and a later reactivation
+        // would OR-merge fresh registrations into the stale session's relays —
+        // misstating the next `subscription_rebuild` audit row.
+        self.registration_log.lock().await.remove(account_id);
         let ids = self
             .account_subscriptions
             .write()
@@ -1097,6 +1103,34 @@ mod tests {
             sdk.take_subscription_registrations(&account_b)
                 .await
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_account_drops_the_undrained_registration_bucket() {
+        // A sign-out between a subscribe and the next sync's drain must not
+        // orphan the bucket: a later reactivation would OR-merge fresh
+        // registrations into the stale session's relays and misstate the next
+        // `subscription_rebuild` audit row (PR #825 follow-up).
+        let client = Client::builder().build();
+        let sdk = NostrSdkRelayClient::new(client);
+        let account = MemberId::new(vec![0xC3; 32]);
+        merge_registration_log(
+            sdk.registration_log
+                .lock()
+                .await
+                .entry(account.clone())
+                .or_default(),
+            [(relay("wss://stale.example"), true)],
+        );
+
+        sdk.unsubscribe_account(&account).await.unwrap();
+
+        assert!(
+            sdk.take_subscription_registrations(&account)
+                .await
+                .is_empty(),
+            "sign-out must drop the account's undrained registrations"
         );
     }
 
