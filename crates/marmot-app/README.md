@@ -55,6 +55,17 @@ list helpers, and public re-exports. Runtime orchestration lives in the `src/run
 live in the `src/client/` module, group DTOs/component projection helpers live in `src/groups.rs`, and encrypted-media
 DTOs plus Blossom upload/download helpers live in the `src/media/` module.
 
+## Encrypted media endpoints
+
+Encrypted media and encrypted group images are uploaded as opaque `application/octet-stream` blobs. A compatible
+Blossom server must accept arbitrary binary data rather than only recognizable image, audio, or video payloads. New
+groups use the ordered built-in ciphertext-compatible endpoint list unless the host build supplies
+`MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`; upload attempts follow that order.
+
+The endpoint list is embedded in the signed `marmot.group.encrypted-media.v1` component. Changing application defaults
+does not rewrite existing group state. An active group admin can migrate an existing group with
+`replace_encrypted_media_blob_endpoints` through the app runtime or UniFFI API.
+
 ## Run the tests
 
 ```sh

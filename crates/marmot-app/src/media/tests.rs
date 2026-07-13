@@ -113,6 +113,18 @@ fn http_status_response(status: u16, reason: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+fn http_error_response(status: u16, reason: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 fn blossom_endpoint(base_url: String) -> BlobStoreEndpointV1 {
     BlobStoreEndpointV1 {
         locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
@@ -220,6 +232,84 @@ async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
         !message.contains(&first) && !message.contains(&second),
         "aggregated error must not embed Blossom server URLs: {message}"
     );
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_preserves_privacy_safe_blossom_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        415,
+        "Unsupported Media Type",
+        &[],
+        "upload rejected: unsupported media type application/octet-stream",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &[],
+        true,
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: upload failed for all Blossom servers: server 1: upload returned HTTP 415: upload rejected: unsupported media type application/octet-stream"
+    );
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
+    let secret_value = "11".repeat(32);
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[(
+            "X-Reason",
+            &format!("blob https://media.example/{secret_value} is forbidden"),
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &[],
+        true,
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("media.example"));
+    assert!(!message.contains(&secret_value));
+}
+
+#[test]
+fn built_in_blossom_endpoints_are_ciphertext_compatible_fallbacks() {
+    assert_eq!(DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS[0]);
+    assert_eq!(
+        DEFAULT_BLOSSOM_SERVER_URLS,
+        [
+            "https://blossom.divine.video",
+            "https://blossom.ditto.pub",
+            "https://cdn.hzrd149.com",
+        ]
+    );
+    assert!(!DEFAULT_BLOSSOM_SERVER_URLS.contains(&"https://blossom.primal.net"));
 }
 
 #[tokio::test]

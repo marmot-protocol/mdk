@@ -15,6 +15,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 - MarmotKit/UniFFI now exposes the cached Nostr Kind 0 `website` field through a read-only profile accessor so app
   profile surfaces can display it without widening the writable profile record.
 
+### Fixed
+
+- Encrypted media and encrypted group-image uploads now default to an ordered list of Blossom endpoints that accept
+  opaque `application/octet-stream` ciphertext instead of the media-only Primal endpoint that returned HTTP 415.
+  Blossom upload failures also retain bounded, privacy-filtered server rejection reasons for actionable diagnostics.
+
 ## [0.9.3] - 2026-07-07
 
 ### Added

@@ -27,7 +27,7 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, fetch_group_image,
+    DEFAULT_BLOSSOM_SERVER_URLS, download_encrypted_media, fetch_group_image,
     is_loopback_http_endpoint, upload_encrypted_media, upload_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
@@ -1951,7 +1951,10 @@ impl AppClient {
             .encrypted_media_blob_endpoints
             .is_empty()
         {
-            vec![DEFAULT_BLOSSOM_SERVER_URL.to_owned()]
+            DEFAULT_BLOSSOM_SERVER_URLS
+                .iter()
+                .map(|endpoint| (*endpoint).to_owned())
+                .collect()
         } else {
             self.app
                 .service_endpoints()

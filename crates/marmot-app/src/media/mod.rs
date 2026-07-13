@@ -27,7 +27,21 @@ pub(crate) use crypto::canonical_media_type;
 pub(crate) use group_image::{fetch_group_image, upload_group_image};
 pub(crate) use host_safety::is_loopback_http_endpoint;
 
-pub const DEFAULT_BLOSSOM_SERVER_URL: &str = "https://blossom.primal.net";
+/// Built-in encrypted-media endpoints, in upload fallback order.
+///
+/// Every endpoint in this list must accept opaque `application/octet-stream`
+/// blobs. Encrypted media and encrypted group images are indistinguishable
+/// from random bytes, so media-only Blossom servers are not compatible even
+/// when the original plaintext was an image or video.
+pub const DEFAULT_BLOSSOM_SERVER_URLS: &[&str] = &[
+    "https://blossom.divine.video",
+    "https://blossom.ditto.pub",
+    "https://cdn.hzrd149.com",
+];
+
+/// Primary built-in Blossom endpoint used by single-endpoint APIs such as
+/// encrypted group-image upload.
+pub const DEFAULT_BLOSSOM_SERVER_URL: &str = DEFAULT_BLOSSOM_SERVER_URLS[0];
 pub const ENCRYPTED_MEDIA_VERSION: &str = ENCRYPTED_MEDIA_FORMAT_V1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

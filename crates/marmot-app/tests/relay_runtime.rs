@@ -4099,6 +4099,21 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
     let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
 
+    let initial_group = app.group("alice", &group_id_hex).unwrap().unwrap();
+    let initial_endpoints = initial_group
+        .encrypted_media
+        .default_blob_endpoints
+        .iter()
+        .map(|endpoint| endpoint.base_url.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        initial_endpoints,
+        marmot_app::DEFAULT_BLOSSOM_SERVER_URLS
+            .iter()
+            .map(|endpoint| format!("{endpoint}/"))
+            .collect::<Vec<_>>()
+    );
+
     let bob_error = bob
         .replace_encrypted_media_blob_endpoints(
             &group_id,

@@ -143,9 +143,10 @@ pub use ids::{
 /// depending on `marmot-forensics` directly.
 pub use marmot_forensics::AuditDataMode;
 pub use media::{
-    DEFAULT_BLOSSOM_SERVER_URL, ENCRYPTED_MEDIA_VERSION, MediaAttachmentReference,
-    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
-    MediaUploadRequest, MediaUploadResult, media_attachment_from_imeta_tag,
+    DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
+    MediaAttachmentReference, MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest,
+    MediaUploadAttachmentResult, MediaUploadRequest, MediaUploadResult,
+    media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use notifications::{
