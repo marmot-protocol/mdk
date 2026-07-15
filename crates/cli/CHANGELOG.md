@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: adopted a chat-first shell. A screen model replaces the fixed four-pane dashboard: a login/account-select
+  screen (create identity, nsec login, or pick from several accounts) opens when there is no single obvious account,
+  and the main view is the chat list plus the message timeline plus the composer, with the reclaimed space going to
+  the chat/messages row. The 12-row status panel and 3-row header collapse into a one-line status bar
+  (`{account} · daemon {on|off} · {n} chats · {u} unread · {latest status}`) and a per-focus hints line. Default
+  focus is the chat list, so `j`/`k` works immediately; `Enter` opens a chat and focuses the messages pane; `A`
+  reopens the account picker. Group MLS/component diagnostics move behind a new `/diagnostics` slash command that
+  toggles a diagnostics panel above the composer. An explicit `--account`/`WN_ACCOUNT` selection that resolves to a
+  loaded account opens the main view directly, even when several accounts exist. No JSON response shapes changed.
 - TUI: the messages pane now renders the materialized message timeline (`messages timeline list` /
   `messages timeline subscribe`) with reactions, reply context, deletion tombstones, and `[img name]`/`[file name]`
   media placeholders. Scrolling uses a
@@ -18,6 +27,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `wn tui` gained optional `--discovery-relays` and `--default-account-relays` flags (comma-separated, matching
+  `wn daemon start`). They are forwarded to the `daemon start` child and to `create-identity`/`login` account setup
+  so a first run with no relay configuration can supply relays without dead-ending. Flag passthrough only; no JSON
+  response shapes changed.
 - MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
   and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
   metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.

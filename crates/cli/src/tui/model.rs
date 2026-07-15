@@ -17,8 +17,16 @@ pub(crate) struct WnInvocation {
     pub(crate) stdin: Option<String>,
 }
 
-pub(crate) fn account_setup_invocation(identity: Option<String>) -> WnInvocation {
-    match identity {
+/// Build the `wn` invocation for account setup. `setup_relay` supplies the
+/// first-run relay to `create-identity` / `login` through the one relay flag
+/// those commands actually accept — the (global, for `create-identity`;
+/// command-local, for `login`) `--relay` — appended only when the caller has no
+/// other `--relay` source, so it is never passed twice.
+pub(crate) fn account_setup_invocation(
+    identity: Option<String>,
+    setup_relay: Option<String>,
+) -> WnInvocation {
+    let mut invocation = match identity {
         Some(identity) if crate::is_nostr_secret(&identity) => WnInvocation {
             args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
             stdin: Some(format!("{identity}\n")),
@@ -31,7 +39,12 @@ pub(crate) fn account_setup_invocation(identity: Option<String>) -> WnInvocation
             args: vec!["create-identity".to_owned()],
             stdin: None,
         },
+    };
+    if let Some(relay) = setup_relay.filter(|relay| !relay.trim().is_empty()) {
+        invocation.args.push("--relay".to_owned());
+        invocation.args.push(relay);
     }
+    invocation
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,9 +180,11 @@ impl Drop for TimelineSubscription {
     }
 }
 
+/// The pane holding keyboard focus in the chat-first main view. The accounts
+/// pane is gone in Phase 2; account switching moves to the login/account-select
+/// screen (reopened with `A`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
-    Accounts,
     Chats,
     Messages,
     Composer,
@@ -178,29 +193,107 @@ pub(crate) enum Focus {
 impl Focus {
     pub(crate) fn next(self) -> Self {
         match self {
-            Self::Accounts => Self::Chats,
             Self::Chats => Self::Messages,
             Self::Messages => Self::Composer,
-            Self::Composer => Self::Accounts,
+            Self::Composer => Self::Chats,
         }
     }
 
     pub(crate) fn previous(self) -> Self {
         match self {
-            Self::Accounts => Self::Composer,
-            Self::Chats => Self::Accounts,
+            Self::Chats => Self::Composer,
             Self::Messages => Self::Chats,
             Self::Composer => Self::Messages,
         }
     }
+}
 
-    pub(crate) fn title(self) -> &'static str {
-        match self {
-            Self::Accounts => "accounts",
-            Self::Chats => "chats",
-            Self::Messages => "messages",
-            Self::Composer => "composer",
+/// The top-level screen the TUI is showing. Phase 2 has exactly two: the
+/// login/account-select flow and the chat-first main view. Group detail,
+/// profile, search, and health screens arrive in Phase 5.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Screen {
+    Login(LoginMode),
+    Main,
+}
+
+/// The three states of the login screen: the create/login menu (no accounts),
+/// the account picker (several accounts), and the masked nsec entry field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoginMode {
+    Menu,
+    AccountSelect,
+    NsecEntry,
+}
+
+/// Route the startup screen from the number of loaded accounts: no accounts
+/// opens the login menu, exactly one drops straight into the main view with it
+/// selected, and several open the account picker — unless `initial_selected` is
+/// set (a `--account`/`WN_ACCOUNT` selector resolved to a loaded account), which
+/// enters the main view directly with that account.
+pub(crate) fn startup_screen(account_count: usize, initial_selected: bool) -> Screen {
+    match account_count {
+        0 => Screen::Login(LoginMode::Menu),
+        1 => Screen::Main,
+        _ if initial_selected => Screen::Main,
+        _ => Screen::Login(LoginMode::AccountSelect),
+    }
+}
+
+/// The login mode to return to when leaving nsec entry: the menu when there are
+/// no accounts yet, otherwise the account picker (the two screens that open it).
+pub(crate) fn login_mode_for_accounts(account_count: usize) -> LoginMode {
+    if account_count == 0 {
+        LoginMode::Menu
+    } else {
+        LoginMode::AccountSelect
+    }
+}
+
+/// Render a secret as one `*` per character, preserving length without exposing
+/// the value. Used for the nsec-entry field (key material never renders).
+pub(crate) fn masked_secret(value: &str) -> String {
+    "*".repeat(value.chars().count())
+}
+
+/// The one-line status bar for the main view:
+/// `{account} · daemon {on|off} · {n} chats · {u} unread · {latest status}`.
+/// Untrusted fields (the account label and the status message) pass through
+/// `terminal_safe_text`, and the assembled line is shortened to `width`.
+pub(crate) fn status_bar_line(
+    account_label: &str,
+    daemon_running: bool,
+    chats: usize,
+    unread: usize,
+    status: &str,
+    width: usize,
+) -> String {
+    let account = shorten(&terminal_safe_text(account_label), 24);
+    let daemon = if daemon_running { "on" } else { "off" };
+    let status = terminal_safe_text(status);
+    let line = format!("{account} · daemon {daemon} · {chats} chats · {unread} unread · {status}");
+    shorten(&line, width)
+}
+
+/// The per-screen, per-focus hints line. Terse and kept in lockstep with the
+/// real keymap (the README and in-app help mirror these strings). `entered_main`
+/// gates the account picker's `Esc back` hint: `Esc` only returns to the main
+/// view when a session is already active, so the startup picker omits it.
+pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'static str {
+    match screen {
+        Screen::Login(LoginMode::Menu) => "c create identity  l nsec login  q quit",
+        Screen::Login(LoginMode::AccountSelect) if entered_main => {
+            "j/k navigate  Enter select  c create  l nsec  Esc back  q quit"
         }
+        Screen::Login(LoginMode::AccountSelect) => {
+            "j/k navigate  Enter select  c create  l nsec  q quit"
+        }
+        Screen::Login(LoginMode::NsecEntry) => "Enter submit  Esc back",
+        Screen::Main => match focus {
+            Focus::Chats => "j/k navigate  Enter open  A accounts  / command  ? help  q quit",
+            Focus::Messages => "j/k select  G/g ends  PgUp older  i compose  Tab cycle",
+            Focus::Composer => "Enter send  Esc clear",
+        },
     }
 }
 
@@ -208,6 +301,7 @@ impl Focus {
 pub(crate) enum SlashCommand {
     Help,
     Refresh,
+    Diagnostics,
     Account(String),
     AccountCreate,
     AccountAddPublic(String),
@@ -277,6 +371,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/refresh",
         description: "reload accounts and chats",
+    },
+    SlashCommandSuggestion {
+        usage: "/diagnostics",
+        description: "toggle the MLS group diagnostics panel",
     },
     SlashCommandSuggestion {
         usage: "/account <npub-or-hex>",
@@ -2115,6 +2213,26 @@ pub(crate) fn composer_display_text(input: &str) -> String {
         return "/login <hidden nsec>".to_owned();
     }
     input.to_owned()
+}
+
+/// Args for the `daemon start` child, forwarding the TUI's first-run relay
+/// flags. `wn daemon start` accepts comma-delimited `--discovery-relays` /
+/// `--default-account-relays`, so each non-empty list is joined and passed as
+/// the same flag the daemon exposes (flag passthrough, no JSON change).
+pub(crate) fn daemon_start_args(
+    discovery_relays: &[String],
+    default_account_relays: &[String],
+) -> Vec<String> {
+    let mut args = vec!["daemon".to_owned(), "start".to_owned()];
+    if !discovery_relays.is_empty() {
+        args.push("--discovery-relays".to_owned());
+        args.push(discovery_relays.join(","));
+    }
+    if !default_account_relays.is_empty() {
+        args.push("--default-account-relays".to_owned());
+        args.push(default_account_relays.join(","));
+    }
+    args
 }
 
 pub(crate) fn message_subscription_args() -> Vec<String> {

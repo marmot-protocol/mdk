@@ -446,7 +446,7 @@ fn group_members_status_summarizes_member_records() {
 }
 
 #[test]
-fn status_panel_lines_show_latest_status_then_mls_and_components() {
+fn diagnostics_panel_lines_show_mls_and_components() {
     let diagnostics = parse_group_diagnostics(&serde_json::json!({
         "group": {
             "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -473,19 +473,18 @@ fn status_panel_lines_show_latest_status_then_mls_and_components() {
     }))
     .expect("diagnostics");
 
-    let rendered = status_panel_lines("loaded 2 message(s)", Some(&diagnostics))
+    // The diagnostics panel drops the leading status line (now in the status bar):
+    // it starts straight at the MLS summary.
+    let rendered = diagnostics_panel_lines(Some(&diagnostics))
         .iter()
         .map(line_text)
         .collect::<Vec<_>>();
 
-    assert_eq!(rendered[0], "loaded 2 message(s)");
-    assert_eq!(rendered[1], "");
-    assert_eq!(rendered[2], "");
     assert_eq!(
-        rendered[3],
+        rendered[0],
         "MLS epoch=7 group=aaaaaaa...aaaaaaaa members=3"
     );
-    assert_eq!(rendered[4], "components:");
+    assert_eq!(rendered[1], "components:");
     assert!(
         rendered
             .iter()
@@ -722,12 +721,12 @@ fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
     };
     assert_eq!(line_text(&chat_row_line(&chat, false, 0)), "  ops[5m");
 
-    let status = status_panel_lines(
-        "ready\u{1b}[2J",
-        Some(&GroupDiagnostics::unavailable("aa", "bad\u{1b}[31m")),
+    let diagnostics =
+        diagnostics_panel_lines(Some(&GroupDiagnostics::unavailable("aa", "bad\u{1b}[31m")));
+    assert_eq!(
+        line_text(&diagnostics[0]),
+        "MLS group=aa unavailable: bad[31m"
     );
-    assert_eq!(line_text(&status[0]), "ready[2J");
-    assert_eq!(line_text(&status[3]), "MLS group=aa unavailable: bad[31m");
 }
 
 #[test]
@@ -759,7 +758,7 @@ fn image_slash_command_uses_real_media_upload_send_surface() {
 }
 
 #[test]
-fn daemon_status_json_becomes_header_and_status_text() {
+fn daemon_status_json_becomes_status_text() {
     let daemon = parse_daemon_view(&serde_json::json!({
         "running": true,
         "pid": 1234,
@@ -772,10 +771,6 @@ fn daemon_status_json_becomes_header_and_status_text() {
         }
     }));
 
-    assert_eq!(
-        daemon_header_label(&daemon),
-        "on pid=1234 activity=3/1/4 errors=1"
-    );
     assert_eq!(
         daemon_status_sentence(&daemon),
         "daemon running last-activity accounts=2 events=3 joined=1 messages=4 errors=1"
@@ -813,7 +808,6 @@ fn daemon_stream_watches_become_status_and_preview_rows() {
         ]
     }));
 
-    assert_eq!(daemon_header_label(&daemon), "on pid=1234 streams=1");
     assert_eq!(
         daemon_status_sentence(&daemon),
         "daemon running streams: running=1 completed=1 failed=0 latest=bbbbbbb...bbbbbbbb"
@@ -1293,6 +1287,44 @@ fn message_subscription_gates_on_loaded_chat_not_highlighted_chat() {
 }
 
 #[test]
+fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
+    // A picker reached via `A` from an active session keeps its background
+    // drains running. On the login/account-select screen the status line carries
+    // the nsec prompt and picker guidance, so a live drain must apply its state
+    // changes without overwriting that prompt.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    let (tx, rx) = mpsc::channel();
+    app.message_subscription = Some(MessageSubscription {
+        account_id: account_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    let prompt = "enter nsec; Enter submits, Esc cancels".to_owned();
+    app.status = prompt.clone();
+    tx.send(SubscriptionEvent::Error("relay dropped".to_owned()))
+        .expect("send error event");
+    assert!(app.drain_message_subscription());
+    assert_eq!(
+        app.status, prompt,
+        "the login prompt survives a background drain"
+    );
+
+    // The same event on the main view still surfaces on the status line.
+    app.screen = Screen::Main;
+    tx.send(SubscriptionEvent::Error("relay dropped".to_owned()))
+        .expect("send error event");
+    assert!(app.drain_message_subscription());
+    assert!(
+        app.status.contains("relay dropped"),
+        "main-view drains still set status, got: {}",
+        app.status
+    );
+}
+
+#[test]
 fn selected_message_subscription_retains_account_wide_stream_without_selected_chat() {
     let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let mut app = test_tui_app(test_unused_client(), account_id);
@@ -1473,16 +1505,56 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
 #[test]
 fn account_setup_invocation_pipes_nsec_imports_to_stdin() {
     assert_eq!(
-        account_setup_invocation(Some("nsec1secret".to_owned())),
+        account_setup_invocation(Some("nsec1secret".to_owned()), None),
         WnInvocation {
             args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
             stdin: Some("nsec1secret\n".to_owned()),
         }
     );
     assert_eq!(
-        account_setup_invocation(Some("npub1bob".to_owned())),
+        account_setup_invocation(Some("npub1bob".to_owned()), None),
         WnInvocation {
             args: vec!["login".to_owned(), "npub1bob".to_owned()],
+            stdin: None,
+        }
+    );
+}
+
+#[test]
+fn account_setup_invocation_appends_first_run_setup_relay() {
+    // The first-run setup relay is appended as the one `--relay` flag account
+    // setup accepts (global for create-identity, command-local for login).
+    assert_eq!(
+        account_setup_invocation(None, Some("wss://relay.example".to_owned())),
+        WnInvocation {
+            args: vec![
+                "create-identity".to_owned(),
+                "--relay".to_owned(),
+                "wss://relay.example".to_owned(),
+            ],
+            stdin: None,
+        }
+    );
+    assert_eq!(
+        account_setup_invocation(
+            Some("nsec1secret".to_owned()),
+            Some("wss://relay.example".to_owned())
+        ),
+        WnInvocation {
+            args: vec![
+                "login".to_owned(),
+                "--nsec-stdin".to_owned(),
+                "--relay".to_owned(),
+                "wss://relay.example".to_owned(),
+            ],
+            stdin: Some("nsec1secret\n".to_owned()),
+        }
+    );
+    // A blank relay adds no flag.
+    assert_eq!(
+        account_setup_invocation(None, Some("  ".to_owned())),
+        WnInvocation {
+            args: vec!["create-identity".to_owned()],
             stdin: None,
         }
     );
@@ -1672,6 +1744,9 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         client,
         initial_account: None,
         running: true,
+        screen: Screen::Main,
+        entered_main: true,
+        show_diagnostics: false,
         focus: Focus::Composer,
         accounts: vec![AccountRow {
             account_id: account_id.to_owned(),
@@ -1680,6 +1755,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
             local_signing: true,
         }],
         selected_account: 0,
+        picker_selection: 0,
         chats: Vec::new(),
         selected_chat: 0,
         messages_account_id: None,
@@ -1711,6 +1787,8 @@ fn test_unused_client() -> WnClient {
         home: None,
         socket: None,
         relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
         secret_store: None,
         keychain_service: None,
     }
@@ -1724,6 +1802,8 @@ fn test_json_client(response: &str) -> (tempfile::TempDir, WnClient) {
         home: None,
         socket: None,
         relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
         secret_store: None,
         keychain_service: None,
     };
@@ -1799,6 +1879,46 @@ fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
     let streaming = app.streaming.as_ref().expect("composer remains active");
     assert_eq!(streaming.pending_text, "queued");
     assert_eq!(streaming.last_flush, retry_gate);
+}
+
+#[test]
+fn streaming_keys_capture_input_before_screen_dispatch() {
+    // The streaming-composer check must sit ahead of the screen dispatch (behind
+    // only Ctrl-C), so any future Main->Login path with an open stream still
+    // routes keys to the stream while tick() keeps flushing, instead of the login
+    // handler consuming the key. Constructed by flipping the screen to Login with
+    // a live stream.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.streaming = Some(StreamComposer {
+        stream_id: "stream-1".to_owned(),
+        group_id: "bb".repeat(32),
+        pending_text: String::new(),
+        last_flush: Instant::now(),
+    });
+
+    // Main view: a character queues on the stream composer.
+    app.screen = Screen::Main;
+    app.handle_key(char_key('x')).expect("char in main");
+    assert_eq!(
+        app.streaming.as_ref().expect("stream active").pending_text,
+        "x"
+    );
+
+    // With the screen on the login/account-select flow, an open stream keeps
+    // capturing input; the login handler never sees the key.
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+    app.handle_key(char_key('y'))
+        .expect("char while login screen");
+    assert_eq!(
+        app.streaming.as_ref().expect("stream active").pending_text,
+        "xy"
+    );
+    assert_eq!(
+        app.screen,
+        Screen::Login(LoginMode::AccountSelect),
+        "the login handler never consumed the streaming key"
+    );
 }
 
 #[test]
@@ -3558,5 +3678,560 @@ fn render_messages_wraps_long_lines_so_the_tail_is_visible() {
     assert!(
         rendered.contains("TAILMARKER"),
         "the wrapped tail of a long message must render, not truncate at the pane edge"
+    );
+}
+
+// --- Phase 2: the shell (screen model, key routing, status/hints bars) ---
+
+#[test]
+fn startup_screen_routes_by_account_count() {
+    assert_eq!(startup_screen(0, false), Screen::Login(LoginMode::Menu));
+    assert_eq!(startup_screen(1, false), Screen::Main);
+    assert_eq!(
+        startup_screen(2, false),
+        Screen::Login(LoginMode::AccountSelect)
+    );
+    assert_eq!(
+        startup_screen(9, false),
+        Screen::Login(LoginMode::AccountSelect)
+    );
+    // An explicit --account selection enters the main view even with several
+    // accounts; a resolved single/none selection is unaffected.
+    assert_eq!(startup_screen(2, true), Screen::Main);
+    assert_eq!(startup_screen(9, true), Screen::Main);
+    assert_eq!(startup_screen(0, true), Screen::Login(LoginMode::Menu));
+}
+
+#[test]
+fn focus_cycles_the_three_main_panes() {
+    assert_eq!(Focus::Chats.next(), Focus::Messages);
+    assert_eq!(Focus::Messages.next(), Focus::Composer);
+    assert_eq!(Focus::Composer.next(), Focus::Chats);
+    assert_eq!(Focus::Chats.previous(), Focus::Composer);
+    assert_eq!(Focus::Messages.previous(), Focus::Chats);
+    assert_eq!(Focus::Composer.previous(), Focus::Messages);
+}
+
+#[test]
+fn login_mode_for_accounts_picks_the_launching_screen() {
+    assert_eq!(login_mode_for_accounts(0), LoginMode::Menu);
+    assert_eq!(login_mode_for_accounts(1), LoginMode::AccountSelect);
+    assert_eq!(login_mode_for_accounts(4), LoginMode::AccountSelect);
+}
+
+#[test]
+fn masked_secret_hides_every_character() {
+    assert_eq!(masked_secret(""), "");
+    assert_eq!(masked_secret("nsec1abc"), "********");
+    // Multi-byte characters each mask to a single `*`.
+    assert_eq!(masked_secret("aé😀"), "***");
+}
+
+#[test]
+fn status_bar_line_assembles_daemon_counts_and_status() {
+    assert_eq!(
+        status_bar_line("alice", true, 3, 5, "loaded 2 message(s)", 200),
+        "alice · daemon on · 3 chats · 5 unread · loaded 2 message(s)"
+    );
+    assert_eq!(
+        status_bar_line("bob", false, 0, 0, "", 200),
+        "bob · daemon off · 0 chats · 0 unread · "
+    );
+    // Narrow widths shorten the assembled line (middle ellipsis keeps head + tail).
+    let narrow = status_bar_line("alice", true, 3, 5, "loaded", 20);
+    assert!(narrow.chars().count() <= 20, "over width: {narrow:?}");
+    assert!(narrow.contains("..."), "expected truncation: {narrow:?}");
+}
+
+#[test]
+fn status_bar_line_strips_control_sequences_from_untrusted_fields() {
+    assert_eq!(
+        status_bar_line("al\u{1b}[31mice", true, 1, 0, "ok\u{1b}[2J", 200),
+        "al[31mice · daemon on · 1 chats · 0 unread · ok[2J"
+    );
+}
+
+#[test]
+fn hints_line_matches_the_keymap_per_screen_and_focus() {
+    assert_eq!(
+        hints_line(Screen::Main, Focus::Chats, true),
+        "j/k navigate  Enter open  A accounts  / command  ? help  q quit"
+    );
+    assert_eq!(
+        hints_line(Screen::Main, Focus::Messages, true),
+        "j/k select  G/g ends  PgUp older  i compose  Tab cycle"
+    );
+    assert_eq!(
+        hints_line(Screen::Main, Focus::Composer, true),
+        "Enter send  Esc clear"
+    );
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::Menu), Focus::Chats, false),
+        "c create identity  l nsec login  q quit"
+    );
+    // The account picker shows `Esc back` only when a main session exists to
+    // return to; at the startup picker `Esc` is inert, so the hint is omitted.
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::AccountSelect), Focus::Chats, true),
+        "j/k navigate  Enter select  c create  l nsec  Esc back  q quit"
+    );
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::AccountSelect), Focus::Chats, false),
+        "j/k navigate  Enter select  c create  l nsec  q quit"
+    );
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::NsecEntry), Focus::Chats, false),
+        "Enter submit  Esc back"
+    );
+}
+
+#[test]
+fn daemon_start_args_forward_first_run_relays() {
+    assert_eq!(
+        daemon_start_args(&[], &[]),
+        vec!["daemon".to_owned(), "start".to_owned()]
+    );
+    assert_eq!(
+        daemon_start_args(
+            &["wss://a".to_owned(), "wss://b".to_owned()],
+            &["wss://c".to_owned()],
+        ),
+        vec![
+            "daemon".to_owned(),
+            "start".to_owned(),
+            "--discovery-relays".to_owned(),
+            "wss://a,wss://b".to_owned(),
+            "--default-account-relays".to_owned(),
+            "wss://c".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn account_setup_relay_fills_in_only_without_a_global_relay() {
+    let mut client = test_unused_client();
+    client.default_account_relays = vec!["wss://default".to_owned()];
+    client.discovery_relays = vec!["wss://discovery".to_owned()];
+    assert_eq!(
+        client.account_setup_relay().as_deref(),
+        Some("wss://default")
+    );
+
+    // Discovery relay is the fallback when no default account relay is set.
+    client.default_account_relays.clear();
+    assert_eq!(
+        client.account_setup_relay().as_deref(),
+        Some("wss://discovery")
+    );
+
+    // A global `--relay` already covers setup (`command` appends it), so none here.
+    client.relay = Some("wss://global".to_owned());
+    assert_eq!(client.account_setup_relay(), None);
+}
+
+#[test]
+fn slash_command_parser_handles_diagnostics_toggle() {
+    assert_eq!(
+        parse_slash_command("/diagnostics"),
+        Ok(SlashCommand::Diagnostics)
+    );
+    assert!(parse_slash_command("/diagnostics on").is_err());
+}
+
+#[test]
+fn diagnostics_slash_command_toggles_the_panel() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    assert!(!app.show_diagnostics);
+    app.run_slash_command(SlashCommand::Diagnostics)
+        .expect("toggle on");
+    assert!(app.show_diagnostics);
+    app.run_slash_command(SlashCommand::Diagnostics)
+        .expect("toggle off");
+    assert!(!app.show_diagnostics);
+}
+
+#[test]
+fn login_menu_keys_open_nsec_entry_and_quit() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::Menu);
+
+    app.handle_key(char_key('l')).expect("l");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+
+    app.screen = Screen::Login(LoginMode::Menu);
+    app.handle_key(char_key('q')).expect("q");
+    assert!(!app.running, "q quits from the login menu");
+}
+
+#[test]
+fn login_create_failure_stays_on_the_login_screen() {
+    // The fake exe does not exist, so create fails; the error must surface on the
+    // status line without leaving the login screen (errors never tear down).
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::Menu);
+    app.handle_key(char_key('c')).expect("c");
+    assert_eq!(app.screen, Screen::Login(LoginMode::Menu));
+    assert!(
+        app.status.starts_with("error:"),
+        "expected surfaced error, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn nsec_entry_accepts_masked_input_and_esc_returns_to_picker() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input.clear();
+
+    for character in "nsec1secret".chars() {
+        app.handle_key(char_key(character)).expect("char");
+    }
+    assert_eq!(app.input, "nsec1secret");
+    assert_eq!(masked_secret(&app.input), "***********");
+
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .expect("backspace");
+    assert_eq!(app.input, "nsec1secre");
+
+    // Esc clears the secret and returns to the picker (one account exists).
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert!(app.input.is_empty(), "esc clears the entered secret");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+}
+
+#[test]
+fn nsec_entry_esc_returns_to_the_menu_without_accounts() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.accounts.clear();
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input = "partial".to_owned();
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert!(app.input.is_empty());
+    assert_eq!(app.screen, Screen::Login(LoginMode::Menu));
+}
+
+#[test]
+fn nsec_entry_q_is_typed_not_a_quit() {
+    // `q` quits only outside the composer with an empty input; during nsec entry
+    // it is ordinary input and must append to the masked field, never quit.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input.clear();
+
+    app.handle_key(char_key('q')).expect("q");
+
+    assert_eq!(app.input, "q", "q is entered into the masked nsec field");
+    assert!(app.running, "q must not quit during nsec entry");
+}
+
+#[test]
+fn nsec_entry_empty_submit_reports_and_stays() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input = "   ".to_owned();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+    assert!(app.input.is_empty(), "the field is cleared on submit");
+    assert!(app.status.contains("empty"), "got {}", app.status);
+}
+
+#[test]
+fn account_picker_esc_discards_navigation_and_keeps_the_active_account() {
+    // Regression: picker navigation must not mutate the live selection. Before
+    // the fix, `j` moved `selected_account` directly, so `Esc` (which only calls
+    // `show_main` with no chat reload) left the status bar and
+    // `require_selected_local_account` reporting the highlighted account while
+    // the loaded chats/messages still belonged to the active one.
+    let alice = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &alice);
+    app.accounts.push(AccountRow {
+        account_id: "bb".repeat(32),
+        npub: "npub1bob".to_owned(),
+        display_name: Some("Bob".to_owned()),
+        local_signing: true,
+    });
+    // Alice (index 0) is the active account with her view loaded.
+    app.selected_account = 0;
+    app.messages_account_id = Some(alice.clone());
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+
+    // `A` opens the picker from the active session; highlight a *different*
+    // account, then cancel with `Esc`.
+    app.handle_key(char_key('A')).expect("A");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+    app.handle_key(char_key('j')).expect("j");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+
+    // Esc discards the highlight: the active account and its loaded view are
+    // untouched, so account-scoped commands still run against Alice.
+    assert_eq!(app.screen, Screen::Main);
+    assert_eq!(app.focus, Focus::Chats);
+    assert_eq!(app.selected_account, 0);
+    assert_eq!(app.require_selected_local_account().unwrap(), alice);
+    assert_eq!(app.messages_account_id.as_deref(), Some(alice.as_str()));
+}
+
+#[test]
+fn account_picker_enter_commits_the_highlighted_account() {
+    let alice = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &alice);
+    app.accounts.push(AccountRow {
+        account_id: "bb".repeat(32),
+        npub: "npub1bob".to_owned(),
+        display_name: Some("Bob".to_owned()),
+        local_signing: true,
+    });
+    app.selected_account = 0;
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+
+    // `A` opens the picker, `j` highlights Bob, `Enter` commits the selection.
+    app.handle_key(char_key('A')).expect("A");
+    app.handle_key(char_key('j')).expect("j");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+
+    assert_eq!(app.screen, Screen::Main);
+    assert_eq!(
+        app.selected_account, 1,
+        "Enter commits the highlighted account"
+    );
+}
+
+#[test]
+fn account_picker_esc_is_inert_before_main_is_active() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.entered_main = false;
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert_eq!(
+        app.screen,
+        Screen::Login(LoginMode::AccountSelect),
+        "no main view to return to yet"
+    );
+}
+
+#[test]
+fn account_picker_l_opens_nsec_entry() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+    app.handle_key(char_key('l')).expect("l");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+}
+
+#[test]
+fn shift_a_reopens_the_account_picker_from_the_chat_list() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('A')).expect("A");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+}
+
+#[test]
+fn enter_opens_the_chat_and_focuses_messages() {
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) =
+        test_json_client(r#"{"ok":true,"result":{"messages":[],"has_more_before":false}}"#);
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.daemon = DaemonView::default();
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+    }];
+    app.selected_chat = 0;
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(
+        app.focus,
+        Focus::Messages,
+        "opening a chat moves focus to the messages pane"
+    );
+    assert_eq!(app.messages_group_id.as_deref(), Some(group_id.as_str()));
+}
+
+#[test]
+fn start_routes_to_login_menu_without_accounts() {
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.daemon = DaemonView::default();
+    app.start().expect("start");
+    assert_eq!(app.screen, Screen::Login(LoginMode::Menu));
+    assert!(app.accounts.is_empty());
+}
+
+#[test]
+fn start_enters_main_with_a_single_account() {
+    let account_id = "aa".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"accounts":[{{"account_id":"{account_id}","npub":"npub1alice","local_signing":true}}]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default();
+    app.start().expect("start");
+    assert_eq!(app.screen, Screen::Main);
+    assert_eq!(app.accounts.len(), 1);
+}
+
+#[test]
+fn start_opens_the_account_picker_with_several_accounts() {
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"accounts":[{{"account_id":"{a}","npub":"npub1a","local_signing":true}},{{"account_id":"{b}","npub":"npub1b","local_signing":true}}]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &a);
+    app.daemon = DaemonView::default();
+    app.entered_main = false;
+    app.start().expect("start");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+    assert_eq!(app.accounts.len(), 2);
+    assert!(
+        !app.entered_main,
+        "the startup picker has no active main yet"
+    );
+}
+
+#[test]
+fn start_with_explicit_account_enters_main_with_that_accounts_chats() {
+    // `wn tui --account <b>` with several accounts must honor the explicit
+    // selection and open the main view directly, not the account picker.
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"accounts":[{{"account_id":"{a}","npub":"npub1a","local_signing":true}},{{"account_id":"{b}","npub":"npub1b","local_signing":true}}],"chats":[]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &a);
+    app.daemon = DaemonView::default();
+    app.initial_account = Some(b.clone());
+    app.entered_main = false;
+
+    app.start().expect("start");
+
+    assert_eq!(
+        app.screen,
+        Screen::Main,
+        "an explicit --account skips the picker"
+    );
+    assert_eq!(
+        app.selected_account, 1,
+        "the explicitly selected account is active"
+    );
+    assert_eq!(
+        app.messages_account_id.as_deref(),
+        Some(b.as_str()),
+        "the selected account's chats loaded"
+    );
+}
+
+fn rendered_buffer(app: &mut TuiApp) -> String {
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+}
+
+#[test]
+fn main_frame_shows_chats_and_messages_with_bars_and_toggled_diagnostics() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+    app.chats = vec![ChatRow {
+        group_id: "bb".repeat(32),
+        name: "ops-room".to_owned(),
+        archived: false,
+    }];
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Al".to_owned());
+    row.display_text = "hello MESSAGEBODY".to_owned();
+    app.timeline = vec![row];
+    app.group_diagnostics = Some(GroupDiagnostics::unavailable(&"cc".repeat(32), "loading"));
+    app.status = "loaded 1 message(s)".to_owned();
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("Chats"), "chat panel present");
+    assert!(rendered.contains("ops-room"), "chat name visible");
+    assert!(rendered.contains("MESSAGEBODY"), "message body visible");
+    assert!(
+        !rendered.contains("Accounts"),
+        "the accounts pane is gone from the main view"
+    );
+    assert!(
+        rendered.contains("j/k navigate"),
+        "chats hints line present"
+    );
+    assert!(rendered.contains("daemon"), "status bar present");
+    assert!(
+        !rendered.contains("Diagnostics"),
+        "the diagnostics panel is off by default"
+    );
+
+    app.show_diagnostics = true;
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("Diagnostics"),
+        "the diagnostics panel appears after /diagnostics"
+    );
+    assert!(
+        rendered.contains("ops-room"),
+        "chats still visible with diagnostics on"
+    );
+    assert!(
+        rendered.contains("MESSAGEBODY"),
+        "messages still visible with diagnostics on"
+    );
+}
+
+#[test]
+fn login_menu_frame_shows_options_and_hints() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::Menu);
+    app.status = "no identities yet".to_owned();
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("White Noise"));
+    assert!(rendered.contains("Create a new identity"));
+    assert!(rendered.contains("Log in with an nsec"));
+    assert!(
+        rendered.contains("c create identity"),
+        "login hints line present"
+    );
+}
+
+#[test]
+fn nsec_entry_frame_masks_the_secret() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input = "nsec1supersecret".to_owned();
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        !rendered.contains("nsec1supersecret"),
+        "the secret must never render"
+    );
+    assert!(
+        rendered.contains("****"),
+        "the field renders as mask characters"
     );
 }

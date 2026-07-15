@@ -2,34 +2,6 @@
 
 use super::*;
 
-pub(crate) fn daemon_header_label(daemon: &DaemonView) -> String {
-    if !daemon.running {
-        return "off".to_owned();
-    }
-    let mut label = daemon
-        .pid
-        .map(|pid| format!("on pid={pid}"))
-        .unwrap_or_else(|| "on".to_owned());
-    if let Some(activity) = &daemon.last_runtime_activity {
-        label.push_str(&format!(
-            " activity={}/{}/{}",
-            activity.events, activity.joined_groups, activity.messages
-        ));
-        if activity.errors > 0 {
-            label.push_str(&format!(" errors={}", activity.errors));
-        }
-    }
-    let active_streams = daemon
-        .stream_watches
-        .iter()
-        .filter(|watch| watch.status == "running")
-        .count();
-    if active_streams > 0 {
-        label.push_str(&format!(" streams={active_streams}"));
-    }
-    label
-}
-
 pub(crate) fn daemon_status_sentence(daemon: &DaemonView) -> String {
     if !daemon.running {
         return "daemon not running".to_owned();
@@ -231,26 +203,21 @@ pub(crate) fn chat_label(name: &str, unread_count: usize, max_len: usize) -> Str
     shorten(&format!("{name} ({unread_count})"), max_len)
 }
 
-pub(crate) fn status_panel_lines(
-    status: &str,
+/// The opt-in MLS group diagnostics panel body (`/diagnostics`). This is the old
+/// status panel minus its leading status-message line, which now lives in the
+/// one-line status bar. Group id and error text pass through `terminal_safe_text`.
+pub(crate) fn diagnostics_panel_lines(
     diagnostics: Option<&GroupDiagnostics>,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(terminal_safe_text(status)),
-        Line::from(""),
-        Line::from(""),
-    ];
     let Some(diagnostics) = diagnostics else {
-        lines.push(Line::from("MLS no group selected"));
-        return lines;
+        return vec![Line::from("MLS no group selected")];
     };
     if let Some(error) = &diagnostics.error {
-        lines.push(Line::from(format!(
+        return vec![Line::from(format!(
             "MLS group={} unavailable: {}",
             shorten(&terminal_safe_text(&diagnostics.group_id), 18),
             terminal_safe_text(error)
-        )));
-        return lines;
+        ))];
     }
     let epoch = diagnostics
         .epoch
@@ -260,10 +227,10 @@ pub(crate) fn status_panel_lines(
         .member_count
         .map(|member_count| member_count.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
-    lines.push(Line::from(format!(
+    let mut lines = vec![Line::from(format!(
         "MLS epoch={epoch} group={} members={member_count}",
         shorten(&terminal_safe_text(&diagnostics.group_id), 18)
-    )));
+    ))];
     if diagnostics.components.is_empty() {
         lines.push(Line::from("components: none"));
         return lines;
@@ -346,71 +313,108 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
 
 impl TuiApp {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
+        match self.screen {
+            Screen::Login(mode) => self.render_login(frame, mode),
+            Screen::Main => self.render_main(frame),
+        }
+    }
+
+    fn render_main(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        let show_diagnostics = self.show_diagnostics;
+        let diagnostics_lines = if show_diagnostics {
+            diagnostics_panel_lines(self.group_diagnostics.as_ref())
+        } else {
+            Vec::new()
+        };
+
+        // Vertical stack: the chat/messages row takes all reclaimed space, then
+        // the opt-in diagnostics panel, the composer, and the one-line hints and
+        // status bars that replaced the old header and status panel.
+        let mut constraints = vec![Constraint::Min(6)];
+        if show_diagnostics {
+            let height = (diagnostics_lines.len() as u16 + 2).clamp(3, 11);
+            constraints.push(Constraint::Length(height));
+        }
+        constraints.push(Constraint::Length(3));
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(1));
         let root = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(8),
-                Constraint::Length(3),
-                Constraint::Length(12),
-            ])
+            .constraints(constraints)
             .split(area);
-
-        self.render_header(frame, root[0]);
 
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(34),
-                Constraint::Length(36),
-                Constraint::Min(24),
-            ])
-            .split(root[1]);
+            .constraints([Constraint::Length(36), Constraint::Min(24)])
+            .split(root[0]);
+        self.render_chats(frame, body[0]);
+        self.render_messages(frame, body[1]);
 
-        self.render_accounts(frame, body[0]);
-        self.render_chats(frame, body[1]);
-        self.render_messages(frame, body[2]);
-        self.render_composer(frame, root[2]);
-        self.render_status_panel(frame, root[3]);
-        self.render_slash_suggestions(frame, root[2]);
+        let mut index = 1;
+        if show_diagnostics {
+            self.render_diagnostics_panel(frame, root[index], diagnostics_lines);
+            index += 1;
+        }
+        let composer_area = root[index];
+        index += 1;
+        let hints_area = root[index];
+        index += 1;
+        let status_area = root[index];
+
+        self.render_composer(frame, composer_area);
+        self.render_slash_suggestions(frame, composer_area);
+        self.render_hints(frame, hints_area);
+        self.render_status_bar(frame, status_area);
 
         if self.show_help {
             self.render_help(frame, centered_rect(70, 70, area));
         }
     }
 
-    pub(crate) fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let account = self
-            .selected_account_row()
-            .map(|account| shorten(&terminal_safe_text(&account_display_label(account)), 18))
-            .unwrap_or_else(|| "no account".to_owned());
-        let chat = self
-            .selected_chat_row()
-            .map(|chat| shorten(&terminal_safe_text(&chat.name), 24))
-            .unwrap_or_else(|| "no chat".to_owned());
-        let daemon = terminal_safe_text(&daemon_header_label(&self.daemon));
-        let line = Line::from(vec![
-            Span::styled(
-                "wn",
+    fn render_login(&self, frame: &mut Frame, mode: LoginMode) {
+        let area = frame.area();
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        match mode {
+            LoginMode::Menu => self.render_login_menu(frame, root[0]),
+            LoginMode::AccountSelect => self.render_account_picker(frame, root[0]),
+            LoginMode::NsecEntry => self.render_nsec_entry(frame, root[0]),
+        }
+        self.render_hints(frame, root[1]);
+        self.render_status_bar(frame, root[2]);
+    }
+
+    fn render_login_menu(&self, frame: &mut Frame, area: Rect) {
+        let lines = vec![
+            Line::from(Span::styled(
+                "White Noise",
                 Style::default()
                     .fg(FOCUS_ACCENT)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::raw(format!("focus={}  ", self.focus.title())),
-            Span::raw(format!("daemon={daemon}  ")),
-            Span::raw(format!("account={account}  chat={chat}")),
-        ]);
+            )),
+            Line::from(""),
+            Line::from("No identities yet. Get started:"),
+            Line::from(""),
+            Line::from("  c   Create a new identity"),
+            Line::from("  l   Log in with an nsec"),
+            Line::from("  q   Quit"),
+        ];
         frame.render_widget(
-            Paragraph::new(line)
-                .block(Block::default().borders(Borders::ALL).title("White Noise"))
-                .alignment(Alignment::Left),
+            Paragraph::new(lines)
+                .block(panel_block("Welcome", false))
+                .wrap(Wrap { trim: false }),
             area,
         );
     }
 
-    pub(crate) fn render_accounts(&self, frame: &mut Frame, area: Rect) {
+    fn render_account_picker(&self, frame: &mut Frame, area: Rect) {
         let items = if self.accounts.is_empty() {
             vec![ListItem::new("no accounts")]
         } else {
@@ -418,33 +422,82 @@ impl TuiApp {
                 .iter()
                 .enumerate()
                 .map(|(index, account)| {
-                    let marker = if index == self.selected_account {
-                        ">"
-                    } else {
-                        " "
-                    };
+                    let selected = index == self.picker_selection;
+                    let marker = if selected { ">" } else { " " };
                     let signing = if account.local_signing {
                         "local"
                     } else {
                         "public"
                     };
-                    let style = selected_style(index == self.selected_account);
                     ListItem::new(Line::from(vec![
                         Span::raw(format!("{marker} ")),
                         Span::styled(
                             shorten(&terminal_safe_text(&account_display_label(account)), 22),
-                            row_label_style(index == self.selected_account, ACCOUNT_ACCENT),
+                            row_label_style(selected, ACCOUNT_ACCENT),
                         ),
                         Span::raw(format!(" {signing}")),
                     ]))
-                    .style(style)
+                    .style(selected_style(selected))
                 })
                 .collect()
         };
         frame.render_widget(
-            List::new(items).block(panel_block("Accounts", self.focus == Focus::Accounts)),
+            List::new(items).block(panel_block("Select Account", true)),
             area,
         );
+    }
+
+    fn render_nsec_entry(&self, frame: &mut Frame, area: Rect) {
+        let lines = vec![
+            Line::from("Paste or type your nsec, then press Enter:"),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("nsec ", Style::default().fg(FOCUS_ACCENT)),
+                Span::raw(masked_secret(&self.input)),
+            ]),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("Log in with nsec", true))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_diagnostics_panel(&self, frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("Diagnostics", false))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn render_hints(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hints_line(self.screen, self.focus, self.entered_main),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+    }
+
+    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        let account_label = self
+            .selected_account_row()
+            .map(account_display_label)
+            .unwrap_or_else(|| "no account".to_owned());
+        let unread_total = self.unread_counts.values().sum();
+        let text = status_bar_line(
+            &account_label,
+            self.daemon.running,
+            self.chats.len(),
+            unread_total,
+            &self.status,
+            area.width as usize,
+        );
+        frame.render_widget(Paragraph::new(Line::from(text)), area);
     }
 
     pub(crate) fn render_chats(&self, frame: &mut Frame, area: Rect) {
@@ -598,18 +651,6 @@ impl TuiApp {
         );
     }
 
-    pub(crate) fn render_status_panel(&self, frame: &mut Frame, area: Rect) {
-        frame.render_widget(
-            Paragraph::new(status_panel_lines(
-                &self.status,
-                self.group_diagnostics.as_ref(),
-            ))
-            .block(panel_block("Status", false))
-            .wrap(Wrap { trim: false }),
-            area,
-        );
-    }
-
     pub(crate) fn render_help(&self, frame: &mut Frame, area: Rect) {
         let lines = vec![
             Line::from(Span::styled(
@@ -619,13 +660,18 @@ impl TuiApp {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("Tab cycles panels. Arrows move. Enter selects or submits. Ctrl-C quits."),
+            Line::from(
+                "Chats + messages fill the screen; the composer, hints, and status sit below.",
+            ),
+            Line::from("Tab/BackTab cycle chats, messages, and composer. Ctrl-C quits."),
+            Line::from("Chats: j/k move; Enter opens the chat; A reopens the account picker."),
             Line::from("Messages: j/k or arrows move; PageUp/PageDown page."),
             Line::from(
                 "G/g jump newest/oldest; past oldest loads history; i/Enter focus composer.",
             ),
             Line::from(""),
             Line::from("/refresh"),
+            Line::from("/diagnostics"),
             Line::from("/account <npub-or-hex>"),
             Line::from("/create-identity"),
             Line::from("/login <nsec-or-npub>"),

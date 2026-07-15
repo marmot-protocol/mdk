@@ -8,20 +8,50 @@ pub(crate) struct WnClient {
     pub(crate) home: Option<PathBuf>,
     pub(crate) socket: Option<PathBuf>,
     pub(crate) relay: Option<String>,
+    /// First-run discovery relays from `wn tui --discovery-relays`, forwarded to
+    /// the `daemon start` child (no JSON change; flag passthrough only).
+    pub(crate) discovery_relays: Vec<String>,
+    /// First-run default account relays from `wn tui --default-account-relays`,
+    /// forwarded to the `daemon start` child and used as the account-setup relay.
+    pub(crate) default_account_relays: Vec<String>,
     pub(crate) secret_store: Option<SecretStoreKind>,
     pub(crate) keychain_service: Option<String>,
 }
 
 impl WnClient {
     pub(crate) fn from_cli(cli: &Cli) -> TuiResult<Self> {
+        let (discovery_relays, default_account_relays) = match &cli.command {
+            crate::Command::Tui {
+                discovery_relays,
+                default_account_relays,
+            } => (discovery_relays.clone(), default_account_relays.clone()),
+            _ => (Vec::new(), Vec::new()),
+        };
         Ok(Self {
             exe: std::env::current_exe()?,
             home: cli.home.clone(),
             socket: cli.socket.clone(),
             relay: cli.relay.clone(),
+            discovery_relays,
+            default_account_relays,
             secret_store: cli.secret_store,
             keychain_service: cli.keychain_service.clone(),
         })
+    }
+
+    /// The relay to hand account setup (`create-identity` / `login`) when no
+    /// global `--relay` already covers it. `command` appends `--relay` from
+    /// `self.relay` to every child, so supplying one here too would pass it
+    /// twice; only fill in when `self.relay` is absent, preferring a default
+    /// account relay and falling back to a discovery relay.
+    pub(crate) fn account_setup_relay(&self) -> Option<String> {
+        if self.relay.is_some() {
+            return None;
+        }
+        self.default_account_relays
+            .first()
+            .or_else(|| self.discovery_relays.first())
+            .cloned()
     }
 
     pub(crate) fn run_json<S>(&self, account: Option<&str>, args: &[S]) -> TuiResult<Value>
@@ -630,7 +660,7 @@ impl TuiApp {
         identity: Option<String>,
         action: &'static str,
     ) -> TuiResult<()> {
-        let invocation = account_setup_invocation(identity);
+        let invocation = account_setup_invocation(identity, self.client.account_setup_relay());
         let result = match invocation.stdin {
             Some(stdin) => self
                 .client
@@ -804,7 +834,10 @@ impl TuiApp {
     }
 
     pub(crate) fn start_daemon(&mut self) -> TuiResult<()> {
-        let args = vec!["daemon".to_owned(), "start".to_owned()];
+        let args = daemon_start_args(
+            &self.client.discovery_relays,
+            &self.client.default_account_relays,
+        );
         let result = self.client.run_json(None, &args)?;
         self.daemon = parse_daemon_view(&result);
         self.ensure_selected_chat_subscription();
@@ -826,7 +859,11 @@ impl TuiApp {
         Ok(())
     }
 
-    pub(crate) fn refresh_accounts(&mut self) -> TuiResult<()> {
+    /// Reload just the account list (`wn account list`), reselecting the
+    /// previously active account, and clear all chat/message/subscription state
+    /// when no accounts remain. Does not load chats or route the screen; the
+    /// startup/login flow decides the screen from the resulting account count.
+    pub(crate) fn load_accounts(&mut self) -> TuiResult<()> {
         let result = self.client.run_json(None, &["account", "list"])?;
         let previous_account_id = self
             .selected_account_row()
@@ -849,7 +886,14 @@ impl TuiApp {
             self.message_subscription = None;
             self.group_state_subscription = None;
             self.group_diagnostics = None;
-            self.status = "no identities yet; create one with wn create-identity".to_owned();
+            self.status = "no identities yet; create one from the login screen".to_owned();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_accounts(&mut self) -> TuiResult<()> {
+        self.load_accounts()?;
+        if self.accounts.is_empty() {
             return Ok(());
         }
         self.refresh_chats()
@@ -1235,6 +1279,17 @@ impl TuiApp {
         }
     }
 
+    /// Assign a status produced by a background drain, but only while the main
+    /// view is showing. On the login/account-select screen the status line
+    /// carries the nsec prompt and picker guidance; a live drain (a picker
+    /// reached via `A` keeps its subscriptions running) must apply its state
+    /// changes without clobbering that prompt.
+    fn set_drain_status(&mut self, status: String) {
+        if self.screen == Screen::Main {
+            self.status = status;
+        }
+    }
+
     pub(crate) fn drain_chat_subscription(&mut self) -> bool {
         let Some(subscription) = self.chat_subscription.as_ref() else {
             return false;
@@ -1265,11 +1320,11 @@ impl TuiApp {
                         &result,
                     ) {
                         chats_changed = true;
-                        self.status = status;
+                        self.set_drain_status(status);
                     }
                 }
                 SubscriptionEvent::Error(err) => {
-                    self.status = format!("chat subscription failed: {err}");
+                    self.set_drain_status(format!("chat subscription failed: {err}"));
                 }
                 SubscriptionEvent::Ended => {
                     self.chat_subscription = None;
@@ -1330,12 +1385,12 @@ impl TuiApp {
                             ));
                         }
                         if let Some(status) = update.status {
-                            self.status = status;
+                            self.set_drain_status(status);
                         }
                     }
                 }
                 SubscriptionEvent::Error(err) => {
-                    self.status = format!("group state subscription failed: {err}");
+                    self.set_drain_status(format!("group state subscription failed: {err}"));
                 }
                 SubscriptionEvent::Ended => {
                     self.group_state_subscription = None;
@@ -1374,11 +1429,11 @@ impl TuiApp {
                         loaded_group_id.as_deref(),
                         &result,
                     ) {
-                        self.status = status;
+                        self.set_drain_status(status);
                     }
                 }
                 SubscriptionEvent::Error(err) => {
-                    self.status = format!("message subscription failed: {err}");
+                    self.set_drain_status(format!("message subscription failed: {err}"));
                 }
                 SubscriptionEvent::Ended => {
                     self.message_subscription = None;
@@ -1419,7 +1474,7 @@ impl TuiApp {
                     );
                 }
                 SubscriptionEvent::Error(err) => {
-                    self.status = format!("timeline subscription failed: {err}");
+                    self.set_drain_status(format!("timeline subscription failed: {err}"));
                 }
                 SubscriptionEvent::Ended => {
                     self.timeline_subscription = None;

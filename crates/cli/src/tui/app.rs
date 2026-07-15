@@ -6,9 +6,20 @@ pub(crate) struct TuiApp {
     pub(crate) client: WnClient,
     pub(crate) initial_account: Option<String>,
     pub(crate) running: bool,
+    pub(crate) screen: Screen,
+    /// True once an account has been activated into the main view, so `Esc` from
+    /// the account picker knows whether there is a session to return to.
+    pub(crate) entered_main: bool,
+    /// Whether the opt-in MLS group diagnostics panel is shown (`/diagnostics`).
+    pub(crate) show_diagnostics: bool,
     pub(crate) focus: Focus,
     pub(crate) accounts: Vec<AccountRow>,
     pub(crate) selected_account: usize,
+    /// The account-picker highlight, kept separate from `selected_account` so
+    /// picker navigation never mutates the live selection. It is seeded from
+    /// `selected_account` when the picker opens and committed back only on
+    /// `Enter`; `Esc` discards it.
+    pub(crate) picker_selection: usize,
     pub(crate) chats: Vec<ChatRow>,
     pub(crate) selected_chat: usize,
     pub(crate) messages_account_id: Option<String>,
@@ -37,9 +48,13 @@ impl TuiApp {
             client,
             initial_account: cli.account.clone(),
             running: true,
-            focus: Focus::Composer,
+            screen: Screen::Login(LoginMode::Menu),
+            entered_main: false,
+            show_diagnostics: false,
+            focus: Focus::Chats,
             accounts: Vec::new(),
             selected_account: 0,
+            picker_selection: 0,
             chats: Vec::new(),
             selected_chat: 0,
             messages_account_id: None,
@@ -66,7 +81,7 @@ impl TuiApp {
         let mut terminal = ratatui::init();
         let result = (|| -> TuiResult<()> {
             let _ = self.refresh_daemon_status();
-            self.refresh_accounts()?;
+            self.start()?;
             let mut dirty = true;
             while self.running {
                 dirty |= self.tick();
@@ -109,11 +124,77 @@ impl TuiApp {
         changed
     }
 
+    /// Route the opening screen from the loaded account list: no accounts opens
+    /// the login menu, one drops straight into the main view, several open the
+    /// account picker.
+    pub(crate) fn start(&mut self) -> TuiResult<()> {
+        self.load_accounts()?;
+        // An explicit `--account`/`WN_ACCOUNT` selector that resolves to a loaded
+        // account is honored directly, so it wins over the several-accounts
+        // picker instead of routing purely on the account count.
+        let initial_index = self
+            .initial_account
+            .as_deref()
+            .and_then(|selector| selected_account_index(&self.accounts, Some(selector)));
+        if let Some(index) = initial_index {
+            self.selected_account = index;
+        }
+        match startup_screen(self.accounts.len(), initial_index.is_some()) {
+            Screen::Main => self.enter_main(),
+            Screen::Login(LoginMode::AccountSelect) => {
+                self.open_account_picker();
+                Ok(())
+            }
+            screen => {
+                self.screen = screen;
+                Ok(())
+            }
+        }
+    }
+
+    /// Open the account picker, seeding its highlight from the currently active
+    /// account so navigation starts on the current selection and `Esc` discards
+    /// cleanly back to that account without committing a different one.
+    pub(crate) fn open_account_picker(&mut self) {
+        self.picker_selection = self.selected_account;
+        self.screen = Screen::Login(LoginMode::AccountSelect);
+    }
+
+    /// Commit to the main view without reloading: used after account setup, which
+    /// has already loaded the new account's chats.
+    pub(crate) fn show_main(&mut self) {
+        self.screen = Screen::Main;
+        self.focus = Focus::Chats;
+        self.entered_main = true;
+    }
+
+    /// Enter the main view for the currently selected account, loading its chats.
+    pub(crate) fn enter_main(&mut self) -> TuiResult<()> {
+        self.show_main();
+        self.refresh_chats()
+    }
+
+    /// Reload accounts and chats, dropping back to the login menu if the last
+    /// account has disappeared. Backs the `/refresh` slash command.
+    pub(crate) fn refresh_or_return_to_login(&mut self) -> TuiResult<()> {
+        self.refresh_accounts()?;
+        if self.accounts.is_empty() {
+            self.entered_main = false;
+            self.screen = Screen::Login(LoginMode::Menu);
+        }
+        Ok(())
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> TuiResult<()> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.running = false;
             return Ok(());
         }
+        // The streaming check sits ahead of the screen dispatch (behind only
+        // Ctrl-C) so the invariant is structural: while a stream is open, keys go
+        // to the composer and `tick()` keeps flushing regardless of which screen
+        // is showing. Otherwise a future Main->Login transition with a live stream
+        // would silently bypass the streaming keys.
         if self.streaming.is_some() {
             // Streaming key handling (finish/cancel/append) performs fallible
             // daemon/relay operations. Mirror the non-streaming Enter path and
@@ -125,6 +206,10 @@ impl TuiApp {
                 self.status = format!("error: {err}");
             }
             return Ok(());
+        }
+        match self.screen {
+            Screen::Login(mode) => return self.handle_login_key(mode, key),
+            Screen::Main => {}
         }
 
         match key.code {
@@ -144,6 +229,12 @@ impl TuiApp {
                 self.show_help = false;
                 self.focus = Focus::Composer;
                 self.input.push('/');
+            }
+            // Reopen the account picker from the chat list (the accounts pane is
+            // gone; `A` is its replacement entry point).
+            KeyCode::Char('A') if self.focus == Focus::Chats => {
+                self.show_help = false;
+                self.open_account_picker();
             }
             // Messages pane: the message-offset scroll model. `k`/Up and PageUp
             // may reach the oldest loaded row and page in older history.
@@ -166,7 +257,7 @@ impl TuiApp {
             KeyCode::Char('i') | KeyCode::Enter if self.focus == Focus::Messages => {
                 self.focus = Focus::Composer;
             }
-            // Accounts and chats lists.
+            // Chat list navigation.
             KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer => {
                 self.move_selection(-1);
             }
@@ -192,10 +283,6 @@ impl TuiApp {
 
     pub(crate) fn move_selection(&mut self, delta: isize) {
         match self.focus {
-            Focus::Accounts => {
-                self.selected_account =
-                    move_index(self.selected_account, self.accounts.len(), delta);
-            }
             Focus::Chats => {
                 self.selected_chat = move_index(self.selected_chat, self.chats.len(), delta);
             }
@@ -203,6 +290,13 @@ impl TuiApp {
             // it is driven directly in `handle_key`, not through `move_selection`.
             Focus::Messages | Focus::Composer => {}
         }
+    }
+
+    /// Move the account-picker highlight (login/account-select screen only).
+    /// This is picker-local state committed to `selected_account` on `Enter`, so
+    /// navigation never disturbs the active selection.
+    pub(crate) fn move_account_selection(&mut self, delta: isize) {
+        self.picker_selection = move_index(self.picker_selection, self.accounts.len(), delta);
     }
 
     /// Move the message selection one row older, paging in older history when the
@@ -242,8 +336,13 @@ impl TuiApp {
 
     pub(crate) fn activate_focus(&mut self) -> TuiResult<()> {
         match self.focus {
-            Focus::Accounts => self.select_current_account(),
-            Focus::Chats => self.refresh_messages(),
+            // Opening a chat also moves focus to the messages pane so the reader
+            // can immediately scroll the conversation.
+            Focus::Chats => {
+                self.refresh_messages()?;
+                self.focus = Focus::Messages;
+                Ok(())
+            }
             Focus::Messages => Ok(()),
             Focus::Composer => self.submit_input(),
         }
@@ -292,13 +391,114 @@ impl TuiApp {
         }
     }
 
+    /// Handle a keypress on the login/account-select screen. Fallible account
+    /// setup is caught into the status line so a failed create/login never tears
+    /// down the session (mirrors the streaming and main-view Enter paths).
+    pub(crate) fn handle_login_key(&mut self, mode: LoginMode, key: KeyEvent) -> TuiResult<()> {
+        match mode {
+            LoginMode::Menu => self.handle_login_menu_key(key),
+            LoginMode::AccountSelect => self.handle_account_select_key(key),
+            LoginMode::NsecEntry => self.handle_nsec_entry_key(key),
+        }
+        Ok(())
+    }
+
+    fn handle_login_menu_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('c') => self.create_identity_from_login(),
+            KeyCode::Char('l') => self.begin_nsec_entry(),
+            KeyCode::Char('q') => self.running = false,
+            _ => {}
+        }
+    }
+
+    fn handle_account_select_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_account_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_account_selection(1),
+            KeyCode::Enter => {
+                // Commit the picker highlight before loading; `Esc` (below) never
+                // reaches here, so the live selection only changes on `Enter`.
+                self.selected_account = self.picker_selection;
+                if let Err(err) = self.enter_main() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Char('c') => self.create_identity_from_login(),
+            KeyCode::Char('l') => self.begin_nsec_entry(),
+            KeyCode::Char('q') => self.running = false,
+            // Only return to the main view when one is already active (opened via
+            // `A`); at startup with several accounts there is nothing to return to.
+            KeyCode::Esc if self.entered_main => self.show_main(),
+            _ => {}
+        }
+    }
+
+    fn handle_nsec_entry_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.submit_nsec_login(),
+            KeyCode::Esc => {
+                self.input.clear();
+                match login_mode_for_accounts(self.accounts.len()) {
+                    LoginMode::AccountSelect => self.open_account_picker(),
+                    mode => self.screen = Screen::Login(mode),
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(character) => self.input.push(character),
+            _ => {}
+        }
+    }
+
+    /// Create a new local signing identity from the login screen; enter the main
+    /// view on success, surface the error on the status line otherwise.
+    fn create_identity_from_login(&mut self) {
+        match self.create_or_import_account(None, "created identity") {
+            Ok(()) => self.show_main(),
+            Err(err) => self.status = format!("error: {err}"),
+        }
+    }
+
+    fn begin_nsec_entry(&mut self) {
+        self.screen = Screen::Login(LoginMode::NsecEntry);
+        self.input.clear();
+        self.status = "enter nsec; Enter submits, Esc cancels".to_owned();
+    }
+
+    /// Submit the masked nsec-entry field through the existing stdin-piped login
+    /// path. The value is cleared before shelling out (as the composer does), so
+    /// a secret never lingers in state after submission.
+    fn submit_nsec_login(&mut self) {
+        let identity = self.input.trim().to_owned();
+        self.input.clear();
+        if identity.is_empty() {
+            self.status = "nsec is empty; type an nsec or press Esc".to_owned();
+            return;
+        }
+        match self.create_or_import_account(Some(identity), "logged in identity") {
+            Ok(()) => self.show_main(),
+            Err(err) => self.status = format!("error: {err}"),
+        }
+    }
+
     pub(crate) fn run_slash_command(&mut self, command: SlashCommand) -> TuiResult<()> {
         match command {
             SlashCommand::Help => {
                 self.show_help = true;
                 Ok(())
             }
-            SlashCommand::Refresh => self.refresh_accounts(),
+            SlashCommand::Refresh => self.refresh_or_return_to_login(),
+            SlashCommand::Diagnostics => {
+                self.show_diagnostics = !self.show_diagnostics;
+                self.status = if self.show_diagnostics {
+                    "diagnostics panel on".to_owned()
+                } else {
+                    "diagnostics panel off".to_owned()
+                };
+                Ok(())
+            }
             SlashCommand::Account(selector) => self.select_account_by_selector(&selector),
             SlashCommand::AccountCreate => self.create_or_import_account(None, "created identity"),
             SlashCommand::AccountAddPublic(account) => {
@@ -383,13 +583,6 @@ impl TuiApp {
                 Ok(())
             }
         }
-    }
-
-    pub(crate) fn select_current_account(&mut self) -> TuiResult<()> {
-        if self.accounts.is_empty() {
-            return Ok(());
-        }
-        self.refresh_chats()
     }
 
     pub(crate) fn select_account_by_selector(&mut self, selector: &str) -> TuiResult<()> {
