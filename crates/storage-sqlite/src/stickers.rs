@@ -128,6 +128,31 @@ impl SqliteAccountStorage {
                     ],
                 )
                 .storage()?;
+                conn.execute(
+                    "INSERT INTO app_sticker_assets (
+                        pack_coordinate, shortcode, url, sha256, mime, width,
+                        height, alt, emoji
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(pack_coordinate, shortcode, sha256) DO UPDATE SET
+                        url = excluded.url,
+                        mime = excluded.mime,
+                        width = excluded.width,
+                        height = excluded.height,
+                        alt = excluded.alt,
+                        emoji = excluded.emoji",
+                    params![
+                        &pack.coordinate,
+                        &sticker.shortcode,
+                        &sticker.url,
+                        &sticker.sha256,
+                        &sticker.mime,
+                        sticker.width.map(i64::from),
+                        sticker.height.map(i64::from),
+                        sticker.alt.as_deref(),
+                        sticker.emoji.as_deref(),
+                    ],
+                )
+                .storage()?;
             }
             Ok(true)
         })
@@ -218,10 +243,10 @@ impl SqliteAccountStorage {
             .collect()
     }
 
-    /// Resolve a historical message reference against the currently validated
-    /// addressable pack. The plaintext hash is part of the lookup: replacing a
-    /// shortcode with different bytes can never silently substitute the new
-    /// sticker into an old message.
+    /// Resolve a historical message reference against assets retained from
+    /// validated addressable-pack versions. The plaintext hash is part of the
+    /// lookup: replacing a shortcode with different bytes can never silently
+    /// substitute the new sticker into an old message.
     pub fn sticker_for_ref(
         &self,
         coordinate: &str,
@@ -231,7 +256,7 @@ impl SqliteAccountStorage {
         self.lock()?
             .query_row(
                 "SELECT shortcode, url, sha256, mime, width, height, alt, emoji
-                 FROM app_stickers
+                 FROM app_sticker_assets
                  WHERE pack_coordinate = ?1 AND shortcode = ?2 AND sha256 = ?3",
                 params![coordinate, shortcode, plaintext_sha256],
                 sticker_from_row,
@@ -699,11 +724,13 @@ mod tests {
 
         let tie_winner = pack(&"aa".repeat(32), 10, &hash_b);
         assert!(store.replace_sticker_pack_if_newer(&tie_winner).unwrap());
-        assert!(
+        assert_eq!(
             store
                 .sticker_for_ref(&first.coordinate, "wave", &hash_a)
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .sha256,
+            hash_a
         );
         assert!(
             store

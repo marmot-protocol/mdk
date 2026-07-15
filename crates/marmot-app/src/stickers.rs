@@ -282,7 +282,7 @@ impl MarmotApp {
             &sticker_ref.shortcode,
             &sticker_ref.plaintext_sha256,
         )?;
-        if stored.is_none() {
+        if stored.is_none() && storage.sticker_pack(&coordinate)?.is_none() {
             // A received sticker may reference a valid pack outside the recent
             // discovery window and outside this account's installed list.
             // Resolve that exact address on demand, serialized with the other
@@ -292,14 +292,7 @@ impl MarmotApp {
             let context = self.sticker_context(account_ref)?;
             let mutation_lock = self.sticker_mutation_lock(&context.label);
             let _guard = mutation_lock.lock().await;
-            if storage
-                .sticker_for_ref(
-                    &coordinate,
-                    &sticker_ref.shortcode,
-                    &sticker_ref.plaintext_sha256,
-                )?
-                .is_none()
-            {
+            if storage.sticker_pack(&coordinate)?.is_none() {
                 fetch_pack_into_storage(self, &context, &coordinate).await?;
             }
             stored = storage.sticker_for_ref(
