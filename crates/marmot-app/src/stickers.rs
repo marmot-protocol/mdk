@@ -275,14 +275,40 @@ impl MarmotApp {
     ) -> Result<AppStickerAsset, AppError> {
         let sticker_ref = sticker_ref.to_sdk()?;
         let account = self.account_home().account(account_ref)?;
-        let stored = self
-            .account_storage(&account.label)?
-            .sticker_for_ref(
+        let storage = self.account_storage(&account.label)?;
+        let coordinate = sticker_ref.pack.coordinate();
+        let mut stored = storage.sticker_for_ref(
+            &coordinate,
+            &sticker_ref.shortcode,
+            &sticker_ref.plaintext_sha256,
+        )?;
+        if stored.is_none() {
+            // A received sticker may reference a valid pack outside the recent
+            // discovery window and outside this account's installed list.
+            // Resolve that exact address on demand, serialized with the other
+            // account sticker mutations, then authorize the shortcode/hash
+            // against the newly persisted SQLite projection before touching
+            // its Blossom URL.
+            let context = self.sticker_context(account_ref)?;
+            let mutation_lock = self.sticker_mutation_lock(&context.label);
+            let _guard = mutation_lock.lock().await;
+            if storage
+                .sticker_for_ref(
+                    &coordinate,
+                    &sticker_ref.shortcode,
+                    &sticker_ref.plaintext_sha256,
+                )?
+                .is_none()
+            {
+                fetch_pack_into_storage(self, &context, &coordinate).await?;
+            }
+            stored = storage.sticker_for_ref(
                 &sticker_ref.pack.coordinate(),
                 &sticker_ref.shortcode,
                 &sticker_ref.plaintext_sha256,
-            )?
-            .ok_or(AppError::StickerNotFound)?;
+            )?;
+        }
+        let stored = stored.ok_or(AppError::StickerNotFound)?;
         let bytes = fetch_blossom_blob_limited(
             &stored.url,
             MAX_STICKER_ASSET_BYTES,
