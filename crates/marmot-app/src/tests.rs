@@ -1691,6 +1691,30 @@ fn chat_intent_builds_kind_nine_with_no_tags() {
 }
 
 #[test]
+fn sticker_intent_builds_sonar_kind_nine_tag() {
+    let coordinate = format!("30031:{}:cats", "ab".repeat(32));
+    let hash = "11".repeat(32);
+    let event = build(AppMessageIntent::Sticker {
+        sticker_ref: AppStickerRef {
+            pack_coordinate: coordinate.clone(),
+            shortcode: "wave".to_owned(),
+            plaintext_sha256: hash.clone(),
+        },
+    });
+    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+    assert!(event.content.is_empty());
+    assert_eq!(
+        event.tags,
+        vec![vec![
+            "sticker".to_owned(),
+            coordinate,
+            "wave".to_owned(),
+            hash,
+        ]]
+    );
+}
+
+#[test]
 fn reaction_intent_builds_kind_seven_with_e_tag() {
     let event = build(AppMessageIntent::Reaction {
         target_message_id: "abc123".to_owned(),

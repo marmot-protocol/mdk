@@ -204,6 +204,10 @@ pub struct NotificationUpdate {
     pub sender: NotificationUser,
     pub receiver: NotificationUser,
     pub preview_text: Option<String>,
+    /// Typed Sonar sticker reference for an otherwise-empty kind-9 message.
+    /// Host apps localize the notification body (for example, "Sticker") and
+    /// never need to parse raw tags.
+    pub sticker: Option<crate::AppStickerRef>,
     /// Reaction emoji (Nostr kind 7 content); `None` for non-reactions. Additive
     /// at the DTO level (no `trigger`/`preview_text` change), but it changes the
     /// generated UniFFI record: consumers must regenerate bindings and ship the
@@ -1318,6 +1322,7 @@ fn notification_update_from_message(
         sender,
         receiver,
         preview_text: preview_text_for_message(&event.message),
+        sticker: crate::sticker_ref_from_message(&event.message),
         reaction_emoji,
         reacted_to_preview,
         timestamp_ms: unix_now_ms(),
@@ -1362,6 +1367,7 @@ fn notification_update_from_group_join(
         sender,
         receiver,
         preview_text: None,
+        sticker: None,
         reaction_emoji: None,
         reacted_to_preview: None,
         timestamp_ms: unix_now_ms(),

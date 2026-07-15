@@ -160,6 +160,9 @@ pub(crate) enum AppMessageIntent {
     Chat {
         content: String,
     },
+    Sticker {
+        sticker_ref: crate::AppStickerRef,
+    },
     Reaction {
         target_message_id: String,
         emoji: String,
@@ -245,6 +248,11 @@ pub(crate) fn build_inner_event(
             MARMOT_APP_EVENT_KIND_CHAT,
             mention_p_tags(content),
             content.clone(),
+        )),
+        AppMessageIntent::Sticker { sticker_ref } => Ok(event(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![crate::stickers::sticker_ref_tag(sticker_ref)?],
+            String::new(),
         )),
         AppMessageIntent::Reaction {
             target_message_id,

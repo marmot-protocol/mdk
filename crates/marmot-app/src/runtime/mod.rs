@@ -1666,6 +1666,28 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn send_sticker(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        sticker_ref: crate::AppStickerRef,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Sticker { sticker_ref },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
     pub async fn unreact_from_message(
         &self,
         account_ref: &str,

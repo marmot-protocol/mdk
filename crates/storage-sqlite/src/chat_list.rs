@@ -69,6 +69,7 @@ pub struct ChatListMessagePreview {
     pub sender_display_name: Option<String>,
     pub plaintext: String,
     pub kind: u64,
+    pub tags: Vec<Vec<String>>,
     pub timeline_at: u64,
     pub deleted: bool,
 }
@@ -487,6 +488,15 @@ fn chat_list_projection_complete_tx(
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      )
+                   OR row.last_message_tags_json IS NOT (
+                        SELECT mt.tags_json
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     )
                    OR row.last_message_timeline_at IS NOT (
                         SELECT mt.timeline_at
                         FROM message_timeline AS mt
@@ -578,6 +588,11 @@ fn rebuild_chat_list_row_for_group_tx(
         mention_classifier,
     )?;
     let now = unix_now_seconds();
+    let latest_tags_json = latest
+        .as_ref()
+        .map(|message| serde_json::to_string(&message.tags))
+        .transpose()
+        .map_err(|err| StorageError::Serialization(err.to_string()))?;
     tx.execute(
         "INSERT INTO chat_list_rows (
             group_id_hex, archived, pending_confirmation, title, group_name,
@@ -585,14 +600,15 @@ fn rebuild_chat_list_row_for_group_tx(
             avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
             avatar_image_upload_key_hex, avatar_media_type,
             last_message_id_hex, last_message_sender, last_message_preview,
-            last_message_kind, last_message_timeline_at, last_message_deleted,
+            last_message_kind, last_message_tags_json, last_message_timeline_at,
+            last_message_deleted,
             unread_count, unread_mention_count, first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at, updated_at,
             self_membership
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -609,6 +625,7 @@ fn rebuild_chat_list_row_for_group_tx(
             last_message_sender = excluded.last_message_sender,
             last_message_preview = excluded.last_message_preview,
             last_message_kind = excluded.last_message_kind,
+            last_message_tags_json = excluded.last_message_tags_json,
             last_message_timeline_at = excluded.last_message_timeline_at,
             last_message_deleted = excluded.last_message_deleted,
             unread_count = excluded.unread_count,
@@ -655,6 +672,7 @@ fn rebuild_chat_list_row_for_group_tx(
             latest.as_ref().map(|message| message.sender.as_str()),
             latest.as_ref().map(|message| message.plaintext.as_str()),
             optional_u64_to_i64(latest.as_ref().map(|message| message.kind))?,
+            latest_tags_json.as_deref(),
             optional_u64_to_i64(latest.as_ref().map(|message| message.timeline_at))?,
             latest
                 .as_ref()
@@ -841,7 +859,7 @@ fn latest_kind9_message_tx(
     group_id_hex: &str,
 ) -> StorageResult<Option<ChatListMessagePreview>> {
     tx.query_row(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
+        "SELECT message_id_hex, sender, plaintext, kind, tags_json, timeline_at, deleted
          FROM message_timeline
          WHERE group_id_hex = ?1 AND kind = ?2
            AND invalidation_status IS NULL
@@ -860,7 +878,7 @@ fn timeline_message_for_read_marker_tx(
     message_id_hex: &str,
 ) -> StorageResult<Option<ChatListMessagePreview>> {
     tx.query_row(
-        "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
+        "SELECT message_id_hex, sender, plaintext, kind, tags_json, timeline_at, deleted
          FROM message_timeline
          WHERE group_id_hex = ?1 AND message_id_hex = ?2 AND kind = ?3",
         params![
@@ -881,8 +899,11 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         sender_display_name: None,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
-        deleted: row.get::<_, i64>(5)? != 0,
+        tags: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        timeline_at: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
+        deleted: row.get::<_, i64>(6)? != 0,
     })
 }
 
@@ -916,7 +937,8 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
-                last_message_kind, last_message_timeline_at, last_message_deleted,
+                last_message_kind, last_message_tags_json, last_message_timeline_at,
+                last_message_deleted,
                 unread_count, unread_mention_count, first_unread_message_id_hex,
                 last_read_message_id_hex,
                 last_read_timeline_at, updated_at, self_membership
@@ -928,7 +950,8 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
-                last_message_kind, last_message_timeline_at, last_message_deleted,
+                last_message_kind, last_message_tags_json, last_message_timeline_at,
+                last_message_deleted,
                 unread_count, unread_mention_count, first_unread_message_id_hex,
                 last_read_message_id_hex,
                 last_read_timeline_at, updated_at, self_membership
@@ -950,7 +973,8 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
                 avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
                 avatar_image_upload_key_hex, avatar_media_type,
                 last_message_id_hex, last_message_sender, last_message_preview,
-                last_message_kind, last_message_timeline_at, last_message_deleted,
+                last_message_kind, last_message_tags_json, last_message_timeline_at,
+                last_message_deleted,
                 unread_count, unread_mention_count, first_unread_message_id_hex,
                 last_read_message_id_hex,
                 last_read_timeline_at, updated_at, self_membership
@@ -986,21 +1010,26 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
+        tags: row
+            .get::<_, Option<String>>(15)
+            .unwrap_or_default()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
         timeline_at: row
-            .get::<_, Option<i64>>(15)
+            .get::<_, Option<i64>>(16)
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
-        deleted: row.get::<_, i64>(16).unwrap_or_default() != 0,
+        deleted: row.get::<_, i64>(17).unwrap_or_default() != 0,
     });
-    let raw_unread_count = row.get::<_, i64>(17)?;
+    let raw_unread_count = row.get::<_, i64>(18)?;
     let unread_count = raw_unread_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(17, raw_unread_count))?;
-    let raw_unread_mention_count = row.get::<_, i64>(18)?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(18, raw_unread_count))?;
+    let raw_unread_mention_count = row.get::<_, i64>(19)?;
     let unread_mention_count = raw_unread_mention_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(18, raw_unread_mention_count))?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(19, raw_unread_mention_count))?;
     Ok(ChatListRow {
         group_id_hex: row.get(0)?,
         archived: row.get::<_, i64>(1)? != 0,
@@ -1020,13 +1049,13 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
         has_unread: unread_count > 0,
         unread_mention_count,
         has_unread_mention: unread_mention_count > 0,
-        first_unread_message_id_hex: row.get(19)?,
-        last_read_message_id_hex: row.get(20)?,
+        first_unread_message_id_hex: row.get(20)?,
+        last_read_message_id_hex: row.get(21)?,
         last_read_timeline_at: row
-            .get::<_, Option<i64>>(21)?
+            .get::<_, Option<i64>>(22)?
             .and_then(|value| value.try_into().ok()),
-        updated_at: row.get::<_, i64>(22)?.try_into().unwrap_or_default(),
-        self_membership: SelfMembership::from_storage(&row.get::<_, String>(23)?),
+        updated_at: row.get::<_, i64>(23)?.try_into().unwrap_or_default(),
+        self_membership: SelfMembership::from_storage(&row.get::<_, String>(24)?),
     })
 }
 

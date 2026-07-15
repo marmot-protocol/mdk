@@ -23,6 +23,7 @@ mod message;
 mod notification;
 mod push;
 mod relay;
+mod sticker;
 mod timeline;
 
 pub use account::*;
@@ -38,6 +39,7 @@ pub use message::*;
 pub use notification::*;
 pub use push::*;
 pub use relay::*;
+pub use sticker::*;
 pub use timeline::*;
 
 #[cfg(test)]
@@ -197,6 +199,7 @@ mod tests {
                 sender: "bb".repeat(32),
                 plaintext: "parent text".to_owned(),
                 kind: 9,
+                tags: Vec::new(),
                 source_epoch: None,
                 media: None,
                 agent_text_stream: None,

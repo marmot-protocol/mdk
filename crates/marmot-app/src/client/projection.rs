@@ -395,6 +395,13 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         }
         AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
         AppError::BlobStore(_) => "read_marker_failed:blob_store",
+        AppError::InvalidSticker(_) => "read_marker_failed:invalid_sticker",
+        AppError::StickerNotFound => "read_marker_failed:sticker_not_found",
+        AppError::StickerRelay(_) => "read_marker_failed:sticker_relay",
+        AppError::StickerImport(_) => "read_marker_failed:sticker_import",
+        AppError::StickerExternalSignerImportUnsupported => {
+            "read_marker_failed:sticker_external_signer_import_unsupported"
+        }
         AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
         AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
         AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",

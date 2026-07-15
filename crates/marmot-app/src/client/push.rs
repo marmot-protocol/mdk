@@ -232,6 +232,7 @@ pub(crate) fn notification_trigger_for_intent(
 ) -> Option<notifications::NotificationTrigger> {
     match intent {
         AppMessageIntent::Chat { .. }
+        | AppMessageIntent::Sticker { .. }
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
         | AppMessageIntent::StreamFinal { .. } => {

@@ -109,6 +109,16 @@ pub enum MarmotKitError {
     /// retry without treating the account as broken.
     #[error("external signer request was rejected or cancelled")]
     ExternalSignerRejected,
+    #[error("invalid sticker data: {details}")]
+    InvalidSticker { details: String },
+    #[error("sticker pack or asset is unavailable")]
+    StickerNotFound,
+    #[error("sticker network operation failed: {details}")]
+    StickerNetwork { details: String },
+    #[error("sticker import failed: {details}")]
+    StickerImport { details: String },
+    #[error("Signal sticker import is unavailable for external-signing accounts")]
+    StickerImportUnsupported,
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
 }
@@ -184,6 +194,11 @@ impl From<AppError> for MarmotKitError {
             }
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
+            AppError::InvalidSticker(details) => Self::InvalidSticker { details },
+            AppError::StickerNotFound => Self::StickerNotFound,
+            AppError::StickerRelay(details) => Self::StickerNetwork { details },
+            AppError::StickerImport(details) => Self::StickerImport { details },
+            AppError::StickerExternalSignerImportUnsupported => Self::StickerImportUnsupported,
             other => Self::Runtime {
                 details: other.to_string(),
             },

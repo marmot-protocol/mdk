@@ -2067,6 +2067,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -2837,7 +2838,7 @@ dependencies = [
  "nostr-relay-builder",
  "nostr-sdk",
  "opentelemetry-proto",
- "prost",
+ "prost 0.14.3",
  "psl",
  "rand 0.8.6",
  "reqwest",
@@ -2845,6 +2846,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sonar-stickers",
  "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",
@@ -3391,7 +3393,7 @@ checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
- "prost",
+ "prost 0.14.3",
 ]
 
 [[package]]
@@ -3840,12 +3842,35 @@ dependencies = [
 
 [[package]]
 name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.14.3",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4292,6 +4317,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4864,6 +4890,26 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sonar-stickers"
+version = "0.1.0"
+source = "git+https://github.com/hedwig-corp/bitchat-to-sonar?rev=162ac26c88b351dfa3f35d8f098c00a18ae46114#162ac26c88b351dfa3f35d8f098c00a18ae46114"
+dependencies = [
+ "aes",
+ "base64",
+ "cbc",
+ "hex",
+ "hkdf",
+ "hmac",
+ "nostr",
+ "prost 0.13.5",
+ "reqwest",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]
