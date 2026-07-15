@@ -14,6 +14,7 @@ fn chat(id: &str, sender: &str, at: u64, plaintext: &str) -> StoredAppEvent {
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -31,6 +32,7 @@ fn reaction(id: &str, sender: &str, target: &str, at: u64, emoji: &str) -> Store
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -49,6 +51,7 @@ fn agent_operation(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEv
             recorded_at: at,
             received_at: at,
             origin_commit_id: None,
+        moderation_grant: false,
         }
 }
 
@@ -69,6 +72,7 @@ fn reply(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> Stor
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -86,7 +90,14 @@ fn delete(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
+}
+
+fn moderated_delete(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
+    let mut event = delete(id, sender, target, at);
+    event.moderation_grant = true;
+    event
 }
 
 fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
@@ -103,6 +114,7 @@ fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> Store
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -136,6 +148,7 @@ fn group_system(id: &str, system_type: &str, at: u64) -> StoredAppEvent {
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -977,6 +990,7 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
         recorded_at: 1,
         received_at: 1,
         origin_commit_id: None,
+        moderation_grant: false,
     };
     let final_event = StoredAppEvent {
         group_id_hex: "11".repeat(32),
@@ -994,6 +1008,7 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
         recorded_at: 2,
         received_at: 2,
         origin_commit_id: None,
+        moderation_grant: false,
     };
 
     store.record_app_event(&start).unwrap();
@@ -1530,6 +1545,95 @@ fn message_delete_by_sender_clears_content_and_reactions_but_other_sender_does_n
     assert_eq!(message.plaintext, "");
     assert!(message.reactions.user_reactions.is_empty());
     assert!(message.reactions.by_emoji.is_empty());
+}
+
+#[test]
+fn moderation_grant_delete_tombstones_other_members_message() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "secret"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+    store
+        .record_app_event(&moderated_delete("admin-delete", "carol", "target", 3))
+        .unwrap();
+
+    let message = list(&store).pop().unwrap();
+
+    assert!(message.deleted);
+    assert_eq!(
+        message.deleted_by_message_id_hex.as_deref(),
+        Some("admin-delete")
+    );
+    assert_eq!(message.plaintext, "");
+    assert!(message.reactions.user_reactions.is_empty());
+    assert!(message.reactions.by_emoji.is_empty());
+}
+
+#[test]
+fn moderation_grant_delete_tombstones_target_arriving_later() {
+    // Out-of-order delivery: the moderation delete lands before its target.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&moderated_delete("admin-delete", "carol", "target", 1))
+        .unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 2, "secret"))
+        .unwrap();
+
+    let message = list(&store).pop().unwrap();
+
+    assert!(message.deleted);
+    assert_eq!(message.plaintext, "");
+}
+
+#[test]
+fn moderation_grant_survives_full_timeline_rebuild() {
+    // The grant is persisted with the delete event, so rebuilding the
+    // projection from raw app events must keep honoring the moderated
+    // tombstone even though the admin set is long gone from this layer.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "secret"))
+        .unwrap();
+    store
+        .record_app_event(&moderated_delete("admin-delete", "carol", "target", 2))
+        .unwrap();
+
+    store
+        .rebuild_message_timeline_for_group(&"11".repeat(32))
+        .unwrap();
+
+    let message = list(&store).pop().unwrap();
+    assert!(message.deleted);
+    assert_eq!(
+        message.deleted_by_message_id_hex.as_deref(),
+        Some("admin-delete")
+    );
+    assert_eq!(message.plaintext, "");
+}
+
+#[test]
+fn moderation_grant_does_not_retract_other_members_reaction() {
+    // Reaction retraction keeps its sender-equality forged-delete guard;
+    // moderation authority applies to messages, not to reaction removal.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "hello"))
+        .unwrap();
+    store
+        .record_app_event(&reaction("reaction-1", "bob", "target", 2, "+"))
+        .unwrap();
+    store
+        .record_app_event(&moderated_delete("admin-delete", "carol", "reaction-1", 3))
+        .unwrap();
+
+    let message = list(&store).pop().unwrap();
+
+    assert!(!message.deleted);
+    assert_eq!(message.reactions.user_reactions.len(), 1);
 }
 
 #[test]

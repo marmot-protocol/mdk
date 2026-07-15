@@ -276,6 +276,7 @@ fn prune_group_messages_before_removes_only_expired_group_rows() {
             source_epoch: None,
             recorded_at: Some(recorded_at),
             origin_commit_id: None,
+            moderation_grant: false,
         })
         .unwrap();
     }

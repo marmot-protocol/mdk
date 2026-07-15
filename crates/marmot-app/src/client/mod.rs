@@ -1120,7 +1120,7 @@ impl AppClient {
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {
             let update = self.record_local_app_event_projection(
-                &group_id_hex,
+                group_id,
                 &sender,
                 &event,
                 None,
@@ -1187,7 +1187,7 @@ impl AppClient {
             .map(|report| hex::encode(report.message_id.as_slice()));
         if should_project_locally {
             let update = self.record_local_app_event_projection(
-                &group_id_hex,
+                group_id,
                 &sender,
                 &event,
                 source_message_id_hex,

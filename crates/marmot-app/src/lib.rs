@@ -779,6 +779,11 @@ pub(crate) struct AppMessageProjection {
     /// system row, so the row can be invalidated by origin commit if that commit
     /// loses a fork. `None` for all other projections.
     pub(crate) origin_commit_id: Option<String>,
+    /// True only for a delete whose authenticated sender may moderate other
+    /// members' messages (group admin, non-direct group), evaluated against
+    /// the signed MLS group state when the delete is recorded and persisted
+    /// with the event. `false` for every other projection.
+    pub(crate) moderation_grant: bool,
 }
 
 fn generate_telemetry_install_id() -> String {

@@ -50,6 +50,8 @@ mod migration_0024_pending_welcome_delivery;
 mod migration_0025_chat_notification_settings;
 #[path = "migrations/0026_message_drafts.rs"]
 mod migration_0026_message_drafts;
+#[path = "migrations/0027_app_event_moderation_grant.rs"]
+mod migration_0027_app_event_moderation_grant;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -191,6 +193,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 26,
         name: "0026_message_drafts",
         apply: migration_0026_message_drafts::apply,
+    },
+    Migration {
+        version: 27,
+        name: "0027_app_event_moderation_grant",
+        apply: migration_0027_app_event_moderation_grant::apply,
     },
 ];
 

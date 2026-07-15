@@ -55,6 +55,13 @@ pub struct StoredAppEvent {
     /// can produce many rows. Enables `invalidate_app_events_by_origin_commit`
     /// when that commit loses a fork. `None` for all other event kinds.
     pub origin_commit_id: Option<String>,
+    /// True only for a delete whose authenticated sender held group-admin
+    /// moderation authority in a non-direct group when the delete was
+    /// recorded. The verdict is frozen at the event's first record — an upsert
+    /// keeps the stored value — so reprojection and relay echoes arriving
+    /// after an admin-set change can never flip an honored tombstone. `false`
+    /// for every other event.
+    pub moderation_grant: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -227,6 +234,7 @@ struct RawAppEvent {
     received_at: u64,
     invalidated: bool,
     invalidation_reason: Option<String>,
+    moderation_grant: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -328,9 +336,10 @@ impl SqliteAccountStorage {
             conn.execute(
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
-                    plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id
+                    plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id,
+                    moderation_grant
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
                     source_message_id_hex = excluded.source_message_id_hex,
                     source_epoch = excluded.source_epoch,
@@ -342,6 +351,7 @@ impl SqliteAccountStorage {
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
+                    moderation_grant = app_events.moderation_grant,
                     invalidated = 0,
                     invalidation_reason = NULL",
                 params![
@@ -357,6 +367,7 @@ impl SqliteAccountStorage {
                     u64_to_i64(event.recorded_at)?,
                     u64_to_i64(event.received_at)?,
                     &event.origin_commit_id,
+                    event.moderation_grant,
                 ],
             )
             .storage()?;
@@ -927,7 +938,7 @@ fn project_single_message_timeline_tx(
         .query_row(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason
+                    invalidated, invalidation_reason, moderation_grant
              FROM app_events
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group_id_hex, message_id_hex],
@@ -1061,7 +1072,10 @@ fn apply_targeted_modifiers_tx(tx: &Connection, row: &mut TimelineRow) -> Storag
         &row.message_id_hex,
     )?;
     for delete in deletes {
-        if row.sender != delete.sender {
+        // Self-retraction, or an admin moderation delete whose grant was
+        // authenticated and frozen at ingest (never granted in direct
+        // conversations). Anything else is a forged cross-sender delete.
+        if row.sender != delete.sender && !delete.moderation_grant {
             continue;
         }
         row.deleted = true;
@@ -1158,7 +1172,8 @@ fn app_events_targeting_message_tx(
                     app_events.source_epoch, app_events.direction, app_events.sender,
                     app_events.plaintext, app_events.kind, app_events.tags_json,
                     app_events.recorded_at, app_events.received_at,
-                    app_events.invalidated, app_events.invalidation_reason
+                    app_events.invalidated, app_events.invalidation_reason,
+                    app_events.moderation_grant
              FROM message_modifier_edges AS edges
              JOIN app_events
                ON app_events.group_id_hex = edges.group_id_hex
@@ -1271,7 +1286,7 @@ fn app_events_for_rebuild_tx(
         .prepare(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason
+                    invalidated, invalidation_reason, moderation_grant
              FROM app_events
              WHERE group_id_hex = ?1
              ORDER BY recorded_at, message_id_hex, insert_order",
@@ -2107,7 +2122,7 @@ fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<Stre
             let Some(row) = timeline.get_mut(target) else {
                 continue;
             };
-            if row.sender != delete.sender {
+            if row.sender != delete.sender && !delete.moderation_grant {
                 continue;
             }
             row.deleted = true;
@@ -2280,6 +2295,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
         invalidated: row.get::<_, i64>(11)? != 0,
         invalidation_reason: row.get(12)?,
+        moderation_grant: row.get::<_, i64>(13)? != 0,
     })
 }
 
