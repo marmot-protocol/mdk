@@ -192,7 +192,7 @@ pub fn parse_sticker_pack_input(input: &str) -> Result<String, AppError> {
     parse_sticker_pack_input(&value)
 }
 
-fn validate_signal_sticker_link(input: &str) -> Result<(), AppError> {
+fn validate_signal_sticker_link(input: &str) -> Result<String, AppError> {
     let input = input.trim();
     if input.is_empty() || input.chars().count() > MAX_LINK_CHARS {
         return Err(invalid_sticker("invalid Signal sticker link"));
@@ -212,18 +212,21 @@ fn validate_signal_sticker_link(input: &str) -> Result<(), AppError> {
         .or_else(|| url.query())
         .ok_or_else(|| invalid_sticker("Signal sticker link is missing credentials"))?;
     let parameters = url::form_urlencoded::parse(encoded.as_bytes()).collect::<HashMap<_, _>>();
-    if parameters
+    let pack_id = parameters
         .get("pack_id")
+        .filter(|value| {
+            value.len() == 32 && value.chars().all(|character| character.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| invalid_sticker("Signal sticker link has an invalid pack id"))?;
+    if parameters
+        .get("pack_key")
         .is_none_or(|value| value.is_empty())
-        || parameters
-            .get("pack_key")
-            .is_none_or(|value| value.is_empty())
     {
         return Err(invalid_sticker(
             "Signal sticker link is missing credentials",
         ));
     }
-    Ok(())
+    Ok(pack_id.to_ascii_lowercase())
 }
 
 impl MarmotApp {
@@ -431,17 +434,33 @@ impl MarmotApp {
         blossom_server: Option<&str>,
     ) -> Result<AppStickerImportResult, AppError> {
         let signal_link = Zeroizing::new(signal_link);
-        validate_signal_sticker_link(signal_link.as_str())?;
+        let signal_pack_id = validate_signal_sticker_link(signal_link.as_str())?;
         let context = self.sticker_context(account_ref)?;
         if !context.local_signing {
             return Err(AppError::StickerExternalSignerImportUnsupported);
         }
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
+        rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
+        let anticipated_coordinate = PackAddress::new(
+            context.account_id_hex.clone(),
+            format!("signal-{signal_pack_id}"),
+        )
+        .map_err(|_| invalid_sticker("imported pack address is invalid"))?
+        .coordinate();
+        validate_install_capacity(
+            &context.storage.desired_installed_sticker_packs()?,
+            &anticipated_coordinate,
+        )?;
 
         let imported = sonar_stickers::signal::import_signal_pack(signal_link.as_str())
             .await
             .map_err(|_| AppError::StickerImport("Signal pack could not be imported".into()))?;
+        if imported.pack_id != signal_pack_id {
+            return Err(invalid_sticker(
+                "Signal pack identity changed during import",
+            ));
+        }
         let server = blossom_server
             .map(str::trim)
             .filter(|server| !server.is_empty())
@@ -698,6 +717,12 @@ async fn publish_pending_installed_list(
     app: &MarmotApp,
     context: &StickerAccountContext,
 ) -> Result<(), AppError> {
+    if context.storage.sticker_install_operations()?.is_empty() {
+        return Ok(());
+    }
+    context
+        .storage
+        .trim_sticker_install_operations_to_capacity(MAX_INSTALLED_PACKS)?;
     if context.storage.sticker_install_operations()?.is_empty() {
         return Ok(());
     }
@@ -1428,30 +1453,45 @@ mod tests {
     fn signal_import_only_accepts_the_canonical_https_origin() {
         assert!(
             validate_signal_sticker_link(
-                "https://signal.art/addstickers/#pack_id=abc&pack_key=def"
+                "https://signal.art/addstickers/#pack_id=0123456789abcdef0123456789abcdef&pack_key=def"
             )
             .is_ok()
         );
         assert!(
-            validate_signal_sticker_link("https://signal.art/addstickers?pack_id=abc&pack_key=def")
-                .is_ok()
-        );
-        assert!(
-            validate_signal_sticker_link("https://evil.test/addstickers/#pack_id=abc&pack_key=def")
-                .is_err()
-        );
-        assert!(
-            validate_signal_sticker_link("http://signal.art/addstickers/#pack_id=abc&pack_key=def")
-                .is_err()
+            validate_signal_sticker_link(
+                "https://signal.art/addstickers?pack_id=0123456789abcdef0123456789abcdef&pack_key=def"
+            )
+            .is_ok()
         );
         assert!(
             validate_signal_sticker_link(
-                "https://signal.art:8443/addstickers/#pack_id=abc&pack_key=def"
+                "https://evil.test/addstickers/#pack_id=0123456789abcdef0123456789abcdef&pack_key=def"
             )
             .is_err()
         );
         assert!(
-            validate_signal_sticker_link("https://signal.art/addstickers/#pack_id=abc").is_err()
+            validate_signal_sticker_link(
+                "http://signal.art/addstickers/#pack_id=0123456789abcdef0123456789abcdef&pack_key=def"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_signal_sticker_link(
+                "https://signal.art:8443/addstickers/#pack_id=0123456789abcdef0123456789abcdef&pack_key=def"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_signal_sticker_link(
+                "https://signal.art/addstickers/#pack_id=0123456789abcdef0123456789abcdef"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_signal_sticker_link(
+                "https://signal.art/addstickers/#pack_id=abc&pack_key=def"
+            )
+            .is_err()
         );
     }
 

@@ -287,6 +287,50 @@ impl SqliteAccountStorage {
         sticker_install_operations_tx(&conn)
     }
 
+    /// Resolve a cross-device cap race by dropping the oldest pending local
+    /// installs that add packs outside the refreshed remote base. Uninstalls
+    /// and re-installs of base packs do not increase cardinality and are kept.
+    pub fn trim_sticker_install_operations_to_capacity(
+        &self,
+        max_packs: usize,
+    ) -> StorageResult<Vec<String>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let base = installed_sticker_state_tx(&conn)?
+                .packs
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let mut excess = desired_installed_sticker_packs_tx(&conn)?
+                .len()
+                .saturating_sub(max_packs);
+            if excess == 0 {
+                return Ok(Vec::new());
+            }
+            let mut dropped = Vec::with_capacity(excess);
+            for operation in sticker_install_operations_tx(&conn)? {
+                if excess == 0 {
+                    break;
+                }
+                if !operation.installed || base.contains(&operation.pack_coordinate) {
+                    continue;
+                }
+                conn.execute(
+                    "DELETE FROM app_sticker_install_operations WHERE pack_coordinate = ?1",
+                    params![&operation.pack_coordinate],
+                )
+                .storage()?;
+                dropped.push(operation.pack_coordinate);
+                excess -= 1;
+            }
+            if excess != 0 {
+                return Err(StorageError::Backend(
+                    "installed sticker base exceeds capacity".to_owned(),
+                ));
+            }
+            Ok(dropped)
+        })
+    }
+
     pub fn desired_installed_sticker_packs(&self) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
         desired_installed_sticker_packs_tx(&conn)
@@ -770,6 +814,50 @@ mod tests {
             vec!["pack-c".to_owned(), "pack-b".to_owned()]
         );
         assert_eq!(store.sticker_install_operations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cross_device_capacity_race_drops_oldest_excess_local_install() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let initial = (0..99)
+            .map(|index| format!("pack-{index}"))
+            .collect::<Vec<_>>();
+        store
+            .replace_installed_sticker_packs_if_newer(
+                &StoredStickerPackVersion {
+                    event_id_hex: "cc".repeat(32),
+                    created_at: 5,
+                },
+                &initial,
+            )
+            .unwrap();
+        store
+            .enqueue_sticker_install_operation("local-pack", true, 6)
+            .unwrap();
+        assert_eq!(store.desired_installed_sticker_packs().unwrap().len(), 100);
+
+        let remote = (0..100)
+            .map(|index| format!("remote-pack-{index}"))
+            .collect::<Vec<_>>();
+        store
+            .replace_installed_sticker_packs_if_newer(
+                &StoredStickerPackVersion {
+                    event_id_hex: "dd".repeat(32),
+                    created_at: 7,
+                },
+                &remote,
+            )
+            .unwrap();
+        assert_eq!(store.desired_installed_sticker_packs().unwrap().len(), 101);
+
+        assert_eq!(
+            store
+                .trim_sticker_install_operations_to_capacity(100)
+                .unwrap(),
+            vec!["local-pack".to_owned()]
+        );
+        assert_eq!(store.desired_installed_sticker_packs().unwrap(), remote);
+        assert!(store.sticker_install_operations().unwrap().is_empty());
     }
 
     #[test]
