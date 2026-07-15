@@ -179,12 +179,16 @@ impl SqliteAccountStorage {
         }
         let coordinates = match search {
             Some(search) => {
-                let pattern = format!("%{}%", search.to_ascii_lowercase());
+                let escaped = search
+                    .replace('!', "!!")
+                    .replace('%', "!%")
+                    .replace('_', "!_");
+                let pattern = format!("%{escaped}%");
                 let mut stmt = conn
                     .prepare(
                         "SELECT coordinate FROM app_sticker_packs
-                         WHERE lower(title) LIKE ?1
-                            OR lower(COALESCE(description, '')) LIKE ?1
+                         WHERE lower(title) LIKE ?1 ESCAPE '!'
+                            OR lower(COALESCE(description, '')) LIKE ?1 ESCAPE '!'
                          ORDER BY created_at DESC, event_id_hex ASC
                          LIMIT ?2",
                     )
@@ -773,6 +777,33 @@ mod tests {
             .enqueue_sticker_install_operation(&stored_pack.coordinate, false, 12)
             .unwrap();
         assert!(store.sticker_packs(true, None, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sticker_pack_search_treats_like_metacharacters_literally() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut literal = pack(&"bb".repeat(32), 10, &"11".repeat(32));
+        literal.identifier = "literal".to_owned();
+        literal.coordinate = format!("30031:{}:literal", literal.author_pubkey_hex);
+        literal.title = "100% cat_pack!".to_owned();
+        let mut wildcard_only = pack(&"cc".repeat(32), 11, &"22".repeat(32));
+        wildcard_only.identifier = "wildcard".to_owned();
+        wildcard_only.coordinate = format!("30031:{}:wildcard", wildcard_only.author_pubkey_hex);
+        wildcard_only.title = "100X cat-packX".to_owned();
+        store.replace_sticker_pack_if_newer(&literal).unwrap();
+        store.replace_sticker_pack_if_newer(&wildcard_only).unwrap();
+
+        for needle in ["%", "_", "!"] {
+            assert_eq!(
+                store
+                    .sticker_packs(false, Some(needle), 100)
+                    .unwrap()
+                    .into_iter()
+                    .map(|pack| pack.coordinate)
+                    .collect::<Vec<_>>(),
+                vec![literal.coordinate.clone()]
+            );
+        }
     }
 
     #[test]
