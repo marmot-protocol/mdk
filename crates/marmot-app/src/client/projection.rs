@@ -54,9 +54,20 @@ impl AppClient {
             origin_commit_id: None,
             moderation_grant,
         };
-        let update = self
-            .app
-            .record_account_app_event(&self.state.label, &message_projection)?;
+        // The reconciling post-publish projection (advance_read_marker) runs
+        // after group sync, so its recomputed moderation grant supersedes the
+        // optimistic pre-send one; the pre-send projection keeps the default
+        // freeze so a later no-op re-record can't downgrade it.
+        let update = if advance_read_marker {
+            self.app
+                .record_account_app_event_refreshing_moderation_grant(
+                    &self.state.label,
+                    &message_projection,
+                )?
+        } else {
+            self.app
+                .record_account_app_event(&self.state.label, &message_projection)?
+        };
         if advance_read_marker && event.kind == MARMOT_APP_EVENT_KIND_CHAT {
             let read_marker =
                 self.app

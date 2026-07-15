@@ -2747,6 +2747,24 @@ impl MarmotApp {
         self.app_projection_update(label, storage_update)
     }
 
+    /// As [`Self::record_account_app_event`], but a conflicting row's
+    /// `moderation_grant` is replaced rather than frozen. Used by the local
+    /// sender's post-publish reconciling projection so a moderation grant
+    /// recomputed after group sync supersedes the optimistic pre-send value.
+    pub(crate) fn record_account_app_event_refreshing_moderation_grant(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        let now = unix_now_seconds();
+        let storage_update = self
+            .account_storage(label)?
+            .record_app_event_refreshing_moderation_grant(&stored_app_event_from_projection(
+                message, now,
+            ))?;
+        self.app_projection_update(label, storage_update)
+    }
+
     pub(crate) fn invalidate_timeline_source_message(
         &self,
         label: &str,

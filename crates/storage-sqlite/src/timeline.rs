@@ -57,10 +57,13 @@ pub struct StoredAppEvent {
     pub origin_commit_id: Option<String>,
     /// True only for a delete whose authenticated sender held group-admin
     /// moderation authority in a non-direct group when the delete was
-    /// recorded. The verdict is frozen at the event's first record — an upsert
-    /// keeps the stored value — so reprojection and relay echoes arriving
-    /// after an admin-set change can never flip an honored tombstone. `false`
-    /// for every other event.
+    /// recorded. On the default [`record_app_event`] path a conflicting row's
+    /// value is frozen, so reprojection and relay echoes arriving after an
+    /// admin-set change can never flip an honored tombstone. The local
+    /// sender's post-publish reconciling projection uses
+    /// [`record_app_event_refreshing_moderation_grant`] instead, so the grant
+    /// recomputed after group sync supersedes the optimistic pre-send one.
+    /// `false` for every other event.
     pub moderation_grant: bool,
 }
 
@@ -301,6 +304,28 @@ impl SqliteAccountStorage {
         &self,
         event: &StoredAppEvent,
     ) -> StorageResult<TimelineProjectionUpdate> {
+        // Default path freezes an existing row's moderation_grant on conflict
+        // (see the upsert below): a re-received or relay-echoed delete must not
+        // have its honored verdict recomputed against later admin state.
+        self.record_app_event_inner(event, false)
+    }
+
+    /// Like [`record_app_event`], but a conflicting row's `moderation_grant` is
+    /// replaced with this event's value instead of frozen. Used only by the
+    /// local sender's post-publish reconciling projection, where the grant
+    /// recomputed after group sync supersedes the optimistic pre-send one.
+    pub fn record_app_event_refreshing_moderation_grant(
+        &self,
+        event: &StoredAppEvent,
+    ) -> StorageResult<TimelineProjectionUpdate> {
+        self.record_app_event_inner(event, true)
+    }
+
+    fn record_app_event_inner(
+        &self,
+        event: &StoredAppEvent,
+        refresh_moderation_grant: bool,
+    ) -> StorageResult<TimelineProjectionUpdate> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let new_affected_message_ids = affected_timeline_message_ids_tx(&conn, event)?;
@@ -351,7 +376,7 @@ impl SqliteAccountStorage {
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
-                    moderation_grant = app_events.moderation_grant,
+                    moderation_grant = CASE WHEN ?14 THEN excluded.moderation_grant ELSE app_events.moderation_grant END,
                     invalidated = 0,
                     invalidation_reason = NULL",
                 params![
@@ -368,6 +393,7 @@ impl SqliteAccountStorage {
                     u64_to_i64(event.received_at)?,
                     &event.origin_commit_id,
                     event.moderation_grant,
+                    refresh_moderation_grant,
                 ],
             )
             .storage()?;

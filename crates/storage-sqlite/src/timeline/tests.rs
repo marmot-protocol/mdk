@@ -1637,6 +1637,62 @@ fn moderation_grant_does_not_retract_other_members_reaction() {
 }
 
 #[test]
+fn re_recording_a_delete_freezes_the_stored_moderation_grant() {
+    // The default path must keep an honored grant: a re-received / echoed
+    // delete recomputed as non-moderated after an admin-set change cannot
+    // resurrect the tombstoned message.
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "secret"))
+        .unwrap();
+    store
+        .record_app_event(&moderated_delete("admin-delete", "carol", "target", 2))
+        .unwrap();
+    // Echo of the same delete id, now without a grant.
+    store
+        .record_app_event(&delete("admin-delete", "carol", "target", 2))
+        .unwrap();
+
+    let message = list(&store).pop().unwrap();
+    assert!(message.deleted, "frozen grant must keep the tombstone");
+}
+
+#[test]
+fn refreshing_variant_replaces_the_stored_moderation_grant() {
+    // The local sender's post-publish reconciling projection supersedes the
+    // optimistic pre-send grant: a grant recomputed as non-moderated after
+    // group sync must drop the tombstone (and vice versa).
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .record_app_event(&chat("target", "alice", 1, "secret"))
+        .unwrap();
+    store
+        .record_app_event(&moderated_delete("admin-delete", "carol", "target", 2))
+        .unwrap();
+    assert!(list(&store).pop().unwrap().deleted);
+
+    // Post-sync recompute: no longer a moderator → grant withdrawn.
+    store
+        .record_app_event_refreshing_moderation_grant(&delete("admin-delete", "carol", "target", 2))
+        .unwrap();
+    assert!(
+        !list(&store).pop().unwrap().deleted,
+        "refresh must withdraw the tombstone when the grant is recomputed away",
+    );
+
+    // Post-sync recompute the other way: moderator confirmed → grant restored.
+    store
+        .record_app_event_refreshing_moderation_grant(&moderated_delete(
+            "admin-delete",
+            "carol",
+            "target",
+            2,
+        ))
+        .unwrap();
+    assert!(list(&store).pop().unwrap().deleted);
+}
+
+#[test]
 fn re_recording_reaction_does_not_duplicate_edges_or_reaction() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
