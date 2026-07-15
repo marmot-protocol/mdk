@@ -16,3 +16,6 @@ dev/data/
 
 # Project specific optional env-vars
 .env
+
+# opencode tool artifacts
+.opencode/
