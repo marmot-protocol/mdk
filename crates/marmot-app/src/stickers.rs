@@ -4,8 +4,8 @@ use std::sync::Arc;
 use cgka_traits::TransportEndpoint;
 use nostr::nips::nip19::{FromBech32, Nip19Coordinate};
 use nostr::{
-    Alphabet, Event, EventBuilder, Filter, JsonUtil, Kind, NostrSigner, PublicKey, SingleLetterTag,
-    Tag, Timestamp as NostrTimestamp,
+    Alphabet, Event, EventBuilder, Filter, JsonUtil, Kind, NostrSigner, PublicKey, RelayUrl,
+    SingleLetterTag, Tag, Timestamp as NostrTimestamp,
 };
 use serde::{Deserialize, Serialize};
 use sonar_stickers::{
@@ -33,6 +33,7 @@ const MAX_STICKER_ANIMATION_FRAMES: u32 = 200;
 const MAX_DISCOVERY_PACKS: usize = 100;
 const MAX_INSTALLED_PACKS: usize = 100;
 const MAX_LINK_CHARS: usize = 2048;
+const MAX_STICKER_RELAY_HINTS: usize = 8;
 const MAX_FUTURE_EVENT_SKEW_SECONDS: u64 = 5 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,30 +149,47 @@ pub(crate) fn sticker_ref_tag(sticker_ref: &AppStickerRef) -> Result<Vec<String>
     Ok(build_sticker_ref_tag(&sticker_ref.to_sdk()?).to_vec())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedStickerPackInput {
+    coordinate: String,
+    relay_hints: Vec<TransportEndpoint>,
+}
+
 /// Accept a canonical coordinate, an NIP-19 `naddr`/`nostr:naddr`, or Sonar's
-/// documented HTTPS viewer link. Relay hints embedded in links are deliberately
-/// ignored; only the account's already-approved relay set is used for fetches.
+/// documented HTTPS viewer link.
 pub fn parse_sticker_pack_input(input: &str) -> Result<String, AppError> {
+    parse_sticker_pack_input_with_relays(input).map(|parsed| parsed.coordinate)
+}
+
+fn parse_sticker_pack_input_with_relays(input: &str) -> Result<ParsedStickerPackInput, AppError> {
     let input = input.trim();
     if input.is_empty() || input.chars().count() > MAX_LINK_CHARS {
         return Err(invalid_sticker("invalid sticker pack link"));
     }
     if let Ok(address) = PackAddress::parse(input) {
-        return Ok(address.coordinate());
+        return Ok(ParsedStickerPackInput {
+            coordinate: address.coordinate(),
+            relay_hints: Vec::new(),
+        });
     }
     let bech32 = input.strip_prefix("nostr:").unwrap_or(input);
     if bech32.starts_with("naddr1") {
-        let coordinate = Nip19Coordinate::from_bech32(bech32)
+        let nip19 = Nip19Coordinate::from_bech32(bech32)
             .map_err(|_| invalid_sticker("invalid sticker pack address"))?;
-        if coordinate.coordinate.kind != Kind::Custom(STICKER_PACK_KIND) {
+        if nip19.coordinate.kind != Kind::Custom(STICKER_PACK_KIND) {
             return Err(invalid_sticker("sticker pack address has the wrong kind"));
         }
-        return PackAddress::new(
-            coordinate.coordinate.public_key.to_hex(),
-            coordinate.coordinate.identifier,
+        let address = PackAddress::new(
+            nip19.coordinate.public_key.to_hex(),
+            nip19.coordinate.identifier,
         )
-        .map(|address| address.coordinate())
-        .map_err(|_| invalid_sticker("invalid sticker pack address"));
+        .map_err(|_| invalid_sticker("invalid sticker pack address"))?;
+        return Ok(ParsedStickerPackInput {
+            coordinate: address.coordinate(),
+            relay_hints: normalize_sticker_relay_hints(
+                nip19.relays.into_iter().map(|relay| relay.to_string()),
+            ),
+        });
     }
     let url = Url::parse(input).map_err(|_| invalid_sticker("invalid sticker pack link"))?;
     if url.scheme() != "https"
@@ -185,11 +203,45 @@ pub fn parse_sticker_pack_input(input: &str) -> Result<String, AppError> {
     {
         return Err(invalid_sticker("untrusted sticker pack link"));
     }
-    let value = url
-        .query_pairs()
-        .find_map(|(key, value)| (key == "a").then(|| value.into_owned()))
+    let query_pairs = url.query_pairs().collect::<Vec<_>>();
+    let value = query_pairs
+        .iter()
+        .find_map(|(key, value)| (key == "a").then(|| value.as_ref().to_owned()))
         .ok_or_else(|| invalid_sticker("sticker pack link is missing its address"))?;
-    parse_sticker_pack_input(&value)
+    let mut parsed = parse_sticker_pack_input_with_relays(&value)?;
+    let link_relays = normalize_sticker_relay_hints(
+        query_pairs
+            .into_iter()
+            .filter_map(|(key, value)| (key == "relay").then(|| value.into_owned())),
+    );
+    for relay in link_relays {
+        if parsed.relay_hints.len() >= MAX_STICKER_RELAY_HINTS {
+            break;
+        }
+        if !parsed.relay_hints.contains(&relay) {
+            parsed.relay_hints.push(relay);
+        }
+    }
+    Ok(parsed)
+}
+
+fn normalize_sticker_relay_hints(
+    relays: impl IntoIterator<Item = String>,
+) -> Vec<TransportEndpoint> {
+    let mut normalized = Vec::new();
+    for relay in relays {
+        let Ok(relay) = RelayUrl::parse(relay.trim()) else {
+            continue;
+        };
+        let endpoint = TransportEndpoint(relay.to_string());
+        if !normalized.contains(&endpoint) {
+            normalized.push(endpoint);
+        }
+        if normalized.len() >= MAX_STICKER_RELAY_HINTS {
+            break;
+        }
+    }
+    normalized
 }
 
 fn validate_signal_sticker_link(input: &str) -> Result<String, AppError> {
@@ -293,7 +345,7 @@ impl MarmotApp {
             let mutation_lock = self.sticker_mutation_lock(&context.label);
             let _guard = mutation_lock.lock().await;
             if storage.sticker_pack(&coordinate)?.is_none() {
-                fetch_pack_into_storage(self, &context, &coordinate).await?;
+                fetch_pack_into_storage(self, &context, &coordinate, &[]).await?;
             }
             stored = storage.sticker_for_ref(
                 &sticker_ref.pack.coordinate(),
@@ -364,7 +416,7 @@ impl MarmotApp {
         let desired = context.storage.desired_installed_sticker_packs()?;
         for coordinate in desired.iter().take(MAX_INSTALLED_PACKS) {
             if context.storage.sticker_pack(coordinate)?.is_none() {
-                let _ = fetch_pack_into_storage(self, &context, coordinate).await;
+                let _ = fetch_pack_into_storage(self, &context, coordinate, &[]).await;
             }
         }
         publish_pending_installed_list(self, &context).await?;
@@ -383,12 +435,12 @@ impl MarmotApp {
         account_ref: &str,
         input: &str,
     ) -> Result<AppStickerPack, AppError> {
-        let coordinate = parse_sticker_pack_input(input)?;
+        let parsed = parse_sticker_pack_input_with_relays(input)?;
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        fetch_pack_into_storage(self, &context, &coordinate).await?;
-        app_pack_for_context(&context, &coordinate)
+        fetch_pack_into_storage(self, &context, &parsed.coordinate, &parsed.relay_hints).await?;
+        app_pack_for_context(&context, &parsed.coordinate)
     }
 
     pub async fn install_sticker_pack(
@@ -396,30 +448,31 @@ impl MarmotApp {
         account_ref: &str,
         input: &str,
     ) -> Result<AppStickerPack, AppError> {
-        let coordinate = parse_sticker_pack_input(input)?;
+        let parsed = parse_sticker_pack_input_with_relays(input)?;
+        let coordinate = &parsed.coordinate;
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
         rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
-        if context.storage.sticker_pack(&coordinate)?.is_none() {
-            fetch_pack_into_storage(self, &context, &coordinate).await?;
+        if context.storage.sticker_pack(coordinate)?.is_none() {
+            fetch_pack_into_storage(self, &context, coordinate, &parsed.relay_hints).await?;
         } else {
             // A validated cached pack is enough to record an install while
             // offline. Refresh opportunistically without making connectivity
             // a precondition for the user's local intent.
             tolerate_offline(
-                fetch_pack_into_storage(self, &context, &coordinate)
+                fetch_pack_into_storage(self, &context, coordinate, &parsed.relay_hints)
                     .await
                     .map(|_| ()),
             )?;
         }
         let desired = context.storage.desired_installed_sticker_packs()?;
-        validate_install_capacity(&desired, &coordinate)?;
+        validate_install_capacity(&desired, coordinate)?;
         context
             .storage
-            .enqueue_sticker_install_operation(&coordinate, true, unix_now_seconds())?;
+            .enqueue_sticker_install_operation(coordinate, true, unix_now_seconds())?;
         tolerate_offline(publish_pending_installed_list(self, &context).await)?;
-        app_pack_for_context(&context, &coordinate)
+        app_pack_for_context(&context, coordinate)
     }
 
     pub async fn uninstall_sticker_pack(
@@ -605,6 +658,7 @@ async fn fetch_pack_into_storage(
     app: &MarmotApp,
     context: &StickerAccountContext,
     coordinate: &str,
+    relay_hints: &[TransportEndpoint],
 ) -> Result<bool, AppError> {
     let address = PackAddress::parse(coordinate)
         .map_err(|_| invalid_sticker("invalid sticker pack coordinate"))?;
@@ -618,23 +672,53 @@ async fn fetch_pack_into_storage(
             address.identifier.clone(),
         )
         .limit(16);
+    if !relay_hints.is_empty() {
+        match fetch_pack_from_endpoints(
+            app,
+            context,
+            coordinate,
+            relay_hints.to_vec(),
+            filter.clone(),
+        )
+        .await
+        {
+            Ok((updated, true)) => return Ok(updated),
+            Ok((_, false)) | Err(AppError::StickerRelay(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (updated, _) =
+        fetch_pack_from_endpoints(app, context, coordinate, context.endpoints.clone(), filter)
+            .await?;
+    if context.storage.sticker_pack(coordinate)?.is_none() {
+        return Err(AppError::StickerNotFound);
+    }
+    Ok(updated)
+}
+
+async fn fetch_pack_from_endpoints(
+    app: &MarmotApp,
+    context: &StickerAccountContext,
+    coordinate: &str,
+    endpoints: Vec<TransportEndpoint>,
+    filter: Filter,
+) -> Result<(bool, bool), AppError> {
     let events = app
         .relay_plane
-        .fetch_public_events(context.endpoints.clone(), filter)
+        .fetch_public_events(endpoints, filter)
         .await
         .map_err(AppError::StickerRelay)?;
     let mut updated = false;
+    let mut found = false;
     for event in events {
         let stored = match stored_pack_from_event(&event) {
             Ok(pack) if pack.coordinate == coordinate => pack,
             _ => continue,
         };
+        found = true;
         updated |= context.storage.replace_sticker_pack_if_newer(&stored)?;
     }
-    if context.storage.sticker_pack(coordinate)?.is_none() {
-        return Err(AppError::StickerNotFound);
-    }
-    Ok(updated)
+    Ok((updated, found))
 }
 
 fn ingest_pack_events(
@@ -1487,9 +1571,23 @@ mod tests {
     fn pack_input_accepts_only_canonical_and_trusted_sonar_links() {
         let coordinate = coordinate();
         assert_eq!(parse_sticker_pack_input(&coordinate).unwrap(), coordinate);
-        let link =
-            format!("https://sonarprivacy.xyz/stickers?a={coordinate}&relay=wss://evil.test");
+        let link = format!(
+            "https://sonarprivacy.xyz/stickers?a={coordinate}\
+             &relay=wss%3A%2F%2Frelay.damus.io\
+             &relay=wss%3A%2F%2Fnos.lol\
+             &relay=wss%3A%2F%2Fnos.lol\
+             &relay=not-a-relay"
+        );
         assert_eq!(parse_sticker_pack_input(&link).unwrap(), coordinate);
+        assert_eq!(
+            parse_sticker_pack_input_with_relays(&link)
+                .unwrap()
+                .relay_hints,
+            vec![
+                TransportEndpoint("wss://relay.damus.io".to_owned()),
+                TransportEndpoint("wss://nos.lol".to_owned()),
+            ]
+        );
         assert!(
             parse_sticker_pack_input(&format!("https://evil.test/stickers?a={coordinate}"))
                 .is_err()
