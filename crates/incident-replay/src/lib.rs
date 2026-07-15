@@ -35,7 +35,9 @@ pub mod ndjson;
 pub mod synth;
 
 pub use accept::{AcceptError, accept, accept_convergence};
-pub use classify::{BehindEngine, BehindMode, QuarantineReason, Verdict, classify};
+pub use classify::{
+    BehindEngine, BehindMode, QuarantineReason, Verdict, classify, liveness_advisory,
+};
 pub use convergence::{
     ConvergenceDecisionKind, ConvergenceRecoveryError, RecoveredConvergence, recover_convergence,
 };

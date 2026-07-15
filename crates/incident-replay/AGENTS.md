@@ -29,7 +29,10 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     ConvergenceSelected | Quarantine { reason }`. Everything downstream is gated
     behind this, so a healthy export yields zero vectors and a clean exit. Also
     home of the liveness gate (rule 5 below), which keeps a silently split
-    group from reading as healthy.
+    group from reading as healthy. `liveness_advisory` exposes that same rule-5
+    computation independent of the verdict, so a co-occurring liveness incident
+    that loses the single verdict to a higher-precedence incident (fork or
+    convergence) is still surfaced — the CLI prints it as a secondary advisory.
 - **Module:** `src/fork.rs`
   - **Role:** `recover_fork` turns a fork-recovery export into a `RecoveredFork`
     (source epoch + commit kind), or a `ForkRecoveryError` when it cannot be
@@ -79,7 +82,11 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
   - **Role:** CLI — classify one export file; for a fork-recovery or convergence
     incident, run the recover → accept → write pipeline. Exits 0 for any
     classification (healthy, quarantine, and accepted are all valid), 2 on
-    usage/IO/parse/write failure.
+    usage/IO/parse/write failure. Also prints a secondary `advisory (liveness):`
+    line whenever `liveness_advisory` fires and the primary verdict is not
+    already the epoch-divergence quarantine, so an accepted or quarantined
+    incident never masks a co-occurring engine left behind (the real e1a04e82
+    export carried both an accepted membership fork and a lag-12 stuck device).
 
 ## Classification rules (verified against real Goggles exports)
 

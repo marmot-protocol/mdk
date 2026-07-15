@@ -14,8 +14,8 @@ use std::process::ExitCode;
 
 use cgka_conformance_simulator::VectorFixture;
 use incident_replay::{
-    AgentStateExport, ForkCommitKind, Verdict, accept, accept_convergence, classify, is_stream,
-    parse, parse_stream, recover_convergence, recover_fork,
+    AgentStateExport, ForkCommitKind, QuarantineReason, Verdict, accept, accept_convergence,
+    classify, is_stream, liveness_advisory, parse, parse_stream, recover_convergence, recover_fork,
 };
 
 /// Vector name for a group-metadata fork-recovery incident.
@@ -59,7 +59,17 @@ fn main() -> ExitCode {
         }
     };
 
-    match classify(&export) {
+    let verdict = classify(&export);
+    // A co-occurring liveness incident (rule 5) loses the single verdict to any
+    // higher-precedence incident, so surface it as a secondary advisory — unless
+    // it *is* the primary verdict, where it is already printed.
+    let liveness_is_primary = matches!(
+        &verdict,
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence { .. }
+        }
+    );
+    let code = match verdict {
         Verdict::ForkRecovery => run_fork_recovery(&export, out_dir.as_deref()),
         Verdict::Healthy => {
             println!("healthy: 0 vectors");
@@ -67,7 +77,11 @@ fn main() -> ExitCode {
         }
         Verdict::ConvergenceSelected => run_convergence(&export, out_dir.as_deref()),
         Verdict::Quarantine { reason } => quarantine(&reason),
+    };
+    if !liveness_is_primary && let Some(reason) = liveness_advisory(&export) {
+        println!("advisory (liveness): {reason}");
     }
+    code
 }
 
 fn run_fork_recovery(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitCode {
