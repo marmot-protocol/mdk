@@ -414,21 +414,25 @@ impl MarmotRelayPlane {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let client = NostrSdkClient::builder().build();
-        for relay_url in &relay_urls {
-            client
-                .add_relay(relay_url.clone())
-                .await
-                .map_err(|_| "public event fetch: add relay failed".to_owned())?;
-            timeout(
+        let mut connected_relays = Vec::with_capacity(relay_urls.len());
+        for relay_url in relay_urls {
+            if client.add_relay(relay_url.clone()).await.is_err() {
+                continue;
+            }
+            if let Ok(Ok(_)) = timeout(
                 DIRECTORY_RELAY_CONNECT_WAIT,
                 client.connect_relay(relay_url.clone()),
             )
             .await
-            .map_err(|_| "public event fetch: relay connect timed out".to_owned())?
-            .map_err(|_| "public event fetch: relay connect failed".to_owned())?;
+            {
+                connected_relays.push(relay_url);
+            }
+        }
+        if connected_relays.is_empty() {
+            return Err("public event fetch: no relay connected".to_owned());
         }
         client
-            .fetch_events_from(relay_urls, filter, PUBLIC_EVENT_FETCH_WAIT)
+            .fetch_events_from(connected_relays, filter, PUBLIC_EVENT_FETCH_WAIT)
             .await
             .map(|events| events.into_iter().collect())
             .map_err(|_| "public event fetch failed".to_owned())

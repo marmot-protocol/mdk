@@ -469,6 +469,7 @@ impl MarmotApp {
         let mut stickers_by_id = HashMap::new();
         let mut stickers = Vec::with_capacity(imported.stickers.len());
         for imported_sticker in &imported.stickers {
+            validate_sticker_asset_size(&imported_sticker.bytes)?;
             let inspected = inspect_image(&imported_sticker.bytes)?;
             if sha256_hex(&imported_sticker.bytes) != imported_sticker.sha256 {
                 return Err(invalid_sticker("Signal sticker hash mismatch"));
@@ -1077,9 +1078,7 @@ fn invalid_sticker(reason: &'static str) -> AppError {
 }
 
 fn validate_downloaded_sticker(sticker: &StoredSticker, bytes: &[u8]) -> Result<(), AppError> {
-    if bytes.is_empty() || bytes.len() as u64 > MAX_STICKER_ASSET_BYTES {
-        return Err(invalid_sticker("sticker asset size is invalid"));
-    }
+    validate_sticker_asset_size(bytes)?;
     if sha256_hex(bytes) != sticker.sha256 {
         return Err(invalid_sticker("sticker asset hash mismatch"));
     }
@@ -1093,6 +1092,13 @@ fn validate_downloaded_sticker(sticker: &StoredSticker, bytes: &[u8]) -> Result<
             .is_some_and(|height| height != inspected.height)
     {
         return Err(invalid_sticker("sticker asset dimensions mismatch"));
+    }
+    Ok(())
+}
+
+fn validate_sticker_asset_size(bytes: &[u8]) -> Result<(), AppError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_STICKER_ASSET_BYTES {
+        return Err(invalid_sticker("sticker asset size is invalid"));
     }
     Ok(())
 }
@@ -1138,8 +1144,8 @@ fn inspect_png(bytes: &[u8]) -> Result<InspectedImage, AppError> {
     let width = be_u32(bytes, 16)?;
     let height = be_u32(bytes, 20)?;
     let mut offset = 8_usize;
-    let mut frames = 1_u32;
-    let mut animated = false;
+    let mut declared_frames = None;
+    let mut frame_controls = 0_u32;
     let mut saw_iend = false;
     while offset.checked_add(12).is_some_and(|end| end <= bytes.len()) {
         let length = be_u32(bytes, offset)? as usize;
@@ -1150,11 +1156,28 @@ fn inspect_png(bytes: &[u8]) -> Result<InspectedImage, AppError> {
             .ok_or_else(|| invalid_sticker("invalid PNG chunk length"))?;
         let kind = &bytes[offset + 4..offset + 8];
         if kind == b"acTL" {
-            if length != 8 {
+            if length != 8 || declared_frames.is_some() {
                 return Err(invalid_sticker("invalid APNG animation header"));
             }
-            frames = be_u32(bytes, offset + 8)?;
-            animated = true;
+            let frames = be_u32(bytes, offset + 8)?;
+            if frames == 0 || frames > MAX_STICKER_ANIMATION_FRAMES {
+                return Err(invalid_sticker(
+                    "sticker animation frame count exceeds limits",
+                ));
+            }
+            declared_frames = Some(frames);
+        } else if kind == b"fcTL" {
+            if length != 26 || declared_frames.is_none() {
+                return Err(invalid_sticker("invalid APNG frame control"));
+            }
+            frame_controls = frame_controls
+                .checked_add(1)
+                .ok_or_else(|| invalid_sticker("sticker animation frame count exceeds limits"))?;
+            if frame_controls > MAX_STICKER_ANIMATION_FRAMES {
+                return Err(invalid_sticker(
+                    "sticker animation frame count exceeds limits",
+                ));
+            }
         }
         offset = chunk_end;
         if kind == b"IEND" {
@@ -1165,8 +1188,18 @@ fn inspect_png(bytes: &[u8]) -> Result<InspectedImage, AppError> {
     if !saw_iend {
         return Err(invalid_sticker("PNG sticker is truncated"));
     }
+    let frames = match declared_frames {
+        Some(declared) if declared == frame_controls => declared,
+        Some(_) => return Err(invalid_sticker("APNG frame count mismatch")),
+        None if frame_controls == 0 => 1,
+        None => return Err(invalid_sticker("invalid APNG frame control")),
+    };
     Ok(InspectedImage {
-        mime: if animated { "image/apng" } else { "image/png" },
+        mime: if declared_frames.is_some() {
+            "image/apng"
+        } else {
+            "image/png"
+        },
         width,
         height,
         frames,
@@ -1361,21 +1394,38 @@ mod tests {
         chunk
     }
 
-    fn png(width: u32, height: u32, animation_frames: Option<u32>) -> Vec<u8> {
+    fn png_with_frame_controls(
+        width: u32,
+        height: u32,
+        declared_frames: Option<u32>,
+        actual_frames: u32,
+    ) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(&width.to_be_bytes());
         ihdr.extend_from_slice(&height.to_be_bytes());
         ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
         bytes.extend(chunk(b"IHDR", &ihdr));
-        if let Some(frames) = animation_frames {
+        if let Some(frames) = declared_frames {
             let mut actl = Vec::new();
             actl.extend_from_slice(&frames.to_be_bytes());
             actl.extend_from_slice(&0_u32.to_be_bytes());
             bytes.extend(chunk(b"acTL", &actl));
         }
+        for _ in 0..actual_frames {
+            bytes.extend(chunk(b"fcTL", &[0; 26]));
+        }
         bytes.extend(chunk(b"IEND", &[]));
         bytes
+    }
+
+    fn png(width: u32, height: u32, animation_frames: Option<u32>) -> Vec<u8> {
+        png_with_frame_controls(
+            width,
+            height,
+            animation_frames,
+            animation_frames.unwrap_or_default(),
+        )
     }
 
     #[test]
@@ -1571,7 +1621,25 @@ mod tests {
         );
         assert!(inspect_image(&png(4097, 1, None)).is_err());
         assert!(inspect_image(&png(32, 32, Some(MAX_STICKER_ANIMATION_FRAMES + 1))).is_err());
+        assert!(inspect_image(&png_with_frame_controls(32, 32, Some(1), 2)).is_err());
+        assert!(
+            inspect_image(&png_with_frame_controls(
+                32,
+                32,
+                Some(1),
+                MAX_STICKER_ANIMATION_FRAMES + 1,
+            ))
+            .is_err()
+        );
         assert!(inspect_image(b"not an image").is_err());
+    }
+
+    #[test]
+    fn sticker_asset_size_rejects_empty_and_oversized_buffers() {
+        assert!(validate_sticker_asset_size(&[]).is_err());
+        assert!(
+            validate_sticker_asset_size(&vec![0; MAX_STICKER_ASSET_BYTES as usize + 1]).is_err()
+        );
     }
 
     #[test]
