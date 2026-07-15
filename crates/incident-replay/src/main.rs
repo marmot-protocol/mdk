@@ -14,12 +14,15 @@ use std::process::ExitCode;
 
 use cgka_conformance_simulator::VectorFixture;
 use incident_replay::{
-    AgentStateExport, Verdict, accept, accept_convergence, classify, is_stream, parse,
-    parse_stream, recover_convergence, recover_fork,
+    AgentStateExport, ForkCommitKind, Verdict, accept, accept_convergence, classify, is_stream,
+    parse, parse_stream, recover_convergence, recover_fork,
 };
 
-/// Vector name for a fork-recovery incident (one incident per export today).
+/// Vector name for a group-metadata fork-recovery incident.
 const INCIDENT_NAME: &str = "fork-recovery-incident/v1";
+/// Vector name for a membership/admin fork-recovery incident (a distinct shape,
+/// so a distinct name and file — it must not overwrite the group-data vector).
+const MEMBERSHIP_INCIDENT_NAME: &str = "membership-fork-recovery-incident/v1";
 /// Vector name for a convergence incident.
 const CONVERGENCE_NAME: &str = "convergence-incident/v1";
 
@@ -72,7 +75,11 @@ fn run_fork_recovery(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitC
         Ok(fork) => fork,
         Err(err) => return quarantine(&err),
     };
-    match accept(&fork, INCIDENT_NAME) {
+    let name = match fork.commit {
+        ForkCommitKind::GroupData => INCIDENT_NAME,
+        ForkCommitKind::Membership => MEMBERSHIP_INCIDENT_NAME,
+    };
+    match accept(&fork, name) {
         Ok(vector) => persist_or_report(&vector, out_dir),
         Err(err) => quarantine(&err),
     }

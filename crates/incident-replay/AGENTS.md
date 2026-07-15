@@ -32,9 +32,16 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     group from reading as healthy.
 - **Module:** `src/fork.rs`
   - **Role:** `recover_fork` turns a fork-recovery export into a `RecoveredFork`
-    (source epoch, commit kind, and the designated winner recovered tier-b from
-    the invalidated message's publisher), or a `ForkRecoveryError` when it cannot
-    be replayed. Only metadata (group-data) forks are supported today.
+    (source epoch + commit kind), or a `ForkRecoveryError` when it cannot be
+    replayed. Two `ForkCommitKind`s are synthesizable: **group-data** forks
+    (topic/name/avatar/retention) and **membership** forks (member add/remove,
+    admin grant/revoke — all collapse to one `Membership` kind, so a real
+    add-vs-promote race is one shape, not `MixedCommitKinds`). Rule-3 tier-b
+    winner attribution (the invalidated message's publisher is the loser) runs
+    **only for group-data forks** — the membership fork is winner-agnostic, and
+    real observer-recorded exports cannot join a publisher's `account_ref` (the
+    observing engine) to a committer's `actor_member_ref` (an MLS member id), so
+    the join is structurally impossible on real data.
 - **Module:** `src/convergence.rs`
   - **Role:** `recover_convergence` turns a convergence-selected export into a
     `RecoveredConvergence` (the decisive rule + a `ConvergenceDecisionKind`), or a
@@ -47,8 +54,12 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     on raw commit depth, not the boost), indistinct candidate branch ids, or a
     priority/digest rule.
 - **Module:** `src/synth.rs`
-  - **Role:** `synthesize` builds the concurrent-fork `VectorFixture` (two
-    committers race group-data commits, no `SetPartition`). `synthesize_convergence`
+  - **Role:** `synthesize` builds the concurrent-fork `VectorFixture`, dispatching
+    on the commit kind: a **group-data** fork (two committers race `UpdateGroupData`
+    commits, no `SetPartition`) or a **membership** fork (two committers race
+    competing invites with the two invitees held out by a partition; after
+    recovery `member_count == 3` proves exactly one branch survived — the proven
+    `convergence-chaos/v1` invite-fork shape). `synthesize_convergence`
     dispatches on `ConvergenceDecisionKind`: the committer-decided vector (two
     admins race invite commits observed by a passive third client) or the
     witness-decided vector (the observer delivers two senders' app messages on one
@@ -56,9 +67,12 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     overrides the committer tiebreak on the reorg). Both normalise real epochs to
     the simulator's `1 → 2` range; the convergence assertion is winner-agnostic.
 - **Module:** `src/accept.rs`
-  - **Role:** `accept` (fork) tries both label orderings and returns the vector
-    only when the full `RecoverySummary` matches **and** the designated winner's
-    branch survives. `accept_convergence` is a single run-and-compare (winner-agnostic
+  - **Role:** `accept` (fork) dispatches on the commit kind. A **group-data** fork
+    tries both label orderings and returns the vector only when the full
+    `RecoverySummary` matches **and** the designated winner's branch survives. A
+    **membership** fork is a single run-and-compare (winner-agnostic ⇒ no label
+    search): `member_count == 3` is the survival proof. `accept_convergence` is a
+    single run-and-compare (winner-agnostic
     ⇒ no label search) that returns the vector only when the recorded convergence
     decision reproduces. No reproduction ⇒ `AcceptError` (no vector).
 - **Module:** `src/main.rs`

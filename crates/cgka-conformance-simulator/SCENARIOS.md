@@ -150,6 +150,20 @@ the top-level portable-vector test (Phase 5 wires the directory into CI).
 - Expected: the engine fork-recovers on delivery, the designated winner's branch survives, and both clients converge at
   epoch 2 with the full recovery summary matching the recorded incident.
 
+### `membership-fork-recovery-incident/v1`
+
+- File: `vectors/incidents/membership-fork-recovery-incident.v1.json`
+- Setup: two committers create a group, then raise competing membership commits (an invite race) from the same epoch,
+  with the two invitees held out by a partition — the membership-fork shape the adapter derives from a fork-recovery
+  incident whose contested tip is a membership/admin commit (`member_added`/`member_removed`/`admin_added`/`admin_removed`).
+- Pressure: same-epoch membership commit race with deferred delivery; the fork-recovery seam — not the convergence
+  selector — resolves it.
+- Expected: the engine fork-recovers on delivery and both committers converge at epoch 2 with `member_count == 3` — the
+  winner-agnostic proof that exactly one branch's invite survived — and the full recovery summary matching the recorded
+  incident. Unlike the group-data fork, the recovery is winner-agnostic (no branch-name label search), because real
+  observer-recorded exports cannot join a commit's publisher (`account_ref`, the observing engine) to its committer
+  (`actor_member_ref`, an MLS member id).
+
 ### `convergence-incident/v1`
 
 - File: `vectors/incidents/convergence-incident.v1.json`

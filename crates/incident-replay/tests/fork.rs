@@ -77,16 +77,50 @@ fn an_unattributable_invalidated_commit_makes_the_winner_unrecoverable() {
 }
 
 #[test]
-fn an_unmapped_commit_kind_is_quarantined() {
-    // A membership fork (member_added) is not synthesizable yet.
+fn recovers_a_membership_fork() {
+    // The real e1a04e82 shape: one committer `admin_added`, the other
+    // `member_added`, at the same epoch. Both collapse to `Membership`, so the
+    // heterogeneous add-vs-promote race is one shape, not mixed.
     let json = r#"{ "events": [
-        { "kind": { "type": "fork_resolution", "source_epoch": 30, "invalidated_msg_id": "inv-1", "winner": "incumbent" } },
-        { "account_ref": "alpha", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "member_added", "actor_member_ref": "alpha" } },
+        { "kind": { "type": "fork_resolution", "source_epoch": 30, "invalidated_msg_id": "inv-1", "winner": "candidate" } },
+        { "account_ref": "alpha", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "admin_added", "actor_member_ref": "alpha" } },
         { "account_ref": "beta", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "member_added", "actor_member_ref": "beta" } },
         { "account_ref": "beta", "kind": { "type": "publish_outcome", "msg_id": "inv-1" } }
     ] }"#;
     assert_eq!(
         recover(json),
-        Err(ForkRecoveryError::UnmappedCommitKind("member_added".into()))
+        Ok(RecoveredFork {
+            source_epoch: 30,
+            commit: ForkCommitKind::Membership,
+        })
+    );
+}
+
+#[test]
+fn a_tip_mixing_group_data_and_membership_is_quarantined() {
+    // A group-metadata commit racing a membership commit has no single vector.
+    let json = r#"{ "events": [
+        { "kind": { "type": "fork_resolution", "source_epoch": 30, "invalidated_msg_id": "inv-1", "winner": "incumbent" } },
+        { "account_ref": "alpha", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "alpha" } },
+        { "account_ref": "beta", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "member_added", "actor_member_ref": "beta" } },
+        { "account_ref": "beta", "kind": { "type": "publish_outcome", "msg_id": "inv-1" } }
+    ] }"#;
+    assert_eq!(recover(json), Err(ForkRecoveryError::MixedCommitKinds));
+}
+
+#[test]
+fn an_unmapped_commit_kind_is_quarantined() {
+    // A commit kind with no vector shape yet still fail-closes as unmapped.
+    let json = r#"{ "events": [
+        { "kind": { "type": "fork_resolution", "source_epoch": 30, "invalidated_msg_id": "inv-1", "winner": "incumbent" } },
+        { "account_ref": "alpha", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "capability_upgraded", "actor_member_ref": "alpha" } },
+        { "account_ref": "beta", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "capability_upgraded", "actor_member_ref": "beta" } },
+        { "account_ref": "beta", "kind": { "type": "publish_outcome", "msg_id": "inv-1" } }
+    ] }"#;
+    assert_eq!(
+        recover(json),
+        Err(ForkRecoveryError::UnmappedCommitKind(
+            "capability_upgraded".into()
+        ))
     );
 }
