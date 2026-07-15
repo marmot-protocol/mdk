@@ -15,12 +15,12 @@ pub(crate) struct TuiApp {
     pub(crate) messages_group_id: Option<String>,
     pub(crate) unread_counts: HashMap<String, usize>,
     pub(crate) show_archived_chats: bool,
-    pub(crate) messages: Vec<MessageRow>,
-    pub(crate) messages_scroll: u16,
-    pub(crate) messages_viewport: u16,
+    pub(crate) timeline: Vec<TimelineRow>,
+    pub(crate) timeline_scroll: TimelineScroll,
     pub(crate) live_stream_previews: Vec<LiveStreamPreview>,
     pub(crate) chat_subscription: Option<ChatSubscription>,
     pub(crate) message_subscription: Option<MessageSubscription>,
+    pub(crate) timeline_subscription: Option<TimelineSubscription>,
     pub(crate) group_state_subscription: Option<GroupStateSubscription>,
     pub(crate) daemon: DaemonView,
     pub(crate) group_diagnostics: Option<GroupDiagnostics>,
@@ -46,12 +46,12 @@ impl TuiApp {
             messages_group_id: None,
             unread_counts: HashMap::new(),
             show_archived_chats: false,
-            messages: Vec::new(),
-            messages_scroll: 0,
-            messages_viewport: 0,
+            timeline: Vec::new(),
+            timeline_scroll: TimelineScroll::default(),
             live_stream_previews: Vec::new(),
             chat_subscription: None,
             message_subscription: None,
+            timeline_subscription: None,
             group_state_subscription: None,
             daemon: DaemonView::default(),
             group_diagnostics: None,
@@ -98,6 +98,7 @@ impl TuiApp {
         changed |= self.drain_chat_subscription();
         changed |= self.drain_group_state_subscription();
         changed |= self.drain_message_subscription();
+        changed |= self.drain_timeline_subscription();
         match self.flush_stream_append_if_due(now) {
             Ok(flushed) => changed |= flushed,
             Err(err) => {
@@ -135,41 +136,51 @@ impl TuiApp {
             }
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.previous(),
-            KeyCode::Up => self.move_selection(-1),
-            KeyCode::Down => self.move_selection(1),
-            KeyCode::PageUp => {
-                let by = self.messages_page();
-                self.scroll_messages_up(by);
-            }
-            KeyCode::PageDown => {
-                let by = self.messages_page();
-                self.scroll_messages_down(by);
-            }
-            KeyCode::Home => {
-                self.messages_scroll = u16::MAX;
-            }
-            KeyCode::End => {
-                self.messages_scroll = 0;
-            }
-            KeyCode::Enter => {
-                if let Err(err) = self.activate_focus() {
-                    self.status = format!("error: {err}");
-                }
-            }
             KeyCode::Esc => {
                 self.show_help = false;
                 self.input.clear();
-            }
-            KeyCode::Backspace if self.focus == Focus::Composer => {
-                self.input.pop();
             }
             KeyCode::Char('/') if self.focus != Focus::Composer => {
                 self.show_help = false;
                 self.focus = Focus::Composer;
                 self.input.push('/');
             }
-            KeyCode::Char('j') if self.focus != Focus::Composer => self.move_selection(1),
-            KeyCode::Char('k') if self.focus != Focus::Composer => self.move_selection(-1),
+            // Messages pane: the message-offset scroll model. `k`/Up and PageUp
+            // may reach the oldest loaded row and page in older history.
+            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Messages => {
+                self.messages_select_up();
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Messages => {
+                self.timeline_scroll.select_down(self.timeline.len());
+            }
+            KeyCode::PageUp if self.focus == Focus::Messages => self.messages_page_up(),
+            KeyCode::PageDown if self.focus == Focus::Messages => {
+                self.timeline_scroll.page_down(self.timeline.len());
+            }
+            KeyCode::End | KeyCode::Char('G') if self.focus == Focus::Messages => {
+                self.timeline_scroll.jump_newest(self.timeline.len());
+            }
+            KeyCode::Home | KeyCode::Char('g') if self.focus == Focus::Messages => {
+                self.messages_jump_oldest();
+            }
+            KeyCode::Char('i') | KeyCode::Enter if self.focus == Focus::Messages => {
+                self.focus = Focus::Composer;
+            }
+            // Accounts and chats lists.
+            KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer => {
+                self.move_selection(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.focus != Focus::Composer => {
+                self.move_selection(1);
+            }
+            KeyCode::Enter => {
+                if let Err(err) = self.activate_focus() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Backspace if self.focus == Focus::Composer => {
+                self.input.pop();
+            }
             KeyCode::Char(character) if self.focus == Focus::Composer => {
                 self.show_help = false;
                 self.input.push(character);
@@ -188,27 +199,45 @@ impl TuiApp {
             Focus::Chats => {
                 self.selected_chat = move_index(self.selected_chat, self.chats.len(), delta);
             }
-            Focus::Messages => {
-                if delta < 0 {
-                    self.scroll_messages_up(1);
-                } else if delta > 0 {
-                    self.scroll_messages_down(1);
-                }
-            }
-            Focus::Composer => {}
+            // The messages pane owns its own selection through `timeline_scroll`;
+            // it is driven directly in `handle_key`, not through `move_selection`.
+            Focus::Messages | Focus::Composer => {}
         }
     }
 
-    pub(crate) fn messages_page(&self) -> u16 {
-        self.messages_viewport.saturating_sub(1).max(1)
+    /// Move the message selection one row older, paging in older history when the
+    /// move lands on the oldest loaded row.
+    pub(crate) fn messages_select_up(&mut self) {
+        self.timeline_scroll.select_up(self.timeline.len());
+        self.request_older_if_needed();
     }
 
-    pub(crate) fn scroll_messages_up(&mut self, by: u16) {
-        self.messages_scroll = self.messages_scroll.saturating_add(by);
+    /// Page the message selection up by a screenful, paging in older history when
+    /// the move lands on the oldest loaded row.
+    pub(crate) fn messages_page_up(&mut self) {
+        self.timeline_scroll.page_up(self.timeline.len());
+        self.request_older_if_needed();
     }
 
-    pub(crate) fn scroll_messages_down(&mut self, by: u16) {
-        self.messages_scroll = self.messages_scroll.saturating_sub(by);
+    /// Jump the message selection to the oldest loaded row (the `g` / `Home`
+    /// binding), paging in older history since that lands on the oldest row.
+    pub(crate) fn messages_jump_oldest(&mut self) {
+        self.timeline_scroll.jump_oldest(self.timeline.len());
+        self.request_older_if_needed();
+    }
+
+    /// Fetch the previous history page when the selection has reached the oldest
+    /// loaded row and more history remains. Errors surface on the status line so a
+    /// failed page never tears down the session; `loading_older` is cleared on the
+    /// error path inside `load_older_messages`.
+    pub(crate) fn request_older_if_needed(&mut self) {
+        if self
+            .timeline_scroll
+            .should_request_older(self.timeline.len())
+            && let Err(err) = self.load_older_messages()
+        {
+            self.status = format!("error: {err}");
+        }
     }
 
     pub(crate) fn activate_focus(&mut self) -> TuiResult<()> {

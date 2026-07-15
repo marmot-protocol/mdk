@@ -448,8 +448,10 @@ real time.
 ## TUI
 
 `wn tui` is a Ratatui interface over the real `wn --json` command surface. It lists local accounts, shows
-visible chats for the selected local signing account, renders recent messages, sends messages from a composer, and
-keeps the latest status plus selected-chat MLS/component state in a status panel below the composer.
+visible chats for the selected local signing account, renders the materialized message timeline (with reactions,
+reply context, deletion tombstones, and `[img name]`/`[file name]` media placeholders), sends messages from a
+composer, and keeps the latest status plus
+selected-chat MLS/component state in a status panel below the composer.
 
 ```sh
 wn tui
@@ -461,11 +463,15 @@ group-state changes, and refreshes snapshots when the composer is idle.
 
 Controls:
 
-- `Tab`: cycle accounts, chats, and composer.
-- Arrow keys or `j`/`k`: move the selected account or chat.
-- `Enter`: select the highlighted account/chat or submit the composer.
+- `Tab`: cycle accounts, chats, messages, and composer.
+- Accounts/chats: arrow keys or `j`/`k` move the selection; `Enter` selects the highlighted account/chat.
+- Messages: `j`/`k` or arrows move the message selection; `PageUp`/`PageDown` page; `G`/`End` jump to the newest
+  message (and pin to the bottom), `g`/`Home` to the oldest. New messages stay pinned to the bottom while you are at
+  the newest message and hold your position when you have scrolled up. Scrolling past the oldest loaded message loads
+  the previous page of history. `i` or `Enter` focuses the composer.
+- Composer: `Enter` submits.
 - `?`: open help.
-- `Esc`: clear help or input.
+- `Esc`: close the help popup or clear the composer input.
 - `Ctrl-C`: quit.
 
 Composer slash commands:

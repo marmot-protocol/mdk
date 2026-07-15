@@ -170,22 +170,39 @@ pub(crate) fn stream_preview_line_pair(
     ])
 }
 
-pub(crate) fn message_lines(
-    messages: &[MessageRow],
-    selected_account: Option<&AccountRow>,
-) -> Vec<Line<'static>> {
-    messages
-        .iter()
-        .flat_map(|message| {
-            let author = terminal_safe_text(&message_author_label(message, selected_account));
-            [
-                Line::from(vec![
-                    Span::styled(author, Style::default().fg(Color::Yellow)),
-                    Span::raw(": "),
-                    Span::raw(terminal_safe_text(&message.display_text)),
-                ]),
-                Line::from(""),
-            ]
+/// The messages-pane title: plain "Messages" when pinned with everything on
+/// screen, otherwise annotated with the row counts above and below the viewport
+/// so the reader knows history or newer content is off-screen.
+pub(crate) fn timeline_pane_title(total: usize, first: usize, last: usize) -> String {
+    let above = first;
+    let below = total.saturating_sub(last + 1);
+    match (above, below) {
+        (0, 0) => "Messages".to_owned(),
+        (above, 0) => format!("Messages [{above} older]"),
+        (0, below) => format!("Messages [{below} newer]"),
+        (above, below) => format!("Messages [{above} older | {below} newer]"),
+    }
+}
+
+/// Apply the selection highlight to a row's rendered lines: a dark-gray
+/// background over every span, bumping a dark-gray foreground to gray so the
+/// timestamp/reply/attachment text stays legible on the highlight.
+fn highlight_timeline_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let spans = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let mut style = span.style.bg(Color::DarkGray);
+                    if span.style.fg == Some(Color::DarkGray) {
+                        style = style.fg(Color::Gray);
+                    }
+                    Span::styled(span.content, style)
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
         })
         .collect()
 }
@@ -456,44 +473,81 @@ impl TuiApp {
     }
 
     pub(crate) fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
-        let mut lines = if self.messages.is_empty() {
-            vec![Line::from("no messages")]
-        } else {
-            message_lines(&self.messages, self.message_account_row())
-        };
-        let group_id = self
-            .messages_group_id
-            .as_deref()
-            .or_else(|| self.selected_chat_row().map(|chat| chat.group_id.as_str()));
-        for preview in stream_preview_lines(&self.daemon, &self.live_stream_previews, group_id) {
-            lines.push(preview);
+        let focused = self.focus == Focus::Messages;
+        if self.timeline.is_empty() {
+            frame.render_widget(
+                Paragraph::new(vec![Line::from("no messages")])
+                    .block(panel_block("Messages", focused)),
+                area,
+            );
+            return;
         }
 
         let inner_width = area.width.saturating_sub(2);
         let inner_height = area.height.saturating_sub(2);
-        self.messages_viewport = inner_height;
 
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let total = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
-        let (clamped_scroll, scroll_top) =
-            messages_scroll_offsets(total, inner_height, self.messages_scroll);
-        self.messages_scroll = clamped_scroll;
-
-        let title = if scroll_top == 0 && self.messages_scroll == 0 {
-            "Messages".to_owned()
-        } else if self.messages_scroll == 0 {
-            format!("Messages [{scroll_top} above]")
+        // Live stream previews sit in a bottom block that only exists (and only
+        // reserves viewport rows) while the view is anchored at the newest row.
+        let group_id = self
+            .messages_group_id
+            .as_deref()
+            .or_else(|| self.selected_chat_row().map(|chat| chat.group_id.as_str()));
+        let preview_lines =
+            stream_preview_lines(&self.daemon, &self.live_stream_previews, group_id);
+        let bottom_block = if self.timeline_scroll.is_pinned() {
+            u16::try_from(preview_lines.len()).unwrap_or(u16::MAX)
         } else {
-            format!(
-                "Messages [{scroll_top} above | {} below]",
-                self.messages_scroll
-            )
+            0
         };
 
+        let selected_account = self.message_account_row();
+        let heights = timeline_row_heights(&self.timeline, selected_account, inner_width);
+        let total = self.timeline.len();
+        let selected = self.timeline_scroll.resolved_selection(total);
+
+        // One algorithm decides both the reported visible range and what is drawn,
+        // so the follow-scroll feedback and the rendered rows never diverge.
+        let (title, mut lines, range) = match timeline_visible_range(
+            &heights,
+            inner_height,
+            self.timeline_scroll.offset,
+            bottom_block,
+        ) {
+            Some((first, last)) => {
+                let mut lines = Vec::new();
+                for index in first..=last {
+                    let mut row_lines = timeline_row_lines(&self.timeline[index], selected_account);
+                    if selected == Some(index) {
+                        row_lines = highlight_timeline_lines(row_lines);
+                    }
+                    lines.extend(row_lines);
+                    // Blank separator row, counted in each row's rendered height.
+                    lines.push(Line::from(""));
+                }
+                (
+                    timeline_pane_title(total, first, last),
+                    lines,
+                    Some((first, last)),
+                )
+            }
+            None => ("Messages".to_owned(), Vec::new(), None),
+        };
+        if bottom_block > 0 {
+            lines.extend(preview_lines);
+        }
+
+        if let Some((first, last)) = range {
+            self.timeline_scroll
+                .record_visible_range(first, last, total);
+        }
+
         frame.render_widget(
-            paragraph
-                .block(panel_block(&title, self.focus == Focus::Messages))
-                .scroll((scroll_top, 0)),
+            Paragraph::new(lines)
+                .block(panel_block(&title, focused))
+                // Match `timeline_row_height`, which measures with wrapping: without
+                // this, long lines truncate at the pane edge and the reserved-vs-drawn
+                // height mismatch breaks bottom-anchoring.
+                .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -566,8 +620,9 @@ impl TuiApp {
             )),
             Line::from(""),
             Line::from("Tab cycles panels. Arrows move. Enter selects or submits. Ctrl-C quits."),
+            Line::from("Messages: j/k or arrows move; PageUp/PageDown page."),
             Line::from(
-                "Messages panel: Up/Down or j/k scroll; PageUp/PageDown, Home/End jump. New messages stick to the bottom.",
+                "G/g jump newest/oldest; past oldest loads history; i/Enter focus composer.",
             ),
             Line::from(""),
             Line::from("/refresh"),

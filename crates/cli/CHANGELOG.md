@@ -7,6 +7,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- TUI: the messages pane now renders the materialized message timeline (`messages timeline list` /
+  `messages timeline subscribe`) with reactions, reply context, deletion tombstones, and `[img name]`/`[file name]`
+  media placeholders. Scrolling uses a
+  message-offset model — `j`/`k` select, `G`/`g` jump to newest/oldest, `PageUp`/`PageDown` page, and scrolling past
+  the oldest loaded message pages in older history; incoming messages hold your position unless you are pinned to the
+  bottom. Timestamps render in local wall-clock time. No JSON response shapes changed.
+
 ### Added
 
 - MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
