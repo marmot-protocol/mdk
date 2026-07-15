@@ -17,6 +17,7 @@ import re
 import shutil
 import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterable, Literal, Optional, Tuple
 
@@ -40,6 +41,10 @@ STATUS_RECORD = 0x03
 TRANSCRIPT_HASH_CONTEXT = b"marmot agent text stream transcript v1"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
+_TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
+    "marmot_turn_parent_message_id_hex",
+    default=None,
+)
 TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # Bounded backoff (seconds) for durable send_final retries. One idempotency key
 # is reused across these attempts so a retry after a post-write timeout dedups at
@@ -860,18 +865,22 @@ class MarmotAgentControlClient:
         group_id_hex: str,
         *,
         stream_id_hex: Optional[str] = None,
+        parent_message_id_hex: Optional[str] = None,
         quic_candidates: Iterable[str] = (),
     ) -> Dict[str, Any]:
-        return await self.request(
-            {
-                "type": "stream_begin",
-                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
-                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
-                "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex") if stream_id_hex else None,
-                "quic_candidates": [str(candidate).strip() for candidate in quic_candidates if str(candidate).strip()],
-            },
-            timeout=self.preview_request_timeout,
-        )
+        payload: Dict[str, Any] = {
+            "type": "stream_begin",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+            "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex") if stream_id_hex else None,
+            "quic_candidates": [str(candidate).strip() for candidate in quic_candidates if str(candidate).strip()],
+        }
+        if parent_message_id_hex:
+            payload["parent_message_id_hex"] = _normalize_hex(
+                parent_message_id_hex,
+                "parent_message_id_hex",
+            )
+        return await self.request(payload, timeout=self.preview_request_timeout)
 
     async def stream_append(self, stream_id_hex: str, append_text: str) -> Dict[str, Any]:
         return await self.request(
@@ -1148,13 +1157,15 @@ class MarmotLiveStream:
         quic_candidates: Iterable[str],
         chunk_bytes: int,
         stream_id_hex: Optional[str] = None,
+        parent_message_id_hex: Optional[str] = None,
     ) -> "MarmotLiveStream":
-        response = await client.stream_begin(
-            account_id_hex,
-            group_id_hex,
-            stream_id_hex=stream_id_hex,
-            quic_candidates=quic_candidates,
-        )
+        begin_options: Dict[str, Any] = {
+            "stream_id_hex": stream_id_hex,
+            "quic_candidates": quic_candidates,
+        }
+        if parent_message_id_hex is not None:
+            begin_options["parent_message_id_hex"] = parent_message_id_hex
+        response = await client.stream_begin(account_id_hex, group_id_hex, **begin_options)
         return cls(
             client=client,
             account_id_hex=account_id_hex,
@@ -1373,7 +1384,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error="Marmot live preview requires MARMOT_QUIC_CANDIDATES")
             try:
                 await self._cancel_other_chat_streams(chat_id, reason="superseded by newer preview")
-                stream = await self._begin_live_stream(chat_id)
+                stream = await self._begin_live_stream(
+                    chat_id,
+                    parent_message_id_hex=_optional_hex(reply_to),
+                )
                 await stream.append_replacement(visible_content)
                 message_id = _stream_message_id(stream.stream_id_hex)
                 self._active_streams[message_id] = stream
@@ -1490,6 +1504,29 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     ) -> bool:
         return bool(self.quic_candidates)
 
+    def _start_session_processing(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        interrupt_event: Optional[asyncio.Event] = None,
+    ) -> bool:
+        """Copy the triggering message id into the spawned turn's task context."""
+        source = getattr(event, "source", None)
+        parent_message_id_hex = _optional_hex(
+            getattr(event, "message_id", None) or getattr(source, "message_id", None),
+            "parent_message_id_hex",
+        )
+        token = _TURN_PARENT_MESSAGE_ID_HEX.set(parent_message_id_hex)
+        try:
+            return super()._start_session_processing(
+                event,
+                session_key,
+                interrupt_event=interrupt_event,
+            )
+        finally:
+            _TURN_PARENT_MESSAGE_ID_HEX.reset(token)
+
     def render_message_event(self, event: Any, sink: Any) -> None:
         try:
             from gateway.stream_events import Commentary, MessageChunk, MessageStop
@@ -1563,7 +1600,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     reason="superseded by newer draft",
                 )
                 await self._cancel_other_chat_streams(chat_id, reason="superseded by newer draft")
-                stream = await self._begin_live_stream(chat_id)
+                metadata = metadata or {}
+                stream = await self._begin_live_stream(
+                    chat_id,
+                    parent_message_id_hex=_optional_hex(
+                        metadata.get("parent_message_id_hex")
+                        or metadata.get("reply_to_message_id_hex")
+                        or _TURN_PARENT_MESSAGE_ID_HEX.get()
+                    ),
+                )
                 self._draft_streams[key] = stream
                 self._last_chat_stream[chat_id] = stream
             await stream.append_replacement(visible_content)
@@ -1909,12 +1954,18 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             self._tool_progress_replies.pop(dropped_message_id, None)
         return seen
 
-    async def _begin_live_stream(self, chat_id: str) -> MarmotLiveStream:
+    async def _begin_live_stream(
+        self,
+        chat_id: str,
+        *,
+        parent_message_id_hex: Optional[str] = None,
+    ) -> MarmotLiveStream:
         account_id = await self._ensure_account_id()
         return await MarmotLiveStream.begin(
             client=self.client,
             account_id_hex=account_id,
             group_id_hex=chat_id,
+            parent_message_id_hex=parent_message_id_hex,
             quic_candidates=self.quic_candidates,
             chunk_bytes=self.stream_chunk_bytes,
         )

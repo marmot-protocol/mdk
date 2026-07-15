@@ -15,6 +15,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - MarmotKit/UniFFI now exposes the cached Nostr Kind 0 `website` field through a read-only profile accessor so app
   profile surfaces can display it without widening the writable profile record.
 
+### Fixed
+
+- WN Agent, Hermes, and OpenClaw now carry the triggering prompt message id on agent text-stream start events through
+  the protocol `parent` tag, preserving the durable reply chain after timeline reloads.
+
 ## [0.9.3] - 2026-07-07
 
 ### Added

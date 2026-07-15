@@ -12,7 +12,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
+    MARMOT_APP_EVENT_KIND_REACTION, STREAM_PARENT_TAG, STREAM_TAG,
 };
 use cgka_traits::engine::{GroupEvent, GroupStateChange};
 use cgka_traits::{EpochId, GroupId, MessageId};
@@ -1906,6 +1906,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
 
     let group_id_hex = hex::encode(group_id.as_slice());
     let stream_id_hex = hex::encode([0x77; 32]);
+    let parent_message_id_hex = hex::encode([0x88; 32]);
     let socket = dir.path().join("dev").join("wn-agent.sock");
     let connector = AgentConnector::open(test_config(
         dir.path(),
@@ -1926,6 +1927,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
             account_id_hex: agent.account.account_id_hex.clone(),
             group_id_hex: group_id_hex.clone(),
             stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: Some(parent_message_id_hex.clone()),
             quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
         },
     )
@@ -1941,6 +1943,30 @@ async fn connector_socket_composes_and_finalizes_stream() {
     };
     assert_eq!(begun_stream_id_hex, stream_id_hex);
     assert_eq!(quic_candidates, vec!["quic://127.0.0.1:9"]);
+    let stored = connector
+        .runtime
+        .messages_with_query(
+            &agent.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                limit: None,
+            },
+        )
+        .unwrap();
+    let start = stored
+        .iter()
+        .find(|message| message.message_id_hex == start_message_id_hex)
+        .expect("stream start must be in the local app projection");
+    assert_eq!(start.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
+    assert_eq!(
+        start
+            .tags
+            .iter()
+            .find(|tag| tag.first().map(String::as_str) == Some(STREAM_PARENT_TAG))
+            .and_then(|tag| tag.get(1))
+            .map(String::as_str),
+        Some(parent_message_id_hex.as_str())
+    );
 
     let appended = serve_control_request_once(
         &connector,
@@ -2054,6 +2080,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
             account_id_hex: agent.account.account_id_hex.clone(),
             group_id_hex: group_id_hex.clone(),
             stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: None,
             quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
         },
     )
@@ -2214,6 +2241,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
             account_id_hex: agent.account.account_id_hex.clone(),
             group_id_hex,
             stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: None,
             quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
         },
     )
@@ -2361,6 +2389,7 @@ async fn connector_socket_cancels_stream_session() {
             account_id_hex: agent.account.account_id_hex,
             group_id_hex,
             stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: None,
             quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
         },
     )

@@ -1519,9 +1519,21 @@ impl AppClient {
         stream_id: &[u8],
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.start_agent_text_stream_with_parent(group_id, stream_id, None, quic_candidates)
+            .await
+    }
+
+    pub async fn start_agent_text_stream_with_parent(
+        &mut self,
+        group_id: &GroupId,
+        stream_id: &[u8],
+        parent_message_id: Option<String>,
+        quic_candidates: Vec<String>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
         self.start_agent_text_stream_with_local_projection(
             group_id,
             stream_id,
+            parent_message_id,
             quic_candidates,
             |_| {},
         )
@@ -1532,6 +1544,7 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         stream_id: &[u8],
+        parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
         on_local_projection: F,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError>
@@ -1542,6 +1555,7 @@ impl AppClient {
             group_id,
             AppMessageIntent::StreamStart {
                 stream_id: stream_id.to_vec(),
+                parent_message_id,
                 quic_candidates,
             },
             on_local_projection,

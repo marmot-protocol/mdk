@@ -325,17 +325,26 @@ export class MarmotAgentControlClient {
   async streamBegin(
     accountIdHex: string,
     groupIdHex: string,
-    options: { streamIdHex?: string | null; quicCandidates?: Iterable<string> } = {},
+    options: {
+      streamIdHex?: string | null;
+      parentMessageIdHex?: string | null;
+      quicCandidates?: Iterable<string>;
+    } = {},
   ): Promise<StreamBegunResponse> {
     const quicCandidates = [...(options.quicCandidates ?? [])]
       .map((candidate) => String(candidate).trim())
       .filter((candidate) => candidate.length > 0);
+    const parentMessageIdHex = optionalHex(
+      options.parentMessageIdHex,
+      "parent_message_id_hex",
+    );
     return (await this.request(
       {
         type: "stream_begin",
         account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
         group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
         stream_id_hex: optionalHex(options.streamIdHex, "stream_id_hex"),
+        ...(parentMessageIdHex ? { parent_message_id_hex: parentMessageIdHex } : {}),
         quic_candidates: quicCandidates,
       },
       { timeoutMs: this.previewRequestTimeoutMs },

@@ -47,6 +47,7 @@ const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb
 interface Calls {
   sendFinal: { accountIdHex: string; text: string; replyTo: string | null }[];
   begin: number;
+  beginParents: (string | null)[];
   append: string[];
   status: string[];
   progress: string[];
@@ -55,7 +56,16 @@ interface Calls {
 }
 
 function emptyCalls(): Calls {
-  return { sendFinal: [], begin: 0, append: [], status: [], progress: [], finalize: [], cancel: [] };
+  return {
+    sendFinal: [],
+    begin: 0,
+    beginParents: [],
+    append: [],
+    status: [],
+    progress: [],
+    finalize: [],
+    cancel: [],
+  };
 }
 
 function stubClient(calls: Calls, opts: { isDirect?: boolean } = {}): MarmotSinkClient {
@@ -74,8 +84,13 @@ function stubClient(calls: Calls, opts: { isDirect?: boolean } = {}): MarmotSink
         subject: null,
       };
     },
-    async streamBegin() {
+    async streamBegin(
+      _accountIdHex: string,
+      _groupIdHex: string,
+      options: { parentMessageIdHex?: string | null } = {},
+    ) {
       calls.begin += 1;
+      calls.beginParents.push(options.parentMessageIdHex ?? null);
       return {
         type: "stream_begun",
         stream_id_hex: STREAM_ID,
@@ -111,6 +126,7 @@ function makeSink(
   opts: {
     streamMode?: StreamMode;
     quicCandidates?: string[];
+    replyToMessageIdHex?: string | null;
     resolveFinalText?: () => Promise<string | undefined> | string | undefined;
   } = {},
 ): MarmotReplySink {
@@ -118,6 +134,7 @@ function makeSink(
     client: stubClient(calls),
     accountIdHex: HEX32("aa"),
     groupIdHex: HEX32("cc"),
+    replyToMessageIdHex: opts.replyToMessageIdHex,
     streamMode: opts.streamMode ?? "block",
     quicCandidates: opts.quicCandidates ?? ["quic://broker:4450"],
     resolveFinalText: opts.resolveFinalText,
@@ -125,6 +142,16 @@ function makeSink(
 }
 
 describe("MarmotReplySink", () => {
+  it("passes the triggering message id to stream_begin", async () => {
+    const calls = emptyCalls();
+    const parentMessageIdHex = HEX32("dd");
+    const sink = makeSink(calls, { replyToMessageIdHex: parentMessageIdHex });
+
+    await sink.partial({ text: "hello" });
+
+    expect(calls.beginParents).toEqual([parentMessageIdHex]);
+  });
+
   it("sends a plain final when there were no preview blocks", async () => {
     const calls = emptyCalls();
     await makeSink(calls).deliver({ text: "hello world" }, { kind: "final" });

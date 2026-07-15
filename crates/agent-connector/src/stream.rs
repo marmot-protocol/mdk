@@ -65,6 +65,7 @@ impl AgentConnector {
         account_id_hex: &str,
         group_id_hex: &str,
         stream_id_hex: Option<String>,
+        parent_message_id_hex: Option<String>,
         quic_candidates: Vec<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
@@ -77,6 +78,17 @@ impl AgentConnector {
             .transpose()?
             .unwrap_or_else(transport_quic_stream::random_stream_id);
         let stream_id_hex = hex::encode(&stream_id);
+        let parent_message_id_hex = parent_message_id_hex
+            .map(|parent_message_id_hex| -> Result<String, ConnectorError> {
+                let normalized = normalize_hex(&parent_message_id_hex)?;
+                if normalized.len() != 64 {
+                    return Err(ConnectorError::Stream(
+                        "stream parent message id must be 32 bytes".into(),
+                    ));
+                }
+                Ok(normalized)
+            })
+            .transpose()?;
         let candidate = first_quic_candidate(&quic_candidates)?;
         let parsed_candidate = parse_quic_candidate(&candidate)?;
         let broker_addr =
@@ -88,11 +100,12 @@ impl AgentConnector {
         );
         let (_payload, summary) = self
             .runtime
-            .start_agent_text_stream(
+            .start_agent_text_stream_with_parent(
                 &account.label,
                 &group_id,
                 &stream_id,
                 unix_now_seconds(),
+                parent_message_id_hex,
                 quic_candidates.clone(),
             )
             .await?;

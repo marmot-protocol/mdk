@@ -226,6 +226,7 @@ pub(crate) enum AccountWorkerCommand {
     StartAgentTextStream {
         group_id: GroupId,
         stream_id: Vec<u8>,
+        parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
         respond: oneshot::Sender<Result<(MarmotInnerEvent, SendSummary), AppError>>,
     },
@@ -1128,6 +1129,7 @@ async fn handle_account_worker_command(
         AccountWorkerCommand::StartAgentTextStream {
             group_id,
             stream_id,
+            parent_message_id,
             quic_candidates,
             respond,
         } => {
@@ -1135,6 +1137,7 @@ async fn handle_account_worker_command(
                 .start_agent_text_stream_with_local_projection(
                     &group_id,
                     &stream_id,
+                    parent_message_id,
                     quic_candidates,
                     |update| {
                         publish_app_runtime_projection_update(

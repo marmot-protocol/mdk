@@ -57,6 +57,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         stream_id_hex: HEX32("ee"),
         start_message_id_hex: HEX32("ff"),
         quic_candidates: [],
+        echoed_parent_message_id_hex: req.parent_message_id_hex ?? null,
       });
       break;
     case "stream_finalize":
@@ -201,6 +202,20 @@ describe("MarmotAgentControlClient", () => {
       1,
     )) as unknown as { echoed_idempotency_key?: string | null };
     expect(withoutKey.echoed_idempotency_key).toBeNull();
+  });
+
+  it("forwards the optional parent message id on stream_begin", async () => {
+    const parentMessageIdHex = HEX32("dd");
+    const withParent = (await client.streamBegin(HEX32("aa"), HEX32("cc"), {
+      parentMessageIdHex,
+    })) as unknown as { echoed_parent_message_id_hex?: string | null };
+    expect(withParent.echoed_parent_message_id_hex).toBe(parentMessageIdHex);
+
+    const withoutParent = (await client.streamBegin(
+      HEX32("aa"),
+      HEX32("cc"),
+    )) as unknown as { echoed_parent_message_id_hex?: string | null };
+    expect(withoutParent.echoed_parent_message_id_hex).toBeNull();
   });
 
   it("deletes a message and returns the deletion event ids", async () => {

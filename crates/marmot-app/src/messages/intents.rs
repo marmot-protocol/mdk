@@ -8,8 +8,8 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
-    STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_ROUTE_TAG,
-    STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
+    STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG,
+    STREAM_PARENT_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
 };
 use nostr::nips::nip21::Nip21;
 use serde_json::{Map, Value, json};
@@ -184,6 +184,7 @@ pub(crate) enum AppMessageIntent {
     },
     StreamStart {
         stream_id: Vec<u8>,
+        parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
     },
     StreamFinal {
@@ -343,6 +344,7 @@ pub(crate) fn build_inner_event(
         }
         AppMessageIntent::StreamStart {
             stream_id,
+            parent_message_id,
             quic_candidates,
         } => {
             let stream_id_hex = hex::encode(stream_id);
@@ -367,6 +369,12 @@ pub(crate) fn build_inner_event(
                 ],
                 vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
             ];
+            if let Some(parent_message_id) = parent_message_id {
+                tags.push(vec![
+                    STREAM_PARENT_TAG.to_owned(),
+                    normalize_stream_parent_message_id(parent_message_id)?,
+                ]);
+            }
             tags.extend(
                 brokers
                     .into_iter()
@@ -541,6 +549,20 @@ fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+fn normalize_stream_parent_message_id(parent_message_id: &str) -> Result<String, AppError> {
+    let raw = hex::decode(parent_message_id).map_err(|_| {
+        AppError::InvalidAppMessagePayload(
+            "agent text stream parent message id must be 32-byte hex".into(),
+        )
+    })?;
+    if raw.len() != 32 {
+        return Err(AppError::InvalidAppMessagePayload(
+            "agent text stream parent message id must be 32-byte hex".into(),
+        ));
+    }
+    Ok(hex::encode(raw))
 }
 
 fn validate_non_empty_field(value: &str, field: &str) -> Result<String, AppError> {
