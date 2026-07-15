@@ -1170,6 +1170,23 @@ fn inspect_png(bytes: &[u8]) -> Result<InspectedImage, AppError> {
             if length != 26 || declared_frames.is_none() {
                 return Err(invalid_sticker("invalid APNG frame control"));
             }
+            let frame_width = be_u32(bytes, offset + 12)?;
+            let frame_height = be_u32(bytes, offset + 16)?;
+            let frame_x = be_u32(bytes, offset + 20)?;
+            let frame_y = be_u32(bytes, offset + 24)?;
+            if frame_width == 0
+                || frame_height == 0
+                || frame_width > MAX_STICKER_DIMENSION
+                || frame_height > MAX_STICKER_DIMENSION
+                || frame_x
+                    .checked_add(frame_width)
+                    .is_none_or(|right| right > width)
+                || frame_y
+                    .checked_add(frame_height)
+                    .is_none_or(|bottom| bottom > height)
+            {
+                return Err(invalid_sticker("APNG frame dimensions exceed canvas"));
+            }
             frame_controls = frame_controls
                 .checked_add(1)
                 .ok_or_else(|| invalid_sticker("sticker animation frame count exceeds limits"))?;
@@ -1394,11 +1411,11 @@ mod tests {
         chunk
     }
 
-    fn png_with_frame_controls(
+    fn png_with_frames(
         width: u32,
         height: u32,
         declared_frames: Option<u32>,
-        actual_frames: u32,
+        frames: &[(u32, u32, u32, u32)],
     ) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         let mut ihdr = Vec::new();
@@ -1412,20 +1429,23 @@ mod tests {
             actl.extend_from_slice(&0_u32.to_be_bytes());
             bytes.extend(chunk(b"acTL", &actl));
         }
-        for _ in 0..actual_frames {
-            bytes.extend(chunk(b"fcTL", &[0; 26]));
+        for (sequence, (frame_width, frame_height, frame_x, frame_y)) in frames.iter().enumerate() {
+            let mut frame_control = Vec::with_capacity(26);
+            frame_control.extend_from_slice(&(sequence as u32).to_be_bytes());
+            frame_control.extend_from_slice(&frame_width.to_be_bytes());
+            frame_control.extend_from_slice(&frame_height.to_be_bytes());
+            frame_control.extend_from_slice(&frame_x.to_be_bytes());
+            frame_control.extend_from_slice(&frame_y.to_be_bytes());
+            frame_control.extend_from_slice(&[0; 6]);
+            bytes.extend(chunk(b"fcTL", &frame_control));
         }
         bytes.extend(chunk(b"IEND", &[]));
         bytes
     }
 
     fn png(width: u32, height: u32, animation_frames: Option<u32>) -> Vec<u8> {
-        png_with_frame_controls(
-            width,
-            height,
-            animation_frames,
-            animation_frames.unwrap_or_default(),
-        )
+        let frames = vec![(width, height, 0, 0); animation_frames.unwrap_or_default() as usize];
+        png_with_frames(width, height, animation_frames, &frames)
     }
 
     #[test]
@@ -1621,16 +1641,27 @@ mod tests {
         );
         assert!(inspect_image(&png(4097, 1, None)).is_err());
         assert!(inspect_image(&png(32, 32, Some(MAX_STICKER_ANIMATION_FRAMES + 1))).is_err());
-        assert!(inspect_image(&png_with_frame_controls(32, 32, Some(1), 2)).is_err());
         assert!(
-            inspect_image(&png_with_frame_controls(
+            inspect_image(&png_with_frames(
                 32,
                 32,
                 Some(1),
-                MAX_STICKER_ANIMATION_FRAMES + 1,
+                &[(32, 32, 0, 0), (32, 32, 0, 0)],
             ))
             .is_err()
         );
+        assert!(
+            inspect_image(&png_with_frames(
+                32,
+                32,
+                Some(1),
+                &vec![(32, 32, 0, 0); MAX_STICKER_ANIMATION_FRAMES as usize + 1],
+            ))
+            .is_err()
+        );
+        assert!(inspect_image(&png_with_frames(32, 32, Some(1), &[(0, 32, 0, 0)])).is_err());
+        assert!(inspect_image(&png_with_frames(32, 32, Some(1), &[(33, 32, 0, 0)])).is_err());
+        assert!(inspect_image(&png_with_frames(32, 32, Some(1), &[(16, 16, 17, 0)])).is_err());
         assert!(inspect_image(b"not an image").is_err());
     }
 

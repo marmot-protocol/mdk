@@ -419,11 +419,10 @@ impl MarmotRelayPlane {
             if client.add_relay(relay_url.clone()).await.is_err() {
                 continue;
             }
-            if let Ok(Ok(_)) = timeout(
-                DIRECTORY_RELAY_CONNECT_WAIT,
-                client.connect_relay(relay_url.clone()),
-            )
-            .await
+            if client
+                .try_connect_relay(relay_url.clone(), DIRECTORY_RELAY_CONNECT_WAIT)
+                .await
+                .is_ok()
             {
                 connected_relays.push(relay_url);
             }
