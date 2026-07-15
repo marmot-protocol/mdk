@@ -321,8 +321,8 @@ impl MarmotApp {
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        flush_sticker_outbox(self, &context).await?;
         refresh_installed_base(self, &context).await?;
+        tolerate_offline(flush_sticker_outbox(self, &context).await)?;
 
         let filter = Filter::new()
             .kind(Kind::Custom(STICKER_PACK_KIND))
@@ -365,7 +365,6 @@ impl MarmotApp {
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        flush_sticker_outbox(self, &context).await?;
         fetch_pack_into_storage(self, &context, &coordinate).await?;
         app_pack_for_context(&context, &coordinate)
     }
@@ -379,7 +378,7 @@ impl MarmotApp {
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        tolerate_offline(flush_sticker_outbox(self, &context).await)?;
+        rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
         if context.storage.sticker_pack(&coordinate)?.is_none() {
             fetch_pack_into_storage(self, &context, &coordinate).await?;
         } else {
@@ -392,7 +391,8 @@ impl MarmotApp {
                     .map(|_| ()),
             )?;
         }
-        tolerate_offline(refresh_installed_base(self, &context).await)?;
+        let desired = context.storage.desired_installed_sticker_packs()?;
+        validate_install_capacity(&desired, &coordinate)?;
         context
             .storage
             .enqueue_sticker_install_operation(&coordinate, true, unix_now_seconds())?;
@@ -409,8 +409,7 @@ impl MarmotApp {
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        tolerate_offline(flush_sticker_outbox(self, &context).await)?;
-        tolerate_offline(refresh_installed_base(self, &context).await)?;
+        rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
         context.storage.enqueue_sticker_install_operation(
             &coordinate,
             false,
@@ -439,7 +438,6 @@ impl MarmotApp {
         }
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        flush_sticker_outbox(self, &context).await?;
 
         let imported = sonar_stickers::signal::import_signal_pack(signal_link.as_str())
             .await
@@ -507,7 +505,8 @@ impl MarmotApp {
             None,
         )
         .map_err(|_| invalid_sticker("imported sticker pack is invalid"))?;
-        let created_at = next_publication_timestamp(&context.storage)?;
+        let coordinate = pack.address.coordinate();
+        let created_at = next_pack_publication_timestamp(&context.storage, &coordinate)?;
         let event = sign_public_event(
             &context,
             STICKER_PACK_KIND,
@@ -516,12 +515,13 @@ impl MarmotApp {
         )
         .await?;
         publish_outboxed_event(self, &context, &event).await?;
-        let coordinate = pack.address.coordinate();
         // The newly published pack is already durable locally. A transient
         // relay read must not prevent recording the user's install intent;
         // the same pending-operation projection used by normal installs will
         // reconcile it on the next sync.
         tolerate_offline(refresh_installed_base(self, &context).await)?;
+        let desired = context.storage.desired_installed_sticker_packs()?;
+        validate_install_capacity(&desired, &coordinate)?;
         context
             .storage
             .enqueue_sticker_install_operation(&coordinate, true, unix_now_seconds())?;
@@ -622,6 +622,27 @@ fn ingest_pack_events(
     Ok(updated)
 }
 
+/// Refresh the remote installed-list winner before flushing any locally
+/// outboxed kind-10031 event. If the account is offline, leave both outbox and
+/// operations untouched so the next successful refresh can rebase first.
+async fn rebase_and_flush_sticker_outbox_best_effort(
+    app: &MarmotApp,
+    context: &StickerAccountContext,
+) -> Result<(), AppError> {
+    match refresh_installed_base(app, context).await {
+        Ok(()) => tolerate_offline(flush_sticker_outbox(app, context).await),
+        Err(AppError::StickerRelay(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_install_capacity(desired: &[String], coordinate: &str) -> Result<(), AppError> {
+    if desired.len() >= MAX_INSTALLED_PACKS && !desired.iter().any(|pack| pack == coordinate) {
+        return Err(invalid_sticker("too many installed sticker packs"));
+    }
+    Ok(())
+}
+
 async fn refresh_installed_base(
     app: &MarmotApp,
     context: &StickerAccountContext,
@@ -695,13 +716,15 @@ async fn publish_pending_installed_list(
         context,
         USER_STICKER_PACKS_KIND,
         build_installed_packs_tags(&InstalledPackList::new(addresses)),
-        next_publication_timestamp(&context.storage)?,
+        next_installed_list_publication_timestamp(&context.storage)?,
     )
     .await?;
     publish_outboxed_event(app, context, &event).await
 }
 
-fn next_publication_timestamp(storage: &SqliteAccountStorage) -> Result<u64, AppError> {
+fn next_installed_list_publication_timestamp(
+    storage: &SqliteAccountStorage,
+) -> Result<u64, AppError> {
     let now = unix_now_seconds();
     let installed_created_at = storage
         .installed_sticker_state()?
@@ -717,15 +740,61 @@ fn next_publication_timestamp(storage: &SqliteAccountStorage) -> Result<u64, App
         .into_iter()
         .chain(outbox_created_at)
         .max();
+    next_monotonic_publication_timestamp(
+        now,
+        latest,
+        "installed-list timestamp is too far in the future",
+    )
+}
+
+fn next_pack_publication_timestamp(
+    storage: &SqliteAccountStorage,
+    coordinate: &str,
+) -> Result<u64, AppError> {
+    let now = unix_now_seconds();
+    let stored_created_at = storage
+        .sticker_pack(coordinate)?
+        .map(|pack| pack.version.created_at);
+    let mut outbox_created_at: Option<u64> = None;
+    for pending in storage
+        .sticker_outbox_events()?
+        .into_iter()
+        .filter(|event| event.kind == u64::from(STICKER_PACK_KIND))
+    {
+        let Ok(event) = Event::from_json(&pending.event_json) else {
+            continue;
+        };
+        let Ok(pack) = parse_pack_event(&event) else {
+            continue;
+        };
+        if pack.address.coordinate() == coordinate {
+            outbox_created_at = Some(
+                outbox_created_at
+                    .unwrap_or_default()
+                    .max(event.created_at.as_secs()),
+            );
+        }
+    }
+    next_monotonic_publication_timestamp(
+        now,
+        stored_created_at.into_iter().chain(outbox_created_at).max(),
+        "sticker-pack timestamp is too far in the future",
+    )
+}
+
+fn next_monotonic_publication_timestamp(
+    now: u64,
+    latest: Option<u64>,
+    future_error: &'static str,
+) -> Result<u64, AppError> {
     let Some(latest) = latest else {
         return Ok(now);
     };
-    if latest > now.saturating_add(MAX_FUTURE_EVENT_SKEW_SECONDS) {
-        return Err(invalid_sticker(
-            "installed-list timestamp is too far in the future",
-        ));
+    let next = now.max(latest.saturating_add(1));
+    if next > now.saturating_add(MAX_FUTURE_EVENT_SKEW_SECONDS) {
+        return Err(invalid_sticker(future_error));
     }
-    Ok(now.max(latest.saturating_add(1)))
+    Ok(next)
 }
 
 async fn sign_public_event(
@@ -795,6 +864,13 @@ async fn flush_sticker_outbox(
     app: &MarmotApp,
     context: &StickerAccountContext,
 ) -> Result<(), AppError> {
+    // Kind-10031 outbox events are snapshots of an older remote base plus the
+    // still-persisted local operations. Never replay that snapshot verbatim
+    // after a refresh: even a lower-timestamp remote winner may contain packs
+    // that were unknown when the snapshot was signed. Keep the operations and
+    // let `publish_pending_installed_list` re-sign the freshly rebased desired
+    // list. Pack events are self-contained and remain safe to replay.
+    discard_outboxed_installed_lists(&context.storage)?;
     for pending in context.storage.sticker_outbox_events()? {
         let event = Event::from_json(&pending.event_json)
             .map_err(|_| invalid_sticker("stored sticker publication is invalid"))?;
@@ -809,6 +885,15 @@ async fn flush_sticker_outbox(
         context
             .storage
             .clear_sticker_outbox_event(&pending.event_id_hex)?;
+    }
+    Ok(())
+}
+
+fn discard_outboxed_installed_lists(storage: &SqliteAccountStorage) -> Result<(), AppError> {
+    for pending in storage.sticker_outbox_events()? {
+        if pending.kind == u64::from(USER_STICKER_PACKS_KIND) {
+            storage.clear_sticker_outbox_event(&pending.event_id_hex)?;
+        }
     }
     Ok(())
 }
@@ -1368,6 +1453,65 @@ mod tests {
         assert!(
             validate_signal_sticker_link("https://signal.art/addstickers/#pack_id=abc").is_err()
         );
+    }
+
+    #[test]
+    fn install_capacity_rejects_only_a_new_pack_at_the_limit() {
+        let installed = (0..MAX_INSTALLED_PACKS)
+            .map(|index| format!("pack-{index}"))
+            .collect::<Vec<_>>();
+        assert!(validate_install_capacity(&installed, "pack-new").is_err());
+        assert!(validate_install_capacity(&installed, "pack-0").is_ok());
+    }
+
+    #[test]
+    fn outboxed_installed_snapshot_is_discarded_without_clearing_rebase_operations() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        storage
+            .enqueue_sticker_install_operation("pack-b", true, 6)
+            .unwrap();
+        storage
+            .put_sticker_outbox_event(&StoredStickerOutboxEvent {
+                event_id_hex: "ef".repeat(32),
+                kind: u64::from(USER_STICKER_PACKS_KIND),
+                event_json: "{}".to_owned(),
+                created_at: 7,
+            })
+            .unwrap();
+
+        discard_outboxed_installed_lists(&storage).unwrap();
+
+        assert!(storage.sticker_outbox_events().unwrap().is_empty());
+        assert_eq!(storage.sticker_install_operations().unwrap().len(), 1);
+        assert_eq!(
+            storage.desired_installed_sticker_packs().unwrap(),
+            vec!["pack-b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn pack_republication_timestamp_advances_past_same_second_version() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let created_at = unix_now_seconds();
+        let coordinate = coordinate();
+        storage
+            .replace_sticker_pack_if_newer(&StoredStickerPack {
+                coordinate: coordinate.clone(),
+                author_pubkey_hex: "ab".repeat(32),
+                identifier: "cats".to_owned(),
+                version: StoredStickerPackVersion {
+                    event_id_hex: "cd".repeat(32),
+                    created_at,
+                },
+                title: "Cats".to_owned(),
+                description: None,
+                cover: None,
+                stickers: Vec::new(),
+                license: None,
+            })
+            .unwrap();
+
+        assert!(next_pack_publication_timestamp(&storage, &coordinate).unwrap() > created_at);
     }
 
     #[test]

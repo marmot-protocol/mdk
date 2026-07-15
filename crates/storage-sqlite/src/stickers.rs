@@ -138,9 +138,9 @@ impl SqliteAccountStorage {
         sticker_pack_tx(&conn, coordinate)
     }
 
-    /// Return pre-shaped packs. `installed_only` filters through the persisted
-    /// installed-list projection; search is bounded by the caller-supplied
-    /// limit and matches only non-secret public metadata.
+    /// Return pre-shaped packs. `installed_only` filters through the committed
+    /// installed-list projection with pending local operations rebased over it;
+    /// search is bounded and matches only non-secret public metadata.
     pub fn sticker_packs(
         &self,
         installed_only: bool,
@@ -149,44 +149,36 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Vec<StoredStickerPack>> {
         let conn = self.lock()?;
         let limit = limit.clamp(1, 200);
-        let search = search.map(str::trim).filter(|value| !value.is_empty());
-        let coordinates = match (installed_only, search) {
-            (true, Some(search)) => {
-                let pattern = format!("%{}%", search.to_ascii_lowercase());
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT packs.coordinate
-                         FROM app_installed_sticker_packs installed
-                         JOIN app_sticker_packs packs
-                           ON packs.coordinate = installed.pack_coordinate
-                         WHERE lower(packs.title) LIKE ?1
-                            OR lower(COALESCE(packs.description, '')) LIKE ?1
-                         ORDER BY installed.position ASC, packs.coordinate ASC
-                         LIMIT ?2",
-                    )
-                    .storage()?;
-                stmt.query_map(params![pattern, usize_to_i64(limit)?], |row| row.get(0))
-                    .storage()?
-                    .collect::<Result<Vec<String>, _>>()
-                    .storage()?
+        let search = search
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        if installed_only {
+            let mut packs = Vec::new();
+            for coordinate in desired_installed_sticker_packs_tx(&conn)? {
+                let Some(pack) = sticker_pack_tx(&conn, &coordinate)? else {
+                    continue;
+                };
+                if search.as_ref().is_some_and(|needle| {
+                    !pack.title.to_ascii_lowercase().contains(needle)
+                        && !pack
+                            .description
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .contains(needle)
+                }) {
+                    continue;
+                }
+                packs.push(pack);
+                if packs.len() == limit {
+                    break;
+                }
             }
-            (true, None) => {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT packs.coordinate
-                         FROM app_installed_sticker_packs installed
-                         JOIN app_sticker_packs packs
-                           ON packs.coordinate = installed.pack_coordinate
-                         ORDER BY installed.position ASC, packs.coordinate ASC
-                         LIMIT ?1",
-                    )
-                    .storage()?;
-                stmt.query_map(params![usize_to_i64(limit)?], |row| row.get(0))
-                    .storage()?
-                    .collect::<Result<Vec<String>, _>>()
-                    .storage()?
-            }
-            (false, Some(search)) => {
+            return Ok(packs);
+        }
+        let coordinates = match search {
+            Some(search) => {
                 let pattern = format!("%{}%", search.to_ascii_lowercase());
                 let mut stmt = conn
                     .prepare(
@@ -202,7 +194,7 @@ impl SqliteAccountStorage {
                     .collect::<Result<Vec<String>, _>>()
                     .storage()?
             }
-            (false, None) => {
+            None => {
                 let mut stmt = conn
                     .prepare(
                         "SELECT coordinate FROM app_sticker_packs
@@ -297,14 +289,7 @@ impl SqliteAccountStorage {
 
     pub fn desired_installed_sticker_packs(&self) -> StorageResult<Vec<String>> {
         let conn = self.lock()?;
-        let mut packs = installed_sticker_state_tx(&conn)?.packs;
-        for operation in sticker_install_operations_tx(&conn)? {
-            packs.retain(|coordinate| coordinate != &operation.pack_coordinate);
-            if operation.installed {
-                packs.push(operation.pack_coordinate);
-            }
-        }
-        Ok(deduplicated(packs))
+        desired_installed_sticker_packs_tx(&conn)
     }
 
     /// Commit a successfully published installed-list event and clear the local
@@ -524,6 +509,17 @@ fn installed_sticker_state_tx(conn: &Connection) -> StorageResult<StoredInstalle
     Ok(StoredInstalledStickerState { version, packs })
 }
 
+fn desired_installed_sticker_packs_tx(conn: &Connection) -> StorageResult<Vec<String>> {
+    let mut packs = installed_sticker_state_tx(conn)?.packs;
+    for operation in sticker_install_operations_tx(conn)? {
+        packs.retain(|coordinate| coordinate != &operation.pack_coordinate);
+        if operation.installed {
+            packs.push(operation.pack_coordinate);
+        }
+    }
+    Ok(deduplicated(packs))
+}
+
 fn replace_installed_sticker_packs_tx(
     conn: &Connection,
     version: &StoredStickerPackVersion,
@@ -708,6 +704,72 @@ mod tests {
                 .unwrap()
         );
         assert!(store.sticker_install_operations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn installed_only_listing_reflects_pending_local_operations() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let stored_pack = pack(&"bb".repeat(32), 10, &"11".repeat(32));
+        store.replace_sticker_pack_if_newer(&stored_pack).unwrap();
+
+        store
+            .enqueue_sticker_install_operation(&stored_pack.coordinate, true, 11)
+            .unwrap();
+        assert_eq!(
+            store
+                .sticker_packs(true, None, 100)
+                .unwrap()
+                .into_iter()
+                .map(|pack| pack.coordinate)
+                .collect::<Vec<_>>(),
+            vec![stored_pack.coordinate.clone()]
+        );
+
+        store
+            .enqueue_sticker_install_operation(&stored_pack.coordinate, false, 12)
+            .unwrap();
+        assert!(store.sticker_packs(true, None, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_outbox_commit_cannot_clear_operations_rebased_over_newer_remote() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let base = StoredStickerPackVersion {
+            event_id_hex: "cc".repeat(32),
+            created_at: 5,
+        };
+        store
+            .replace_installed_sticker_packs_if_newer(&base, &["pack-a".to_owned()])
+            .unwrap();
+        store
+            .enqueue_sticker_install_operation("pack-b", true, 6)
+            .unwrap();
+
+        let remote = StoredStickerPackVersion {
+            event_id_hex: "dd".repeat(32),
+            created_at: 8,
+        };
+        store
+            .replace_installed_sticker_packs_if_newer(&remote, &["pack-c".to_owned()])
+            .unwrap();
+
+        let stale_outbox = StoredStickerPackVersion {
+            event_id_hex: "ee".repeat(32),
+            created_at: 7,
+        };
+        assert!(
+            !store
+                .commit_installed_sticker_publication(
+                    &stale_outbox,
+                    &["pack-a".to_owned(), "pack-b".to_owned()],
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.desired_installed_sticker_packs().unwrap(),
+            vec!["pack-c".to_owned(), "pack-b".to_owned()]
+        );
+        assert_eq!(store.sticker_install_operations().unwrap().len(), 1);
     }
 
     #[test]
