@@ -567,6 +567,17 @@ impl HarnessClient {
 
     /// Invite new members to the default group.
     pub async fn invite(&mut self, kps: Vec<KeyPackage>) -> PendingStateRef {
+        self.try_invite(kps).await.expect("send invite")
+    }
+
+    /// Invite new members to the default group, surfacing the engine error
+    /// instead of panicking. Nothing reaches the bus on failure. Used by
+    /// scenarios that deliberately fail an invite during commit staging
+    /// (e.g. the phantom committed-from regression).
+    pub async fn try_invite(
+        &mut self,
+        kps: Vec<KeyPackage>,
+    ) -> Result<PendingStateRef, EngineError> {
         let gid = self.default_group.clone().expect("group");
         let res = self
             .engine
@@ -574,8 +585,7 @@ impl HarnessClient {
                 group_id: gid.clone(),
                 key_packages: kps,
             })
-            .await
-            .expect("send invite");
+            .await?;
         match res {
             SendResult::GroupEvolution {
                 msg,
@@ -589,9 +599,11 @@ impl HarnessClient {
                     self.bus.send(self.bus_id, w);
                 }
                 self.bus.send(self.bus_id, route(msg, &gid));
-                pending
+                Ok(pending)
             }
-            other => panic!("expected GroupEvolution, got {other:?}"),
+            other => Err(EngineError::Other(format!(
+                "expected GroupEvolution, got {other:?}"
+            ))),
         }
     }
 
