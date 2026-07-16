@@ -18,6 +18,13 @@
 //! below-floor probe should start arriving (via backfill) and this file's
 //! expectations must be updated accordingly.
 //!
+//! Epoch-gap backfill has since landed, splitting this file in two:
+//! `cold_restart_since_floor_permanently_drops_backlog_below_it` still pins the
+//! UNARMED floor-drop (one undecryptable probe stays under the backfill
+//! threshold, so it stays dropped forever), while
+//! `stalled_epoch_backfill_recovers_below_floor_backlog_when_armed` pins the
+//! ARMED recovery of below-floor backlog through the full-history backfill.
+//!
 //! # Why one account per store
 //!
 //! `MarmotRelayPlane` runs one shared router per `MarmotApp`/store
@@ -98,13 +105,19 @@ use nostr_sdk::prelude::{
 };
 use tokio::time::sleep;
 use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
 /// Mirrors `marmot_app::lib.rs`'s private `APP_RUNTIME_RELAY_REBUILD_LOOKBACK`
 /// (120s). Not importable (crate-private); every production runtime plane
 /// uses this exact fixed value, so the test must match it, not merely be
 /// consistent with itself.
 const REBUILD_LOOKBACK_SECS: u64 = 120;
+
+/// Mirrors `marmot_app::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD`
+/// (crate-private, hence mirrored): the number of distinct undecryptable
+/// messages a group must accumulate at one stalled epoch before the runtime
+/// arms a full-history epoch-gap backfill.
+const BACKFILL_THRESHOLD: usize = 8;
 
 /// How long a cold boot's initial catch-up is allowed to take before this
 /// test gives up waiting for it. Generous relative to the crate's own
@@ -187,32 +200,62 @@ async fn inbound_events_delivered(app: &MarmotApp) -> usize {
     app.relay_telemetry().await.metrics.inbound_events_delivered
 }
 
+/// Poll delivery telemetry until at least `target` inbound events have been
+/// routed to the account, failing at `CATCH_UP_DEADLINE`. A behavioral await
+/// on observable state: the epoch-gap backfill replay runs *after* the initial
+/// catch-up op is recorded, so `wait_for_first_catch_up` alone cannot see it —
+/// the delivered count is the signal that the replay has landed.
+async fn wait_for_inbound_delivered(app: &MarmotApp, target: usize) {
+    let deadline = Instant::now() + CATCH_UP_DEADLINE;
+    loop {
+        let delivered = inbound_events_delivered(app).await;
+        if delivered >= target {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "inbound deliveries stalled at {delivered}, expected at least \
+             {target} within the deadline",
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Publish a kind-445 group-message event at the wire level with a fresh,
 /// arbitrary (non-member) ephemeral signing key and a caller-chosen
 /// `created_at`. This is legitimate wire traffic, not a forged event: real
 /// kind-445 senders are always a fresh per-event key, never the sender's
 /// Marmot account identity. This mirrors the existing `signed_group_event_dto`
-/// precedent in `transport-nostr-adapter/src/sdk_client.rs`'s own tests. The
-/// content is undecryptable garbage — this test exercises delivery, not
-/// decryption.
+/// precedent in `transport-nostr-adapter/src/sdk_client.rs`'s own tests.
+///
+/// The content is an *envelope-shaped* undecryptable probe. Per
+/// `spec/transports/nostr.md`, kind-445 content is `base64(nonce ||
+/// ciphertext)`; the probe carries a zero nonce plus marker bytes that
+/// authenticate under no key, so the recipient peels it to a clean
+/// `PeelerError::DecryptFailed` — the same shape as real traffic sealed under
+/// an exporter secret this device does not hold, and the shape the epoch-stall
+/// detector counts as `IngestOutcome::Stale { reason: PeelFailed }`. (A
+/// shorter-than-envelope body would instead be `Malformed`, a hard ingest
+/// error rather than an undecryptable-message observation.)
 async fn publish_garbage_group_message_at(
     relay_url: &str,
     nostr_group_id_hex: &str,
     created_at: u64,
     marker: &str,
 ) {
+    // 12-byte zero nonce, then the marker as the unauthenticatable ciphertext.
+    let mut envelope = vec![0u8; 12];
+    envelope.extend_from_slice(format!("since-floor-probe:{marker}").as_bytes());
+    assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
     let ephemeral = Keys::generate();
-    let signed = EventBuilder::new(
-        Kind::MlsGroupMessage,
-        BASE64_STANDARD.encode(format!("since-floor-probe:{marker}").as_bytes()),
-    )
-    .tags([Tag::custom(
-        TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-        [nostr_group_id_hex.to_owned()],
-    )])
-    .custom_created_at(NostrTimestamp::from_secs(created_at))
-    .sign_with_keys(&ephemeral)
-    .expect("sign ephemeral kind-445 test event");
+    let signed = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(envelope))
+        .tags([Tag::custom(
+            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+            [nostr_group_id_hex.to_owned()],
+        )])
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .sign_with_keys(&ephemeral)
+        .expect("sign ephemeral kind-445 test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
     let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
@@ -353,6 +396,185 @@ async fn cold_restart_since_floor_permanently_drops_backlog_below_it() {
         "a second, independent cold restart must still never deliver the \
          below-floor probe: the miss is permanent, not a one-off timing \
          fluke (the permanent-drop property)",
+    );
+    runtime_bob_boot3.shutdown().await;
+}
+
+/// The armed counterpart to
+/// [`cold_restart_since_floor_permanently_drops_backlog_below_it`]: with enough
+/// undecryptable traffic at a stalled epoch, epoch-gap backfill recovers the
+/// backlog the rebuilt subscription's since floor would otherwise drop forever.
+///
+/// The probes play two distinct roles on either side of the floor:
+///
+/// - **Arming** (`arm-0`..`arm-7`, above the floor): the cold boot's ordinary
+///   floored catch-up delivers them, each fails to peel, and — being distinct
+///   event ids — each counts as a distinct undecryptable message at bob's
+///   stalled epoch. The eighth crosses `EPOCH_STALL_BACKFILL_THRESHOLD` and
+///   arms a full-history transport replay (`since = None`).
+/// - **Recovery target** (`below-target`, below the floor): the floored
+///   catch-up can never deliver it; the only path to ingest is the unfloored
+///   backfill replay the arming probes trigger.
+///
+/// Boot 2 pins the heal itself. Boot 3 pins that the heal is *durable and
+/// debounced*: ingested event ids persist in the account's seen-event state,
+/// so a later cold boot neither re-arms the detector nor replays full history
+/// again — recovery costs one backfill, not one per boot.
+#[tokio::test]
+async fn stalled_epoch_backfill_recovers_below_floor_backlog_when_armed() {
+    let (_relay, url) = mock_relay().await;
+
+    // Same one-account-per-store split as the floor-drop test above.
+    let dir_bob = tempfile::tempdir().unwrap();
+    let home_bob = AccountHome::open(dir_bob.path());
+    home_bob.create_account("bob").unwrap();
+    let bob_id = home_bob.account("bob").unwrap().account_id_hex;
+
+    let dir_alice = tempfile::tempdir().unwrap();
+    let home_alice = AccountHome::open(dir_alice.path());
+    home_alice.create_account("alice").unwrap();
+    let app_alice = open_store(&dir_alice, &url);
+
+    // --- boot 1: bob live, joins the group, receives one ordinary message ---
+    let app_bob_boot1 = open_store(&dir_bob, &url);
+    {
+        let mut bob_setup = app_bob_boot1.client("bob").await.unwrap();
+        bob_setup.publish_key_package().await.unwrap();
+    }
+    let runtime_bob_boot1 = MarmotAppRuntime::new(app_bob_boot1.clone());
+    let mut events_bob_boot1 = runtime_bob_boot1.subscribe();
+    runtime_bob_boot1.start().await.unwrap();
+
+    let mut alice_client = app_alice.client("alice").await.unwrap();
+    let group_id = alice_client
+        .create_group("epoch-gap backfill recovery", &[bob_id.as_str()])
+        .await
+        .unwrap();
+    wait_for_event(&mut events_bob_boot1, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == &bob_id && joined == &group_id
+        )
+    })
+    .await;
+
+    alice_client
+        .send(&group_id, b"ordinary traffic advances the cursor")
+        .await
+        .unwrap();
+    wait_for_event(&mut events_bob_boot1, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::MessageReceived(message)
+                if message.account_id_hex == bob_id
+                    && message.message.group_id == group_id
+                    && message.message.plaintext == "ordinary traffic advances the cursor"
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let nostr_group_id_hex = app_bob_boot1
+        .group("bob", &group_id_hex)
+        .unwrap()
+        .expect("bob's group projection")
+        .nostr_routing
+        .nostr_group_id_hex;
+
+    // Measured, not assumed, exactly as in the floor-drop test: how many
+    // deliveries a fresh cold boot legitimately re-fetches (the welcome and
+    // the one ordinary message).
+    let legitimate_delivery_count = inbound_events_delivered(&app_bob_boot1).await;
+
+    // Same floor placement as the floor-drop test above.
+    let reference_now = test_unix_now_seconds();
+    let floor_estimate = reference_now.saturating_sub(REBUILD_LOOKBACK_SECS);
+    let below_floor_created_at = floor_estimate.saturating_sub(180);
+    let above_floor_created_at = floor_estimate.saturating_add(60);
+    assert!(above_floor_created_at < reference_now);
+
+    // bob must be fully offline before any probe is published (see the module
+    // doc comment on live subscriptions ignoring `since`).
+    runtime_bob_boot1.shutdown().await;
+
+    // The recovery target: below the floor, unreachable by any floored
+    // catch-up — only an unfloored backfill replay can deliver it.
+    publish_garbage_group_message_at(
+        &url,
+        &nostr_group_id_hex,
+        below_floor_created_at,
+        "below-target",
+    )
+    .await;
+    // The arming probes: above the floor, so the ordinary catch-up delivers
+    // them. Distinct markers make distinct event ids, hence distinct
+    // undecryptable messages at bob's stalled epoch.
+    for arm in 0..BACKFILL_THRESHOLD {
+        publish_garbage_group_message_at(
+            &url,
+            &nostr_group_id_hex,
+            above_floor_created_at,
+            &format!("arm-{arm}"),
+        )
+        .await;
+    }
+
+    // Expected exact delivery count for the armed cold boot:
+    //   legitimate_delivery_count — the catch-up re-fetches the welcome and
+    //                               the one ordinary message;
+    // + BACKFILL_THRESHOLD        — the above-floor arming probes arrive
+    //                               through the floored catch-up and arm the
+    //                               detector at bob's stalled epoch;
+    // + 1                         — the armed backfill's `since = None` replay
+    //                               recovers the below-floor probe.
+    // The unfloored replay re-serves every already-seen event too, but
+    // nostr-sdk emits an `Event` notification only for events new to its
+    // database, so re-fetches are not re-counted and the total is exact — a
+    // higher count would mean double-counted replays, a lower one a dropped
+    // probe.
+    let expected_healed = legitimate_delivery_count + BACKFILL_THRESHOLD + 1;
+
+    // --- boot 2: cold restart; catch-up arms the detector, backfill heals ---
+    let app_bob_boot2 = open_store(&dir_bob, &url);
+    let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2.clone());
+    runtime_bob_boot2.start().await.unwrap();
+    wait_for_first_catch_up(&runtime_bob_boot2).await;
+    wait_for_inbound_delivered(&app_bob_boot2, expected_healed).await;
+    // Settle grace so any spurious extra delivery lands before the
+    // exact-equality check (mirrors the floor-drop test's settle).
+    sleep(TELEMETRY_SETTLE_GRACE).await;
+    assert_eq!(
+        inbound_events_delivered(&app_bob_boot2).await,
+        expected_healed,
+        "an armed cold boot must deliver exactly the legitimate re-fetches, \
+         the arming probes, and — via the epoch-gap backfill replay — the \
+         below-floor probe, with no replayed duplicate re-counted",
+    );
+    runtime_bob_boot2.shutdown().await;
+
+    // --- boot 3: the heal is durable, not a per-boot replay storm. Boot 2
+    // consumed the arming evidence (ingested event ids persist in the
+    // account's seen-event state and are skipped before ingest), so this
+    // independent cold boot re-fetches the above-floor history at the
+    // transport layer without re-arming the per-boot, in-memory detector: no
+    // second full-history replay fires, and the below-floor probe — already
+    // recovered once — stays below the rebuilt floor without being
+    // re-delivered. Exactly the legitimate re-fetches plus the eight
+    // above-floor probes arrive, and nothing else. ---
+    let expected_after_heal = legitimate_delivery_count + BACKFILL_THRESHOLD;
+    let app_bob_boot3 = open_store(&dir_bob, &url);
+    let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3.clone());
+    runtime_bob_boot3.start().await.unwrap();
+    wait_for_first_catch_up(&runtime_bob_boot3).await;
+    wait_for_inbound_delivered(&app_bob_boot3, expected_after_heal).await;
+    sleep(TELEMETRY_SETTLE_GRACE).await;
+    assert_eq!(
+        inbound_events_delivered(&app_bob_boot3).await,
+        expected_after_heal,
+        "a cold boot after the heal must not replay full history again: the \
+         backfill is debounced by the durable seen-event state, so only the \
+         floored catch-up's above-floor re-fetches arrive",
     );
     runtime_bob_boot3.shutdown().await;
 }

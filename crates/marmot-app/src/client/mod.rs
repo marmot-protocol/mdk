@@ -44,10 +44,12 @@ use crate::{
 };
 
 mod audit;
+mod epoch_stall;
 mod projection;
 mod push;
 mod sync;
 
+use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 // Re-exported so the crate's `tests` module can keep calling
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
@@ -71,6 +73,13 @@ pub struct AppClient {
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
+    /// counts the distinct undecryptable messages a group accumulates at a
+    /// stalled epoch. Ephemeral session state, like the pending sets above.
+    pub(crate) epoch_stall: EpochStallDetector,
+    /// Set when [`epoch_stall`] arms a backfill during ingest; drained after the
+    /// sync by running the full-history transport replay.
+    pub(crate) epoch_backfill_pending: bool,
 }
 
 /// A point-in-time copy of the live session's read-only group projections
