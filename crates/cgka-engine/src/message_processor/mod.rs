@@ -883,9 +883,11 @@ impl<S: StorageProvider> Engine<S> {
                     reason: StaleReason::PeelFailed | StaleReason::Quarantined,
                 }) => {
                     // Still un-peelable, or the group is quarantined: leave the
-                    // row deferred. A terminal-after-peel `PeelFailed` already
-                    // retired its raw deferred row inside `ingest_group_message`
-                    // via `mark_raw_transport_message_failed_if_deferred`.
+                    // row in its retry state. A terminal-after-peel `PeelFailed`
+                    // (malformed, stale epoch with no snapshot) already retired
+                    // its raw row — `PeelDeferred` or `Retryable` alike — inside
+                    // `ingest_group_message` via
+                    // `mark_raw_transport_message_failed_if_awaiting_retry`.
                 }
                 Ok(_) => {
                     // Applied (`Processed`) or terminally reclassified

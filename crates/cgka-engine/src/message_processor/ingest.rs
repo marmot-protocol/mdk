@@ -357,7 +357,7 @@ impl<S: StorageProvider> Engine<S> {
                         // (if this came via the retry lifecycle) so it stops
                         // holding a per-group cap slot (mdk#339); a no-op on
                         // the direct path where no deferred row exists.
-                        self.mark_raw_transport_message_failed_if_deferred(
+                        self.mark_raw_transport_message_failed_if_awaiting_retry(
                             &raw_msg_id,
                             "stale_epoch_no_snapshot",
                         )?;
@@ -380,6 +380,27 @@ impl<S: StorageProvider> Engine<S> {
                         });
                     }
                 }
+                Err(PeelerError::Malformed(_)) => {
+                    // Structurally-invalid content is ordinary hostile input:
+                    // anyone can publish to the cleartext routing tag without
+                    // group membership, and no epoch context can ever peel it.
+                    // Terminal — propagating an error here would abort the
+                    // caller's whole transport drain on one garbage event,
+                    // starving every message queued behind it. Dropped
+                    // unpersisted for the same reason as the mdk#339 flood
+                    // cap: transport ids are attacker-controllable, so durable
+                    // rows keyed by them would grow without bound. Retire the
+                    // raw deferred row if this arrived via the retry
+                    // lifecycle; a no-op on the direct path.
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(
+                        &raw_msg_id,
+                        "malformed_payload",
+                    )?;
+                    self.seen_message_ids.insert(msg.id.clone());
+                    return Ok(IngestOutcome::Stale {
+                        reason: StaleReason::PeelFailed,
+                    });
+                }
                 Err(e) => return Err(EngineError::Peeler(e)),
             };
             let mls_bytes = match peeled.content {
@@ -388,7 +409,7 @@ impl<S: StorageProvider> Engine<S> {
                     // A group-message envelope that peels to a Welcome is
                     // malformed: terminal. Retire the raw deferred row first
                     // so its cap slot is released (mdk#339).
-                    self.mark_raw_transport_message_failed_if_deferred(
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(
                         &raw_msg_id,
                         "peeled_welcome_in_group_message",
                     )?;
@@ -461,7 +482,7 @@ impl<S: StorageProvider> Engine<S> {
                     // Peeled successfully but the MLS body is neither a
                     // public nor private message: terminal. Retire the raw
                     // deferred row so it leaves the retry lifecycle (mdk#339).
-                    self.mark_raw_transport_message_failed_if_deferred(
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(
                         &raw_msg_id,
                         "non_mls_message_body",
                     )?;
@@ -498,7 +519,7 @@ impl<S: StorageProvider> Engine<S> {
                         tag,
                     ),
                 );
-                self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
+                self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                 return Ok(IngestOutcome::Stale {
                     reason: StaleReason::PeelFailed,
                 });
@@ -577,7 +598,7 @@ impl<S: StorageProvider> Engine<S> {
                             .tag()
                     };
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -717,7 +738,7 @@ impl<S: StorageProvider> Engine<S> {
                         // Peeled successfully but terminally rejected: retire
                         // the raw deferred row so it leaves the retry
                         // lifecycle instead of holding a cap slot (mdk#339).
-                        self.mark_raw_transport_message_failed_if_deferred(
+                        self.mark_raw_transport_message_failed_if_awaiting_retry(
                             &raw_msg_id,
                             "unattributable_sender",
                         )?;
@@ -737,7 +758,7 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         // Peeled successfully but terminally rejected: retire
                         // the raw deferred row (mdk#339).
-                        self.mark_raw_transport_message_failed_if_deferred(
+                        self.mark_raw_transport_message_failed_if_awaiting_retry(
                             &raw_msg_id,
                             "invalid_app_payload",
                         )?;
@@ -1572,13 +1593,18 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    fn mark_raw_transport_message_failed_if_deferred(
+    fn mark_raw_transport_message_failed_if_awaiting_retry(
         &mut self,
         raw_msg_id: &MessageId,
         reason: &str,
     ) -> Result<(), EngineError> {
         match self.storage.get_message(raw_msg_id) {
-            Ok(record) if record.state == MessageState::PeelDeferred => {
+            Ok(record)
+                if matches!(
+                    record.state,
+                    MessageState::PeelDeferred | MessageState::Retryable
+                ) =>
+            {
                 self.storage
                     .update_message_state(raw_msg_id, MessageState::Failed)?;
                 self.audit_group(
@@ -1591,7 +1617,12 @@ impl<S: StorageProvider> Engine<S> {
                         reason,
                     ),
                 );
-                self.note_peel_deferred_row_retired(&record.group_id, raw_msg_id);
+                // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339);
+                // a `Retryable` row — input buffered pre-peel while the group
+                // could not ingest — sits outside the cap.
+                if record.state == MessageState::PeelDeferred {
+                    self.note_peel_deferred_row_retired(&record.group_id, raw_msg_id);
+                }
                 Ok(())
             }
             Ok(_) | Err(StorageError::NotFound) => Ok(()),

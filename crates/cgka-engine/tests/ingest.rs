@@ -55,6 +55,11 @@ struct RecordingPeeler {
 struct FailOncePeeler {
     failed: Mutex<HashSet<MessageId>>,
 }
+/// Structural minimum mirroring the production Nostr peeler's content-length
+/// gate: a payload too short to carry a nonce-prefixed ciphertext classifies
+/// as `Malformed` before any decryption attempt.
+const STRUCTURAL_MIN_PAYLOAD_LEN: usize = 28;
+struct MalformedShortPayloadPeeler;
 
 impl FailOncePeeler {
     fn new() -> Self {
@@ -197,6 +202,42 @@ impl TransportPeeler for FailOncePeeler {
         };
         if should_fail {
             return Err(PeelerError::DecryptFailed);
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for MalformedShortPayloadPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload.len() < STRUCTURAL_MIN_PAYLOAD_LEN {
+            return Err(PeelerError::Malformed(
+                "content too short for nonce-prefixed ciphertext".into(),
+            ));
         }
         MockPeeler.peel_group_message(msg, ctx).await
     }
@@ -473,6 +514,159 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
             |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"retry after peel")
         ),
         "expected retried message to emit after peel succeeds, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client_with_peeler(b"bob", Box::new(MalformedShortPayloadPeeler));
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // Anyone can publish to a group's cleartext routing tag without being a
+    // member, so structurally-invalid content is ordinary hostile input. It
+    // must classify as stale — never abort ingest, or one garbage event
+    // starves every message queued behind it in a transport drain.
+    let garbage = TransportMessage {
+        id: hash_id(b"malformed garbage"),
+        payload: b"too short".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(garbage)
+        .await
+        .expect("malformed input must classify as stale, not abort ingest");
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed
+            }
+        ),
+        "expected terminal PeelFailed for malformed content, got {outcome:?}"
+    );
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"after the garbage"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+    let after = bob.ingest(msg).await.unwrap();
+    assert!(matches!(after, IngestOutcome::Processed));
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after the garbage")
+        ),
+        "expected the message behind the garbage to still deliver, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_rollback() {
+    let mut alice =
+        build_client_with_peeler(b"alice-pending", Box::new(MalformedShortPayloadPeeler));
+    let mut bob = build_client(b"bob-pending");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    // Stage a commit so the group sits in PendingPublish — the window where
+    // inbound input is persisted `Retryable` for replay BEFORE the peeler
+    // ever classifies it.
+    let staged = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("doomed".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+
+    let garbage = TransportMessage {
+        id: hash_id(b"malformed garbage during pending publish"),
+        payload: b"too short".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let buffered = alice.ingest(garbage.clone()).await.unwrap();
+    assert!(
+        matches!(buffered, IngestOutcome::Buffered { .. }),
+        "pre-peel buffering during PendingPublish is the tested entry \
+         condition, got {buffered:?}"
+    );
+
+    // Rollback returns the group to Stable and replays the buffered backlog;
+    // the garbage now peels `Malformed` for the first time. The terminal
+    // contract: once classification has run, the attacker-keyed row must not
+    // stay in a non-terminal state that re-enters replay forever.
+    alice.publish_failed(staged).await.unwrap();
+    let after_replay = alice.ingest(garbage).await.unwrap();
+    assert!(
+        matches!(after_replay, IngestOutcome::Stale { .. }),
+        "a malformed message must land terminal once classified — a \
+         `Buffered` here means the stored row is still non-terminal and \
+         perpetually reported as pending, got {after_replay:?}"
     );
 }
 
