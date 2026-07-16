@@ -124,8 +124,14 @@ impl<S: StorageProvider> Engine<S> {
             parsed_kps.push(parsed);
         }
 
-        // Record the pre-commit epoch so a later same-epoch commit can be
-        // compared against this locally produced branch.
+        // The pre-commit epoch is the commit origin for fork detection.
+        // `committed_from` bookkeeping is deliberately NOT recorded here: it
+        // happens atomically inside `begin_pending` below, after staging
+        // succeeds. Recording it earlier left a phantom "we committed from
+        // this epoch" entry behind when staging failed (the cleanup guard
+        // clears the OpenMLS commit but nothing prunes `committed_from`),
+        // which later mis-routed legitimate sibling commits into
+        // fail-closed fork recovery.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         // Arm the cleanup guard before creating the snapshot so the snapshot is
         // released on early return / cancellation even before a pending commit
@@ -142,8 +148,6 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
             "pre_invite_commit",
         );
-        self.epoch_manager
-            .record_committed_from(&group_id, pre_commit_epoch);
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
@@ -464,8 +468,6 @@ impl<S: StorageProvider> Engine<S> {
         )?;
         let commit_priority =
             crate::app_components::commit_ordering_priority_for_staged(staged_commit);
-        self.epoch_manager
-            .record_committed_from(&group_id, pre_commit_epoch);
 
         let commit_bytes = commit_out
             .tls_serialize_detached()

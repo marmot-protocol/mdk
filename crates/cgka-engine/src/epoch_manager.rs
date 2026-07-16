@@ -243,15 +243,6 @@ impl EpochManager {
         Ok((group_id, prior_epoch))
     }
 
-    /// Record a committed-from epoch outside the begin_pending path (used
-    /// by the auto-committer, which doesn't go through PendingPublish).
-    pub(crate) fn record_committed_from(&mut self, group_id: &GroupId, epoch: EpochId) {
-        self.committed_from
-            .entry(group_id.clone())
-            .or_default()
-            .insert(epoch);
-    }
-
     pub(crate) fn prune_committed_from_before(
         &mut self,
         group_id: &GroupId,
