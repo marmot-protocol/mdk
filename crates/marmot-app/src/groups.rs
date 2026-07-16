@@ -837,9 +837,19 @@ pub(crate) enum GroupConfirmationProjection {
 }
 
 /// Whether a delete may tombstone other members' messages: its authenticated
-/// sender must be in the group's current admin set, and the group must not be
-/// a direct (two-member, unnamed) conversation — direct chats stay
-/// self-retraction only, so neither peer can moderate the other.
+/// sender must be in the group's current admin set, and the group must not
+/// look like a direct (two-member, unnamed) conversation.
+///
+/// Known limitation: "direct" is a heuristic over mutable state
+/// (`members.len() == 2 && name.is_empty()`), not an immutable conversation
+/// kind. The creator is always an implicit admin, and the only
+/// create/rename API takes a free-form name for any member count, so an admin
+/// can name — or later rename — a two-member conversation to escape this gate
+/// and gain moderation over the peer's messages, with no signal to the peer.
+/// Closing that fully needs a conversation-kind fixed at creation time
+/// (protocol/engine plus client work); until then this is a deliberate,
+/// documented limitation rather than a guarantee that 1:1 chats can never be
+/// moderated.
 pub(crate) fn delete_moderation_grant(
     group: &Group,
     admins: &[[u8; 32]],

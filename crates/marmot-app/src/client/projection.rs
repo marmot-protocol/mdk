@@ -87,6 +87,16 @@ impl AppClient {
 
     /// Fail-closed: a group or admin-policy lookup failure yields no grant, so
     /// the delete degrades to self-retraction semantics.
+    ///
+    /// Accepted trade-off: the grant is evaluated against the admin set this
+    /// device sees now (current signed group state), not the admin set as of
+    /// the delete's epoch, and it is then frozen at first record. Two devices
+    /// that first observe the same delete at different points in their own sync
+    /// — one already past an admin-adding commit, the other not, or one while
+    /// the group is quarantined — can therefore disagree permanently on whether
+    /// it is honored, a milder echo of the cross-device divergence #873
+    /// addresses. This is the deliberate fail-closed / frozen posture; an
+    /// epoch-anchored admin evaluation is future work.
     pub(crate) fn delete_moderation_grant(&self, group_id: &GroupId, sender_hex: &str) -> bool {
         let Ok(group) = self.runtime.group_record(group_id) else {
             return false;
