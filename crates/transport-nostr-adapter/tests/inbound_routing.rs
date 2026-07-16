@@ -94,6 +94,79 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
     }
 }
 
+/// Simulates a relay holding stored events: the moment it sees a group REQ it
+/// streams a matching stored event back through `handle_relay_event`, before
+/// `subscribe` returns — i.e. inside the activation's subscribe window. The
+/// adapter owns the relay client, so the back-reference used for the replay is
+/// attached after construction.
+#[derive(Default)]
+struct StoredReplayRelayClient {
+    adapter: Mutex<Option<NostrTransportAdapter>>,
+    replayed_deliveries: AtomicUsize,
+}
+
+impl StoredReplayRelayClient {
+    fn attach(&self, adapter: &NostrTransportAdapter) {
+        *self.adapter.lock().unwrap() = Some(adapter.clone());
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for StoredReplayRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let NostrSubscription::Group {
+            transport_group_id,
+            endpoints,
+            ..
+        } = &subscription
+        else {
+            return Ok(());
+        };
+        let adapter = self
+            .adapter
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("adapter attached before subscribe");
+        let delivered = adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint: endpoints[0].clone(),
+                subscription_id: Some(subscription.subscription_id()),
+                event: group_event("30", transport_group_id),
+            })
+            .await?;
+        self.replayed_deliveries
+            .fetch_add(delivered, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
 #[derive(Default)]
 struct FakeRelayClient {
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
@@ -538,6 +611,55 @@ async fn subscribed_group_event_becomes_account_scoped_delivery() {
         delivery.source.subscription_id.as_deref(),
         Some("group-sub")
     );
+    assert_eq!(
+        delivery.message.envelope,
+        TransportEnvelope::GroupMessage { transport_group_id }
+    );
+}
+
+// Regression for the cold-boot catch-up race: a relay may stream stored events
+// the moment a REQ is issued, so a stored group event can arrive inside
+// `activate_account`'s subscribe window. Routing state must already cover the
+// account by then; an event arriving before the routes exist is dropped as
+// unroutable, and that stored history is lost — nothing re-requests it.
+#[tokio::test]
+async fn stored_event_replayed_during_activation_subscribe_is_delivered() {
+    let relay = Arc::new(StoredReplayRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    relay.attach(&adapter);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 32]);
+    let transport_group_id = vec![0xC3; 32];
+    let endpoint = TransportEndpoint("wss://group.example".into());
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: group_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+            }],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("activation succeeds");
+
+    assert_eq!(
+        relay.replayed_deliveries.load(Ordering::SeqCst),
+        1,
+        "the stored event replayed during subscribe must route to the account"
+    );
+    let delivery = adapter
+        .receive()
+        .await
+        .expect("receive succeeds")
+        .expect("delivery available");
+    assert_eq!(delivery.account_id, account_id);
+    assert_eq!(delivery.group_id_hint, Some(group_id));
+    assert_eq!(delivery.source.plane, TransportDeliveryPlane::Group);
+    assert_eq!(delivery.source.endpoint, Some(endpoint));
     assert_eq!(
         delivery.message.envelope,
         TransportEnvelope::GroupMessage { transport_group_id }

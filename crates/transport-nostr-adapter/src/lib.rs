@@ -526,6 +526,27 @@ impl TransportAdapter for NostrTransportAdapter {
         for group in &activation.group_subscriptions {
             issued.push(group_subscription(&account_id, group, activation.since));
         }
+        // Register routing/telemetry state BEFORE the relay REQs go out: a
+        // relay may stream stored events the moment it sees a subscription,
+        // and an event arriving before the routes exist is dropped as
+        // unroutable — stored catch-up history would be lost with nothing to
+        // re-request it.
+        {
+            let now_ms = self.now_ms();
+            let mut state = self.state.write().await;
+            // Reactivation replaces the account's routes; evict telemetry for
+            // the old subscription ids first (before recording the new starts,
+            // since unchanged endpoint sets reuse the same ids).
+            state.forget_account_subscription_starts(&account_id);
+            if replaced_count > 0 {
+                // The blanket `unsubscribe_account` above supersedes any queued
+                // per-subscription unsubscribes for this account.
+                state.clear_pending_unsubscribes_for_account(&account_id);
+            }
+            state.record_subscription_starts(&issued, now_ms);
+            state.activate(activation, replaced_count);
+        }
+
         self.subscribe_all("activate_account", &issued).await?;
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -533,20 +554,6 @@ impl TransportAdapter for NostrTransportAdapter {
             issued_count = issued.len(),
             "all transport subscriptions issued"
         );
-
-        let now_ms = self.now_ms();
-        let mut state = self.state.write().await;
-        // Reactivation replaces the account's routes; evict telemetry for the
-        // old subscription ids first (before recording the new starts, since
-        // unchanged endpoint sets reuse the same ids).
-        state.forget_account_subscription_starts(&account_id);
-        if replaced_count > 0 {
-            // The blanket `unsubscribe_account` above supersedes any queued
-            // per-subscription unsubscribes for this account.
-            state.clear_pending_unsubscribes_for_account(&account_id);
-        }
-        state.record_subscription_starts(&issued, now_ms);
-        state.activate(activation, replaced_count);
         Ok(())
     }
 
