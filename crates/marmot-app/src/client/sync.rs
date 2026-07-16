@@ -214,6 +214,7 @@ impl AppClient {
                 && summary.messages.is_empty()
                 && summary.events.is_empty()
                 && self.pending_convergence_groups.is_empty()
+                && !self.epoch_backfill_pending
             {
                 continue;
             }
@@ -349,11 +350,12 @@ impl AppClient {
     /// re-fetches every group, so the detector collapses simultaneously-stuck
     /// groups into a single replay. A no-op when nothing stalled.
     pub(crate) async fn run_pending_epoch_backfill(&mut self) -> Result<(), AppError> {
-        if !std::mem::take(&mut self.epoch_backfill_pending) {
+        if !self.epoch_backfill_pending {
             return Ok(());
         }
         self.runtime.activate_transport(None).await?;
         self.epoch_stall.mark_replayed();
+        self.epoch_backfill_pending = false;
         Ok(())
     }
 
