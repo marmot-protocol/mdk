@@ -660,3 +660,116 @@ async fn join_epoch_recorded_on_welcome_join() {
         "creator records no pre-membership bound"
     );
 }
+
+/// Seam parity with `replay_buffered_messages` (5ae9a440): the deferred-peel
+/// sweep must NOT relabel `Processed` a `PeelDeferred` row that
+/// `ingest_group_message` terminalized during the sweep. The reachable case is
+/// `SelfEvicted`: a future-epoch commit sits `PeelDeferred`; once our own leaf
+/// is removed the group is `!is_active` (still `Stable`, not quarantined), so
+/// re-ingesting the deferred row hits the `!is_active` gate, which persists it
+/// `Failed`. That ingest-committed verdict is authoritative — sweeping it back
+/// to `Processed` would feed a row we were evicted on into canonicalization
+/// (`openmls_projection` / `distributed_convergence` select on `Processed`).
+#[tokio::test]
+async fn deferred_peel_self_evicted_row_stays_failed_not_swept_processed() {
+    // alice (admin) removes carol; bob keeps the group non-trivial afterwards.
+    let (mut alice, _alice_storage) = build_client(b"alice-deferred-self-evict");
+    let (mut bob, _bob_storage) = build_client(b"bob-deferred-self-evict");
+    let (mut carol, carol_storage, _carol_peeler) =
+        build_counting_client(b"carol-deferred-self-evict");
+    let carol_id = carol.self_id().clone();
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "deferred-self-evict".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob-deferred-self-evict"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol-deferred-self-evict"))
+        .await
+        .unwrap();
+    carol.drain_events();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+
+    // Alice removes carol at epoch 1 (source epoch 1) → advances to epoch 2.
+    // Carol can peel & apply this at epoch 1; hold it back for now.
+    let (msg, pending) = evolution(
+        alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![carol_id.clone()],
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let remove_carol = route(msg, &group_id);
+
+    // Alice, now at epoch 2, produces a future commit (source epoch 2) that
+    // carol at epoch 1 cannot peel — it is retained `PeelDeferred`.
+    let (msg, pending) = evolution(
+        alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("post-remove".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    alice.confirm_published(pending).await.unwrap();
+    let future_commit = route(msg, &group_id);
+
+    // Carol (epoch 1) ingests the future commit: undecryptable → PeelDeferred.
+    assert!(matches!(
+        carol.ingest(future_commit.clone()).await.unwrap(),
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+    assert_eq!(
+        carol_storage.get_message(&future_commit.id).unwrap().state,
+        MessageState::PeelDeferred,
+        "the future-epoch commit is retained pending a later peel"
+    );
+
+    // Carol applies the removal: her leaf is gone and the group goes inactive
+    // (still `Stable`, not quarantined), so the deferred row will re-ingest
+    // against an inactive group.
+    carol.ingest(remove_carol).await.unwrap();
+    assert!(
+        !carol
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == carol_id),
+        "carol must have been evicted by the removal"
+    );
+
+    // The deferred future-commit row re-ingests against the inactive group →
+    // `SelfEvicted`, so ingest persists it `Failed`. Regression: the sweep must
+    // not clobber that `Failed` back to `Processed`.
+    carol.retry_deferred_peels(&group_id).await.unwrap();
+    assert_eq!(
+        carol_storage.get_message(&future_commit.id).unwrap().state,
+        MessageState::Failed,
+        "a row we were evicted on must stay Failed after the deferred-peel \
+         sweep, not be swept into canonicalization as Processed"
+    );
+}

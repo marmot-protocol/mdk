@@ -254,14 +254,33 @@ impl<S: StorageProvider> Engine<S> {
             let peeled = match peel_result {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
-                    if let Some(recovery) = self
+                    let recovered = match self
                         .try_peel_group_message_from_available_snapshots(
                             msg,
                             &group_id,
                             current_epoch,
                         )
-                        .await?
+                        .await
                     {
+                        Ok(recovered) => recovered,
+                        // Defense-in-depth for the public TransportPeeler
+                        // contract: a `Malformed` verdict raised only by the
+                        // snapshot fallback is terminal on this seam too — never
+                        // an aborted drain (mdk#707). Not reachable via the
+                        // production Nostr peeler (its Malformed detection is
+                        // deterministic in the message bytes, so the direct peel
+                        // catches it first); MissingContext / storage errors keep
+                        // propagating as genuine engine faults.
+                        Err(EngineError::Peeler(PeelerError::Malformed(_))) => {
+                            return self.malformed_terminal_stale(
+                                &raw_msg_id,
+                                &msg.id,
+                                "malformed_payload_snapshot_fallback",
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(recovery) = recovered {
                         self.audit_group(
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -329,14 +348,33 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 Err(PeelerError::StaleEpoch { .. }) => {
-                    if let Some(recovery) = self
+                    let recovered = match self
                         .try_peel_group_message_from_available_snapshots(
                             msg,
                             &group_id,
                             current_epoch,
                         )
-                        .await?
+                        .await
                     {
+                        Ok(recovered) => recovered,
+                        // Defense-in-depth for the public TransportPeeler
+                        // contract: a `Malformed` verdict raised only by the
+                        // snapshot fallback is terminal on this seam too — never
+                        // an aborted drain (mdk#707). Not reachable via the
+                        // production Nostr peeler (its Malformed detection is
+                        // deterministic in the message bytes, so the direct peel
+                        // catches it first); MissingContext / storage errors keep
+                        // propagating as genuine engine faults.
+                        Err(EngineError::Peeler(PeelerError::Malformed(_))) => {
+                            return self.malformed_terminal_stale(
+                                &raw_msg_id,
+                                &msg.id,
+                                "malformed_payload_snapshot_fallback",
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(recovery) = recovered {
                         self.audit_group(
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -357,7 +395,7 @@ impl<S: StorageProvider> Engine<S> {
                         // (if this came via the retry lifecycle) so it stops
                         // holding a per-group cap slot (mdk#339); a no-op on
                         // the direct path where no deferred row exists.
-                        self.mark_raw_transport_message_failed_if_deferred(
+                        self.mark_raw_transport_message_failed_if_awaiting_retry(
                             &raw_msg_id,
                             "stale_epoch_no_snapshot",
                         )?;
@@ -380,6 +418,24 @@ impl<S: StorageProvider> Engine<S> {
                         });
                     }
                 }
+                Err(PeelerError::Malformed(_)) => {
+                    // Structurally-invalid content is ordinary hostile input:
+                    // anyone can publish to the cleartext routing tag without
+                    // group membership, and no epoch context can ever peel it.
+                    // Terminal — propagating an error here would abort the
+                    // caller's whole transport drain on one garbage event,
+                    // starving every message queued behind it. Dropped
+                    // unpersisted for the same reason as the mdk#339 flood
+                    // cap: transport ids are attacker-controllable, so durable
+                    // rows keyed by them would grow without bound. Retire the
+                    // raw deferred row if this arrived via the retry
+                    // lifecycle; a no-op on the direct path.
+                    return self.malformed_terminal_stale(
+                        &raw_msg_id,
+                        &msg.id,
+                        "malformed_payload",
+                    );
+                }
                 Err(e) => return Err(EngineError::Peeler(e)),
             };
             let mls_bytes = match peeled.content {
@@ -388,7 +444,7 @@ impl<S: StorageProvider> Engine<S> {
                     // A group-message envelope that peels to a Welcome is
                     // malformed: terminal. Retire the raw deferred row first
                     // so its cap slot is released (mdk#339).
-                    self.mark_raw_transport_message_failed_if_deferred(
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(
                         &raw_msg_id,
                         "peeled_welcome_in_group_message",
                     )?;
@@ -461,7 +517,7 @@ impl<S: StorageProvider> Engine<S> {
                     // Peeled successfully but the MLS body is neither a
                     // public nor private message: terminal. Retire the raw
                     // deferred row so it leaves the retry lifecycle (mdk#339).
-                    self.mark_raw_transport_message_failed_if_deferred(
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(
                         &raw_msg_id,
                         "non_mls_message_body",
                     )?;
@@ -498,7 +554,7 @@ impl<S: StorageProvider> Engine<S> {
                         tag,
                     ),
                 );
-                self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
+                self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                 return Ok(IngestOutcome::Stale {
                     reason: StaleReason::PeelFailed,
                 });
@@ -577,7 +633,7 @@ impl<S: StorageProvider> Engine<S> {
                             .tag()
                     };
                     self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                    self.mark_raw_transport_message_failed_if_deferred(&raw_msg_id, tag)?;
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(&raw_msg_id, tag)?;
                     return Ok(IngestOutcome::Stale {
                         reason: StaleReason::PeelFailed,
                     });
@@ -717,7 +773,7 @@ impl<S: StorageProvider> Engine<S> {
                         // Peeled successfully but terminally rejected: retire
                         // the raw deferred row so it leaves the retry
                         // lifecycle instead of holding a cap slot (mdk#339).
-                        self.mark_raw_transport_message_failed_if_deferred(
+                        self.mark_raw_transport_message_failed_if_awaiting_retry(
                             &raw_msg_id,
                             "unattributable_sender",
                         )?;
@@ -737,7 +793,7 @@ impl<S: StorageProvider> Engine<S> {
                         self.update_stored_message_state(&msg.id, MessageState::Failed)?;
                         // Peeled successfully but terminally rejected: retire
                         // the raw deferred row (mdk#339).
-                        self.mark_raw_transport_message_failed_if_deferred(
+                        self.mark_raw_transport_message_failed_if_awaiting_retry(
                             &raw_msg_id,
                             "invalid_app_payload",
                         )?;
@@ -1572,31 +1628,23 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    fn mark_raw_transport_message_failed_if_deferred(
+    /// Terminal disposition for a peel that resolved to `Malformed`: retire the
+    /// awaiting-retry raw transport row (a no-op on the direct path, where no
+    /// deferred row exists), mark the id seen so a redelivery short-circuits,
+    /// and classify the input `Stale { PeelFailed }`. Shared by the direct peel
+    /// and both snapshot-fallback seams so the terminal behavior has a single
+    /// definition — a guard living on one seam only is a bug (mdk#707).
+    fn malformed_terminal_stale(
         &mut self,
         raw_msg_id: &MessageId,
-        reason: &str,
-    ) -> Result<(), EngineError> {
-        match self.storage.get_message(raw_msg_id) {
-            Ok(record) if record.state == MessageState::PeelDeferred => {
-                self.storage
-                    .update_message_state(raw_msg_id, MessageState::Failed)?;
-                self.audit_group(
-                    &record.group_id,
-                    crate::audit_helpers::message_state_transition_event(
-                        hex::encode(raw_msg_id.as_slice()),
-                        Some(record.state),
-                        MessageState::Failed,
-                        Some(record.epoch),
-                        reason,
-                    ),
-                );
-                self.note_peel_deferred_row_retired(&record.group_id, raw_msg_id);
-                Ok(())
-            }
-            Ok(_) | Err(StorageError::NotFound) => Ok(()),
-            Err(err) => Err(EngineError::Storage(err)),
-        }
+        msg_id: &MessageId,
+        reason: &'static str,
+    ) -> Result<IngestOutcome, EngineError> {
+        self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
+        self.seen_message_ids.insert(msg_id.clone());
+        Ok(IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed,
+        })
     }
 
     /// Whether `msg_epoch` predates this device's membership in `group_id`
