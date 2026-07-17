@@ -18,7 +18,7 @@ use cgka_traits::storage::MessageStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{MemberId, MessageId};
+use cgka_traits::types::{EpochId, MemberId, MessageId};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -238,6 +238,62 @@ impl TransportPeeler for MalformedShortPayloadPeeler {
             return Err(PeelerError::Malformed(
                 "content too short for nonce-prefixed ciphertext".into(),
             ));
+        }
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+/// Garbage payload whose malformed verdict is context-dependent: it peels
+/// `DecryptFailed` against the live epoch (so ingest falls through to the
+/// retained-snapshot fallback) but `Malformed` against any older snapshot
+/// context. This simulates a trait-permitted non-Nostr peeler: the production
+/// Nostr peeler can never reach the fallback with a `Malformed` verdict, since
+/// its malformed detection is a pure function of the message bytes and is
+/// always caught by the direct peel first. The public `TransportPeeler`
+/// contract, however, allows `StaleEpoch`-hint peelers whose malformed
+/// detection is context-dependent, so the fallback seam must still treat that
+/// verdict as terminal (mdk#707).
+const SNAPSHOT_FALLBACK_GARBAGE: &[u8] = b"snapshot-fallback-garbage-payload";
+
+struct SnapshotFallbackMalformedPeeler {
+    malformed_below_epoch: u64,
+}
+
+#[async_trait]
+impl TransportPeeler for SnapshotFallbackMalformedPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload == SNAPSHOT_FALLBACK_GARBAGE {
+            return if ctx.epoch().0 < self.malformed_below_epoch {
+                Err(PeelerError::Malformed(
+                    "malformed only against an older snapshot context".into(),
+                ))
+            } else {
+                Err(PeelerError::DecryptFailed)
+            };
         }
         MockPeeler.peel_group_message(msg, ctx).await
     }
@@ -667,6 +723,143 @@ async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_
         "a malformed message must land terminal once classified — a \
          `Buffered` here means the stored row is still non-terminal and \
          perpetually reported as pending, got {after_replay:?}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_via_snapshot_fallback_is_stale_and_does_not_wedge_ingest() {
+    // Simulates a trait-permitted non-Nostr peeler whose `Malformed` verdict is
+    // context-dependent: the direct peel at the live epoch returns
+    // `DecryptFailed`, driving ingest into the retained-snapshot fallback, where
+    // the peel against the older snapshot context returns `Malformed`. The
+    // production Nostr peeler cannot reach this branch (its malformed detection
+    // is a pure function of the bytes, so the direct peel catches it first), but
+    // the fallback seam must handle the verdict identically to the direct seam:
+    // terminal stale, never an aborted drain (mdk#707).
+    let mut alice = build_client(b"alice");
+    // The group reaches epoch 2 below (create -> 1, invite -> 2), so the
+    // retained epoch-1 anchor is the only past-peel snapshot older than live.
+    let live_epoch = 2u64;
+    let mut bob = build_client_with_peeler(
+        b"bob",
+        Box::new(SnapshotFallbackMalformedPeeler {
+            malformed_below_epoch: live_epoch,
+        }),
+    );
+    let mut carol = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // Alice invites Carol so a commit advances the group and Bob retains an
+    // anchor snapshot at the pre-commit epoch — the snapshot the fallback rolls
+    // back to and peels against below.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        _ => unreachable!(),
+    };
+    // Convergence settles a peer commit only after its quiescence window has
+    // elapsed, so buffer at one instant and converge at a later one (mirroring
+    // the retained-anchor convergence tests) to apply the commit and retain the
+    // pre-commit epoch anchor.
+    bob.buffer_openmls_convergence_message(&group_id, invite, 1_000)
+        .expect("invite commit buffered");
+    bob.converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("invite commit applies and retains the pre-commit anchor");
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        EpochId(live_epoch),
+        "Bob must advance to the live epoch so an older retained anchor exists"
+    );
+
+    // Garbage arrives: direct peel `DecryptFailed` -> snapshot fallback peels
+    // `Malformed`. The terminal contract must hold on this seam too — classify
+    // stale, do not abort the drain.
+    let garbage = TransportMessage {
+        id: hash_id(b"malformed via snapshot fallback"),
+        payload: SNAPSHOT_FALLBACK_GARBAGE.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(garbage)
+        .await
+        .expect("malformed snapshot-fallback peel must classify stale, not abort ingest");
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed
+            }
+        ),
+        "expected terminal PeelFailed for a malformed snapshot-fallback peel, got {outcome:?}"
+    );
+
+    // The drain is not wedged: a well-formed message queued behind the garbage
+    // still processes.
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"after the snapshot garbage"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+    let after = bob.ingest(msg).await.unwrap();
+    assert!(matches!(after, IngestOutcome::Processed));
+    let events = bob.drain_events();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after the snapshot garbage")
+        ),
+        "expected the message behind the garbage to still deliver, got {events:?}"
     );
 }
 

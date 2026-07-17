@@ -254,14 +254,33 @@ impl<S: StorageProvider> Engine<S> {
             let peeled = match peel_result {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
-                    if let Some(recovery) = self
+                    let recovered = match self
                         .try_peel_group_message_from_available_snapshots(
                             msg,
                             &group_id,
                             current_epoch,
                         )
-                        .await?
+                        .await
                     {
+                        Ok(recovered) => recovered,
+                        // Defense-in-depth for the public TransportPeeler
+                        // contract: a `Malformed` verdict raised only by the
+                        // snapshot fallback is terminal on this seam too — never
+                        // an aborted drain (mdk#707). Not reachable via the
+                        // production Nostr peeler (its Malformed detection is
+                        // deterministic in the message bytes, so the direct peel
+                        // catches it first); MissingContext / storage errors keep
+                        // propagating as genuine engine faults.
+                        Err(EngineError::Peeler(PeelerError::Malformed(_))) => {
+                            return self.malformed_terminal_stale(
+                                &raw_msg_id,
+                                &msg.id,
+                                "malformed_payload_snapshot_fallback",
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(recovery) = recovered {
                         self.audit_group(
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -329,14 +348,33 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 Err(PeelerError::StaleEpoch { .. }) => {
-                    if let Some(recovery) = self
+                    let recovered = match self
                         .try_peel_group_message_from_available_snapshots(
                             msg,
                             &group_id,
                             current_epoch,
                         )
-                        .await?
+                        .await
                     {
+                        Ok(recovered) => recovered,
+                        // Defense-in-depth for the public TransportPeeler
+                        // contract: a `Malformed` verdict raised only by the
+                        // snapshot fallback is terminal on this seam too — never
+                        // an aborted drain (mdk#707). Not reachable via the
+                        // production Nostr peeler (its Malformed detection is
+                        // deterministic in the message bytes, so the direct peel
+                        // catches it first); MissingContext / storage errors keep
+                        // propagating as genuine engine faults.
+                        Err(EngineError::Peeler(PeelerError::Malformed(_))) => {
+                            return self.malformed_terminal_stale(
+                                &raw_msg_id,
+                                &msg.id,
+                                "malformed_payload_snapshot_fallback",
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(recovery) = recovered {
                         self.audit_group(
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -392,14 +430,11 @@ impl<S: StorageProvider> Engine<S> {
                     // rows keyed by them would grow without bound. Retire the
                     // raw deferred row if this arrived via the retry
                     // lifecycle; a no-op on the direct path.
-                    self.mark_raw_transport_message_failed_if_awaiting_retry(
+                    return self.malformed_terminal_stale(
                         &raw_msg_id,
+                        &msg.id,
                         "malformed_payload",
-                    )?;
-                    self.seen_message_ids.insert(msg.id.clone());
-                    return Ok(IngestOutcome::Stale {
-                        reason: StaleReason::PeelFailed,
-                    });
+                    );
                 }
                 Err(e) => return Err(EngineError::Peeler(e)),
             };
@@ -1591,6 +1626,25 @@ impl<S: StorageProvider> Engine<S> {
         // byte-identical and collapses in the app's canonical-row-id upsert.
         self.clear_leave_request_state(group_id)?;
         Ok(())
+    }
+
+    /// Terminal disposition for a peel that resolved to `Malformed`: retire the
+    /// awaiting-retry raw transport row (a no-op on the direct path, where no
+    /// deferred row exists), mark the id seen so a redelivery short-circuits,
+    /// and classify the input `Stale { PeelFailed }`. Shared by the direct peel
+    /// and both snapshot-fallback seams so the terminal behavior has a single
+    /// definition — a guard living on one seam only is a bug (mdk#707).
+    fn malformed_terminal_stale(
+        &mut self,
+        raw_msg_id: &MessageId,
+        msg_id: &MessageId,
+        reason: &'static str,
+    ) -> Result<IngestOutcome, EngineError> {
+        self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
+        self.seen_message_ids.insert(msg_id.clone());
+        Ok(IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed,
+        })
     }
 
     /// Whether `msg_epoch` predates this device's membership in `group_id`
