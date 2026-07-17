@@ -62,6 +62,7 @@ impl AppClient {
     ) -> Option<AuditEventContext> {
         let (action, target_count): (&'static str, Option<u64>) = match intent {
             AppMessageIntent::Chat { .. } => ("send_message", None),
+            AppMessageIntent::Sticker { .. } => ("send_sticker", None),
             AppMessageIntent::Reply { .. } => ("reply_message", None),
             AppMessageIntent::Edit { .. } => ("edit_message", None),
             AppMessageIntent::Reaction { .. } => ("react", None),

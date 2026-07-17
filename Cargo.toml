@@ -101,6 +101,7 @@ cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
 cgka-session = { path = "crates/cgka-session" }
 storage-sqlite = { path = "crates/storage-sqlite" }
+sonar-stickers = { git = "https://github.com/hedwig-corp/bitchat-to-sonar", rev = "162ac26c88b351dfa3f35d8f098c00a18ae46114", features = ["nostr", "signal-import"] }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }

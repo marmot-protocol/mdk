@@ -80,6 +80,18 @@ pub(crate) async fn fetch_blossom_blob(
     url: &str,
     allow_loopback_http: bool,
 ) -> Result<Vec<u8>, AppError> {
+    fetch_blossom_blob_limited(url, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, allow_loopback_http).await
+}
+
+/// Hardened bounded Blossom fetch shared by encrypted media and smaller public
+/// assets such as stickers. Callers choose a domain-specific byte ceiling;
+/// URL, redirect, DNS/IP pinning, timeout, proxy, and content-encoding policy
+/// remain identical.
+pub(crate) async fn fetch_blossom_blob_limited(
+    url: &str,
+    max_bytes: u64,
+    allow_loopback_http: bool,
+) -> Result<Vec<u8>, AppError> {
     let mut current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, allow_loopback_http)
@@ -95,7 +107,7 @@ pub(crate) async fn fetch_blossom_blob(
             .map_err(reqwest_blob_error)?;
         let status = response.status();
         if status.is_success() {
-            return read_limited_blossom_body(response, MAX_ENCRYPTED_MEDIA_BLOB_BYTES).await;
+            return read_limited_blossom_body(response, max_bytes).await;
         }
         if !status.is_redirection() {
             return Err(AppError::BlobStore(format!(

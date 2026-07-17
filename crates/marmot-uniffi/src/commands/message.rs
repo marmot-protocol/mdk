@@ -4,7 +4,8 @@ use marmot_app::AppMessageQuery;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppMessageRecordFfi, SecureDeleteExpiredResultFfi, SendSummaryFfi, group_id_from_hex,
+    AppMessageRecordFfi, SecureDeleteExpiredResultFfi, SendSummaryFfi, StickerRefFfi,
+    group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
@@ -27,6 +28,23 @@ impl Marmot {
         let summary = self
             .runtime
             .send_message(&account_ref, &group_id, text.into_bytes())
+            .await?;
+        Ok(summary.into())
+    }
+
+    /// Send a Sonar sticker as a kind-9 message carrying the immutable
+    /// coordinate/shortcode/plaintext-hash reference. Native storage must
+    /// currently authorize the exact reference before the send is accepted.
+    pub async fn send_sticker(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        sticker_ref: StickerRefFfi,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let summary = self
+            .runtime
+            .send_sticker(&account_ref, &group_id, sticker_ref.into())
             .await?;
         Ok(summary.into())
     }

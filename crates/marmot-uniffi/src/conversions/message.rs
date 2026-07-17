@@ -2,10 +2,11 @@
 
 use marmot_app::{
     AppMessageRecord, ReceivedMessage, RuntimeMessageReceived, RuntimeMessageUpdate,
-    SecureDeleteExpiredResult,
+    SecureDeleteExpiredResult, sticker_ref_from_tags,
 };
 
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
+use crate::conversions::StickerRefFfi;
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -20,6 +21,7 @@ pub struct AppMessageRecordFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    pub sticker: Option<StickerRefFfi>,
     pub recorded_at: u64,
     pub received_at: u64,
 }
@@ -27,6 +29,7 @@ pub struct AppMessageRecordFfi {
 impl From<AppMessageRecord> for AppMessageRecordFfi {
     fn from(value: AppMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex,
             direction: value.direction,
@@ -36,6 +39,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
+            sticker,
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }
@@ -69,6 +73,7 @@ pub struct ReceivedMessageFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    pub sticker: Option<StickerRefFfi>,
     /// Source-event timestamp (seconds since epoch) for the MLS-delivered
     /// message. Clients should sort the timeline by this value so chronology
     /// reflects send time, not delivery time. Zero means the timestamp was
@@ -78,6 +83,7 @@ pub struct ReceivedMessageFfi {
 
 impl From<&ReceivedMessage> for ReceivedMessageFfi {
     fn from(value: &ReceivedMessage) -> Self {
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex.clone(),
             group_id_hex: hex::encode(value.group_id.as_slice()),
@@ -87,6 +93,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
+            sticker,
             recorded_at: value.recorded_at,
         }
     }

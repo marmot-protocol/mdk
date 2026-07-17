@@ -5,12 +5,13 @@ use marmot_app::{
     AppGroupSystemEvent, AppProjectionUpdate, RuntimeProjectionUpdate,
     RuntimeTimelineMessageUpdate, TimelineMessageChange, TimelineMessageRecord, TimelinePage,
     TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction, group_system_event_from_message,
+    TimelineUserReaction, group_system_event_from_message, sticker_ref_from_tags,
 };
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
 use super::media::{MediaAttachmentReferenceFfi, timeline_media_references_ffi};
+use crate::conversions::StickerRefFfi;
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -90,6 +91,7 @@ pub struct TimelineReplyPreviewFfi {
     pub plaintext: String,
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
+    pub sticker: Option<StickerRefFfi>,
     pub media_json: Option<String>,
     /// Fully-resolved, downloadable media references for the previewed message,
     /// built from its `imeta` tags + its own `source_epoch` using the same
@@ -104,12 +106,14 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let media = timeline_media_references_ffi(&value.media, value.source_epoch);
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
             plaintext: value.plaintext,
             content_tokens,
             kind: value.kind,
+            sticker,
             media_json: value.media.map(|media| media.to_string()),
             media,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
@@ -171,6 +175,7 @@ pub struct TimelineMessageRecordFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub tags: Vec<MessageTagFfi>,
+    pub sticker: Option<StickerRefFfi>,
     pub timeline_at: u64,
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
@@ -202,6 +207,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let group_system = group_system_event_from_message(value.kind, &value.plaintext);
         let media = timeline_media_references_ffi(&value.media, value.source_epoch);
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex,
             source_message_id_hex: value.source_message_id_hex,
@@ -212,6 +218,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
             content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
+            sticker,
             timeline_at: value.timeline_at,
             received_at: value.received_at,
             reply_to_message_id_hex: value.reply_to_message_id_hex,
@@ -521,6 +528,7 @@ mod tests {
             sender: "bob".to_owned(),
             plaintext: "original".to_owned(),
             kind: 9,
+            tags: Vec::new(),
             // The previewed (target) message lives in its own epoch, distinct
             // from the replying message's epoch.
             source_epoch: Some(3),

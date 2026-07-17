@@ -15,14 +15,16 @@ mod crypto;
 mod group_image;
 mod host_safety;
 
-use blossom::{blossom_content_hash_from_url, upload_blossom_blob};
+use blossom::blossom_content_hash_from_url;
 use crypto::{
     derive_media_file_key, media_aad, media_hash_from_reference, media_nonce_from_reference,
     validate_sha256_hex,
 };
 use host_safety::validate_locator;
 
-pub(crate) use blossom::{blossom_blob_url, fetch_blossom_blob};
+pub(crate) use blossom::{
+    blossom_blob_url, fetch_blossom_blob, fetch_blossom_blob_limited, upload_blossom_blob,
+};
 pub(crate) use crypto::canonical_media_type;
 pub(crate) use group_image::{fetch_group_image, upload_group_image};
 pub(crate) use host_safety::is_loopback_http_endpoint;

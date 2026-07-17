@@ -1,8 +1,12 @@
 //! Chat-list avatar, row, message-preview, and subscription-update FFI conversions.
 
-use marmot_app::{ChatListAvatar, ChatListMessagePreview, ChatListRow, RuntimeChatListUpdate};
+use marmot_app::{
+    ChatListAvatar, ChatListMessagePreview, ChatListRow, RuntimeChatListUpdate,
+    sticker_ref_from_tags,
+};
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
+use crate::conversions::StickerRefFfi;
 use crate::markdown::MarkdownDocumentFfi;
 
 /// Group avatar reference. `image_key_hex` is the symmetric key that decrypts
@@ -55,6 +59,7 @@ pub struct ChatListMessagePreviewFfi {
     pub plaintext: String,
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
+    pub sticker: Option<StickerRefFfi>,
     pub timeline_at: u64,
     pub deleted: bool,
 }
@@ -62,6 +67,7 @@ pub struct ChatListMessagePreviewFfi {
 impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
@@ -69,6 +75,7 @@ impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
             plaintext: value.plaintext,
             content_tokens,
             kind: value.kind,
+            sticker,
             timeline_at: value.timeline_at,
             deleted: value.deleted,
         }

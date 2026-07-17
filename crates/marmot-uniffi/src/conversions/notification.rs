@@ -1,6 +1,7 @@
 //! Notification settings, triggers, users, and update FFI conversions —
 //! plus the wake-path cursor-persistence policy.
 
+use crate::conversions::StickerRefFfi;
 use marmot_app::{
     CursorPersistence, NotificationCollectionStatus, NotificationSettings, NotificationTrigger,
     NotificationUpdate, NotificationUser, NotificationWakeSource,
@@ -135,6 +136,7 @@ pub struct NotificationUpdateFfi {
     pub sender: NotificationUserFfi,
     pub receiver: NotificationUserFfi,
     pub preview_text: Option<String>,
+    pub sticker: Option<StickerRefFfi>,
     pub reaction_emoji: Option<String>,
     pub reacted_to_preview: Option<String>,
     pub timestamp_ms: i64,
@@ -157,6 +159,7 @@ impl From<NotificationUpdate> for NotificationUpdateFfi {
             sender: value.sender.into(),
             receiver: value.receiver.into(),
             preview_text: value.preview_text,
+            sticker: value.sticker.map(Into::into),
             reaction_emoji: value.reaction_emoji,
             reacted_to_preview: value.reacted_to_preview,
             timestamp_ms: value.timestamp_ms,

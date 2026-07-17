@@ -1076,6 +1076,10 @@ impl AppClient {
         F: FnMut(crate::AppProjectionUpdate),
     {
         self.ensure_group(group_id)?;
+        if let AppMessageIntent::Sticker { sticker_ref } = &intent {
+            self.app
+                .authorize_sticker_ref(&self.state.label, sticker_ref)?;
+        }
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `Delete` below, so the audit log records the user's actual intent.
         let audit_context = Self::message_human_action_context(&intent);

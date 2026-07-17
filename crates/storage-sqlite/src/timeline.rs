@@ -112,6 +112,7 @@ pub struct TimelineReplyPreview {
     pub sender: String,
     pub plaintext: String,
     pub kind: u64,
+    pub tags: Vec<Vec<String>>,
     /// Source epoch of the previewed (reply target) message, carried so callers
     /// can resolve its `imeta` media into downloadable attachment references.
     /// `None` for local sends not yet committed to an epoch.
@@ -784,7 +785,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
 ) -> StorageResult<()> {
     let latest = tx
         .query_row(
-            "SELECT message_id_hex, sender, plaintext, kind, timeline_at, deleted
+            "SELECT message_id_hex, sender, plaintext, kind, tags_json, timeline_at, deleted
              FROM message_timeline
              WHERE group_id_hex = ?1
                AND kind = ?2
@@ -798,30 +799,33 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )
         .optional()
         .storage()?;
     let updated_at = u64_to_i64(unix_now_seconds())?;
-    if let Some((message_id, sender, plaintext, kind, timeline_at, deleted)) = latest {
+    if let Some((message_id, sender, plaintext, kind, tags_json, timeline_at, deleted)) = latest {
         tx.execute(
             "UPDATE chat_list_rows
              SET last_message_id_hex = ?1,
                  last_message_sender = ?2,
                  last_message_preview = ?3,
                  last_message_kind = ?4,
-                 last_message_timeline_at = ?5,
-                 last_message_deleted = ?6,
-                 updated_at = ?7
-             WHERE group_id_hex = ?8",
+                 last_message_tags_json = ?5,
+                 last_message_timeline_at = ?6,
+                 last_message_deleted = ?7,
+                 updated_at = ?8
+             WHERE group_id_hex = ?9",
             params![
                 message_id,
                 sender,
                 plaintext,
                 kind,
+                tags_json,
                 timeline_at,
                 deleted,
                 updated_at,
@@ -836,6 +840,7 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                  last_message_sender = NULL,
                  last_message_preview = NULL,
                  last_message_kind = NULL,
+                 last_message_tags_json = NULL,
                  last_message_timeline_at = NULL,
                  last_message_deleted = 0,
                  updated_at = ?1
@@ -2381,7 +2386,7 @@ fn load_reply_previews(
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch
+            "SELECT message_id_hex, sender, plaintext, kind, tags_json, media_json, agent_stream_json, deleted, source_epoch
              FROM message_timeline
              WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
         );
@@ -2410,21 +2415,24 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
         sender: row.get(1)?,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        media: optional_value_from_json(row.get::<_, Option<String>>(4)?).map_err(|err| {
+        tags: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(5)?).map_err(
+        media: optional_value_from_json(row.get::<_, Option<String>>(5)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+        })?,
+        agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(6)?).map_err(
             |err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    5,
+                    6,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
             },
         )?,
-        deleted: row.get::<_, i64>(6)? != 0,
+        deleted: row.get::<_, i64>(7)? != 0,
         source_epoch: row
-            .get::<_, Option<i64>>(7)?
+            .get::<_, Option<i64>>(8)?
             .and_then(|value| value.try_into().ok()),
     })
 }

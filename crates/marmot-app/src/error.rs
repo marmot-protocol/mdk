@@ -80,6 +80,16 @@ pub enum AppError {
     InvalidEncryptedMedia(String),
     #[error("blob store request failed: {0}")]
     BlobStore(String),
+    #[error("invalid sticker data: {0}")]
+    InvalidSticker(String),
+    #[error("sticker pack or asset is unavailable")]
+    StickerNotFound,
+    #[error("sticker relay operation failed: {0}")]
+    StickerRelay(String),
+    #[error("sticker import failed: {0}")]
+    StickerImport(String),
+    #[error("Signal sticker import is unavailable for external-signing accounts")]
+    StickerExternalSignerImportUnsupported,
     #[error("invalid app message payload: {0}")]
     InvalidAppMessagePayload(String),
     #[error("invalid push token")]
@@ -156,6 +166,13 @@ impl AppError {
             Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
             Self::BlobStore(_) => "blob_store",
+            Self::InvalidSticker(_) => "invalid_sticker",
+            Self::StickerNotFound => "sticker_not_found",
+            Self::StickerRelay(_) => "sticker_relay",
+            Self::StickerImport(_) => "sticker_import",
+            Self::StickerExternalSignerImportUnsupported => {
+                "sticker_external_signer_import_unsupported"
+            }
             Self::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             Self::InvalidPushToken(_) => "invalid_push_token",
             Self::InvalidPushServer(_) => "invalid_push_server",
