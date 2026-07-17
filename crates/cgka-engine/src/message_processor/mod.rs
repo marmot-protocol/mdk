@@ -880,23 +880,49 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 }
                 Ok(IngestOutcome::Stale {
-                    reason: StaleReason::PeelFailed | StaleReason::Quarantined,
+                    reason:
+                        StaleReason::PeelFailed | StaleReason::Quarantined | StaleReason::UnknownGroup,
                 }) => {
-                    // Still un-peelable, or the group is quarantined: leave the
-                    // row in its retry state. A terminal-after-peel `PeelFailed`
-                    // (malformed, stale epoch with no snapshot) already retired
-                    // its raw row — `PeelDeferred` or `Retryable` alike — inside
-                    // `ingest_group_message` via
-                    // `mark_raw_transport_message_failed_if_awaiting_retry`.
+                    // Leave the row in its retry state so a later pass re-attempts
+                    // it. `PeelFailed`: still un-peelable, or already retired to
+                    // `Failed` by a terminal-after-peel path inside
+                    // `ingest_group_message`
+                    // (`mark_raw_transport_message_failed_if_awaiting_retry`,
+                    // `PeelDeferred`/`Retryable` alike). `Quarantined`: the group
+                    // is frozen; the row replays once repair clears it.
+                    // `UnknownGroup`: no local group matches yet — `ingest`
+                    // deliberately re-buffered the row `Retryable` because a later
+                    // welcome may create the group, so terminalizing it here would
+                    // drop a recoverable message.
                 }
                 Ok(_) => {
-                    // Applied (`Processed`) or terminally reclassified
-                    // (`AlreadySeen`, `SelfEvicted`, ...): retire a raw
-                    // deferred wrapper so it stops holding a cap slot
-                    // (mdk#339). Non-deferred rows keep the pre-existing
-                    // no-op behavior.
-                    if was_peel_deferred {
+                    // Terminal reclassification of the raw wrapper: the content-
+                    // derived row now carries the real verdict — applied
+                    // (`Processed`), a same-epoch fork the incumbent won
+                    // (`AlreadyAtEpoch`, content row `EpochInvalidated`), a
+                    // duplicate (`AlreadySeen`), our own echo (`OwnEcho`), or our
+                    // own eviction (`SelfEvicted`). Retire the raw wrapper so it
+                    // leaves the retry lifecycle instead of being re-peeled on
+                    // every subsequent publish-cycle replay — but ONLY while it is
+                    // still awaiting retry. `record.state` is the pre-ingest
+                    // snapshot; `ingest_group_message` may have already committed a
+                    // terminal state to this same row during the call. The
+                    // reachable case is `SelfEvicted`: a buffered peer commit that
+                    // evicts our leaf makes the next buffered row hit `!is_active`,
+                    // which persists that row `Failed` (ingest.rs). That
+                    // ingest-committed verdict is authoritative — relabeling an
+                    // evicted-on row `Processed` would sweep it back into
+                    // canonicalization (`openmls_projection` /
+                    // `distributed_convergence` select on `Processed`). Re-read the
+                    // row and retire only a state ingest left awaiting retry.
+                    if self.raw_transport_row_awaiting_retry(&record.id)? {
                         self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                    }
+                    // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339);
+                    // its accounting tracks the original deferred count, so release
+                    // the slot whenever the row leaves the retry lifecycle — whether
+                    // this arm retired it or ingest already terminalized it.
+                    if was_peel_deferred {
                         self.note_peel_deferred_row_retired(group_id, &record.id);
                     }
                 }

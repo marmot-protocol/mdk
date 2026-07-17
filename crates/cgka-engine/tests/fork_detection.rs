@@ -21,8 +21,9 @@ use cgka_traits::engine::{
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
+use cgka_traits::storage::{AccountDeviceSignerStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -474,6 +475,245 @@ async fn convergence_privileged_remove_beats_grinding_ordinary_self_update() {
     assert!(
         !members.iter().any(|member| member.id == bob_id),
         "Bob remains removed; the grinding self-update cannot resurrect him"
+    );
+}
+
+/// A peer's same-epoch commit that arrives during our own `PendingPublish`
+/// window is buffered `Retryable` before any peel. When our own commit confirms
+/// and wins the fork, replay must reclassify the buffered commit terminal: the
+/// content row lands `EpochInvalidated`, and the raw transport wrapper is
+/// retired `Processed` — not left `Retryable` to be re-peeled on every later
+/// publish-cycle replay.
+#[tokio::test]
+async fn buffered_losing_fork_commit_raw_row_is_retired_after_confirm_replay() {
+    use cgka_traits::ingest::IngestOutcome;
+    use sha2::{Digest, Sha256};
+
+    let (mut alice, alice_storage) = build_client_with_storage(b"alice-buffered-fork");
+    let (mut bob, bob_storage) = build_client_with_storage(b"bob-buffered-fork");
+    let bob_id = bob.self_id();
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "buffered-losing-fork".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+
+    // Bob's ordinary self-update commit branches from epoch 1. A privileged
+    // admin commit always sorts ahead of an ordinary one, so the incumbent wins
+    // regardless of digest — no grinding needed to pin the winner.
+    let self_update = raw_self_update_commit(&bob_storage, &bob_id, &group_id);
+    let raw_id = self_update.id.clone();
+    let content_id = MessageId::new(Sha256::digest(&self_update.payload).to_vec());
+
+    // Alice stages a privileged admin Remove(Bob) → PendingPublish, the window
+    // where inbound input is buffered `Retryable` before any peel.
+    let remove_pending = match alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected RemoveMembers GroupEvolution, got {other:?}"),
+    };
+
+    let buffered = alice.ingest(self_update).await.unwrap();
+    assert!(
+        matches!(buffered, IngestOutcome::Buffered { .. }),
+        "peer commit during PendingPublish must buffer, got {buffered:?}"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Retryable,
+        "the buffered raw transport row is persisted Retryable pending replay"
+    );
+
+    // Confirm advances Alice to epoch 2 and replays the backlog. The buffered
+    // commit loses the fork to the incumbent (privileged > ordinary).
+    alice.confirm_published(remove_pending).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+
+    assert_eq!(
+        alice_storage.get_message(&content_id).unwrap().state,
+        MessageState::EpochInvalidated,
+        "the losing fork commit's content row carries the real verdict"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Processed,
+        "the raw transport wrapper must be retired terminal after replay — not \
+         left Retryable to be re-peeled on every later publish cycle"
+    );
+    assert!(
+        alice
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
+        "the incumbent won the fork; no rollback / ForkRecovered is emitted"
+    );
+}
+
+/// Two peer rows buffered during our own `PendingPublish` window replay in a
+/// single pass. The first is a privileged admin `RemoveMembers` that removes
+/// our leaf; being privileged it deterministically wins the same-source-epoch
+/// fork over our own ordinary `UpdateGroupData`, so on confirm-replay fork
+/// recovery rolls us back and applies it inline — our local group state goes
+/// `Inactive`. The second buffered row is then re-ingested against that
+/// inactive state, so `ingest_group_message` classifies it `SelfEvicted` and
+/// persists its raw row `Failed` (authenticated evidence we were removed).
+///
+/// Replay retires the backlog, and that retirement must only touch rows STILL
+/// awaiting retry after re-ingest. The unconditional retirement write introduced
+/// in ae616488 violates this in two ways in exactly this scenario: it errors
+/// (`Storage(NotFound)`) on the winning remove's raw row, which fork-recovery
+/// rollback already swept away, and — the invariant this guards — it would
+/// relabel the `SelfEvicted` row `Processed`, clobbering the `Failed` verdict
+/// ingest committed. A `Processed` raw row is a canonicalization input
+/// (`openmls_projection` / `distributed_convergence` select on it), so a row we
+/// were evicted on must stay `Failed`, never be swept back into convergence.
+#[tokio::test]
+async fn buffered_self_evicted_row_stays_failed_not_swept_processed_on_replay() {
+    use cgka_traits::ingest::IngestOutcome;
+
+    let (mut alice, alice_storage) = build_client_with_storage(b"alice-self-evict-replay");
+    let (mut bob, bob_storage) = build_client_with_storage(b"bob-self-evict-replay");
+    let alice_id = alice.self_id();
+    let bob_id = bob.self_id();
+
+    // Bob is a co-admin so he can remove Alice; Alice (creator) is implicitly an
+    // admin, so removing her still leaves an admin (Bob) — MIP-03 §149.
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "self-evict-replay".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+
+    let route = |msg: TransportMessage| TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    };
+
+    // A second epoch-1 message from Bob, produced before he advances. On replay
+    // this is the row that classifies `SelfEvicted` once Alice's leaf is gone —
+    // its content is never peeled (the `!is_active` gate fires first).
+    let second = route(raw_self_update_commit(&bob_storage, &bob_id, &group_id));
+    let second_id = second.id.clone();
+
+    // Bob (admin) removes Alice at epoch 1 → a privileged commit.
+    let remove_alice = match bob
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![alice_id.clone()],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            bob.confirm_published(pending).await.unwrap();
+            route(msg)
+        }
+        other => panic!("expected RemoveMembers GroupEvolution, got {other:?}"),
+    };
+    assert_ne!(remove_alice.id, second_id, "distinct buffered rows");
+
+    // Alice stages her own ordinary commit → PendingPublish, the window where
+    // inbound input buffers `Retryable` before any peel. Buffer the eviction
+    // commit FIRST (lower insert_order → replayed first), then the second row.
+    let staged = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected UpdateGroupData GroupEvolution, got {other:?}"),
+    };
+
+    for msg in [remove_alice, second] {
+        let id = msg.id.clone();
+        assert!(
+            matches!(
+                alice.ingest(msg).await.unwrap(),
+                IngestOutcome::Buffered { .. }
+            ),
+            "peer input during PendingPublish must buffer"
+        );
+        assert_eq!(
+            alice_storage.get_message(&id).unwrap().state,
+            MessageState::Retryable,
+            "buffered raw rows are persisted Retryable pending replay"
+        );
+    }
+
+    // Confirm advances Alice to epoch 2 (her ordinary update applied) and
+    // replays the backlog. The buffered remove is a same-source-epoch fork the
+    // privileged committer wins, so fork recovery rolls Alice back and applies
+    // it inline — evicting her leaf — before the second row is replayed.
+    alice.confirm_published(staged).await.unwrap();
+
+    // The buffered remove really did evict Alice on replay.
+    assert!(
+        !alice
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == alice_id),
+        "the buffered remove must have evicted Alice on replay"
+    );
+
+    // Regression: the `SelfEvicted` row's raw wrapper must keep the `Failed`
+    // state ingest committed — never clobbered to `Processed`.
+    assert_eq!(
+        alice_storage.get_message(&second_id).unwrap().state,
+        MessageState::Failed,
+        "a row we were evicted on must stay Failed after replay, not be swept \
+         into canonicalization as Processed"
     );
 }
 

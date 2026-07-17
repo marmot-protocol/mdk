@@ -55,6 +55,31 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
+    /// Whether the raw transport row `id` is STILL awaiting retry as of its
+    /// *current* stored state — the same `Created | Retryable | PeelDeferred`
+    /// set the replay / deferred-peel loops admit at entry.
+    ///
+    /// Retirement paths re-read through this rather than trusting a row state
+    /// snapshotted before re-ingest: `ingest_group_message` can commit a
+    /// terminal state to this same row during the call (e.g. the `SelfEvicted`
+    /// path persists it `Failed`, `ingest.rs`), and that verdict is
+    /// authoritative — overwriting it with `Processed` would relabel a row we
+    /// were evicted on as a canonicalization input. A vanished row
+    /// (`NotFound`) is not awaiting retry.
+    pub(crate) fn raw_transport_row_awaiting_retry(
+        &self,
+        id: &MessageId,
+    ) -> Result<bool, EngineError> {
+        match self.storage.get_message(id) {
+            Ok(record) => Ok(matches!(
+                record.state,
+                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
+            )),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(e) => Err(EngineError::Storage(e)),
+        }
+    }
+
     pub(crate) fn record_sent_message(
         &mut self,
         msg: &TransportMessage,

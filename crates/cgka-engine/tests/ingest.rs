@@ -319,6 +319,45 @@ impl TransportPeeler for SnapshotFallbackMalformedPeeler {
     }
 }
 
+/// Pass-through peeler (identical to [`MockPeeler`]) that counts how many times
+/// `peel_group_message` is invoked, so a test can assert a retired raw row is
+/// not wastefully re-peeled on later replay passes.
+struct CountingPeeler {
+    peels: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl TransportPeeler for CountingPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        *self.peels.lock().unwrap() += 1;
+        MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
 fn selfremove_registry() -> FeatureRegistry {
     let mut r = FeatureRegistry::new();
     r.register(
@@ -1227,6 +1266,144 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
     assert!(
         replayed,
         "expected buffered message after rollback; got {events:?}"
+    );
+}
+
+/// A peer message that arrives during our own `PendingPublish` window is
+/// buffered `Retryable` (persisted before any peel). Once the publish cycle
+/// resolves and replay applies it, the raw transport wrapper MUST reach a
+/// terminal state: the content-derived row now carries the real verdict, so
+/// leaving the raw row `Retryable` only makes replay re-peel it wastefully on
+/// every subsequent publish cycle.
+#[tokio::test]
+async fn buffered_retryable_peer_message_is_retired_terminal_after_replay() {
+    let peels = Arc::new(Mutex::new(0usize));
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let alice_storage = storage.clone();
+    let mut alice = build_client_with_storage_and_peeler(
+        storage,
+        b"alice-buffered-retire",
+        Box::new(CountingPeeler {
+            peels: peels.clone(),
+        }),
+    );
+    let mut bob = build_client(b"bob-buffered-retire");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (create_pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        _ => unreachable!(),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+    alice.drain_events();
+    bob.drain_events();
+
+    let bob_msg = match bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, b"arrived while alice was pending"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        _ => unreachable!(),
+    };
+    let raw_id = bob_msg.id.clone();
+
+    // ── Cycle 1: buffer during PendingPublish, then replay on rollback. ──
+    let staged = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+
+    let buffered = alice.ingest(bob_msg).await.unwrap();
+    assert!(
+        matches!(buffered, IngestOutcome::Buffered { .. }),
+        "peer message during PendingPublish must buffer, got {buffered:?}"
+    );
+    assert_eq!(
+        *peels.lock().unwrap(),
+        0,
+        "buffering is pre-peel: the PendingPublish window must not peel the row"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Retryable,
+        "the buffered raw transport row is persisted Retryable pending replay"
+    );
+
+    alice.publish_failed(staged).await.unwrap();
+    assert!(
+        alice.drain_events().iter().any(
+            |e| matches!(e, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"arrived while alice was pending"),
+        ),
+        "the buffered message must be delivered once replay runs"
+    );
+    assert_eq!(
+        *peels.lock().unwrap(),
+        1,
+        "replay peels the buffered row exactly once"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Processed,
+        "after replay applies it, the raw transport wrapper must be terminal \
+         (Processed) — not left Retryable to be re-peeled forever"
+    );
+
+    // ── Cycle 2: a second publish cycle must not re-peel the retired row. ──
+    let staged_again = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending-again".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.publish_failed(staged_again).await.unwrap();
+    assert_eq!(
+        *peels.lock().unwrap(),
+        1,
+        "a retired raw row is excluded from replay — no wasted re-peel on the \
+         next publish cycle"
+    );
+    assert_eq!(
+        alice_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Processed,
+        "the retired raw row stays terminal across publish cycles"
     );
 }
 
