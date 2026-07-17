@@ -88,6 +88,12 @@ def install_fake_hermes_modules():
         def _mark_disconnected(self):
             self._running = False
 
+        async def connect(self, *, is_reconnect: bool = False) -> bool:
+            # Mirrors hermes-agent's keyword-only base signature; the gateway
+            # always calls connect(is_reconnect=...), so overrides must accept
+            # the keyword even when they ignore it (#836).
+            raise NotImplementedError
+
         def build_source(self, **kwargs):
             return SessionSource(platform=self.platform, **kwargs)
 
@@ -811,6 +817,30 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(adapter._tool_progress_events, {})
         self.assertEqual(adapter._tool_progress_replies, {})
+
+    async def test_connect_accepts_gateway_is_reconnect_keyword(self):
+        # hermes-agent's gateway connects adapters via connect(is_reconnect=...)
+        # on cold boot and reconnect alike, so a signature without the
+        # keyword-only argument raises TypeError before the platform ever
+        # comes up (#836).
+        class FakeClient:
+            async def inbound_events(self, account_id_hex=None, group_id_hex=None):
+                await asyncio.Event().wait()
+                yield {}  # unreachable: marks this as an async generator
+
+        for is_reconnect in (False, True):
+            with self.subTest(is_reconnect=is_reconnect):
+                adapter = self.adapter_module.MarmotPlatformAdapter(
+                    self.config_cls(extra={"account_id_hex": "11" * 32}),
+                    client=FakeClient(),
+                )
+                try:
+                    self.assertTrue(await adapter.connect(is_reconnect=is_reconnect))
+                    self.assertTrue(adapter._running)
+                    self.assertIsNotNone(adapter._listener_task)
+                finally:
+                    await adapter.disconnect()
+                self.assertIsNone(adapter._listener_task)
 
     async def test_inbound_event_is_forwarded_to_hermes_message_event(self):
         events = [
