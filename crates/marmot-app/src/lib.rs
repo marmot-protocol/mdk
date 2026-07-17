@@ -779,6 +779,11 @@ pub(crate) struct AppMessageProjection {
     /// system row, so the row can be invalidated by origin commit if that commit
     /// loses a fork. `None` for all other projections.
     pub(crate) origin_commit_id: Option<String>,
+    /// True only for a delete whose authenticated sender may moderate other
+    /// members' messages (group admin, non-direct group), evaluated against
+    /// the signed MLS group state when the delete is recorded and persisted
+    /// with the event. `false` for every other projection.
+    pub(crate) moderation_grant: bool,
 }
 
 fn generate_telemetry_install_id() -> String {
@@ -2739,6 +2744,24 @@ impl MarmotApp {
         let storage_update = self
             .account_storage(label)?
             .record_app_event(&stored_app_event_from_projection(message, now))?;
+        self.app_projection_update(label, storage_update)
+    }
+
+    /// As [`Self::record_account_app_event`], but a conflicting row's
+    /// `moderation_grant` is replaced rather than frozen. Used by the local
+    /// sender's post-publish reconciling projection so a moderation grant
+    /// recomputed after group sync supersedes the optimistic pre-send value.
+    pub(crate) fn record_account_app_event_refreshing_moderation_grant(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        let now = unix_now_seconds();
+        let storage_update = self
+            .account_storage(label)?
+            .record_app_event_refreshing_moderation_grant(&stored_app_event_from_projection(
+                message, now,
+            ))?;
         self.app_projection_update(label, storage_update)
     }
 

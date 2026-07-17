@@ -4,7 +4,9 @@ use cgka_traits::app_components::{
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
 };
-use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MarmotAppEvent as MarmotInnerEvent,
+};
 
 use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group};
 use crate::{
@@ -23,18 +25,24 @@ impl AppClient {
     /// post-publish success projection advances it.
     pub(crate) fn record_local_app_event_projection(
         &self,
-        group_id_hex: &str,
+        group_id: &GroupId,
         sender: &str,
         event: &MarmotInnerEvent,
         source_message_id_hex: Option<String>,
         source_epoch: Option<u64>,
         advance_read_marker: bool,
     ) -> Result<crate::AppProjectionUpdate, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        // Stamped on the sender's own store too, so a moderation delete of
+        // another member's message survives local reprojection instead of
+        // resurrecting the target.
+        let moderation_grant = event.kind == MARMOT_APP_EVENT_KIND_DELETE
+            && self.delete_moderation_grant(group_id, sender);
         let message_projection = AppMessageProjection {
             message_id_hex: event.id.clone(),
             source_message_id_hex,
             direction: "sent".to_owned(),
-            group_id_hex: group_id_hex.to_owned(),
+            group_id_hex: group_id_hex.clone(),
             sender: sender.to_owned(),
             plaintext: event.content.clone(),
             kind: event.kind,
@@ -44,14 +52,26 @@ impl AppClient {
             // Only synthesized kind-1210 system rows carry an origin commit;
             // ordinary sent app events do not.
             origin_commit_id: None,
+            moderation_grant,
         };
-        let update = self
-            .app
-            .record_account_app_event(&self.state.label, &message_projection)?;
+        // The reconciling post-publish projection (advance_read_marker) runs
+        // after group sync, so its recomputed moderation grant supersedes the
+        // optimistic pre-send one; the pre-send projection keeps the default
+        // freeze so a later no-op re-record can't downgrade it.
+        let update = if advance_read_marker {
+            self.app
+                .record_account_app_event_refreshing_moderation_grant(
+                    &self.state.label,
+                    &message_projection,
+                )?
+        } else {
+            self.app
+                .record_account_app_event(&self.state.label, &message_projection)?
+        };
         if advance_read_marker && event.kind == MARMOT_APP_EVENT_KIND_CHAT {
             let read_marker =
                 self.app
-                    .mark_timeline_message_read(&self.state.label, group_id_hex, &event.id);
+                    .mark_timeline_message_read(&self.state.label, &group_id_hex, &event.id);
             if let Err(err) = read_marker {
                 let error_code = read_marker_error_code(&err);
                 tracing::warn!(
@@ -63,6 +83,28 @@ impl AppClient {
             }
         }
         Ok(update)
+    }
+
+    /// Fail-closed: a group or admin-policy lookup failure yields no grant, so
+    /// the delete degrades to self-retraction semantics.
+    ///
+    /// Accepted trade-off: the grant is evaluated against the admin set this
+    /// device sees now (current signed group state), not the admin set as of
+    /// the delete's epoch, and it is then frozen at first record. Two devices
+    /// that first observe the same delete at different points in their own sync
+    /// — one already past an admin-adding commit, the other not, or one while
+    /// the group is quarantined — can therefore disagree permanently on whether
+    /// it is honored, a milder echo of the cross-device divergence #873
+    /// addresses. This is the deliberate fail-closed / frozen posture; an
+    /// epoch-anchored admin evaluation is future work.
+    pub(crate) fn delete_moderation_grant(&self, group_id: &GroupId, sender_hex: &str) -> bool {
+        let Ok(group) = self.runtime.group_record(group_id) else {
+            return false;
+        };
+        let Ok(admins) = self.runtime.admin_pubkeys(group_id) else {
+            return false;
+        };
+        crate::groups::delete_moderation_grant(&group, &admins, sender_hex)
     }
 
     pub(crate) fn state_group_record(&self, group_id: &GroupId) -> Option<AppGroupRecord> {
@@ -342,6 +384,7 @@ fn build_group_system_projection(
         tags: material.tags,
         source_epoch: Some(epoch),
         recorded_at: Some(recorded_at),
+        moderation_grant: false,
         // Non-unique link to the origin commit so a losing-branch rollback can
         // invalidate every row this commit synthesized (1:N).
         origin_commit_id,

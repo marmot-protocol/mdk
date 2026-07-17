@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cgka_traits::TransportAdapter;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
 use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
@@ -493,6 +493,11 @@ impl AppClient {
                     );
                 }
                 self.app.remember_directory_message_sender(&message)?;
+                // Evaluated against the signed MLS group state while the
+                // delete's epoch context is live, then persisted with the
+                // event so later admin-set changes cannot flip the verdict.
+                let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                    && self.delete_moderation_grant(&message.group_id, &message.sender);
                 let message_projection = AppMessageProjection {
                     message_id_hex: message.message_id_hex.clone(),
                     source_message_id_hex: Some(message.source_message_id_hex.clone()),
@@ -506,6 +511,7 @@ impl AppClient {
                     recorded_at: Some(source_recorded_at),
                     // Received app messages are not synthesized system rows.
                     origin_commit_id: None,
+                    moderation_grant,
                 };
                 let projection_update = self
                     .app

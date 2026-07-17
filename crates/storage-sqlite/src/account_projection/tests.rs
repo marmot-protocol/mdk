@@ -60,6 +60,7 @@ fn app_event(id: &str, group_id_hex: &str, at: u64) -> StoredAppEvent {
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -82,6 +83,7 @@ fn agent_stream_start_event(
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -102,6 +104,7 @@ fn reply_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> StoredApp
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -119,6 +122,7 @@ fn reaction_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> Stored
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
@@ -142,6 +146,7 @@ fn delete_event(
         recorded_at: at,
         received_at: at,
         origin_commit_id: None,
+        moderation_grant: false,
     }
 }
 
