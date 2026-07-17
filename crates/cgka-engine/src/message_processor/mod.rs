@@ -593,15 +593,38 @@ impl<S: StorageProvider> Engine<S> {
                 Ok(IngestOutcome::Buffered { .. } | IngestOutcome::Processed) => {
                     // The peeled content now has its own content-derived record;
                     // retire the raw transport wrapper so it does not keep
-                    // re-entering this retry loop as a stale duplicate.
-                    self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                    // re-entering this retry loop as a stale duplicate — but ONLY
+                    // while it is still awaiting retry. `record` is the pre-ingest
+                    // sweep snapshot; `ingest_group_message` may have committed a
+                    // terminal state to this same row during the call (or
+                    // fork-recovery rollback may have deleted it). That
+                    // ingest-committed verdict is authoritative, so re-read the
+                    // row and retire only a state ingest left awaiting retry
+                    // (seam parity with `replay_buffered_messages`, 5ae9a440).
+                    if self.raw_transport_row_awaiting_retry(&record.id)? {
+                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                    }
+                    // Release the flood-cap slot whenever the row leaves the
+                    // retry lifecycle, whether this arm retired it or ingest
+                    // already terminalized it.
                     self.note_peel_deferred_row_retired(group_id, &record.id);
                     progressed += 1;
                 }
                 Ok(IngestOutcome::Stale { .. }) => {
                     // Terminal stale classifications are still successful
-                    // reclassifications of this raw deferred row.
-                    self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                    // reclassifications of this raw deferred row. Retire it only
+                    // while it is still awaiting retry: the reachable case is
+                    // `SelfEvicted`, where re-ingesting the deferred row against a
+                    // now-inactive group makes ingest persist it `Failed`
+                    // (ingest.rs). Relabeling that evicted-on row `Processed`
+                    // would sweep it back into canonicalization, so re-read the
+                    // row and never clobber ingest's terminal verdict (seam parity
+                    // with `replay_buffered_messages`, 5ae9a440).
+                    if self.raw_transport_row_awaiting_retry(&record.id)? {
+                        self.update_stored_message_state(&record.id, MessageState::Processed)?;
+                    }
+                    // The cap-slot release stays outside the guard: the row has
+                    // left the retry lifecycle regardless of who terminalized it.
                     self.note_peel_deferred_row_retired(group_id, &record.id);
                     progressed += 1;
                 }
