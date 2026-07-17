@@ -118,7 +118,7 @@ fn privacy_safe_server_reason(reason: &str) -> Option<String> {
         return None;
     }
     let lowercase = reason.to_ascii_lowercase();
-    if ["http://", "https://", "nostr:", "npub1", "nsec1"]
+    if ["://", "nostr:", "npub1", "nsec1"]
         .iter()
         .any(|needle| lowercase.contains(needle))
     {

@@ -298,6 +298,35 @@ async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
     assert!(!message.contains(&secret_value));
 }
 
+#[tokio::test]
+async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[("X-Reason", "denied, use relay wss://relay.example instead")],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &[],
+        true,
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("relay.example"));
+}
+
 #[test]
 fn built_in_blossom_endpoints_are_ciphertext_compatible_fallbacks() {
     assert_eq!(DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS[0]);

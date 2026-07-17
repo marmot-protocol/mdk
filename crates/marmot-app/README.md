@@ -60,7 +60,8 @@ DTOs plus Blossom upload/download helpers live in the `src/media/` module.
 Encrypted media and encrypted group images are uploaded as opaque `application/octet-stream` blobs. A compatible
 Blossom server must accept arbitrary binary data rather than only recognizable image, audio, or video payloads. New
 groups use the ordered built-in ciphertext-compatible endpoint list unless the host build supplies
-`MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`; upload attempts follow that order.
+`MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`. Encrypted media uploads try those endpoints in order; encrypted group-image
+uploads use only the primary (first) endpoint.
 
 The endpoint list is embedded in the signed `marmot.group.encrypted-media.v1` component. Changing application defaults
 does not rewrite existing group state. An active group admin can migrate an existing group with

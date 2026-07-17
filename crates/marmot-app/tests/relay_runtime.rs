@@ -4106,11 +4106,25 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         .iter()
         .map(|endpoint| endpoint.base_url.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        initial_endpoints,
+    // Host builds may compile in MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS, so
+    // expect whichever list the client actually embeds.
+    let configured = marmot_app::MarmotServiceEndpoints::compiled().encrypted_media_blob_endpoints;
+    let expected_endpoints = if configured.is_empty() {
         marmot_app::DEFAULT_BLOSSOM_SERVER_URLS
             .iter()
-            .map(|endpoint| format!("{endpoint}/"))
+            .map(|endpoint| (*endpoint).to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        configured
+    };
+    assert_eq!(
+        initial_endpoints
+            .iter()
+            .map(|endpoint| endpoint.trim_end_matches('/'))
+            .collect::<Vec<_>>(),
+        expected_endpoints
+            .iter()
+            .map(|endpoint| endpoint.trim_end_matches('/'))
             .collect::<Vec<_>>()
     );
 
