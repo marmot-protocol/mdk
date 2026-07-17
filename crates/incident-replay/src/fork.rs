@@ -8,13 +8,20 @@ use std::collections::BTreeSet;
 
 use crate::export::{AgentStateExport, EventKind, ForkWinner};
 
-/// The kind of commit both branches raced with. Only group-metadata forks are
-/// synthesizable today; membership/admin forks are deferred (they need a
-/// distinct scenario shape) and quarantine as unmapped.
+/// The kind of commit both branches raced with. Two shapes are synthesizable:
+/// group-metadata forks (`UpdateGroupData`) and membership/admin forks (a
+/// competing-invite race). The fork-recovery mechanism is content-independent —
+/// what matters is that two committers raced a commit at the same epoch and one
+/// branch was invalidated — so a membership-changing commit race reproduces the
+/// same `RecoverySummary` (outcome-equivalence, as the convergence path does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkCommitKind {
     /// A group-metadata commit (topic/name/avatar/retention) → `UpdateGroupData`.
     GroupData,
+    /// A membership/admin commit (member add/remove, admin grant/revoke) →
+    /// reproduced by a competing-invite race, where `member_count == 3` after
+    /// recovery is the winner-agnostic proof that exactly one branch survived.
+    Membership,
 }
 
 /// The minimal, reproducible facts of a recovered fork.
@@ -48,12 +55,20 @@ pub enum ForkRecoveryError {
     UnrecoverableWinner,
     #[error("unmapped commit kind `{0}` at the contested tip")]
     UnmappedCommitKind(String),
+    #[error(
+        "the contested tip mixes a group-metadata commit with a membership commit, which has no \
+         single vector shape"
+    )]
+    MixedCommitKinds,
 }
 
 fn commit_kind(change_kind: &str) -> Result<ForkCommitKind, ForkRecoveryError> {
     match change_kind {
         "topic_changed" | "group_renamed" | "avatar_changed" | "retention_changed" => {
             Ok(ForkCommitKind::GroupData)
+        }
+        "member_added" | "member_removed" | "admin_added" | "admin_removed" => {
+            Ok(ForkCommitKind::Membership)
         }
         other => Err(ForkRecoveryError::UnmappedCommitKind(other.to_string())),
     }
@@ -99,26 +114,49 @@ pub fn recover_fork(export: &AgentStateExport) -> Result<RecoveredFork, ForkReco
         return Err(ForkRecoveryError::AmbiguousCommitters(committers.len()));
     }
 
-    // Every competing commit must map to one synthesizable kind.
-    let mut commit = None;
+    // Every competing commit must map to one synthesizable kind. A single fork
+    // is one shape: a tip that mixes a group-metadata commit with a membership
+    // commit has no single vector to race, so it fail-closes. (The membership
+    // variants all collapse to one `Membership` kind, so the real add-vs-promote
+    // race — `member_added` on one branch, `admin_added` on the other — is not
+    // mixed.)
+    let mut kinds: Vec<ForkCommitKind> = Vec::new();
     for (_, change_kind) in &tip {
-        commit = Some(commit_kind(change_kind)?);
+        let kind = commit_kind(change_kind)?;
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
     }
-    let commit = commit.expect("two committers implies at least one tip change");
+    let commit = match kinds.as_slice() {
+        [only] => *only,
+        [] => unreachable!("two committers implies at least one tip change"),
+        _ => return Err(ForkRecoveryError::MixedCommitKinds),
+    };
 
-    // Rule 3 tier-b: the account that published the invalidated commit is the
-    // loser; the winner is the other committer. If the invalidated commit can't
-    // be attributed to one of the two committers, the winner is unrecoverable.
-    let loser = invalidated
-        .and_then(|inv| {
-            export
-                .events
-                .iter()
-                .find(|e| e.published_msg_id() == Some(inv))
-        })
-        .and_then(|event| event.account_ref.as_deref());
-    if !loser.is_some_and(|loser| committers.contains(loser)) {
-        return Err(ForkRecoveryError::UnrecoverableWinner);
+    // Rule 3 tier-b winner attribution is only needed for the group-data fork,
+    // whose accept path label-searches for the ordering that makes the designated
+    // winner's branch survive. The membership fork is winner-agnostic
+    // (`member_count == 3` is the survival proof, so accept is a single run with
+    // no label search), and real observer-recorded exports cannot even provide
+    // the join it would need: `account_ref` on a publish event is the *observing*
+    // engine, while the committers are `actor_member_ref` (MLS member ids) — a
+    // disjoint id space, so the publisher never matches a committer. Gating this
+    // to `GroupData` is what lets a real membership fork recover.
+    if commit == ForkCommitKind::GroupData {
+        // The account that published the invalidated commit is the loser; the
+        // winner is the other committer. If the invalidated commit can't be
+        // attributed to one of the two committers, the winner is unrecoverable.
+        let loser = invalidated
+            .and_then(|inv| {
+                export
+                    .events
+                    .iter()
+                    .find(|e| e.published_msg_id() == Some(inv))
+            })
+            .and_then(|event| event.account_ref.as_deref());
+        if !loser.is_some_and(|loser| committers.contains(loser)) {
+            return Err(ForkRecoveryError::UnrecoverableWinner);
+        }
     }
 
     Ok(RecoveredFork {

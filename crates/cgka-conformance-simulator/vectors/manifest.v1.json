@@ -203,6 +203,19 @@
       "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
     },
     {
+      "id": "membership-fork-recovery-incident/v1",
+      "kind": "scenario_vector",
+      "status": "incident_replay",
+      "artifact": "incidents/membership-fork-recovery-incident.v1.json",
+      "coverage": [
+        "Goggles forensic export replayed as a conformance vector",
+        "same-epoch membership/admin fork recovery (competing-invite race)",
+        "winner-agnostic branch survival via post-recovery member count",
+        "full recovery-summary reproduction"
+      ],
+      "next": "Wire vectors/incidents/ into the portable vector fixture test (Phase 5)."
+    },
+    {
       "id": "convergence-incident/v1",
       "kind": "scenario_vector",
       "status": "incident_replay",
