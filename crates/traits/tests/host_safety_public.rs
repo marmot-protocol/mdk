@@ -80,6 +80,15 @@ fn shared_host_safety_classifies_canonical_ipv6_ranges() {
     assert!(is_public_ipv6("::ffff:93.184.216.34".parse().unwrap()));
     assert!(is_public_ip(IpAddr::V6("2606:4700::1".parse().unwrap())));
 
+    // Only the actual RFC 9637 block 3fff:0000::/20 is documentation space.
+    // Neighbouring global-unicast hextets (3ff0:: to 3ffe::) and 3fff:: past the
+    // /20 boundary (second hextet >= 0x1000) are ordinary routable space.
+    for raw in ["3ff0::1", "3ffe::1", "3fff:1000::1", "3fff:ffff::1"] {
+        let addr: Ipv6Addr = raw.parse().expect("test IPv6 literal parses");
+        assert!(is_public_ipv6(addr), "{raw} should be accepted");
+        assert!(is_public_ip(IpAddr::V6(addr)), "{raw} should be accepted");
+    }
+
     for raw in [
         "::1",              // loopback
         "::",               // unspecified
@@ -91,7 +100,8 @@ fn shared_host_safety_classifies_canonical_ipv6_ranges() {
         "2002::1",          // 6to4 transition prefix
         "2001::1",          // Teredo 2001:0000::/32
         "2001:db8::1",      // documentation
-        "3fff::1",          // documentation 3fff::/20
+        "3fff::1",          // documentation 3fff::/20 (lower edge)
+        "3fff:0fff::1",     // documentation 3fff::/20 (upper edge)
         "4000::1",          // outside global-unicast 2000::/3
     ] {
         let addr: Ipv6Addr = raw.parse().expect("test IPv6 literal parses");

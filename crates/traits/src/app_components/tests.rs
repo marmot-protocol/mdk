@@ -350,7 +350,7 @@ fn group_avatar_url_rejects_documentation_ipv6_ranges() {
         "https://[2001:db8::1]/a.png",
         "https://[2001:db8:abcd:12::1]/a.png",
         "https://[3fff::1]/a.png",
-        "https://[3fff:ffff::1]/a.png",
+        "https://[3fff:0fff::1]/a.png",
     ] {
         assert!(
             validate_and_normalize_group_avatar_url(raw).is_err(),
