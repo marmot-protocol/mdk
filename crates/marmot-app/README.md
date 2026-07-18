@@ -67,6 +67,10 @@ The endpoint list is embedded in the signed `marmot.group.encrypted-media.v1` co
 does not rewrite existing group state. An active group admin can migrate an existing group with
 `replace_encrypted_media_blob_endpoints` through the app runtime or UniFFI API.
 
+Encrypted group images differ: no endpoint is stored in group state, so upload and fetch both resolve against the
+build's primary endpoint. Clients compiled with different defaults therefore look for group images in different
+places; re-setting the group image on a current build republishes it to the current primary endpoint.
+
 ## Run the tests
 
 ```sh

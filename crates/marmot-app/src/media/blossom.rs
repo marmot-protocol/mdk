@@ -125,9 +125,11 @@ fn privacy_safe_server_reason(reason: &str) -> Option<String> {
         return None;
     }
     if reason.split_ascii_whitespace().any(|token| {
-        let token = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
-        (token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            || (token.len() >= 48 && token.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        // Collapse punctuation so hyphenated hashes and UUIDs still register
+        // as one long identifier.
+        let token: String = token.chars().filter(char::is_ascii_alphanumeric).collect();
+        token.len() >= 48
+            || (token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
     }) {
         return None;
     }

@@ -299,6 +299,71 @@ async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
 }
 
 #[tokio::test]
+async fn upload_encrypted_media_drops_punctuated_hash_rejection_reason() {
+    let secret_value = "11".repeat(32);
+    let rejecting = spawn_http_response(http_error_response(
+        409,
+        "Conflict",
+        &[(
+            "X-Reason",
+            &format!("duplicate-blob-{secret_value}-already-exists"),
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &[],
+        true,
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 409"));
+    assert!(!message.contains(&secret_value));
+}
+
+#[tokio::test]
+async fn upload_encrypted_media_drops_uuid_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[(
+            "X-Reason",
+            "upload id 123e4567-e89b-12d3-a456-426614174000 already used",
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        &endpoints,
+        &[],
+        true,
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("123e4567"));
+}
+
+#[tokio::test]
 async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
     let rejecting = spawn_http_response(http_error_response(
         403,
