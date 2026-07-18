@@ -394,6 +394,33 @@ fn sync_drain_round_trips_through_serde() {
     );
 }
 
+#[test]
+fn epoch_stall_backfill_armed_roundtrips_and_carries_its_fields() {
+    let kind = AuditEventKind::EpochStallBackfillArmed {
+        stalled_epoch: 19,
+        threshold: 8,
+    };
+    let event = AuditEvent {
+        schema_version: AUDIT_LOG_SCHEMA_VERSION.into(),
+        seq: 7,
+        wall_time_ms: 1_700_000_000_000,
+        audit_data_mode: AuditDataMode::ObfuscatedSensitiveData,
+        recorder_session_id: Some("recorder-1".into()),
+        account_ref: None,
+        engine_id: "engine-xyz".into(),
+        group_ref: None,
+        context: None,
+        kind: kind.clone(),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["kind"]["type"], "epoch_stall_backfill_armed");
+    assert_eq!(value["kind"]["stalled_epoch"], 19);
+    assert_eq!(value["kind"]["threshold"], 8);
+    let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.kind, kind);
+}
+
 fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
     vec![
         AuditEventKind::RecorderStarted {
@@ -803,6 +830,10 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             deliveries: 3,
             cursor_before_secs: Some(1_699_999_880),
             cursor_after_secs: Some(1_700_000_000),
+        },
+        AuditEventKind::EpochStallBackfillArmed {
+            stalled_epoch: 19,
+            threshold: 8,
         },
     ]
 }

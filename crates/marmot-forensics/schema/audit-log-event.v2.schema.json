@@ -1639,6 +1639,22 @@
               "$ref": "#/$defs/u64"
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "stalled_epoch", "threshold"],
+          "properties": {
+            "type": {
+              "const": "epoch_stall_backfill_armed"
+            },
+            "stalled_epoch": {
+              "$ref": "#/$defs/u64"
+            },
+            "threshold": {
+              "$ref": "#/$defs/u64"
+            }
+          }
         }
       ]
     }
