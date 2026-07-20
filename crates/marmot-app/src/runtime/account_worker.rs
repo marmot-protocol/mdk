@@ -485,10 +485,6 @@ async fn run_app_runtime_account_worker(
             Err(message)
         }
     };
-    client
-        .retry_pending_push_registration_shares_best_effort()
-        .await;
-
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result.
@@ -510,6 +506,12 @@ async fn run_app_runtime_account_worker(
             }
         }
     }
+    // Automatic gossip is best-effort network work. Run it only after startup
+    // callers have received their deferred responses so a degraded relay cannot
+    // extend account-open latency.
+    client
+        .retry_pending_push_registration_shares_best_effort()
+        .await;
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
     // / InviteMembers) can buffer convergence groups. The steady-state arms below
@@ -687,9 +689,6 @@ async fn handle_account_worker_command(
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("catch_up");
                     }
-                    client
-                        .retry_pending_push_registration_shares_best_effort()
-                        .await;
                     Ok(())
                 }
                 Err(err) => {
@@ -708,7 +707,13 @@ async fn handle_account_worker_command(
                 sync_started_at.elapsed(),
                 result.is_ok(),
             );
+            let retry_after_response = result.is_ok();
             let _ = respond.send(result);
+            if retry_after_response {
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+            }
         }
         AccountWorkerCommand::CreateGroup {
             name,
@@ -734,12 +739,15 @@ async fn handle_account_worker_command(
                     account_label,
                     group_id,
                 );
+            }
+            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
+            let retry_after_response = result.is_ok();
+            let _ = respond.send(result);
+            if retry_after_response {
                 client
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
             }
-            publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
-            let _ = respond.send(result);
         }
         AccountWorkerCommand::Members { group_id, respond } => {
             let result = client.members(&group_id);
@@ -941,11 +949,14 @@ async fn handle_account_worker_command(
                     account_label,
                     &group_id,
                 );
+            }
+            let retry_after_response = result.is_ok();
+            let _ = respond.send(result);
+            if retry_after_response {
                 client
                     .retry_pending_push_registration_shares_best_effort()
                     .await;
             }
-            let _ = respond.send(result);
         }
         AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => {
             let result = client.decline_group_invite(&group_id).await;

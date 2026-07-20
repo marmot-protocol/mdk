@@ -1606,7 +1606,13 @@ impl MarmotAppRuntime {
             .app
             .set_native_push_enabled(account_ref, enabled)?;
         if enabled && self.accounts.app.push_registration(account_ref)?.is_some() {
-            let _ = self.share_push_registration(account_ref).await;
+            // Re-enabling durably queues all joined groups in storage. Schedule
+            // the serialized worker retry, but do not make the settings toggle
+            // wait for relay I/O.
+            let _ = self
+                .accounts
+                .schedule_push_registration_share(account_ref)
+                .await;
         }
         Ok(settings)
     }

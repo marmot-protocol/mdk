@@ -33,11 +33,27 @@ use crate::messages::{AppMessageIntent, build_inner_event};
 #[derive(Default)]
 struct ScriptedPushRelayClient {
     publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    block_next_publish: std::sync::atomic::AtomicBool,
+    publish_started: tokio::sync::Notify,
+    publish_release: tokio::sync::Notify,
 }
 
 impl ScriptedPushRelayClient {
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
+    }
+
+    fn block_next_publish(&self) {
+        self.block_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_publish(&self) {
+        self.publish_started.notified().await;
+    }
+
+    fn release_publish(&self) {
+        self.publish_release.notify_one();
     }
 }
 
@@ -70,6 +86,13 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         _event: &NostrTransportEvent,
         _required_acks: usize,
     ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        if self
+            .block_next_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.publish_started.notify_one();
+            self.publish_release.notified().await;
+        }
         if self
             .publish_results
             .lock()
@@ -129,7 +152,7 @@ async fn push_registration_retry_survives_all_failed_partial_and_restart() {
     drop(app);
     let reopened_relay = Arc::new(ScriptedPushRelayClient::default());
     let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(reopened_relay);
+        .with_test_relay_client(reopened_relay.clone());
     let runtime = MarmotAppRuntime::new(reopened.clone());
     runtime.reconcile_accounts().await.unwrap();
     let fingerprint = reopened
@@ -192,6 +215,58 @@ async fn push_registration_retry_survives_all_failed_partial_and_restart() {
     );
     assert_eq!(first.share.status, PushRegistrationShareStatus::Complete);
     assert_eq!(second.share.status, PushRegistrationShareStatus::Complete);
+
+    runtime
+        .set_native_push_enabled("alice", false)
+        .await
+        .unwrap();
+    let disabled_sync = runtime
+        .upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "token-stored-while-disabled",
+            &server_pubkey_hex,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        disabled_sync.share.status,
+        PushRegistrationShareStatus::Pending
+    );
+    let disabled_fingerprint = disabled_sync.registration.token_fingerprint;
+    let disabled_revision = disabled_sync.registration.updated_at_ms;
+    reopened_relay.block_next_publish();
+    let settings = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.set_native_push_enabled("alice", true),
+    )
+    .await
+    .expect("native-push settings must not wait for registration gossip")
+    .unwrap();
+    assert!(settings.native_push_enabled);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reopened_relay.wait_for_blocked_publish(),
+    )
+    .await
+    .expect("re-enable should schedule registration gossip");
+    reopened_relay.release_publish();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if reopened
+                .pending_push_registration_shares("alice", &disabled_fingerprint, disabled_revision)
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("scheduled re-enable gossip should drain after relay recovery");
+
     runtime.shutdown().await;
 }
 

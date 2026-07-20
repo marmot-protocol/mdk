@@ -153,18 +153,27 @@ pub struct PushRegistration {
     pub last_shared_at_ms: Option<i64>,
 }
 
+/// Whether every joined group has received the current push registration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PushRegistrationShareStatus {
+    /// No per-group share work remains for the current registration revision.
     Complete,
+    /// One or more joined groups still need the current registration revision.
     Pending,
 }
 
+/// Per-attempt result for durable push-registration gossip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushRegistrationShareOutcome {
+    /// Aggregate completion status after the attempt.
     pub status: PushRegistrationShareStatus,
+    /// Groups selected for this attempt.
     pub attempted_groups: u32,
+    /// Selected groups whose publish completed and durable work was cleared.
     pub succeeded_groups: u32,
+    /// Selected groups whose preparation, publish, or conditional completion failed.
     pub failed_groups: u32,
+    /// Groups still durably queued after the attempt.
     pub pending_groups: u32,
 }
 
@@ -189,9 +198,12 @@ impl PushRegistrationShareOutcome {
     }
 }
 
+/// Stored registration together with the immediate per-group gossip outcome.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushRegistrationSyncResult {
+    /// The registration revision persisted for the account.
     pub registration: PushRegistration,
+    /// Result of attempting to share that exact revision.
     pub share: PushRegistrationShareOutcome,
 }
 
