@@ -2,7 +2,8 @@
 
 use crate::Marmot;
 use crate::conversions::{
-    GroupPushDebugInfoFfi, PushPlatformFfi, PushRegistrationFfi, group_id_from_hex,
+    GroupPushDebugInfoFfi, PushPlatformFfi, PushRegistrationFfi, PushRegistrationSyncResultFfi,
+    group_id_from_hex,
 };
 use crate::errors::MarmotKitError;
 
@@ -25,7 +26,7 @@ impl Marmot {
         raw_token: String,
         server_pubkey_hex: String,
         relay_hint: Option<String>,
-    ) -> Result<PushRegistrationFfi, MarmotKitError> {
+    ) -> Result<PushRegistrationSyncResultFfi, MarmotKitError> {
         Ok(self
             .runtime
             .upsert_push_registration(

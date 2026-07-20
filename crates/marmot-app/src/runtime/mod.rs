@@ -38,10 +38,11 @@ use crate::{
     MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
     MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
     NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, ReceivedMessage,
-    RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, RelayTelemetrySettings,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelinePage,
-    UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
+    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, SecureDeleteExpiredResult, SendSummary,
+    TimelineMessageQuery, TimelinePage, UserDirectoryRefresh, UserProfileMetadata,
+    default_profile_pseudonym, unix_now_seconds,
 };
 
 mod account_worker;
@@ -1373,7 +1374,10 @@ impl MarmotAppRuntime {
             .await
     }
 
-    pub async fn share_push_registration(&self, account_ref: &str) -> Result<usize, AppError> {
+    pub async fn share_push_registration(
+        &self,
+        account_ref: &str,
+    ) -> Result<PushRegistrationShareOutcome, AppError> {
         self.accounts.share_push_registration(account_ref).await
     }
 
@@ -1597,9 +1601,14 @@ impl MarmotAppRuntime {
                 .remove_push_registration(account_ref, registration)
                 .await;
         }
-        self.accounts
+        let settings = self
+            .accounts
             .app
-            .set_native_push_enabled(account_ref, enabled)
+            .set_native_push_enabled(account_ref, enabled)?;
+        if enabled && self.accounts.app.push_registration(account_ref)?.is_some() {
+            let _ = self.share_push_registration(account_ref).await;
+        }
+        Ok(settings)
     }
 
     pub fn push_registration(
@@ -1616,16 +1625,16 @@ impl MarmotAppRuntime {
         raw_token: &str,
         server_pubkey_hex: &str,
         relay_hint: Option<String>,
-    ) -> Result<PushRegistration, AppError> {
-        let registration = self.accounts.app.upsert_push_registration(
-            account_ref,
-            platform,
-            raw_token,
-            server_pubkey_hex,
-            relay_hint,
-        )?;
-        let _ = self.share_push_registration(account_ref).await;
-        Ok(registration)
+    ) -> Result<PushRegistrationSyncResult, AppError> {
+        self.accounts
+            .upsert_push_registration(
+                account_ref,
+                platform,
+                raw_token,
+                server_pubkey_hex,
+                relay_hint,
+            )
+            .await
     }
 
     pub async fn clear_push_registration(&self, account_ref: &str) -> Result<(), AppError> {

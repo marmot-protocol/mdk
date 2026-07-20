@@ -12,6 +12,7 @@ use rand::rngs::OsRng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
+use zeroize::Zeroizing;
 
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
@@ -27,7 +28,8 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppProjectionUpdate, AppQuarantinedGroup,
     GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
     MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    PushRegistration, ReceivedMessage, SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    ReceivedMessage, SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -253,7 +255,14 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
     SharePushRegistration {
-        respond: oneshot::Sender<Result<usize, AppError>>,
+        respond: oneshot::Sender<Result<PushRegistrationShareOutcome, AppError>>,
+    },
+    UpsertPushRegistration {
+        platform: PushPlatform,
+        raw_token: Zeroizing<String>,
+        server_pubkey_hex: String,
+        relay_hint: Option<String>,
+        respond: oneshot::Sender<Result<PushRegistrationSyncResult, AppError>>,
     },
     RemovePushRegistration {
         registration: PushRegistration,
@@ -476,6 +485,9 @@ async fn run_app_runtime_account_worker(
             Err(message)
         }
     };
+    client
+        .retry_pending_push_registration_shares_best_effort()
+        .await;
 
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
@@ -594,6 +606,11 @@ async fn run_app_runtime_account_worker(
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }
+                        if !summary.joined_groups.is_empty() {
+                            client
+                                .retry_pending_push_registration_shares_best_effort()
+                                .await;
+                        }
                     }
                     Err(err) => {
                         publish_app_runtime_account_error(
@@ -612,13 +629,16 @@ async fn run_app_runtime_account_worker(
                             _ = &mut shutdown => return,
                             result = app.runtime_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                         } {
-                            Ok(reopened) => {
+                            Ok(mut reopened) => {
                                 // The reopen re-hydrates + reconnects + resubscribes
                                 // (via `runtime_client`) but does NOT run the
                                 // catch-up `sync()` on the readiness path — it
                                 // resumes the live `next_event` tail below — so it
                                 // does not reintroduce the catch-up blocking this
                                 // worker removed from startup.
+                                reopened
+                                    .retry_pending_push_registration_shares_best_effort()
+                                    .await;
                                 client = reopened;
                             }
                             Err(setup_err) => {
@@ -667,6 +687,9 @@ async fn handle_account_worker_command(
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("catch_up");
                     }
+                    client
+                        .retry_pending_push_registration_shares_best_effort()
+                        .await;
                     Ok(())
                 }
                 Err(err) => {
@@ -711,6 +734,9 @@ async fn handle_account_worker_command(
                     account_label,
                     group_id,
                 );
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
             }
             publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
             let _ = respond.send(result);
@@ -915,6 +941,9 @@ async fn handle_account_worker_command(
                     account_label,
                     &group_id,
                 );
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
             }
             let _ = respond.send(result);
         }
@@ -1217,6 +1246,23 @@ async fn handle_account_worker_command(
         }
         AccountWorkerCommand::SharePushRegistration { respond } => {
             let result = client.share_push_registration().await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UpsertPushRegistration {
+            platform,
+            raw_token,
+            server_pubkey_hex,
+            relay_hint,
+            respond,
+        } => {
+            let result = client
+                .upsert_and_share_push_registration(
+                    platform,
+                    &raw_token,
+                    &server_pubkey_hex,
+                    relay_hint,
+                )
+                .await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::RemovePushRegistration {

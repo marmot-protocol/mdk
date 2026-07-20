@@ -566,6 +566,7 @@ impl SqliteAccountStorage {
                 "account_group_app_components",
                 "group_push_tokens",
                 "group_push_token_tombstones",
+                "pending_push_registration_shares",
                 "chat_notification_settings",
                 "encrypted_media_epoch_secrets",
                 "account_groups",
@@ -594,15 +595,56 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         membership: SelfMembership,
     ) -> StorageResult<()> {
-        self.lock()?
-            .execute(
-                "UPDATE account_groups
-                 SET self_membership = ?2
-                 WHERE group_id_hex = ?1",
-                params![group_id_hex, membership.as_str()],
-            )
-            .storage()?;
-        Ok(())
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let updated = conn
+                .execute(
+                    "UPDATE account_groups
+                     SET self_membership = ?2
+                     WHERE group_id_hex = ?1",
+                    params![group_id_hex, membership.as_str()],
+                )
+                .storage()?;
+            if updated == 0 {
+                return Ok(());
+            }
+            match membership {
+                SelfMembership::Member => {
+                    let queued_at_ms = unix_now_ms();
+                    let queued = conn
+                        .execute(
+                            "INSERT INTO pending_push_registration_shares (
+                                group_id_hex, token_fingerprint,
+                                registration_updated_at_ms, queued_at_ms,
+                                last_attempted_at_ms
+                             )
+                             SELECT ?1, token_fingerprint, updated_at_ms, ?2, NULL
+                             FROM push_registration
+                             LIMIT 1
+                             ON CONFLICT(group_id_hex) DO UPDATE SET
+                                token_fingerprint = excluded.token_fingerprint,
+                                registration_updated_at_ms = excluded.registration_updated_at_ms,
+                                queued_at_ms = excluded.queued_at_ms,
+                                last_attempted_at_ms = NULL",
+                            params![group_id_hex, queued_at_ms],
+                        )
+                        .storage()?;
+                    if queued > 0 {
+                        conn.execute("UPDATE push_registration SET last_shared_at_ms = NULL", [])
+                            .storage()?;
+                    }
+                }
+                SelfMembership::Left | SelfMembership::Removed => {
+                    conn.execute(
+                        "DELETE FROM pending_push_registration_shares
+                         WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                    )
+                    .storage()?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// `group_id_hex` of every `account_groups` row whose `self_membership` is
@@ -836,15 +878,54 @@ impl SqliteAccountStorage {
         enabled: bool,
     ) -> StorageResult<AccountNotificationSettings> {
         self.ensure_notification_settings(account_label, account_id_hex)?;
-        self.lock()?
-            .execute(
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let was_enabled = conn
+                .query_row(
+                    "SELECT native_push_enabled FROM notification_settings
+                     WHERE account_label = ?1",
+                    params![account_label],
+                    |row| Ok(row.get::<_, i64>(0)? != 0),
+                )
+                .storage()?;
+            let now_ms = unix_now_ms();
+            conn.execute(
                 "UPDATE notification_settings
                  SET native_push_enabled = ?2, updated_at_ms = ?3
                  WHERE account_label = ?1",
-                params![account_label, bool_i64(enabled), unix_now_ms()],
+                params![account_label, bool_i64(enabled), now_ms],
             )
             .storage()?;
-        self.notification_settings(account_label, account_id_hex)
+            if enabled && !was_enabled {
+                let queued = conn
+                    .execute(
+                        "INSERT INTO pending_push_registration_shares (
+                            group_id_hex, token_fingerprint,
+                            registration_updated_at_ms, queued_at_ms,
+                            last_attempted_at_ms
+                         )
+                         SELECT account_groups.group_id_hex,
+                                push_registration.token_fingerprint,
+                                push_registration.updated_at_ms, ?1, NULL
+                         FROM account_groups
+                         CROSS JOIN push_registration
+                         WHERE account_groups.self_membership = 'member'
+                         ON CONFLICT(group_id_hex) DO UPDATE SET
+                            token_fingerprint = excluded.token_fingerprint,
+                            registration_updated_at_ms = excluded.registration_updated_at_ms,
+                            queued_at_ms = excluded.queued_at_ms,
+                            last_attempted_at_ms = NULL",
+                        params![now_ms],
+                    )
+                    .storage()?;
+                if queued > 0 {
+                    conn.execute("UPDATE push_registration SET last_shared_at_ms = NULL", [])
+                        .storage()?;
+                }
+            }
+            drop(conn);
+            self.notification_settings(account_label, account_id_hex)
+        })
     }
 
     pub fn chat_notification_settings(
@@ -936,85 +1017,231 @@ impl SqliteAccountStorage {
 
     pub fn upsert_push_registration(
         &self,
-        registration: AccountPushRegistration,
+        mut registration: AccountPushRegistration,
         token_bytes: Vec<u8>,
     ) -> StorageResult<AccountStoredPushRegistration> {
-        let existing = self.push_registration(&registration.account_label)?;
-        let created_at_ms = existing
-            .as_ref()
-            .map(|existing| existing.registration.created_at_ms)
-            .unwrap_or(registration.created_at_ms);
-        let last_shared_at_ms = existing
-            .as_ref()
-            .filter(|existing| {
-                existing.registration.token_fingerprint == registration.token_fingerprint
-                    && existing.registration.server_pubkey_hex == registration.server_pubkey_hex
-                    && existing.registration.platform == registration.platform
-            })
-            .and_then(|existing| existing.registration.last_shared_at_ms);
+        self.connection.with_transaction(|| {
+            let existing = self.push_registration(&registration.account_label)?;
+            let created_at_ms = existing
+                .as_ref()
+                .map(|existing| existing.registration.created_at_ms)
+                .unwrap_or(registration.created_at_ms);
+            if let Some(existing) = &existing
+                && registration.updated_at_ms <= existing.registration.updated_at_ms
+            {
+                registration.updated_at_ms = existing
+                    .registration
+                    .updated_at_ms
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        StorageError::Backend(
+                            "push registration revision space was exhausted".to_owned(),
+                        )
+                    })?;
+            }
+            self.lock()?
+                .execute(
+                    "INSERT INTO push_registration (
+                        account_label, account_id_hex, platform, token_fingerprint,
+                        token_bytes, server_pubkey_hex, relay_hint, created_at_ms,
+                        updated_at_ms, last_shared_at_ms
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
+                     ON CONFLICT(account_label) DO UPDATE SET
+                        account_id_hex = excluded.account_id_hex,
+                        platform = excluded.platform,
+                        token_fingerprint = excluded.token_fingerprint,
+                        token_bytes = excluded.token_bytes,
+                        server_pubkey_hex = excluded.server_pubkey_hex,
+                        relay_hint = excluded.relay_hint,
+                        updated_at_ms = excluded.updated_at_ms,
+                        last_shared_at_ms = NULL",
+                    params![
+                        &registration.account_label,
+                        &registration.account_id_hex,
+                        i64::from(registration.platform),
+                        &registration.token_fingerprint,
+                        token_bytes,
+                        &registration.server_pubkey_hex,
+                        &registration.relay_hint,
+                        created_at_ms,
+                        registration.updated_at_ms,
+                    ],
+                )
+                .storage()?;
+            self.queue_push_registration_shares(
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+                registration.updated_at_ms,
+            )?;
+            self.push_registration(&registration.account_label)?
+                .ok_or_else(|| StorageError::Backend("push registration was not stored".to_owned()))
+        })
+    }
+
+    /// Reconcile durable gossip intent to the currently joined group set and
+    /// queue every joined group for the supplied registration version.
+    pub fn queue_push_registration_shares(
+        &self,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+        queued_at_ms: i64,
+    ) -> StorageResult<usize> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute(
+                "DELETE FROM pending_push_registration_shares
+                 WHERE group_id_hex NOT IN (
+                    SELECT group_id_hex FROM account_groups WHERE self_membership = 'member'
+                 )",
+                [],
+            )
+            .storage()?;
+            conn.execute(
+                "INSERT INTO pending_push_registration_shares (
+                    group_id_hex, token_fingerprint, registration_updated_at_ms,
+                    queued_at_ms, last_attempted_at_ms
+                 )
+                 SELECT group_id_hex, ?1, ?2, ?3, NULL
+                 FROM account_groups
+                 WHERE self_membership = 'member'
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    token_fingerprint = excluded.token_fingerprint,
+                    registration_updated_at_ms = excluded.registration_updated_at_ms,
+                    queued_at_ms = excluded.queued_at_ms,
+                    last_attempted_at_ms = NULL",
+                params![token_fingerprint, registration_updated_at_ms, queued_at_ms],
+            )
+            .storage()?;
+            let count = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_push_registration_shares
+                     WHERE token_fingerprint = ?1
+                       AND registration_updated_at_ms = ?2",
+                    params![token_fingerprint, registration_updated_at_ms],
+                    |row| row.get::<_, usize>(0),
+                )
+                .storage()?;
+            if count > 0 {
+                conn.execute("UPDATE push_registration SET last_shared_at_ms = NULL", [])
+                    .storage()?;
+            }
+            Ok(count)
+        })
+    }
+
+    pub fn pending_push_registration_shares(
+        &self,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+    ) -> StorageResult<Vec<String>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT group_id_hex
+                 FROM pending_push_registration_shares
+                 WHERE token_fingerprint = ?1
+                   AND registration_updated_at_ms = ?2
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        statement
+            .query_map(
+                params![token_fingerprint, registration_updated_at_ms],
+                |row| row.get(0),
+            )
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    pub fn mark_push_registration_share_attempted(
+        &self,
+        group_id_hex: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+        attempted_at_ms: i64,
+    ) -> StorageResult<()> {
         self.lock()?
             .execute(
-                "INSERT INTO push_registration (
-                    account_label, account_id_hex, platform, token_fingerprint,
-                    token_bytes, server_pubkey_hex, relay_hint, created_at_ms,
-                    updated_at_ms, last_shared_at_ms
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(account_label) DO UPDATE SET
-                    account_id_hex = excluded.account_id_hex,
-                    platform = excluded.platform,
-                    token_fingerprint = excluded.token_fingerprint,
-                    token_bytes = excluded.token_bytes,
-                    server_pubkey_hex = excluded.server_pubkey_hex,
-                    relay_hint = excluded.relay_hint,
-                    updated_at_ms = excluded.updated_at_ms,
-                    last_shared_at_ms = excluded.last_shared_at_ms",
+                "UPDATE pending_push_registration_shares
+                 SET last_attempted_at_ms = ?4
+                 WHERE group_id_hex = ?1 AND token_fingerprint = ?2
+                   AND registration_updated_at_ms = ?3",
                 params![
-                    &registration.account_label,
-                    &registration.account_id_hex,
-                    i64::from(registration.platform),
-                    &registration.token_fingerprint,
-                    token_bytes,
-                    &registration.server_pubkey_hex,
-                    &registration.relay_hint,
-                    created_at_ms,
-                    registration.updated_at_ms,
-                    last_shared_at_ms,
+                    group_id_hex,
+                    token_fingerprint,
+                    registration_updated_at_ms,
+                    attempted_at_ms
                 ],
             )
             .storage()?;
-        self.push_registration(&registration.account_label)?
-            .ok_or_else(|| StorageError::Backend("push registration was not stored".to_owned()))
+        Ok(())
+    }
+
+    pub fn complete_push_registration_share(
+        &self,
+        group_id_hex: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+    ) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute(
+                "DELETE FROM pending_push_registration_shares
+                 WHERE group_id_hex = ?1 AND token_fingerprint = ?2
+                   AND registration_updated_at_ms = ?3",
+                params![group_id_hex, token_fingerprint, registration_updated_at_ms],
+            )
+            .storage()?
+            > 0)
     }
 
     pub fn mark_push_registration_shared(
         &self,
         account_label: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
         shared_at_ms: i64,
-    ) -> StorageResult<()> {
-        self.lock()?
+    ) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
             .execute(
                 "UPDATE push_registration
-                 SET last_shared_at_ms = ?2, updated_at_ms = ?2
-                 WHERE account_label = ?1",
-                params![account_label, shared_at_ms],
+                 SET last_shared_at_ms = ?4
+                 WHERE account_label = ?1
+                   AND token_fingerprint = ?2
+                   AND updated_at_ms = ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pending_push_registration_shares
+                   )",
+                params![
+                    account_label,
+                    token_fingerprint,
+                    registration_updated_at_ms,
+                    shared_at_ms
+                ],
             )
-            .storage()?;
-        Ok(())
+            .storage()?
+            > 0)
     }
 
     pub fn clear_push_registration(
         &self,
         account_label: &str,
     ) -> StorageResult<Option<AccountStoredPushRegistration>> {
-        let existing = self.push_registration(account_label)?;
-        self.lock()?
-            .execute(
+        self.connection.with_transaction(|| {
+            let existing = self.push_registration(account_label)?;
+            let conn = self.lock()?;
+            conn.execute(
                 "DELETE FROM push_registration WHERE account_label = ?1",
                 params![account_label],
             )
             .storage()?;
-        Ok(existing)
+            conn.execute("DELETE FROM pending_push_registration_shares", [])
+                .storage()?;
+            Ok(existing)
+        })
     }
 
     /// Unconditional upsert keyed on `(group, member, leaf, platform, server)`.

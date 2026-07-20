@@ -1,4 +1,5 @@
 use super::*;
+use async_trait::async_trait;
 use cgka_traits::Timestamp;
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
@@ -12,6 +13,8 @@ use cgka_traits::app_event::{
 };
 use marmot_account::AccountHomeError;
 use storage_sqlite::StoredRelayTelemetrySettings;
+use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
+use transport_nostr_peeler::NostrTransportEvent;
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
@@ -26,6 +29,171 @@ use crate::key_package_records::{
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
+
+#[derive(Default)]
+struct ScriptedPushRelayClient {
+    publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
+}
+
+impl ScriptedPushRelayClient {
+    fn script(&self, results: impl IntoIterator<Item = bool>) {
+        *self.publish_results.lock().unwrap() = results.into_iter().collect();
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for ScriptedPushRelayClient {
+    async fn subscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &cgka_traits::MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        if self
+            .publish_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(true)
+        {
+            Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+        } else {
+            Err(cgka_traits::TransportAdapterError::Publish(
+                "injected publish failure".to_owned(),
+            ))
+        }
+    }
+}
+
+#[tokio::test]
+async fn push_registration_retry_survives_all_failed_partial_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    client.create_group("alpha", &[]).await.unwrap();
+    client.create_group("beta", &[]).await.unwrap();
+    app.set_native_push_enabled("alice", true).unwrap();
+    let server_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
+    app.upsert_push_registration(
+        "alice",
+        PushPlatform::Fcm,
+        "opaque-token",
+        &server_pubkey_hex,
+        None,
+    )
+    .unwrap();
+
+    relay.script([false, false]);
+    let all_failed = client.share_push_registration().await.unwrap();
+    assert_eq!(all_failed.status, PushRegistrationShareStatus::Pending);
+    assert_eq!(all_failed.attempted_groups, 2);
+    assert_eq!(all_failed.succeeded_groups, 0);
+    assert_eq!(all_failed.failed_groups, 2);
+    assert_eq!(all_failed.pending_groups, 2);
+
+    relay.script([true, false]);
+    let partial = client.share_push_registration().await.unwrap();
+    assert_eq!(partial.status, PushRegistrationShareStatus::Pending);
+    assert_eq!(partial.attempted_groups, 2);
+    assert_eq!(partial.succeeded_groups, 1);
+    assert_eq!(partial.failed_groups, 1);
+    assert_eq!(partial.pending_groups, 1);
+
+    drop(client);
+    drop(app);
+    let reopened_relay = Arc::new(ScriptedPushRelayClient::default());
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(reopened_relay);
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let fingerprint = reopened
+        .push_registration("alice")
+        .unwrap()
+        .unwrap()
+        .token_fingerprint;
+    let registration_updated_at_ms = reopened
+        .push_registration("alice")
+        .unwrap()
+        .unwrap()
+        .updated_at_ms;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if reopened
+                .pending_push_registration_shares("alice", &fingerprint, registration_updated_at_ms)
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup retry should drain the persisted group intent");
+    let already_drained = runtime.share_push_registration("alice").await.unwrap();
+    assert_eq!(
+        already_drained.status,
+        PushRegistrationShareStatus::Complete
+    );
+    assert_eq!(already_drained.attempted_groups, 0);
+    assert_eq!(already_drained.pending_groups, 0);
+
+    let (first, second) = tokio::join!(
+        runtime.upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "concurrent-token-one",
+            &server_pubkey_hex,
+            None,
+        ),
+        runtime.upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "concurrent-token-two",
+            &server_pubkey_hex,
+            None,
+        )
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(
+        first.registration.token_fingerprint,
+        push_token_fingerprint(PushPlatform::Fcm, b"concurrent-token-one")
+    );
+    assert_eq!(
+        second.registration.token_fingerprint,
+        push_token_fingerprint(PushPlatform::Fcm, b"concurrent-token-two")
+    );
+    assert_eq!(first.share.status, PushRegistrationShareStatus::Complete);
+    assert_eq!(second.share.status, PushRegistrationShareStatus::Complete);
+    runtime.shutdown().await;
+}
 
 #[derive(Clone, Debug)]
 struct TestExternalAccountSigner {
