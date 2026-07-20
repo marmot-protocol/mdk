@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,7 +13,7 @@ use nostr_sdk::prelude::{
     RelayPoolNotification, RelayStatus, RelayUrl, SingleLetterTag, SubscriptionId, Tag, TagKind,
     Timestamp as NostrTimestamp,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
@@ -23,6 +24,8 @@ use crate::{
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+const SDK_RELAY_TERMINATED_CONNECT_ATTEMPTS: usize = 3;
+const SDK_RELAY_RESET_SETTLE_WAIT: Duration = Duration::from_millis(50);
 // nostr-sdk 0.44 waits up to 10s for each relay's OK response. Keep this
 // wrapper above that so SDK endpoint-level success/failure results surface
 // instead of a MDK-level timeout masking them.
@@ -85,12 +88,22 @@ pub struct RelayRegistrationOutcome {
     pub accepted: bool,
 }
 
+struct RelayPublishTaskControl {
+    recover: AtomicBool,
+    cancel: Notify,
+}
+
 /// `nostr-sdk` backed implementation of [`NostrRelayClient`].
 #[derive(Clone)]
 pub struct NostrSdkRelayClient {
     client: Client,
     account_subscriptions: Arc<RwLock<HashMap<MemberId, Vec<SubscriptionId>>>>,
     publish_relay_refs: Arc<Mutex<HashMap<RelayUrl, usize>>>,
+    /// Serializes publish and failed-connection reset work per relay. Weak
+    /// entries keep this cache bounded by currently active publishes instead
+    /// of retaining every endpoint ever observed.
+    publish_relay_locks: Arc<Mutex<HashMap<RelayUrl, Weak<Mutex<()>>>>>,
+    publish_overall_wait: Duration,
     /// Per-account, per-relay subscription-registration outcomes accumulated
     /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
@@ -111,12 +124,20 @@ impl NostrSdkRelayClient {
             client,
             account_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             publish_relay_refs: Arc::new(Mutex::new(HashMap::new())),
+            publish_relay_locks: Arc::new(Mutex::new(HashMap::new())),
+            publish_overall_wait: SDK_RELAY_PUBLISH_OVERALL_WAIT,
             registration_log: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    #[cfg(test)]
+    fn with_publish_overall_wait(mut self, wait: Duration) -> Self {
+        self.publish_overall_wait = wait;
+        self
     }
 
     /// Summarize SDK-owned relay health without exposing relay URLs.
@@ -349,30 +370,42 @@ impl NostrSdkRelayClient {
         event: Event,
     ) -> Result<TransportEndpointReceipt, TransportEndpointFailure> {
         let transport_endpoint = TransportEndpoint(endpoint.to_string());
-        match timeout(
-            SDK_RELAY_CONNECT_WAIT,
-            client.connect_relay(endpoint.clone()),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
+        let Some(relay) = client.relays().await.get(&endpoint).cloned() else {
+            return Err(TransportEndpointFailure {
+                endpoint: transport_endpoint,
+                reason: "connect relay failed".to_owned(),
+            });
+        };
+        for attempt in 1..=SDK_RELAY_TERMINATED_CONNECT_ATTEMPTS {
             // Failure reasons never embed the nostr-sdk error Display: it
             // commonly carries the relay URL, and these reasons flow into
             // `TransportAdapterError::Publish` Display (see
-            // `finish_publish_outcome`), which upper layers may log. The
-            // endpoint stays available on the structured failure record.
-            Ok(Err(_)) => {
-                return Err(TransportEndpointFailure {
-                    endpoint: transport_endpoint,
-                    reason: "connect relay failed".to_owned(),
-                });
+            // `finish_publish_outcome`), which upper layers may log.
+            if client.connect_relay(endpoint.clone()).await.is_err() {
+                break;
             }
-            Err(_) => {
-                return Err(TransportEndpointFailure {
-                    endpoint: transport_endpoint,
-                    reason: "connect relay timed out".to_owned(),
-                });
+            // `connect_relay` only spawns the SDK connection task. Give that
+            // task an immediate scheduling opportunity before waiting.
+            tokio::task::yield_now().await;
+            relay.wait_for_connection(SDK_RELAY_CONNECT_WAIT).await;
+            if relay.is_connected() {
+                break;
             }
+            // A just-reset relay can remain Terminated until its old task
+            // finishes. Retry only that handoff state; ordinary connection
+            // failures keep the SDK's normal reconnect behavior and budget.
+            if relay.status() != RelayStatus::Terminated
+                || attempt == SDK_RELAY_TERMINATED_CONNECT_ATTEMPTS
+            {
+                break;
+            }
+            tokio::time::sleep(SDK_RELAY_RESET_SETTLE_WAIT).await;
+        }
+        if !relay.is_connected() {
+            return Err(TransportEndpointFailure {
+                endpoint: transport_endpoint,
+                reason: "connect relay failed".to_owned(),
+            });
         }
 
         let mut last_error = "send event failed".to_owned();
@@ -466,6 +499,31 @@ impl NostrSdkRelayClient {
                 reason: "add publish relay failed".to_owned(),
             }),
         }
+    }
+
+    async fn publish_relay_lock(&self, endpoint: &RelayUrl) -> Arc<Mutex<()>> {
+        let mut locks = self.publish_relay_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(endpoint).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(endpoint.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn reset_relay_after_publish_failure(client: &Client, endpoint: &RelayUrl) {
+        let Some(relay) = client.relays().await.get(endpoint).cloned() else {
+            return;
+        };
+        // Preserve the relay entry, flags, and long-lived subscriptions while
+        // terminating the socket. nostr-relay-pool marks the relay Terminated
+        // synchronously, then consumes the termination signal in its connection
+        // task; wait briefly while still holding the per-relay publish lock so a
+        // concurrent retry cannot steal that signal before teardown completes.
+        relay.disconnect();
+        tokio::time::sleep(SDK_RELAY_RESET_SETTLE_WAIT).await;
     }
 
     async fn cleanup_publish_relays(&self, endpoints: Vec<RelayUrl>) {
@@ -705,6 +763,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
         let mut accepted = Vec::new();
         let mut failed = Vec::new();
         let mut cleanup_endpoints = Vec::new();
+        let mut pending_recoveries = HashMap::new();
         let mut publishes = JoinSet::new();
         for endpoint in parsed_endpoints {
             match self.retain_publish_relay(&endpoint).await {
@@ -715,25 +774,49 @@ impl NostrRelayClient for NostrSdkRelayClient {
                     continue;
                 }
             }
-            publishes.spawn(Self::publish_to_relay(
-                self.client.clone(),
-                endpoint,
-                event.clone(),
-            ));
+            let client = self.client.clone();
+            let event = event.clone();
+            let publish_lock = self.publish_relay_lock(&endpoint).await;
+            let control = Arc::new(RelayPublishTaskControl {
+                recover: AtomicBool::new(false),
+                cancel: Notify::new(),
+            });
+            pending_recoveries.insert(endpoint.clone(), control.clone());
+            publishes.spawn(async move {
+                let _publish_guard = publish_lock.lock().await;
+                let outcome = tokio::select! {
+                    outcome = Self::publish_to_relay(client.clone(), endpoint.clone(), event) => {
+                        if outcome.is_err() {
+                            Self::reset_relay_after_publish_failure(&client, &endpoint).await;
+                        }
+                        Some(outcome)
+                    }
+                    _ = control.cancel.notified() => {
+                        if control.recover.load(Ordering::Acquire) {
+                            Self::reset_relay_after_publish_failure(&client, &endpoint).await;
+                        }
+                        None
+                    }
+                };
+                (endpoint, outcome)
+            });
         }
 
         // Drain completions, but bound the whole fan-out by an overall deadline
         // so a publish to unreachable (or under-acking) relays fails in bounded
         // time instead of waiting out every relay's full retry budget. Per-relay
         // early returns once `required_acks` is met are unaffected.
-        let deadline = tokio::time::Instant::now() + SDK_RELAY_PUBLISH_OVERALL_WAIT;
-        let mut aborted_publishes = false;
+        let deadline = tokio::time::Instant::now() + self.publish_overall_wait;
+        let mut canceled_publishes = false;
         let mut timed_out = false;
         let result = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                publishes.abort_all();
-                aborted_publishes = true;
+                for control in pending_recoveries.values() {
+                    control.recover.store(true, Ordering::Release);
+                    control.cancel.notify_one();
+                }
+                canceled_publishes = true;
                 timed_out = true;
                 break Self::finish_publish_outcome(
                     message_id,
@@ -745,8 +828,11 @@ impl NostrRelayClient for NostrSdkRelayClient {
             }
             match timeout(remaining, publishes.join_next()).await {
                 Err(_elapsed) => {
-                    publishes.abort_all();
-                    aborted_publishes = true;
+                    for control in pending_recoveries.values() {
+                        control.recover.store(true, Ordering::Release);
+                        control.cancel.notify_one();
+                    }
+                    canceled_publishes = true;
                     timed_out = true;
                     break Self::finish_publish_outcome(
                         message_id,
@@ -766,11 +852,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
                     );
                 }
                 Ok(Some(result)) => match result {
-                    Ok(Ok(receipt)) => {
+                    Ok((endpoint, Some(Ok(receipt)))) => {
+                        pending_recoveries.remove(&endpoint);
                         accepted.push(receipt);
                         if ack_goal.is_some_and(|goal| accepted.len() >= goal) {
-                            publishes.abort_all();
-                            aborted_publishes = true;
+                            for control in pending_recoveries.values() {
+                                control.cancel.notify_one();
+                            }
+                            canceled_publishes = true;
                             break Ok(NostrPublishOutcome {
                                 message_id: Some(message_id),
                                 accepted,
@@ -778,10 +867,19 @@ impl NostrRelayClient for NostrSdkRelayClient {
                             });
                         }
                     }
-                    Ok(Err(failure)) => failed.push(failure),
+                    Ok((endpoint, Some(Err(failure)))) => {
+                        pending_recoveries.remove(&endpoint);
+                        failed.push(failure);
+                    }
+                    Ok((endpoint, None)) => {
+                        pending_recoveries.remove(&endpoint);
+                    }
                     Err(e) => {
-                        publishes.abort_all();
-                        aborted_publishes = true;
+                        for control in pending_recoveries.values() {
+                            control.recover.store(true, Ordering::Release);
+                            control.cancel.notify_one();
+                        }
+                        canceled_publishes = true;
                         break Err(TransportAdapterError::Publish(format!(
                             "publish task failed: {e}"
                         )));
@@ -790,8 +888,12 @@ impl NostrRelayClient for NostrSdkRelayClient {
             }
         };
 
-        if aborted_publishes {
-            while publishes.join_next().await.is_some() {}
+        if canceled_publishes {
+            while let Some(joined) = publishes.join_next().await {
+                if let Ok((endpoint, _)) = joined {
+                    pending_recoveries.remove(&endpoint);
+                }
+            }
         }
         self.cleanup_publish_relays(cleanup_endpoints).await;
         result
@@ -889,10 +991,12 @@ mod tests {
     use crate::NostrKeyPackagePublication;
     use cgka_traits::Timestamp;
     use cgka_traits::engine::KeyPackage;
+    use futures::{SinkExt, StreamExt};
     use nostr_relay_builder::MockRelay;
     use nostr_sdk::prelude::Keys;
     use tokio::net::TcpListener;
-    use tokio::time::{Duration, advance, timeout};
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::tungstenite::Message;
     use transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE;
 
     /// Build a kind-445 group event DTO pre-signed by a fresh ephemeral key,
@@ -1309,12 +1413,13 @@ mod tests {
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn publish_event_cleans_one_shot_relay_after_overall_timeout() {
         let silent = TransportEndpoint(silent_relay_url().await);
         let keys = Keys::generate();
         let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk =
+            NostrSdkRelayClient::new(client).with_publish_overall_wait(Duration::from_millis(500));
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
@@ -1324,16 +1429,17 @@ mod tests {
             .await
             .expect_err("silent relay should miss the required ack deadline");
 
-        assert!(err.to_string().contains("publish timed out"));
+        assert!(matches!(err, TransportAdapterError::Publish(_)));
         assert_eq!(sdk.relay_health().await.total_relays, 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn publish_event_retains_relay_promoted_to_durable_during_publish() {
         let endpoint = TransportEndpoint(silent_relay_url().await);
         let keys = Keys::generate();
         let client = Client::builder().signer(keys).build();
-        let sdk = NostrSdkRelayClient::new(client);
+        let sdk =
+            NostrSdkRelayClient::new(client).with_publish_overall_wait(Duration::from_millis(500));
         // kind-445 events must arrive pre-signed by a fresh ephemeral key; the
         // publish path rejects unsigned 445s (spec/transports/nostr.md:64-66).
         let dto = signed_group_event_dto();
@@ -1361,14 +1467,101 @@ mod tests {
 
         sdk.client().add_relay(endpoint.as_str()).await.unwrap();
 
-        advance(SDK_RELAY_PUBLISH_OVERALL_WAIT + Duration::from_secs(1)).await;
         let err = publish
             .await
             .expect("publish task should not panic")
             .expect_err("silent relay should miss the required ack deadline");
 
-        assert!(err.to_string().contains("publish timed out"));
-        assert_eq!(sdk.relay_health().await.total_relays, 1);
+        assert!(matches!(err, TransportAdapterError::Publish(_)));
+        let health = sdk.relay_health().await;
+        assert_eq!(health.total_relays, 1);
+        assert_eq!(health.terminated, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_publish_resets_durable_relay_and_next_publish_reconnects() {
+        let endpoint = TransportEndpoint(zombie_then_healthy_relay_url().await);
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys).build();
+        client.add_relay(endpoint.as_str()).await.unwrap();
+        let sdk =
+            NostrSdkRelayClient::new(client).with_publish_overall_wait(Duration::from_millis(500));
+        let dto = signed_group_event_dto();
+
+        sdk.publish_event(std::slice::from_ref(&endpoint), &dto, 1)
+            .await
+            .expect_err("the first connection must miss the ack deadline");
+        let health = sdk.relay_health().await;
+        assert_eq!(health.total_relays, 1);
+        assert_eq!(
+            health.terminated, 1,
+            "the failed connection must be terminated before returning"
+        );
+
+        let outcome = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &dto, 1)
+            .await
+            .expect("the next publish must reconnect with a fresh socket");
+
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].endpoint, endpoint);
+    }
+
+    #[tokio::test]
+    async fn best_effort_publish_failure_still_resets_durable_relay() {
+        let endpoint = TransportEndpoint(silent_relay_url().await);
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys).build();
+        client.add_relay(endpoint.as_str()).await.unwrap();
+        let sdk =
+            NostrSdkRelayClient::new(client).with_publish_overall_wait(Duration::from_millis(500));
+        let dto = signed_group_event_dto();
+
+        let outcome = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &dto, 0)
+            .await
+            .expect("required_acks=0 returns the endpoint report");
+
+        assert!(outcome.accepted.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(sdk.relay_health().await.terminated, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_publish_failure_does_not_reset_healthy_relay() {
+        let healthy = MockRelay::run().await.unwrap();
+        let healthy_url = healthy.url().await;
+        let healthy_endpoint = TransportEndpoint(healthy_url.to_string());
+        let silent_endpoint = TransportEndpoint(silent_relay_url().await);
+        let keys = Keys::generate();
+        let client = Client::builder().signer(keys).build();
+        client.add_relay(healthy_url.clone()).await.unwrap();
+        client.add_relay(silent_endpoint.as_str()).await.unwrap();
+        let sdk =
+            NostrSdkRelayClient::new(client).with_publish_overall_wait(Duration::from_millis(500));
+        let dto = signed_group_event_dto();
+
+        sdk.publish_event(
+            &[healthy_endpoint.clone(), silent_endpoint.clone()],
+            &dto,
+            2,
+        )
+        .await
+        .expect_err("one of two required acknowledgements must fail");
+
+        let relays = sdk.client().relays().await;
+        assert_ne!(
+            relays.get(&healthy_url).expect("healthy relay").status(),
+            RelayStatus::Terminated,
+            "an accepted endpoint must keep its connection"
+        );
+        assert_eq!(
+            relays
+                .get(&RelayUrl::parse(silent_endpoint.as_str()).unwrap())
+                .expect("silent relay")
+                .status(),
+            RelayStatus::Terminated
+        );
     }
 
     #[tokio::test]
@@ -1465,6 +1658,55 @@ mod tests {
                 tokio::spawn(async move {
                     if tokio_tungstenite::accept_async(stream).await.is_ok() {
                         std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    async fn zombie_then_healthy_relay_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("first connection");
+            let mut first_socket = tokio_tungstenite::accept_async(first_stream)
+                .await
+                .expect("first websocket handshake");
+            tokio::spawn(async move { while first_socket.next().await.is_some() {} });
+
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = socket.next().await {
+                        let Message::Text(message) = message else {
+                            continue;
+                        };
+                        let Ok(message) = serde_json::from_str::<serde_json::Value>(&message)
+                        else {
+                            continue;
+                        };
+                        let Some(event_id) = message
+                            .as_array()
+                            .filter(|message| {
+                                message.first().and_then(|v| v.as_str()) == Some("EVENT")
+                            })
+                            .and_then(|message| message.get(1))
+                            .and_then(|event| event.get("id"))
+                            .and_then(|id| id.as_str())
+                        else {
+                            continue;
+                        };
+                        let ack = serde_json::json!(["OK", event_id, true, ""]);
+                        if socket
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 });
             }
