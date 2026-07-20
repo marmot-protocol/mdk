@@ -32,7 +32,8 @@ MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-harnesses}"
 MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.harnesses}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
 WN_OPENCODE_BIN="${WN_OPENCODE_BIN:-opencode}"
-WN_OPENCODE_TIMEOUT_SECS="${WN_OPENCODE_TIMEOUT_SECS:-300}"
+WN_OPENCODE_TIMEOUT_SECS="${WN_OPENCODE_TIMEOUT_SECS:-3600}"
+WN_OPENCODE_IDLE_TIMEOUT_SECS="${WN_OPENCODE_IDLE_TIMEOUT_SECS:-120}"
 WN_OPENCODE_REQUEST_TIMEOUT_SECS="${WN_OPENCODE_REQUEST_TIMEOUT_SECS:-30}"
 WN_OPENCODE_MAX_REPLY_BYTES="${WN_OPENCODE_MAX_REPLY_BYTES:-30000}"
 WN_OPENCODE_MAX_PENDING_PER_GROUP="${WN_OPENCODE_MAX_PENDING_PER_GROUP:-4}"
@@ -420,6 +421,7 @@ install_macos_opencode_service() {
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install LaunchAgent $plist"
         log "would run: launchctl bootstrap gui/$UID $plist"
+        log "env: WN_OPENCODE_TIMEOUT_SECS=$WN_OPENCODE_TIMEOUT_SECS WN_OPENCODE_IDLE_TIMEOUT_SECS=$WN_OPENCODE_IDLE_TIMEOUT_SECS"
         return 0
     fi
 
@@ -443,6 +445,7 @@ install_macos_opencode_service() {
         plist_env_entry "WN_OPENCODE_ALLOWED_SENDERS_HEX" "$BOOTSTRAP_ALLOWED_SENDERS_HEX"
         plist_env_entry "WN_OPENCODE_BIN" "$WN_OPENCODE_BIN"
         plist_env_entry "WN_OPENCODE_TIMEOUT_SECS" "$WN_OPENCODE_TIMEOUT_SECS"
+        plist_env_entry "WN_OPENCODE_IDLE_TIMEOUT_SECS" "$WN_OPENCODE_IDLE_TIMEOUT_SECS"
         plist_env_entry "WN_OPENCODE_REQUEST_TIMEOUT_SECS" "$WN_OPENCODE_REQUEST_TIMEOUT_SECS"
         plist_env_entry "WN_OPENCODE_MAX_REPLY_BYTES" "$WN_OPENCODE_MAX_REPLY_BYTES"
         plist_env_entry "WN_OPENCODE_MAX_PENDING_PER_GROUP" "$WN_OPENCODE_MAX_PENDING_PER_GROUP"
@@ -523,6 +526,7 @@ install_linux_opencode_service() {
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
         log "would run: systemctl --user enable --now wn-opencode.service"
+        log "env: WN_OPENCODE_TIMEOUT_SECS=$WN_OPENCODE_TIMEOUT_SECS WN_OPENCODE_IDLE_TIMEOUT_SECS=$WN_OPENCODE_IDLE_TIMEOUT_SECS"
         return 0
     fi
 
@@ -544,6 +548,7 @@ install_linux_opencode_service() {
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_ALLOWED_SENDERS_HEX=$BOOTSTRAP_ALLOWED_SENDERS_HEX")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_BIN=$WN_OPENCODE_BIN")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_TIMEOUT_SECS=$WN_OPENCODE_TIMEOUT_SECS")"
+        printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_IDLE_TIMEOUT_SECS=$WN_OPENCODE_IDLE_TIMEOUT_SECS")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_REQUEST_TIMEOUT_SECS=$WN_OPENCODE_REQUEST_TIMEOUT_SECS")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_MAX_REPLY_BYTES=$WN_OPENCODE_MAX_REPLY_BYTES")"
         printf 'Environment=%s\n' "$(systemd_quote "WN_OPENCODE_MAX_PENDING_PER_GROUP=$WN_OPENCODE_MAX_PENDING_PER_GROUP")"
@@ -681,6 +686,7 @@ write_opencode_env() {
     local env_file="$MARMOT_HOME/dev/wn-opencode.env"
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would write private env file $env_file"
+        log "env: WN_OPENCODE_TIMEOUT_SECS=$WN_OPENCODE_TIMEOUT_SECS WN_OPENCODE_IDLE_TIMEOUT_SECS=$WN_OPENCODE_IDLE_TIMEOUT_SECS"
         return 0
     fi
     run mkdir -p "$MARMOT_HOME/dev"
@@ -693,6 +699,7 @@ write_opencode_env() {
             printf 'WN_OPENCODE_ALLOWED_SENDERS_HEX=%q\n' "$BOOTSTRAP_ALLOWED_SENDERS_HEX"
             printf 'WN_OPENCODE_BIN=%q\n' "$WN_OPENCODE_BIN"
             printf 'WN_OPENCODE_TIMEOUT_SECS=%q\n' "$WN_OPENCODE_TIMEOUT_SECS"
+            printf 'WN_OPENCODE_IDLE_TIMEOUT_SECS=%q\n' "$WN_OPENCODE_IDLE_TIMEOUT_SECS"
             printf 'WN_OPENCODE_REQUEST_TIMEOUT_SECS=%q\n' "$WN_OPENCODE_REQUEST_TIMEOUT_SECS"
             printf 'WN_OPENCODE_MAX_REPLY_BYTES=%q\n' "$WN_OPENCODE_MAX_REPLY_BYTES"
             printf 'WN_OPENCODE_MAX_PENDING_PER_GROUP=%q\n' "$WN_OPENCODE_MAX_PENDING_PER_GROUP"

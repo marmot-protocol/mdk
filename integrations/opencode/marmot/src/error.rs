@@ -30,6 +30,8 @@ pub(crate) enum HarnessError {
     ControlRejected { method: &'static str, code: String },
     #[error("opencode invocation timed out")]
     OpencodeTimedOut,
+    #[error("opencode went idle without producing output")]
+    OpencodeIdle,
     #[error("opencode stream error")]
     OpencodeStream,
     #[error("opencode process failed to start")]
@@ -51,6 +53,7 @@ impl HarnessError {
             Self::UnexpectedResponse { .. } => "unexpected_response",
             Self::ControlRejected { .. } => "control_rejected",
             Self::OpencodeTimedOut => "opencode_timeout",
+            Self::OpencodeIdle => "opencode_idle",
             Self::OpencodeStream => "opencode_stream",
             Self::OpencodeSpawn => "opencode_spawn",
             Self::Join => "join",

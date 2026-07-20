@@ -8,7 +8,8 @@ use crate::error::{HarnessError, Result};
 
 pub(crate) const DEFAULT_MAX_REPLY_BYTES: usize = 30_000;
 pub(crate) const MARMOT_MESSAGE_BYTES_CEILING: usize = 60_000;
-const DEFAULT_OPENCODE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_OPENCODE_TIMEOUT_SECS: u64 = 3600;
+const DEFAULT_OPENCODE_IDLE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_PENDING_PER_GROUP: usize = 4;
 const MIN_REPLY_BYTES: usize = 4;
@@ -21,6 +22,7 @@ pub(crate) struct Config {
     pub(crate) account_id_hex: Option<String>,
     pub(crate) opencode_bin: String,
     pub(crate) opencode_timeout: Duration,
+    pub(crate) opencode_idle_timeout: Duration,
     pub(crate) request_timeout: Duration,
     pub(crate) max_reply_bytes: usize,
     pub(crate) max_pending_per_group: usize,
@@ -91,6 +93,11 @@ impl Config {
             DEFAULT_OPENCODE_TIMEOUT_SECS,
             "WN_OPENCODE_TIMEOUT_SECS",
         )?);
+        let opencode_idle_timeout = Duration::from_secs(parse_u64(
+            lookup("WN_OPENCODE_IDLE_TIMEOUT_SECS"),
+            DEFAULT_OPENCODE_IDLE_TIMEOUT_SECS,
+            "WN_OPENCODE_IDLE_TIMEOUT_SECS",
+        )?);
         let request_timeout = Duration::from_secs(parse_u64(
             lookup("WN_OPENCODE_REQUEST_TIMEOUT_SECS"),
             DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -129,6 +136,7 @@ impl Config {
             account_id_hex,
             opencode_bin,
             opencode_timeout,
+            opencode_idle_timeout,
             request_timeout,
             max_reply_bytes,
             max_pending_per_group,
@@ -220,6 +228,25 @@ mod tests {
         let cfg = Config::from_pairs(&[("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER)]).unwrap();
         assert!(cfg.allowed_senders.contains(SENDER));
         assert_eq!(cfg.max_reply_bytes, DEFAULT_MAX_REPLY_BYTES);
+    }
+
+    #[test]
+    fn config_defaults_idle_and_total_timeouts() {
+        let cfg = Config::from_pairs(&[("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER)]).unwrap();
+        assert_eq!(cfg.opencode_timeout, Duration::from_secs(3600));
+        assert_eq!(cfg.opencode_idle_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn config_accepts_custom_idle_and_total_timeouts() {
+        let cfg = Config::from_pairs(&[
+            ("WN_OPENCODE_ALLOWED_SENDERS_HEX", SENDER),
+            ("WN_OPENCODE_TIMEOUT_SECS", "600"),
+            ("WN_OPENCODE_IDLE_TIMEOUT_SECS", "45"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.opencode_timeout, Duration::from_secs(600));
+        assert_eq!(cfg.opencode_idle_timeout, Duration::from_secs(45));
     }
 
     #[test]

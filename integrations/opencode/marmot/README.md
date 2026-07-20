@@ -90,7 +90,8 @@ Configure with environment variables:
 | `WN_OPENCODE_ADMIN_HEX` | unset | Legacy alias for `WN_OPENCODE_ALLOWED_SENDERS_HEX` |
 | `WN_OPENCODE_ACCOUNT_ID_HEX` | first local account | Specific `wn-agent` account to use |
 | `WN_OPENCODE_BIN` | `opencode` | OpenCode binary or executable path |
-| `WN_OPENCODE_TIMEOUT_SECS` | `300` | Hard timeout for each OpenCode invocation |
+| `WN_OPENCODE_IDLE_TIMEOUT_SECS` | `120` | Kill the invocation when OpenCode produces no stdout line for this long |
+| `WN_OPENCODE_TIMEOUT_SECS` | `3600` | Generous total safety cap for wedge recovery; ongoing output resets only the idle timer |
 | `WN_OPENCODE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for each control-socket request |
 | `WN_OPENCODE_MAX_REPLY_BYTES` | `30000` | UTF-8 byte limit for each durable Marmot reply chunk |
 | `WN_OPENCODE_MAX_PENDING_PER_GROUP` | `4` | Per-group in-flight/queued prompt cap |
