@@ -11,7 +11,7 @@ local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
-- Pinned OpenClaw SDK: **`openclaw@2026.6.8`** (`openclaw/plugin-sdk/*`).
+- Pinned OpenClaw SDK: **`openclaw@2026.6.11`** (`openclaw/plugin-sdk/*`).
 - Toolchain: TypeScript, pnpm, Node ≥ 22.19, Vitest.
 
 ## Install (release)
@@ -21,7 +21,7 @@ GitHub pre-releases. OpenClaw must already be installed with `openclaw` on `PATH
 
 Prerequisites:
 
-- OpenClaw **2026.6.8** or compatible (this plugin pins `openclaw@2026.6.8`)
+- OpenClaw **2026.6.11** or compatible (this plugin pins `openclaw@2026.6.11`)
 - Node ≥ 22.19
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
