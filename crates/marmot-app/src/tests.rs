@@ -7,8 +7,8 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
-    STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
-    STREAM_TYPE_TAG,
+    STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG, STREAM_PARENT_TAG, STREAM_START_TAG,
+    STREAM_TAG, STREAM_TYPE_TAG,
 };
 use marmot_account::AccountHomeError;
 use storage_sqlite::StoredRelayTelemetrySettings;
@@ -1806,8 +1806,10 @@ fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
 
 #[test]
 fn stream_start_intent_builds_kind_1200_with_broker_tags() {
+    let parent_message_id = "cd".repeat(32);
     let event = build(AppMessageIntent::StreamStart {
         stream_id: vec![0xab; 32],
+        parent_message_id: Some(parent_message_id.clone()),
         quic_candidates: vec![
             "quic://broker.example:4450".to_owned(),
             "quic://[::1]:4450".to_owned(),
@@ -1827,6 +1829,20 @@ fn stream_start_intent_builds_kind_1200_with_broker_tags() {
     );
     assert_eq!(tag_value(&event.tags, STREAM_TYPE_TAG), Some("text"));
     assert_eq!(tag_value(&event.tags, STREAM_FINAL_KIND_TAG), Some("9"));
+    assert_eq!(
+        tag_value(&event.tags, STREAM_PARENT_TAG),
+        Some(parent_message_id.as_str())
+    );
+}
+
+#[test]
+fn stream_start_intent_without_parent_omits_parent_tag() {
+    let event = build(AppMessageIntent::StreamStart {
+        stream_id: vec![0xab; 32],
+        parent_message_id: None,
+        quic_candidates: vec!["quic://broker.example:4450".to_owned()],
+    });
+    assert_eq!(tag_value(&event.tags, STREAM_PARENT_TAG), None);
 }
 
 #[test]
@@ -1834,12 +1850,27 @@ fn stream_start_intent_requires_a_broker() {
     let result = build_inner_event(
         &AppMessageIntent::StreamStart {
             stream_id: vec![0xab; 32],
+            parent_message_id: None,
             quic_candidates: vec!["   ".to_owned()],
         },
         SENDER_HEX,
         1,
     );
     assert!(matches!(result, Err(AppError::AgentStreamMissingCandidate)));
+}
+
+#[test]
+fn stream_start_intent_rejects_a_non_message_id_parent() {
+    let result = build_inner_event(
+        &AppMessageIntent::StreamStart {
+            stream_id: vec![0xab; 32],
+            parent_message_id: Some("abcd".to_owned()),
+            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
+        },
+        SENDER_HEX,
+        1,
+    );
+    assert!(matches!(result, Err(AppError::InvalidAppMessagePayload(_))));
 }
 
 #[test]

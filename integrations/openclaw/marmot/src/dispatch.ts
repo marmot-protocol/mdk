@@ -145,6 +145,7 @@ export class MarmotReplySink {
       this.preview = new MarmotLivePreview(this.options.client, {
         accountIdHex: this.options.accountIdHex,
         groupIdHex: this.options.groupIdHex,
+        parentMessageIdHex: this.options.replyToMessageIdHex,
         quicCandidates: this.options.quicCandidates,
         chunkBytes: this.options.chunkBytes,
       });
@@ -719,9 +720,8 @@ export function createMarmotInboundDispatcher(
       client: deps.client,
       accountIdHex: message.accountIdHex,
       groupIdHex: message.groupIdHex,
-      // Thread the reply to the triggering message (channel declares
-      // topLevelReplyToMode "reply"). Honored by the durable send_final path;
-      // the streaming finalize path threads in a later phase.
+      // Thread both the durable reply and the live stream-start event to the
+      // inbound message that triggered this agent turn.
       replyToMessageIdHex: message.messageIdHex,
       streamMode: deps.streamMode,
       quicCandidates: deps.quicCandidates,

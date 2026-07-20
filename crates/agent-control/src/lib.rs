@@ -92,6 +92,8 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
         stream_id_hex: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_message_id_hex: Option<String>,
         quic_candidates: Vec<String>,
     },
     StreamAppend {
@@ -547,6 +549,36 @@ mod tests {
     }
 
     #[test]
+    fn stream_begin_parent_message_id_is_optional_and_round_trips_when_present() {
+        let without = AgentControlRequest::StreamBegin {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            stream_id_hex: None,
+            parent_message_id_hex: None,
+            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(
+            value.get("parent_message_id_hex").is_none(),
+            "absent parent must not be serialized"
+        );
+        let decoded: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, without);
+
+        let with = AgentControlRequest::StreamBegin {
+            account_id_hex: "aa".repeat(32),
+            group_id_hex: "cc".repeat(32),
+            stream_id_hex: Some("55".repeat(32)),
+            parent_message_id_hex: Some("dd".repeat(32)),
+            quic_candidates: vec!["quic://broker.example:4450".to_owned()],
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["parent_message_id_hex"], "dd".repeat(32));
+        let decoded: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, with);
+    }
+
+    #[test]
     fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
         // Additive, v1-compatible field: omitted from the wire when None so an
         // old peer's frame stays byte-identical; present and round-tripping when
@@ -805,6 +837,7 @@ mod tests {
                     account_id_hex: account(),
                     group_id_hex: group(),
                     stream_id_hex: None,
+                    parent_message_id_hex: None,
                     quic_candidates: vec!["quic://127.0.0.1:4450".to_owned()],
                 },
                 "stream_begin",

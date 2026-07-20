@@ -158,12 +158,14 @@ impl AgentConnector {
                 account_id_hex,
                 group_id_hex,
                 stream_id_hex,
+                parent_message_id_hex,
                 quic_candidates,
             } => {
                 self.stream_begin_response(
                     &account_id_hex,
                     &group_id_hex,
                     stream_id_hex,
+                    parent_message_id_hex,
                     quic_candidates,
                 )
                 .await

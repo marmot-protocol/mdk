@@ -23,6 +23,7 @@ export type StreamControlClient = Pick<
 export interface MarmotLivePreviewOptions {
   accountIdHex: string;
   groupIdHex: string;
+  parentMessageIdHex?: string | null;
   quicCandidates: string[];
   chunkBytes?: number;
 }
@@ -95,7 +96,10 @@ export class MarmotLivePreview {
     const response = await this.client.streamBegin(
       this.options.accountIdHex,
       this.options.groupIdHex,
-      { quicCandidates: this.options.quicCandidates },
+      {
+        parentMessageIdHex: this.options.parentMessageIdHex,
+        quicCandidates: this.options.quicCandidates,
+      },
     );
     this.streamIdHex = response.stream_id_hex;
     this.startMessageIdHex = response.start_message_id_hex;

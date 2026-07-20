@@ -878,6 +878,7 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
         stream_id: Vec<u8>,
+        parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
         let command = self.worker_commands(account_ref).await?;
@@ -886,6 +887,7 @@ impl AccountManager {
             .send(AccountWorkerCommand::StartAgentTextStream {
                 group_id: group_id.clone(),
                 stream_id,
+                parent_message_id,
                 quic_candidates,
                 respond,
             })

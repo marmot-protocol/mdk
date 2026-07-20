@@ -1854,11 +1854,39 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id: &GroupId,
         stream_id: &[u8],
+        created_at: u64,
+        quic_candidates: Vec<String>,
+    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
+        self.start_agent_text_stream_with_parent(
+            account_ref,
+            group_id,
+            stream_id,
+            created_at,
+            None,
+            quic_candidates,
+        )
+        .await
+    }
+
+    /// Anchor a kind-1200 agent text stream start, optionally threading it to the
+    /// inbound message that triggered the agent turn.
+    pub async fn start_agent_text_stream_with_parent(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        stream_id: &[u8],
         _created_at: u64,
+        parent_message_id: Option<String>,
         quic_candidates: Vec<String>,
     ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
         self.accounts
-            .start_agent_text_stream(account_ref, group_id, stream_id.to_vec(), quic_candidates)
+            .start_agent_text_stream(
+                account_ref,
+                group_id,
+                stream_id.to_vec(),
+                parent_message_id,
+                quic_candidates,
+            )
             .await
     }
 
