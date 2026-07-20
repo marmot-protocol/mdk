@@ -785,6 +785,9 @@ impl NostrRelayClient for NostrSdkRelayClient {
             publishes.spawn(async move {
                 let _publish_guard = publish_lock.lock().await;
                 let outcome = tokio::select! {
+                    // Preserve a result that is already ready when cancellation
+                    // races the task at the overall deadline or ack goal.
+                    biased;
                     outcome = Self::publish_to_relay(client.clone(), endpoint.clone(), event) => {
                         if outcome.is_err() {
                             Self::reset_relay_after_publish_failure(&client, &endpoint).await;
