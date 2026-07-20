@@ -1,7 +1,7 @@
 {
   "scenario_name": "convergence-witness-selected/v1",
   "vector_version": "1",
-  "conformance_version": "0.9.4",
+  "conformance_version": "0.9.5",
   "seed": null,
   "scenario": {
     "name": "convergence-witness-selected/v1",
