@@ -22,14 +22,17 @@ use marmot_app::{
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use nostr_relay_builder::MockRelay;
-use nostr_sdk::prelude::Client as NostrSdkClient;
+use nostr_sdk::prelude::{
+    Alphabet, Client as NostrSdkClient, EventBuilder, Keys, Kind, SingleLetterTag, Tag, TagKind,
+    Timestamp as NostrTimestamp,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, oneshot};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient};
-use transport_nostr_peeler::NostrTransportEvent;
+use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
 const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const AUDIT_TRACKER_NON_BLOCKING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -121,6 +124,28 @@ async fn capture_delayed_audit_upload_with_overlap_probe(
             }
             let _ = release.await;
             write_http_response(&mut stream, 204, "text/plain", b"").await;
+        }
+    }
+}
+
+/// Accept audit uploads in a loop, forwarding each request body over `bodies`
+/// and answering 204 immediately. Unlike the gated `capture_delayed_*` helpers,
+/// this drains a stream of uploads so a test can wait for the *one* whose body
+/// carries a specific forensic row while ignoring earlier unrelated uploads.
+async fn forward_audit_upload_bodies(
+    listener: TcpListener,
+    bodies: mpsc::UnboundedSender<Vec<u8>>,
+) {
+    loop {
+        let Ok((mut stream, _peer)) = listener.accept().await else {
+            return;
+        };
+        let Some(captured) = read_captured_audit_upload(&mut stream).await else {
+            continue;
+        };
+        write_http_response(&mut stream, 204, "text/plain", b"").await;
+        if bodies.send(captured.body).is_err() {
+            return;
         }
     }
 }
@@ -329,6 +354,40 @@ async fn publish_nostr_event_at(
         .publish_event(&[endpoint(relay_url)], &event, 1)
         .await
         .unwrap();
+}
+
+/// Publish an envelope-shaped undecryptable kind-445 probe with a fresh
+/// ephemeral key, h-tagged to `nostr_group_id_hex`. Mirrors the probe publisher
+/// in `next_event_backfill.rs`: real kind-445 senders always sign with a fresh
+/// per-event key, and a zero-nonce marker body peels to a clean
+/// `PeelFailed` — the `IngestOutcome::Stale` shape the epoch-stall detector
+/// counts toward arming a backfill. Distinct `marker`s yield distinct event ids,
+/// hence distinct undecryptables at the group's one stalled epoch.
+async fn publish_garbage_group_message(
+    relay_url: &str,
+    nostr_group_id_hex: &str,
+    created_at: u64,
+    marker: &str,
+) {
+    let mut envelope = vec![0u8; 12];
+    envelope.extend_from_slice(format!("backfill-armed-probe:{marker}").as_bytes());
+    assert!(envelope.len() >= NOSTR_GROUP_CONTENT_MIN_LEN);
+    let ephemeral = Keys::generate();
+    let signed = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(envelope))
+        .tags([Tag::custom(
+            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+            [nostr_group_id_hex.to_owned()],
+        )])
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .sign_with_keys(&ephemeral)
+        .expect("sign ephemeral kind-445 test event");
+    let transport_event =
+        NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    relay_client
+        .publish_event(&[endpoint(relay_url)], &transport_event, 1)
+        .await
+        .expect("publish garbage kind-445 test event");
 }
 
 async fn publish_account_relay_lists_at(
@@ -1431,6 +1490,116 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
 
     let _ = release_tx.send(());
     server.await.unwrap();
+    runtime.shutdown().await;
+}
+
+/// The epoch-stall backfill arms on a run of undecryptable traffic that carries
+/// NO visible `SyncSummary` content, so the summary-gated audit-tracker schedule
+/// never fires for it. The arm still records an `epoch_stall_backfill_armed`
+/// forensic row, and the runtime worker must push it to the field tracker — a
+/// passively-stalled account whose only traffic is undecryptable is exactly the
+/// case the field-evidence loop needs to observe.
+#[tokio::test]
+async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
+    // Mirrors `EPOCH_STALL_BACKFILL_THRESHOLD` (crate-private): the distinct
+    // undecryptable messages at one stalled epoch that arm a backfill.
+    const BACKFILL_THRESHOLD: usize = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let bob_id = home.account("bob").unwrap().account_id_hex;
+
+    let (_relay, app, url) = mock_app(&dir).await;
+    app.set_audit_log_settings(AuditLogSettings {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut bob_setup = app.client("bob").await.unwrap();
+    bob_setup.publish_key_package().await.unwrap();
+    drop(bob_setup);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    let (body_tx, mut body_rx) = mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(forward_audit_upload_bodies(listener, body_tx));
+    runtime
+        .set_audit_log_tracker_config(AuditLogTrackerConfig {
+            endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+            authorization_bearer_token: Some("goggles_backfill_secret".to_owned()),
+            source: AuditLogUploadSource::default(),
+        })
+        .unwrap();
+    runtime.start().await.unwrap();
+
+    // bob's managed worker joins the group so it holds a live subscription on
+    // which the undecryptable probes below are delivered.
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("runtime epoch backfill arm", &["bob"])
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let nostr_group_id_hex = app
+        .group("bob", &group_id_hex)
+        .unwrap()
+        .expect("bob's group projection")
+        .nostr_routing
+        .nostr_group_id_hex;
+
+    // Arm bob's detector with exactly the threshold of distinct undecryptable
+    // messages at his live epoch. Present-dated so they clear any since floor;
+    // none yields visible summary content, so the summary-gated schedule stays
+    // silent and only the armed-backfill schedule can deliver these rows.
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for arm in 0..BACKFILL_THRESHOLD {
+        publish_garbage_group_message(&url, &nostr_group_id_hex, created_at, &format!("arm-{arm}"))
+            .await;
+    }
+
+    // Wait, across uploads, for the one carrying the armed row. Earlier uploads
+    // (e.g. the welcome-join schedule) are drained and ignored.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut carried_armed_row = false;
+    while Instant::now() < deadline {
+        match timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            body_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(body)) => {
+                if String::from_utf8_lossy(&body).contains("epoch_stall_backfill_armed") {
+                    carried_armed_row = true;
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        carried_armed_row,
+        "the runtime must push the epoch_stall_backfill_armed row to the audit \
+         tracker even though the arming traffic produced no visible activity",
+    );
+
+    server.abort();
     runtime.shutdown().await;
 }
 

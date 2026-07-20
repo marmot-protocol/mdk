@@ -351,6 +351,13 @@ impl AppClient {
         }
     }
 
+    /// Whether an epoch-gap backfill is armed and awaiting its replay. Read by
+    /// the account worker to schedule a forensic audit-tracker upload for the
+    /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
+    pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
+        self.epoch_backfill_pending
+    }
+
     /// Recover any group that stalled below its live epoch during ingest by
     /// replaying the account's full transport history (`since = None`). One replay
     /// re-fetches every group, so the detector collapses simultaneously-stuck
