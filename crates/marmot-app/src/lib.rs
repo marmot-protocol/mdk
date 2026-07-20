@@ -143,9 +143,10 @@ pub use ids::{
 /// depending on `marmot-forensics` directly.
 pub use marmot_forensics::AuditDataMode;
 pub use media::{
-    DEFAULT_BLOSSOM_SERVER_URL, ENCRYPTED_MEDIA_VERSION, MediaAttachmentReference,
-    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadAttachmentResult,
-    MediaUploadRequest, MediaUploadResult, media_attachment_from_imeta_tag,
+    DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
+    MediaAttachmentReference, MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest,
+    MediaUploadAttachmentResult, MediaUploadRequest, MediaUploadResult,
+    media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use notifications::{
@@ -779,6 +780,11 @@ pub(crate) struct AppMessageProjection {
     /// system row, so the row can be invalidated by origin commit if that commit
     /// loses a fork. `None` for all other projections.
     pub(crate) origin_commit_id: Option<String>,
+    /// True only for a delete whose authenticated sender may moderate other
+    /// members' messages (group admin, non-direct group), evaluated against
+    /// the signed MLS group state when the delete is recorded and persisted
+    /// with the event. `false` for every other projection.
+    pub(crate) moderation_grant: bool,
 }
 
 fn generate_telemetry_install_id() -> String {
@@ -1081,6 +1087,8 @@ impl MarmotApp {
             pending_projection_updates: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             pending_welcome_delivery_events: Vec::new(),
+            epoch_stall: Default::default(),
+            epoch_backfill_pending: false,
         };
         // One-time upgrade backfill: derive `self_membership` for pre-0018 rows
         // from current engine state so groups the local account already left /
@@ -2737,6 +2745,24 @@ impl MarmotApp {
         let storage_update = self
             .account_storage(label)?
             .record_app_event(&stored_app_event_from_projection(message, now))?;
+        self.app_projection_update(label, storage_update)
+    }
+
+    /// As [`Self::record_account_app_event`], but a conflicting row's
+    /// `moderation_grant` is replaced rather than frozen. Used by the local
+    /// sender's post-publish reconciling projection so a moderation grant
+    /// recomputed after group sync supersedes the optimistic pre-send value.
+    pub(crate) fn record_account_app_event_refreshing_moderation_grant(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        let now = unix_now_seconds();
+        let storage_update = self
+            .account_storage(label)?
+            .record_app_event_refreshing_moderation_grant(&stored_app_event_from_projection(
+                message, now,
+            ))?;
         self.app_projection_update(label, storage_update)
     }
 

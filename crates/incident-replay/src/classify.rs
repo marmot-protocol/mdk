@@ -216,6 +216,21 @@ pub fn classify(export: &AgentStateExport) -> Verdict {
     Verdict::Healthy
 }
 
+/// The liveness (epoch-divergence) incident an export carries, independent of
+/// its routing [`Verdict`].
+///
+/// [`classify`] returns a single verdict, and a reproducible incident (fork or
+/// convergence) outranks the liveness gate on purpose — so an export that
+/// carries *both* a replayable incident and an engine left behind routes to the
+/// incident, and the liveness signal never reaches the operator. This exposes the
+/// same rule-5 computation so a caller (the CLI) can surface it as a secondary
+/// advisory alongside the primary outcome. Returns `None` when no engine is left
+/// behind — the gate stays unarmed on untimed or synthetic exports, exactly as
+/// [`classify`]'s healthy path does.
+pub fn liveness_advisory(export: &AgentStateExport) -> Option<QuarantineReason> {
+    epoch_divergence(export)
+}
+
 /// Per-engine activity, folded from the event log.
 #[derive(Default)]
 struct EngineActivity {

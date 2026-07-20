@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use cgka_traits::TransportAdapter;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
-use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE};
+use cgka_traits::ingest::{IngestOutcome, StaleReason};
 use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
@@ -17,6 +17,7 @@ use crate::{
 };
 
 use super::AppClient;
+use crate::config::CursorPersistence;
 
 impl AppClient {
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
@@ -213,6 +214,7 @@ impl AppClient {
                 && summary.messages.is_empty()
                 && summary.events.is_empty()
                 && self.pending_convergence_groups.is_empty()
+                && !self.epoch_backfill_pending
             {
                 continue;
             }
@@ -288,11 +290,13 @@ impl AppClient {
     ) -> Result<(), AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let source_recorded_at = delivery.message.timestamp.0;
+        let group_id_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
         fail_if_publish_failed(&effects.effects)?;
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_effects(&effects.effects);
         self.remember_transport_cursor(source_recorded_at);
+        self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
         self.observe_account_device_effects(
             &effects.effects,
             display_names,
@@ -301,6 +305,58 @@ impl AppClient {
             source_recorded_at,
         )
         .await
+    }
+
+    /// Feed an undecryptable group delivery to the epoch-stall detector, arming a
+    /// backfill once a group has accumulated enough undecryptable traffic at a
+    /// stalled epoch (see [`super::epoch_stall`]). Only observed under
+    /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not own
+    /// recovery, and the main app sees the same evidence on its own next sync.
+    fn detect_epoch_stall(
+        &mut self,
+        group_id_hint: Option<cgka_traits::GroupId>,
+        message_id_hex: &str,
+        outcome: &IngestOutcome,
+    ) {
+        if self.app.cursor_persistence() != CursorPersistence::Advance {
+            return;
+        }
+        if !matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed
+            }
+        ) {
+            return;
+        }
+        let Some(group_id) = group_id_hint else {
+            return;
+        };
+        // A group we cannot resolve (unknown or quarantined) has its own recovery
+        // surface; do not track it here.
+        let Ok(record) = self.runtime.group_record(&group_id) else {
+            return;
+        };
+        if self
+            .epoch_stall
+            .observe_undecryptable(group_id, message_id_hex.to_owned(), record.epoch)
+        {
+            self.epoch_backfill_pending = true;
+        }
+    }
+
+    /// Recover any group that stalled below its live epoch during ingest by
+    /// replaying the account's full transport history (`since = None`). One replay
+    /// re-fetches every group, so the detector collapses simultaneously-stuck
+    /// groups into a single replay. A no-op when nothing stalled.
+    pub(crate) async fn run_pending_epoch_backfill(&mut self) -> Result<(), AppError> {
+        if !self.epoch_backfill_pending {
+            return Ok(());
+        }
+        self.runtime.activate_transport(None).await?;
+        self.epoch_stall.mark_replayed();
+        self.epoch_backfill_pending = false;
+        Ok(())
     }
 
     pub(crate) async fn advance_convergence_after_runtime_sync(
@@ -437,6 +493,11 @@ impl AppClient {
                     );
                 }
                 self.app.remember_directory_message_sender(&message)?;
+                // Evaluated against the signed MLS group state while the
+                // delete's epoch context is live, then persisted with the
+                // event so later admin-set changes cannot flip the verdict.
+                let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                    && self.delete_moderation_grant(&message.group_id, &message.sender);
                 let message_projection = AppMessageProjection {
                     message_id_hex: message.message_id_hex.clone(),
                     source_message_id_hex: Some(message.source_message_id_hex.clone()),
@@ -450,6 +511,7 @@ impl AppClient {
                     recorded_at: Some(source_recorded_at),
                     // Received app messages are not synthesized system rows.
                     origin_commit_id: None,
+                    moderation_grant,
                 };
                 let projection_update = self
                     .app

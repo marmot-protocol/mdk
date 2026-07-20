@@ -19,6 +19,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - WN Agent, Hermes, and OpenClaw now carry the triggering prompt message id on agent text-stream start events through
   the protocol `parent` tag, preserving the durable reply chain after timeline reloads.
+- Encrypted media uploads now fail over, in order, across a default list of Blossom endpoints that accept opaque
+  `application/octet-stream` ciphertext, and encrypted group-image uploads use that list's primary endpoint, replacing
+  the media-only Primal default that returned HTTP 415. Blossom upload failures also retain bounded, privacy-filtered
+  server rejection reasons for actionable diagnostics. Group images store no endpoint in group state, so clients
+  compiled with different defaults resolve them against different endpoints until the group image is re-set on a
+  current build.
 
 ## [0.9.3] - 2026-07-07
 

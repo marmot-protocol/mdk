@@ -836,6 +836,119 @@ pub(crate) enum GroupConfirmationProjection {
     },
 }
 
+/// Whether a delete may tombstone other members' messages: its authenticated
+/// sender must be in the group's current admin set, and the group must not
+/// look like a direct (two-member, unnamed) conversation.
+///
+/// Known limitation: "direct" is a heuristic over mutable state
+/// (`members.len() == 2 && name.is_empty()`), not an immutable conversation
+/// kind. The creator is always an implicit admin, and the only
+/// create/rename API takes a free-form name for any member count, so an admin
+/// can name — or later rename — a two-member conversation to escape this gate
+/// and gain moderation over the peer's messages, with no signal to the peer.
+/// Closing that fully needs a conversation-kind fixed at creation time
+/// (protocol/engine plus client work); until then this is a deliberate,
+/// documented limitation rather than a guarantee that 1:1 chats can never be
+/// moderated.
+pub(crate) fn delete_moderation_grant(
+    group: &Group,
+    admins: &[[u8; 32]],
+    sender_hex: &str,
+) -> bool {
+    let direct = group.members.len() == 2 && group.name.trim().is_empty();
+    !direct && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
+}
+
+#[cfg(test)]
+mod delete_moderation_grant_tests {
+    use super::*;
+    use cgka_traits::group::Member;
+    use cgka_traits::types::{EpochId, MemberId};
+
+    fn group_with(name: &str, member_count: usize) -> Group {
+        Group {
+            id: GroupId::new(vec![1u8; 16]),
+            name: name.to_owned(),
+            description: String::new(),
+            epoch: EpochId(3),
+            members: (0..member_count)
+                .map(|index| Member {
+                    id: MemberId::new(vec![index as u8; 32]),
+                    credential: Vec::new(),
+                })
+                .collect(),
+            required_capabilities: Default::default(),
+            removed: false,
+            join_epoch: EpochId(0),
+        }
+    }
+
+    const ADMIN: [u8; 32] = [7u8; 32];
+
+    #[test]
+    fn admin_in_named_group_gets_grant() {
+        let group = group_with("ops", 3);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn non_admin_sender_gets_no_grant() {
+        let group = group_with("ops", 3);
+        assert!(!delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode([9u8; 32])
+        ));
+    }
+
+    #[test]
+    fn direct_conversation_never_grants_even_to_admin() {
+        let group = group_with("", 2);
+        assert!(!delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+        // A whitespace-only name is still an unnamed direct conversation.
+        let group = group_with("  ", 2);
+        assert!(!delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn two_member_named_group_is_not_direct() {
+        let group = group_with("pair", 2);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn unnamed_larger_group_is_not_direct() {
+        let group = group_with("", 3);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn empty_admin_set_grants_nothing() {
+        let group = group_with("ops", 3);
+        assert!(!delete_moderation_grant(&group, &[], &hex::encode(ADMIN)));
+    }
+}
+
 /// Strictly decode the inner Marmot app event from MLS plaintext and bind it to
 /// the MLS-authenticated sender. Returns `None` (rejecting the message) when the
 /// canonical id does not match or the inner `pubkey` is not the authenticated

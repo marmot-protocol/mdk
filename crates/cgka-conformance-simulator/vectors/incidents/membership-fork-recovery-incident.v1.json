@@ -1,0 +1,119 @@
+{
+  "scenario_name": "membership-fork-recovery-incident/v1",
+  "vector_version": "1",
+  "conformance_version": "0.9.4",
+  "seed": null,
+  "scenario": {
+    "name": "membership-fork-recovery-incident/v1",
+    "spec_version": "1",
+    "clients": [
+      "alice",
+      "bob",
+      "david",
+      "eve"
+    ],
+    "steps": [
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "replay",
+        "invitees": [
+          "bob"
+        ],
+        "required_features": [],
+        "pending": "create"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "create"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "clear_events",
+        "clients": [
+          "alice",
+          "bob",
+          "david",
+          "eve"
+        ]
+      },
+      {
+        "type": "set_partition",
+        "allow": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "invite_members",
+        "inviter": "alice",
+        "invitees": [
+          "david"
+        ],
+        "pending": "w"
+      },
+      {
+        "type": "invite_members",
+        "inviter": "bob",
+        "invitees": [
+          "eve"
+        ],
+        "pending": "l"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "alice",
+        "pending": "w"
+      },
+      {
+        "type": "confirm_pending",
+        "client": "bob",
+        "pending": "l"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "recovery_summary",
+      "count": 1,
+      "source_epoch": 1,
+      "recovered_epoch": 2,
+      "winner_differs_from_invalidated": true
+    },
+    {
+      "type": "clients_converged",
+      "clients": [
+        "alice",
+        "bob"
+      ],
+      "epoch": 2,
+      "member_count": 3
+    }
+  ]
+}

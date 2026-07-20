@@ -1308,7 +1308,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             "id": chat_id,
         }
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         try:
             await self._ensure_account_id()
             await self._sync_welcomer_allowlist()

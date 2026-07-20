@@ -450,6 +450,14 @@ async fn run_app_runtime_account_worker(
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
             scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+            if let Err(err) = client.run_pending_epoch_backfill().await {
+                publish_app_runtime_account_error(
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    account_error_message("epoch-gap backfill failed", &err),
+                );
+            }
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
@@ -575,6 +583,14 @@ async fn run_app_runtime_account_worker(
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
                         scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+                        if let Err(err) = client.run_pending_epoch_backfill().await {
+                            publish_app_runtime_account_error(
+                                &events,
+                                &account_id_hex,
+                                &account_label,
+                                account_error_message("epoch-gap backfill failed", &err),
+                            );
+                        }
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }

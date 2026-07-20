@@ -12,6 +12,7 @@ use crate::{AppError, unix_now_seconds};
 
 const BLOSSOM_UPLOAD_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
 const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
+const MAX_BLOSSOM_ERROR_BODY_BYTES: u64 = 1024;
 const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -45,10 +46,7 @@ pub(crate) async fn upload_blossom_blob(
         .await
         .map_err(reqwest_blob_error)?;
     if !response.status().is_success() {
-        return Err(AppError::BlobStore(format!(
-            "upload returned HTTP {}",
-            response.status().as_u16()
-        )));
+        return Err(blossom_upload_status_error(response).await);
     }
     let descriptor = response
         .json::<BlossomBlobDescriptor>()
@@ -74,6 +72,68 @@ pub(crate) async fn upload_blossom_blob(
         ));
     }
     Ok(url)
+}
+
+async fn blossom_upload_status_error(response: reqwest::Response) -> AppError {
+    let status = response.status().as_u16();
+    let header_reason = response
+        .headers()
+        .get("X-Reason")
+        .and_then(|value| value.to_str().ok())
+        .and_then(privacy_safe_server_reason);
+    let body = read_limited_blossom_body(response, MAX_BLOSSOM_ERROR_BODY_BYTES)
+        .await
+        .ok();
+    let body_reason = body
+        .as_deref()
+        .and_then(blossom_error_body_reason)
+        .and_then(|reason| privacy_safe_server_reason(&reason));
+    match header_reason.or(body_reason) {
+        Some(reason) => AppError::BlobStore(format!("upload returned HTTP {status}: {reason}")),
+        None => AppError::BlobStore(format!("upload returned HTTP {status}")),
+    }
+}
+
+fn blossom_error_body_reason(body: &[u8]) -> Option<String> {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        return ["reason", "message", "error"]
+            .into_iter()
+            .find_map(|key| value.get(key).and_then(|value| value.as_str()))
+            .map(str::to_owned);
+    }
+    std::str::from_utf8(body).ok().map(str::to_owned)
+}
+
+/// Keep server-provided diagnostics useful without allowing an untrusted
+/// response to inject blob hashes, pubkeys, URLs, or unbounded text into app
+/// errors that may later be logged.
+fn privacy_safe_server_reason(reason: &str) -> Option<String> {
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if reason.is_empty()
+        || reason.len() > 256
+        || !reason
+            .chars()
+            .all(|character| character.is_ascii() && !character.is_ascii_control())
+    {
+        return None;
+    }
+    let lowercase = reason.to_ascii_lowercase();
+    if ["://", "nostr:", "npub1", "nsec1"]
+        .iter()
+        .any(|needle| lowercase.contains(needle))
+    {
+        return None;
+    }
+    if reason.split_ascii_whitespace().any(|token| {
+        // Collapse punctuation so hyphenated hashes and UUIDs still register
+        // as one long identifier.
+        let token: String = token.chars().filter(char::is_ascii_alphanumeric).collect();
+        token.len() >= 48
+            || (token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    }) {
+        return None;
+    }
+    Some(reason)
 }
 
 pub(crate) async fn fetch_blossom_blob(

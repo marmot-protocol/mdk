@@ -27,7 +27,7 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    DEFAULT_BLOSSOM_SERVER_URL, download_encrypted_media, fetch_group_image,
+    DEFAULT_BLOSSOM_SERVER_URLS, download_encrypted_media, fetch_group_image,
     is_loopback_http_endpoint, upload_encrypted_media, upload_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
@@ -44,10 +44,12 @@ use crate::{
 };
 
 mod audit;
+mod epoch_stall;
 mod projection;
 mod push;
 mod sync;
 
+use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 // Re-exported so the crate's `tests` module can keep calling
 // `client::is_own_relay_echo`; the function itself lives in `client::sync`.
@@ -71,6 +73,13 @@ pub struct AppClient {
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
     /// without polling (mdk#352).
     pub(crate) pending_welcome_delivery_events: Vec<PendingWelcomeDelivery>,
+    /// Per-group detector for the epoch-gap backfill (commit-loss recovery): it
+    /// counts the distinct undecryptable messages a group accumulates at a
+    /// stalled epoch. Ephemeral session state, like the pending sets above.
+    pub(crate) epoch_stall: EpochStallDetector,
+    /// Set when [`epoch_stall`] arms a backfill during ingest; drained after the
+    /// sync by running the full-history transport replay.
+    pub(crate) epoch_backfill_pending: bool,
 }
 
 /// A point-in-time copy of the live session's read-only group projections
@@ -1111,7 +1120,7 @@ impl AppClient {
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {
             let update = self.record_local_app_event_projection(
-                &group_id_hex,
+                group_id,
                 &sender,
                 &event,
                 None,
@@ -1178,7 +1187,7 @@ impl AppClient {
             .map(|report| hex::encode(report.message_id.as_slice()));
         if should_project_locally {
             let update = self.record_local_app_event_projection(
-                &group_id_hex,
+                group_id,
                 &sender,
                 &event,
                 source_message_id_hex,
@@ -1956,7 +1965,10 @@ impl AppClient {
             .encrypted_media_blob_endpoints
             .is_empty()
         {
-            vec![DEFAULT_BLOSSOM_SERVER_URL.to_owned()]
+            DEFAULT_BLOSSOM_SERVER_URLS
+                .iter()
+                .map(|endpoint| (*endpoint).to_owned())
+                .collect()
         } else {
             self.app
                 .service_endpoints()

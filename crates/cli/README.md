@@ -247,14 +247,19 @@ Media commands:
 ```sh
 wn --account <npub-or-hex> media list <group-hex>
 wn --account <npub-or-hex> media upload <group-hex> <file-path> --send --message <caption>
-wn --account <npub-or-hex> media upload <group-hex> <file-path> --server https://blossom.primal.net
+wn --account <npub-or-hex> media upload <group-hex> <file-path> --server https://blossom.divine.video
 wn --account <npub-or-hex> media download <group-hex> <file-hash> --output ./file.jpg
 ```
 
 `media upload` encrypts the file with the group's current `MLS-Exporter("marmot", "encrypted-media", 32)` media secret,
-uploads the ciphertext to Blossom, and optionally sends a kind-9 media message. Without `--server`, the upload targets
-the endpoints in the group's `marmot.group.encrypted-media.v1` component (`https://blossom.primal.net` is the endpoint
-baked into newly created groups' component, not a hardcoded CLI default).
+uploads the ciphertext to Blossom, and optionally sends a kind-9 media message. Because the encrypted bytes are opaque,
+the server must accept `application/octet-stream` uploads. Without `--server`, the upload targets the ordered endpoints
+in the group's `marmot.group.encrypted-media.v1` component. Newly created groups use MDK's ciphertext-compatible
+built-in endpoint list unless the application was compiled with `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`.
+
+Endpoint policy is signed group state. Upgrading MDK changes the defaults for new groups only; an active group admin must
+call `replace_encrypted_media_blob_endpoints` to migrate an existing group whose embedded endpoints reject encrypted
+blobs.
 Upload JSON returns an `attachments` array with each attachment's `plaintext_sha256`, `ciphertext_sha256`, and locators.
 `media download` resolves a projected media reference by plaintext hash, fetches the encrypted blob, verifies it,
 decrypts it, and writes the plaintext file.

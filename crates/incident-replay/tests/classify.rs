@@ -1,7 +1,9 @@
 //! Classification behaviour, exercised through the public parse + classify API
 //! against synthetic, non-sensitive fixtures.
 
-use incident_replay::{BehindEngine, BehindMode, QuarantineReason, Verdict, classify, parse};
+use incident_replay::{
+    BehindEngine, BehindMode, QuarantineReason, Verdict, classify, liveness_advisory, parse,
+};
 
 fn load(name: &str) -> incident_replay::AgentStateExport {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -161,6 +163,28 @@ fn a_reproducible_incident_outranks_the_liveness_gate() {
     assert_eq!(
         classify(&load("fork-recovery-with-behind-engine.json")),
         Verdict::ForkRecovery
+    );
+}
+
+#[test]
+fn liveness_advisory_surfaces_behind_an_incident_verdict() {
+    // The export routes to ForkRecovery (rule 4 outranks the rule-5 liveness
+    // gate), so classify's single verdict hides engine-b, which sits 12 epochs
+    // behind while still active — exactly the shape the real e1a04e82 export
+    // carried. liveness_advisory exposes that co-occurring incident so the CLI
+    // can print it as a secondary advisory alongside the accepted vector.
+    let export = load("fork-with-active-behind-engine.json");
+    assert_eq!(classify(&export), Verdict::ForkRecovery);
+    assert_eq!(
+        liveness_advisory(&export),
+        Some(QuarantineReason::EpochDivergence {
+            group_epoch: 31,
+            engines: vec![BehindEngine {
+                engine_id: "engine-b".into(),
+                epoch: 19,
+                mode: BehindMode::ActiveWhileBehind,
+            }],
+        })
     );
 }
 

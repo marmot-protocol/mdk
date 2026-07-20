@@ -1215,6 +1215,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             source_epoch: None,
             recorded_at: Some(1_700_000_101),
             origin_commit_id: None,
+            moderation_grant: false,
         })
         .unwrap();
     legacy
@@ -1280,6 +1281,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             source_epoch: None,
             recorded_at: Some(1_700_000_102),
             origin_commit_id: None,
+            moderation_grant: false,
         })
         .unwrap();
     assert_eq!(app.messages("alice").unwrap().len(), 1);
@@ -2317,6 +2319,7 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
             source_epoch: None,
             recorded_at: Some(10),
             origin_commit_id: None,
+            moderation_grant: false,
         },
     )
     .unwrap();
@@ -2389,6 +2392,7 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
             source_epoch: Some(2),
             recorded_at: Some(10),
             origin_commit_id,
+            moderation_grant: false,
         };
     // The losing commit synthesized this row (the "B renamed the group" lie).
     app.record_account_app_event(

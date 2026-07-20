@@ -240,6 +240,7 @@ pub(crate) fn stored_app_event_from_projection(
         recorded_at: message.recorded_at.unwrap_or(received_at),
         received_at,
         origin_commit_id: message.origin_commit_id.clone(),
+        moderation_grant: message.moderation_grant,
     }
 }
 
@@ -257,6 +258,9 @@ pub(crate) fn stored_app_event_from_message_record(record: &AppMessageRecord) ->
         recorded_at: record.recorded_at,
         received_at: record.received_at,
         origin_commit_id: None,
+        // Legacy-import records predate moderation deletes, so none carries a
+        // grant.
+        moderation_grant: false,
     }
 }
 

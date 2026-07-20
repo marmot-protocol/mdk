@@ -55,6 +55,31 @@ impl<S: StorageProvider> Engine<S> {
         ))
     }
 
+    /// Whether the raw transport row `id` is STILL awaiting retry as of its
+    /// *current* stored state — the same `Created | Retryable | PeelDeferred`
+    /// set the replay / deferred-peel loops admit at entry.
+    ///
+    /// Retirement paths re-read through this rather than trusting a row state
+    /// snapshotted before re-ingest: `ingest_group_message` can commit a
+    /// terminal state to this same row during the call (e.g. the `SelfEvicted`
+    /// path persists it `Failed`, `ingest.rs`), and that verdict is
+    /// authoritative — overwriting it with `Processed` would relabel a row we
+    /// were evicted on as a canonicalization input. A vanished row
+    /// (`NotFound`) is not awaiting retry.
+    pub(crate) fn raw_transport_row_awaiting_retry(
+        &self,
+        id: &MessageId,
+    ) -> Result<bool, EngineError> {
+        match self.storage.get_message(id) {
+            Ok(record) => Ok(matches!(
+                record.state,
+                MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
+            )),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(e) => Err(EngineError::Storage(e)),
+        }
+    }
+
     pub(crate) fn record_sent_message(
         &mut self,
         msg: &TransportMessage,
@@ -277,6 +302,43 @@ impl<S: StorageProvider> Engine<S> {
             self.audit(event);
         }
         Ok(())
+    }
+
+    pub(crate) fn mark_raw_transport_message_failed_if_awaiting_retry(
+        &mut self,
+        raw_msg_id: &MessageId,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        match self.storage.get_message(raw_msg_id) {
+            Ok(record)
+                if matches!(
+                    record.state,
+                    MessageState::PeelDeferred | MessageState::Retryable
+                ) =>
+            {
+                self.storage
+                    .update_message_state(raw_msg_id, MessageState::Failed)?;
+                self.audit_group(
+                    &record.group_id,
+                    crate::audit_helpers::message_state_transition_event(
+                        hex::encode(raw_msg_id.as_slice()),
+                        Some(record.state),
+                        MessageState::Failed,
+                        Some(record.epoch),
+                        reason,
+                    ),
+                );
+                // Only a `PeelDeferred` row holds a flood-cap slot (mdk#339);
+                // a `Retryable` row — input buffered pre-peel while the group
+                // could not ingest — sits outside the cap.
+                if record.state == MessageState::PeelDeferred {
+                    self.note_peel_deferred_row_retired(&record.group_id, raw_msg_id);
+                }
+                Ok(())
+            }
+            Ok(_) | Err(StorageError::NotFound) => Ok(()),
+            Err(err) => Err(EngineError::Storage(err)),
+        }
     }
 }
 
