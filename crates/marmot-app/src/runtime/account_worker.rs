@@ -450,14 +450,14 @@ async fn run_app_runtime_account_worker(
         Ok(summary) => {
             publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
             scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
-            if let Err(err) = client.run_pending_epoch_backfill().await {
-                publish_app_runtime_account_error(
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    account_error_message("epoch-gap backfill failed", &err),
-                );
-            }
+            run_pending_epoch_backfill_reporting_arm(
+                &mut client,
+                &events,
+                &account_id_hex,
+                &account_label,
+                &shared,
+            )
+            .await;
             if sync_summary_triggers_audit_tracker_update(&summary) {
                 shared.schedule_audit_log_tracker_update("startup_sync");
             }
@@ -583,14 +583,14 @@ async fn run_app_runtime_account_worker(
                         reconnect_backoff.reset();
                         publish_app_runtime_summary(&events, &account_id_hex, &account_label, &summary);
                         scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
-                        if let Err(err) = client.run_pending_epoch_backfill().await {
-                            publish_app_runtime_account_error(
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                account_error_message("epoch-gap backfill failed", &err),
-                            );
-                        }
+                        run_pending_epoch_backfill_reporting_arm(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            &shared,
+                        )
+                        .await;
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }
@@ -664,6 +664,14 @@ async fn handle_account_worker_command(
             let result = match client.sync().await {
                 Ok(summary) => {
                     publish_app_runtime_summary(events, account_id_hex, account_label, &summary);
+                    // Catch-up arms without running the backfill (the next
+                    // receive pass runs it), but the arm row is already durable
+                    // and the arming traffic never trips the summary gate below
+                    // — push it to the tracker from the seam that observed the
+                    // arm rather than a hoped-for later delivery.
+                    if client.has_pending_epoch_backfill() {
+                        shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
+                    }
                     if sync_summary_triggers_audit_tracker_update(&summary) {
                         shared.schedule_audit_log_tracker_update("catch_up");
                     }
@@ -1426,6 +1434,36 @@ fn retry_delay_for_attempt(attempt: u32) -> Duration {
 
 fn sync_summary_triggers_audit_tracker_update(summary: &SyncSummary) -> bool {
     !summary.joined_groups.is_empty() || !summary.messages.is_empty() || !summary.events.is_empty()
+}
+
+/// Run any pending epoch-gap backfill and push its arm evidence to the audit
+/// tracker. The arm state is captured *before* the replay drains it, and the
+/// tracker is scheduled unconditionally on the replay outcome: the
+/// `epoch_stall_backfill_armed` row is already durable, a failing replay is the
+/// highest-value upload, and the arming pass returns an empty summary that
+/// never trips the visible-activity gate. Shared by the startup and receive
+/// seams so the capture-before-run ordering cannot drift between them; the
+/// catch-up seam schedules the upload without running the backfill and stays
+/// separate.
+async fn run_pending_epoch_backfill_reporting_arm(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+) {
+    let backfill_armed = client.has_pending_epoch_backfill();
+    if let Err(err) = client.run_pending_epoch_backfill().await {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("epoch-gap backfill failed", &err),
+        );
+    }
+    if backfill_armed {
+        shared.schedule_audit_log_tracker_update("epoch_backfill_armed");
+    }
 }
 
 fn publish_app_runtime_summary(

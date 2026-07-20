@@ -337,12 +337,25 @@ impl AppClient {
         let Ok(record) = self.runtime.group_record(&group_id) else {
             return;
         };
-        if self
-            .epoch_stall
-            .observe_undecryptable(group_id, message_id_hex.to_owned(), record.epoch)
-        {
+        if self.epoch_stall.observe_undecryptable(
+            group_id.clone(),
+            message_id_hex.to_owned(),
+            record.epoch,
+        ) {
+            // Record the arm decision before the replay side effect runs (the
+            // worker seam calls run_pending_epoch_backfill after this returns).
+            // Best-effort, fire-and-forget: recording can never block or fail
+            // the backfill.
+            self.record_epoch_stall_backfill_armed(&group_id, record.epoch.0);
             self.epoch_backfill_pending = true;
         }
+    }
+
+    /// Whether an epoch-gap backfill is armed and awaiting its replay. Read by
+    /// the account worker to schedule a forensic audit-tracker upload for the
+    /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
+    pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
+        self.epoch_backfill_pending
     }
 
     /// Recover any group that stalled below its live epoch during ingest by

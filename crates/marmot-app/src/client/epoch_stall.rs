@@ -64,6 +64,14 @@ impl EpochStallDetector {
         }
     }
 
+    /// The distinct-undecryptable count at which this detector arms a backfill.
+    /// Reported on the `epoch_stall_backfill_armed` audit row so the row is
+    /// honest even when the detector was built with a non-default threshold
+    /// (unit tests, or a future configurable value).
+    pub(crate) fn threshold(&self) -> usize {
+        self.threshold
+    }
+
     /// Record that an account-wide full-history replay was just triggered. One
     /// replay re-fetches every group's history, so suppress a further backfill
     /// for every currently-tracked group at its current epoch: N groups stuck at

@@ -1002,6 +1002,25 @@ pub enum AuditEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor_after_secs: Option<u64>,
     },
+    /// A group crossed the epoch-stall backfill threshold — enough distinct
+    /// undecryptable messages at one stalled epoch — and armed a full-history
+    /// epoch-gap backfill (commit-loss recovery). Emitted once per (group,
+    /// stalled epoch) at the arm decision, *before* the replay side effect runs,
+    /// so a field export reveals when and why full-history replays fire — the
+    /// evidence loop for tuning the empirical backfill threshold.
+    ///
+    /// Group-scoped: the stalled group's id is on the enclosing
+    /// [`AuditEvent::group_ref`], exactly as the `human_action` group rows carry
+    /// it; it is deliberately not duplicated into a field here. `stalled_epoch`
+    /// is the group epoch the device was stuck at when it armed — correlate it
+    /// against the group's live epoch (visible on `group_context` / `epoch_*`
+    /// rows) to read the size of the gap that triggered recovery. `threshold` is
+    /// the distinct-undecryptable count that armed the backfill, carried so an
+    /// export is self-describing when the constant is retuned across builds.
+    ///
+    /// Privacy: two scalar counts only — no ids, relay URLs, message ids, or
+    /// payloads — so nothing here needs scrubbing in either [`AuditDataMode`].
+    EpochStallBackfillArmed { stalled_epoch: u64, threshold: u64 },
 }
 
 impl AuditEventKind {
@@ -1052,6 +1071,7 @@ impl AuditEventKind {
             AuditEventKind::Rejection { .. } => "rejection",
             AuditEventKind::SubscriptionRebuild { .. } => "subscription_rebuild",
             AuditEventKind::SyncDrain { .. } => "sync_drain",
+            AuditEventKind::EpochStallBackfillArmed { .. } => "epoch_stall_backfill_armed",
         }
     }
 }

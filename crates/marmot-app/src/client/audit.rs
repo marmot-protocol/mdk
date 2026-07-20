@@ -189,6 +189,21 @@ impl AppClient {
         );
     }
 
+    /// Record an `epoch_stall_backfill_armed` forensic audit row at the arm
+    /// decision: the epoch the group was stalled at (`stalled_epoch`) and the
+    /// distinct-undecryptable threshold that armed the backfill (`threshold`).
+    /// Group-scoped, so `group_ref` carries the stalled group id.
+    pub(crate) fn record_epoch_stall_backfill_armed(&self, group_id: &GroupId, stalled_epoch: u64) {
+        self.runtime.session().record_audit_event(
+            Some(group_id),
+            None,
+            AuditEventKind::EpochStallBackfillArmed {
+                stalled_epoch,
+                threshold: self.epoch_stall.threshold() as u64,
+            },
+        );
+    }
+
     /// Apply the audit-logging switch to this live session by swapping the
     /// recorder in place: a file-backed recorder when `enabled`, or a no-op
     /// recorder when off. Dropping the prior recorder flushes and closes any
