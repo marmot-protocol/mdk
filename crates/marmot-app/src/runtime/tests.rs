@@ -1221,6 +1221,27 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
     ));
 }
 
+#[tokio::test]
+async fn lifecycle_waits_for_account_opens_to_drain() {
+    let lifecycle = RuntimeLifecycle::new();
+    let permit = lifecycle
+        .begin_account_open()
+        .expect("account open should start before shutdown");
+
+    let waiter = {
+        let lifecycle = lifecycle.clone();
+        tokio::spawn(async move {
+            lifecycle
+                .wait_for_account_opens_to_drain(Duration::from_secs(1))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    drop(permit);
+
+    assert!(waiter.await.expect("drain waiter should complete"));
+}
+
 // Sender-controlled broker candidates must clear the shared dial-safety gate
 // at resolve time: literal-IP authorities resolve without DNS, so these cover
 // the canonical non-public classes end to end (issue #331).

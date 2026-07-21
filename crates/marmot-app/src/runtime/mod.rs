@@ -458,8 +458,17 @@ impl RuntimeLifecycle {
 
         let started_at = Instant::now();
         let drained = timeout(wait, async {
-            while self.active_account_opens() != 0 {
-                self.inner.account_opens_drained.notified().await;
+            loop {
+                // `notify_waiters` does not retain a permit. Register the
+                // waiter before observing the counter so the final account
+                // open cannot finish in between the check and registration.
+                let notified = self.inner.account_opens_drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.active_account_opens() == 0 {
+                    break;
+                }
+                notified.await;
             }
         })
         .await
