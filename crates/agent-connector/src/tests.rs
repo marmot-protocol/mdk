@@ -5,8 +5,8 @@ use agent_control::{
     AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-    AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
@@ -2901,6 +2901,18 @@ fn inbound_message_event_detects_inline_nostr_mention() {
         panic!("expected inbound message event");
     };
     assert!(mentions_self, "inline nostr:<pubkey> should mark a mention");
+}
+
+#[test]
+fn inbound_message_event_does_not_scan_for_hex_mentions_past_the_cap() {
+    let account = "aa".repeat(32);
+    let mut text = "x".repeat(AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize);
+    text.push_str(&format!(" nostr:{account}"));
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "nostr:<hex> mentions past the bounded scan window must be ignored"
+    );
 }
 
 #[test]
