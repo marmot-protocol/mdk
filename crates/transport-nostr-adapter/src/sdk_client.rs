@@ -513,7 +513,8 @@ impl NostrSdkRelayClient {
         required_acks: usize,
         timed_out: bool,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        if required_acks == 0 || accepted.len() >= required_acks {
+        let required_acks = required_acks.max(1);
+        if accepted.len() >= required_acks {
             return Ok(NostrPublishOutcome {
                 message_id: Some(message_id),
                 accepted,
@@ -700,7 +701,9 @@ impl NostrRelayClient for NostrSdkRelayClient {
             endpoint_count = parsed_endpoints.len(),
             "publishing SDK relay event"
         );
-        let ack_goal = (required_acks > 0).then_some(required_acks);
+        // A configured threshold of zero relaxes the quorum but never permits
+        // confirming work that no relay accepted.
+        let ack_goal = required_acks.max(1);
         let message_id = cgka_traits::MessageId::new(event.id.to_bytes().to_vec());
         let mut accepted = Vec::new();
         let mut failed = Vec::new();
@@ -768,7 +771,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 Ok(Some(result)) => match result {
                     Ok(Ok(receipt)) => {
                         accepted.push(receipt);
-                        if ack_goal.is_some_and(|goal| accepted.len() >= goal) {
+                        if accepted.len() >= ack_goal {
                             publishes.abort_all();
                             aborted_publishes = true;
                             break Ok(NostrPublishOutcome {
@@ -933,6 +936,36 @@ mod tests {
         let rendered = err.to_string();
         assert!(!rendered.contains("private-relay.example"), "{rendered}");
         assert!(rendered.contains("connect relay failed"), "{rendered}");
+    }
+
+    #[test]
+    fn zero_required_acks_still_requires_one_acceptance() {
+        let message_id = cgka_traits::MessageId::new(vec![0xD5; 32]);
+        let no_acceptance = NostrSdkRelayClient::finish_publish_outcome(
+            message_id.clone(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+        assert!(matches!(
+            no_acceptance,
+            Err(TransportAdapterError::Publish(_))
+        ));
+
+        let accepted = vec![TransportEndpointReceipt {
+            endpoint: TransportEndpoint("wss://relay.example".into()),
+            accepted_at: None,
+        }];
+        let outcome = NostrSdkRelayClient::finish_publish_outcome(
+            message_id,
+            accepted.clone(),
+            Vec::new(),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.accepted, accepted);
     }
 
     #[test]
