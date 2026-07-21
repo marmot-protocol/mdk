@@ -314,12 +314,12 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         // loads the whole cache. Ordering preserved (users by account_id_hex;
         // each user's follows by position then follow id).
         let cap = i64::try_from(max).unwrap_or(i64::MAX);
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction().storage()?;
         let mut follows_by_account: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         {
-            let mut stmt = self
-                .conn_ref(&conn)
+            let mut stmt = tx
                 .prepare(
                     "SELECT account_id_hex, follow_account_id_hex FROM directory_user_follows
                      WHERE account_id_hex IN (
@@ -342,8 +342,7 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
                     .push(follow);
             }
         }
-        let mut stmt = self
-            .conn_ref(&conn)
+        let mut stmt = tx
             .prepare(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
                         key_package_json, event_id_hex, event_kind, event_created_at
@@ -369,6 +368,8 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
+        drop(stmt);
+        tx.commit().storage()?;
         if records.len() >= max {
             // no silent caps: surface (aggregate count only, privacy-safe) that
             // the listing was truncated so an operator can tell the bound bit.
@@ -715,6 +716,21 @@ mod tests {
                 .iter()
                 .all(|user| user.follows == vec!["ff".repeat(32)])
         );
+    }
+
+    #[test]
+    fn public_directory_users_read_users_and_follows_in_one_transaction() {
+        let source = include_str!("shared.rs");
+        let body = source
+            .split("fn public_directory_users_capped(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn relay_telemetry_settings(")
+            .next()
+            .unwrap();
+
+        assert!(body.contains("transaction()"));
+        assert!(body.contains("tx.commit()"));
     }
 
     #[test]
