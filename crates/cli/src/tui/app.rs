@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// Disables bracketed paste on drop so an unwind out of `run` cannot leave the
+/// user's terminal in bracketed-paste mode. `ratatui::init` installs a panic
+/// hook that restores the terminal, but bracketed paste is enabled outside
+/// ratatui's knowledge, so its hook does not disable it. The normal exit path
+/// still disables explicitly (see `run`) to keep the teardown ordering visible;
+/// this guard only covers the panic/unwind path. Best-effort chrome: failures
+/// are ignored.
+struct BracketedPasteGuard;
+
+impl Drop for BracketedPasteGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    }
+}
+
 pub(crate) struct TuiApp {
     pub(crate) client: WnClient,
     pub(crate) initial_account: Option<String>,
@@ -35,7 +50,7 @@ pub(crate) struct TuiApp {
     pub(crate) group_state_subscription: Option<GroupStateSubscription>,
     pub(crate) daemon: DaemonView,
     pub(crate) group_diagnostics: Option<GroupDiagnostics>,
-    pub(crate) input: String,
+    pub(crate) input: Input,
     pub(crate) streaming: Option<StreamComposer>,
     pub(crate) status: String,
     pub(crate) show_help: bool,
@@ -70,7 +85,7 @@ impl TuiApp {
             group_state_subscription: None,
             daemon: DaemonView::default(),
             group_diagnostics: None,
-            input: String::new(),
+            input: Input::default(),
             streaming: None,
             status: "loading accounts".to_owned(),
             show_help: false,
@@ -79,6 +94,16 @@ impl TuiApp {
 
     pub(crate) fn run(&mut self) -> TuiResult<()> {
         let mut terminal = ratatui::init();
+        // Bracketed paste delivers a paste as one `Event::Paste(text)` instead of a
+        // burst of key events, so a multi-line paste keeps its newlines instead of
+        // firing Enter (send) on every line. Best-effort chrome: ignore failures
+        // and always disable before restore.
+        let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+        // Safety net so a panic unwinding out of the loop still disables bracketed
+        // paste (ratatui's panic hook restores the terminal but does not know
+        // about this mode). The explicit disable below keeps the normal path's
+        // ordering; the guard's drop then repeats it harmlessly.
+        let _bracketed_paste = BracketedPasteGuard;
         let result = (|| -> TuiResult<()> {
             let _ = self.refresh_daemon_status();
             self.start()?;
@@ -95,6 +120,10 @@ impl TuiApp {
                             self.handle_key(key)?;
                             dirty = true;
                         }
+                        Event::Paste(text) => {
+                            self.handle_paste(text);
+                            dirty = true;
+                        }
                         _ => {
                             dirty = true;
                         }
@@ -103,8 +132,41 @@ impl TuiApp {
             }
             Ok(())
         })();
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
         result
+    }
+
+    /// Route pasted text (from bracketed paste) into whatever input is accepting
+    /// characters — the streaming composer, the nsec field, or the main composer —
+    /// as literal characters with no keybinding interpretation. Newlines are kept
+    /// (normalized to `\n`) so multi-line content lands verbatim. Paste elsewhere
+    /// is ignored, mirroring where typed characters are accepted.
+    pub(crate) fn handle_paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.streaming.is_some() {
+            self.input.insert_str(&text);
+            let mut stream_id = None;
+            if let Some(streaming) = self.streaming.as_mut() {
+                streaming.pending_text.push_str(&text);
+                stream_id = Some(streaming.stream_id.clone());
+                // Mirror the typed-char status so a paste is as visible as typing.
+                self.status = format!(
+                    "queued {} byte(s) on {}",
+                    streaming.pending_text.len(),
+                    shorten(&streaming.stream_id, 18)
+                );
+            }
+            if let Some(stream_id) = stream_id {
+                self.upsert_active_stream_preview(&stream_id);
+            }
+            return;
+        }
+        match self.screen {
+            Screen::Login(LoginMode::NsecEntry) => self.input.insert_str(&text),
+            Screen::Main if self.focus == Focus::Composer => self.input.insert_str(&text),
+            _ => {}
+        }
     }
 
     pub(crate) fn tick(&mut self) -> bool {
@@ -228,7 +290,7 @@ impl TuiApp {
             KeyCode::Char('/') if self.focus != Focus::Composer => {
                 self.show_help = false;
                 self.focus = Focus::Composer;
-                self.input.push('/');
+                self.input.insert('/');
             }
             // Reopen the account picker from the chat list (the accounts pane is
             // gone; `A` is its replacement entry point).
@@ -257,6 +319,23 @@ impl TuiApp {
             KeyCode::Char('i') | KeyCode::Enter if self.focus == Focus::Messages => {
                 self.focus = Focus::Composer;
             }
+            // Message-interaction accelerators (Messages focus, popups are Phase 5).
+            // `r` and `d` prefill a slash command in the composer so Enter is the
+            // visible action; `u` removes your own reaction immediately (no input).
+            KeyCode::Char('r') if self.focus == Focus::Messages => {
+                self.show_help = false;
+                self.prefill_composer("/react ");
+            }
+            KeyCode::Char('u') if self.focus == Focus::Messages => {
+                self.show_help = false;
+                if let Err(err) = self.unreact_selected_message() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Char('d') if self.focus == Focus::Messages => {
+                self.show_help = false;
+                self.prefill_composer("/delete");
+            }
             // Chat list navigation.
             KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer => {
                 self.move_selection(-1);
@@ -269,12 +348,19 @@ impl TuiApp {
                     self.status = format!("error: {err}");
                 }
             }
+            // Composer cursor editing (Phase 3). Left/Right/Home/End move; Delete
+            // removes the char at the cursor; Backspace the one before it.
+            KeyCode::Left if self.focus == Focus::Composer => self.input.left(),
+            KeyCode::Right if self.focus == Focus::Composer => self.input.right(),
+            KeyCode::Home if self.focus == Focus::Composer => self.input.home(),
+            KeyCode::End if self.focus == Focus::Composer => self.input.end(),
+            KeyCode::Delete if self.focus == Focus::Composer => self.input.delete(),
             KeyCode::Backspace if self.focus == Focus::Composer => {
-                self.input.pop();
+                self.input.backspace();
             }
             KeyCode::Char(character) if self.focus == Focus::Composer => {
                 self.show_help = false;
-                self.input.push(character);
+                self.input.insert(character);
             }
             _ => {}
         }
@@ -348,8 +434,21 @@ impl TuiApp {
         }
     }
 
+    /// Prefill the composer with an accelerator's slash command and focus it, but
+    /// only when the composer is empty. A draft is never clobbered: `r`/`d` after
+    /// Tab-cycling to Messages would otherwise silently destroy typed text, so an
+    /// existing draft is left intact and the status line explains the suppression.
+    fn prefill_composer(&mut self, command: &str) {
+        if self.input.is_empty() {
+            self.input.set_value(command);
+            self.focus = Focus::Composer;
+        } else {
+            self.status = "composer has a draft; clear it before using r/d".to_owned();
+        }
+    }
+
     pub(crate) fn submit_input(&mut self) -> TuiResult<()> {
-        let input = self.input.trim().to_owned();
+        let input = self.input.value().trim().to_owned();
         self.input.clear();
         if input.is_empty() {
             return Ok(());
@@ -371,7 +470,7 @@ impl TuiApp {
                 Ok(())
             }
             KeyCode::Char(character) => {
-                self.input.push(character);
+                self.input.insert(character);
                 let mut stream_id = None;
                 if let Some(streaming) = self.streaming.as_mut() {
                     streaming.pending_text.push(character);
@@ -439,15 +538,19 @@ impl TuiApp {
             KeyCode::Enter => self.submit_nsec_login(),
             KeyCode::Esc => {
                 self.input.clear();
+                self.input.set_masked(false);
                 match login_mode_for_accounts(self.accounts.len()) {
                     LoginMode::AccountSelect => self.open_account_picker(),
                     mode => self.screen = Screen::Login(mode),
                 }
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(character) => self.input.push(character),
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
+            KeyCode::Delete => self.input.delete(),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Char(character) => self.input.insert(character),
             _ => {}
         }
     }
@@ -464,6 +567,9 @@ impl TuiApp {
     fn begin_nsec_entry(&mut self) {
         self.screen = Screen::Login(LoginMode::NsecEntry);
         self.input.clear();
+        // Reuse the composer input's masked mode so the field renders as `*` per
+        // char and key material never reaches the screen.
+        self.input.set_masked(true);
         self.status = "enter nsec; Enter submits, Esc cancels".to_owned();
     }
 
@@ -471,14 +577,18 @@ impl TuiApp {
     /// path. The value is cleared before shelling out (as the composer does), so
     /// a secret never lingers in state after submission.
     fn submit_nsec_login(&mut self) {
-        let identity = self.input.trim().to_owned();
+        let identity = self.input.value().trim().to_owned();
         self.input.clear();
         if identity.is_empty() {
             self.status = "nsec is empty; type an nsec or press Esc".to_owned();
             return;
         }
         match self.create_or_import_account(Some(identity), "logged in identity") {
-            Ok(()) => self.show_main(),
+            Ok(()) => {
+                // Leaving nsec entry: the shared input returns to plain composer mode.
+                self.input.set_masked(false);
+                self.show_main();
+            }
             Err(err) => self.status = format!("error: {err}"),
         }
     }
@@ -527,6 +637,10 @@ impl TuiApp {
             SlashCommand::MembersAdd(members) => self.add_selected_chat_members(members),
             SlashCommand::MembersRemove(members) => self.remove_selected_chat_members(members),
             SlashCommand::MembersList => self.show_selected_chat_members(),
+            SlashCommand::React { emoji } => self.react_to_selected_message(emoji),
+            SlashCommand::Unreact => self.unreact_selected_message(),
+            SlashCommand::Delete => self.delete_selected_message(),
+            SlashCommand::Retry { event_id } => self.retry_message(event_id),
             SlashCommand::Image { file_path, caption } => self.send_image(file_path, caption),
             SlashCommand::KeysFetch(account) => {
                 let result = self.client.run_json(None, &["keys", "fetch", &account])?;

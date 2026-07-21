@@ -534,7 +534,17 @@ Main view controls:
   message (and pin to the bottom), `g`/`Home` to the oldest. New messages stay pinned to the bottom while you are at
   the newest message and hold your position when you have scrolled up. Scrolling past the oldest loaded message loads
   the previous page of history. `i` or `Enter` focuses the composer.
-- Composer: `Enter` submits.
+- Messages, on the selected message: `r` reacts (it prefills `/react ` in the composer, so `Enter` sends the default
+  `+` and typing an emoji first customizes it); `u` removes your own reaction immediately; `d` deletes your own
+  message (it prefills `/delete`, so `Enter` is the visible confirmation). Counts update live in both directions from
+  the timeline projection; the list is not reloaded. The `r` and `d` prefills are skipped when the composer already
+  holds a draft, so an in-progress message is never clobbered (a status-line notice explains the skip). These also
+  work as the `/react`, `/unreact`, and `/delete` slash commands, which error to the status line when no message is
+  selected (and `/delete` when the message is not yours).
+- Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
+  character, and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard newline, so
+  multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8 rows), taking
+  the space from the messages pane.
 - `?`: open help.
 - `Esc`: close the help popup or clear the composer input.
 - `Ctrl-C`: quit.
@@ -565,6 +575,10 @@ Composer slash commands:
 /members add <npub-or-hex> [...]
 /members remove <npub-or-hex> [...]
 /members list
+/react [emoji]
+/unreact
+/delete
+/retry <event-id>
 /image <file-path> [caption]
 /keys fetch <npub-or-hex>
 /keys rotate
@@ -585,6 +599,11 @@ Composer slash commands:
 `/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the
 visible-chat list. Member commands operate on the selected chat and call the same group membership commands exposed by
 the CLI.
+`/react`, `/unreact`, and `/delete` operate on the selected message in the messages pane and call the real
+`messages react|unreact|delete` commands; `/react` defaults to the `+` emoji. On success they only update the status
+line — the timeline projection folds the reaction or tombstone into the existing row, so the list is not reloaded.
+`/retry <event-id>` retries a failed outbound event by id; it takes the id as an argument rather than acting on the
+selected message, because timeline rows do not carry per-message failed-send state to target from.
 `/image` uses the real encrypted media path (`wn media upload <group> <file> --send`) and sends the optional caption
 as the media message text; it does not send plaintext file paths or placeholder messages.
 Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch and completed previews

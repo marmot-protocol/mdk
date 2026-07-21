@@ -193,7 +193,7 @@ fn composer_renders_filtered_slash_command_popup() {
         test_unused_client(),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
-    app.input = "/chat r".to_owned();
+    app.input.set_value("/chat r");
 
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -855,7 +855,7 @@ fn active_stream_preview_pins_to_open_time_group_after_selection_shift() {
         pending_text: String::new(),
         last_flush: Instant::now(),
     });
-    app.input = "hello".to_owned();
+    app.input.set_value("hello");
 
     // A keystroke-driven preview upsert must land under the pinned group.
     app.upsert_active_stream_preview(stream_id);
@@ -1709,12 +1709,12 @@ fn leading_question_mark_inserts_into_empty_composer() {
 
     app.handle_key(char_key('?')).expect("handle '?'");
 
-    assert_eq!(app.input, "?");
+    assert_eq!(app.input.value(), "?");
     assert!(!app.show_help, "'?' in composer must not toggle help");
 
     app.handle_key(char_key('h')).expect("handle 'h'");
     app.handle_key(char_key('i')).expect("handle 'i'");
-    assert_eq!(app.input, "?hi");
+    assert_eq!(app.input.value(), "?hi");
 }
 
 #[test]
@@ -1774,7 +1774,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
             ..DaemonView::default()
         },
         group_diagnostics: None,
-        input: String::new(),
+        input: Input::default(),
         streaming: None,
         status: String::new(),
         show_help: false,
@@ -1823,6 +1823,31 @@ fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
     exe
+}
+
+/// A fake `wn` that records its argv (one arg per line) to a sidecar file and
+/// then prints `response`, so a test can assert which command was spawned.
+/// Returns the executable path and the args-file path.
+#[cfg(unix)]
+fn test_arg_recording_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe = dir.join("wn-json");
+    let args_file = dir.join("recorded-args");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat <<'JSON'\n{response}\nJSON\n",
+            args_file.display()
+        ),
+    )
+    .expect("write fake wn");
+    let mut permissions = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    (exe, args_file)
 }
 
 #[cfg(windows)]
@@ -1936,7 +1961,7 @@ fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
         pending_text: String::new(),
         last_flush: Instant::now(),
     });
-    app.input = "hello".to_owned();
+    app.input.set_value("hello");
 
     let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -1960,7 +1985,8 @@ fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
         "composer must be restored after a compose-finish failure so Enter/Esc retries the stream"
     );
     assert_eq!(
-        app.input, "hello",
+        app.input.value(),
+        "hello",
         "draft text must be preserved for retry after a compose-finish failure"
     );
 }
@@ -1980,7 +2006,7 @@ fn streaming_enter_failure_before_finish_preserves_composer() {
         pending_text: "queued".to_owned(),
         last_flush: Instant::now(),
     });
-    app.input = "queued".to_owned();
+    app.input.set_value("queued");
 
     let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -3406,6 +3432,41 @@ fn send_message_upserts_an_optimistic_timeline_row() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn send_message_uses_the_documented_plural_messages_namespace() {
+    // `messages send` is the documented surface; `message send` is a hidden
+    // deprecated alias. The message interactions (react/unreact/delete/retry)
+    // all spawn the plural form, so send must too, for a consistent surface.
+    let account_id = "aa".repeat(32);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_arg_recording_executable(
+        tempdir.path(),
+        r#"{"ok":true,"result":{"published":1,"message_ids":["m1"]}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+
+    app.send_message("hello there".to_owned()).expect("send");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let args: Vec<&str> = recorded.lines().collect();
+    let send_index = args
+        .iter()
+        .position(|arg| *arg == "send")
+        .expect("a send subcommand was spawned");
+    assert_eq!(
+        args[send_index - 1],
+        "messages",
+        "send must spawn the plural `messages send`, not the singular alias; got {args:?}"
+    );
+}
+
 #[test]
 fn refresh_messages_loads_the_materialized_timeline_page() {
     let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -3759,7 +3820,7 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Messages, true),
-        "j/k select  G/g ends  PgUp older  i compose  Tab cycle"
+        "j/k select  G/g ends  r react  u unreact  d delete  i compose"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Composer, true),
@@ -3883,16 +3944,19 @@ fn nsec_entry_accepts_masked_input_and_esc_returns_to_picker() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
     app.input.clear();
+    app.input.set_masked(true);
 
     for character in "nsec1secret".chars() {
         app.handle_key(char_key(character)).expect("char");
     }
-    assert_eq!(app.input, "nsec1secret");
-    assert_eq!(masked_secret(&app.input), "***********");
+    assert_eq!(app.input.value(), "nsec1secret");
+    // The field reuses the composer input's masked mode: it renders `*` per char,
+    // never the secret.
+    assert_eq!(app.input.display(), "***********");
 
     app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
         .expect("backspace");
-    assert_eq!(app.input, "nsec1secre");
+    assert_eq!(app.input.value(), "nsec1secre");
 
     // Esc clears the secret and returns to the picker (one account exists).
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -3906,7 +3970,8 @@ fn nsec_entry_esc_returns_to_the_menu_without_accounts() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.accounts.clear();
     app.screen = Screen::Login(LoginMode::NsecEntry);
-    app.input = "partial".to_owned();
+    app.input.set_value("partial");
+    app.input.set_masked(true);
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .expect("esc");
     assert!(app.input.is_empty());
@@ -3920,10 +3985,15 @@ fn nsec_entry_q_is_typed_not_a_quit() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
     app.input.clear();
+    app.input.set_masked(true);
 
     app.handle_key(char_key('q')).expect("q");
 
-    assert_eq!(app.input, "q", "q is entered into the masked nsec field");
+    assert_eq!(
+        app.input.value(),
+        "q",
+        "q is entered into the masked nsec field"
+    );
     assert!(app.running, "q must not quit during nsec entry");
 }
 
@@ -3931,7 +4001,8 @@ fn nsec_entry_q_is_typed_not_a_quit() {
 fn nsec_entry_empty_submit_reports_and_stays() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
-    app.input = "   ".to_owned();
+    app.input.set_value("   ");
+    app.input.set_masked(true);
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .expect("enter");
     assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
@@ -4223,7 +4294,8 @@ fn login_menu_frame_shows_options_and_hints() {
 fn nsec_entry_frame_masks_the_secret() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
-    app.input = "nsec1supersecret".to_owned();
+    app.input.set_value("nsec1supersecret");
+    app.input.set_masked(true);
 
     let rendered = rendered_buffer(&mut app);
     assert!(
@@ -4234,4 +4306,672 @@ fn nsec_entry_frame_masks_the_secret() {
         rendered.contains("****"),
         "the field renders as mask characters"
     );
+}
+
+// --- Phase 3: composer input model + editing ---
+
+#[test]
+fn input_inserts_deletes_and_moves_across_multibyte_chars() {
+    let mut input = Input::default();
+    for character in "café".chars() {
+        input.insert(character);
+    }
+    assert_eq!(input.value(), "café");
+    assert_eq!(input.cursor(), 4);
+
+    // Backspace removes the multi-byte 'é' as one char.
+    input.backspace();
+    assert_eq!(input.value(), "caf");
+    assert_eq!(input.cursor(), 3);
+
+    // Move left twice and insert mid-string.
+    input.left();
+    input.left();
+    assert_eq!(input.cursor(), 1);
+    input.insert('x');
+    assert_eq!(input.value(), "cxaf");
+    assert_eq!(input.cursor(), 2);
+
+    // Forward-delete removes the char at the cursor ('a').
+    input.delete();
+    assert_eq!(input.value(), "cxf");
+    assert_eq!(input.cursor(), 2);
+
+    // Cursor movement clamps at both ends; deletes at the edges are no-ops.
+    input.home();
+    assert_eq!(input.cursor(), 0);
+    input.left();
+    assert_eq!(input.cursor(), 0, "left clamps at the start");
+    input.backspace();
+    assert_eq!(input.value(), "cxf", "backspace at the start is a no-op");
+    input.end();
+    assert_eq!(input.cursor(), 3);
+    input.right();
+    assert_eq!(input.cursor(), 3, "right clamps at the end");
+    input.delete();
+    assert_eq!(input.value(), "cxf", "delete at the end is a no-op");
+}
+
+#[test]
+fn input_handles_astral_plane_characters_as_single_stops() {
+    let mut input = Input::default();
+    input.insert('a');
+    input.insert('😀'); // 4-byte UTF-8: one char, one cursor stop
+    input.insert('b');
+    assert_eq!(input.value(), "a😀b");
+    assert_eq!(input.cursor(), 3);
+
+    input.left(); // between 😀 and b
+    input.backspace(); // removes 😀 whole, not a broken byte
+    assert_eq!(input.value(), "ab");
+    assert_eq!(input.cursor(), 1);
+}
+
+#[test]
+fn input_insert_str_pastes_multibyte_and_multiline_at_the_cursor() {
+    let mut input = Input::default();
+    input.set_value("ac");
+    input.left(); // cursor between 'a' and 'c'
+    input.insert_str("b\nx"); // multi-line paste
+    assert_eq!(input.value(), "ab\nxc");
+    assert_eq!(
+        input.cursor(),
+        4,
+        "cursor advances by the pasted char count"
+    );
+
+    // Multi-byte paste advances by char count, not byte count.
+    let mut other = Input::default();
+    other.insert_str("héllo");
+    assert_eq!(other.cursor(), 5);
+}
+
+#[test]
+fn input_masked_display_hides_the_value_but_preserves_it() {
+    let mut input = Input::default();
+    input.set_value("nsec1secret");
+    assert_eq!(input.display(), "nsec1secret", "plain display by default");
+
+    input.set_masked(true);
+    assert_eq!(
+        input.display(),
+        "***********",
+        "masked renders one * per char"
+    );
+    assert_eq!(
+        input.value(),
+        "nsec1secret",
+        "the value is preserved under the mask"
+    );
+
+    // Multi-byte chars each mask to a single *.
+    let mut emoji = Input::default();
+    emoji.set_value("aé😀");
+    emoji.set_masked(true);
+    assert_eq!(emoji.display(), "***");
+}
+
+#[test]
+fn composer_height_grows_with_lines_and_clamps_between_three_and_eight() {
+    let mut input = Input::default();
+    // A single (empty) line is the 3-row minimum (1 content + 2 borders).
+    assert_eq!(composer_height(&input, true, false, 40), 3);
+
+    // More wrapped lines grow the composer.
+    input.set_value("a\nb\nc");
+    assert_eq!(composer_height(&input, true, false, 40), 5);
+
+    // A long single line wraps by width and grows the composer beyond one row.
+    input.set_value("x".repeat(100));
+    assert!(
+        composer_height(&input, false, false, 40) > 3,
+        "a wrapped long line grows the composer past the minimum"
+    );
+
+    // Beyond the clamp, height caps at 8.
+    input.set_value("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
+    assert_eq!(composer_height(&input, true, false, 40), 8);
+}
+
+#[test]
+fn composer_grows_with_content_and_renders_the_cursor_cell() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    // No selected chat row and no timeline selection, so the only black-on-white
+    // cell in the frame is the composer's cursor cell.
+    app.chats.clear();
+    app.timeline.clear();
+    app.input.set_value("line one\nline two\nTAILMARKER");
+
+    let backend = ratatui::backend::TestBackend::new(60, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    let buffer = terminal.backend().buffer().clone();
+
+    let rendered = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    // A fixed 3-row composer would clip the tail; growth shows every pasted line.
+    assert!(
+        rendered.contains("TAILMARKER"),
+        "the grown composer shows every pasted line"
+    );
+    // The status bar still renders, so growth stole from the messages row, not the bars.
+    assert!(
+        rendered.contains("daemon"),
+        "the status bar survives composer growth"
+    );
+    // The focused composer draws a black-on-white cursor cell.
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|cell| cell.fg == Color::Black && cell.bg == Color::White),
+        "the focused composer renders the cursor cell"
+    );
+}
+
+/// Count the black-on-white cursor cells in a set of composer lines.
+fn cursor_cell_contents(lines: &[Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .filter(|span| span.style.fg == Some(Color::Black) && span.style.bg == Some(Color::White))
+        .map(|span| span.content.to_string())
+        .collect()
+}
+
+#[test]
+fn composer_cursor_cell_renders_at_display_end_when_redaction_shrinks_the_value() {
+    // nsec redaction shrinks the display (`/login nsec1…` -> `/login <hidden
+    // nsec>`), so the raw cursor at the end of the value lies beyond the display.
+    // The cursor must still render exactly one cell, clamped to the display end,
+    // instead of vanishing because no display segment holds the raw index.
+    let mut input = Input::default();
+    input.set_value("/login nsec1supersecretvalue");
+    input.end();
+
+    let lines = composer_lines(&input, true, false);
+    assert_eq!(
+        cursor_cell_contents(&lines),
+        vec![" ".to_owned()],
+        "exactly one cursor cell renders, a trailing space at the redacted display end"
+    );
+}
+
+#[test]
+fn composer_cursor_keeps_exact_placement_for_unredacted_input() {
+    // Normal input (display == value) keeps the cursor on the exact character.
+    let mut input = Input::default();
+    input.set_value("hello");
+    input.home();
+    input.right();
+
+    let lines = composer_lines(&input, true, false);
+    assert_eq!(
+        cursor_cell_contents(&lines),
+        vec!["e".to_owned()],
+        "the cursor cell sits on the exact char for unredacted input"
+    );
+}
+
+#[test]
+fn nsec_entry_reuses_masked_mode_and_clears_it_on_exit() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.accounts.clear();
+    app.screen = Screen::Login(LoginMode::Menu);
+
+    // `l` begins nsec entry with the shared input switched into masked mode.
+    app.handle_key(char_key('l')).expect("l");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+    for character in "nsec1secret".chars() {
+        app.handle_key(char_key(character)).expect("char");
+    }
+    assert_eq!(
+        app.input.display(),
+        "***********",
+        "the nsec field reuses the input's masked mode"
+    );
+    assert_eq!(app.input.value(), "nsec1secret");
+
+    // Leaving nsec entry returns the shared input to plain composer mode.
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    app.input.set_value("hello");
+    assert_eq!(
+        app.input.display(),
+        "hello",
+        "the composer input is no longer masked after nsec entry"
+    );
+}
+
+// --- Phase 3: message interactions ---
+
+#[test]
+fn slash_command_parser_handles_message_interactions() {
+    assert_eq!(
+        parse_slash_command("/react"),
+        Ok(SlashCommand::React {
+            emoji: "+".to_owned()
+        }),
+        "a bare /react uses the default + emoji"
+    );
+    assert_eq!(
+        parse_slash_command("/react 🔥"),
+        Ok(SlashCommand::React {
+            emoji: "🔥".to_owned()
+        })
+    );
+    assert_eq!(parse_slash_command("/unreact"), Ok(SlashCommand::Unreact));
+    assert_eq!(parse_slash_command("/delete"), Ok(SlashCommand::Delete));
+    assert_eq!(
+        parse_slash_command("/retry evt123"),
+        Ok(SlashCommand::Retry {
+            event_id: "evt123".to_owned()
+        })
+    );
+
+    // Argument-shape errors surface to the status line instead of panicking.
+    assert!(parse_slash_command("/react a b").is_err());
+    assert!(parse_slash_command("/unreact x").is_err());
+    assert!(parse_slash_command("/delete x").is_err());
+    assert!(parse_slash_command("/retry").is_err());
+    assert!(parse_slash_command("/retry a b").is_err());
+}
+
+#[test]
+fn messages_r_prefills_the_react_command_in_the_composer() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+
+    app.handle_key(char_key('r')).expect("r");
+
+    assert_eq!(app.focus, Focus::Composer, "r focuses the composer");
+    assert_eq!(
+        app.input.value(),
+        "/react ",
+        "r prefills the react command so Enter sends the default +"
+    );
+}
+
+#[test]
+fn messages_d_prefills_the_delete_command_in_the_composer() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+
+    app.handle_key(char_key('d')).expect("d");
+
+    assert_eq!(app.focus, Focus::Composer, "d focuses the composer");
+    assert_eq!(
+        app.input.value(),
+        "/delete",
+        "d prefills /delete so Enter is the visible confirmation"
+    );
+}
+
+#[test]
+fn messages_r_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
+    // A draft typed in the composer survives Tab-cycling to Messages. Pressing
+    // `r` there must not silently overwrite it with `/react `; it leaves the
+    // draft intact and explains the suppression on the status line.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.input.set_value("half-written draft");
+
+    app.handle_key(char_key('r')).expect("r");
+
+    assert_eq!(
+        app.input.value(),
+        "half-written draft",
+        "r must not clobber an existing composer draft"
+    );
+    assert!(
+        app.status.contains("draft"),
+        "the status line explains why r/d was suppressed, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn messages_d_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.input.set_value("half-written draft");
+
+    app.handle_key(char_key('d')).expect("d");
+
+    assert_eq!(
+        app.input.value(),
+        "half-written draft",
+        "d must not clobber an existing composer draft"
+    );
+    assert!(
+        app.status.contains("draft"),
+        "the status line explains why r/d was suppressed, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn messages_u_dismisses_the_help_overlay_like_r_and_d() {
+    // `r` and `d` already clear the help overlay; `u` should too, for one-liner
+    // consistency. The dismissal happens regardless of whether the unreact call
+    // itself succeeds (here it errors into the status line with no selection).
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.show_help = true;
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+
+    app.handle_key(char_key('u')).expect("u");
+
+    assert!(!app.show_help, "u dismisses the help overlay like r and d");
+}
+
+#[test]
+fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Messages;
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+    app.timeline = vec![timeline_row("m0", 0)];
+
+    app.handle_key(char_key('u')).expect("u");
+
+    assert_eq!(
+        app.focus,
+        Focus::Messages,
+        "u acts immediately; it never focuses the composer"
+    );
+    assert!(app.input.is_empty(), "u does not prefill the composer");
+    assert_eq!(app.status, "removed reaction");
+    assert_eq!(
+        app.timeline.len(),
+        1,
+        "no list reload on interaction success"
+    );
+}
+
+#[test]
+fn messages_u_without_a_selected_message_surfaces_a_status_error() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    // A resolvable group but an empty pane: nothing to unreact.
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+
+    app.handle_key(char_key('u')).expect("u");
+
+    assert_eq!(app.focus, Focus::Messages, "u never prefills the composer");
+    assert!(app.input.is_empty());
+    assert!(
+        app.status.contains("no message selected"),
+        "got {}",
+        app.status
+    );
+}
+
+#[test]
+fn delete_rejects_foreign_messages_before_shelling_out() {
+    // The row's `direction` makes the ownership check trivial, so a clear
+    // status-line error fires early instead of a CLI rejection. The client is
+    // unused: the early return means no subprocess runs.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+    let mut foreign = timeline_row("m0", 0);
+    foreign.direction = "received".to_owned();
+    app.timeline = vec![foreign];
+
+    let error = app
+        .delete_selected_message()
+        .expect_err("foreign delete is rejected");
+    assert!(
+        matches!(error, TuiError::Cli(message) if message.contains("your own")),
+        "expected an own-messages-only error"
+    );
+}
+
+#[test]
+fn delete_allows_own_message_arriving_via_the_received_path() {
+    // Ownership must match render ownership: the renderer colors a row as yours
+    // when `timeline_row_is_self` holds, which also matches `from` against the
+    // loaded account id/npub/label. Your own message can arrive on the received
+    // path (a second device, a re-sync echo, projection upserts overwriting
+    // `direction`); it renders as yours and must therefore delete as yours,
+    // even though `direction` is not "sent".
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+    let mut own_via_received = timeline_row("m0", 0);
+    own_via_received.direction = "received".to_owned();
+    own_via_received.from = account_id.clone();
+    app.timeline = vec![own_via_received];
+
+    app.delete_selected_message()
+        .expect("an own message on the received path renders as yours and is deletable");
+    assert_eq!(app.status, "deleted message");
+}
+
+#[test]
+fn own_message_interactions_do_not_reload_the_timeline() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+    let mut own = timeline_row("m0", 0);
+    own.direction = "sent".to_owned();
+    app.timeline = vec![own];
+
+    app.react_to_selected_message("+".to_owned())
+        .expect("react");
+    assert_eq!(app.status, "reacted +");
+    assert_eq!(app.timeline.len(), 1, "react does not reload the list");
+
+    app.delete_selected_message().expect("delete own");
+    assert_eq!(app.status, "deleted message");
+    assert_eq!(
+        app.timeline.len(),
+        1,
+        "delete does not reload the list; the projection tombstones the row"
+    );
+}
+
+#[test]
+fn reaction_projection_updates_the_selected_row_without_reloading() {
+    let mut rows = vec![timeline_row("m0", 0), timeline_row("m1", 1)];
+    let mut scroll = TimelineScroll {
+        selection: Some(1),
+        ..TimelineScroll::default()
+    };
+    let before_len = rows.len();
+
+    // A ReactionAdded projection change arrives as an upsert of the same row with
+    // the reaction already folded in (Phase 1 machinery). It updates in place.
+    let mut reacted = timeline_row("m1", 1);
+    reacted.reactions = vec![TimelineReaction {
+        emoji: "+".to_owned(),
+        count: 1,
+    }];
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("g"),
+        TimelineEvent::ProjectionUpdated {
+            group_id: "g".to_owned(),
+            changes: vec![TimelineChange::Upsert(Box::new(reacted))],
+        },
+    );
+
+    assert_eq!(
+        rows.len(),
+        before_len,
+        "no row appended: the fold is a reload-free upsert"
+    );
+    assert_eq!(
+        scroll.resolved_selection(rows.len()),
+        Some(1),
+        "the selection stays on the same row"
+    );
+    let selected = &rows[scroll.resolved_selection(rows.len()).unwrap()];
+    assert_eq!(selected.message_id, "m1");
+    assert_eq!(
+        selected.reactions,
+        vec![TimelineReaction {
+            emoji: "+".to_owned(),
+            count: 1,
+        }],
+        "the selected row shows the folded reaction without a list reload"
+    );
+}
+
+// --- Phase 3: bracketed-paste routing ---
+
+#[test]
+fn handle_paste_inserts_at_the_composer_cursor_and_normalizes_newlines() {
+    // A paste lands as literal characters at the cursor, with CRLF and lone CR
+    // normalized to `\n` so multi-line content keeps its line breaks without
+    // firing a send per line.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    app.input.set_value("ac");
+    app.input.left(); // cursor between 'a' and 'c'
+
+    app.handle_paste("X\r\nY\rZ".to_owned());
+
+    assert_eq!(
+        app.input.value(),
+        "aX\nY\nZc",
+        "paste inserts at the cursor with CRLF and lone CR normalized to \\n"
+    );
+    assert_eq!(
+        app.input.cursor(),
+        6,
+        "the cursor advances past the pasted text"
+    );
+}
+
+#[test]
+fn handle_paste_into_masked_nsec_entry_appends_and_stays_masked() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input.set_masked(true);
+
+    app.handle_paste("nsec1pasted".to_owned());
+
+    assert_eq!(
+        app.input.value(),
+        "nsec1pasted",
+        "paste fills the nsec field"
+    );
+    assert_eq!(
+        app.input.display(),
+        "***********",
+        "the pasted nsec stays masked and never renders"
+    );
+}
+
+#[test]
+fn handle_paste_while_streaming_appends_to_pending_text_and_updates_status() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.streaming = Some(StreamComposer {
+        stream_id: "s1".to_owned(),
+        group_id: "bb".repeat(32),
+        pending_text: "typed".to_owned(),
+        last_flush: Instant::now(),
+    });
+
+    app.handle_paste("PASTED".to_owned());
+
+    let streaming = app.streaming.as_ref().expect("still streaming after paste");
+    assert_eq!(
+        streaming.pending_text, "typedPASTED",
+        "paste appends to the stream's pending text"
+    );
+    assert_eq!(
+        app.status, "queued 11 byte(s) on s1",
+        "paste updates the status line the same way typed chars do"
+    );
+    assert_eq!(
+        app.input.value(),
+        "PASTED",
+        "paste is also mirrored into the composer buffer"
+    );
+}
+
+#[test]
+fn handle_paste_is_ignored_on_the_login_menu_and_when_messages_focused() {
+    // The login menu accepts single-key choices, not text; paste is a no-op.
+    let mut menu = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    menu.screen = Screen::Login(LoginMode::Menu);
+    menu.handle_paste("ignored".to_owned());
+    assert!(menu.input.is_empty(), "paste is ignored on the login menu");
+
+    // The messages pane is not a text input; paste there is a no-op too.
+    let mut messages = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    messages.screen = Screen::Main;
+    messages.focus = Focus::Messages;
+    messages.handle_paste("ignored".to_owned());
+    assert!(
+        messages.input.is_empty(),
+        "paste is ignored when the messages pane is focused"
+    );
+}
+
+#[test]
+fn composer_min_and_max_height_coexist_with_the_diagnostics_panel() {
+    // With the diagnostics panel toggled on, the composer still clamps to its
+    // 3..=8 range and the diagnostics panel plus the hints and status bars all
+    // keep rendering at both extremes (growth steals from the messages row only).
+    let render_with = |value: &str, expected_composer_rows: u16| {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.screen = Screen::Main;
+        app.focus = Focus::Composer;
+        app.show_diagnostics = true;
+        app.group_diagnostics = None; // renders "MLS no group selected"
+        app.chats.clear();
+        app.timeline.clear();
+        app.input.set_value(value);
+
+        assert_eq!(
+            composer_height(&app.input, true, false, 60 - 2),
+            expected_composer_rows,
+            "composer clamps to {expected_composer_rows} rows"
+        );
+
+        let backend = ratatui::backend::TestBackend::new(60, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Diagnostics"),
+            "the diagnostics panel renders at composer height {expected_composer_rows}"
+        );
+        assert!(
+            rendered.contains("MLS no group selected"),
+            "the diagnostics content renders alongside the composer"
+        );
+        assert!(
+            rendered.contains("daemon"),
+            "the status bar survives at composer height {expected_composer_rows}"
+        );
+    };
+
+    render_with("", 3);
+    render_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj", 8);
 }

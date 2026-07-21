@@ -311,6 +311,124 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
         .split(vertical[1])[1]
 }
 
+/// Render `text` with a black-on-white cursor cell at char index `cursor` when
+/// `focused` — a trailing space when the cursor sits at the end. Unfocused
+/// renders the text as a single plain span (no cursor). Indexing is by char, so
+/// the cell lands on a whole multi-byte character.
+pub(crate) fn cursor_spans(text: &str, cursor: usize, focused: bool) -> Vec<Span<'static>> {
+    if !focused {
+        return vec![Span::raw(text.to_owned())];
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    let before = chars[..cursor].iter().collect::<String>();
+    let (at, after) = match chars.get(cursor) {
+        Some(&ch) => (
+            ch.to_string(),
+            chars[cursor + 1..].iter().collect::<String>(),
+        ),
+        None => (" ".to_owned(), String::new()),
+    };
+    vec![
+        Span::raw(before),
+        Span::styled(at, Style::default().fg(Color::Black).bg(Color::White)),
+        Span::raw(after),
+    ]
+}
+
+/// Render an editable field's `display` string as lines: split on embedded
+/// newlines (multi-line paste), make each segment terminal-safe, and draw the
+/// cursor cell on the segment that holds char index `cursor` when `focused`. The
+/// first line carries the optional `prefix` span (the composer `> ` prompt or the
+/// nsec `nsec ` label). Shared by the composer and the login nsec field.
+pub(crate) fn input_field_lines(
+    display: &str,
+    cursor: usize,
+    focused: bool,
+    prefix: Option<Span<'static>>,
+) -> Vec<Line<'static>> {
+    // The cursor is a char index into the raw value, but it is rendered against
+    // the display string, which can be shorter (nsec redaction, stripped format
+    // chars). Clamp it into the display's range so a cursor cell always renders —
+    // at the display end when the raw cursor lies beyond it. Pure rendering: the
+    // submitted value and redaction are untouched.
+    let cursor = cursor.min(display.chars().count());
+    let mut base = 0usize;
+    let mut placed = false;
+    display
+        .split('\n')
+        .enumerate()
+        .map(|(index, segment)| {
+            let safe = terminal_safe_text(segment);
+            let seg_len = segment.chars().count();
+            let on_this = focused && !placed && cursor <= base + seg_len;
+            let mut spans = Vec::new();
+            if index == 0
+                && let Some(prefix) = prefix.clone()
+            {
+                spans.push(prefix);
+            }
+            if on_this {
+                placed = true;
+                spans.extend(cursor_spans(&safe, cursor - base, true));
+            } else {
+                spans.push(Span::raw(safe));
+            }
+            base += seg_len + 1;
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The composer's rendered lines: the `> ` prompt then the display text with the
+/// cursor cell when focused. Empty input shows the cursor cell (focused) or a dim
+/// placeholder. The value is redacted (`/login <hidden nsec>`) via
+/// `composer_display_text` and made terminal-safe before rendering.
+pub(crate) fn composer_lines(input: &Input, focused: bool, streaming: bool) -> Vec<Line<'static>> {
+    let prompt = Span::styled("> ", Style::default().fg(FOCUS_ACCENT));
+    if input.is_empty() {
+        if focused && !streaming {
+            return input_field_lines("", 0, true, Some(prompt));
+        }
+        let placeholder = if streaming {
+            "streaming... type text, Enter finishes, Esc cancels"
+        } else {
+            "type a message or / for commands"
+        };
+        return vec![Line::from(vec![
+            prompt,
+            Span::styled(placeholder.to_owned(), Style::default().fg(Color::DarkGray)),
+        ])];
+    }
+    let display = composer_display_text(input.value());
+    input_field_lines(&display, input.cursor(), focused, Some(prompt))
+}
+
+/// The composer's auto-grow height in rows: the wrapped line count of its
+/// rendered content plus the top and bottom borders, clamped to 3..=8. Measured
+/// with the same wrap the renderer uses (`Paragraph::line_count`) so the reserved
+/// height matches what is drawn; the growth steals from the flexible messages
+/// row, never the bars.
+pub(crate) fn composer_height(
+    input: &Input,
+    focused: bool,
+    streaming: bool,
+    inner_width: u16,
+) -> u16 {
+    let lines = composer_lines(input, focused, streaming);
+    let content = if inner_width == 0 {
+        lines.len()
+    } else {
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width)
+    };
+    u16::try_from(content)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .clamp(3, 8)
+}
+
 impl TuiApp {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
         match self.screen {
@@ -330,13 +448,22 @@ impl TuiApp {
 
         // Vertical stack: the chat/messages row takes all reclaimed space, then
         // the opt-in diagnostics panel, the composer, and the one-line hints and
-        // status bars that replaced the old header and status panel.
+        // status bars that replaced the old header and status panel. The composer
+        // auto-grows with its wrapped content (borders included, clamped 3..=8);
+        // because it is a fixed-length row and the chat/messages body is the only
+        // `Min` row, that growth steals from the messages row, never the bars.
+        let composer_rows = composer_height(
+            &self.input,
+            self.focus == Focus::Composer,
+            self.streaming.is_some(),
+            area.width.saturating_sub(2),
+        );
         let mut constraints = vec![Constraint::Min(6)];
         if show_diagnostics {
             let height = (diagnostics_lines.len() as u16 + 2).clamp(3, 11);
             constraints.push(Constraint::Length(height));
         }
-        constraints.push(Constraint::Length(3));
+        constraints.push(Constraint::Length(composer_rows));
         constraints.push(Constraint::Length(1));
         constraints.push(Constraint::Length(1));
         let root = Layout::default()
@@ -448,14 +575,19 @@ impl TuiApp {
     }
 
     fn render_nsec_entry(&self, frame: &mut Frame, area: Rect) {
-        let lines = vec![
+        // The field reuses the composer input's masked mode (`display()` returns
+        // `*` per char); it is always the focused input on this screen, so the
+        // cursor cell renders. Key material never reaches the buffer.
+        let mut lines = vec![
             Line::from("Paste or type your nsec, then press Enter:"),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("nsec ", Style::default().fg(FOCUS_ACCENT)),
-                Span::raw(masked_secret(&self.input)),
-            ]),
         ];
+        lines.extend(input_field_lines(
+            &self.input.display(),
+            self.input.cursor(),
+            true,
+            Some(Span::styled("nsec ", Style::default().fg(FOCUS_ACCENT))),
+        ));
         frame.render_widget(
             Paragraph::new(lines)
                 .block(panel_block("Log in with nsec", true))
@@ -606,20 +738,11 @@ impl TuiApp {
     }
 
     pub(crate) fn render_composer(&self, frame: &mut Frame, area: Rect) {
-        let prompt = if self.streaming.is_some() && self.input.is_empty() {
-            "streaming... type text, Enter finishes, Esc cancels".to_owned()
-        } else if self.input.is_empty() {
-            "type a message or / for commands".to_owned()
-        } else {
-            composer_display_text(&self.input)
-        };
-        let lines = vec![Line::from(vec![
-            Span::styled("> ", Style::default().fg(FOCUS_ACCENT)),
-            Span::raw(terminal_safe_text(&prompt)),
-        ])];
+        let focused = self.focus == Focus::Composer;
+        let lines = composer_lines(&self.input, focused, self.streaming.is_some());
         frame.render_widget(
             Paragraph::new(lines)
-                .block(panel_block("Composer", self.focus == Focus::Composer))
+                .block(panel_block("Composer", focused))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -629,7 +752,7 @@ impl TuiApp {
         if self.focus != Focus::Composer || self.streaming.is_some() || self.show_help {
             return;
         }
-        let lines = slash_suggestion_lines(&self.input, SLASH_SUGGESTION_LIMIT);
+        let lines = slash_suggestion_lines(self.input.value(), SLASH_SUGGESTION_LIMIT);
         if lines.is_empty() || composer_area.width < 12 || composer_area.y == 0 {
             return;
         }
@@ -669,6 +792,10 @@ impl TuiApp {
             Line::from(
                 "G/g jump newest/oldest; past oldest loads history; i/Enter focus composer.",
             ),
+            Line::from("On the selected message: r react (Enter sends +), u unreact, d delete."),
+            Line::from(
+                "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
+            ),
             Line::from(""),
             Line::from("/refresh"),
             Line::from("/diagnostics"),
@@ -687,6 +814,10 @@ impl TuiApp {
             Line::from("/members add <npub-or-hex> [...]"),
             Line::from("/members remove <npub-or-hex> [...]"),
             Line::from("/members list"),
+            Line::from("/react [emoji]"),
+            Line::from("/unreact"),
+            Line::from("/delete"),
+            Line::from("/retry <event-id>"),
             Line::from("/keys fetch <npub-or-hex>"),
             Line::from("/keys rotate"),
             Line::from("/name <display-name>"),

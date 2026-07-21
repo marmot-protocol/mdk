@@ -220,7 +220,9 @@ impl TuiApp {
     pub(crate) fn send_message(&mut self, text: String) -> TuiResult<()> {
         let account_id = self.message_account_id()?;
         let group_id = self.message_group_id()?;
-        let args = vec!["message", "send", &group_id, &text];
+        // Use the documented plural `messages` surface, matching the react /
+        // unreact / delete / retry interactions (`message` is a hidden alias).
+        let args = vec!["messages", "send", &group_id, &text];
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("sent message", &result);
         if let Some(message_id) = result
@@ -255,6 +257,88 @@ impl TuiApp {
             self.refresh_messages()?;
         }
         self.status = status;
+        Ok(())
+    }
+
+    /// The message id of the currently selected timeline row. Errors when the
+    /// pane is empty (nothing to target), surfaced on the status line.
+    pub(crate) fn selected_timeline_message_id(&self) -> TuiResult<String> {
+        let index = self
+            .timeline_scroll
+            .resolved_selection(self.timeline.len())
+            .ok_or_else(|| TuiError::Cli("no message selected".to_owned()))?;
+        Ok(self.timeline[index].message_id.clone())
+    }
+
+    /// React to the selected message (`messages react <group> <id> [emoji]`). No
+    /// list refetch: the timeline projection subscription folds the reaction in
+    /// both directions, so success only updates the status line.
+    pub(crate) fn react_to_selected_message(&mut self, emoji: String) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let message_id = self.selected_timeline_message_id()?;
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "react", &group_id, &message_id, &emoji],
+        )?;
+        self.status = format!("reacted {emoji}");
+        Ok(())
+    }
+
+    /// Remove your own reaction from the selected message
+    /// (`messages unreact <group> <id>`). No list refetch (see `react_to_...`).
+    pub(crate) fn unreact_selected_message(&mut self) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let message_id = self.selected_timeline_message_id()?;
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "unreact", &group_id, &message_id],
+        )?;
+        self.status = "removed reaction".to_owned();
+        Ok(())
+    }
+
+    /// Delete the selected message (`messages delete <group> <id>`). Delete only
+    /// makes sense for your own messages; the row's `direction` makes the check
+    /// trivial, so a clear status-line error fires early instead of a CLI
+    /// rejection. No list refetch: the projection tombstones the row.
+    pub(crate) fn delete_selected_message(&mut self) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let index = self
+            .timeline_scroll
+            .resolved_selection(self.timeline.len())
+            .ok_or_else(|| TuiError::Cli("no message selected".to_owned()))?;
+        // Gate on the same ownership predicate the renderer uses to color a row
+        // as yours, resolved against the loaded message account. A `direction`
+        // check alone diverges: an own message arriving on the received path (a
+        // second device, a re-sync echo) renders as yours but would be refused.
+        if !timeline_row_is_self(&self.timeline[index], self.message_account_row()) {
+            return Err(TuiError::Cli(
+                "can only delete your own messages".to_owned(),
+            ));
+        }
+        let message_id = self.timeline[index].message_id.clone();
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "delete", &group_id, &message_id],
+        )?;
+        self.status = "deleted message".to_owned();
+        Ok(())
+    }
+
+    /// Retry a failed outbound event (`messages retry <group> <event-id>`). The
+    /// event id is an explicit argument, not the selected row: timeline rows carry
+    /// no failed-send state to target from (documented in the README).
+    pub(crate) fn retry_message(&mut self, event_id: String) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "retry", &group_id, &event_id],
+        )?;
+        self.status = format!("retried {}", shorten(&event_id, 18));
         Ok(())
     }
 
@@ -353,7 +437,7 @@ impl TuiApp {
                 stream_id: stream_id.to_owned(),
                 author: "me".to_owned(),
                 status: "streaming".to_owned(),
-                text: self.input.clone(),
+                text: self.input.value().to_owned(),
                 error: None,
                 optimistic: true,
             },

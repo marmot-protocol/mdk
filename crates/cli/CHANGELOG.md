@@ -29,9 +29,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   message-offset model — `j`/`k` select, `G`/`g` jump to newest/oldest, `PageUp`/`PageDown` page, and scrolling past
   the oldest loaded message pages in older history; incoming messages hold your position unless you are pinned to the
   bottom. Timestamps render in local wall-clock time. No JSON response shapes changed.
+- TUI: rewrote the composer with a cursor-editing input. `Left`/`Right`/`Home`/`End` move the cursor,
+  `Backspace`/`Delete` remove a character, and mid-string edits keep multi-byte characters intact. `Enter` still
+  submits and there is no keyboard newline; multi-line content arrives only by paste (bracketed paste keeps its
+  newlines). The composer auto-grows with its wrapped content up to 8 rows, taking the space from the messages pane.
+  The login nsec-entry field reuses this input's masked mode. No JSON response shapes changed.
 
 ### Added
 
+- TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
+  `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
+  accelerators `r` (prefills `/react `), `u` (removes your reaction immediately), and `d` (prefills `/delete`) drive
+  them from the messages pane. Reaction and deletion results fold in from the timeline projection, so the list is not
+  reloaded on success. `/delete` is refused for messages you did not send, and `/retry` takes an event id rather than
+  acting on the selection because timeline rows carry no per-message failed-send state. No JSON response shapes
+  changed.
 - Markdown autolinks now carry a renderer-facing destination classification across Rust and MarmotKit surfaces. The
   original destination is preserved, while web, contact, app, public Nostr, relative, unknown, dangerous, and
   sensitive targets are distinguished for client policy.

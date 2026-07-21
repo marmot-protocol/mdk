@@ -256,6 +256,126 @@ pub(crate) fn masked_secret(value: &str) -> String {
     "*".repeat(value.chars().count())
 }
 
+/// The composer's text-editing model: a value, a char-index cursor, and a masked
+/// flag. Indexing by char (not byte) keeps multi-byte UTF-8 intact for insert,
+/// delete, and cursor movement. It is not grapheme-cluster aware — a ZWJ emoji is
+/// several cursor stops — which matches the ported wn-tui `Input` behavior.
+/// Masked mode renders one `*` per char while preserving the value; the login
+/// nsec-entry field reuses it so key material never renders.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Input {
+    value: String,
+    cursor: usize,
+    masked: bool,
+}
+
+impl Input {
+    /// The raw edited value (never rendered directly when masked).
+    pub(crate) fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// The cursor position as a char index in `0..=char_count`.
+    pub(crate) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub(crate) fn set_masked(&mut self, masked: bool) {
+        self.masked = masked;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
+
+    /// The char count of the value; the cursor's upper bound.
+    fn char_len(&self) -> usize {
+        self.value.chars().count()
+    }
+
+    /// The display string: `*` per char when masked, otherwise the value.
+    pub(crate) fn display(&self) -> String {
+        if self.masked {
+            masked_secret(&self.value)
+        } else {
+            self.value.clone()
+        }
+    }
+
+    /// The byte offset of char index `char_index`, clamped to the value's end so a
+    /// cursor at (or past) the end splices at the tail.
+    fn byte_offset(&self, char_index: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(char_index)
+            .map_or(self.value.len(), |(offset, _)| offset)
+    }
+
+    /// Replace the value and place the cursor at the end. Backs the accelerator
+    /// prefills (`/react `, `/delete`).
+    pub(crate) fn set_value(&mut self, value: impl Into<String>) {
+        self.value = value.into();
+        self.cursor = self.char_len();
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.value.clear();
+        self.cursor = 0;
+    }
+
+    /// Insert a char at the cursor and advance past it.
+    pub(crate) fn insert(&mut self, ch: char) {
+        let at = self.byte_offset(self.cursor);
+        self.value.insert(at, ch);
+        self.cursor += 1;
+    }
+
+    /// Insert a whole string at the cursor (paste), advancing past it. Multi-byte
+    /// and multi-line content is inserted verbatim.
+    pub(crate) fn insert_str(&mut self, text: &str) {
+        let at = self.byte_offset(self.cursor);
+        self.value.insert_str(at, text);
+        self.cursor += text.chars().count();
+    }
+
+    /// Delete the char before the cursor (Backspace).
+    pub(crate) fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = self.byte_offset(self.cursor - 1);
+        let end = self.byte_offset(self.cursor);
+        self.value.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    /// Delete the char at the cursor (Delete/forward-delete).
+    pub(crate) fn delete(&mut self) {
+        if self.cursor >= self.char_len() {
+            return;
+        }
+        let start = self.byte_offset(self.cursor);
+        let end = self.byte_offset(self.cursor + 1);
+        self.value.replace_range(start..end, "");
+    }
+
+    pub(crate) fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub(crate) fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_len());
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.cursor = self.char_len();
+    }
+}
+
 /// The one-line status bar for the main view:
 /// `{account} · daemon {on|off} · {n} chats · {u} unread · {latest status}`.
 /// Untrusted fields (the account label and the status message) pass through
@@ -291,7 +411,7 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
         Screen::Login(LoginMode::NsecEntry) => "Enter submit  Esc back",
         Screen::Main => match focus {
             Focus::Chats => "j/k navigate  Enter open  A accounts  / command  ? help  q quit",
-            Focus::Messages => "j/k select  G/g ends  PgUp older  i compose  Tab cycle",
+            Focus::Messages => "j/k select  G/g ends  r react  u unreact  d delete  i compose",
             Focus::Composer => "Enter send  Esc clear",
         },
     }
@@ -323,6 +443,20 @@ pub(crate) enum SlashCommand {
     MembersAdd(Vec<String>),
     MembersRemove(Vec<String>),
     MembersList,
+    /// React to the selected message. `emoji` defaults to `+` when the command
+    /// carries none (the `r` accelerator sends the default on a bare Enter).
+    React {
+        emoji: String,
+    },
+    /// Remove your own reaction from the selected message.
+    Unreact,
+    /// Delete the selected message (own messages only).
+    Delete,
+    /// Retry a failed outbound event by id. Not a selected-message accelerator:
+    /// timeline rows carry no failed-send state to target from (see the README).
+    Retry {
+        event_id: String,
+    },
     Image {
         file_path: String,
         caption: Option<String>,
@@ -443,6 +577,22 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/members list",
         description: "show selected chat members",
+    },
+    SlashCommandSuggestion {
+        usage: "/react [emoji]",
+        description: "react to the selected message (default +)",
+    },
+    SlashCommandSuggestion {
+        usage: "/unreact",
+        description: "remove your reaction from the selected message",
+    },
+    SlashCommandSuggestion {
+        usage: "/delete",
+        description: "delete the selected message (own messages only)",
+    },
+    SlashCommandSuggestion {
+        usage: "/retry <event-id>",
+        description: "retry a failed outbound event",
     },
     SlashCommandSuggestion {
         usage: "/image <file-path> [caption]",
@@ -1444,7 +1594,16 @@ mod timeline {
     }
 
     /// Whether a timeline row was authored by the selected account (rendered green).
-    fn timeline_row_is_self(row: &TimelineRow, selected_account: Option<&AccountRow>) -> bool {
+    /// This is the single ownership predicate: `direction == "sent"` OR the row's
+    /// `from` resolves to the loaded account's id, npub, or display label. Own
+    /// messages arriving on the received path (a second device, a re-sync echo,
+    /// projection upserts overwriting `direction`) render as yours through the
+    /// `from` match, so the delete guard shares this to stay in lockstep with the
+    /// render.
+    pub(crate) fn timeline_row_is_self(
+        row: &TimelineRow,
+        selected_account: Option<&AccountRow>,
+    ) -> bool {
         row.direction == "sent"
             || selected_account.is_some_and(|account| {
                 row.from == account.account_id
