@@ -178,7 +178,31 @@ impl AppClient {
     }
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
-        let display_names = self.app.display_names_by_id()?;
+        loop {
+            let delivery = self.receive_next_delivery().await?;
+            let summary = self.ingest_received_delivery(delivery).await?;
+            if summary.joined_groups.is_empty()
+                && summary.messages.is_empty()
+                && summary.events.is_empty()
+                && self.pending_convergence_groups.is_empty()
+                && !self.epoch_backfill_pending
+            {
+                continue;
+            }
+            return Ok(summary);
+        }
+    }
+
+    /// Wait only for the next non-echo, non-duplicate transport delivery.
+    ///
+    /// The account worker selects this transport-only receive phase against
+    /// commands. Once a delivery is returned, it calls
+    /// [`Self::ingest_received_delivery`] outside the `select!`, so durable
+    /// engine ingest, incidental publish, and app projection cannot be dropped
+    /// halfway through when a command arrives.
+    pub(crate) async fn receive_next_delivery(
+        &mut self,
+    ) -> Result<cgka_traits::TransportDelivery, AppError> {
         let local_account_id_hex = self
             .app
             .account_home()
@@ -205,21 +229,20 @@ impl AppClient {
                 continue;
             }
             remember_seen_event(&mut seen, &mut self.state, event_id);
-
-            let mut summary = SyncSummary::default();
-            self.ingest_delivery(delivery, &display_names, &mut summary)
-                .await?;
-            self.app.save_state(&self.state)?;
-            if summary.joined_groups.is_empty()
-                && summary.messages.is_empty()
-                && summary.events.is_empty()
-                && self.pending_convergence_groups.is_empty()
-                && !self.epoch_backfill_pending
-            {
-                continue;
-            }
-            return Ok(summary);
+            return Ok(delivery);
         }
+    }
+
+    pub(crate) async fn ingest_received_delivery(
+        &mut self,
+        delivery: cgka_traits::TransportDelivery,
+    ) -> Result<SyncSummary, AppError> {
+        let display_names = self.app.display_names_by_id()?;
+        let mut summary = SyncSummary::default();
+        self.ingest_delivery(delivery, &display_names, &mut summary)
+            .await?;
+        self.app.save_state(&self.state)?;
+        Ok(summary)
     }
 
     async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, AppError> {
