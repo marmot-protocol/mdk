@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -214,6 +214,65 @@ impl NostrRelayClient for FakeRelayClient {
             .lock()
             .unwrap()
             .push((endpoints.to_vec(), event.clone(), required_acks));
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
+struct FlakySubscribeRelayClient {
+    fail_subscribes: AtomicBool,
+    subscriptions: Mutex<Vec<NostrSubscription>>,
+    unsubscribed_accounts: Mutex<Vec<MemberId>>,
+}
+
+impl Default for FlakySubscribeRelayClient {
+    fn default() -> Self {
+        Self {
+            fail_subscribes: AtomicBool::new(true),
+            subscriptions: Mutex::default(),
+            unsubscribed_accounts: Mutex::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for FlakySubscribeRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self.fail_subscribes.load(Ordering::SeqCst) {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected subscribe failure".into(),
+            ));
+        }
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.unsubscribed_accounts
+            .lock()
+            .unwrap()
+            .push(account_id.clone());
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
         Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
     }
 }
@@ -517,6 +576,45 @@ async fn activate_account_issues_inbox_and_group_subscriptions_concurrently() {
         .expect("activation subscriptions are issued concurrently");
 
     assert_eq!(relay.started.load(Ordering::SeqCst), 2);
+    assert_eq!(relay.subscriptions.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_activation_rolls_back_routes_and_can_retry() {
+    let relay = Arc::new(FlakySubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let activation = TransportAccountActivation {
+        account_id: account_id.clone(),
+        inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+        group_subscriptions: vec![TransportGroupSubscription {
+            group_id: cgka_traits::GroupId::new(vec![0xC3; 32]),
+            transport_group_id: vec![0xD4; 32],
+            endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        }],
+        since: None,
+    };
+
+    adapter
+        .activate_account(activation.clone())
+        .await
+        .expect_err("the first activation should fail");
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_accounts, 0);
+    assert_eq!(metrics.active_group_subscriptions, 0);
+    assert_eq!(
+        relay.unsubscribed_accounts.lock().unwrap().as_slice(),
+        &[account_id]
+    );
+
+    relay.fail_subscribes.store(false, Ordering::SeqCst);
+    adapter
+        .activate_account(activation)
+        .await
+        .expect("retry should activate the account cleanly");
+    let metrics = adapter.metrics().await;
+    assert_eq!(metrics.active_accounts, 1);
+    assert_eq!(metrics.active_group_subscriptions, 1);
     assert_eq!(relay.subscriptions.lock().unwrap().len(), 2);
 }
 

@@ -547,7 +547,27 @@ impl TransportAdapter for NostrTransportAdapter {
             state.activate(activation, replaced_count);
         }
 
-        self.subscribe_all("activate_account", &issued).await?;
+        if let Err(error) = self.subscribe_all("activate_account", &issued).await {
+            // Some concurrent REQs may already have succeeded. Tear those
+            // down best-effort, then always remove the pre-registered local
+            // routes so callers never observe a half-active account.
+            let relay_cleanup_failed = self
+                .relay_client
+                .unsubscribe_account(&account_id)
+                .await
+                .is_err();
+            let mut state = self.state.write().await;
+            state.forget_account_subscription_starts(&account_id);
+            state.clear_pending_unsubscribes_for_account(&account_id);
+            state.deactivate(&account_id, issued.len());
+            tracing::warn!(
+                target: "transport_nostr_adapter::adapter",
+                method = "activate_account",
+                relay_cleanup_failed,
+                "rolled back transport account after subscription failure"
+            );
+            return Err(error);
+        }
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "activate_account",
