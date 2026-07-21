@@ -155,6 +155,7 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
         || label.contains('/')
         || label.contains('\\')
         || label.contains(':')
+        || label.chars().any(char::is_control)
     {
         return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
     }
