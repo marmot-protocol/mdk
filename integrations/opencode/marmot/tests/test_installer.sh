@@ -146,11 +146,28 @@ case "$(uname -s)" in
             *"would install systemd user unit"*"wn-opencode.service"* ) ;;
             *) echo "opencode installer service dry-run did not plan wn-opencode systemd unit" >&2; exit 1;;
         esac
+        case "$installer_service_dry_run" in
+            *"would restart wn-agent-harnesses.service when active; otherwise enable --now"* ) ;;
+            *) echo "opencode installer did not plan active wn-agent restart" >&2; exit 1;;
+        esac
+        case "$installer_service_dry_run" in
+            *"would restart wn-opencode.service when active; otherwise enable --now"* ) ;;
+            *) echo "opencode installer did not plan active wn-opencode restart" >&2; exit 1;;
+        esac
         ;;
 esac
 case "$installer_no_start_dry_run" in
     *"not starting wn-opencode because --no-start-wn-opencode was passed"* ) ;;
     *) echo "opencode installer no-start dry-run did not skip wn-opencode start" >&2; exit 1;;
 esac
+
+grep -F 'if systemctl --user is-active --quiet "$unit"; then' "$installer" >/dev/null || {
+    echo "opencode installer does not distinguish active service upgrades" >&2
+    exit 1
+}
+grep -F 'run systemctl --user restart "$unit"' "$installer" >/dev/null || {
+    echo "opencode installer does not restart active services" >&2
+    exit 1
+}
 
 echo "opencode installer test passed"
