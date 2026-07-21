@@ -537,6 +537,25 @@ fn blossom_reference() -> MediaAttachmentReference {
 }
 
 #[test]
+fn media_fetch_candidates_deduplicate_non_adjacent_fallback_urls() {
+    let mut reference = blossom_reference();
+    let duplicate_url = reference.locators[0].value.clone();
+    reference.locators.push(MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: format!("https://other.example/{}.bin", reference.ciphertext_sha256),
+    });
+    let fallback = [BlobStoreEndpointV1 {
+        locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        base_url: "https://media.example".to_owned(),
+    }];
+
+    let candidates = encrypted_media_fetch_candidates(&reference, &fallback);
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0], duplicate_url);
+}
+
+#[test]
 fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom() {
     // PR #328 review Finding 1: the sender MUST NOT emit a `blossom-v1`
     // reference to a group whose policy does not allow `blossom-v1`, since
