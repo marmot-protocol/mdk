@@ -1117,6 +1117,33 @@ fn local_account_directory_refresh_still_promotes_follows() {
 }
 
 #[test]
+fn empty_follow_fetch_preserves_cached_edges() {
+    let account_id = format!("{:064x}", 6);
+    let followed = format!("{:064x}", 7);
+    let cached = UserDirectoryRecord {
+        account_id_hex: account_id.clone(),
+        npub: npub_for_account_id_lossy(&account_id),
+        local_account: None,
+        profile: None,
+        follows: vec![followed.clone()],
+        follow_source_relays: vec!["wss://cached.example".to_owned()],
+        relay_lists: AccountRelayListStatus::empty(),
+        key_package: None,
+    };
+
+    let selected = directory::cached_or_unknown_follow_list(
+        Some(cached),
+        &[TransportEndpoint("wss://queried.example".to_owned())],
+    );
+
+    assert_eq!(selected.follows, vec![followed]);
+    assert_eq!(
+        selected.source_relays,
+        vec!["wss://cached.example".to_owned()]
+    );
+}
+
+#[test]
 fn avatar_url_round_trips_through_account_projection() {
     let mut group = AppGroupRecord::new(
         "aa".to_owned(),
