@@ -994,6 +994,12 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     }];
     let mut completed = Vec::new();
     let mut invalid_commit_drops = Vec::new();
+    // A structurally valid commit can still fail OpenMLS validation against
+    // every candidate parent state. Track those failed probes separately from
+    // commits that materialize on at least one branch: only the former are
+    // terminal once the BFS has exhausted every reachable parent (#962).
+    let mut replay_rejected_commit_ids = BTreeSet::new();
+    let mut materialized_commit_ids = BTreeSet::new();
     let mut seen_paths = BTreeSet::from([Vec::<[u8; 32]>::new()]);
 
     while !frontier.is_empty() {
@@ -1023,8 +1029,14 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                     own_commits,
                     &mut budget,
                 )? {
-                    CandidatePathProbeResult::Materialized(Some(candidate)) => candidate,
-                    CandidatePathProbeResult::Materialized(None) => continue,
+                    CandidatePathProbeResult::Materialized(Some(candidate)) => {
+                        materialized_commit_ids.insert(commit.message.id.to_string());
+                        candidate
+                    }
+                    CandidatePathProbeResult::Materialized(None) => {
+                        replay_rejected_commit_ids.insert(commit.message.id.to_string());
+                        continue;
+                    }
                     CandidatePathProbeResult::UnauthorizedCommit { message_id } => {
                         invalid_commit_drops.push(DroppedMessage {
                             message_id,
@@ -1059,6 +1071,14 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         }
 
         frontier = next_frontier;
+    }
+
+    for message_id in replay_rejected_commit_ids.difference(&materialized_commit_ids) {
+        invalid_commit_drops.push(DroppedMessage {
+            message_id: message_id.clone(),
+            kind: MessageKind::Commit,
+            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+        });
     }
 
     let mut candidate_paths = Vec::with_capacity(completed.len());

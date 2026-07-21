@@ -4433,6 +4433,87 @@ async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
     assert_message_state(&carol_storage, &far_future_msg, MessageState::Created);
 }
 
+/// mdk#962: a commit that parses structurally but fails OpenMLS validation
+/// against every reachable parent is terminal convergence input. Before the
+/// fix the replay bridge returned no candidate and no disposition, leaving the
+/// stored row `Created` and permanently gating every subsequent send.
+#[tokio::test]
+async fn never_validating_commit_is_terminal_and_does_not_gate_sends() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "never-validating-commit".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (mut invalid_commit, _pending) = evolution(invite);
+    invalid_commit = route(invalid_commit, &group_id);
+    let last = invalid_commit
+        .payload
+        .last_mut()
+        .expect("commit wire payload is non-empty");
+    *last ^= 0x01;
+    assert_eq!(
+        project_mls_message(&invalid_commit.payload)
+            .expect("signature-corrupted commit remains structurally projectable")
+            .source_epoch,
+        Some(1)
+    );
+
+    bob.buffer_openmls_convergence_message(&group_id, invalid_commit.clone(), 1_000)
+        .expect("invalid commit buffered");
+    let result = bob
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("invalid commit classified");
+
+    assert!(result.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == content_hex(&invalid_commit)
+            && dropped.kind == MessageKind::Commit
+            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    }));
+    assert_message_state(
+        &bob_storage,
+        &invalid_commit,
+        MessageState::EpochInvalidated,
+    );
+    assert!(!bob.has_pending_convergence_inputs(&group_id).unwrap());
+
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, b"send after invalid commit"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(sent, SendResult::ApplicationMessage { .. }));
+}
+
 /// mdk#736 (related hardening): a `Created`/`Retryable` convergence row that
 /// cannot be decoded / is not an openmls-wire payload / fails projection is NOT
 /// resolvable convergence work and must fail OPEN (not gate sends). Before the
