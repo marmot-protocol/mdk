@@ -123,6 +123,24 @@ fn angle_bracket_destination_rejects_control_characters() {
 }
 
 #[test]
+fn link_and_image_titles_reject_control_characters() {
+    for control in ['\u{0007}', '\u{001b}', '\u{007f}', '\u{0085}', '\u{009f}'] {
+        for input in [
+            format!("[x](/url \"before{control}after\")"),
+            format!("![x](/url 'before{control}after')"),
+            format!("[x](/url (before{control}after))"),
+        ] {
+            assert!(
+                parse_inlines(&input)
+                    .iter()
+                    .all(|inline| !matches!(inline, Inline::Link { .. } | Inline::Image { .. })),
+                "control character {control:?} must not reach a link or image title"
+            );
+        }
+    }
+}
+
+#[test]
 fn inline_link_bracketed_dest() {
     assert_eq!(
         parse_inlines("[foo](<https://x>)"),

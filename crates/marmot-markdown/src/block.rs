@@ -1015,7 +1015,11 @@ pub(crate) fn parse_link_title(b: &[u8], i: usize) -> Option<(String, usize)> {
             continue;
         }
         if c == close {
-            return Some((String::from_utf8(out_bytes).ok()?, j + 1));
+            let title = String::from_utf8(out_bytes).ok()?;
+            if title.chars().any(char::is_control) {
+                return None;
+            }
+            return Some((title, j + 1));
         }
         // Disallow unescaped opening quote of same family inside parens form.
         if open == b'(' && c == b'(' {
