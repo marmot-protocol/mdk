@@ -50,7 +50,7 @@ pub struct SendSummaryFfi {
 impl From<SendSummary> for SendSummaryFfi {
     fn from(value: SendSummary) -> Self {
         Self {
-            published: value.published as u32,
+            published: super::saturating_u32(value.published),
             message_ids: value.message_ids,
         }
     }

@@ -339,7 +339,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
         Self {
             group_id_hex: value.group_id_hex,
             epoch: value.epoch,
-            member_count: value.member_count as u32,
+            member_count: super::saturating_u32(value.member_count),
             required_app_components: value.required_app_components,
         }
     }

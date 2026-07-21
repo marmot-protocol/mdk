@@ -168,17 +168,17 @@ impl From<RelayPlaneHealth> for RelayHealthFfi {
     fn from(value: RelayPlaneHealth) -> Self {
         Self {
             sdk_backed: value.sdk_backed,
-            total_relays: value.total_relays as u32,
-            initialized: value.initialized as u32,
-            pending: value.pending as u32,
-            connecting: value.connecting as u32,
-            connected: value.connected as u32,
-            disconnected: value.disconnected as u32,
-            terminated: value.terminated as u32,
-            banned: value.banned as u32,
-            sleeping: value.sleeping as u32,
-            connection_attempts: value.connection_attempts as u32,
-            connection_successes: value.connection_successes as u32,
+            total_relays: super::saturating_u32(value.total_relays),
+            initialized: super::saturating_u32(value.initialized),
+            pending: super::saturating_u32(value.pending),
+            connecting: super::saturating_u32(value.connecting),
+            connected: super::saturating_u32(value.connected),
+            disconnected: super::saturating_u32(value.disconnected),
+            terminated: super::saturating_u32(value.terminated),
+            banned: super::saturating_u32(value.banned),
+            sleeping: super::saturating_u32(value.sleeping),
+            connection_attempts: super::saturating_u32(value.connection_attempts),
+            connection_successes: super::saturating_u32(value.connection_successes),
         }
     }
 }
