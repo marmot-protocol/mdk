@@ -195,7 +195,17 @@ impl DirectoryRelayPlane {
             let fetcher = self.fetcher.clone();
             let state = self.state.clone();
             tokio::spawn(async move {
-                let result = fetcher.fetch_directory_events(request).await;
+                // Keep ownership of the inflight entry in this supervisor.
+                // The child JoinHandle converts a fetcher panic into an error,
+                // so cleanup and waiter notification still run.
+                let result = match tokio::spawn(async move {
+                    fetcher.fetch_directory_events(request).await
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("directory fetch task failed".to_owned()),
+                };
                 let mut state = state.lock().await;
                 if result.is_ok() {
                     state.completed_fetches += 1;
