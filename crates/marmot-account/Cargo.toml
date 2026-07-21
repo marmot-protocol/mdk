@@ -9,6 +9,7 @@ publish.workspace = true
 async-trait.workspace = true
 cgka-session.workspace = true
 cgka-traits.workspace = true
+fs-private.workspace = true
 hex.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true

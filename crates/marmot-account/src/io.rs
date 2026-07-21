@@ -51,7 +51,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    fs_private::create_dir_all_private(parent)?;
 
     let (mut file, temp_path) = create_temp_file(parent, path, mode)?;
     let result = (|| -> AccountHomeResult<()> {
@@ -160,4 +160,23 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
         return Err(AccountHomeError::InvalidAccountLabel(label.to_owned()));
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn secret_write_creates_account_directory_owner_only() {
+        let root = tempfile::tempdir().unwrap();
+        let account_dir = root.path().join("accounts").join("alice");
+        let secret_path = account_dir.join("secret.json");
+
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "test" })).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&account_dir), 0o700);
+        assert_eq!(mode(&secret_path), 0o600);
+    }
 }
