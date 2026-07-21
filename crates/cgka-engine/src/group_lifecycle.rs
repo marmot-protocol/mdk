@@ -240,14 +240,20 @@ impl<S: StorageProvider> Engine<S> {
             .use_ratchet_tree_extension(true)
             .build();
 
+        // `MlsGroup::new` persists the OpenMLS group as a sequence of value
+        // writes. Keep that logical store in one backend transaction so a
+        // crash or write fault cannot leave a partial, undiscoverable group.
+        let mut mls_group = self.storage.with_transaction(|storage| {
+            let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+            MlsGroup::new(
+                &provider,
+                &self.identity.signer,
+                &group_config,
+                self.identity.credential_with_key.clone(),
+            )
+            .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))
+        })?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mut mls_group = MlsGroup::new(
-            &provider,
-            &self.identity.signer,
-            &group_config,
-            self.identity.credential_with_key.clone(),
-        )
-        .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
 
         // Admin-leaf coupling at creation (mdk#737): every admin key MUST
@@ -589,17 +595,24 @@ impl<S: StorageProvider> Engine<S> {
         if self.local_state_is_stale_for_rejoin(&group_id) {
             self.clear_live_openmls_group(&group_id)?;
         }
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let staged = processed
-            .into_staged_welcome(&provider, None)
-            .map_err(|_| EngineError::InvalidWelcome)?;
-        let welcome_sender = staged
-            .welcome_sender()
-            .map_err(|_| EngineError::InvalidWelcome)?;
-        let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
-        let mls_group = staged
-            .into_group(&provider)
-            .map_err(|_| EngineError::InvalidWelcome)?;
+        // Building a group from a staged Welcome performs the same multi-row
+        // OpenMLS store as group creation. Make that store atomic; Marmot
+        // post-validation remains immediately below and is deliberately kept
+        // as a separate concern from this partial-write fix.
+        let (mls_group, welcome_sender_id) = self.storage.with_transaction(|storage| {
+            let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+            let staged = processed
+                .into_staged_welcome(&provider, None)
+                .map_err(|_| EngineError::InvalidWelcome)?;
+            let welcome_sender = staged
+                .welcome_sender()
+                .map_err(|_| EngineError::InvalidWelcome)?;
+            let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+            let mls_group = staged
+                .into_group(&provider)
+                .map_err(|_| EngineError::InvalidWelcome)?;
+            Ok::<_, EngineError>((mls_group, welcome_sender_id))
+        })?;
 
         debug_assert_eq!(
             group_id,
