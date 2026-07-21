@@ -35,12 +35,11 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        let current_profile = self
-            .storage
-            .get_group(&group_id)
-            .ok()
-            .map(|g| (g.name, g.description))
-            .unwrap_or_default();
+        // A partial update must carry the other field forward exactly. Never
+        // turn a transient/corrupt storage read into an empty field that would
+        // be committed for every group member.
+        let current_group = self.storage.get_group(&group_id)?;
+        let current_profile = (current_group.name, current_group.description);
         let projected_name = name.unwrap_or(current_profile.0);
         let projected_description = description.unwrap_or(current_profile.1);
         let profile_bytes =
