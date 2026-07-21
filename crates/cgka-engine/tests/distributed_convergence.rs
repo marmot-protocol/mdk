@@ -4502,7 +4502,10 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
         .await
         .unwrap();
 
-    assert!(matches!(queued, SendResult::Queued { .. }));
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected Queued, got {other:?}"),
+    };
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
     assert_message_state(&carol_storage, &commit, MessageState::Created);
     assert_eq!(
@@ -4544,6 +4547,15 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "regeneration keeps the intent until transport acceptance"
+    );
+    carol.confirm_queued_outbound_intent(&intent_id).unwrap();
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
@@ -5272,10 +5284,14 @@ async fn engine_queues_group_evolution_until_convergence_is_settled() {
         .unwrap();
 
     assert_eq!(drained.len(), 1);
-    let queued_commit = match &drained[0] {
-        SendResult::GroupEvolution { msg, welcomes, .. } => {
+    let (queued_commit, queued_pending) = match &drained[0] {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => {
             assert_eq!(welcomes.len(), 1);
-            route(msg.clone(), &group_id)
+            (route(msg.clone(), &group_id), *pending)
         }
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
@@ -5286,11 +5302,21 @@ async fn engine_queues_group_evolution_until_convergence_is_settled() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "regeneration alone must not delete the durable intent"
+    );
+    carol.confirm_published(queued_pending).await.unwrap();
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "confirming the externally visible evolution retires its intent"
     );
 }
 
@@ -5346,7 +5372,10 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
         })
         .await
         .unwrap();
-    assert!(matches!(queued, SendResult::Queued { .. }));
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected Queued, got {other:?}"),
+    };
 
     let policy = CanonicalizationPolicy {
         settlement_quiescence_ms: 0,
@@ -5370,6 +5399,17 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "standalone publish work remains queued until transport acceptance"
+    );
+    engine
+        .confirm_queued_outbound_intent(&intent_id)
+        .expect("simulated transport acceptance retires the intent");
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
@@ -5494,9 +5534,10 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
     alice.confirm_published(pending).await.unwrap();
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite_intent_id = MessageId::new(b"invite-carol".to_vec());
     alice_storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {
-            id: MessageId::new(b"invite-carol".to_vec()),
+            id: invite_intent_id,
             group_id: group_id.clone(),
             intent: SendIntent::Invite {
                 group_id: group_id.clone(),
@@ -5505,9 +5546,10 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             created_at_ms: 0,
         })
         .unwrap();
+    let app_intent_id = MessageId::new(b"later-app".to_vec());
     alice_storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {
-            id: MessageId::new(b"later-app".to_vec()),
+            id: app_intent_id.clone(),
             group_id: group_id.clone(),
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
@@ -5528,7 +5570,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             .list_queued_outbound_intents(&group_id)
             .unwrap()
             .len(),
-        1
+        2
     );
 
     let paused = alice.advance_convergence(&group_id).await.unwrap();
@@ -5541,19 +5583,42 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             .list_queued_outbound_intents(&group_id)
             .unwrap()
             .len(),
-        1
+        2
     );
 
     alice.publish_failed(pending_invite).await.unwrap();
     let drained_after_failure = alice.advance_convergence(&group_id).await.unwrap();
     assert_eq!(drained_after_failure.len(), 1);
-    assert!(
-        matches!(
-            drained_after_failure[0],
-            SendResult::ApplicationMessage { .. }
-        ),
-        "expected later app intent after publish failure, got {drained_after_failure:?}"
+    let retry_pending = match drained_after_failure[0] {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        ref other => panic!("failed evolution must retry before later work, got {other:?}"),
+    };
+    assert_eq!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        2,
+        "publish failure must retain the evolution intent"
     );
+    alice.confirm_published(retry_pending).await.unwrap();
+    assert_eq!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "evolution confirmation retires only that intent"
+    );
+
+    let later = alice.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        matches!(later.as_slice(), [SendResult::ApplicationMessage { .. }]),
+        "later app intent should run after evolution confirmation, got {later:?}"
+    );
+    alice
+        .confirm_queued_outbound_intent(&app_intent_id)
+        .unwrap();
     assert!(
         alice_storage
             .list_queued_outbound_intents(&group_id)
@@ -5614,7 +5679,10 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
         })
         .await
         .unwrap();
-    assert!(matches!(queued, SendResult::Queued { .. }));
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected Queued, got {other:?}"),
+    };
     assert_eq!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
@@ -5648,6 +5716,17 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "restart regeneration keeps the intent until transport acceptance"
+    );
+    restarted
+        .confirm_queued_outbound_intent(&intent_id)
+        .unwrap();
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)

@@ -150,6 +150,17 @@ pub struct Engine<S: StorageProvider> {
     /// `IngestOutcome::Buffered`.
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
 
+    /// Queued intents regenerated into standalone publish work. The session
+    /// consumes these associations when it builds `PublishWork`, then deletes
+    /// the durable intent only after the transport reports acceptance.
+    pub(crate) queued_intent_by_message: HashMap<MessageId, (GroupId, MessageId)>,
+
+    /// Queued group evolutions stay associated with their pending publish so
+    /// confirm can delete the durable intent in the same transaction as the
+    /// MLS merge. Publish failure drops only this in-memory association and
+    /// leaves the intent queued for retry.
+    pub(crate) queued_intent_by_pending: HashMap<PendingStateRef, (GroupId, MessageId)>,
+
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
     pub(crate) convergence_clock_started_at: Instant,
@@ -354,6 +365,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             leaving_groups: HashSet::new(),
             scheduled_self_remove_auto_commits: HashMap::new(),
             pending_convergence_groups: HashSet::new(),
+            queued_intent_by_message: HashMap::new(),
+            queued_intent_by_pending: HashMap::new(),
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
             last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
@@ -1678,6 +1691,14 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         let now_ms = self.convergence_now_ms();
         self.converge_and_drain_queued_outbound_intents(group_id, now_ms)
             .await
+    }
+
+    fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError> {
+        self.confirm_regenerated_queued_intent(intent_id)
+    }
+
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId) {
+        self.retry_regenerated_queued_intent(group_id);
     }
 
     async fn confirm_published(

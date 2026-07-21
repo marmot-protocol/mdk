@@ -596,6 +596,15 @@ pub trait CgkaEngine: Send + Sync {
         group_id: &GroupId,
     ) -> Result<Vec<SendResult>, EngineError>;
 
+    /// Retire a durable queued intent after its regenerated standalone
+    /// message or proposal was accepted by the transport. Group-evolution
+    /// intents are retired automatically by [`Self::confirm_published`].
+    fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError>;
+
+    /// Re-arm a group after a regenerated standalone queued publish reached no
+    /// endpoint. The durable intent remains intact until confirmation.
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId);
+
     /// Confirm that a [`SendResult::GroupEvolution`] (or
     /// [`SendResult::GroupCreated`]) was successfully published to the
     /// transport. The engine applies the staged commit to local MLS state,

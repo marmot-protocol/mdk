@@ -352,8 +352,10 @@ where
 
         while let Some(work) = queue.pop_front() {
             match work {
-                PublishWork::ApplicationMessage { msg } | PublishWork::Proposal { msg } => {
-                    self.publish_one(msg, &mut output, context.clone()).await?;
+                PublishWork::ApplicationMessage { msg, queued_intent }
+                | PublishWork::Proposal { msg, queued_intent } => {
+                    let status = self.publish_one(msg, &mut output, context.clone()).await?;
+                    self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
                 PublishWork::GroupCreated { welcomes, pending } => {
                     self.publish_group_created(
@@ -394,6 +396,38 @@ where
         }
 
         Ok(output)
+    }
+
+    fn resolve_regenerated_queued_intent(
+        &mut self,
+        intent: Option<QueuedIntentRef>,
+        status: PublishStatus,
+    ) {
+        let Some(intent) = intent else {
+            return;
+        };
+        if status.met_required_acks || status.accepted_by_any_endpoint {
+            if self
+                .session
+                .confirm_regenerated_queued_intent(&intent)
+                .is_err()
+            {
+                // The message is externally visible, so do not report the send
+                // as failed. Keep the durable intent and re-arm convergence;
+                // the duplicate-safe publish layer can retry cleanup later.
+                self.session.retry_regenerated_queued_intent(&intent);
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "resolve_regenerated_queued_intent",
+                    error_kind = "queued_intent_cleanup",
+                    "published queued message but could not clear its durable intent"
+                );
+            }
+        } else {
+            // Nothing accepted the publish. The durable intent was never
+            // deleted; re-arm its group for the normal convergence retry.
+            self.session.retry_regenerated_queued_intent(&intent);
+        }
     }
 
     /// Confirm a published commit, retrying on transient backend contention.

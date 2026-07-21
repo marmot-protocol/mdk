@@ -245,8 +245,18 @@ impl<S: StorageProvider> Engine<S> {
                 break;
             }
             let result = self.do_send_ready(record.intent.clone()).await?;
-            self.storage.delete_queued_outbound_intent(&record.id)?;
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
+            match &result {
+                SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
+                    self.queued_intent_by_message
+                        .insert(msg.id.clone(), (record.group_id.clone(), record.id.clone()));
+                }
+                SendResult::GroupEvolution { pending, .. } => {
+                    self.queued_intent_by_pending
+                        .insert(*pending, (record.group_id.clone(), record.id.clone()));
+                }
+                SendResult::GroupCreated { .. } | SendResult::Queued { .. } => {}
+            }
             drained.push(result);
             if pauses_for_pending_publish {
                 break;
@@ -278,6 +288,25 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) fn schedule_pending_convergence_group(&mut self, group_id: &GroupId) {
         self.pending_convergence_groups.insert(group_id.clone());
+    }
+
+    pub fn take_regenerated_queued_intent_for_message(
+        &mut self,
+        message_id: &MessageId,
+    ) -> Option<(GroupId, MessageId)> {
+        self.queued_intent_by_message.remove(message_id)
+    }
+
+    pub fn confirm_regenerated_queued_intent(
+        &mut self,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        self.storage.delete_queued_outbound_intent(intent_id)?;
+        Ok(())
+    }
+
+    pub fn retry_regenerated_queued_intent(&mut self, group_id: &GroupId) {
+        self.schedule_pending_convergence_group(group_id);
     }
 
     pub(crate) fn schedule_self_remove_auto_commit(

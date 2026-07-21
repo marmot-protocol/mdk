@@ -39,7 +39,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
         .await
         .unwrap();
     let app_message = match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => msg.clone(),
+        PublishWork::ApplicationMessage { msg, .. } => msg.clone(),
         other => panic!("expected application message publish work, got {other:?}"),
     };
     let app_report = stack
@@ -428,7 +428,7 @@ async fn send_app_message(
         .await
         .unwrap();
     match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => msg.clone(),
+        PublishWork::ApplicationMessage { msg, .. } => msg.clone(),
         other => panic!("expected application message publish work, got {other:?}"),
     }
 }
