@@ -292,7 +292,7 @@ impl AppClient {
         let source_recorded_at = delivery.message.timestamp.0;
         let group_id_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
-        fail_if_publish_failed(&effects.effects)?;
+        let publish_error = fail_if_publish_failed(&effects.effects).err();
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_effects(&effects.effects);
         self.remember_transport_cursor(source_recorded_at);
@@ -304,7 +304,24 @@ impl AppClient {
             &source_message_id_hex,
             source_recorded_at,
         )
-        .await
+        .await?;
+
+        // Publishing here is incidental work triggered by the inbound
+        // delivery. A hard publish failure may roll that pending commit back,
+        // but it must not discard the already-authenticated inbound message or
+        // roster effects. They are projected above and the transport cursor is
+        // allowed to advance; the failed work remains represented by the
+        // engine's rollback/failure effects rather than turning relay
+        // redelivery into an AlreadySeen projection hole.
+        if let Some(err) = publish_error {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "ingest_delivery",
+                error_kind = err.privacy_safe_kind(),
+                "incidental auto-publish failed after inbound effects were projected"
+            );
+        }
+        Ok(())
     }
 
     /// Feed an undecryptable group delivery to the epoch-stall detector, arming a
