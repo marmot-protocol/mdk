@@ -69,7 +69,22 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
         file.sync_all()?;
         drop(file);
 
+        let mut replaced_private_file = if mode == FileMode::Private {
+            match open_file_for_zero_overwrite(path) {
+                Ok(file) => Some(file),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            None
+        };
         replace_file(&temp_path, path)?;
+        // The handle still refers to the replaced inode after the atomic rename,
+        // so scrub it without creating a window where the live secret path is
+        // zeroed if replacement fails. Best-effort, matching secret deletion.
+        if let Some(file) = &mut replaced_private_file {
+            let _ = overwrite_open_file_with_zeros(file);
+        }
         sync_directory(parent)?;
         Ok(())
     })();
@@ -87,6 +102,11 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
 /// Best-effort in-place zero overwrite used before unlinking files that may
 /// contain plaintext key material.
 pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
+    let mut file = open_file_for_zero_overwrite(path)?;
+    overwrite_open_file_with_zeros(&mut file)
+}
+
+fn open_file_for_zero_overwrite(path: &Path) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
     options.write(true);
     #[cfg(unix)]
@@ -94,7 +114,7 @@ pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -112,7 +132,11 @@ pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
             ));
         }
     }
-    let len = metadata.len();
+    Ok(file)
+}
+
+fn overwrite_open_file_with_zeros(file: &mut File) -> io::Result<()> {
+    let len = file.metadata()?.len();
     if len > 0 {
         let zeros = vec![0u8; len as usize];
         file.seek(SeekFrom::Start(0))?;
@@ -206,6 +230,7 @@ pub(crate) fn validate_account_label(label: &str) -> AccountHomeResult<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -235,6 +260,25 @@ mod tests {
         assert!(
             cleanup.find("overwrite_file_with_zeros").unwrap()
                 < cleanup.find("remove_file").unwrap()
+        );
+    }
+
+    #[test]
+    fn replacing_secret_scrubs_the_replaced_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let secret_path = root.path().join("account").join("secret.json");
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "old-key" })).unwrap();
+        let mut old_inode = File::open(&secret_path).unwrap();
+
+        write_secret_json(&secret_path, &serde_json::json!({ "secret": "new-key" })).unwrap();
+
+        let mut replaced_bytes = Vec::new();
+        old_inode.read_to_end(&mut replaced_bytes).unwrap();
+        assert!(replaced_bytes.iter().all(|byte| *byte == 0));
+        assert!(
+            fs::read_to_string(&secret_path)
+                .unwrap()
+                .contains("new-key")
         );
     }
 }
