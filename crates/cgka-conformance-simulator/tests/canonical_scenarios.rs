@@ -1678,6 +1678,18 @@ async fn canonical_vector_fixtures_match_generated_traces() {
                 .is_some_and(|name| name.ends_with(".v1.json") && name != "manifest.v1.json")
         })
         .collect::<Vec<_>>();
+    fixtures.extend(
+        std::fs::read_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/incidents"),
+        )
+        .expect("incident vectors dir exists")
+        .map(|entry| entry.expect("incident vector entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".v1.json"))
+        }),
+    );
     fixtures.sort();
 
     for path in fixtures {

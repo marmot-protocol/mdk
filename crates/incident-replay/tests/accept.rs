@@ -33,8 +33,8 @@ fn metadata_fork_accepts_with_a_reproducible_vector() {
 
     assert_eq!(vector.scenario_name, "test-topic-fork/v1");
     assert_eq!(vector.scenario.clients.len(), 2);
-    // RecoverySummary + ClientsConverged.
-    assert_eq!(vector.expected_outcomes.len(), 2);
+    // Three step-level resolution outcomes + RecoverySummary + ClientsConverged.
+    assert_eq!(vector.expected_outcomes.len(), 5);
 }
 
 #[test]
@@ -46,6 +46,6 @@ fn membership_fork_accepts_with_a_reproducible_vector() {
     assert_eq!(vector.scenario_name, "test-membership-fork/v1");
     // Two committers race competing invites; the two invitees round it out.
     assert_eq!(vector.scenario.clients.len(), 4);
-    // RecoverySummary + ClientsConverged(member_count 3).
-    assert_eq!(vector.expected_outcomes.len(), 2);
+    // Three step-level resolution outcomes + RecoverySummary + ClientsConverged(member_count 3).
+    assert_eq!(vector.expected_outcomes.len(), 5);
 }

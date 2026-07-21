@@ -295,15 +295,7 @@ fn collect_vector_fixture_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<d
             continue;
         }
         if path.is_dir() {
-            let mut entries = std::fs::read_dir(path)?
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<Result<Vec<_>, _>>()?;
-            entries.sort();
-            fixture_paths.extend(
-                entries
-                    .into_iter()
-                    .filter(|path| is_vector_fixture_file(path)),
-            );
+            collect_vector_fixture_directory(path, &mut fixture_paths)?;
             continue;
         }
         return Err(format!("vector fixture path does not exist: {}", path.display()).into());
@@ -314,6 +306,29 @@ fn collect_vector_fixture_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<d
         return Err("no vector fixture files found".into());
     }
     Ok(fixture_paths)
+}
+
+fn collect_vector_fixture_directory(
+    directory: &Path,
+    fixture_paths: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let mut entries = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            // Byte fixtures have their own schema/runner and deliberately use
+            // the same `.v1.json` suffix. Every other vector subdirectory,
+            // including `incidents/`, carries ordinary `VectorFixture`s.
+            if path.file_name().and_then(|name| name.to_str()) != Some("byte-fixtures") {
+                collect_vector_fixture_directory(&path, fixture_paths)?;
+            }
+        } else if is_vector_fixture_file(&path) {
+            fixture_paths.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn is_vector_fixture_file(path: &Path) -> bool {
