@@ -787,6 +787,89 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
 }
 
 #[tokio::test]
+async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest() {
+    let mut alice = build_client(b"alice-post-peel");
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage(storage.clone(), b"bob-post-peel");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected group create, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // The pass-through test peeler represents a valid authenticated wrapper;
+    // only the carried MLS bytes are malformed. This must be a per-message
+    // terminal disposition, not an engine error that aborts the relay drain.
+    let garbage = TransportMessage {
+        id: hash_id(b"authenticated wrapper with malformed MLS bytes"),
+        payload: b"not an MLS message".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let garbage_content_id = content_id(&garbage);
+    let outcome = bob
+        .ingest(garbage)
+        .await
+        .expect("malformed post-peel MLS bytes must not abort ingest");
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+    assert_eq!(
+        storage.get_message(&garbage_content_id).unwrap().state,
+        MessageState::Failed,
+        "the content-derived poison row must be durable and terminal"
+    );
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"after post-peel garbage"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        other => panic!("expected app message, got {other:?}"),
+    };
+    assert!(matches!(
+        bob.ingest(msg).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert!(bob.drain_events().iter().any(
+        |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after post-peel garbage")
+    ));
+}
+
+#[tokio::test]
 async fn malformed_message_buffered_during_pending_publish_lands_terminal_after_rollback() {
     let mut alice =
         build_client_with_peeler(b"alice-pending", Box::new(MalformedShortPayloadPeeler));
