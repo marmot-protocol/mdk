@@ -17,8 +17,16 @@ pub(crate) struct WnInvocation {
     pub(crate) stdin: Option<String>,
 }
 
-pub(crate) fn account_setup_invocation(identity: Option<String>) -> WnInvocation {
-    match identity {
+/// Build the `wn` invocation for account setup. `setup_relay` supplies the
+/// first-run relay to `create-identity` / `login` through the one relay flag
+/// those commands actually accept — the (global, for `create-identity`;
+/// command-local, for `login`) `--relay` — appended only when the caller has no
+/// other `--relay` source, so it is never passed twice.
+pub(crate) fn account_setup_invocation(
+    identity: Option<String>,
+    setup_relay: Option<String>,
+) -> WnInvocation {
+    let mut invocation = match identity {
         Some(identity) if crate::is_nostr_secret(&identity) => WnInvocation {
             args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
             stdin: Some(format!("{identity}\n")),
@@ -31,7 +39,12 @@ pub(crate) fn account_setup_invocation(identity: Option<String>) -> WnInvocation
             args: vec!["create-identity".to_owned()],
             stdin: None,
         },
+    };
+    if let Some(relay) = setup_relay.filter(|relay| !relay.trim().is_empty()) {
+        invocation.args.push("--relay".to_owned());
+        invocation.args.push(relay);
     }
+    invocation
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,18 +60,6 @@ pub(crate) struct ChatRow {
     pub(crate) group_id: String,
     pub(crate) name: String,
     pub(crate) archived: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MessageRow {
-    pub(crate) message_id: String,
-    pub(crate) direction: String,
-    pub(crate) from: String,
-    pub(crate) from_display_name: Option<String>,
-    pub(crate) plaintext: String,
-    pub(crate) display_text: String,
-    pub(crate) recorded_at: u64,
-    pub(crate) received_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -165,9 +166,25 @@ impl Drop for GroupStateSubscription {
     }
 }
 
+pub(crate) struct TimelineSubscription {
+    pub(crate) account_id: String,
+    pub(crate) group_id: String,
+    pub(crate) child: Child,
+    pub(crate) rx: Receiver<SubscriptionEvent>,
+}
+
+impl Drop for TimelineSubscription {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The pane holding keyboard focus in the chat-first main view. The accounts
+/// pane is gone in Phase 2; account switching moves to the login/account-select
+/// screen (reopened with `A`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Focus {
-    Accounts,
     Chats,
     Messages,
     Composer,
@@ -176,29 +193,107 @@ pub(crate) enum Focus {
 impl Focus {
     pub(crate) fn next(self) -> Self {
         match self {
-            Self::Accounts => Self::Chats,
             Self::Chats => Self::Messages,
             Self::Messages => Self::Composer,
-            Self::Composer => Self::Accounts,
+            Self::Composer => Self::Chats,
         }
     }
 
     pub(crate) fn previous(self) -> Self {
         match self {
-            Self::Accounts => Self::Composer,
-            Self::Chats => Self::Accounts,
+            Self::Chats => Self::Composer,
             Self::Messages => Self::Chats,
             Self::Composer => Self::Messages,
         }
     }
+}
 
-    pub(crate) fn title(self) -> &'static str {
-        match self {
-            Self::Accounts => "accounts",
-            Self::Chats => "chats",
-            Self::Messages => "messages",
-            Self::Composer => "composer",
+/// The top-level screen the TUI is showing. Phase 2 has exactly two: the
+/// login/account-select flow and the chat-first main view. Group detail,
+/// profile, search, and health screens arrive in Phase 5.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Screen {
+    Login(LoginMode),
+    Main,
+}
+
+/// The three states of the login screen: the create/login menu (no accounts),
+/// the account picker (several accounts), and the masked nsec entry field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoginMode {
+    Menu,
+    AccountSelect,
+    NsecEntry,
+}
+
+/// Route the startup screen from the number of loaded accounts: no accounts
+/// opens the login menu, exactly one drops straight into the main view with it
+/// selected, and several open the account picker — unless `initial_selected` is
+/// set (a `--account`/`WN_ACCOUNT` selector resolved to a loaded account), which
+/// enters the main view directly with that account.
+pub(crate) fn startup_screen(account_count: usize, initial_selected: bool) -> Screen {
+    match account_count {
+        0 => Screen::Login(LoginMode::Menu),
+        1 => Screen::Main,
+        _ if initial_selected => Screen::Main,
+        _ => Screen::Login(LoginMode::AccountSelect),
+    }
+}
+
+/// The login mode to return to when leaving nsec entry: the menu when there are
+/// no accounts yet, otherwise the account picker (the two screens that open it).
+pub(crate) fn login_mode_for_accounts(account_count: usize) -> LoginMode {
+    if account_count == 0 {
+        LoginMode::Menu
+    } else {
+        LoginMode::AccountSelect
+    }
+}
+
+/// Render a secret as one `*` per character, preserving length without exposing
+/// the value. Used for the nsec-entry field (key material never renders).
+pub(crate) fn masked_secret(value: &str) -> String {
+    "*".repeat(value.chars().count())
+}
+
+/// The one-line status bar for the main view:
+/// `{account} · daemon {on|off} · {n} chats · {u} unread · {latest status}`.
+/// Untrusted fields (the account label and the status message) pass through
+/// `terminal_safe_text`, and the assembled line is shortened to `width`.
+pub(crate) fn status_bar_line(
+    account_label: &str,
+    daemon_running: bool,
+    chats: usize,
+    unread: usize,
+    status: &str,
+    width: usize,
+) -> String {
+    let account = shorten(&terminal_safe_text(account_label), 24);
+    let daemon = if daemon_running { "on" } else { "off" };
+    let status = terminal_safe_text(status);
+    let line = format!("{account} · daemon {daemon} · {chats} chats · {unread} unread · {status}");
+    shorten(&line, width)
+}
+
+/// The per-screen, per-focus hints line. Terse and kept in lockstep with the
+/// real keymap (the README and in-app help mirror these strings). `entered_main`
+/// gates the account picker's `Esc back` hint: `Esc` only returns to the main
+/// view when a session is already active, so the startup picker omits it.
+pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'static str {
+    match screen {
+        Screen::Login(LoginMode::Menu) => "c create identity  l nsec login  q quit",
+        Screen::Login(LoginMode::AccountSelect) if entered_main => {
+            "j/k navigate  Enter select  c create  l nsec  Esc back  q quit"
         }
+        Screen::Login(LoginMode::AccountSelect) => {
+            "j/k navigate  Enter select  c create  l nsec  q quit"
+        }
+        Screen::Login(LoginMode::NsecEntry) => "Enter submit  Esc back",
+        Screen::Main => match focus {
+            Focus::Chats => "j/k navigate  Enter open  A accounts  / command  ? help  q quit",
+            Focus::Messages => "j/k select  G/g ends  PgUp older  i compose  Tab cycle",
+            Focus::Composer => "Enter send  Esc clear",
+        },
     }
 }
 
@@ -206,6 +301,7 @@ impl Focus {
 pub(crate) enum SlashCommand {
     Help,
     Refresh,
+    Diagnostics,
     Account(String),
     AccountCreate,
     AccountAddPublic(String),
@@ -275,6 +371,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/refresh",
         description: "reload accounts and chats",
+    },
+    SlashCommandSuggestion {
+        usage: "/diagnostics",
+        description: "toggle the MLS group diagnostics panel",
     },
     SlashCommandSuggestion {
         usage: "/account <npub-or-hex>",
@@ -461,64 +561,6 @@ pub(crate) fn parse_chat(value: &Value) -> Option<ChatRow> {
     })
 }
 
-pub(crate) fn parse_message(value: &Value) -> Option<MessageRow> {
-    let plaintext = value_string(value, "plaintext")?;
-    if value
-        .get("agent_text_stream")
-        .and_then(|stream| stream.get("kind"))
-        .and_then(Value::as_str)
-        == Some("start")
-    {
-        return None;
-    }
-    let display_text = if value.get("kind").and_then(Value::as_u64) == Some(GROUP_SYSTEM_KIND) {
-        group_system_summary(value, &plaintext).unwrap_or_else(|| plaintext.clone())
-    } else {
-        value
-            .get("agent_text_stream")
-            .and_then(agent_text_stream_summary)
-            .unwrap_or_else(|| plaintext.clone())
-    };
-    Some(MessageRow {
-        message_id: value_string(value, "message_id").unwrap_or_default(),
-        direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),
-        from: value_string(value, "from").unwrap_or_else(|| "unknown".to_owned()),
-        from_display_name: non_empty_value_string(value, "from_display_name"),
-        plaintext,
-        display_text,
-        recorded_at: value
-            .get("recorded_at")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        received_at: value
-            .get("received_at")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-    })
-}
-
-pub(crate) fn sort_messages_chronologically(messages: &mut [MessageRow]) {
-    messages.sort_by(|left, right| {
-        left.recorded_at
-            .cmp(&right.recorded_at)
-            .then_with(|| left.received_at.cmp(&right.received_at))
-            .then_with(|| left.message_id.cmp(&right.message_id))
-    });
-}
-
-pub(crate) fn sort_and_cap_messages(messages: &mut Vec<MessageRow>) {
-    sort_messages_chronologically(messages);
-    cap_message_scrollback(messages);
-}
-
-pub(crate) fn cap_message_scrollback(messages: &mut Vec<MessageRow>) {
-    if messages.len() <= TUI_MESSAGE_SCROLLBACK_LIMIT {
-        return;
-    }
-    let excess = messages.len() - TUI_MESSAGE_SCROLLBACK_LIMIT;
-    messages.drain(0..excess);
-}
-
 /// Inner app-event kind for durable group system rows (membership/admin/profile).
 pub(crate) const GROUP_SYSTEM_KIND: u64 = 1210;
 
@@ -603,6 +645,933 @@ pub(crate) fn agent_text_stream_summary(value: &Value) -> Option<String> {
     }
 }
 
+/// Phase 1 `wn tui` timeline core: row parsing, the idempotent projection fold,
+/// the message-offset scroll model, and rendering (per-row heights, the
+/// visibility walk, and line building). Consumed by the timeline
+/// client/app/view wiring in this crate.
+mod timeline {
+    use super::*;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Paragraph, Wrap};
+    use serde_json::Value;
+
+    use super::super::{TIMELINE_MESSAGE_SEPARATOR_ROWS, TUI_MESSAGE_SCROLLBACK_LIMIT};
+
+    /// A row of the materialized message timeline (`messages timeline`), as folded by
+    /// the runtime: reactions, reply preview, deletion tombstones, and structured
+    /// media are already resolved server-side. This is the messages-pane row for
+    /// Phase 1; the plain feed now carries only live stream previews and unread counts.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct TimelineRow {
+        pub(crate) message_id: String,
+        pub(crate) direction: String,
+        pub(crate) from: String,
+        pub(crate) from_display_name: Option<String>,
+        pub(crate) plaintext: String,
+        pub(crate) display_text: String,
+        pub(crate) timeline_at: u64,
+        pub(crate) received_at: u64,
+        pub(crate) deleted: bool,
+        pub(crate) reactions: Vec<TimelineReaction>,
+        pub(crate) reply: Option<TimelineReply>,
+        pub(crate) attachments: Vec<TimelineAttachment>,
+    }
+
+    /// One emoji's reaction tally on a timeline row, from `reactions.by_emoji`.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct TimelineReaction {
+        pub(crate) emoji: String,
+        pub(crate) count: usize,
+    }
+
+    /// Reply context for a timeline row: the parent message id plus the hydrated
+    /// preview when the runtime resolved it.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct TimelineReply {
+        pub(crate) reply_to_message_id: String,
+        pub(crate) preview: Option<TimelineReplyPreview>,
+    }
+
+    /// The hydrated parent-message preview carried on a reply row.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct TimelineReplyPreview {
+        pub(crate) sender: Option<String>,
+        pub(crate) plaintext: String,
+        pub(crate) deleted: bool,
+    }
+
+    /// A media attachment placeholder parsed from a row's `media.imeta` tags. Phase 1
+    /// keeps only the fields needed to render a placeholder; no download yet.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct TimelineAttachment {
+        pub(crate) mime: Option<String>,
+        pub(crate) filename: Option<String>,
+    }
+
+    /// Parse a materialized timeline row. Returns `None` for rows the pane does not
+    /// render: `agent_text_stream` `start` markers are skipped.
+    pub(crate) fn parse_timeline_row(value: &Value) -> Option<TimelineRow> {
+        if value
+            .get("agent_text_stream")
+            .and_then(|stream| stream.get("kind"))
+            .and_then(Value::as_str)
+            == Some("start")
+        {
+            return None;
+        }
+        let plaintext = value_string(value, "plaintext").unwrap_or_default();
+        let display_text = if value.get("kind").and_then(Value::as_u64) == Some(GROUP_SYSTEM_KIND) {
+            group_system_summary(value, &plaintext).unwrap_or_else(|| plaintext.clone())
+        } else {
+            value
+                .get("agent_text_stream")
+                .and_then(agent_text_stream_summary)
+                .unwrap_or_else(|| plaintext.clone())
+        };
+        Some(TimelineRow {
+            message_id: value_string(value, "message_id").unwrap_or_default(),
+            direction: value_string(value, "direction").unwrap_or_else(|| "received".to_owned()),
+            from: value_string(value, "from").unwrap_or_else(|| "unknown".to_owned()),
+            from_display_name: non_empty_value_string(value, "from_display_name"),
+            plaintext,
+            display_text,
+            timeline_at: value
+                .get("timeline_at")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            received_at: value
+                .get("received_at")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            deleted: value
+                .get("deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            reactions: parse_timeline_reactions(value),
+            reply: parse_timeline_reply(value),
+            attachments: parse_timeline_attachments(value),
+        })
+    }
+
+    fn parse_timeline_reactions(value: &Value) -> Vec<TimelineReaction> {
+        let Some(by_emoji) = value
+            .get("reactions")
+            .and_then(|reactions| reactions.get("by_emoji"))
+            .and_then(Value::as_object)
+        else {
+            return Vec::new();
+        };
+        let mut reactions = by_emoji
+            .iter()
+            .filter_map(|(emoji, reactors)| {
+                let count = reactors.as_array().map_or(0, Vec::len);
+                (count > 0).then(|| TimelineReaction {
+                    emoji: emoji.clone(),
+                    count,
+                })
+            })
+            .collect::<Vec<_>>();
+        // Deterministic order independent of the JSON map's iteration order.
+        reactions.sort_by(|left, right| left.emoji.cmp(&right.emoji));
+        reactions
+    }
+
+    fn parse_timeline_reply(value: &Value) -> Option<TimelineReply> {
+        let reply_to_message_id = non_empty_value_string(value, "reply_to_message_id")?;
+        let preview = value
+            .get("reply_preview")
+            .filter(|preview| !preview.is_null())
+            .map(|preview| TimelineReplyPreview {
+                sender: non_empty_value_string(preview, "sender"),
+                plaintext: value_string(preview, "plaintext").unwrap_or_default(),
+                deleted: preview
+                    .get("deleted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+        Some(TimelineReply {
+            reply_to_message_id,
+            preview,
+        })
+    }
+
+    fn parse_timeline_attachments(value: &Value) -> Vec<TimelineAttachment> {
+        value
+            .get("media")
+            .and_then(|media| media.get("imeta"))
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(parse_timeline_attachment)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Parse one `imeta` tag (an array of space-delimited `key value` strings) into a
+    /// placeholder attachment, reading only `m` (mime) and `filename` for Phase 1.
+    fn parse_timeline_attachment(entry: &Value) -> Option<TimelineAttachment> {
+        let fields = entry.as_array()?;
+        let mut mime = None;
+        let mut filename = None;
+        for field in fields.iter().filter_map(Value::as_str) {
+            match field.split_once(' ') {
+                Some(("m", value)) => mime = non_empty_string(value),
+                Some(("filename", value)) => filename = non_empty_string(value),
+                _ => {}
+            }
+        }
+        (mime.is_some() || filename.is_some()).then_some(TimelineAttachment { mime, filename })
+    }
+
+    fn non_empty_string(value: &str) -> Option<String> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+
+    /// A parsed `messages timeline subscribe` event. The caller filters
+    /// `ProjectionUpdated` by `group_id` before applying the changes.
+    #[derive(Debug)]
+    pub(crate) enum TimelineEvent {
+        /// The subscription is live; no state change.
+        Ready,
+        /// The initial bulk page plus whether older history remains.
+        InitialPage {
+            rows: Vec<TimelineRow>,
+            has_more_before: bool,
+        },
+        /// Typed upsert/remove changes for one group.
+        ProjectionUpdated {
+            group_id: String,
+            changes: Vec<TimelineChange>,
+        },
+        /// Any other or unrecognized event; no state change.
+        Other,
+    }
+
+    /// One change inside a `timeline_projection_updated` event. Upserts carry the
+    /// full folded row (reactions and `deleted` already applied); removes carry only
+    /// the id to drop.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum TimelineChange {
+        /// Boxed so a `Vec<TimelineChange>` is not sized to the large row for
+        /// every element (most changes are small removes).
+        Upsert(Box<TimelineRow>),
+        Remove {
+            message_id: String,
+        },
+    }
+
+    pub(crate) fn parse_timeline_event(result: &Value) -> TimelineEvent {
+        match result.get("type").and_then(Value::as_str) {
+            Some("timeline_subscription_ready") => TimelineEvent::Ready,
+            Some("initial_timeline_page") => TimelineEvent::InitialPage {
+                rows: parse_timeline_rows(result.get("messages")),
+                has_more_before: result
+                    .get("has_more_before")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+            Some("timeline_projection_updated") => TimelineEvent::ProjectionUpdated {
+                group_id: value_string(result, "group_id").unwrap_or_default(),
+                changes: result
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .map(|changes| changes.iter().filter_map(parse_timeline_change).collect())
+                    .unwrap_or_default(),
+            },
+            _ => TimelineEvent::Other,
+        }
+    }
+
+    fn parse_timeline_rows(messages: Option<&Value>) -> Vec<TimelineRow> {
+        messages
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(parse_timeline_row).collect())
+            .unwrap_or_default()
+    }
+
+    /// Parse the `messages` array of a `messages timeline list` response into rows
+    /// sorted ascending by the backend's `(timeline_at, message_id)` order (oldest
+    /// first, newest last — the order the scroll model's bottom-anchored offset
+    /// expects).
+    pub(crate) fn parse_timeline_page(result: &Value) -> Vec<TimelineRow> {
+        let mut rows = parse_timeline_rows(result.get("messages"));
+        sort_timeline_rows(&mut rows);
+        rows
+    }
+
+    /// Read `has_more_before` from a `messages timeline list` response; missing or
+    /// non-boolean means no older history remains.
+    pub(crate) fn timeline_page_has_more_before(result: &Value) -> bool {
+        result
+            .get("has_more_before")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn parse_timeline_change(change: &Value) -> Option<TimelineChange> {
+        match change.get("type").and_then(Value::as_str)? {
+            "upsert" => Some(TimelineChange::Upsert(Box::new(parse_timeline_row(
+                change.get("message")?,
+            )?))),
+            "remove" => Some(TimelineChange::Remove {
+                message_id: value_string(change, "message_id")?,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Sort timeline rows ascending by the backend's deterministic order,
+    /// `(timeline_at, message_id)`. Same-second rows tiebreak by id, which can
+    /// differ from send order; that is accepted (the tiebreak is deterministic).
+    pub(crate) fn sort_timeline_rows(rows: &mut [TimelineRow]) {
+        rows.sort_by(|left, right| {
+            left.timeline_at
+                .cmp(&right.timeline_at)
+                .then_with(|| left.message_id.cmp(&right.message_id))
+        });
+    }
+
+    /// Insert or replace a row by `message_id`, keeping the list sorted. Idempotent
+    /// in effect: projection events arrive duplicated (optimistic write plus relay
+    /// echo), so re-applying the same row must not append a second copy.
+    pub(crate) fn upsert_timeline_row(rows: &mut Vec<TimelineRow>, row: TimelineRow) {
+        upsert_timeline_row_unsorted(rows, row);
+        sort_timeline_rows(rows);
+    }
+
+    /// Insert or replace by `message_id` without re-sorting; callers that upsert a
+    /// batch sort once at the end.
+    fn upsert_timeline_row_unsorted(rows: &mut Vec<TimelineRow>, row: TimelineRow) {
+        match rows
+            .iter()
+            .position(|existing| existing.message_id == row.message_id)
+        {
+            Some(index) => rows[index] = row,
+            None => rows.push(row),
+        }
+    }
+
+    /// Drop the row with `message_id`, returning the index it occupied. Removing
+    /// preserves sort order, so no re-sort is needed.
+    pub(crate) fn remove_timeline_row(
+        rows: &mut Vec<TimelineRow>,
+        message_id: &str,
+    ) -> Option<usize> {
+        let index = rows.iter().position(|row| row.message_id == message_id)?;
+        rows.remove(index);
+        Some(index)
+    }
+
+    /// What applying a single change did to the row list, so the caller can adjust
+    /// the scroll model. Indices are into the sorted list after the change.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum TimelineFoldOutcome {
+        /// A new row landed at this index.
+        Inserted(usize),
+        /// An existing row (same id) was replaced at this index.
+        Updated(usize),
+        /// A row was dropped from this index.
+        Removed(usize),
+        /// Nothing changed (e.g. a remove for an id that is not present).
+        Unchanged,
+    }
+
+    /// Apply one projection change to the row list, reporting the effect.
+    pub(crate) fn apply_timeline_change(
+        rows: &mut Vec<TimelineRow>,
+        change: TimelineChange,
+    ) -> TimelineFoldOutcome {
+        match change {
+            TimelineChange::Upsert(row) => {
+                let message_id = row.message_id.clone();
+                let existed = rows
+                    .iter()
+                    .any(|existing| existing.message_id == message_id);
+                upsert_timeline_row(rows, *row);
+                let index = rows
+                    .iter()
+                    .position(|existing| existing.message_id == message_id)
+                    .unwrap_or(0);
+                if existed {
+                    TimelineFoldOutcome::Updated(index)
+                } else {
+                    TimelineFoldOutcome::Inserted(index)
+                }
+            }
+            TimelineChange::Remove { message_id } => match remove_timeline_row(rows, &message_id) {
+                Some(index) => TimelineFoldOutcome::Removed(index),
+                None => TimelineFoldOutcome::Unchanged,
+            },
+        }
+    }
+
+    /// Apply one parsed `messages timeline subscribe` event to the pane's rows and
+    /// scroll model. `InitialPage` folds each row (idempotent by id) and drives the
+    /// scroll model by the reported outcome — so rows that arrived between the
+    /// snapshot and the subscribe shift a scrolled-up anchor instead of moving the
+    /// view — then adopts its `has_more_before`. `ProjectionUpdated` is gated on the
+    /// loaded group, then folds each change and drives the scroll model by the
+    /// reported outcome (`on_insert` / `on_remove`; updates and no-ops leave scroll
+    /// alone), capping scrollback afterward. `Ready` and `Other` carry no state
+    /// change.
+    pub(crate) fn apply_timeline_event(
+        rows: &mut Vec<TimelineRow>,
+        scroll: &mut TimelineScroll,
+        loaded_group_id: Option<&str>,
+        event: TimelineEvent,
+    ) {
+        match event {
+            TimelineEvent::Ready | TimelineEvent::Other => {}
+            TimelineEvent::InitialPage {
+                rows: page,
+                has_more_before,
+            } => {
+                // Fold each row through the same change path as the projection
+                // arm and drive the scroll on the reported outcome. The common
+                // case — the snapshot already loaded every row — degenerates to
+                // Updated/Unchanged no-ops; only rows that arrived between the
+                // snapshot and the subscribe are Inserted, and those must shift a
+                // scrolled-up anchor rather than move the view.
+                for row in page {
+                    match apply_timeline_change(rows, TimelineChange::Upsert(Box::new(row))) {
+                        TimelineFoldOutcome::Inserted(index) => scroll.on_insert(index, rows.len()),
+                        TimelineFoldOutcome::Removed(index) => scroll.on_remove(index, rows.len()),
+                        TimelineFoldOutcome::Updated(_) | TimelineFoldOutcome::Unchanged => {}
+                    }
+                }
+                scroll.has_more_before = has_more_before;
+            }
+            TimelineEvent::ProjectionUpdated { group_id, changes } => {
+                if loaded_group_id != Some(group_id.as_str()) {
+                    return;
+                }
+                for change in changes {
+                    match apply_timeline_change(rows, change) {
+                        TimelineFoldOutcome::Inserted(index) => scroll.on_insert(index, rows.len()),
+                        TimelineFoldOutcome::Removed(index) => scroll.on_remove(index, rows.len()),
+                        TimelineFoldOutcome::Updated(_) | TimelineFoldOutcome::Unchanged => {}
+                    }
+                }
+                cap_timeline_scrollback(rows, scroll);
+            }
+        }
+    }
+
+    /// The exclusive `(timeline_at, message_id)` cursor of the oldest loaded row, for
+    /// building the `--before` / `--before-message-id` history-paging flags.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct TimelineCursor {
+        pub(crate) timeline_at: u64,
+        pub(crate) message_id: String,
+    }
+
+    pub(crate) fn oldest_timeline_cursor(rows: &[TimelineRow]) -> Option<TimelineCursor> {
+        rows.first().map(|row| TimelineCursor {
+            timeline_at: row.timeline_at,
+            message_id: row.message_id.clone(),
+        })
+    }
+
+    /// Trim the timeline to `TUI_MESSAGE_SCROLLBACK_LIMIT`, dropping the oldest rows,
+    /// but only while pinned to the bottom. Capping while scrolled up would fight
+    /// history paging (it drops rows the user just paged in), so it is skipped then.
+    /// The selection and visible range are absolute indices, so they shift down by
+    /// the number of dropped rows to stay on the same messages.
+    pub(crate) fn cap_timeline_scrollback(
+        rows: &mut Vec<TimelineRow>,
+        scroll: &mut TimelineScroll,
+    ) {
+        if !scroll.is_pinned() || rows.len() <= TUI_MESSAGE_SCROLLBACK_LIMIT {
+            return;
+        }
+        let excess = rows.len() - TUI_MESSAGE_SCROLLBACK_LIMIT;
+        rows.drain(0..excess);
+        scroll.selection = scroll.selection.map(|sel| sel.saturating_sub(excess));
+        if let Some((first, last)) = scroll.visible_range {
+            scroll.visible_range =
+                Some((first.saturating_sub(excess), last.saturating_sub(excess)));
+        }
+    }
+
+    /// Message-offset scroll state for the messages pane. `offset` counts messages up
+    /// from the bottom (0 = pinned to the newest). `selection` is an absolute index
+    /// into the row list (`None` tracks the
+    /// newest). `visible_range` is fed back by the renderer each frame so navigation
+    /// only nudges the viewport when the selection leaves what is on screen.
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct TimelineScroll {
+        pub(crate) offset: usize,
+        pub(crate) selection: Option<usize>,
+        pub(crate) visible_range: Option<(usize, usize)>,
+        pub(crate) has_more_before: bool,
+        pub(crate) loading_older: bool,
+    }
+
+    impl TimelineScroll {
+        /// True when pinned to the newest message (auto-follow on arrival).
+        pub(crate) fn is_pinned(&self) -> bool {
+            self.offset == 0
+        }
+
+        /// The selected absolute index, defaulting to the newest row. `None` when the
+        /// list is empty.
+        pub(crate) fn resolved_selection(&self, len: usize) -> Option<usize> {
+            (len > 0).then(|| self.selection.map_or(len - 1, |sel| sel.min(len - 1)))
+        }
+
+        /// Adjust for a row inserted at `index` (new length `new_len`). A row newer
+        /// than the current anchor bumps the offset by one while scrolled up (so the
+        /// content being read does not move) and stays pinned at the bottom
+        /// otherwise; a row at or older than the anchor shifts the selection instead.
+        pub(crate) fn on_insert(&mut self, index: usize, new_len: usize) {
+            let old_len = new_len.saturating_sub(1);
+            let anchor = old_len.saturating_sub(1).saturating_sub(self.offset);
+            if index > anchor && !self.is_pinned() {
+                self.offset += 1;
+            }
+            if let Some(sel) = self.selection
+                && index <= sel
+            {
+                self.selection = Some(sel + 1);
+            }
+            if let Some((first, last)) = self.visible_range {
+                self.visible_range = Some((
+                    first + usize::from(index <= first),
+                    last + usize::from(index <= last),
+                ));
+            }
+        }
+
+        /// Adjust for `n` older rows prepended at the front (history paging). The
+        /// offset counts from the unchanged bottom, so it stays put; the selection
+        /// and last visible range are absolute indices, so they shift by `n` to keep
+        /// the same rows selected and on screen.
+        pub(crate) fn on_prepend(&mut self, n: usize) {
+            if n == 0 {
+                return;
+            }
+            if let Some(sel) = self.selection {
+                self.selection = Some(sel + n);
+            }
+            if let Some((first, last)) = self.visible_range {
+                self.visible_range = Some((first + n, last + n));
+            }
+        }
+
+        /// Adjust for the row at `index` being removed (new length `new_len`). The
+        /// mirror of `on_insert`: a row newer than the anchor pulls the offset down
+        /// while scrolled up; a row at or older than the selection shifts it down.
+        pub(crate) fn on_remove(&mut self, index: usize, new_len: usize) {
+            let old_len = new_len + 1;
+            let anchor = (old_len - 1).saturating_sub(self.offset);
+            if index > anchor && !self.is_pinned() {
+                self.offset -= 1;
+            }
+            self.selection = self.selection.and_then(|sel| {
+                let shifted = sel - usize::from(index < sel);
+                (new_len > 0).then(|| shifted.min(new_len - 1))
+            });
+            if let Some((first, last)) = self.visible_range {
+                self.visible_range = Some((
+                    first - usize::from(index < first),
+                    last - usize::from(index < last),
+                ));
+            }
+        }
+
+        /// Move the selection one row toward older messages (`k`).
+        pub(crate) fn select_up(&mut self, len: usize) {
+            self.move_selection(len, |sel| sel.saturating_sub(1));
+        }
+
+        /// Move the selection one row toward newer messages (`j`).
+        pub(crate) fn select_down(&mut self, len: usize) {
+            self.move_selection(len, |sel| sel + 1);
+        }
+
+        /// Move the selection up by the number of currently visible messages
+        /// (`PageUp`), clamped.
+        pub(crate) fn page_up(&mut self, len: usize) {
+            let count = self.visible_count();
+            self.move_selection(len, |sel| sel.saturating_sub(count));
+        }
+
+        /// Move the selection down by the number of currently visible messages
+        /// (`PageDown`), clamped.
+        pub(crate) fn page_down(&mut self, len: usize) {
+            let count = self.visible_count();
+            self.move_selection(len, |sel| sel + count);
+        }
+
+        /// The number of messages the last render reported on screen (at least one).
+        fn visible_count(&self) -> usize {
+            self.visible_range
+                .map_or(1, |(first, last)| last.saturating_sub(first) + 1)
+                .max(1)
+        }
+
+        /// Select the newest message and pin to the bottom (`G`).
+        pub(crate) fn jump_newest(&mut self, _len: usize) {
+            self.selection = None;
+            self.offset = 0;
+        }
+
+        /// Select the oldest loaded message and scroll to the top (`g`).
+        pub(crate) fn jump_oldest(&mut self, len: usize) {
+            if len == 0 {
+                return;
+            }
+            self.selection = Some(0);
+            self.offset = len - 1;
+        }
+
+        fn move_selection(&mut self, len: usize, step: impl FnOnce(usize) -> usize) {
+            let Some(sel) = self.resolved_selection(len) else {
+                return;
+            };
+            self.selection = Some(step(sel).min(len - 1));
+            self.follow_selection(len);
+        }
+
+        /// Record the message range the renderer put on screen this frame. The
+        /// follow-scroll logic reads it to decide when to move the viewport, and
+        /// it also renormalizes a stale over-large offset down to what the render
+        /// geometry actually shows.
+        ///
+        /// `jump_oldest` (and any offset larger than the list can scroll) sets an
+        /// offset the renderer clamps when it anchors and fills forward, so the
+        /// stored offset can exceed the largest offset that still draws the same
+        /// bottom row (`last`). Left uncorrected, a later `on_prepend` — which
+        /// leaves the offset put (rule 6) — would anchor below the true top and
+        /// jump the view. The drawn `last` pins the effective offset to
+        /// `(len - 1) - last`; clamp down to it, never up (a legitimately smaller
+        /// offset always has `last` at the anchor, so this leaves it untouched).
+        pub(crate) fn record_visible_range(&mut self, first: usize, last: usize, len: usize) {
+            self.visible_range = Some((first, last));
+            let effective = len.saturating_sub(1).saturating_sub(last);
+            if self.offset > effective {
+                self.offset = effective;
+            }
+        }
+
+        /// True when the selection is on the oldest loaded row.
+        pub(crate) fn at_oldest(&self, len: usize) -> bool {
+            self.resolved_selection(len) == Some(0)
+        }
+
+        /// True when the caller should fetch an older history page: the selection is
+        /// at the oldest loaded row, more history exists, and no request is in
+        /// flight. The caller sets `loading_older` when it fires the request and,
+        /// once the page arrives, prepends the rows, calls `on_prepend`, and updates
+        /// `has_more_before` / `loading_older`.
+        pub(crate) fn should_request_older(&self, len: usize) -> bool {
+            self.has_more_before && !self.loading_older && self.at_oldest(len)
+        }
+
+        /// Nudge the viewport so the selection stays on screen, using the visible
+        /// range reported by the last render. Movement inside the range scrolls
+        /// nothing; leaving it moves the offset by exactly the overshoot.
+        fn follow_selection(&mut self, len: usize) {
+            let (Some(sel), Some((first, last))) =
+                (self.resolved_selection(len), self.visible_range)
+            else {
+                return;
+            };
+            if sel < first {
+                self.offset = (self.offset + (first - sel)).min(len.saturating_sub(1));
+            } else if sel > last {
+                self.offset = self.offset.saturating_sub(sel - last);
+            }
+        }
+    }
+
+    /// Build the display lines for one timeline row: `[HH:MM] author: content`, with
+    /// an optional reply line above, an optional reactions line below, and
+    /// attachment placeholders. Deleted rows render a tombstone in place. Every
+    /// untrusted string passes through `terminal_safe_text`. Selection highlight is
+    /// applied by the renderer; this returns only the content lines (the blank
+    /// separator counted by `timeline_row_height` is added when rendering).
+    pub(crate) fn timeline_row_lines(
+        row: &TimelineRow,
+        selected_account: Option<&AccountRow>,
+    ) -> Vec<Line<'static>> {
+        let prefix = format!("[{}] ", local_hhmm(row.timeline_at));
+        let author_prefix = format!("{}: ", terminal_safe_text(&timeline_author_label(row)));
+        let indent = prefix.chars().count() + author_prefix.chars().count();
+        let author_style = Style::default()
+            .fg(if timeline_row_is_self(row, selected_account) {
+                Color::Green
+            } else {
+                Color::Cyan
+            })
+            .add_modifier(Modifier::BOLD);
+        let timestamp_style = Style::default().fg(Color::DarkGray);
+
+        let mut lines = Vec::new();
+        if let Some(reply) = &row.reply {
+            lines.push(timeline_reply_line(reply, indent));
+        }
+        if row.deleted {
+            lines.push(Line::from(vec![
+                Span::styled(prefix, timestamp_style),
+                Span::styled(author_prefix, author_style),
+                Span::styled("message deleted", timeline_muted_italic_style()),
+            ]));
+            return lines;
+        }
+        for (index, part) in row.display_text.split('\n').enumerate() {
+            let part = terminal_safe_text(part);
+            if index == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.clone(), timestamp_style),
+                    Span::styled(author_prefix.clone(), author_style),
+                    Span::raw(part),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::raw(part),
+                ]));
+            }
+        }
+        if !row.reactions.is_empty() {
+            lines.push(timeline_reactions_line(&row.reactions, indent));
+        }
+        for attachment in &row.attachments {
+            lines.push(timeline_attachment_line(attachment, indent));
+        }
+        lines
+    }
+
+    /// The rendered height of a timeline row at `width`: the wrapped line count of
+    /// its content plus the blank separator row. The separator makes a row's block
+    /// height, so the visibility walk and the renderer stay in lockstep.
+    pub(crate) fn timeline_row_height(
+        row: &TimelineRow,
+        selected_account: Option<&AccountRow>,
+        width: u16,
+    ) -> u16 {
+        let lines = timeline_row_lines(row, selected_account);
+        let content = if width == 0 {
+            lines.len()
+        } else {
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+        };
+        u16::try_from(content)
+            .unwrap_or(u16::MAX)
+            .saturating_add(TIMELINE_MESSAGE_SEPARATOR_ROWS)
+    }
+
+    /// The rendered height of every row at `width`, for the visibility walk.
+    pub(crate) fn timeline_row_heights(
+        rows: &[TimelineRow],
+        selected_account: Option<&AccountRow>,
+        width: u16,
+    ) -> Vec<u16> {
+        rows.iter()
+            .map(|row| timeline_row_height(row, selected_account, width))
+            .collect()
+    }
+
+    /// Compute the visible message range `(first, last)` (both inclusive, forward
+    /// order) for a viewport, given per-row `heights` and the scroll `offset`. The
+    /// anchor is `newest - offset`; the walk fills backward from it until the
+    /// viewport is full, then renders forward from where it stopped. The anchor is
+    /// always included, so a message taller than the viewport still renders (never a
+    /// blank pane). `bottom_block_height` reserves rows for a bottom-pinned block
+    /// (live stream previews) but only when the anchor is the newest message.
+    ///
+    /// This is the single algorithm the renderer also uses to draw, so the reported
+    /// range and the drawn rows never diverge.
+    pub(crate) fn timeline_visible_range(
+        heights: &[u16],
+        viewport_height: u16,
+        offset: usize,
+        bottom_block_height: u16,
+    ) -> Option<(usize, usize)> {
+        let total = heights.len();
+        if total == 0 || viewport_height == 0 {
+            return None;
+        }
+        let anchor = total - 1 - offset.min(total - 1);
+        let viewport = if anchor == total - 1 {
+            viewport_height.saturating_sub(bottom_block_height)
+        } else {
+            viewport_height
+        };
+        let viewport = usize::from(viewport.max(1));
+        let height = |index: usize| usize::from(heights[index].max(1));
+
+        // Fill backward from the anchor to the topmost row that still fits.
+        let mut first = anchor;
+        let mut used = height(anchor);
+        for index in (0..anchor).rev() {
+            let next = used + height(index);
+            if next > viewport {
+                break;
+            }
+            used = next;
+            first = index;
+        }
+
+        // Render forward from `first`, filling the viewport. The anchor always
+        // renders (the `index != first` guard), so an oversized message is shown.
+        let mut last = first;
+        let mut filled = 0;
+        for index in first..total {
+            let next = filled + height(index);
+            if index != first && next > viewport {
+                break;
+            }
+            filled = next;
+            last = index;
+        }
+        Some((first, last))
+    }
+
+    /// The author label shown before a timeline message: the sender's display name,
+    /// falling back to a shortened id. Color (not "me") signals ownership.
+    fn timeline_author_label(row: &TimelineRow) -> String {
+        row.from_display_name
+            .clone()
+            .unwrap_or_else(|| shorten(&row.from, 18))
+    }
+
+    /// Whether a timeline row was authored by the selected account (rendered green).
+    fn timeline_row_is_self(row: &TimelineRow, selected_account: Option<&AccountRow>) -> bool {
+        row.direction == "sent"
+            || selected_account.is_some_and(|account| {
+                row.from == account.account_id
+                    || row.from == account.npub
+                    || row.from == account_display_label(account)
+            })
+    }
+
+    /// Format a Unix timestamp as local wall-clock `HH:MM`. This is the seam the
+    /// line builder calls; it depends on the machine's timezone, so tests assert
+    /// the `[HH:MM]` shape (fixed 8-column prefix) rather than the value and cover
+    /// the arithmetic through the pure `format_hhmm_with_offset` below. Falls back
+    /// to UTC when the timestamp is out of `DateTime`'s range.
+    fn local_hhmm(timeline_at: u64) -> String {
+        chrono::DateTime::from_timestamp(timeline_at as i64, 0)
+            .map(|instant| {
+                instant
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| format_hhmm(timeline_at))
+    }
+
+    /// Format a Unix timestamp as `HH:MM` in UTC. Pure and deterministic; kept as
+    /// the `local_hhmm` fallback and as the zero-offset case of the tested
+    /// `format_hhmm_with_offset`.
+    fn format_hhmm(timeline_at: u64) -> String {
+        format_hhmm_with_offset(timeline_at, 0)
+    }
+
+    /// Format a Unix timestamp as `HH:MM` shifted by `offset_seconds` from UTC.
+    /// Pure and deterministic (no clock read), so tests can pin an offset and
+    /// assert an exact value; `rem_euclid` keeps a negative wall-clock in range.
+    pub(crate) fn format_hhmm_with_offset(timeline_at: u64, offset_seconds: i64) -> String {
+        let seconds_of_day = (timeline_at as i64 + offset_seconds).rem_euclid(86_400);
+        format!(
+            "{:02}:{:02}",
+            seconds_of_day / 3_600,
+            (seconds_of_day % 3_600) / 60
+        )
+    }
+
+    fn timeline_muted_italic_style() -> Style {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    /// The reply-context line rendered above a reply's content: dark gray italic
+    /// `reply to <name>: "<first 30 chars>"`, falling back to a shortened parent id
+    /// when the preview is absent.
+    fn timeline_reply_line(reply: &TimelineReply, indent: usize) -> Line<'static> {
+        let label = match &reply.preview {
+            Some(preview) => {
+                let name = preview
+                    .sender
+                    .as_deref()
+                    .map(terminal_safe_text)
+                    .filter(|sender| !sender.is_empty())
+                    .unwrap_or_else(|| {
+                        terminal_safe_text(&shorten(&reply.reply_to_message_id, 12))
+                    });
+                let body = if preview.deleted {
+                    "message deleted".to_owned()
+                } else {
+                    terminal_safe_text(&preview.plaintext)
+                };
+                let clipped = body.chars().take(30).collect::<String>();
+                if body.chars().count() > 30 {
+                    format!("reply to {name}: \"{clipped}...\"")
+                } else {
+                    format!("reply to {name}: \"{clipped}\"")
+                }
+            }
+            None => format!(
+                "reply to {}",
+                terminal_safe_text(&shorten(&reply.reply_to_message_id, 12))
+            ),
+        };
+        Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(label, timeline_muted_italic_style()),
+        ])
+    }
+
+    /// The reactions line rendered below a message: yellow `<emoji> <count>` pairs
+    /// two spaces apart, in the row's deterministic emoji order.
+    fn timeline_reactions_line(reactions: &[TimelineReaction], indent: usize) -> Line<'static> {
+        let summary = reactions
+            .iter()
+            .map(|reaction| format!("{} {}", terminal_safe_text(&reaction.emoji), reaction.count))
+            .collect::<Vec<_>>()
+            .join("  ");
+        Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(summary, Style::default().fg(Color::Yellow)),
+        ])
+    }
+
+    /// A placeholder line for a media attachment: `[img name]` for images,
+    /// `[file name]` otherwise. Phase 1 renders no inline media.
+    fn timeline_attachment_line(attachment: &TimelineAttachment, indent: usize) -> Line<'static> {
+        let name = attachment
+            .filename
+            .as_deref()
+            .map(terminal_safe_text)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "file".to_owned());
+        let label = if attachment
+            .mime
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            format!("[img {name}]")
+        } else {
+            format!("[file {name}]")
+        };
+        Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(label, Style::default().fg(Color::DarkGray)),
+        ])
+    }
+}
+
+pub(crate) use timeline::*;
+
 pub(crate) fn value_string(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
@@ -627,26 +1596,6 @@ pub(crate) fn account_display_label(account: &AccountRow) -> String {
         .display_name
         .clone()
         .unwrap_or_else(|| account.npub.clone())
-}
-
-pub(crate) fn message_author_label(
-    message: &MessageRow,
-    selected_account: Option<&AccountRow>,
-) -> String {
-    if message.direction == "sent" {
-        return "me".to_owned();
-    }
-    if selected_account.is_some_and(|account| {
-        message.from == account.account_id
-            || message.from == account.npub
-            || message.from == account_display_label(account)
-    }) {
-        return "me".to_owned();
-    }
-    message
-        .from_display_name
-        .clone()
-        .unwrap_or_else(|| shorten(&message.from, 18))
 }
 
 pub(crate) fn stream_preview_author(
@@ -778,14 +1727,6 @@ pub(crate) fn move_index(current: usize, len: usize, delta: isize) -> usize {
     (current as isize + delta).clamp(0, max) as usize
 }
 
-// `scrollback` counts lines up from the bottom (0 keeps the newest pinned). Returns the
-// clamped scrollback and the top-line offset to hand to `Paragraph::scroll`.
-pub(crate) fn messages_scroll_offsets(total: u16, viewport: u16, scrollback: u16) -> (u16, u16) {
-    let max_scroll = total.saturating_sub(viewport);
-    let clamped = scrollback.min(max_scroll);
-    (clamped, max_scroll - clamped)
-}
-
 pub(crate) fn publish_status(action: &str, result: &Value) -> String {
     let published = result
         .get("published")
@@ -849,7 +1790,6 @@ pub(crate) fn parse_daemon_stream_watch(value: &Value) -> Option<DaemonStreamWat
 }
 
 pub(crate) fn apply_tui_subscription_result(
-    messages: &mut Vec<MessageRow>,
     live_previews: &mut Vec<LiveStreamPreview>,
     unread_counts: &mut HashMap<String, usize>,
     selected_group_id: Option<&str>,
@@ -861,21 +1801,19 @@ pub(crate) fn apply_tui_subscription_result(
     if let Some(group_id) = subscription_result_group_id(result)
         && Some(group_id.as_str()) != selected_group_id
     {
-        if subscription_result_counts_as_unread(result) {
+        let status = subscription_result_counts_as_unread(result).then(|| {
             let unread_count = unread_counts.entry(group_id.clone()).or_default();
             *unread_count += 1;
-            let status = Some(format!(
+            format!(
                 "unread message in {}; count={}",
                 shorten(&group_id, 18),
                 unread_count
-            ));
-            let _ = apply_subscription_result(messages, live_previews, result, true);
-            return status;
-        }
-        let _ = apply_subscription_result(messages, live_previews, result, true);
-        return None;
+            )
+        });
+        apply_subscription_result(live_previews, result);
+        return status;
     }
-    apply_subscription_result(messages, live_previews, result, false)
+    apply_subscription_result(live_previews, result)
 }
 
 pub(crate) fn is_initial_subscription_result(result: &Value) -> bool {
@@ -910,31 +1848,28 @@ pub(crate) fn subscription_result_counts_as_unread(result: &Value) -> bool {
     )
 }
 
+/// Apply one plain `messages subscribe` event to the account-wide live-stream
+/// preview state. The materialized-timeline feed owns the messages pane now, so
+/// message/reaction/media/delete rows drive nothing here; the plain feed is kept
+/// only for what the timeline feed does not carry — the QUIC preview types that
+/// render in the pane's bottom block, plus the preview cleanup when an agent
+/// stream's final row lands. Unread counting for off-screen groups is the
+/// caller's (`apply_tui_subscription_result`) job.
 pub(crate) fn apply_subscription_result(
-    messages: &mut Vec<MessageRow>,
     live_previews: &mut Vec<LiveStreamPreview>,
     result: &Value,
-    suppress_message_append: bool,
 ) -> Option<String> {
     match result.get("type").and_then(Value::as_str) {
-        Some("message" | "reaction" | "message_delete" | "media" | "agent_stream_final") => {
+        Some("agent_stream_final") => {
             let message_value = result.get("message")?;
-            if result.get("type").and_then(Value::as_str) == Some("agent_stream_final")
-                && let Some(stream_id) = message_value
-                    .get("agent_text_stream")
-                    .and_then(|stream| value_string(stream, "stream_id"))
-            {
-                let group_id = value_string(message_value, "group_id");
-                remove_live_stream_preview(live_previews, group_id.as_deref(), &stream_id);
-            }
-            if suppress_message_append {
-                return None;
-            }
-            let message = parse_message(message_value)?;
-            upsert_message(messages, message);
-            sort_and_cap_messages(messages);
-            Some(format!("live update: messages={}", messages.len()))
+            let stream_id = message_value
+                .get("agent_text_stream")
+                .and_then(|stream| value_string(stream, "stream_id"))?;
+            let group_id = value_string(message_value, "group_id");
+            remove_live_stream_preview(live_previews, group_id.as_deref(), &stream_id);
+            None
         }
+        Some("message" | "reaction" | "message_delete" | "media") => None,
         Some("agent_stream_start") => {
             let message = result.get("message")?;
             let stream = message
@@ -990,18 +1925,6 @@ pub(crate) fn apply_subscription_result(
         }
         _ => None,
     }
-}
-
-pub(crate) fn upsert_message(messages: &mut Vec<MessageRow>, message: MessageRow) {
-    if !message.message_id.is_empty()
-        && let Some(existing) = messages
-            .iter_mut()
-            .find(|existing| existing.message_id == message.message_id)
-    {
-        *existing = message;
-        return;
-    }
-    messages.push(message);
 }
 
 pub(crate) fn append_live_stream_delta(
@@ -1292,11 +2215,47 @@ pub(crate) fn composer_display_text(input: &str) -> String {
     input.to_owned()
 }
 
+/// Args for the `daemon start` child, forwarding the TUI's first-run relay
+/// flags. `wn daemon start` accepts comma-delimited `--discovery-relays` /
+/// `--default-account-relays`, so each non-empty list is joined and passed as
+/// the same flag the daemon exposes (flag passthrough, no JSON change).
+pub(crate) fn daemon_start_args(
+    discovery_relays: &[String],
+    default_account_relays: &[String],
+) -> Vec<String> {
+    let mut args = vec!["daemon".to_owned(), "start".to_owned()];
+    if !discovery_relays.is_empty() {
+        args.push("--discovery-relays".to_owned());
+        args.push(discovery_relays.join(","));
+    }
+    if !default_account_relays.is_empty() {
+        args.push("--default-account-relays".to_owned());
+        args.push(default_account_relays.join(","));
+    }
+    args
+}
+
 pub(crate) fn message_subscription_args() -> Vec<String> {
     vec![
         "messages".to_owned(),
         "subscribe".to_owned(),
         "--limit".to_owned(),
         "0".to_owned(),
+    ]
+}
+
+/// Args for the per-group materialized-timeline subscription. Passes `--limit`
+/// with the TUI page size so the subscription's initial page matches the
+/// snapshot load; without it the daemon's default 50-row page transiently
+/// clobbers the snapshot's accurate `has_more_before` (a spurious "loaded 0
+/// older message(s)" fetch for 51-100-message groups).
+pub(crate) fn timeline_subscription_args(group_id: &str) -> Vec<String> {
+    vec![
+        "messages".to_owned(),
+        "timeline".to_owned(),
+        "subscribe".to_owned(),
+        group_id.to_owned(),
+        "--limit".to_owned(),
+        TUI_TIMELINE_PAGE_SIZE.to_string(),
     ]
 }

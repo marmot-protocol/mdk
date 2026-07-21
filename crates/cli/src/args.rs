@@ -81,7 +81,22 @@ impl SecretStoreKind {
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum Command {
     #[command(about = "Open the interactive terminal UI")]
-    Tui,
+    Tui {
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated discovery relays forwarded to daemon start and account setup on first run"
+        )]
+        discovery_relays: Vec<String>,
+        #[arg(
+            long,
+            value_name = "URLS",
+            value_delimiter = ',',
+            help = "Comma-separated default account relays forwarded to daemon start and account setup on first run"
+        )]
+        default_account_relays: Vec<String>,
+    },
     #[command(about = "Inspect local runtime diagnostics")]
     Debug {
         #[command(subcommand)]

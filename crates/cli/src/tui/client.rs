@@ -8,20 +8,50 @@ pub(crate) struct WnClient {
     pub(crate) home: Option<PathBuf>,
     pub(crate) socket: Option<PathBuf>,
     pub(crate) relay: Option<String>,
+    /// First-run discovery relays from `wn tui --discovery-relays`, forwarded to
+    /// the `daemon start` child (no JSON change; flag passthrough only).
+    pub(crate) discovery_relays: Vec<String>,
+    /// First-run default account relays from `wn tui --default-account-relays`,
+    /// forwarded to the `daemon start` child and used as the account-setup relay.
+    pub(crate) default_account_relays: Vec<String>,
     pub(crate) secret_store: Option<SecretStoreKind>,
     pub(crate) keychain_service: Option<String>,
 }
 
 impl WnClient {
     pub(crate) fn from_cli(cli: &Cli) -> TuiResult<Self> {
+        let (discovery_relays, default_account_relays) = match &cli.command {
+            crate::Command::Tui {
+                discovery_relays,
+                default_account_relays,
+            } => (discovery_relays.clone(), default_account_relays.clone()),
+            _ => (Vec::new(), Vec::new()),
+        };
         Ok(Self {
             exe: std::env::current_exe()?,
             home: cli.home.clone(),
             socket: cli.socket.clone(),
             relay: cli.relay.clone(),
+            discovery_relays,
+            default_account_relays,
             secret_store: cli.secret_store,
             keychain_service: cli.keychain_service.clone(),
         })
+    }
+
+    /// The relay to hand account setup (`create-identity` / `login`) when no
+    /// global `--relay` already covers it. `command` appends `--relay` from
+    /// `self.relay` to every child, so supplying one here too would pass it
+    /// twice; only fill in when `self.relay` is absent, preferring a default
+    /// account relay and falling back to a discovery relay.
+    pub(crate) fn account_setup_relay(&self) -> Option<String> {
+        if self.relay.is_some() {
+            return None;
+        }
+        self.default_account_relays
+            .first()
+            .or_else(|| self.discovery_relays.first())
+            .cloned()
     }
 
     pub(crate) fn run_json<S>(&self, account: Option<&str>, args: &[S]) -> TuiResult<Value>
@@ -199,21 +229,28 @@ impl TuiApp {
             .and_then(|ids| ids.first())
             .and_then(Value::as_str)
         {
+            // Optimistic row; the timeline projection event upserts over it by id
+            // once the send lands in the materialized view.
             let now = unix_now_seconds();
-            upsert_message(
-                &mut self.messages,
-                MessageRow {
-                    message_id: message_id.to_owned(),
-                    direction: "sent".to_owned(),
-                    from: account_id,
-                    from_display_name: None,
-                    plaintext: text.clone(),
-                    display_text: text,
-                    recorded_at: now,
-                    received_at: now,
-                },
-            );
-            sort_and_cap_messages(&mut self.messages);
+            let row = TimelineRow {
+                message_id: message_id.to_owned(),
+                direction: "sent".to_owned(),
+                from: account_id,
+                from_display_name: None,
+                plaintext: text.clone(),
+                display_text: text,
+                timeline_at: now,
+                received_at: now,
+                deleted: false,
+                reactions: Vec::new(),
+                reply: None,
+                attachments: Vec::new(),
+            };
+            if let TimelineFoldOutcome::Inserted(index) =
+                apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
+            {
+                self.timeline_scroll.on_insert(index, self.timeline.len());
+            }
         } else {
             self.refresh_messages()?;
         }
@@ -623,7 +660,7 @@ impl TuiApp {
         identity: Option<String>,
         action: &'static str,
     ) -> TuiResult<()> {
-        let invocation = account_setup_invocation(identity);
+        let invocation = account_setup_invocation(identity, self.client.account_setup_relay());
         let result = match invocation.stdin {
             Some(stdin) => self
                 .client
@@ -792,16 +829,21 @@ impl TuiApp {
         self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
+        self.ensure_selected_timeline_subscription();
         Ok(())
     }
 
     pub(crate) fn start_daemon(&mut self) -> TuiResult<()> {
-        let args = vec!["daemon".to_owned(), "start".to_owned()];
+        let args = daemon_start_args(
+            &self.client.discovery_relays,
+            &self.client.default_account_relays,
+        );
         let result = self.client.run_json(None, &args)?;
         self.daemon = parse_daemon_view(&result);
         self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
+        self.ensure_selected_timeline_subscription();
         self.status = daemon_status_sentence(&self.daemon);
         Ok(())
     }
@@ -812,11 +854,16 @@ impl TuiApp {
         self.chat_subscription = None;
         self.message_subscription = None;
         self.group_state_subscription = None;
+        self.timeline_subscription = None;
         self.status = "daemon stopped".to_owned();
         Ok(())
     }
 
-    pub(crate) fn refresh_accounts(&mut self) -> TuiResult<()> {
+    /// Reload just the account list (`wn account list`), reselecting the
+    /// previously active account, and clear all chat/message/subscription state
+    /// when no accounts remain. Does not load chats or route the screen; the
+    /// startup/login flow decides the screen from the resulting account count.
+    pub(crate) fn load_accounts(&mut self) -> TuiResult<()> {
         let result = self.client.run_json(None, &["account", "list"])?;
         let previous_account_id = self
             .selected_account_row()
@@ -831,7 +878,7 @@ impl TuiApp {
             selected_account_index(&self.accounts, previous_account_id.as_deref()).unwrap_or(0);
         if self.accounts.is_empty() {
             self.chats.clear();
-            self.messages.clear();
+            self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
             self.unread_counts.clear();
@@ -839,7 +886,14 @@ impl TuiApp {
             self.message_subscription = None;
             self.group_state_subscription = None;
             self.group_diagnostics = None;
-            self.status = "no identities yet; create one with wn create-identity".to_owned();
+            self.status = "no identities yet; create one from the login screen".to_owned();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_accounts(&mut self) -> TuiResult<()> {
+        self.load_accounts()?;
+        if self.accounts.is_empty() {
             return Ok(());
         }
         self.refresh_chats()
@@ -848,7 +902,7 @@ impl TuiApp {
     pub(crate) fn refresh_chats(&mut self) -> TuiResult<()> {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chats.clear();
-            self.messages.clear();
+            self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
             self.chat_subscription = None;
@@ -860,7 +914,7 @@ impl TuiApp {
         };
         if !account.local_signing {
             self.chats.clear();
-            self.messages.clear();
+            self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
             self.chat_subscription = None;
@@ -890,7 +944,7 @@ impl TuiApp {
             self.status = format!("chat subscription failed: {err}");
         }
         if self.chats.is_empty() {
-            self.messages.clear();
+            self.clear_timeline_pane();
             self.messages_account_id = Some(account.account_id.clone());
             self.messages_group_id = None;
             self.group_state_subscription = None;
@@ -911,28 +965,36 @@ impl TuiApp {
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
         let args = vec![
-            "message".to_owned(),
+            "messages".to_owned(),
+            "timeline".to_owned(),
             "list".to_owned(),
             "--group".to_owned(),
             group_id.clone(),
             "--limit".to_owned(),
-            "50".to_owned(),
+            TUI_TIMELINE_PAGE_SIZE.to_string(),
         ];
         let result = self.client.run_json(Some(&account_id), &args)?;
-        self.messages = result
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|messages| messages.iter().filter_map(parse_message).collect())
-            .unwrap_or_default();
+        self.timeline = parse_timeline_page(&result);
+        self.timeline_scroll = TimelineScroll {
+            has_more_before: timeline_page_has_more_before(&result),
+            ..TimelineScroll::default()
+        };
         self.messages_account_id = Some(account_id.clone());
         self.messages_group_id = Some(group_id.clone());
-        self.messages_scroll = 0;
         self.unread_counts.remove(&group_id);
-        sort_and_cap_messages(&mut self.messages);
-        if let Err(err) = self.ensure_message_subscription(&account_id) {
-            self.status = format!("message subscription failed: {err}");
-            return Ok(());
-        }
+        // Establish all three subscriptions regardless of any one's outcome. The
+        // timeline feed drives the pane's live updates and its `ensure_*` also
+        // kills a stale prior-group child, so a failed plain feed must not skip
+        // it. Each error surfaces on the status line; the user sees the first by
+        // precedence (message, then timeline, then group state).
+        let message_subscription_error = self
+            .ensure_message_subscription(&account_id)
+            .err()
+            .map(|err| format!("message subscription failed: {err}"));
+        let timeline_subscription_error = self
+            .ensure_timeline_subscription(&account_id, &group_id)
+            .err()
+            .map(|err| format!("timeline subscription failed: {err}"));
         let group_state_subscription_error = self
             .ensure_group_state_subscription(&account_id, &group_id)
             .err()
@@ -951,8 +1013,60 @@ impl TuiApp {
         } else {
             self.refresh_group_diagnostics(&account_id, &group_id);
         }
-        self.status = group_state_subscription_error
-            .unwrap_or_else(|| format!("loaded {} message(s)", self.messages.len()));
+        self.status = message_subscription_error
+            .or(timeline_subscription_error)
+            .or(group_state_subscription_error)
+            .unwrap_or_else(|| format!("loaded {} message(s)", self.timeline.len()));
+        Ok(())
+    }
+
+    /// Fetch and prepend the previous history page. Runs synchronously like every
+    /// other TUI action; `loading_older` guards against re-entry and is cleared on
+    /// both the success and error paths so a failed page does not wedge paging.
+    pub(crate) fn load_older_messages(&mut self) -> TuiResult<()> {
+        let Some(cursor) = oldest_timeline_cursor(&self.timeline) else {
+            return Ok(());
+        };
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let args = vec![
+            "messages".to_owned(),
+            "timeline".to_owned(),
+            "list".to_owned(),
+            "--group".to_owned(),
+            group_id,
+            "--before".to_owned(),
+            cursor.timeline_at.to_string(),
+            "--before-message-id".to_owned(),
+            cursor.message_id,
+            "--limit".to_owned(),
+            TUI_TIMELINE_PAGE_SIZE.to_string(),
+        ];
+        self.timeline_scroll.loading_older = true;
+        let result = match self.client.run_json(Some(&account_id), &args) {
+            Ok(result) => result,
+            Err(err) => {
+                self.timeline_scroll.loading_older = false;
+                return Err(err);
+            }
+        };
+        // Rows arrive oldest-first. Upsert each by id — the only merge that stays
+        // idempotent if the exclusive cursor ever overlaps — and shift the scroll
+        // model by the count of genuinely new rows so an overlap neither duplicates
+        // a row nor over-shifts the selection.
+        let older = parse_timeline_page(&result);
+        let mut prepended = 0;
+        for row in older {
+            if let TimelineFoldOutcome::Inserted(_) =
+                apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
+            {
+                prepended += 1;
+            }
+        }
+        self.timeline_scroll.on_prepend(prepended);
+        self.timeline_scroll.has_more_before = timeline_page_has_more_before(&result);
+        self.timeline_scroll.loading_older = false;
+        self.status = format!("loaded {prepended} older message(s)");
         Ok(())
     }
 
@@ -1063,6 +1177,46 @@ impl TuiApp {
         Ok(())
     }
 
+    pub(crate) fn ensure_timeline_subscription(
+        &mut self,
+        account_id: &str,
+        group_id: &str,
+    ) -> TuiResult<()> {
+        if !self.daemon.running {
+            self.timeline_subscription = None;
+            return Ok(());
+        }
+        if self
+            .timeline_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.account_id == account_id && subscription.group_id == group_id
+            })
+        {
+            return Ok(());
+        }
+
+        self.timeline_subscription = None;
+        let args = timeline_subscription_args(group_id);
+        let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
+        let rx = spawn_subscription_reader(&mut child, "timeline")?;
+        self.timeline_subscription = Some(TimelineSubscription {
+            account_id: account_id.to_owned(),
+            group_id: group_id.to_owned(),
+            child,
+            rx,
+        });
+        Ok(())
+    }
+
+    /// Clear the messages pane: drop the loaded timeline rows, reset the scroll
+    /// model to its pinned default, and stop the per-group timeline subscription.
+    pub(crate) fn clear_timeline_pane(&mut self) {
+        self.timeline.clear();
+        self.timeline_scroll = TimelineScroll::default();
+        self.timeline_subscription = None;
+    }
+
     pub(crate) fn ensure_selected_chat_subscription(&mut self) {
         let Some(account) = self.selected_account_row().cloned() else {
             self.chat_subscription = None;
@@ -1109,6 +1263,33 @@ impl TuiApp {
         }
     }
 
+    /// Re-establish the timeline subscription for the currently loaded group (the
+    /// pane target), used when daemon state changes. Keyed to the loaded group,
+    /// not the highlighted chat, so it stays in lockstep with the pane snapshot.
+    pub(crate) fn ensure_selected_timeline_subscription(&mut self) {
+        let (Some(account_id), Some(group_id)) = (
+            self.messages_account_id.clone(),
+            self.messages_group_id.clone(),
+        ) else {
+            self.timeline_subscription = None;
+            return;
+        };
+        if let Err(err) = self.ensure_timeline_subscription(&account_id, &group_id) {
+            self.status = format!("timeline subscription failed: {err}");
+        }
+    }
+
+    /// Assign a status produced by a background drain, but only while the main
+    /// view is showing. On the login/account-select screen the status line
+    /// carries the nsec prompt and picker guidance; a live drain (a picker
+    /// reached via `A` keeps its subscriptions running) must apply its state
+    /// changes without clobbering that prompt.
+    fn set_drain_status(&mut self, status: String) {
+        if self.screen == Screen::Main {
+            self.status = status;
+        }
+    }
+
     pub(crate) fn drain_chat_subscription(&mut self) -> bool {
         let Some(subscription) = self.chat_subscription.as_ref() else {
             return false;
@@ -1139,11 +1320,11 @@ impl TuiApp {
                         &result,
                     ) {
                         chats_changed = true;
-                        self.status = status;
+                        self.set_drain_status(status);
                     }
                 }
                 SubscriptionEvent::Error(err) => {
-                    self.status = format!("chat subscription failed: {err}");
+                    self.set_drain_status(format!("chat subscription failed: {err}"));
                 }
                 SubscriptionEvent::Ended => {
                     self.chat_subscription = None;
@@ -1154,7 +1335,7 @@ impl TuiApp {
         if chats_changed {
             let selected_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
             if previous_group_id != selected_group_id {
-                self.messages.clear();
+                self.clear_timeline_pane();
                 self.messages_account_id = None;
                 self.messages_group_id = None;
                 self.message_subscription = None;
@@ -1204,12 +1385,12 @@ impl TuiApp {
                             ));
                         }
                         if let Some(status) = update.status {
-                            self.status = status;
+                            self.set_drain_status(status);
                         }
                     }
                 }
                 SubscriptionEvent::Error(err) => {
-                    self.status = format!("group state subscription failed: {err}");
+                    self.set_drain_status(format!("group state subscription failed: {err}"));
                 }
                 SubscriptionEvent::Ended => {
                     self.group_state_subscription = None;
@@ -1243,20 +1424,60 @@ impl TuiApp {
                 SubscriptionEvent::Result(result) => {
                     let loaded_group_id = self.messages_group_id.clone();
                     if let Some(status) = apply_tui_subscription_result(
-                        &mut self.messages,
                         &mut self.live_stream_previews,
                         &mut self.unread_counts,
                         loaded_group_id.as_deref(),
                         &result,
                     ) {
-                        self.status = status;
+                        self.set_drain_status(status);
                     }
                 }
                 SubscriptionEvent::Error(err) => {
-                    self.status = format!("message subscription failed: {err}");
+                    self.set_drain_status(format!("message subscription failed: {err}"));
                 }
                 SubscriptionEvent::Ended => {
                     self.message_subscription = None;
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn drain_timeline_subscription(&mut self) -> bool {
+        let Some(subscription) = self.timeline_subscription.as_ref() else {
+            return false;
+        };
+        let mut events = Vec::new();
+        loop {
+            match subscription.rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(SubscriptionEvent::Ended);
+                    break;
+                }
+            }
+        }
+        if events.is_empty() {
+            return false;
+        }
+        let loaded_group_id = self.messages_group_id.clone();
+        for event in events {
+            match event {
+                SubscriptionEvent::Result(result) => {
+                    apply_timeline_event(
+                        &mut self.timeline,
+                        &mut self.timeline_scroll,
+                        loaded_group_id.as_deref(),
+                        parse_timeline_event(&result),
+                    );
+                }
+                SubscriptionEvent::Error(err) => {
+                    self.set_drain_status(format!("timeline subscription failed: {err}"));
+                }
+                SubscriptionEvent::Ended => {
+                    self.timeline_subscription = None;
                     break;
                 }
             }

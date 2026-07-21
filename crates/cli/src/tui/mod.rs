@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -38,6 +38,11 @@ const ACCOUNT_ACCENT: Color = Color::White;
 const DEFAULT_STREAM_CANDIDATE: &str = crate::DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE;
 const SLASH_SUGGESTION_LIMIT: usize = 8;
 const TUI_MESSAGE_SCROLLBACK_LIMIT: usize = 1_000;
+/// Materialized-timeline page size for the snapshot load and each history page.
+const TUI_TIMELINE_PAGE_SIZE: usize = 100;
+/// Blank rows rendered below each timeline message as a separator; counted in a
+/// row's rendered height so the visibility walk and the renderer agree.
+const TIMELINE_MESSAGE_SEPARATOR_ROWS: u16 = 1;
 const TUI_LIVE_STREAM_PREVIEW_LIMIT: usize = 128;
 const TUI_LIVE_STREAM_TEXT_LIMIT: usize = 64 * 1024;
 

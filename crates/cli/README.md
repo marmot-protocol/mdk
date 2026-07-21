@@ -447,32 +447,66 @@ real time.
 
 ## TUI
 
-`wn tui` is a Ratatui interface over the real `wn --json` command surface. It lists local accounts, shows
-visible chats for the selected local signing account, renders recent messages, sends messages from a composer, and
-keeps the latest status plus selected-chat MLS/component state in a status panel below the composer.
+`wn tui` is a Ratatui interface over the real `wn --json` command surface. It opens on a login screen when it has
+no single obvious account, then drops into a chat-first main view: the chat list on the left, the materialized
+message timeline on the right (with reactions, reply context, deletion tombstones, and `[img name]`/`[file name]`
+media placeholders), the composer below them, and a one-line hints bar plus a one-line status bar at the bottom.
 
 ```sh
 wn tui
 ```
 
-When a daemon is running for the same home, TUI child commands use the daemon socket. The header shows daemon
+Startup routes by how many local accounts exist: no accounts open the login menu (create an identity or log in
+with an nsec), exactly one drops straight into the main view, and several open an account picker. An explicit
+`--account <npub-or-hex>` (or `WN_ACCOUNT`) that resolves to a loaded account enters the main view directly with
+that account, even when several accounts exist. The main view no
+longer has an always-visible accounts panel; press `A` from the chat list to reopen the account picker, or use the
+`/account`, `/login`, and `/create-identity` slash commands.
+
+First run without any relay configuration would otherwise dead-end, because creating an identity and starting the
+daemon both need relays. Pass them to `wn tui` and they are forwarded to the daemon-start and account-setup child
+commands:
+
+```sh
+wn tui \
+  --discovery-relays wss://relay.discovery.example \
+  --default-account-relays wss://relay.one.example,wss://relay.two.example
+```
+
+When a daemon is running for the same home, TUI child commands use the daemon socket. The status bar shows daemon
 state. While the daemon is running, the TUI attaches to daemon-backed runtime subscriptions for live message, chat, and
 group-state changes, and refreshes snapshots when the composer is idle.
 
-Controls:
+Login screen controls:
 
-- `Tab`: cycle accounts, chats, and composer.
-- Arrow keys or `j`/`k`: move the selected account or chat.
-- `Enter`: select the highlighted account/chat or submit the composer.
+- Menu (no accounts): `c` create a new identity, `l` log in with an nsec, `q` quit.
+- Account picker (several accounts): `j`/`k` or arrows move the selection; `Enter` selects the account and enters
+  the main view; `c` create; `l` nsec login; `Esc` returns to the main view when one is already active; `q` quit.
+- Nsec entry: type or paste the nsec (rendered masked); `Enter` submits it over stdin; `Esc` cancels.
+
+Main view controls:
+
+- `Tab`/`BackTab`: cycle the chat list, messages, and composer.
+- Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `A` reopens the
+  account picker.
+- Messages: `j`/`k` or arrows move the message selection; `PageUp`/`PageDown` page; `G`/`End` jump to the newest
+  message (and pin to the bottom), `g`/`Home` to the oldest. New messages stay pinned to the bottom while you are at
+  the newest message and hold your position when you have scrolled up. Scrolling past the oldest loaded message loads
+  the previous page of history. `i` or `Enter` focuses the composer.
+- Composer: `Enter` submits.
 - `?`: open help.
-- `Esc`: clear help or input.
+- `Esc`: close the help popup or clear the composer input.
 - `Ctrl-C`: quit.
+
+Group MLS/component diagnostics are hidden by default; `/diagnostics` toggles a diagnostics panel between the
+messages pane and the composer.
 
 Composer slash commands:
 
 ```text
 /help
 /refresh
+/diagnostics
 /account <npub-or-hex>
 /create-identity
 /login <nsec-or-npub>

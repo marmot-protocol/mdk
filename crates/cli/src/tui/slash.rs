@@ -16,6 +16,13 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
     match command.as_str() {
         "help" | "?" => Ok(SlashCommand::Help),
         "refresh" => Ok(SlashCommand::Refresh),
+        "diagnostics" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Diagnostics)
+            } else {
+                Err("/diagnostics does not accept arguments".to_owned())
+            }
+        }
         "sync" => {
             Err("manual sync is not a TUI command; live updates come from subscriptions".to_owned())
         }

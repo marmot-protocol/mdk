@@ -156,7 +156,7 @@ where
         return daemon::run_daemon_command(cli, command).await;
     }
 
-    if matches!(cli.command, Command::Tui) {
+    if matches!(cli.command, Command::Tui { .. }) {
         return tui::run_tui(cli).await;
     }
 
@@ -543,7 +543,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
             plain: "daemon command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
         }),
-        Command::Tui => Ok(CommandOutput {
+        Command::Tui { .. } => Ok(CommandOutput {
             plain: "tui command is handled by wn".to_owned(),
             json: json!({"handled": "client"}),
         }),

@@ -446,7 +446,7 @@ fn group_members_status_summarizes_member_records() {
 }
 
 #[test]
-fn status_panel_lines_show_latest_status_then_mls_and_components() {
+fn diagnostics_panel_lines_show_mls_and_components() {
     let diagnostics = parse_group_diagnostics(&serde_json::json!({
         "group": {
             "group_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -473,19 +473,18 @@ fn status_panel_lines_show_latest_status_then_mls_and_components() {
     }))
     .expect("diagnostics");
 
-    let rendered = status_panel_lines("loaded 2 message(s)", Some(&diagnostics))
+    // The diagnostics panel drops the leading status line (now in the status bar):
+    // it starts straight at the MLS summary.
+    let rendered = diagnostics_panel_lines(Some(&diagnostics))
         .iter()
         .map(line_text)
         .collect::<Vec<_>>();
 
-    assert_eq!(rendered[0], "loaded 2 message(s)");
-    assert_eq!(rendered[1], "");
-    assert_eq!(rendered[2], "");
     assert_eq!(
-        rendered[3],
+        rendered[0],
         "MLS epoch=7 group=aaaaaaa...aaaaaaaa members=3"
     );
-    assert_eq!(rendered[4], "components:");
+    assert_eq!(rendered[1], "components:");
     assert!(
         rendered
             .iter()
@@ -606,64 +605,6 @@ fn chat_label_keeps_unread_count_when_truncated() {
 }
 
 #[test]
-fn message_lines_keep_chronological_order_and_summarize_stream_markers() {
-    let mut messages = [
-            serde_json::json!({
-                "message_id": "03",
-                "recorded_at": 30,
-                "received_at": 30,
-                "direction": "sent",
-                "from": "alice",
-                "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
-                "agent_text_stream": {
-                    "kind": "final",
-                    "stream_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "final_text_or_reference": "hello from the stream",
-                    "transcript_hash": "4c88175697a7232454d93beeeb3d97eb487d9042fc5d37f75e3f9297e626ad5e",
-                    "chunk_count": 3
-                }
-            }),
-            serde_json::json!({
-                "message_id": "01",
-                "recorded_at": 10,
-                "received_at": 30,
-                "direction": "sent",
-                "from": "alice",
-                "plaintext": "hello bob from alice"
-            }),
-            serde_json::json!({
-                "message_id": "02",
-                "recorded_at": 20,
-                "received_at": 30,
-                "direction": "sent",
-                "from": "alice",
-                "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
-                "agent_text_stream": {
-                    "kind": "start",
-                    "stream_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "route": "brokered_quic",
-                    "quic_candidates": ["quic://127.0.0.1:4450"]
-                }
-            }),
-        ]
-        .iter()
-        .filter_map(parse_message)
-        .collect::<Vec<_>>();
-    sort_messages_chronologically(&mut messages);
-
-    let rendered = message_lines(&messages, None)
-        .iter()
-        .map(line_text)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-
-    assert_eq!(rendered[0], "me: hello bob from alice");
-    assert_eq!(rendered[1], "me: hello from the stream");
-    assert!(rendered.iter().all(|line| !line.contains("marmot_payload")));
-    assert!(rendered.iter().all(|line| !line.contains("stream start")));
-}
-
-#[test]
 fn terminal_safe_text_strips_bidi_and_zero_width_format_characters() {
     assert_eq!(
         terminal_safe_text(
@@ -751,21 +692,15 @@ fn terminal_safe_text_preserves_legitimate_visible_and_combining_text() {
 
 #[test]
 fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
-    let messages = vec![MessageRow {
-        message_id: "01".to_owned(),
-        direction: "received".to_owned(),
-        from: "alice".to_owned(),
-        from_display_name: Some("ali\u{1b}]0;pwn\u{7}ce".to_owned()),
-        plaintext: "hi\u{1b}[2J\nbob".to_owned(),
-        display_text: "hi\u{1b}[2J\nbob".to_owned(),
-        recorded_at: 1,
-        received_at: 1,
-    }];
-    let rendered = message_lines(&messages, None)
+    let mut row = timeline_row("01", 0);
+    row.from = "alice".to_owned();
+    row.from_display_name = Some("ali\u{1b}]0;pwn\u{7}ce".to_owned());
+    row.display_text = "hi\u{1b}[2Jbob".to_owned();
+    let rendered = timeline_row_lines(&row, None)
         .into_iter()
         .map(|line| line_text(&line))
         .collect::<Vec<_>>();
-    assert_eq!(rendered[0], "ali]0;pwnce: hi[2Jbob");
+    assert_eq!(hhmm_body(&rendered[0]), "ali]0;pwnce: hi[2Jbob");
 
     let previews = vec![LiveStreamPreview {
         group_id: "group-a".to_owned(),
@@ -786,12 +721,12 @@ fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
     };
     assert_eq!(line_text(&chat_row_line(&chat, false, 0)), "  ops[5m");
 
-    let status = status_panel_lines(
-        "ready\u{1b}[2J",
-        Some(&GroupDiagnostics::unavailable("aa", "bad\u{1b}[31m")),
+    let diagnostics =
+        diagnostics_panel_lines(Some(&GroupDiagnostics::unavailable("aa", "bad\u{1b}[31m")));
+    assert_eq!(
+        line_text(&diagnostics[0]),
+        "MLS group=aa unavailable: bad[31m"
     );
-    assert_eq!(line_text(&status[0]), "ready[2J");
-    assert_eq!(line_text(&status[3]), "MLS group=aa unavailable: bad[31m");
 }
 
 #[test]
@@ -823,7 +758,7 @@ fn image_slash_command_uses_real_media_upload_send_surface() {
 }
 
 #[test]
-fn daemon_status_json_becomes_header_and_status_text() {
+fn daemon_status_json_becomes_status_text() {
     let daemon = parse_daemon_view(&serde_json::json!({
         "running": true,
         "pid": 1234,
@@ -836,10 +771,6 @@ fn daemon_status_json_becomes_header_and_status_text() {
         }
     }));
 
-    assert_eq!(
-        daemon_header_label(&daemon),
-        "on pid=1234 activity=3/1/4 errors=1"
-    );
     assert_eq!(
         daemon_status_sentence(&daemon),
         "daemon running last-activity accounts=2 events=3 joined=1 messages=4 errors=1"
@@ -877,7 +808,6 @@ fn daemon_stream_watches_become_status_and_preview_rows() {
         ]
     }));
 
-    assert_eq!(daemon_header_label(&daemon), "on pid=1234 streams=1");
     assert_eq!(
         daemon_status_sentence(&daemon),
         "daemon running streams: running=1 completed=1 failed=0 latest=bbbbbbb...bbbbbbbb"
@@ -977,11 +907,9 @@ fn stream_preview_lines_hide_empty_and_completed_previews() {
 fn subscription_stream_deltas_update_live_preview_text() {
     let group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let stream_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut messages = Vec::new();
     let mut previews = Vec::new();
 
     apply_subscription_result(
-        &mut messages,
         &mut previews,
         &serde_json::json!({
             "type": "agent_stream_delta",
@@ -991,10 +919,8 @@ fn subscription_stream_deltas_update_live_preview_text() {
                 "text": "hello "
             }
         }),
-        false,
     );
     apply_subscription_result(
-        &mut messages,
         &mut previews,
         &serde_json::json!({
             "type": "agent_stream_delta",
@@ -1004,7 +930,6 @@ fn subscription_stream_deltas_update_live_preview_text() {
                 "text": "stream"
             }
         }),
-        false,
     );
 
     let rendered_preview = stream_preview_lines(&DaemonView::default(), &previews, Some(group_id))
@@ -1014,42 +939,6 @@ fn subscription_stream_deltas_update_live_preview_text() {
     .map(|span| span.content.as_ref())
     .collect::<String>();
     assert_eq!(rendered_preview, "stream: hello stream");
-}
-
-#[test]
-fn subscription_messages_keep_bounded_scrollback() {
-    let mut messages = Vec::new();
-    let mut previews = Vec::new();
-
-    for index in 0..(TUI_MESSAGE_SCROLLBACK_LIMIT + 5) {
-        let message_id = format!("{index:04}");
-        apply_subscription_result(
-            &mut messages,
-            &mut previews,
-            &serde_json::json!({
-                "type": "message",
-                "message": {
-                    "message_id": message_id,
-                    "direction": "received",
-                    "from": "alice",
-                    "plaintext": "hello",
-                    "recorded_at": index,
-                    "received_at": index
-                }
-            }),
-            false,
-        );
-    }
-
-    assert_eq!(messages.len(), TUI_MESSAGE_SCROLLBACK_LIMIT);
-    assert_eq!(
-        messages.first().map(|message| message.message_id.as_str()),
-        Some("0005")
-    );
-    assert_eq!(
-        messages.last().map(|message| message.message_id.as_str()),
-        Some("1004")
-    );
 }
 
 #[test]
@@ -1161,12 +1050,13 @@ fn local_stream_preview_ignores_echoed_deltas() {
 }
 
 #[test]
-fn subscription_final_message_replaces_stream_marker_with_mls_text() {
-    let mut messages = Vec::new();
+fn subscription_final_message_removes_live_stream_preview() {
+    // The plain feed no longer populates the pane (the timeline feed owns it),
+    // but it still clears the live stream preview when the agent stream's final
+    // row lands so a completed stream stops rendering in the pane's bottom block.
     let mut previews = Vec::new();
 
     apply_subscription_result(
-        &mut messages,
         &mut previews,
         &serde_json::json!({
             "type": "agent_stream_start",
@@ -1182,11 +1072,9 @@ fn subscription_final_message_replaces_stream_marker_with_mls_text() {
                 }
             }
         }),
-        false,
     );
     assert_eq!(previews.len(), 1);
     apply_subscription_result(
-        &mut messages,
         &mut previews,
         &serde_json::json!({
             "type": "agent_stream_final",
@@ -1203,15 +1091,8 @@ fn subscription_final_message_replaces_stream_marker_with_mls_text() {
                 }
             }
         }),
-        false,
     );
 
-    let rendered = message_lines(&messages, None)
-        .iter()
-        .map(line_text)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(rendered, vec!["alice: hello from MLS"]);
     assert!(previews.is_empty());
 }
 
@@ -1219,12 +1100,10 @@ fn subscription_final_message_replaces_stream_marker_with_mls_text() {
 fn all_chat_subscription_marks_nonselected_messages_unread() {
     let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut messages = Vec::new();
     let mut previews = Vec::new();
     let mut unread_counts = HashMap::new();
 
     let status = apply_tui_subscription_result(
-        &mut messages,
         &mut previews,
         &mut unread_counts,
         Some(selected_group_id),
@@ -1241,7 +1120,6 @@ fn all_chat_subscription_marks_nonselected_messages_unread() {
         }),
     );
 
-    assert_eq!(messages.len(), 0);
     assert_eq!(unread_counts.get(unread_group_id), Some(&1));
     assert_eq!(
         status,
@@ -1254,7 +1132,6 @@ fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_mes
     let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let stream_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    let mut messages = Vec::new();
     let mut previews = vec![LiveStreamPreview {
         group_id: unread_group_id.to_owned(),
         stream_id: stream_id.to_owned(),
@@ -1267,7 +1144,6 @@ fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_mes
     let mut unread_counts = HashMap::new();
 
     apply_tui_subscription_result(
-        &mut messages,
         &mut previews,
         &mut unread_counts,
         Some(selected_group_id),
@@ -1289,20 +1165,19 @@ fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_mes
         }),
     );
 
-    assert!(messages.is_empty());
     assert!(previews.is_empty());
     assert_eq!(unread_counts.get(unread_group_id), Some(&1));
 }
 
 #[test]
-fn all_chat_subscription_applies_selected_messages_without_unread_count() {
+fn all_chat_subscription_does_not_count_selected_group_as_unread() {
+    // A message for the loaded group must not bump its unread count; the pane is
+    // driven by the timeline feed, so the plain feed only counts off-screen groups.
     let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let mut messages = Vec::new();
     let mut previews = Vec::new();
     let mut unread_counts = HashMap::new();
 
-    apply_tui_subscription_result(
-        &mut messages,
+    let status = apply_tui_subscription_result(
         &mut previews,
         &mut unread_counts,
         Some(selected_group_id),
@@ -1319,21 +1194,18 @@ fn all_chat_subscription_applies_selected_messages_without_unread_count() {
         }),
     );
 
+    assert_eq!(status, None);
     assert_eq!(unread_counts.get(selected_group_id), None);
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].display_text, "hello here");
 }
 
 #[test]
 fn all_chat_subscription_ignores_initial_replay_for_unread_counts() {
     let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let replay_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut messages = Vec::new();
     let mut previews = Vec::new();
     let mut unread_counts = HashMap::new();
 
     let status = apply_tui_subscription_result(
-        &mut messages,
         &mut previews,
         &mut unread_counts,
         Some(selected_group_id),
@@ -1351,7 +1223,6 @@ fn all_chat_subscription_ignores_initial_replay_for_unread_counts() {
     );
 
     assert_eq!(status, None);
-    assert!(messages.is_empty());
     assert!(unread_counts.is_empty());
 }
 
@@ -1396,7 +1267,6 @@ fn message_subscription_gates_on_loaded_chat_not_highlighted_chat() {
     .expect("send highlighted message event");
 
     assert!(app.drain_message_subscription());
-    assert!(app.messages.is_empty());
     assert_eq!(app.unread_counts.get(highlighted_group_id), Some(&1));
 
     tx.send(SubscriptionEvent::Result(serde_json::json!({
@@ -1414,9 +1284,44 @@ fn message_subscription_gates_on_loaded_chat_not_highlighted_chat() {
 
     assert!(app.drain_message_subscription());
     assert_eq!(app.unread_counts.get(loaded_group_id), None);
-    assert_eq!(app.messages.len(), 1);
-    assert_eq!(app.messages[0].message_id, "loaded");
-    assert_eq!(app.messages[0].display_text, "hello loaded");
+}
+
+#[test]
+fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
+    // A picker reached via `A` from an active session keeps its background
+    // drains running. On the login/account-select screen the status line carries
+    // the nsec prompt and picker guidance, so a live drain must apply its state
+    // changes without overwriting that prompt.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    let (tx, rx) = mpsc::channel();
+    app.message_subscription = Some(MessageSubscription {
+        account_id: account_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    let prompt = "enter nsec; Enter submits, Esc cancels".to_owned();
+    app.status = prompt.clone();
+    tx.send(SubscriptionEvent::Error("relay dropped".to_owned()))
+        .expect("send error event");
+    assert!(app.drain_message_subscription());
+    assert_eq!(
+        app.status, prompt,
+        "the login prompt survives a background drain"
+    );
+
+    // The same event on the main view still surfaces on the status line.
+    app.screen = Screen::Main;
+    tx.send(SubscriptionEvent::Error("relay dropped".to_owned()))
+        .expect("send error event");
+    assert!(app.drain_message_subscription());
+    assert!(
+        app.status.contains("relay dropped"),
+        "main-view drains still set status, got: {}",
+        app.status
+    );
 }
 
 #[test]
@@ -1455,7 +1360,7 @@ fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
 
     assert!(app.accounts.is_empty());
     assert!(app.chats.is_empty());
-    assert!(app.messages.is_empty());
+    assert!(app.timeline.is_empty());
     assert!(app.unread_counts.is_empty());
     assert!(app.chat_subscription.is_none());
     assert!(app.message_subscription.is_none());
@@ -1474,7 +1379,7 @@ fn refresh_chats_starts_account_wide_stream_when_no_chats_are_visible() {
     app.refresh_chats().expect("refresh chats");
 
     assert!(app.chats.is_empty());
-    assert!(app.messages.is_empty());
+    assert!(app.timeline.is_empty());
     assert_eq!(
         app.message_subscription
             .as_ref()
@@ -1517,7 +1422,7 @@ fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
     app.refresh_chats().expect("refresh chats");
 
     assert!(app.chats.is_empty());
-    assert!(app.messages.is_empty());
+    assert!(app.timeline.is_empty());
     assert!(app.messages_account_id.is_none());
     assert!(app.messages_group_id.is_none());
     assert!(app.chat_subscription.is_none());
@@ -1535,6 +1440,23 @@ fn message_subscription_skips_initial_replay() {
             "subscribe".to_owned(),
             "--limit".to_owned(),
             "0".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn timeline_subscription_pins_the_initial_page_size() {
+    // Without --limit the daemon's default 50-row page transiently clobbers the
+    // snapshot's accurate has_more_before; pin it to the TUI page size.
+    assert_eq!(
+        timeline_subscription_args("group-1"),
+        vec![
+            "messages".to_owned(),
+            "timeline".to_owned(),
+            "subscribe".to_owned(),
+            "group-1".to_owned(),
+            "--limit".to_owned(),
+            TUI_TIMELINE_PAGE_SIZE.to_string(),
         ]
     );
 }
@@ -1583,16 +1505,56 @@ fn composer_redacts_nsec_imports_without_hiding_other_input() {
 #[test]
 fn account_setup_invocation_pipes_nsec_imports_to_stdin() {
     assert_eq!(
-        account_setup_invocation(Some("nsec1secret".to_owned())),
+        account_setup_invocation(Some("nsec1secret".to_owned()), None),
         WnInvocation {
             args: vec!["login".to_owned(), "--nsec-stdin".to_owned()],
             stdin: Some("nsec1secret\n".to_owned()),
         }
     );
     assert_eq!(
-        account_setup_invocation(Some("npub1bob".to_owned())),
+        account_setup_invocation(Some("npub1bob".to_owned()), None),
         WnInvocation {
             args: vec!["login".to_owned(), "npub1bob".to_owned()],
+            stdin: None,
+        }
+    );
+}
+
+#[test]
+fn account_setup_invocation_appends_first_run_setup_relay() {
+    // The first-run setup relay is appended as the one `--relay` flag account
+    // setup accepts (global for create-identity, command-local for login).
+    assert_eq!(
+        account_setup_invocation(None, Some("wss://relay.example".to_owned())),
+        WnInvocation {
+            args: vec![
+                "create-identity".to_owned(),
+                "--relay".to_owned(),
+                "wss://relay.example".to_owned(),
+            ],
+            stdin: None,
+        }
+    );
+    assert_eq!(
+        account_setup_invocation(
+            Some("nsec1secret".to_owned()),
+            Some("wss://relay.example".to_owned())
+        ),
+        WnInvocation {
+            args: vec![
+                "login".to_owned(),
+                "--nsec-stdin".to_owned(),
+                "--relay".to_owned(),
+                "wss://relay.example".to_owned(),
+            ],
+            stdin: Some("nsec1secret\n".to_owned()),
+        }
+    );
+    // A blank relay adds no flag.
+    assert_eq!(
+        account_setup_invocation(None, Some("  ".to_owned())),
+        WnInvocation {
+            args: vec!["create-identity".to_owned()],
             stdin: None,
         }
     );
@@ -1668,31 +1630,11 @@ fn account_rows_prefer_profile_display_name_then_name_then_npub() {
 }
 
 #[test]
-fn message_lines_use_sender_display_name_when_available() {
-    let messages = [serde_json::json!({
-        "message_id": "01",
-        "recorded_at": 10,
-        "received_at": 10,
-        "direction": "received",
-        "from": "abc123",
-        "from_display_name": "Alice Example",
-        "plaintext": "hello"
-    })]
-    .iter()
-    .filter_map(parse_message)
-    .collect::<Vec<_>>();
-
-    let rendered = message_lines(&messages, None)
-        .iter()
-        .map(line_text)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-
-    assert_eq!(rendered, vec!["Alice Example: hello"]);
-}
-
-#[test]
 fn message_account_row_uses_loaded_account_not_highlighted_account() {
+    // The pane colors a row green when it belongs to the *loaded* account, even
+    // when a different account is highlighted in the accounts list. A received
+    // row whose sender is the loaded account (alice) must render green; a row
+    // from someone else renders cyan.
     let alice = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let bob = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let mut app = test_tui_app(test_unused_client(), alice);
@@ -1705,37 +1647,29 @@ fn message_account_row_uses_loaded_account_not_highlighted_account() {
     app.selected_account = 1;
     app.messages_account_id = Some(alice.to_owned());
 
-    let rendered = message_lines(
-        &[
-            MessageRow {
-                message_id: "01".to_owned(),
-                direction: "sent".to_owned(),
-                from: alice.to_owned(),
-                from_display_name: None,
-                plaintext: "from alice".to_owned(),
-                display_text: "from alice".to_owned(),
-                recorded_at: 1,
-                received_at: 1,
-            },
-            MessageRow {
-                message_id: "02".to_owned(),
-                direction: "received".to_owned(),
-                from: bob.to_owned(),
-                from_display_name: Some("Bob".to_owned()),
-                plaintext: "from bob".to_owned(),
-                display_text: "from bob".to_owned(),
-                recorded_at: 2,
-                received_at: 2,
-            },
-        ],
-        app.message_account_row(),
-    )
-    .iter()
-    .map(line_text)
-    .filter(|line| !line.is_empty())
-    .collect::<Vec<_>>();
+    let mut from_alice = timeline_row("01", 1);
+    from_alice.direction = "received".to_owned();
+    from_alice.from = alice.to_owned();
+    let mut from_bob = timeline_row("02", 2);
+    from_bob.direction = "received".to_owned();
+    from_bob.from = bob.to_owned();
+    from_bob.from_display_name = Some("Bob".to_owned());
 
-    assert_eq!(rendered, vec!["me: from alice", "Bob: from bob"]);
+    let selected_account = app.message_account_row();
+    assert_eq!(
+        timeline_row_lines(&from_alice, selected_account)[0].spans[1]
+            .style
+            .fg,
+        Some(Color::Green),
+        "a row from the loaded account is colored as self"
+    );
+    assert_eq!(
+        timeline_row_lines(&from_bob, selected_account)[0].spans[1]
+            .style
+            .fg,
+        Some(Color::Cyan),
+        "a row from another sender is colored as other"
+    );
 }
 
 #[test]
@@ -1758,19 +1692,6 @@ fn move_index_clamps_at_list_edges() {
     assert_eq!(move_index(0, 3, 1), 1);
     assert_eq!(move_index(2, 3, 1), 2);
     assert_eq!(move_index(0, 0, 1), 0);
-}
-
-#[test]
-fn messages_scroll_offsets_anchor_to_bottom_and_clamp() {
-    // Content fits the viewport: no scrolling is possible.
-    assert_eq!(messages_scroll_offsets(5, 10, 0), (0, 0));
-    assert_eq!(messages_scroll_offsets(5, 10, 4), (0, 0));
-    // Pinned to the bottom shows the newest lines (offset = overflow).
-    assert_eq!(messages_scroll_offsets(40, 10, 0), (0, 30));
-    // Scrolling up moves the top offset toward the first line.
-    assert_eq!(messages_scroll_offsets(40, 10, 12), (12, 18));
-    // Scrollback past the top clamps to the first line.
-    assert_eq!(messages_scroll_offsets(40, 10, u16::MAX), (30, 0));
 }
 
 fn char_key(character: char) -> KeyEvent {
@@ -1823,6 +1744,9 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         client,
         initial_account: None,
         running: true,
+        screen: Screen::Main,
+        entered_main: true,
+        show_diagnostics: false,
         focus: Focus::Composer,
         accounts: vec![AccountRow {
             account_id: account_id.to_owned(),
@@ -1831,18 +1755,19 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
             local_signing: true,
         }],
         selected_account: 0,
+        picker_selection: 0,
         chats: Vec::new(),
         selected_chat: 0,
         messages_account_id: None,
         messages_group_id: None,
         unread_counts: HashMap::new(),
         show_archived_chats: false,
-        messages: Vec::new(),
-        messages_scroll: 0,
-        messages_viewport: 0,
+        timeline: Vec::new(),
+        timeline_scroll: TimelineScroll::default(),
         live_stream_previews: Vec::new(),
         chat_subscription: None,
         message_subscription: None,
+        timeline_subscription: None,
         group_state_subscription: None,
         daemon: DaemonView {
             running: true,
@@ -1862,6 +1787,8 @@ fn test_unused_client() -> WnClient {
         home: None,
         socket: None,
         relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
         secret_store: None,
         keychain_service: None,
     }
@@ -1875,6 +1802,8 @@ fn test_json_client(response: &str) -> (tempfile::TempDir, WnClient) {
         home: None,
         socket: None,
         relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
         secret_store: None,
         keychain_service: None,
     };
@@ -1950,6 +1879,46 @@ fn failed_due_stream_append_updates_last_flush_to_back_off_tick_retry() {
     let streaming = app.streaming.as_ref().expect("composer remains active");
     assert_eq!(streaming.pending_text, "queued");
     assert_eq!(streaming.last_flush, retry_gate);
+}
+
+#[test]
+fn streaming_keys_capture_input_before_screen_dispatch() {
+    // The streaming-composer check must sit ahead of the screen dispatch (behind
+    // only Ctrl-C), so any future Main->Login path with an open stream still
+    // routes keys to the stream while tick() keeps flushing, instead of the login
+    // handler consuming the key. Constructed by flipping the screen to Login with
+    // a live stream.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.streaming = Some(StreamComposer {
+        stream_id: "stream-1".to_owned(),
+        group_id: "bb".repeat(32),
+        pending_text: String::new(),
+        last_flush: Instant::now(),
+    });
+
+    // Main view: a character queues on the stream composer.
+    app.screen = Screen::Main;
+    app.handle_key(char_key('x')).expect("char in main");
+    assert_eq!(
+        app.streaming.as_ref().expect("stream active").pending_text,
+        "x"
+    );
+
+    // With the screen on the login/account-select flow, an open stream keeps
+    // capturing input; the login handler never sees the key.
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+    app.handle_key(char_key('y'))
+        .expect("char while login screen");
+    assert_eq!(
+        app.streaming.as_ref().expect("stream active").pending_text,
+        "xy"
+    );
+    assert_eq!(
+        app.screen,
+        Screen::Login(LoginMode::AccountSelect),
+        "the login handler never consumed the streaming key"
+    );
 }
 
 #[test]
@@ -2059,4 +2028,2210 @@ fn test_sleep_child() -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn timeout test process")
+}
+
+// ── Phase 1 timeline: rows, fold, scroll, heights, line building ────────
+
+#[test]
+fn parse_timeline_row_reads_core_fields() {
+    let value = serde_json::json!({
+        "message_id": "09be",
+        "source_message_id": "5b10",
+        "direction": "sent",
+        "group_id": "cdaa",
+        "from": "5a26",
+        "from_display_name": "Witty Gecko",
+        "plaintext": "msg-15",
+        "kind": 9,
+        "timeline_at": 1784070726u64,
+        "received_at": 1784070726u64,
+        "reply_to_message_id": null,
+        "reply_preview": null,
+        "media": null,
+        "agent_text_stream": null,
+        "reactions": { "by_emoji": {}, "user_reactions": [] },
+        "deleted": false,
+        "deleted_by_message_id": null
+    });
+
+    let row = parse_timeline_row(&value).expect("row parses");
+
+    assert_eq!(row.message_id, "09be");
+    assert_eq!(row.direction, "sent");
+    assert_eq!(row.from, "5a26");
+    assert_eq!(row.from_display_name.as_deref(), Some("Witty Gecko"));
+    assert_eq!(row.plaintext, "msg-15");
+    assert_eq!(row.display_text, "msg-15");
+    assert_eq!(row.timeline_at, 1784070726);
+    assert_eq!(row.received_at, 1784070726);
+    assert!(!row.deleted);
+    assert!(row.reactions.is_empty());
+    assert!(row.reply.is_none());
+    assert!(row.attachments.is_empty());
+}
+
+#[test]
+fn parse_timeline_row_tallies_reactions_by_emoji_in_deterministic_order() {
+    let value = serde_json::json!({
+        "message_id": "1",
+        "plaintext": "hi",
+        "reactions": {
+            "by_emoji": {
+                "\u{2764}": ["a", "b"],
+                "\u{1f44d}": ["1e23"]
+            },
+            "user_reactions": [{ "emoji": "\u{2764}" }]
+        }
+    });
+
+    let row = parse_timeline_row(&value).expect("row parses");
+
+    // Deterministic order regardless of JSON object ordering, and count is the
+    // reactor-list length.
+    assert_eq!(
+        row.reactions,
+        vec![
+            TimelineReaction {
+                emoji: "\u{2764}".to_owned(),
+                count: 2
+            },
+            TimelineReaction {
+                emoji: "\u{1f44d}".to_owned(),
+                count: 1
+            },
+        ]
+    );
+}
+
+#[test]
+fn parse_timeline_row_reads_hydrated_reply_preview() {
+    let value = serde_json::json!({
+        "message_id": "2",
+        "plaintext": "a reply",
+        "reply_to_message_id": "parent-id",
+        "reply_preview": {
+            "message_id_hex": "parent-id",
+            "sender": "Alice",
+            "plaintext": "the original",
+            "kind": 9,
+            "deleted": false
+        }
+    });
+
+    let reply = parse_timeline_row(&value)
+        .expect("row parses")
+        .reply
+        .expect("reply present");
+
+    assert_eq!(reply.reply_to_message_id, "parent-id");
+    let preview = reply.preview.expect("preview hydrated");
+    assert_eq!(preview.sender.as_deref(), Some("Alice"));
+    assert_eq!(preview.plaintext, "the original");
+    assert!(!preview.deleted);
+}
+
+#[test]
+fn parse_timeline_row_reply_without_preview_keeps_parent_id_only() {
+    let value = serde_json::json!({
+        "message_id": "3",
+        "plaintext": "orphan reply",
+        "reply_to_message_id": "unresolved-parent",
+        "reply_preview": null
+    });
+
+    let reply = parse_timeline_row(&value)
+        .expect("row parses")
+        .reply
+        .expect("reply present");
+
+    assert_eq!(reply.reply_to_message_id, "unresolved-parent");
+    assert!(reply.preview.is_none());
+}
+
+#[test]
+fn parse_timeline_row_reads_media_imeta_mime_and_filename() {
+    let value = serde_json::json!({
+        "message_id": "4",
+        "plaintext": "look",
+        "media": {
+            "imeta": [
+                [
+                    "imeta",
+                    "v encrypted-media-v1",
+                    "locator blossom-v1 https://blossom.example/abc",
+                    "ciphertext_sha256 deadbeef",
+                    "plaintext_sha256 cafebabe",
+                    "nonce 00112233",
+                    "m image/png",
+                    "filename pixel.png"
+                ],
+                [
+                    "imeta",
+                    "m application/pdf",
+                    "filename spec.pdf"
+                ]
+            ]
+        }
+    });
+
+    let attachments = parse_timeline_row(&value).expect("row parses").attachments;
+
+    assert_eq!(
+        attachments,
+        vec![
+            TimelineAttachment {
+                mime: Some("image/png".to_owned()),
+                filename: Some("pixel.png".to_owned()),
+            },
+            TimelineAttachment {
+                mime: Some("application/pdf".to_owned()),
+                filename: Some("spec.pdf".to_owned()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn parse_timeline_row_filters_agent_stream_start_marker() {
+    let value = serde_json::json!({
+        "message_id": "5",
+        "plaintext": "{}",
+        "agent_text_stream": { "kind": "start", "stream_id": "abc" }
+    });
+    assert!(parse_timeline_row(&value).is_none());
+}
+
+#[test]
+fn parse_timeline_row_marks_tombstone() {
+    let value = serde_json::json!({
+        "message_id": "6",
+        "plaintext": "",
+        "deleted": true,
+        "deleted_by_message_id": "a83f"
+    });
+    let row = parse_timeline_row(&value).expect("tombstone row is kept");
+    assert!(row.deleted);
+    assert_eq!(row.plaintext, "");
+}
+
+#[test]
+fn parse_timeline_row_derives_group_system_and_stream_summaries() {
+    let group_system = serde_json::json!({
+        "message_id": "7",
+        "kind": 1210,
+        "from_display_name": "alice",
+        "plaintext": "{\"system_type\":\"member_added\",\"data\":{\"subject\":\"bob\"}}"
+    });
+    assert_eq!(
+        parse_timeline_row(&group_system).unwrap().display_text,
+        "alice added bob"
+    );
+
+    let stream_final = serde_json::json!({
+        "message_id": "8",
+        "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
+        "agent_text_stream": {
+            "kind": "final",
+            "stream_id": "s1",
+            "final_text_or_reference": "hello from the stream"
+        }
+    });
+    assert_eq!(
+        parse_timeline_row(&stream_final).unwrap().display_text,
+        "hello from the stream"
+    );
+}
+
+#[test]
+fn parse_timeline_event_reads_ready_initial_and_projection() {
+    let ready = serde_json::json!({
+        "trigger": "TimelineSubscriptionReady",
+        "type": "timeline_subscription_ready"
+    });
+    assert!(matches!(parse_timeline_event(&ready), TimelineEvent::Ready));
+
+    let initial = serde_json::json!({
+        "trigger": "InitialTimelinePage",
+        "type": "initial_timeline_page",
+        "has_more_before": true,
+        "messages": [
+            { "message_id": "a", "plaintext": "one", "timeline_at": 1 },
+            { "message_id": "b", "plaintext": "two", "timeline_at": 2 }
+        ]
+    });
+    match parse_timeline_event(&initial) {
+        TimelineEvent::InitialPage {
+            rows,
+            has_more_before,
+        } => {
+            assert!(has_more_before);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].message_id, "a");
+        }
+        other => panic!("expected initial page, got {other:?}"),
+    }
+
+    let projection = serde_json::json!({
+        "trigger": "TimelineProjectionUpdated",
+        "type": "timeline_projection_updated",
+        "group_id": "cdaa",
+        "changes": [
+            {
+                "type": "upsert",
+                "trigger": "NewMessage",
+                "message": { "message_id": "c", "plaintext": "three", "timeline_at": 3 }
+            },
+            { "type": "remove", "message_id": "d", "reason": "expired" }
+        ]
+    });
+    match parse_timeline_event(&projection) {
+        TimelineEvent::ProjectionUpdated { group_id, changes } => {
+            assert_eq!(group_id, "cdaa");
+            assert_eq!(changes.len(), 2);
+            assert!(matches!(&changes[0], TimelineChange::Upsert(row) if row.message_id == "c"));
+            assert!(
+                matches!(&changes[1], TimelineChange::Remove { message_id } if message_id == "d")
+            );
+        }
+        other => panic!("expected projection update, got {other:?}"),
+    }
+
+    let unknown = serde_json::json!({ "type": "something_else" });
+    assert!(matches!(
+        parse_timeline_event(&unknown),
+        TimelineEvent::Other
+    ));
+}
+
+/// Build a minimal timeline row for fold/scroll tests.
+fn timeline_row(message_id: &str, timeline_at: u64) -> TimelineRow {
+    TimelineRow {
+        message_id: message_id.to_owned(),
+        direction: "received".to_owned(),
+        from: "someone".to_owned(),
+        from_display_name: None,
+        plaintext: format!("msg {message_id}"),
+        display_text: format!("msg {message_id}"),
+        timeline_at,
+        received_at: timeline_at,
+        deleted: false,
+        reactions: Vec::new(),
+        reply: None,
+        attachments: Vec::new(),
+    }
+}
+
+fn timeline_ids(rows: &[TimelineRow]) -> Vec<&str> {
+    rows.iter().map(|row| row.message_id.as_str()).collect()
+}
+
+/// The rendered `[HH:MM] ` timestamp is local wall-clock and machine-dependent
+/// (`local_hhmm`), so row-content tests assert its fixed 8-column shape and
+/// return the text after it instead of a timezone-specific value. The formatting
+/// arithmetic is covered deterministically by `format_hhmm_renders_local_offset`.
+fn hhmm_body(text: &str) -> String {
+    let bytes = text.as_bytes();
+    assert!(
+        bytes.len() >= 8
+            && bytes[0] == b'['
+            && bytes[1].is_ascii_digit()
+            && bytes[2].is_ascii_digit()
+            && bytes[3] == b':'
+            && bytes[4].is_ascii_digit()
+            && bytes[5].is_ascii_digit()
+            && bytes[6] == b']'
+            && bytes[7] == b' ',
+        "expected a [HH:MM] prefix, got {text:?}"
+    );
+    text[8..].to_owned()
+}
+
+#[test]
+fn format_hhmm_renders_local_offset() {
+    // 12:34:56 UTC.
+    assert_eq!(format_hhmm_with_offset(45_296, 0), "12:34");
+    // Same instant five hours west of UTC.
+    assert_eq!(format_hhmm_with_offset(45_296, -5 * 3_600), "07:34");
+    // Wall-clock wraps around midnight without panicking on the negative.
+    assert_eq!(format_hhmm_with_offset(0, -3_600), "23:00");
+}
+
+#[test]
+fn upsert_timeline_row_keeps_sorted_by_timeline_at_then_id() {
+    let mut rows = Vec::new();
+    upsert_timeline_row(&mut rows, timeline_row("b", 20));
+    upsert_timeline_row(&mut rows, timeline_row("a", 10));
+    // Same second: tiebreak by message_id ascending.
+    upsert_timeline_row(&mut rows, timeline_row("z", 20));
+    upsert_timeline_row(&mut rows, timeline_row("y", 20));
+
+    assert_eq!(timeline_ids(&rows), vec!["a", "b", "y", "z"]);
+}
+
+#[test]
+fn upsert_timeline_row_is_idempotent_by_message_id() {
+    let mut rows = Vec::new();
+    upsert_timeline_row(&mut rows, timeline_row("a", 10));
+    upsert_timeline_row(&mut rows, timeline_row("b", 20));
+
+    // Re-applying the same row (as duplicated projection events do) must not
+    // append a second copy and must leave the list unchanged in effect.
+    let before = rows.clone();
+    upsert_timeline_row(&mut rows, timeline_row("a", 10));
+    upsert_timeline_row(&mut rows, timeline_row("b", 20));
+
+    assert_eq!(rows, before);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn upsert_timeline_row_replaces_existing_row_content() {
+    let mut rows = vec![timeline_row("a", 10)];
+    let mut updated = timeline_row("a", 10);
+    updated.reactions = vec![TimelineReaction {
+        emoji: "\u{1f44d}".to_owned(),
+        count: 1,
+    }];
+    upsert_timeline_row(&mut rows, updated);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reactions.len(), 1);
+}
+
+#[test]
+fn apply_timeline_change_reports_insert_update_and_remove() {
+    let mut rows = vec![timeline_row("a", 10), timeline_row("c", 30)];
+
+    // New row inserted in sorted position between a and c.
+    let outcome = apply_timeline_change(
+        &mut rows,
+        TimelineChange::Upsert(Box::new(timeline_row("b", 20))),
+    );
+    assert_eq!(outcome, TimelineFoldOutcome::Inserted(1));
+    assert_eq!(timeline_ids(&rows), vec!["a", "b", "c"]);
+
+    // Same id again = update, not a second row (duplicated events).
+    let outcome = apply_timeline_change(
+        &mut rows,
+        TimelineChange::Upsert(Box::new(timeline_row("b", 20))),
+    );
+    assert_eq!(outcome, TimelineFoldOutcome::Updated(1));
+    assert_eq!(rows.len(), 3);
+
+    // Remove drops the row.
+    let outcome = apply_timeline_change(
+        &mut rows,
+        TimelineChange::Remove {
+            message_id: "b".to_owned(),
+        },
+    );
+    assert_eq!(outcome, TimelineFoldOutcome::Removed(1));
+    assert_eq!(timeline_ids(&rows), vec!["a", "c"]);
+
+    // Removing an unknown id changes nothing.
+    let outcome = apply_timeline_change(
+        &mut rows,
+        TimelineChange::Remove {
+            message_id: "zzz".to_owned(),
+        },
+    );
+    assert_eq!(outcome, TimelineFoldOutcome::Unchanged);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn oldest_timeline_cursor_reads_first_row() {
+    assert!(oldest_timeline_cursor(&[]).is_none());
+    let rows = vec![timeline_row("a", 10), timeline_row("b", 20)];
+    assert_eq!(
+        oldest_timeline_cursor(&rows),
+        Some(TimelineCursor {
+            timeline_at: 10,
+            message_id: "a".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn timeline_scroll_default_is_pinned_to_newest() {
+    let scroll = TimelineScroll::default();
+    assert!(scroll.is_pinned());
+    assert_eq!(scroll.offset, 0);
+    // With no explicit selection, the newest message is selected.
+    assert_eq!(scroll.resolved_selection(4), Some(3));
+    assert!(scroll.resolved_selection(0).is_none());
+}
+
+#[test]
+fn timeline_scroll_stays_pinned_when_message_arrives_at_bottom() {
+    let mut scroll = TimelineScroll::default();
+    // A new newest row is appended: old len 3 -> new len 4, index 3.
+    scroll.on_insert(3, 4);
+    assert!(scroll.is_pinned());
+    assert_eq!(scroll.offset, 0);
+}
+
+#[test]
+fn timeline_scroll_holds_position_when_scrolled_up_and_message_arrives() {
+    // Reading history, 2 messages up from the bottom.
+    let mut scroll = TimelineScroll {
+        offset: 2,
+        ..TimelineScroll::default()
+    };
+    // A new newest row is appended (old len 4 -> new len 5, index 4).
+    scroll.on_insert(4, 5);
+    assert_eq!(scroll.offset, 3, "offset bumps by one so content stays put");
+}
+
+#[test]
+fn timeline_scroll_prepend_keeps_same_message_selected_and_visible() {
+    // Reading the top of a 5-row list.
+    let mut scroll = TimelineScroll {
+        offset: 4,
+        selection: Some(0),
+        visible_range: Some((0, 2)),
+        ..TimelineScroll::default()
+    };
+
+    // Page in 5 older rows at the front.
+    scroll.on_prepend(5);
+
+    // The same logical rows stay selected and visible; only their absolute
+    // indices shifted by N. Offset counts from the unchanged bottom, so it must
+    // NOT move (moving it would jump the view to the newly loaded oldest rows).
+    assert_eq!(scroll.selection, Some(5));
+    assert_eq!(scroll.visible_range, Some((5, 7)));
+    assert_eq!(scroll.offset, 4);
+}
+
+#[test]
+fn timeline_scroll_prepend_of_nothing_is_a_noop() {
+    let mut scroll = TimelineScroll {
+        offset: 2,
+        selection: Some(1),
+        visible_range: Some((0, 3)),
+        ..TimelineScroll::default()
+    };
+    let before = scroll.clone();
+    scroll.on_prepend(0);
+    assert_eq!(scroll, before);
+}
+
+#[test]
+fn timeline_scroll_selection_within_viewport_does_not_scroll() {
+    let mut scroll = TimelineScroll {
+        visible_range: Some((10, 19)),
+        ..TimelineScroll::default()
+    };
+    // Newest (19) selected by default; move up to 18, still on screen.
+    scroll.select_up(20);
+    assert_eq!(scroll.selection, Some(18));
+    assert_eq!(
+        scroll.offset, 0,
+        "selection inside the viewport scrolls nothing"
+    );
+}
+
+#[test]
+fn timeline_scroll_selection_leaving_top_nudges_offset_up() {
+    let mut scroll = TimelineScroll {
+        offset: 5,
+        selection: Some(10),
+        visible_range: Some((10, 19)),
+        ..TimelineScroll::default()
+    };
+    scroll.select_up(30);
+    assert_eq!(scroll.selection, Some(9));
+    assert_eq!(
+        scroll.offset, 6,
+        "viewport nudges up by one when selection exits the top"
+    );
+}
+
+#[test]
+fn timeline_scroll_selection_leaving_bottom_nudges_offset_down() {
+    let mut scroll = TimelineScroll {
+        offset: 5,
+        selection: Some(19),
+        visible_range: Some((10, 19)),
+        ..TimelineScroll::default()
+    };
+    scroll.select_down(30);
+    assert_eq!(scroll.selection, Some(20));
+    assert_eq!(
+        scroll.offset, 4,
+        "viewport nudges down by one when selection exits the bottom"
+    );
+}
+
+#[test]
+fn timeline_scroll_selection_clamps_at_both_ends() {
+    let mut scroll = TimelineScroll {
+        selection: Some(0),
+        ..TimelineScroll::default()
+    };
+    scroll.select_up(20);
+    assert_eq!(scroll.selection, Some(0));
+    scroll.selection = Some(19);
+    scroll.select_down(20);
+    assert_eq!(scroll.selection, Some(19));
+}
+
+#[test]
+fn timeline_scroll_jump_newest_selects_newest_and_pins() {
+    let mut scroll = TimelineScroll {
+        offset: 7,
+        selection: Some(3),
+        ..TimelineScroll::default()
+    };
+    scroll.jump_newest(20);
+    assert_eq!(scroll.offset, 0);
+    assert!(scroll.is_pinned());
+    assert_eq!(scroll.resolved_selection(20), Some(19));
+}
+
+#[test]
+fn timeline_scroll_jump_oldest_selects_first_and_scrolls_to_top() {
+    let mut scroll = TimelineScroll::default();
+    scroll.jump_oldest(20);
+    assert_eq!(scroll.selection, Some(0));
+    assert_eq!(scroll.offset, 19);
+    // Empty list is a no-op.
+    let mut empty = TimelineScroll::default();
+    empty.jump_oldest(0);
+    assert_eq!(empty, TimelineScroll::default());
+}
+
+#[test]
+fn timeline_scroll_page_up_moves_by_visible_count_and_follows() {
+    let mut scroll = TimelineScroll {
+        offset: 0,
+        selection: Some(50),
+        visible_range: Some((45, 54)), // 10 visible messages
+        ..TimelineScroll::default()
+    };
+    scroll.page_up(100);
+    assert_eq!(scroll.selection, Some(40), "moved up by the visible count");
+    assert_eq!(
+        scroll.offset, 5,
+        "viewport follows the selection above the top"
+    );
+}
+
+#[test]
+fn timeline_scroll_page_down_moves_by_visible_count() {
+    let mut scroll = TimelineScroll {
+        offset: 8,
+        selection: Some(40),
+        visible_range: Some((40, 49)),
+        ..TimelineScroll::default()
+    };
+    scroll.page_down(100);
+    assert_eq!(
+        scroll.selection,
+        Some(50),
+        "moved down by the visible count"
+    );
+    assert!(
+        scroll.offset < 8,
+        "viewport follows the selection below the bottom"
+    );
+}
+
+#[test]
+fn timeline_scroll_page_clamps_at_edges() {
+    let mut scroll = TimelineScroll {
+        selection: Some(3),
+        visible_range: Some((0, 9)),
+        ..TimelineScroll::default()
+    };
+    scroll.page_up(40);
+    assert_eq!(scroll.selection, Some(0));
+    scroll.selection = Some(35);
+    scroll.page_down(40);
+    assert_eq!(scroll.selection, Some(39));
+}
+
+#[test]
+fn timeline_scroll_records_visible_range_from_the_renderer() {
+    let mut scroll = TimelineScroll::default();
+    scroll.record_visible_range(3, 9, 20);
+    assert_eq!(scroll.visible_range, Some((3, 9)));
+    assert_eq!(
+        scroll.offset, 0,
+        "a small offset with `last` at the anchor is not renormalized"
+    );
+}
+
+#[test]
+fn timeline_scroll_record_visible_range_clamps_a_stale_over_large_offset() {
+    // `g` set offset to len-1 (29); the renderer clamped the anchor to 0 and
+    // filled forward to `last` = 4. The effective offset is (30-1) - 4 = 25.
+    let mut scroll = TimelineScroll {
+        offset: 29,
+        ..TimelineScroll::default()
+    };
+    scroll.record_visible_range(0, 4, 30);
+    assert_eq!(
+        scroll.offset, 25,
+        "offset clamps down to the drawn geometry"
+    );
+    // Idempotent: a second identical frame leaves it put.
+    scroll.record_visible_range(0, 4, 30);
+    assert_eq!(scroll.offset, 25);
+}
+
+#[test]
+fn timeline_scroll_requests_older_history_only_at_the_oldest_row() {
+    let mut scroll = TimelineScroll {
+        has_more_before: true,
+        selection: Some(5),
+        ..TimelineScroll::default()
+    };
+    assert!(!scroll.at_oldest(20));
+    assert!(!scroll.should_request_older(20), "not at the oldest row");
+
+    scroll.selection = Some(0);
+    assert!(scroll.at_oldest(20));
+    assert!(
+        scroll.should_request_older(20),
+        "at oldest with more history"
+    );
+
+    scroll.loading_older = true;
+    assert!(
+        !scroll.should_request_older(20),
+        "a page request is already in flight"
+    );
+
+    scroll.loading_older = false;
+    scroll.has_more_before = false;
+    assert!(!scroll.should_request_older(20), "no more history to load");
+}
+
+#[test]
+fn timeline_scroll_remove_below_selection_shifts_it_down() {
+    let mut scroll = TimelineScroll {
+        offset: 3,
+        selection: Some(10),
+        ..TimelineScroll::default()
+    };
+    // Remove a row older than the selection (index 4 of an old list of 20).
+    scroll.on_remove(4, 19);
+    assert_eq!(
+        scroll.selection,
+        Some(9),
+        "same message stays selected after older row drops"
+    );
+    assert_eq!(
+        scroll.offset, 3,
+        "removing below the anchor does not move the viewport"
+    );
+}
+
+#[test]
+fn timeline_scroll_remove_newer_than_anchor_pulls_offset_down_while_scrolled_up() {
+    let mut scroll = TimelineScroll {
+        offset: 2,
+        selection: Some(1),
+        ..TimelineScroll::default()
+    };
+    // Old list of 10; anchor = 9 - 2 = 7. Remove index 8 (newer than anchor).
+    scroll.on_remove(8, 9);
+    assert_eq!(scroll.offset, 1, "viewport follows the shrinking bottom");
+}
+
+#[test]
+fn timeline_scroll_remove_clamps_selection_when_list_empties() {
+    let mut scroll = TimelineScroll {
+        selection: Some(0),
+        ..TimelineScroll::default()
+    };
+    scroll.on_remove(0, 0);
+    assert_eq!(scroll.resolved_selection(0), None);
+}
+
+#[test]
+fn cap_timeline_scrollback_trims_oldest_only_when_pinned() {
+    let mut rows: Vec<TimelineRow> = (0..(TUI_MESSAGE_SCROLLBACK_LIMIT + 5))
+        .map(|i| timeline_row(&format!("{i:05}"), i as u64))
+        .collect();
+    let mut scroll = TimelineScroll {
+        selection: Some(rows.len() - 1),
+        ..TimelineScroll::default()
+    };
+    cap_timeline_scrollback(&mut rows, &mut scroll);
+    assert_eq!(rows.len(), TUI_MESSAGE_SCROLLBACK_LIMIT);
+    assert_eq!(
+        rows.first().unwrap().message_id,
+        "00005",
+        "oldest rows dropped"
+    );
+    assert_eq!(
+        scroll.selection,
+        Some(TUI_MESSAGE_SCROLLBACK_LIMIT - 1),
+        "selection follows the dropped rows so it stays on the same message"
+    );
+}
+
+#[test]
+fn cap_timeline_scrollback_never_trims_while_scrolled_up() {
+    let mut rows: Vec<TimelineRow> = (0..(TUI_MESSAGE_SCROLLBACK_LIMIT + 5))
+        .map(|i| timeline_row(&format!("{i:05}"), i as u64))
+        .collect();
+    let original_len = rows.len();
+    let mut scroll = TimelineScroll {
+        offset: 3,
+        ..TimelineScroll::default()
+    };
+    cap_timeline_scrollback(&mut rows, &mut scroll);
+    assert_eq!(
+        rows.len(),
+        original_len,
+        "capping while scrolled up would fight history paging"
+    );
+}
+
+#[test]
+fn timeline_row_lines_render_timestamp_author_and_content() {
+    let mut row = timeline_row("m1", 45296);
+    row.from_display_name = Some("Alice".to_owned());
+    row.display_text = "hello world".to_owned();
+
+    let lines = timeline_row_lines(&row, None);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(hhmm_body(&line_text(&lines[0])), "Alice: hello world");
+    assert_eq!(
+        lines[0].spans[0].style.fg,
+        Some(Color::DarkGray),
+        "timestamp is dark gray"
+    );
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(Color::Cyan),
+        "other author is cyan"
+    );
+    assert!(
+        lines[0].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD)
+    );
+}
+
+#[test]
+fn timeline_row_lines_color_own_messages_green() {
+    let mut row = timeline_row("m2", 0);
+    row.direction = "sent".to_owned();
+    row.from_display_name = Some("Me".to_owned());
+    let lines = timeline_row_lines(&row, None);
+    assert_eq!(
+        lines[0].spans[1].style.fg,
+        Some(Color::Green),
+        "own author is green"
+    );
+}
+
+#[test]
+fn timeline_row_lines_indent_embedded_newlines_to_the_prefix_width() {
+    let mut row = timeline_row("m3", 0);
+    row.from_display_name = Some("Al".to_owned());
+    row.display_text = "one\ntwo".to_owned();
+    let lines = timeline_row_lines(&row, None);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(hhmm_body(&line_text(&lines[0])), "Al: one");
+    // Continuation indents to "[HH:MM] Al: " width (12 columns).
+    assert_eq!(line_text(&lines[1]), "            two");
+}
+
+#[test]
+fn timeline_row_lines_render_reply_context_above_content() {
+    let mut row = timeline_row("m", 0);
+    row.from_display_name = Some("Bob".to_owned());
+    row.display_text = "agreed".to_owned();
+    row.reply = Some(TimelineReply {
+        reply_to_message_id: "parent".to_owned(),
+        preview: Some(TimelineReplyPreview {
+            sender: Some("Alice".to_owned()),
+            plaintext: "this is a long parent message body over thirty chars".to_owned(),
+            deleted: false,
+        }),
+    });
+    let lines = timeline_row_lines(&row, None);
+    assert_eq!(
+        line_text(&lines[0]),
+        "             reply to Alice: \"this is a long parent message ...\""
+    );
+    assert!(
+        lines[0].spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::ITALIC)
+    );
+    assert_eq!(lines[0].spans[1].style.fg, Some(Color::DarkGray));
+    assert_eq!(hhmm_body(&line_text(&lines[1])), "Bob: agreed");
+}
+
+#[test]
+fn timeline_row_lines_reply_falls_back_to_shortened_id() {
+    let mut row = timeline_row("m", 0);
+    row.reply = Some(TimelineReply {
+        reply_to_message_id: "0123456789abcdef".to_owned(),
+        preview: None,
+    });
+    let lines = timeline_row_lines(&row, None);
+    assert!(line_text(&lines[0]).contains("reply to 0123...bcdef"));
+}
+
+#[test]
+fn timeline_row_lines_reply_fallback_strips_terminal_controls_from_parent_id() {
+    // The parent id is untrusted; both fallback branches (no preview, and a
+    // preview whose sender resolves empty) must sanitize it like every sibling
+    // path. Controls sit in the surviving prefix/suffix so shortening keeps them.
+    let raw_id = "\u{202e}ab\u{7}cdefghij0123456789";
+
+    // Branch 1: no preview at all.
+    let mut row = timeline_row("m", 0);
+    row.reply = Some(TimelineReply {
+        reply_to_message_id: raw_id.to_owned(),
+        preview: None,
+    });
+    let text = line_text(&timeline_row_lines(&row, None)[0]);
+    assert!(
+        !text.contains('\u{202e}'),
+        "bidi override stripped from the no-preview fallback id"
+    );
+    assert!(
+        !text.contains('\u{7}'),
+        "control char stripped from the no-preview fallback id"
+    );
+
+    // Branch 2: a preview whose sender is absent falls back to the parent id.
+    let mut row = timeline_row("m", 0);
+    row.reply = Some(TimelineReply {
+        reply_to_message_id: raw_id.to_owned(),
+        preview: Some(TimelineReplyPreview {
+            sender: None,
+            plaintext: "hi".to_owned(),
+            deleted: false,
+        }),
+    });
+    let text = line_text(&timeline_row_lines(&row, None)[0]);
+    assert!(
+        !text.contains('\u{202e}'),
+        "bidi override stripped from the empty-sender fallback id"
+    );
+    assert!(
+        !text.contains('\u{7}'),
+        "control char stripped from the empty-sender fallback id"
+    );
+}
+
+#[test]
+fn timeline_row_lines_render_reactions_below_content() {
+    let mut row = timeline_row("m", 0);
+    row.reactions = vec![
+        TimelineReaction {
+            emoji: "\u{1f44d}".to_owned(),
+            count: 2,
+        },
+        TimelineReaction {
+            emoji: "\u{2764}".to_owned(),
+            count: 1,
+        },
+    ];
+    let lines = timeline_row_lines(&row, None);
+    let reactions = lines.last().unwrap();
+    assert_eq!(line_text(reactions).trim_start(), "\u{1f44d} 2  \u{2764} 1");
+    assert_eq!(reactions.spans[1].style.fg, Some(Color::Yellow));
+}
+
+#[test]
+fn timeline_row_lines_render_tombstone_for_deleted_rows() {
+    let mut row = timeline_row("m", 0);
+    row.from_display_name = Some("Al".to_owned());
+    row.deleted = true;
+    row.plaintext = String::new();
+    row.display_text = String::new();
+    let lines = timeline_row_lines(&row, None);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(hhmm_body(&line_text(&lines[0])), "Al: message deleted");
+    let tombstone = lines[0].spans.last().unwrap();
+    assert!(tombstone.style.add_modifier.contains(Modifier::ITALIC));
+    assert_eq!(tombstone.style.fg, Some(Color::DarkGray));
+}
+
+#[test]
+fn timeline_row_lines_render_attachment_placeholders() {
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![
+        TimelineAttachment {
+            mime: Some("image/png".to_owned()),
+            filename: Some("pixel.png".to_owned()),
+        },
+        TimelineAttachment {
+            mime: Some("application/pdf".to_owned()),
+            filename: Some("spec.pdf".to_owned()),
+        },
+    ];
+    let lines = timeline_row_lines(&row, None);
+    assert_eq!(line_text(&lines[1]).trim_start(), "[img pixel.png]");
+    assert_eq!(line_text(&lines[2]).trim_start(), "[file spec.pdf]");
+}
+
+#[test]
+fn timeline_row_lines_strip_terminal_control_sequences() {
+    let mut row = timeline_row("m", 0);
+    row.from_display_name = Some("Al\u{202e}ice".to_owned());
+    row.display_text = "hi\u{7}there".to_owned();
+    let lines = timeline_row_lines(&row, None);
+    let text = line_text(&lines[0]);
+    assert!(
+        !text.contains('\u{202e}'),
+        "bidi override stripped from author"
+    );
+    assert!(
+        !text.contains('\u{7}'),
+        "control char stripped from content"
+    );
+    assert_eq!(hhmm_body(&text), "Alice: hithere");
+}
+
+#[test]
+fn timeline_row_height_counts_content_reactions_reply_and_separator() {
+    let mut row = timeline_row("m1", 0);
+    row.from_display_name = Some("Al".to_owned());
+    row.display_text = "hi".to_owned();
+    // one content line + one blank separator row
+    assert_eq!(timeline_row_height(&row, None, 80), 2);
+
+    row.reactions = vec![TimelineReaction {
+        emoji: "x".to_owned(),
+        count: 1,
+    }];
+    assert_eq!(timeline_row_height(&row, None, 80), 3);
+
+    row.reply = Some(TimelineReply {
+        reply_to_message_id: "p".to_owned(),
+        preview: None,
+    });
+    assert_eq!(timeline_row_height(&row, None, 80), 4);
+}
+
+#[test]
+fn timeline_row_height_accounts_for_wrapping() {
+    let mut row = timeline_row("m", 0);
+    row.from_display_name = Some("A".to_owned());
+    row.display_text = "x".repeat(200);
+    assert!(
+        timeline_row_height(&row, None, 40) > 3,
+        "a 200-char body must wrap to several rows at width 40"
+    );
+}
+
+#[test]
+fn timeline_row_heights_maps_every_row() {
+    let rows = vec![timeline_row("a", 0), timeline_row("b", 1)];
+    assert_eq!(timeline_row_heights(&rows, None, 80).len(), 2);
+}
+
+#[test]
+fn timeline_visible_range_pins_newest_at_bottom() {
+    let heights = vec![1u16; 20];
+    assert_eq!(timeline_visible_range(&heights, 10, 0, 0), Some((10, 19)));
+}
+
+#[test]
+fn timeline_visible_range_walks_back_from_the_anchor() {
+    let heights = vec![1u16; 20];
+    // offset 10: anchor = 9, fill backward then render forward through the anchor.
+    assert_eq!(timeline_visible_range(&heights, 10, 10, 0), Some((0, 9)));
+}
+
+#[test]
+fn timeline_visible_range_scroll_to_top_fills_forward_not_blank() {
+    let heights = vec![1u16; 20];
+    // offset at the max (as `g` sets it) shows the oldest at the top and fills
+    // the viewport forward — never a nearly blank pane.
+    let (first, last) = timeline_visible_range(&heights, 10, 19, 0).unwrap();
+    assert_eq!(first, 0);
+    assert!(last >= 9, "viewport filled forward, got last={last}");
+}
+
+#[test]
+fn timeline_visible_range_shows_oversized_message() {
+    let heights = vec![50u16];
+    assert_eq!(timeline_visible_range(&heights, 10, 0, 0), Some((0, 0)));
+}
+
+#[test]
+fn timeline_visible_range_bottom_block_consumes_space_only_at_newest() {
+    let heights = vec![1u16; 20];
+    // Pinned at newest: a 3-row bottom block (live stream preview) shrinks the
+    // message viewport from 10 to 7.
+    assert_eq!(timeline_visible_range(&heights, 10, 0, 3), Some((13, 19)));
+    // Scrolled up: the anchor is not the newest, so the block is not shown and
+    // does not consume viewport space.
+    assert_eq!(timeline_visible_range(&heights, 10, 5, 3), Some((5, 14)));
+}
+
+#[test]
+fn timeline_visible_range_is_empty_without_rows_or_viewport() {
+    assert_eq!(timeline_visible_range(&[], 10, 0, 0), None);
+    assert_eq!(timeline_visible_range(&[1u16; 5], 0, 0, 0), None);
+}
+
+/// Render one frame: compute the visible range with the real height/visibility
+/// algorithm, feed it back to the scroll model, and return the visible ids.
+fn timeline_frame(
+    rows: &[TimelineRow],
+    scroll: &mut TimelineScroll,
+    width: u16,
+    viewport: u16,
+) -> Vec<String> {
+    let heights = timeline_row_heights(rows, None, width);
+    match timeline_visible_range(&heights, viewport, scroll.offset, 0) {
+        Some((first, last)) => {
+            scroll.record_visible_range(first, last, rows.len());
+            rows[first..=last]
+                .iter()
+                .map(|row| row.message_id.clone())
+                .collect()
+        }
+        None => Vec::new(),
+    }
+}
+
+fn uniform_row(id: &str, timeline_at: u64) -> TimelineRow {
+    let mut row = timeline_row(id, timeline_at);
+    row.from_display_name = Some("a".to_owned());
+    row.display_text = "x".to_owned();
+    row
+}
+
+#[test]
+fn scrolled_up_view_is_stable_across_arrival_and_history_paging() {
+    let (width, viewport) = (80u16, 10u16);
+    let mut rows: Vec<TimelineRow> = (10..40)
+        .map(|i| uniform_row(&format!("{i:03}"), i))
+        .collect();
+    let mut scroll = TimelineScroll::default();
+
+    // Scroll to the oldest row, rendering each frame like the real loop.
+    timeline_frame(&rows, &mut scroll, width, viewport);
+    for _ in 0..rows.len() + 5 {
+        scroll.select_up(rows.len());
+        timeline_frame(&rows, &mut scroll, width, viewport);
+    }
+    assert!(scroll.at_oldest(rows.len()));
+    let visible_before = timeline_frame(&rows, &mut scroll, width, viewport);
+    let selected_before = rows[scroll.resolved_selection(rows.len()).unwrap()]
+        .message_id
+        .clone();
+
+    // A new message arrives at the bottom while scrolled up: the view must not move.
+    let outcome = apply_timeline_change(
+        &mut rows,
+        TimelineChange::Upsert(Box::new(uniform_row("999", 999))),
+    );
+    if let TimelineFoldOutcome::Inserted(index) = outcome {
+        scroll.on_insert(index, rows.len());
+    }
+    assert_eq!(
+        timeline_frame(&rows, &mut scroll, width, viewport),
+        visible_before,
+        "an incoming message must not move a scrolled-up reader"
+    );
+
+    // Page in 5 older rows at the front: the view still must not move.
+    let older: Vec<TimelineRow> = (5..10)
+        .map(|i| uniform_row(&format!("{i:03}"), i))
+        .collect();
+    let paged_in = older.len();
+    rows.extend(older);
+    sort_timeline_rows(&mut rows);
+    scroll.on_prepend(paged_in);
+    assert_eq!(
+        timeline_frame(&rows, &mut scroll, width, viewport),
+        visible_before,
+        "history paging must not move the view (offset stays; indices shift)"
+    );
+    assert_eq!(
+        rows[scroll.resolved_selection(rows.len()).unwrap()].message_id,
+        selected_before,
+        "the same message stays selected across paging"
+    );
+}
+
+#[test]
+fn jump_oldest_then_paging_keeps_the_top_of_history_stable() {
+    // `g` (jump_oldest) sets a geometrically over-large offset; the renderer
+    // clamps the anchor to 0. If that stale offset survives, a later prepend
+    // anchors below the true top and the view jumps. Rendering must renormalize
+    // the offset from the drawn geometry so paging keeps the top stable.
+    let (width, viewport) = (80u16, 10u16);
+    let mut rows: Vec<TimelineRow> = (10..40)
+        .map(|i| uniform_row(&format!("{i:03}"), i))
+        .collect();
+    let mut scroll = TimelineScroll::default();
+
+    // Jump to the oldest row, then render one frame.
+    scroll.jump_oldest(rows.len());
+    let visible_before = timeline_frame(&rows, &mut scroll, width, viewport);
+    assert_eq!(
+        visible_before.first().map(String::as_str),
+        Some("010"),
+        "g shows the oldest row at the top"
+    );
+
+    // Page in 5 older rows at the front; the offset stays put (rule 6) and the
+    // view must not move.
+    let older: Vec<TimelineRow> = (5..10)
+        .map(|i| uniform_row(&format!("{i:03}"), i))
+        .collect();
+    let paged_in = older.len();
+    rows.extend(older);
+    sort_timeline_rows(&mut rows);
+    scroll.on_prepend(paged_in);
+
+    assert_eq!(
+        timeline_frame(&rows, &mut scroll, width, viewport),
+        visible_before,
+        "history paging after `g` must not move the view"
+    );
+}
+
+#[test]
+fn pinned_view_follows_incoming_messages() {
+    let (width, viewport) = (80u16, 10u16);
+    let mut rows: Vec<TimelineRow> = (0..12)
+        .map(|i| uniform_row(&format!("{i:03}"), i))
+        .collect();
+    let mut scroll = TimelineScroll::default();
+    timeline_frame(&rows, &mut scroll, width, viewport);
+
+    let outcome = apply_timeline_change(
+        &mut rows,
+        TimelineChange::Upsert(Box::new(uniform_row("099", 99))),
+    );
+    if let TimelineFoldOutcome::Inserted(index) = outcome {
+        scroll.on_insert(index, rows.len());
+    }
+    let visible = timeline_frame(&rows, &mut scroll, width, viewport);
+    assert!(scroll.is_pinned());
+    assert_eq!(
+        visible.last().map(String::as_str),
+        Some("099"),
+        "pinned view shows the new message"
+    );
+}
+
+// ── Phase 1 timeline: pane title, event fold, and app wiring ────────────
+
+#[test]
+fn timeline_pane_title_reports_offscreen_row_counts() {
+    // Everything on screen: the plain title.
+    assert_eq!(timeline_pane_title(5, 0, 4), "Messages");
+    // Older rows above the view.
+    assert_eq!(timeline_pane_title(10, 3, 9), "Messages [3 older]");
+    // Newer rows below the view.
+    assert_eq!(timeline_pane_title(10, 0, 6), "Messages [3 newer]");
+    // Both directions.
+    assert_eq!(
+        timeline_pane_title(10, 2, 6),
+        "Messages [2 older | 3 newer]"
+    );
+}
+
+#[test]
+fn apply_timeline_event_initial_page_sets_rows_and_more_before() {
+    let mut rows = Vec::new();
+    let mut scroll = TimelineScroll::default();
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("group"),
+        TimelineEvent::InitialPage {
+            rows: vec![timeline_row("b", 20), timeline_row("a", 10)],
+            has_more_before: true,
+        },
+    );
+    assert_eq!(timeline_ids(&rows), vec!["a", "b"], "merged and sorted");
+    assert!(scroll.has_more_before);
+
+    // Re-delivering the same page (the feed duplicates events) is a no-op in
+    // effect: the fold upserts by id and never appends a second copy.
+    let before = rows.clone();
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("group"),
+        TimelineEvent::InitialPage {
+            rows: vec![timeline_row("b", 20), timeline_row("a", 10)],
+            has_more_before: true,
+        },
+    );
+    assert_eq!(rows, before, "duplicated initial page is idempotent by id");
+}
+
+#[test]
+fn apply_timeline_event_initial_page_compensates_scroll_for_newer_rows() {
+    // The snapshot loaded rows 000..029 and the reader scrolled up. The
+    // subscription's initial page then carries the same rows plus 3 newer rows
+    // that arrived between the snapshot and the subscribe; folding them must
+    // drive the scroll model so the row being read stays anchored, exactly like
+    // the projection arm.
+    let mut rows: Vec<TimelineRow> = (0..30)
+        .map(|i| timeline_row(&format!("{i:03}"), i))
+        .collect();
+    let mut scroll = TimelineScroll {
+        offset: 5,
+        selection: Some(24),
+        visible_range: Some((20, 24)),
+        ..TimelineScroll::default()
+    };
+
+    let mut page: Vec<TimelineRow> = (0..33)
+        .map(|i| timeline_row(&format!("{i:03}"), i))
+        .collect();
+    // Deliver the page out of order to prove the fold indexes by sorted position.
+    page.reverse();
+
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("group"),
+        TimelineEvent::InitialPage {
+            rows: page,
+            has_more_before: false,
+        },
+    );
+
+    assert_eq!(rows.len(), 33, "3 newer rows merged in");
+    let anchor = (rows.len() - 1) - scroll.offset;
+    assert_eq!(
+        rows[anchor].message_id, "024",
+        "the row being read stays anchored despite the newer rows"
+    );
+    assert_eq!(scroll.selection, Some(24), "same row stays selected");
+}
+
+#[test]
+fn apply_timeline_event_projection_folds_and_drives_scroll_for_loaded_group() {
+    let mut rows = vec![timeline_row("a", 10), timeline_row("b", 20)];
+    let mut scroll = TimelineScroll::default();
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("group"),
+        TimelineEvent::ProjectionUpdated {
+            group_id: "group".to_owned(),
+            changes: vec![TimelineChange::Upsert(Box::new(timeline_row("c", 30)))],
+        },
+    );
+    assert_eq!(timeline_ids(&rows), vec!["a", "b", "c"]);
+    assert!(
+        scroll.is_pinned(),
+        "an arrival while pinned keeps the view pinned"
+    );
+
+    // A duplicated projection event (optimistic write plus relay echo) must not
+    // append a second copy.
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("group"),
+        TimelineEvent::ProjectionUpdated {
+            group_id: "group".to_owned(),
+            changes: vec![TimelineChange::Upsert(Box::new(timeline_row("c", 30)))],
+        },
+    );
+    assert_eq!(timeline_ids(&rows), vec!["a", "b", "c"], "idempotent by id");
+
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("group"),
+        TimelineEvent::ProjectionUpdated {
+            group_id: "group".to_owned(),
+            changes: vec![TimelineChange::Remove {
+                message_id: "a".to_owned(),
+            }],
+        },
+    );
+    assert_eq!(timeline_ids(&rows), vec!["b", "c"]);
+}
+
+#[test]
+fn apply_timeline_event_ignores_projection_for_other_group() {
+    let mut rows = vec![timeline_row("a", 10)];
+    let mut scroll = TimelineScroll::default();
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("loaded"),
+        TimelineEvent::ProjectionUpdated {
+            group_id: "elsewhere".to_owned(),
+            changes: vec![TimelineChange::Upsert(Box::new(timeline_row("z", 99)))],
+        },
+    );
+    assert_eq!(
+        timeline_ids(&rows),
+        vec!["a"],
+        "off-group changes are dropped"
+    );
+}
+
+#[test]
+fn send_message_upserts_an_optimistic_timeline_row() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_tempdir, client) =
+        test_json_client(r#"{"ok":true,"result":{"published":1,"message_ids":["m1"]}}"#);
+    let mut app = test_tui_app(client, account_id);
+    app.messages_account_id = Some(account_id.to_owned());
+    app.messages_group_id = Some(group_id.to_owned());
+
+    app.send_message("hello there".to_owned())
+        .expect("send message");
+
+    assert_eq!(app.timeline.len(), 1);
+    assert_eq!(app.timeline[0].message_id, "m1");
+    assert_eq!(app.timeline[0].direction, "sent");
+    assert_eq!(app.timeline[0].display_text, "hello there");
+    assert!(
+        app.timeline_scroll.is_pinned(),
+        "an own send keeps the view pinned to the bottom"
+    );
+}
+
+#[test]
+fn refresh_messages_loads_the_materialized_timeline_page() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"messages":[{"message_id":"m1","direction":"received","from":"alice","plaintext":"hello","timeline_at":100,"received_at":100}],"has_more_before":true}}"#,
+    );
+    let mut app = test_tui_app(client, account_id);
+    app.chats = vec![ChatRow {
+        group_id: group_id.to_owned(),
+        name: "general".to_owned(),
+        archived: false,
+    }];
+    app.selected_chat = 0;
+
+    app.refresh_messages().expect("refresh messages");
+
+    assert_eq!(app.timeline.len(), 1);
+    assert_eq!(app.timeline[0].message_id, "m1");
+    assert!(app.timeline_scroll.has_more_before);
+    assert!(app.timeline_scroll.is_pinned());
+    assert_eq!(app.timeline_scroll.selection, None);
+    assert_eq!(app.messages_group_id.as_deref(), Some(group_id));
+}
+
+#[test]
+fn load_older_messages_prepends_a_page_and_updates_the_cursor() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"messages":[{"message_id":"old","direction":"received","from":"alice","plaintext":"older","timeline_at":50,"received_at":50}],"has_more_before":false}}"#,
+    );
+    let mut app = test_tui_app(client, account_id);
+    app.messages_account_id = Some(account_id.to_owned());
+    app.messages_group_id = Some(group_id.to_owned());
+    app.timeline = vec![timeline_row("new", 100)];
+    app.timeline_scroll.has_more_before = true;
+
+    app.load_older_messages().expect("load older messages");
+
+    assert_eq!(timeline_ids(&app.timeline), vec!["old", "new"]);
+    assert!(
+        !app.timeline_scroll.has_more_before,
+        "page reported no more"
+    );
+    assert!(!app.timeline_scroll.loading_older, "in-flight flag cleared");
+}
+
+#[test]
+fn load_older_messages_clears_loading_flag_on_error() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"backend gone"}}"#);
+    let mut app = test_tui_app(client, account_id);
+    app.messages_account_id = Some(account_id.to_owned());
+    app.messages_group_id = Some(group_id.to_owned());
+    app.timeline = vec![timeline_row("new", 100)];
+    app.timeline_scroll.has_more_before = true;
+
+    let outcome = app.load_older_messages();
+
+    assert!(
+        outcome.is_err(),
+        "the backend failure propagates to the caller"
+    );
+    assert_eq!(app.timeline.len(), 1, "no rows added on failure");
+    assert!(
+        !app.timeline_scroll.loading_older,
+        "the in-flight flag is cleared on the error path so paging is not wedged"
+    );
+}
+
+#[test]
+fn load_older_messages_upserts_overlap_without_duplicating_or_overshifting() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    // The fetched page overlaps the oldest loaded row ("new") and adds one
+    // genuinely older row ("old"). An exclusive cursor should not overlap, but if
+    // it ever does the merge must stay idempotent: no duplicate, no over-shift.
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"messages":[
+            {"message_id":"old","direction":"received","from":"alice","plaintext":"older","timeline_at":50,"received_at":50},
+            {"message_id":"new","direction":"received","from":"alice","plaintext":"newer","timeline_at":100,"received_at":100}
+        ],"has_more_before":false}}"#,
+    );
+    let mut app = test_tui_app(client, account_id);
+    app.messages_account_id = Some(account_id.to_owned());
+    app.messages_group_id = Some(group_id.to_owned());
+    app.timeline = vec![timeline_row("new", 100)];
+    app.timeline_scroll.has_more_before = true;
+    app.timeline_scroll.selection = Some(0);
+    app.timeline_scroll.visible_range = Some((0, 0));
+
+    app.load_older_messages().expect("load older messages");
+
+    assert_eq!(
+        timeline_ids(&app.timeline),
+        vec!["old", "new"],
+        "the overlapping row is upserted, not duplicated"
+    );
+    assert_eq!(
+        app.timeline_scroll.selection,
+        Some(1),
+        "only the one genuinely-new row shifts the selection"
+    );
+    assert_eq!(app.timeline_scroll.visible_range, Some((1, 1)));
+}
+
+#[test]
+fn messages_select_up_pages_in_older_history_at_the_oldest_row() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"messages":[{"message_id":"old","direction":"received","from":"alice","plaintext":"older","timeline_at":5,"received_at":5}],"has_more_before":false}}"#,
+    );
+    let mut app = test_tui_app(client, account_id);
+    app.focus = Focus::Messages;
+    app.messages_account_id = Some(account_id.to_owned());
+    app.messages_group_id = Some(group_id.to_owned());
+    app.timeline = vec![timeline_row("new", 10)];
+    app.timeline_scroll.has_more_before = true;
+    app.timeline_scroll.selection = Some(0);
+
+    app.handle_key(char_key('k'))
+        .expect("handle 'k' at oldest row");
+
+    assert_eq!(timeline_ids(&app.timeline), vec!["old", "new"]);
+    assert!(!app.timeline_scroll.has_more_before);
+}
+
+#[test]
+fn messages_jump_oldest_pages_in_older_history() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"messages":[{"message_id":"old","direction":"received","from":"alice","plaintext":"older","timeline_at":5,"received_at":5}],"has_more_before":false}}"#,
+    );
+    let mut app = test_tui_app(client, account_id);
+    app.focus = Focus::Messages;
+    app.messages_account_id = Some(account_id.to_owned());
+    app.messages_group_id = Some(group_id.to_owned());
+    app.timeline = vec![timeline_row("new", 10)];
+    app.timeline_scroll.has_more_before = true;
+
+    // `g` jumps to the oldest loaded row and must fetch older history, like `k`.
+    app.handle_key(char_key('g'))
+        .expect("handle 'g' jump oldest");
+
+    assert_eq!(timeline_ids(&app.timeline), vec!["old", "new"]);
+    assert!(!app.timeline_scroll.has_more_before);
+}
+
+#[test]
+fn drain_timeline_subscription_applies_events_for_the_loaded_group_only() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let other_group = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let mut app = test_tui_app(test_unused_client(), account_id);
+    app.messages_group_id = Some(group_id.to_owned());
+    let (tx, rx) = mpsc::channel();
+    app.timeline_subscription = Some(TimelineSubscription {
+        account_id: account_id.to_owned(),
+        group_id: group_id.to_owned(),
+        child: test_sleep_child(),
+        rx,
+    });
+
+    tx.send(SubscriptionEvent::Result(serde_json::json!({
+        "type": "initial_timeline_page",
+        "has_more_before": true,
+        "messages": [
+            { "message_id": "a", "plaintext": "one", "timeline_at": 1 },
+            { "message_id": "b", "plaintext": "two", "timeline_at": 2 }
+        ]
+    })))
+    .expect("send initial page");
+    assert!(app.drain_timeline_subscription());
+    assert_eq!(timeline_ids(&app.timeline), vec!["a", "b"]);
+    assert!(app.timeline_scroll.has_more_before);
+
+    tx.send(SubscriptionEvent::Result(serde_json::json!({
+        "type": "timeline_projection_updated",
+        "group_id": group_id,
+        "changes": [
+            { "type": "upsert", "message": { "message_id": "c", "plaintext": "three", "timeline_at": 3 } }
+        ]
+    })))
+    .expect("send projection for loaded group");
+    assert!(app.drain_timeline_subscription());
+    assert_eq!(timeline_ids(&app.timeline), vec!["a", "b", "c"]);
+
+    tx.send(SubscriptionEvent::Result(serde_json::json!({
+        "type": "timeline_projection_updated",
+        "group_id": other_group,
+        "changes": [
+            { "type": "upsert", "message": { "message_id": "z", "plaintext": "nope", "timeline_at": 9 } }
+        ]
+    })))
+    .expect("send projection for another group");
+    assert!(app.drain_timeline_subscription());
+    assert_eq!(
+        timeline_ids(&app.timeline),
+        vec!["a", "b", "c"],
+        "a projection for another group is ignored"
+    );
+}
+
+#[test]
+fn messages_pane_keys_drive_the_selection_and_composer_focus() {
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut app = test_tui_app(test_unused_client(), account_id);
+    app.focus = Focus::Messages;
+    app.timeline = (0..5).map(|i| timeline_row(&format!("m{i}"), i)).collect();
+    // No older history, so navigation never shells out (the client is unused).
+    app.timeline_scroll.has_more_before = false;
+
+    assert_eq!(
+        app.timeline_scroll.resolved_selection(5),
+        Some(4),
+        "newest by default"
+    );
+    app.handle_key(char_key('k')).expect("k");
+    assert_eq!(app.timeline_scroll.resolved_selection(5), Some(3));
+    app.handle_key(char_key('g')).expect("g");
+    assert_eq!(
+        app.timeline_scroll.resolved_selection(5),
+        Some(0),
+        "g jumps to oldest"
+    );
+    app.handle_key(char_key('j')).expect("j");
+    assert_eq!(app.timeline_scroll.resolved_selection(5), Some(1));
+    app.handle_key(char_key('G')).expect("G");
+    assert_eq!(
+        app.timeline_scroll.resolved_selection(5),
+        Some(4),
+        "G jumps to newest"
+    );
+    assert!(app.timeline_scroll.is_pinned(), "G pins to the bottom");
+    app.handle_key(char_key('i')).expect("i");
+    assert_eq!(app.focus, Focus::Composer, "i focuses the composer");
+}
+
+#[test]
+fn render_messages_wraps_long_lines_so_the_tail_is_visible() {
+    // The height model (`timeline_row_height`) measures with wrapping, so the
+    // renderer must wrap too or long lines truncate at the pane edge and the
+    // reserved-vs-drawn height mismatch breaks bottom-anchoring.
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut app = test_tui_app(test_unused_client(), account_id);
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.from_display_name = Some("Al".to_owned());
+    // ~100 chars, wider than the ~28-column messages pane; the tail only renders
+    // if the paragraph wraps.
+    row.display_text = format!("{}TAILMARKER", "word ".repeat(19));
+    app.timeline = vec![row];
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(
+        rendered.contains("TAILMARKER"),
+        "the wrapped tail of a long message must render, not truncate at the pane edge"
+    );
+}
+
+// --- Phase 2: the shell (screen model, key routing, status/hints bars) ---
+
+#[test]
+fn startup_screen_routes_by_account_count() {
+    assert_eq!(startup_screen(0, false), Screen::Login(LoginMode::Menu));
+    assert_eq!(startup_screen(1, false), Screen::Main);
+    assert_eq!(
+        startup_screen(2, false),
+        Screen::Login(LoginMode::AccountSelect)
+    );
+    assert_eq!(
+        startup_screen(9, false),
+        Screen::Login(LoginMode::AccountSelect)
+    );
+    // An explicit --account selection enters the main view even with several
+    // accounts; a resolved single/none selection is unaffected.
+    assert_eq!(startup_screen(2, true), Screen::Main);
+    assert_eq!(startup_screen(9, true), Screen::Main);
+    assert_eq!(startup_screen(0, true), Screen::Login(LoginMode::Menu));
+}
+
+#[test]
+fn focus_cycles_the_three_main_panes() {
+    assert_eq!(Focus::Chats.next(), Focus::Messages);
+    assert_eq!(Focus::Messages.next(), Focus::Composer);
+    assert_eq!(Focus::Composer.next(), Focus::Chats);
+    assert_eq!(Focus::Chats.previous(), Focus::Composer);
+    assert_eq!(Focus::Messages.previous(), Focus::Chats);
+    assert_eq!(Focus::Composer.previous(), Focus::Messages);
+}
+
+#[test]
+fn login_mode_for_accounts_picks_the_launching_screen() {
+    assert_eq!(login_mode_for_accounts(0), LoginMode::Menu);
+    assert_eq!(login_mode_for_accounts(1), LoginMode::AccountSelect);
+    assert_eq!(login_mode_for_accounts(4), LoginMode::AccountSelect);
+}
+
+#[test]
+fn masked_secret_hides_every_character() {
+    assert_eq!(masked_secret(""), "");
+    assert_eq!(masked_secret("nsec1abc"), "********");
+    // Multi-byte characters each mask to a single `*`.
+    assert_eq!(masked_secret("aé😀"), "***");
+}
+
+#[test]
+fn status_bar_line_assembles_daemon_counts_and_status() {
+    assert_eq!(
+        status_bar_line("alice", true, 3, 5, "loaded 2 message(s)", 200),
+        "alice · daemon on · 3 chats · 5 unread · loaded 2 message(s)"
+    );
+    assert_eq!(
+        status_bar_line("bob", false, 0, 0, "", 200),
+        "bob · daemon off · 0 chats · 0 unread · "
+    );
+    // Narrow widths shorten the assembled line (middle ellipsis keeps head + tail).
+    let narrow = status_bar_line("alice", true, 3, 5, "loaded", 20);
+    assert!(narrow.chars().count() <= 20, "over width: {narrow:?}");
+    assert!(narrow.contains("..."), "expected truncation: {narrow:?}");
+}
+
+#[test]
+fn status_bar_line_strips_control_sequences_from_untrusted_fields() {
+    assert_eq!(
+        status_bar_line("al\u{1b}[31mice", true, 1, 0, "ok\u{1b}[2J", 200),
+        "al[31mice · daemon on · 1 chats · 0 unread · ok[2J"
+    );
+}
+
+#[test]
+fn hints_line_matches_the_keymap_per_screen_and_focus() {
+    assert_eq!(
+        hints_line(Screen::Main, Focus::Chats, true),
+        "j/k navigate  Enter open  A accounts  / command  ? help  q quit"
+    );
+    assert_eq!(
+        hints_line(Screen::Main, Focus::Messages, true),
+        "j/k select  G/g ends  PgUp older  i compose  Tab cycle"
+    );
+    assert_eq!(
+        hints_line(Screen::Main, Focus::Composer, true),
+        "Enter send  Esc clear"
+    );
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::Menu), Focus::Chats, false),
+        "c create identity  l nsec login  q quit"
+    );
+    // The account picker shows `Esc back` only when a main session exists to
+    // return to; at the startup picker `Esc` is inert, so the hint is omitted.
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::AccountSelect), Focus::Chats, true),
+        "j/k navigate  Enter select  c create  l nsec  Esc back  q quit"
+    );
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::AccountSelect), Focus::Chats, false),
+        "j/k navigate  Enter select  c create  l nsec  q quit"
+    );
+    assert_eq!(
+        hints_line(Screen::Login(LoginMode::NsecEntry), Focus::Chats, false),
+        "Enter submit  Esc back"
+    );
+}
+
+#[test]
+fn daemon_start_args_forward_first_run_relays() {
+    assert_eq!(
+        daemon_start_args(&[], &[]),
+        vec!["daemon".to_owned(), "start".to_owned()]
+    );
+    assert_eq!(
+        daemon_start_args(
+            &["wss://a".to_owned(), "wss://b".to_owned()],
+            &["wss://c".to_owned()],
+        ),
+        vec![
+            "daemon".to_owned(),
+            "start".to_owned(),
+            "--discovery-relays".to_owned(),
+            "wss://a,wss://b".to_owned(),
+            "--default-account-relays".to_owned(),
+            "wss://c".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn account_setup_relay_fills_in_only_without_a_global_relay() {
+    let mut client = test_unused_client();
+    client.default_account_relays = vec!["wss://default".to_owned()];
+    client.discovery_relays = vec!["wss://discovery".to_owned()];
+    assert_eq!(
+        client.account_setup_relay().as_deref(),
+        Some("wss://default")
+    );
+
+    // Discovery relay is the fallback when no default account relay is set.
+    client.default_account_relays.clear();
+    assert_eq!(
+        client.account_setup_relay().as_deref(),
+        Some("wss://discovery")
+    );
+
+    // A global `--relay` already covers setup (`command` appends it), so none here.
+    client.relay = Some("wss://global".to_owned());
+    assert_eq!(client.account_setup_relay(), None);
+}
+
+#[test]
+fn slash_command_parser_handles_diagnostics_toggle() {
+    assert_eq!(
+        parse_slash_command("/diagnostics"),
+        Ok(SlashCommand::Diagnostics)
+    );
+    assert!(parse_slash_command("/diagnostics on").is_err());
+}
+
+#[test]
+fn diagnostics_slash_command_toggles_the_panel() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    assert!(!app.show_diagnostics);
+    app.run_slash_command(SlashCommand::Diagnostics)
+        .expect("toggle on");
+    assert!(app.show_diagnostics);
+    app.run_slash_command(SlashCommand::Diagnostics)
+        .expect("toggle off");
+    assert!(!app.show_diagnostics);
+}
+
+#[test]
+fn login_menu_keys_open_nsec_entry_and_quit() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::Menu);
+
+    app.handle_key(char_key('l')).expect("l");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+
+    app.screen = Screen::Login(LoginMode::Menu);
+    app.handle_key(char_key('q')).expect("q");
+    assert!(!app.running, "q quits from the login menu");
+}
+
+#[test]
+fn login_create_failure_stays_on_the_login_screen() {
+    // The fake exe does not exist, so create fails; the error must surface on the
+    // status line without leaving the login screen (errors never tear down).
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::Menu);
+    app.handle_key(char_key('c')).expect("c");
+    assert_eq!(app.screen, Screen::Login(LoginMode::Menu));
+    assert!(
+        app.status.starts_with("error:"),
+        "expected surfaced error, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn nsec_entry_accepts_masked_input_and_esc_returns_to_picker() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input.clear();
+
+    for character in "nsec1secret".chars() {
+        app.handle_key(char_key(character)).expect("char");
+    }
+    assert_eq!(app.input, "nsec1secret");
+    assert_eq!(masked_secret(&app.input), "***********");
+
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .expect("backspace");
+    assert_eq!(app.input, "nsec1secre");
+
+    // Esc clears the secret and returns to the picker (one account exists).
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert!(app.input.is_empty(), "esc clears the entered secret");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+}
+
+#[test]
+fn nsec_entry_esc_returns_to_the_menu_without_accounts() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.accounts.clear();
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input = "partial".to_owned();
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert!(app.input.is_empty());
+    assert_eq!(app.screen, Screen::Login(LoginMode::Menu));
+}
+
+#[test]
+fn nsec_entry_q_is_typed_not_a_quit() {
+    // `q` quits only outside the composer with an empty input; during nsec entry
+    // it is ordinary input and must append to the masked field, never quit.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input.clear();
+
+    app.handle_key(char_key('q')).expect("q");
+
+    assert_eq!(app.input, "q", "q is entered into the masked nsec field");
+    assert!(app.running, "q must not quit during nsec entry");
+}
+
+#[test]
+fn nsec_entry_empty_submit_reports_and_stays() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input = "   ".to_owned();
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+    assert!(app.input.is_empty(), "the field is cleared on submit");
+    assert!(app.status.contains("empty"), "got {}", app.status);
+}
+
+#[test]
+fn account_picker_esc_discards_navigation_and_keeps_the_active_account() {
+    // Regression: picker navigation must not mutate the live selection. Before
+    // the fix, `j` moved `selected_account` directly, so `Esc` (which only calls
+    // `show_main` with no chat reload) left the status bar and
+    // `require_selected_local_account` reporting the highlighted account while
+    // the loaded chats/messages still belonged to the active one.
+    let alice = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &alice);
+    app.accounts.push(AccountRow {
+        account_id: "bb".repeat(32),
+        npub: "npub1bob".to_owned(),
+        display_name: Some("Bob".to_owned()),
+        local_signing: true,
+    });
+    // Alice (index 0) is the active account with her view loaded.
+    app.selected_account = 0;
+    app.messages_account_id = Some(alice.clone());
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+
+    // `A` opens the picker from the active session; highlight a *different*
+    // account, then cancel with `Esc`.
+    app.handle_key(char_key('A')).expect("A");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+    app.handle_key(char_key('j')).expect("j");
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+
+    // Esc discards the highlight: the active account and its loaded view are
+    // untouched, so account-scoped commands still run against Alice.
+    assert_eq!(app.screen, Screen::Main);
+    assert_eq!(app.focus, Focus::Chats);
+    assert_eq!(app.selected_account, 0);
+    assert_eq!(app.require_selected_local_account().unwrap(), alice);
+    assert_eq!(app.messages_account_id.as_deref(), Some(alice.as_str()));
+}
+
+#[test]
+fn account_picker_enter_commits_the_highlighted_account() {
+    let alice = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &alice);
+    app.accounts.push(AccountRow {
+        account_id: "bb".repeat(32),
+        npub: "npub1bob".to_owned(),
+        display_name: Some("Bob".to_owned()),
+        local_signing: true,
+    });
+    app.selected_account = 0;
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+
+    // `A` opens the picker, `j` highlights Bob, `Enter` commits the selection.
+    app.handle_key(char_key('A')).expect("A");
+    app.handle_key(char_key('j')).expect("j");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+
+    assert_eq!(app.screen, Screen::Main);
+    assert_eq!(
+        app.selected_account, 1,
+        "Enter commits the highlighted account"
+    );
+}
+
+#[test]
+fn account_picker_esc_is_inert_before_main_is_active() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.entered_main = false;
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert_eq!(
+        app.screen,
+        Screen::Login(LoginMode::AccountSelect),
+        "no main view to return to yet"
+    );
+}
+
+#[test]
+fn account_picker_l_opens_nsec_entry() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+    app.handle_key(char_key('l')).expect("l");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+}
+
+#[test]
+fn shift_a_reopens_the_account_picker_from_the_chat_list() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('A')).expect("A");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+}
+
+#[test]
+fn enter_opens_the_chat_and_focuses_messages() {
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) =
+        test_json_client(r#"{"ok":true,"result":{"messages":[],"has_more_before":false}}"#);
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.daemon = DaemonView::default();
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+    }];
+    app.selected_chat = 0;
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(
+        app.focus,
+        Focus::Messages,
+        "opening a chat moves focus to the messages pane"
+    );
+    assert_eq!(app.messages_group_id.as_deref(), Some(group_id.as_str()));
+}
+
+#[test]
+fn start_routes_to_login_menu_without_accounts() {
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.daemon = DaemonView::default();
+    app.start().expect("start");
+    assert_eq!(app.screen, Screen::Login(LoginMode::Menu));
+    assert!(app.accounts.is_empty());
+}
+
+#[test]
+fn start_enters_main_with_a_single_account() {
+    let account_id = "aa".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"accounts":[{{"account_id":"{account_id}","npub":"npub1alice","local_signing":true}}]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default();
+    app.start().expect("start");
+    assert_eq!(app.screen, Screen::Main);
+    assert_eq!(app.accounts.len(), 1);
+}
+
+#[test]
+fn start_opens_the_account_picker_with_several_accounts() {
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"accounts":[{{"account_id":"{a}","npub":"npub1a","local_signing":true}},{{"account_id":"{b}","npub":"npub1b","local_signing":true}}]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &a);
+    app.daemon = DaemonView::default();
+    app.entered_main = false;
+    app.start().expect("start");
+    assert_eq!(app.screen, Screen::Login(LoginMode::AccountSelect));
+    assert_eq!(app.accounts.len(), 2);
+    assert!(
+        !app.entered_main,
+        "the startup picker has no active main yet"
+    );
+}
+
+#[test]
+fn start_with_explicit_account_enters_main_with_that_accounts_chats() {
+    // `wn tui --account <b>` with several accounts must honor the explicit
+    // selection and open the main view directly, not the account picker.
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"accounts":[{{"account_id":"{a}","npub":"npub1a","local_signing":true}},{{"account_id":"{b}","npub":"npub1b","local_signing":true}}],"chats":[]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &a);
+    app.daemon = DaemonView::default();
+    app.initial_account = Some(b.clone());
+    app.entered_main = false;
+
+    app.start().expect("start");
+
+    assert_eq!(
+        app.screen,
+        Screen::Main,
+        "an explicit --account skips the picker"
+    );
+    assert_eq!(
+        app.selected_account, 1,
+        "the explicitly selected account is active"
+    );
+    assert_eq!(
+        app.messages_account_id.as_deref(),
+        Some(b.as_str()),
+        "the selected account's chats loaded"
+    );
+}
+
+fn rendered_buffer(app: &mut TuiApp) -> String {
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
+}
+
+#[test]
+fn main_frame_shows_chats_and_messages_with_bars_and_toggled_diagnostics() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Chats;
+    app.chats = vec![ChatRow {
+        group_id: "bb".repeat(32),
+        name: "ops-room".to_owned(),
+        archived: false,
+    }];
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Al".to_owned());
+    row.display_text = "hello MESSAGEBODY".to_owned();
+    app.timeline = vec![row];
+    app.group_diagnostics = Some(GroupDiagnostics::unavailable(&"cc".repeat(32), "loading"));
+    app.status = "loaded 1 message(s)".to_owned();
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("Chats"), "chat panel present");
+    assert!(rendered.contains("ops-room"), "chat name visible");
+    assert!(rendered.contains("MESSAGEBODY"), "message body visible");
+    assert!(
+        !rendered.contains("Accounts"),
+        "the accounts pane is gone from the main view"
+    );
+    assert!(
+        rendered.contains("j/k navigate"),
+        "chats hints line present"
+    );
+    assert!(rendered.contains("daemon"), "status bar present");
+    assert!(
+        !rendered.contains("Diagnostics"),
+        "the diagnostics panel is off by default"
+    );
+
+    app.show_diagnostics = true;
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("Diagnostics"),
+        "the diagnostics panel appears after /diagnostics"
+    );
+    assert!(
+        rendered.contains("ops-room"),
+        "chats still visible with diagnostics on"
+    );
+    assert!(
+        rendered.contains("MESSAGEBODY"),
+        "messages still visible with diagnostics on"
+    );
+}
+
+#[test]
+fn login_menu_frame_shows_options_and_hints() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::Menu);
+    app.status = "no identities yet".to_owned();
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("White Noise"));
+    assert!(rendered.contains("Create a new identity"));
+    assert!(rendered.contains("Log in with an nsec"));
+    assert!(
+        rendered.contains("c create identity"),
+        "login hints line present"
+    );
+}
+
+#[test]
+fn nsec_entry_frame_masks_the_secret() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input = "nsec1supersecret".to_owned();
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        !rendered.contains("nsec1supersecret"),
+        "the secret must never render"
+    );
+    assert!(
+        rendered.contains("****"),
+        "the field renders as mask characters"
+    );
 }
