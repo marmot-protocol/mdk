@@ -110,6 +110,19 @@ fn inline_link_with_title() {
 }
 
 #[test]
+fn angle_bracket_destination_rejects_control_characters() {
+    for control in ['\u{0007}', '\u{001b}', '\u{007f}'] {
+        let input = format!("[x](<https://example.test/{control}payload>)");
+        assert!(
+            parse_inlines(&input)
+                .iter()
+                .all(|inline| !matches!(inline, Inline::Link { .. })),
+            "control character {control:?} must not reach a link destination"
+        );
+    }
+}
+
+#[test]
 fn inline_link_bracketed_dest() {
     assert_eq!(
         parse_inlines("[foo](<https://x>)"),

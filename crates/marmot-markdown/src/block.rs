@@ -940,7 +940,7 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
         let mut j = start;
         let mut out_bytes: Vec<u8> = Vec::new();
         while j < b.len() && b[j] != b'>' {
-            if b[j] == b'<' || b[j] == b'\n' {
+            if b[j] == b'<' || b[j] < 0x20 || b[j] == 0x7f {
                 return None;
             }
             if b[j] == b'\\' && j + 1 < b.len() && scanner::is_ascii_punct(b[j + 1]) {
