@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         .storage()?;
         for (position, follow) in record.follows.iter().enumerate() {
             tx.execute(
-                "INSERT INTO directory_user_follows (
+                "INSERT OR IGNORE INTO directory_user_follows (
                     account_id_hex, follow_account_id_hex, position, event_id_hex, event_created_at
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -634,6 +634,32 @@ mod tests {
                 .unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn duplicate_public_directory_follows_do_not_abort_the_record_upsert() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let follow = "cc".repeat(32);
+        let record = PublicDirectoryUserRecord {
+            account_id_hex: "aa".repeat(32),
+            npub: "npub1example".to_owned(),
+            profile_json: Some(r#"{"name":"Alice"}"#.to_owned()),
+            relay_lists_json: "{}".to_owned(),
+            key_package_json: None,
+            event_id_hex: Some("bb".repeat(32)),
+            event_kind: Some(3),
+            event_created_at: Some(1_700_000_000),
+            follows: vec![follow.clone(), follow.clone()],
+        };
+
+        storage.put_public_directory_user(&record).unwrap();
+
+        let stored = storage
+            .public_directory_user(&record.account_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.npub, record.npub);
+        assert_eq!(stored.follows, vec![follow]);
     }
 
     // #761: the batched listing is defensively bounded. The uncapped path still
