@@ -201,3 +201,9 @@ fn refdef_invalid_destination_falls_through_to_paragraph() {
     // No destination after `]:` — not a valid ref-def, becomes paragraph.
     assert_eq!(parse_blocks("[foo]:"), vec![paragraph("[foo]:")]);
 }
+
+#[test]
+fn refdef_label_over_999_bytes_falls_through_to_paragraph() {
+    let input = format!("[{}]: /url", "x".repeat(1000));
+    assert_eq!(parse_blocks(&input), vec![paragraph(&input)]);
+}

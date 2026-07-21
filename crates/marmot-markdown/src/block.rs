@@ -851,6 +851,9 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
     while j < b.len() && b[j] != b']' {
         if b[j] == b'\\' && j + 1 < b.len() {
             j += 2;
+            if j - label_start > 999 {
+                return None;
+            }
             continue;
         }
         if b[j] == b'\n' {
@@ -859,6 +862,9 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
             // — treat newlines as label content.
         }
         j += 1;
+        if j - label_start > 999 {
+            return None;
+        }
     }
     if j >= b.len() || b[j] != b']' {
         return None;
