@@ -107,9 +107,10 @@ impl fmt::Debug for StoredMessageDraftSummary {
 impl SqliteAccountStorage {
     /// List draft preview metadata newest-first without loading attachment BLOBs.
     pub fn message_drafts(&self) -> StorageResult<Vec<StoredMessageDraftSummary>> {
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
         let mut drafts = {
-            let mut statement = conn
+            let mut statement = tx
                 .prepare(
                     "SELECT group_id_hex, content, reply_to_message_id_hex,
                             created_at_ms, updated_at_ms
@@ -135,15 +136,19 @@ impl SqliteAccountStorage {
 
         for draft in &mut drafts {
             draft.media_attachments =
-                load_message_draft_attachment_summaries(&conn, &draft.group_id_hex)?;
+                load_message_draft_attachment_summaries(&tx, &draft.group_id_hex)?;
         }
+        tx.commit().storage()?;
         Ok(drafts)
     }
 
     /// Load one fully hydrated draft for a group.
     pub fn message_draft(&self, group_id_hex: &str) -> StorageResult<Option<StoredMessageDraft>> {
-        let conn = self.lock()?;
-        load_message_draft(&conn, group_id_hex)
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let draft = load_message_draft(&tx, group_id_hex)?;
+        tx.commit().storage()?;
+        Ok(draft)
     }
 
     /// Transactionally validate the group and upsert a draft plus its ordered
@@ -654,6 +659,30 @@ mod tests {
             )
             .unwrap();
         assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
+    }
+
+    #[test]
+    fn message_draft_reads_use_one_snapshot_for_rows_and_attachments() {
+        let source = include_str!("message_drafts.rs");
+        let list_body = source
+            .split("pub fn message_drafts(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn message_draft(")
+            .next()
+            .unwrap();
+        let single_body = source
+            .split("pub fn message_draft(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn save_message_draft(")
+            .next()
+            .unwrap();
+
+        for body in [list_body, single_body] {
+            assert!(body.contains("transaction()"));
+            assert!(body.contains("tx.commit()"));
+        }
     }
 
     #[test]
