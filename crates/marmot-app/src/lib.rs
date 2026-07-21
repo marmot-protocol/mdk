@@ -155,8 +155,8 @@ pub use notifications::{
     KIND_MARMOT_NOTIFICATION_SERVER_RELAYS, LocalPushRegistrationDebug,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE, NotificationCollectionStatus, NotificationSettings,
-    NotificationTrigger, NotificationUpdate, NotificationUser, NotificationWakeSource,
-    PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform, PushRegistration,
+    NotificationTrafficClass, NotificationTrigger, NotificationUpdate, NotificationUser,
+    NotificationWakeSource, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform, PushRegistration,
     build_notification_gift_wrap, build_notification_rumor_content, encrypted_push_token,
     parse_provider_token, push_token_fingerprint,
 };

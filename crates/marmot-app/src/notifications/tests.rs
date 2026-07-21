@@ -515,6 +515,7 @@ fn group_invite_notification_is_not_a_mention() {
     .unwrap();
 
     assert!(matches!(update.trigger, NotificationTrigger::GroupInvite));
+    assert_eq!(update.traffic_class, NotificationTrafficClass::Standard);
     assert!(!update.is_mention);
 }
 
@@ -650,15 +651,26 @@ fn normal_message_yields_no_reaction_fields() {
 }
 
 #[test]
-fn only_chat_and_reaction_kinds_are_notifiable() {
+fn agent_activity_and_operation_kinds_are_notifiable() {
     use cgka_traits::app_event::{
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     };
-    assert!(is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_CHAT));
-    assert!(is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_REACTION));
-    // State changes, not new user messages — never alert.
+
+    assert!(is_notifiable_message_kind(
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
+    ));
+    assert!(is_notifiable_message_kind(
+        MARMOT_APP_EVENT_KIND_AGENT_OPERATION
+    ));
+}
+
+#[test]
+fn state_change_kinds_remain_non_notifiable() {
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_DELETE,
+        MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    };
+
     assert!(!is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_DELETE));
     assert!(!is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_EDIT));
     assert!(!is_notifiable_message_kind(
@@ -667,6 +679,73 @@ fn only_chat_and_reaction_kinds_are_notifiable() {
     assert!(!is_notifiable_message_kind(
         MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
     ));
+}
+
+#[test]
+fn notification_traffic_class_is_deterministic_from_the_wire_kind() {
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+    };
+
+    assert_eq!(
+        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY),
+        NotificationTrafficClass::AgentActivity,
+    );
+    assert_eq!(
+        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_OPERATION),
+        NotificationTrafficClass::AgentActivity,
+    );
+    assert_eq!(
+        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_CHAT),
+        NotificationTrafficClass::Standard,
+    );
+    assert_eq!(
+        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_REACTION),
+        NotificationTrafficClass::Standard,
+    );
+}
+
+#[test]
+fn agent_activity_notification_preview_uses_the_structured_text() {
+    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY;
+
+    assert_eq!(
+        preview_text_for_kind(
+            MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+            r#"{"status":"running","text":"Searching relays"}"#,
+        )
+        .as_deref(),
+        Some("Searching relays"),
+    );
+}
+
+#[test]
+fn agent_operation_notification_preview_prefers_the_structured_preview() {
+    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_OPERATION;
+
+    assert_eq!(
+        preview_text_for_kind(
+            MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+            r#"{"status":"running","text":"Executing browser tool","preview":"Opening example.com"}"#,
+        )
+        .as_deref(),
+        Some("Opening example.com"),
+    );
+}
+
+#[test]
+fn agent_operation_notification_preview_falls_back_to_text() {
+    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_OPERATION;
+
+    assert_eq!(
+        preview_text_for_kind(
+            MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+            r#"{"status":"running","text":"Executing browser tool"}"#,
+        )
+        .as_deref(),
+        Some("Executing browser tool"),
+    );
 }
 
 #[test]

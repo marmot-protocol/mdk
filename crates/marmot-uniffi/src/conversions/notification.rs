@@ -2,8 +2,9 @@
 //! plus the wake-path cursor-persistence policy.
 
 use marmot_app::{
-    CursorPersistence, NotificationCollectionStatus, NotificationSettings, NotificationTrigger,
-    NotificationUpdate, NotificationUser, NotificationWakeSource,
+    CursorPersistence, NotificationCollectionStatus, NotificationSettings,
+    NotificationTrafficClass, NotificationTrigger, NotificationUpdate, NotificationUser,
+    NotificationWakeSource,
 };
 
 /// Durable transport-cursor persistence policy, chosen at [`crate::Marmot`]
@@ -84,6 +85,21 @@ impl From<NotificationTrigger> for NotificationTriggerFfi {
     }
 }
 
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum NotificationTrafficClassFfi {
+    Standard,
+    AgentActivity,
+}
+
+impl From<NotificationTrafficClass> for NotificationTrafficClassFfi {
+    fn from(value: NotificationTrafficClass) -> Self {
+        match value {
+            NotificationTrafficClass::Standard => Self::Standard,
+            NotificationTrafficClass::AgentActivity => Self::AgentActivity,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct NotificationSettingsFfi {
     pub account_ref: String,
@@ -125,6 +141,7 @@ pub struct NotificationUpdateFfi {
     pub notification_key: String,
     pub conversation_key: String,
     pub trigger: NotificationTriggerFfi,
+    pub traffic_class: NotificationTrafficClassFfi,
     pub account_ref: String,
     pub account_id_hex: String,
     pub group_id_hex: String,
@@ -147,6 +164,7 @@ impl From<NotificationUpdate> for NotificationUpdateFfi {
             notification_key: value.notification_key,
             conversation_key: value.conversation_key,
             trigger: value.trigger.into(),
+            traffic_class: value.traffic_class.into(),
             account_ref: value.account_ref,
             account_id_hex: value.account_id_hex,
             group_id_hex: value.group_id_hex,
@@ -179,5 +197,18 @@ impl From<marmot_app::BackgroundNotificationCollection> for BackgroundNotificati
             notifications: value.notifications.into_iter().map(Into::into).collect(),
             error: value.error,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_activity_traffic_class_crosses_the_ffi_boundary() {
+        assert!(matches!(
+            NotificationTrafficClassFfi::from(marmot_app::NotificationTrafficClass::AgentActivity,),
+            NotificationTrafficClassFfi::AgentActivity,
+        ));
     }
 }

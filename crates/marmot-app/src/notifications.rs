@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrTransportEvent;
 
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
 };
 
 use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
@@ -185,11 +186,18 @@ pub struct NotificationUser {
     pub picture_url: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationTrafficClass {
+    Standard,
+    AgentActivity,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationUpdate {
     pub notification_key: String,
     pub conversation_key: String,
     pub trigger: NotificationTrigger,
+    pub traffic_class: NotificationTrafficClass,
     pub account_ref: String,
     pub account_id_hex: String,
     pub group_id_hex: String,
@@ -1240,10 +1248,26 @@ pub(crate) fn notification_update_from_event_cached(
 }
 
 /// Whether a received app-event kind should ever surface as a notification.
-/// Only chat messages and reactions alert; deletes, edits, agent-stream control
-/// events, and group-system rows are state changes, not new user messages.
+/// Chat messages, reactions, and explicitly classified agent activity are
+/// eligible for notification. Deletes, edits, stream control, and group-system
+/// rows are state changes rather than new user-visible traffic.
 fn is_notifiable_message_kind(kind: u64) -> bool {
-    kind == MARMOT_APP_EVENT_KIND_CHAT || kind == MARMOT_APP_EVENT_KIND_REACTION
+    matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_CHAT
+            | MARMOT_APP_EVENT_KIND_REACTION
+            | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
+            | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
+    )
+}
+
+fn notification_traffic_for_kind(kind: u64) -> NotificationTrafficClass {
+    match kind {
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY | MARMOT_APP_EVENT_KIND_AGENT_OPERATION => {
+            NotificationTrafficClass::AgentActivity
+        }
+        _ => NotificationTrafficClass::Standard,
+    }
 }
 
 fn notification_update_from_message(
@@ -1255,10 +1279,10 @@ fn notification_update_from_message(
     if !settings.local_notifications_enabled {
         return Err(AppError::NotificationsDisabled);
     }
-    // Only chat messages and reactions alert. Deletes, edits, agent-stream
-    // control events, and group-system rows are not new user-facing messages,
-    // so they never produce a notification (e.g. deleting a message must not
-    // push a "Deleted a message" alert).
+    // Only chat messages, reactions, and explicitly classified agent activity
+    // alert. Deletes, edits, stream control events, and group-system rows never
+    // produce notifications (e.g. deleting a message must not push a "Deleted
+    // a message" alert).
     if !is_notifiable_message_kind(event.message.kind) {
         return Ok(None);
     }
@@ -1311,6 +1335,7 @@ fn notification_update_from_message(
         ),
         conversation_key: conversation_key(&event.account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::NewMessage,
+        traffic_class: notification_traffic_for_kind(event.message.kind),
         account_ref: event.account_label.clone(),
         account_id_hex: event.account_id_hex.clone(),
         group_id_hex,
@@ -1355,6 +1380,7 @@ fn notification_update_from_group_join(
         notification_key: format!("invite:{account_id_hex}:{invite_ref}"),
         conversation_key: conversation_key(account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::GroupInvite,
+        traffic_class: NotificationTrafficClass::Standard,
         account_ref: account_label.to_owned(),
         account_id_hex: account_id_hex.to_owned(),
         group_id_hex,
@@ -1438,9 +1464,25 @@ pub(crate) fn message_text_mentions_account(
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     if is_push_gossip_kind(kind) || plaintext.trim().is_empty() {
         None
+    } else if kind == MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY {
+        structured_agent_preview(plaintext, &["text", "status"])
+    } else if kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION {
+        structured_agent_preview(plaintext, &["preview", "text", "status"])
     } else {
         Some(plaintext.to_owned())
     }
+}
+
+fn structured_agent_preview(plaintext: &str, fields: &[&str]) -> Option<String> {
+    let payload = serde_json::from_str::<serde_json::Value>(plaintext).ok()?;
+    fields.iter().find_map(|field| {
+        payload
+            .get(field)?
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// Shape the (emoji, preview) pair for a reaction from its already-resolved
