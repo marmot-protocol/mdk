@@ -238,6 +238,19 @@ fn entity_zero_becomes_replacement_char() {
 }
 
 #[test]
+fn entity_numeric_control_characters_become_replacement_chars() {
+    for entity in ["&#7;", "&#27;", "&#127;", "&#x80;", "&#x9f;"] {
+        assert_eq!(parse_inlines(entity), vec![t("\u{FFFD}")], "{entity}");
+    }
+}
+
+#[test]
+fn entity_numeric_text_whitespace_remains_allowed() {
+    assert_eq!(parse_inlines("a&#9;b"), vec![t("a\tb")]);
+    assert_eq!(parse_inlines("a&#10;b"), vec![t("a\nb")]);
+}
+
+#[test]
 fn entity_no_terminator_passthrough() {
     assert_eq!(parse_inlines("&amp"), vec![t("&amp")]);
 }

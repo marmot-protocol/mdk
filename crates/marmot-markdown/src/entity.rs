@@ -65,7 +65,10 @@ fn decode_numeric(b: &[u8], start: usize) -> Option<(String, usize)> {
     if k == val_start || b.get(k) != Some(&b';') {
         return None;
     }
-    let ch = if code == 0 || (0xD800..=0xDFFF).contains(&code) || code > 0x10FFFF {
+    let ch = if matches!(code, 0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0x9F)
+        || (0xD800..=0xDFFF).contains(&code)
+        || code > 0x10FFFF
+    {
         '\u{FFFD}'
     } else {
         char::from_u32(code).unwrap_or('\u{FFFD}')
