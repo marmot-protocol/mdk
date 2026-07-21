@@ -5,7 +5,9 @@ use std::thread;
 
 use url::Url;
 
-use super::blossom::{MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body};
+use super::blossom::{
+    MAX_BLOSSOM_DESCRIPTOR_BYTES, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body,
+};
 use super::host_safety::validate_blossom_fetch_url;
 
 fn valid_imeta_tag() -> Vec<String> {
@@ -201,6 +203,26 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
     assert!(
         !locator.value.starts_with(&failing),
         "upload must not use the failed server locator"
+    );
+}
+
+#[tokio::test]
+async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_BLOSSOM_DESCRIPTOR_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let encrypted = b"encrypted bytes";
+    let encrypted_hash = hex::encode(Sha256::digest(encrypted));
+
+    let error = upload_blossom_blob(&server, encrypted, &encrypted_hash, &signing_keys(), true)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: upload descriptor exceeds size limit"
     );
 }
 
