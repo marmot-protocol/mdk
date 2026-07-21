@@ -36,11 +36,16 @@ pub fn decode_components_list(bytes: &[u8]) -> Result<BTreeSet<AppComponentId>, 
         return Err("component list byte length must be even".into());
     }
     let mut ids = BTreeSet::new();
+    let mut previous = None;
     for chunk in bytes[prefix_len..end].chunks_exact(2) {
         let id = u16::from_be_bytes([chunk[0], chunk[1]]);
         if !ids.insert(id) {
             return Err("component list contains duplicate ids".into());
         }
+        if previous.is_some_and(|previous| id < previous) {
+            return Err("component list is not sorted".into());
+        }
+        previous = Some(id);
     }
     Ok(ids)
 }

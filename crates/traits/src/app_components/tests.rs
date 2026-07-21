@@ -36,6 +36,15 @@ fn component_list_rejects_duplicate_or_trailing_bytes() {
 }
 
 #[test]
+fn component_list_rejects_non_canonical_id_order() {
+    let descending = vec![4, 0x80, 0x02, 0x80, 0x01];
+    assert_eq!(
+        decode_components_list(&descending),
+        Err("component list is not sorted".into())
+    );
+}
+
+#[test]
 fn quic_varint_decoder_rejects_non_canonical_lengths() {
     assert_eq!(
         decode_quic_varint(&[0x40, 0x3f]),
