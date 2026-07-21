@@ -1828,28 +1828,29 @@ fn reply_message_ids_for_targets_tx(
     if target_message_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", target_message_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT message_id_hex
-         FROM message_timeline
-         WHERE group_id_hex = ?
-           AND reply_to_message_id_hex IN ({placeholders})"
-    );
-    let mut values = Vec::<rusqlite::types::Value>::with_capacity(target_message_ids.len() + 1);
-    values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-    values.extend(
-        target_message_ids
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::Text),
-    );
-    let mut stmt = tx.prepare(&sql).storage()?;
-    stmt.query_map(params_from_iter(values.iter()), |row| row.get(0))
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()
+    let mut message_ids = BTreeSet::new();
+    for chunk in target_message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id_hex
+             FROM message_timeline
+             WHERE group_id_hex = ?
+               AND reply_to_message_id_hex IN ({placeholders})"
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+        values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        values.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_ids = stmt
+            .query_map(params_from_iter(values.iter()), |row| row.get(0))
+            .storage()?
+            .collect::<Result<Vec<String>, _>>()
+            .storage()?;
+        message_ids.extend(chunk_ids);
+    }
+    Ok(message_ids.into_iter().collect())
 }
 
 fn reaction_target_message_id_tx(
@@ -1894,27 +1895,34 @@ fn timeline_records_by_ids_tx(
     if message_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", message_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
+    let message_ids = message_ids.into_iter().collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
                 plaintext, kind, tags_json, timeline_at, received_at,
                 reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
                 deleted, deleted_by_message_id_hex, invalidation_status
-         FROM message_timeline
-         WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})
-         {TIMELINE_ORDER_BY_ASC}"
-    );
-    let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
-    params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-    params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
-    let mut stmt = tx.prepare(&sql).storage()?;
-    let mut messages = stmt
-        .query_map(params_from_iter(params.iter()), timeline_record_from_row)
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
+             FROM message_timeline
+             WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
+        );
+        let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+        params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_messages = stmt
+            .query_map(params_from_iter(params.iter()), timeline_record_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        messages.extend(chunk_messages);
+    }
+    messages.sort_by(|left, right| {
+        (left.timeline_at, &left.message_id_hex).cmp(&(right.timeline_at, &right.message_id_hex))
+    });
     attach_reply_previews(tx, &mut messages)?;
     Ok(messages)
 }

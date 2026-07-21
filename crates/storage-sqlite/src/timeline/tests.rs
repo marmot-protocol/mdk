@@ -100,6 +100,49 @@ fn moderated_delete(id: &str, sender: &str, target: &str, at: u64) -> StoredAppE
     event
 }
 
+#[test]
+fn oversized_timeline_id_sets_are_chunked() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let ids = (0..=SQLITE_BIND_PARAMETER_CHUNK)
+        .map(|index| format!("message-{index:04}"))
+        .collect::<Vec<_>>();
+    store
+        .record_app_event(&chat(&ids[0], "alice", 20, "first chunk"))
+        .unwrap();
+    store
+        .record_app_event(&chat(
+            &ids[SQLITE_BIND_PARAMETER_CHUNK],
+            "alice",
+            10,
+            "second chunk",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&reply(
+            "reply",
+            "bob",
+            &ids[SQLITE_BIND_PARAMETER_CHUNK],
+            30,
+            "answer",
+        ))
+        .unwrap();
+
+    let conn = store.lock().unwrap();
+    assert_eq!(
+        reply_message_ids_for_targets_tx(&conn, &"11".repeat(32), &ids).unwrap(),
+        vec!["reply".to_owned()]
+    );
+    let records =
+        timeline_records_by_ids_tx(&conn, &"11".repeat(32), ids.iter().cloned().collect()).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![ids[SQLITE_BIND_PARAMETER_CHUNK].as_str(), ids[0].as_str()]
+    );
+}
+
 fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),
