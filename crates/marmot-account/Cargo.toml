@@ -12,6 +12,7 @@ cgka-traits.workspace = true
 fs-private.workspace = true
 hex.workspace = true
 keyring-core.workspace = true
+libc.workspace = true
 marmot-forensics.workspace = true
 nostr.workspace = true
 serde.workspace = true

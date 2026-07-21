@@ -280,6 +280,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn scrub_and_remove_does_not_follow_a_secret_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let secret_path = dir.path().join("secret.json");
+        fs::write(&target, b"must remain intact").unwrap();
+        symlink(&target, &secret_path).unwrap();
+
+        scrub_and_remove_local_secret_file(&secret_path).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"must remain intact");
+        assert!(!secret_path.exists());
+    }
+
+    #[test]
     fn local_file_remove_secret_scrubs_and_unlinks_the_secret_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFileSecretStore::new(dir.path());

@@ -87,8 +87,32 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
 /// Best-effort in-place zero overwrite used before unlinking files that may
 /// contain plaintext key material.
 pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new().write(true).open(path)?;
-    let len = file.metadata()?.len();
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secret scrub target must be a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "secret scrub target must have exactly one hard link",
+            ));
+        }
+    }
+    let len = metadata.len();
     if len > 0 {
         let zeros = vec![0u8; len as usize];
         file.seek(SeekFrom::Start(0))?;
