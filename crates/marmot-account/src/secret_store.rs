@@ -2,7 +2,6 @@
 //! keychain-backed implementations.
 
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -10,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::home::{ACCOUNT_SECRET_FILE, AccountSummary, LOCAL_FILE_SECRET_BACKEND};
-use crate::io::{read_secret_json, write_secret_json};
+use crate::io::{overwrite_file_with_zeros, read_secret_json, write_secret_json};
 use crate::keyring::{initialize_keyring_store, map_keyring_error};
 
 #[derive(Serialize, Deserialize)]
@@ -151,18 +150,6 @@ pub(crate) fn scrub_and_remove_local_secret_file(path: &Path) -> AccountHomeResu
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
-}
-
-fn overwrite_file_with_zeros(path: &Path) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new().write(true).open(path)?;
-    let len = file.metadata()?.len();
-    if len > 0 {
-        let zeros = vec![0u8; len as usize];
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&zeros)?;
-        file.sync_all()?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]

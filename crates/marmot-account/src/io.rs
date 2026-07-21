@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -75,10 +75,27 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
     })();
 
     if result.is_err() {
+        if mode == FileMode::Private {
+            let _ = overwrite_file_with_zeros(&temp_path);
+        }
         let _ = fs::remove_file(&temp_path);
     }
 
     result
+}
+
+/// Best-effort in-place zero overwrite used before unlinking files that may
+/// contain plaintext key material.
+pub(crate) fn overwrite_file_with_zeros(path: &Path) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).open(path)?;
+    let len = file.metadata()?.len();
+    if len > 0 {
+        let zeros = vec![0u8; len as usize];
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&zeros)?;
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 fn create_temp_file(
@@ -178,5 +195,22 @@ mod tests {
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&account_dir), 0o700);
         assert_eq!(mode(&secret_path), 0o600);
+    }
+
+    #[test]
+    fn failed_private_atomic_write_scrubs_temp_before_unlink() {
+        let source = include_str!("io.rs");
+        let cleanup = source
+            .split("if result.is_err()")
+            .nth(1)
+            .unwrap()
+            .split("result\n}")
+            .next()
+            .unwrap();
+
+        assert!(
+            cleanup.find("overwrite_file_with_zeros").unwrap()
+                < cleanup.find("remove_file").unwrap()
+        );
     }
 }
