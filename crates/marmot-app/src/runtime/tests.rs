@@ -173,6 +173,26 @@ fn merge_user_profile_update_preserves_unknown_kind0_fields() {
     );
 }
 
+#[test]
+fn newest_user_profile_keeps_newer_cached_extra_fields() {
+    let cached = UserProfileMetadata {
+        created_at: 200,
+        extra: std::collections::BTreeMap::from([(
+            "website".to_owned(),
+            serde_json::json!("https://new.example"),
+        )]),
+        ..UserProfileMetadata::default()
+    };
+    let fetched = UserProfileMetadata {
+        created_at: 100,
+        extra: std::collections::BTreeMap::new(),
+        ..UserProfileMetadata::default()
+    };
+
+    let selected = newest_user_profile(Some(cached.clone()), Some(fetched)).unwrap();
+    assert_eq!(selected, cached);
+}
+
 #[tokio::test]
 async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout() {
     let (commands, _commands_rx) = mpsc::channel(1);

@@ -217,7 +217,7 @@ impl MarmotApp {
         let Some(profile) = profiles.get(&account_id_hex).cloned() else {
             return Ok(None);
         };
-        self.remember_directory_profile(&account_id_hex, &profile)?;
+        self.remember_directory_profile_if_newer(&account_id_hex, &profile)?;
         Ok(Some(profile))
     }
 
@@ -545,7 +545,7 @@ impl MarmotApp {
             self.remember_directory_user(account_id)?;
         }
         for (account_id, profile) in &profiles {
-            self.remember_directory_profile(account_id, profile)?;
+            self.remember_directory_profile_if_newer(account_id, profile)?;
         }
         Ok(profiles.len())
     }

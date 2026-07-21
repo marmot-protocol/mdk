@@ -2276,8 +2276,7 @@ impl MarmotAppRuntime {
             )
             .await
         {
-            Ok(Some(profile)) => Ok(Some(profile)),
-            Ok(None) => Ok(cached),
+            Ok(fetched) => Ok(newest_user_profile(cached, fetched)),
             Err(error) => {
                 tracing::debug!(
                     target: "marmot_app::runtime",
@@ -3695,6 +3694,17 @@ fn collect_notification_update_from_event(
 fn stamp_published_profile_created_at(profile: &mut UserProfileMetadata, now: u64) {
     if profile.created_at == 0 {
         profile.created_at = now;
+    }
+}
+
+fn newest_user_profile(
+    cached: Option<UserProfileMetadata>,
+    fetched: Option<UserProfileMetadata>,
+) -> Option<UserProfileMetadata> {
+    match (cached, fetched) {
+        (Some(cached), Some(fetched)) if cached.created_at >= fetched.created_at => Some(cached),
+        (_, Some(fetched)) => Some(fetched),
+        (cached, None) => cached,
     }
 }
 
