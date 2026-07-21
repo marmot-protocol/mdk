@@ -155,6 +155,7 @@ impl SqliteAccountStorage {
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[StoredMessageDraftAttachment],
     ) -> StorageResult<StoredMessageDraft> {
+        validate_waveform_samples(media_attachments)?;
         let now_ms = unix_now_ms();
         let saved = {
             let mut conn = self.lock()?;
@@ -204,6 +205,19 @@ impl SqliteAccountStorage {
             .storage()?;
         Ok(())
     }
+}
+
+fn validate_waveform_samples(attachments: &[StoredMessageDraftAttachment]) -> StorageResult<()> {
+    if attachments
+        .iter()
+        .flat_map(|attachment| &attachment.waveform_samples)
+        .any(|sample| !sample.is_finite())
+    {
+        return Err(StorageError::Serialization(
+            "message draft waveform samples must be finite".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn load_message_draft_attachment_summaries(
@@ -725,5 +739,40 @@ mod tests {
             storage.save_message_draft(&"33".repeat(16), "draft", None, &[]),
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[test]
+    fn saving_draft_rejects_non_finite_waveform_samples_before_writing() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let group_id_hex = "44".repeat(16);
+        storage
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    seen_events: vec![],
+                    last_transport_timestamp: None,
+                    groups: vec![group(&group_id_hex)],
+                },
+                100,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        let attachment = StoredMessageDraftAttachment {
+            id: "voice".to_owned(),
+            file_name: "voice.m4a".to_owned(),
+            media_type: "audio/mp4".to_owned(),
+            plaintext: vec![1, 2, 3],
+            dim: None,
+            thumbhash: None,
+            duration_seconds: Some(1.0),
+            waveform_samples: vec![0.25, f64::NAN],
+        };
+
+        let error = storage
+            .save_message_draft(&group_id_hex, "draft", None, &[attachment])
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::Serialization(_)));
+        assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
     }
 }
