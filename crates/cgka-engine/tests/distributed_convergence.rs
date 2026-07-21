@@ -4162,6 +4162,113 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
     );
 }
 
+/// mdk#963: an unconsumed proposal is scoped to its source epoch. It must not
+/// be replayed before every later candidate commit, where OpenMLS rejects it as
+/// WrongEpoch and prunes every candidate path.
+#[tokio::test]
+async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "stale-proposal-replay".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let stale_proposal = route(
+        proposal(
+            bob.send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        ),
+        &group_id,
+    );
+
+    // Alice never sees Bob's proposal, so this epoch-1 commit cannot consume
+    // it. Carol observes both through stored convergence.
+    let first_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (first_commit, first_pending) = evolution(first_invite);
+    alice.confirm_published(first_pending).await.unwrap();
+    let first_commit = route(first_commit, &group_id);
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, stale_proposal.clone(), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, first_commit.clone(), 1_000)
+        .unwrap();
+    let first = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(first.accepted_commits, vec![content_hex(&first_commit)]);
+    assert!(first.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == content_hex(&stale_proposal)
+            && dropped.kind == MessageKind::Proposal
+            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    }));
+    assert_message_state(
+        &carol_storage,
+        &stale_proposal,
+        MessageState::EpochInvalidated,
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    // A later epoch-2 commit must materialize normally. Before the fix the
+    // stale epoch-1 proposal was prepended and every replay failed WrongEpoch.
+    let second_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (second_commit, second_pending) = evolution(second_invite);
+    alice.confirm_published(second_pending).await.unwrap();
+    let second_commit = route(second_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, second_commit.clone(), 2_000)
+        .unwrap();
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+
+    assert_eq!(second.accepted_commits, vec![content_hex(&second_commit)]);
+    assert_message_state(&carol_storage, &second_commit, MessageState::Processed);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}
+
 #[tokio::test]
 async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     let (mut alice, _alice_storage) = build_client(b"alice");

@@ -374,6 +374,11 @@ fn proposals_are_accepted_only_when_consumed_by_canonical_commits() {
                 kind: MessageKind::Proposal,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
             },
+            DroppedMessage {
+                message_id: "pending-proposal".into(),
+                kind: MessageKind::Proposal,
+                reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            },
         ]
     );
     assert!(

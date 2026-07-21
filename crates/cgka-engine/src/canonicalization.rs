@@ -705,6 +705,14 @@ fn handle_proposal(
             .push(dropped(message, DroppedMessageReason::BeyondAnchor));
     } else if selected_consumed_proposal_ids.contains(&message.message_id) {
         result.accepted_proposals.push(message.message_id.clone());
+    } else if result.selected_tip.unwrap_or(input.state.current_tip_epoch) > message.source_epoch {
+        // An unconsumed proposal cannot cross an epoch boundary. Once the
+        // canonical tip advances past its source epoch it is terminal and must
+        // not be prepended to every later candidate replay (#963).
+        result.dropped_messages.push(dropped(
+            message,
+            DroppedMessageReason::InvalidAgainstCandidateState,
+        ));
     } else if materialized_branch_ids.contains(branch_id)
         && !selected_branch_path.contains(branch_id)
         && result.selected_branch_id.is_some()

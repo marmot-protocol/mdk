@@ -1642,34 +1642,81 @@ fn candidate_paths_with_pending_replay_messages(
     candidate_paths: &[OpenMlsCandidatePath],
     pending_messages: &[TransportMessage],
 ) -> Result<Vec<OpenMlsCandidatePath>, OpenMlsProjectionError> {
-    let mut proposals = Vec::new();
+    let mut proposals_by_epoch: BTreeMap<u64, Vec<TransportMessage>> = BTreeMap::new();
     let mut applications = Vec::new();
     for message in pending_messages {
-        match project_mls_message(&message.payload)?.kind {
-            OpenMlsContentKind::Proposal => proposals.push(message.clone()),
+        let projection = project_mls_message(&message.payload)?;
+        match projection.kind {
+            OpenMlsContentKind::Proposal => {
+                let source_epoch = projection.source_epoch.ok_or(
+                    OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
+                )?;
+                proposals_by_epoch
+                    .entry(source_epoch)
+                    .or_default()
+                    .push(message.clone());
+            }
             OpenMlsContentKind::Application => applications.push(message.clone()),
             OpenMlsContentKind::Commit
             | OpenMlsContentKind::Welcome
             | OpenMlsContentKind::Other => {}
         }
     }
+    for proposals in proposals_by_epoch.values_mut() {
+        proposals.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    }
 
-    Ok(candidate_paths
+    candidate_paths
         .iter()
-        .map(|path| {
-            let mut seen = BTreeSet::new();
-            let mut messages = Vec::new();
-            for message in proposals.iter().chain(&path.messages).chain(&applications) {
-                if seen.insert(hex::encode(message.id.as_slice())) {
-                    messages.push(message.clone());
+        .map(
+            |path| -> Result<OpenMlsCandidatePath, OpenMlsProjectionError> {
+                let mut seen = BTreeSet::new();
+                let mut messages = Vec::new();
+                let mut final_epoch = None;
+                for message in &path.messages {
+                    let projection = project_mls_message(&message.payload)?;
+                    if projection.kind == OpenMlsContentKind::Commit {
+                        let source_epoch = projection.source_epoch.ok_or(
+                            OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
+                        )?;
+                        if let Some(proposals) = proposals_by_epoch.get(&source_epoch) {
+                            for proposal in proposals {
+                                if seen.insert(hex::encode(proposal.id.as_slice())) {
+                                    messages.push(proposal.clone());
+                                }
+                            }
+                        }
+                        final_epoch = Some(source_epoch.saturating_add(1));
+                    }
+                    if seen.insert(hex::encode(message.id.as_slice())) {
+                        messages.push(message.clone());
+                    }
                 }
-            }
-            OpenMlsCandidatePath {
-                branch_id: path.branch_id.clone(),
-                messages,
-            }
-        })
-        .collect())
+                // Proposals created at the path tip are still live evidence even
+                // when no commit consumes them yet. Older proposals were either
+                // folded immediately before their epoch's commit or are stale;
+                // future proposals belong to a later path (#963).
+                if let Some(final_epoch) = final_epoch
+                    && let Some(proposals) = proposals_by_epoch.get(&final_epoch)
+                {
+                    for proposal in proposals {
+                        if seen.insert(hex::encode(proposal.id.as_slice())) {
+                            messages.push(proposal.clone());
+                        }
+                    }
+                }
+                for message in &applications {
+                    if seen.insert(hex::encode(message.id.as_slice())) {
+                        messages.push(message.clone());
+                    }
+                }
+                Ok(OpenMlsCandidatePath {
+                    branch_id: path.branch_id.clone(),
+                    messages,
+                })
+            },
+        )
+        .collect()
 }
 
 fn proposal_id_by_ref(candidates: &[OpenMlsMaterializedCandidate]) -> BTreeMap<String, String> {

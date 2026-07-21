@@ -684,7 +684,7 @@ fn canonical_dispositions_are_order_invariant(case: CanonicalDispositionCase) {
         "only consumed selected-branch proposals are accepted",
     );
 
-    let dropped_losing_proposals: BTreeSet<String> = observed
+    let dropped_stale_or_losing_proposals: BTreeSet<String> = observed
         .dropped_messages
         .iter()
         .filter(|message| {
@@ -693,13 +693,14 @@ fn canonical_dispositions_are_order_invariant(case: CanonicalDispositionCase) {
         })
         .map(|message| message.message_id.clone())
         .collect();
-    let expected_losing_proposals: BTreeSet<String> = (0..case.losing_proposals)
+    let expected_stale_or_losing_proposals: BTreeSet<String> = (0..case.losing_proposals)
         .map(|i| format!("losing-proposal-{i}"))
+        .chain((0..case.pending_proposals).map(|i| format!("pending-proposal-{i}")))
         .collect();
     prop_assert(
-        dropped_losing_proposals,
-        expected_losing_proposals,
-        "losing-branch proposals are dropped",
+        dropped_stale_or_losing_proposals,
+        expected_stale_or_losing_proposals,
+        "stale and losing-branch proposals are dropped",
     );
 
     let already_seen_ids: BTreeSet<String> = observed
