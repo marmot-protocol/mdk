@@ -354,6 +354,19 @@ fn shortcut_ref_link() {
 }
 
 #[test]
+fn shortcut_and_collapsed_reference_labels_over_999_bytes_do_not_resolve() {
+    let label = format!("{}foo", " ".repeat(997));
+    for suffix in ["", "[]"] {
+        let input = format!("[{label}]{suffix}\n\n[foo]: /url");
+        let blocks = parse_blocks(&input);
+        let Block::Paragraph { inlines } = &blocks[0] else {
+            panic!("overlong reference must remain a paragraph");
+        };
+        assert_eq!(count_links(inlines), 0);
+    }
+}
+
+#[test]
 fn ref_link_case_insensitive() {
     let input = "[Foo]\n\n[foo]: /url";
     assert_eq!(

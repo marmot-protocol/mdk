@@ -930,6 +930,9 @@ fn parse_ref_label(b: &[u8], i: usize) -> Option<(String, usize)> {
 /// raw bytes between `[` and `]` from the source. Backslash-escaped `]`
 /// inside is allowed.
 fn label_text(b: &[u8], start: usize, end: usize) -> String {
+    if end.saturating_sub(start) > 999 {
+        return String::new();
+    }
     let mut out = String::new();
     let src = std::str::from_utf8(&b[start..end]).unwrap_or("");
     let mut chars = src.chars().peekable();
