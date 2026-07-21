@@ -203,6 +203,65 @@ pub(crate) fn chat_label(name: &str, unread_count: usize, max_len: usize) -> Str
     shorten(&format!("{name} ({unread_count})"), max_len)
 }
 
+/// The dark-gray last-message preview line under a chat row (wn-tui style):
+/// `<sender>: <text>`, trailing-truncated. `None` when the chat has no last
+/// message yet. A deleted last message renders as a tombstone; a group-system
+/// row renders its summary instead of raw JSON. All untrusted text passes
+/// through `terminal_safe_text`.
+pub(crate) fn chat_preview_line(chat: &ChatRow) -> Option<Line<'static>> {
+    let preview = chat_preview_text(chat.projection.last_message.as_ref()?);
+    Some(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(preview, Style::default().fg(Color::DarkGray)),
+    ]))
+}
+
+/// The preview body for a chat's last message, terminal-safe and trailing-
+/// truncated to [`TUI_CHAT_PREVIEW_LIMIT`] chars.
+fn chat_preview_text(message: &ChatLastMessage) -> String {
+    let body = if message.deleted {
+        "message deleted".to_owned()
+    } else if message.kind == Some(GROUP_SYSTEM_KIND) {
+        // Group-system rows carry JSON in `plaintext`; summarize as the pane does.
+        chat_preview_group_system(message)
+    } else {
+        match chat_preview_sender(message) {
+            Some(sender) => format!("{sender}: {}", message.plaintext),
+            None => message.plaintext.clone(),
+        }
+    };
+    truncate_preview(&terminal_safe_text(&body), TUI_CHAT_PREVIEW_LIMIT)
+}
+
+/// The sender label for a preview: the display name, else a shortened id.
+fn chat_preview_sender(message: &ChatLastMessage) -> Option<String> {
+    message
+        .sender_display_name
+        .clone()
+        .or_else(|| message.sender.as_deref().map(|sender| shorten(sender, 16)))
+}
+
+/// Summarize a group-system last message ("alice added bob") by reusing the
+/// timeline's summarizer over a minimal value; falls back to the raw plaintext.
+fn chat_preview_group_system(message: &ChatLastMessage) -> String {
+    let value = serde_json::json!({
+        "from_display_name": message.sender_display_name,
+        "from": message.sender,
+    });
+    group_system_summary(&value, &message.plaintext).unwrap_or_else(|| message.plaintext.clone())
+}
+
+/// Trailing-truncate `text` to `max` chars, appending an ellipsis when clipped.
+/// Prose-friendly, unlike `shorten`'s middle ellipsis for ids.
+fn truncate_preview(text: &str, max: usize) -> String {
+    let clipped = text.chars().take(max).collect::<String>();
+    if text.chars().count() > max {
+        format!("{clipped}...")
+    } else {
+        clipped
+    }
+}
+
 /// The opt-in MLS group diagnostics panel body (`/diagnostics`). This is the old
 /// status panel minus its leading status-message line, which now lives in the
 /// one-line status bar. Group id and error text pass through `terminal_safe_text`.
@@ -620,12 +679,11 @@ impl TuiApp {
             .selected_account_row()
             .map(account_display_label)
             .unwrap_or_else(|| "no account".to_owned());
-        let unread_total = self.unread_counts.values().sum();
         let text = status_bar_line(
             &account_label,
             self.daemon.running,
             self.chats.len(),
-            unread_total,
+            total_unread(&self.chats),
             &self.status,
             area.width as usize,
         );
@@ -641,20 +699,27 @@ impl TuiApp {
                 .enumerate()
                 .map(|(index, chat)| {
                     let selected = index == self.selected_chat;
-                    let unread_count = self
-                        .unread_counts
-                        .get(&chat.group_id)
-                        .copied()
-                        .unwrap_or_default();
-                    ListItem::new(chat_row_line(chat, selected, unread_count))
-                        .style(selected_style(selected))
+                    // Unread badge and preview both come from the runtime-backed
+                    // projection now — no TUI-local counting.
+                    let mut lines =
+                        vec![chat_row_line(chat, selected, chat.projection.unread_count)];
+                    if let Some(preview) = chat_preview_line(chat) {
+                        lines.push(preview);
+                    }
+                    ListItem::new(lines).style(selected_style(selected))
                 })
                 .collect()
         };
-        frame.render_widget(
-            List::new(items).block(panel_block("Chats", self.focus == Focus::Chats)),
-            area,
-        );
+        let list = List::new(items).block(panel_block("Chats", self.focus == Focus::Chats));
+        // Drive the list with a ListState synced to the selection so it always
+        // scrolls the highlighted chat into view. Rows are 1-2 lines tall;
+        // ratatui's List accounts for multi-line item heights when it computes
+        // the offset, which a plain `render_widget` (offset fixed at 0) does not.
+        let mut state = ListState::default();
+        if !self.chats.is_empty() {
+            state.select(Some(self.selected_chat.min(self.chats.len() - 1)));
+        }
+        frame.render_stateful_widget(list, area, &mut state);
     }
 
     pub(crate) fn render_messages(&mut self, frame: &mut Frame, area: Rect) {

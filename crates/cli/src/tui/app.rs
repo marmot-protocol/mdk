@@ -39,7 +39,6 @@ pub(crate) struct TuiApp {
     pub(crate) selected_chat: usize,
     pub(crate) messages_account_id: Option<String>,
     pub(crate) messages_group_id: Option<String>,
-    pub(crate) unread_counts: HashMap<String, usize>,
     pub(crate) show_archived_chats: bool,
     pub(crate) timeline: Vec<TimelineRow>,
     pub(crate) timeline_scroll: TimelineScroll,
@@ -48,6 +47,22 @@ pub(crate) struct TuiApp {
     pub(crate) message_subscription: Option<MessageSubscription>,
     pub(crate) timeline_subscription: Option<TimelineSubscription>,
     pub(crate) group_state_subscription: Option<GroupStateSubscription>,
+    pub(crate) notification_subscription: Option<NotificationSubscription>,
+    /// Debounce gate for the notification-driven chats re-list. A NewMessage for
+    /// a non-loaded chat sets it; `tick` performs exactly one re-list per tick
+    /// when set, then clears it, coalescing every such event since the last tick
+    /// into a single `chats list` re-read.
+    pub(crate) pending_chat_relist: bool,
+    /// Schedule a `chats mark-read` for the loaded chat. The timeline fold arms
+    /// it when it imports a nonzero unread count for the viewed chat (viewing is
+    /// reading); `tick` issues at most one mark-read per tick, then the folded
+    /// zero count leaves it clear. Cleared before the call and re-armed on error
+    /// like `pending_chat_relist`, so a failure retries next tick, not forever.
+    pub(crate) pending_mark_read: bool,
+    /// Notification `notification_key`s already handled, so the runtime feed's
+    /// duplicated emissions do not re-trigger a re-list or a repeated invite
+    /// notice. FIFO-bounded to the recent event window, not unbounded.
+    pub(crate) seen_notification_keys: SeenNotificationKeys,
     pub(crate) daemon: DaemonView,
     pub(crate) group_diagnostics: Option<GroupDiagnostics>,
     pub(crate) input: Input,
@@ -74,7 +89,6 @@ impl TuiApp {
             selected_chat: 0,
             messages_account_id: None,
             messages_group_id: None,
-            unread_counts: HashMap::new(),
             show_archived_chats: false,
             timeline: Vec::new(),
             timeline_scroll: TimelineScroll::default(),
@@ -83,6 +97,10 @@ impl TuiApp {
             message_subscription: None,
             timeline_subscription: None,
             group_state_subscription: None,
+            notification_subscription: None,
+            pending_chat_relist: false,
+            pending_mark_read: false,
+            seen_notification_keys: SeenNotificationKeys::new(),
             daemon: DaemonView::default(),
             group_diagnostics: None,
             input: Input::default(),
@@ -176,6 +194,38 @@ impl TuiApp {
         changed |= self.drain_group_state_subscription();
         changed |= self.drain_message_subscription();
         changed |= self.drain_timeline_subscription();
+        changed |= self.drain_notification_subscription();
+        // Debounce: notification drains coalesce every NewMessage for a
+        // non-loaded chat since the last tick into this one pending flag, so at
+        // most one background `chats list` re-read runs per tick. Cleared before
+        // the call and re-armed on error so a transient failure retries next
+        // tick instead of dropping the batch; the flag is checked once per tick,
+        // so a permanently-failing re-list retries at most once per tick (the
+        // tick cadence is the hot-loop ceiling by construction).
+        if self.pending_chat_relist {
+            self.pending_chat_relist = false;
+            if let Err(err) = self.relist_chats() {
+                self.pending_chat_relist = true;
+                self.set_drain_status(format!("chat re-list failed: {err}"));
+            }
+            changed = true;
+        }
+        // Viewing is reading: the timeline fold arms this when the viewed chat's
+        // unread count grows, and we clear it with one `chats mark-read` here.
+        // Same once-per-tick, re-arm-on-error discipline as the re-list above; a
+        // success folds the count to zero so the timeline fold stops re-arming.
+        if self.pending_mark_read {
+            self.pending_mark_read = false;
+            if let (Some(account_id), Some(group_id)) = (
+                self.messages_account_id.clone(),
+                self.messages_group_id.clone(),
+            ) && let Err(err) = self.mark_selected_chat_read(&account_id, &group_id)
+            {
+                self.pending_mark_read = true;
+                self.set_drain_status(format!("mark-read failed: {err}"));
+            }
+            changed = true;
+        }
         match self.flush_stream_append_if_due(now) {
             Ok(flushed) => changed |= flushed,
             Err(err) => {

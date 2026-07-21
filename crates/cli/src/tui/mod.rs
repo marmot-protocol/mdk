@@ -1,6 +1,6 @@
 //! Ratatui terminal UI over the `wn --json` surface: entry point and module wiring.
 
-use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command as StdCommand, Output, Stdio};
@@ -16,7 +16,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use serde_json::Value;
 
 use crate::{Cli, CliOutput, SecretStoreKind};
@@ -47,7 +47,15 @@ const TUI_TIMELINE_PAGE_SIZE: usize = 100;
 /// row's rendered height so the visibility walk and the renderer agree.
 const TIMELINE_MESSAGE_SEPARATOR_ROWS: u16 = 1;
 const TUI_LIVE_STREAM_PREVIEW_LIMIT: usize = 128;
+/// Cap on the notification-key dedup set. Dedup only needs to cover the recent
+/// event window (the runtime feed emits duplicates close together), so the set
+/// ages out the oldest keys past this bound instead of growing per-session.
+const TUI_SEEN_NOTIFICATION_KEYS_LIMIT: usize = 512;
 const TUI_LIVE_STREAM_TEXT_LIMIT: usize = 64 * 1024;
+/// Max chars of the chat-list last-message preview line before trailing-ellipsis
+/// truncation. The List widget clips overflow too; this keeps a stored preview
+/// tidy and bounded independent of the panel width.
+const TUI_CHAT_PREVIEW_LIMIT: usize = 48;
 
 pub(crate) async fn run_tui(cli: Cli) -> CliOutput {
     match TuiApp::new(cli).and_then(|mut app| app.run()) {

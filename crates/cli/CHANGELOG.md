@@ -34,6 +34,19 @@ versioning through the workspace version in the root `Cargo.toml`.
   submits and there is no keyboard newline; multi-line content arrives only by paste (bracketed paste keeps its
   newlines). The composer auto-grows with its wrapped content up to 8 rows, taking the space from the messages pane.
   The login nsec-entry field reuses this input's masked mode. No JSON response shapes changed.
+- TUI: unread badges are now runtime-backed instead of counted in the TUI. Each chat row's badge and the status
+  bar's `{u} unread` total derive from the `chats list` projection (`unread_count`), so they survive a TUI restart;
+  the TUI-local unread tally and its plain-`messages subscribe`-feed counting are gone (that feed now serves only
+  QUIC stream previews). Chat rows gained a wn-tui-style last-message preview line (sender plus truncated text, dark
+  gray; group-system rows render their summary, deleted rows a tombstone), and the chat list orders by last activity
+  (`last_message.timeline_at` descending; equal-activity chats keep the `chats list` order). Opening a chat clears
+  its badge immediately by calling `chats mark-read` and folding the returned projection (a failed mark-read leaves
+  the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
+  chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
+  `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
+  tick (notification events deduplicated by `notification_key`). Group-invite notifications surface as a status-line
+  notice. Background re-lists and reorders keep the highlighted chat selected by group id. No JSON response shapes
+  changed.
 
 ### Added
 

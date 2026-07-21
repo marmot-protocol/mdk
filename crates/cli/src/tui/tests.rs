@@ -213,6 +213,36 @@ fn composer_renders_filtered_slash_command_popup() {
 }
 
 #[test]
+fn chat_list_scrolls_the_selection_into_view() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    // A chat list far taller than the panel, with the selection at the bottom.
+    app.chats = (0..40)
+        .map(|i| projected_chat(&format!("group{i:02}"), &format!("room{i:02}"), 0, Some(i)))
+        .collect();
+    let last = app.chats.len() - 1;
+    app.chats[last].name = "BOTTOMROOM".to_owned();
+    app.selected_chat = last;
+    app.focus = Focus::Chats;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(
+        rendered.contains("BOTTOMROOM"),
+        "the selected chat at the bottom must scroll into view, not clip off-panel"
+    );
+}
+
+#[test]
 fn slash_command_parser_handles_key_package_commands() {
     assert_eq!(
         parse_slash_command("/keys fetch npub1bob"),
@@ -586,6 +616,7 @@ fn chat_row_line_shows_unread_count_in_bold() {
         group_id: "group-a".to_owned(),
         name: "Project Room".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     };
 
     let line = chat_row_line(&chat, false, 3);
@@ -718,6 +749,7 @@ fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
         group_id: "group-a".to_owned(),
         name: "ops\u{1b}[5m".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     };
     assert_eq!(line_text(&chat_row_line(&chat, false, 0)), "  ops[5m");
 
@@ -846,6 +878,7 @@ fn active_stream_preview_pins_to_open_time_group_after_selection_shift() {
         group_id: other_group.to_owned(),
         name: "other".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     // Selection now points at a DIFFERENT group than the streamed-into one.
     app.selected_chat = 0;
@@ -1021,6 +1054,7 @@ fn chat_subscription_result_inserts_live_invite_without_account_switch() {
             group_id: group_id.to_owned(),
             name: "new invite".to_owned(),
             archived: false,
+            projection: ChatProjection::default(),
         }]
     );
 }
@@ -1097,43 +1131,17 @@ fn subscription_final_message_removes_live_stream_preview() {
 }
 
 #[test]
-fn all_chat_subscription_marks_nonselected_messages_unread() {
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut previews = Vec::new();
-    let mut unread_counts = HashMap::new();
-
-    let status = apply_tui_subscription_result(
-        &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
-        &serde_json::json!({
-            "trigger": "MessageReceived",
-            "type": "message",
-            "message": {
-                "message_id": "02",
-                "direction": "received",
-                "group_id": unread_group_id,
-                "from": "alice",
-                "plaintext": "hello elsewhere"
-            }
-        }),
-    );
-
-    assert_eq!(unread_counts.get(unread_group_id), Some(&1));
-    assert_eq!(
-        status,
-        Some("unread message in bbbbbbb...bbbbbbbb; count=1".to_owned())
-    );
-}
-
-#[test]
-fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_message() {
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+fn plain_feed_cleans_up_stream_preview_on_agent_final() {
+    // Phase 4 retired the plain feed's local unread counting (unread is
+    // runtime-backed now). The feed still owns QUIC stream previews: an agent
+    // stream's final row clears the live preview, with no message appended.
+    // (Retired with the local counting: all_chat_subscription_marks_nonselected_
+    // messages_unread, _does_not_count_selected_group_as_unread, and
+    // _ignores_initial_replay_for_unread_counts.)
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let stream_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let mut previews = vec![LiveStreamPreview {
-        group_id: unread_group_id.to_owned(),
+        group_id: group_id.to_owned(),
         stream_id: stream_id.to_owned(),
         author: "alice".to_owned(),
         status: "streaming".to_owned(),
@@ -1141,19 +1149,16 @@ fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_mes
         error: None,
         optimistic: false,
     }];
-    let mut unread_counts = HashMap::new();
 
-    apply_tui_subscription_result(
+    apply_subscription_result(
         &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
         &serde_json::json!({
             "trigger": "AgentStreamFinalized",
             "type": "agent_stream_final",
             "message": {
                 "message_id": "final",
                 "direction": "received",
-                "group_id": unread_group_id,
+                "group_id": group_id,
                 "from": "alice",
                 "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
                 "agent_text_stream": {
@@ -1166,125 +1171,13 @@ fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_mes
     );
 
     assert!(previews.is_empty());
-    assert_eq!(unread_counts.get(unread_group_id), Some(&1));
 }
 
-#[test]
-fn all_chat_subscription_does_not_count_selected_group_as_unread() {
-    // A message for the loaded group must not bump its unread count; the pane is
-    // driven by the timeline feed, so the plain feed only counts off-screen groups.
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let mut previews = Vec::new();
-    let mut unread_counts = HashMap::new();
-
-    let status = apply_tui_subscription_result(
-        &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
-        &serde_json::json!({
-            "trigger": "MessageReceived",
-            "type": "message",
-            "message": {
-                "message_id": "01",
-                "direction": "received",
-                "group_id": selected_group_id,
-                "from": "alice",
-                "plaintext": "hello here"
-            }
-        }),
-    );
-
-    assert_eq!(status, None);
-    assert_eq!(unread_counts.get(selected_group_id), None);
-}
-
-#[test]
-fn all_chat_subscription_ignores_initial_replay_for_unread_counts() {
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let replay_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut previews = Vec::new();
-    let mut unread_counts = HashMap::new();
-
-    let status = apply_tui_subscription_result(
-        &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
-        &serde_json::json!({
-            "trigger": "InitialMessage",
-            "type": "message",
-            "message": {
-                "message_id": "old",
-                "direction": "received",
-                "group_id": replay_group_id,
-                "from": "alice",
-                "plaintext": "old message"
-            }
-        }),
-    );
-
-    assert_eq!(status, None);
-    assert!(unread_counts.is_empty());
-}
-
-#[test]
-fn message_subscription_gates_on_loaded_chat_not_highlighted_chat() {
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let loaded_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let highlighted_group_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    let mut app = test_tui_app(test_unused_client(), account_id);
-    app.chats = vec![
-        ChatRow {
-            group_id: loaded_group_id.to_owned(),
-            name: "loaded".to_owned(),
-            archived: false,
-        },
-        ChatRow {
-            group_id: highlighted_group_id.to_owned(),
-            name: "highlighted".to_owned(),
-            archived: false,
-        },
-    ];
-    app.selected_chat = 1;
-    app.messages_group_id = Some(loaded_group_id.to_owned());
-    let (tx, rx) = mpsc::channel();
-    app.message_subscription = Some(MessageSubscription {
-        account_id: account_id.to_owned(),
-        child: test_sleep_child(),
-        rx,
-    });
-
-    tx.send(SubscriptionEvent::Result(serde_json::json!({
-        "trigger": "MessageReceived",
-        "type": "message",
-        "message": {
-            "message_id": "highlighted",
-            "direction": "received",
-            "group_id": highlighted_group_id,
-            "from": "alice",
-            "plaintext": "hello highlighted"
-        }
-    })))
-    .expect("send highlighted message event");
-
-    assert!(app.drain_message_subscription());
-    assert_eq!(app.unread_counts.get(highlighted_group_id), Some(&1));
-
-    tx.send(SubscriptionEvent::Result(serde_json::json!({
-        "trigger": "MessageReceived",
-        "type": "message",
-        "message": {
-            "message_id": "loaded",
-            "direction": "received",
-            "group_id": loaded_group_id,
-            "from": "bob",
-            "plaintext": "hello loaded"
-        }
-    })))
-    .expect("send loaded message event");
-
-    assert!(app.drain_message_subscription());
-    assert_eq!(app.unread_counts.get(loaded_group_id), None);
-}
+// Retired in Phase 4: message_subscription_gates_on_loaded_chat_not_highlighted_chat
+// asserted the plain feed's local unread counting, which no longer exists — unread
+// is runtime-backed. The loaded-vs-highlighted gating that still matters (the
+// timeline feed and mark-read target the loaded pane) is covered by the timeline
+// and mark-read tests below.
 
 #[test]
 fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
@@ -1341,7 +1234,7 @@ fn selected_message_subscription_retains_account_wide_stream_without_selected_ch
 }
 
 #[test]
-fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
+fn refresh_accounts_clears_chat_state_when_no_accounts_remain() {
     let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"accounts":[]}}"#);
@@ -1350,10 +1243,15 @@ fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
         group_id: group_id.to_owned(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection {
+            unread_count: 3,
+            has_unread: true,
+            ..ChatProjection::default()
+        },
     }];
-    app.unread_counts.insert(group_id.to_owned(), 3);
     app.chat_subscription = Some(test_chat_subscription(account_id, false));
     app.message_subscription = Some(test_message_subscription(account_id));
+    app.notification_subscription = Some(test_notification_subscription(account_id));
     app.group_diagnostics = Some(GroupDiagnostics::unavailable(group_id, "old"));
 
     app.refresh_accounts().expect("refresh accounts");
@@ -1361,9 +1259,9 @@ fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
     assert!(app.accounts.is_empty());
     assert!(app.chats.is_empty());
     assert!(app.timeline.is_empty());
-    assert!(app.unread_counts.is_empty());
     assert!(app.chat_subscription.is_none());
     assert!(app.message_subscription.is_none());
+    assert!(app.notification_subscription.is_none());
     assert!(app.group_diagnostics.is_none());
 }
 
@@ -1412,6 +1310,7 @@ fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
         group_id: previous_group.to_owned(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     app.messages_account_id = Some(previous_account.to_owned());
     app.messages_group_id = Some(previous_group.to_owned());
@@ -1428,6 +1327,7 @@ fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
     assert!(app.chat_subscription.is_none());
     assert!(app.message_subscription.is_none());
     assert!(app.group_state_subscription.is_none());
+    assert!(app.notification_subscription.is_none());
     assert!(app.group_diagnostics.is_none());
 }
 
@@ -1760,7 +1660,6 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         selected_chat: 0,
         messages_account_id: None,
         messages_group_id: None,
-        unread_counts: HashMap::new(),
         show_archived_chats: false,
         timeline: Vec::new(),
         timeline_scroll: TimelineScroll::default(),
@@ -1769,6 +1668,10 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         message_subscription: None,
         timeline_subscription: None,
         group_state_subscription: None,
+        notification_subscription: None,
+        pending_chat_relist: false,
+        pending_mark_read: false,
+        seen_notification_keys: SeenNotificationKeys::new(),
         daemon: DaemonView {
             running: true,
             ..DaemonView::default()
@@ -2034,6 +1937,707 @@ fn test_message_subscription(account_id: &str) -> MessageSubscription {
         child,
         rx,
     }
+}
+
+fn test_notification_subscription(account_id: &str) -> NotificationSubscription {
+    let child = test_sleep_child();
+    let (_tx, rx) = mpsc::channel();
+    NotificationSubscription {
+        account_id: account_id.to_owned(),
+        child,
+        rx,
+    }
+}
+
+/// A chat row carrying a runtime projection: `unread` unread messages and, when
+/// `last_activity` is set, a `last_message` from "Bob" at that timestamp.
+fn projected_chat(
+    group_id: &str,
+    name: &str,
+    unread: usize,
+    last_activity: Option<u64>,
+) -> ChatRow {
+    ChatRow {
+        group_id: group_id.to_owned(),
+        name: name.to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            unread_count: unread,
+            has_unread: unread > 0,
+            last_message: last_activity.map(|timeline_at| ChatLastMessage {
+                sender: Some("bob".to_owned()),
+                sender_display_name: Some("Bob".to_owned()),
+                plaintext: "hello".to_owned(),
+                kind: Some(9),
+                timeline_at,
+                deleted: false,
+            }),
+            ..ChatProjection::default()
+        },
+    }
+}
+
+/// A `notifications subscribe` daemon event with the runtime DTO nested under
+/// `notification`, matching the real feed's envelope.
+fn notification_json(trigger: &str, group_id: &str, notification_key: &str) -> Value {
+    serde_json::json!({
+        "trigger": "Notification",
+        "type": "notification",
+        "group_id": group_id,
+        "notification_key": notification_key,
+        "notification": {
+            "trigger": trigger,
+            "group_id_hex": group_id,
+            "notification_key": notification_key
+        }
+    })
+}
+
+// ── Phase 4 ambient state: projection, previews, ordering, notifications ────
+
+#[test]
+fn parse_chat_reads_runtime_projection_fields() {
+    let chat = parse_chat(&serde_json::json!({
+        "group_id": "aa",
+        "profile": {"name": "ops"},
+        "archived": false,
+        "unread_count": 4,
+        "has_unread": true,
+        "last_message": {
+            "message_id_hex": "m1",
+            "sender": "bob_hex",
+            "sender_display_name": "Bob",
+            "plaintext": "hey there",
+            "kind": 9,
+            "timeline_at": 1_700_000_050_u64,
+            "deleted": false
+        },
+        "last_read_message_id_hex": "r1",
+        "last_read_timeline_at": 1_700_000_000_u64
+    }))
+    .expect("chat parses");
+
+    assert_eq!(chat.projection.unread_count, 4);
+    assert!(chat.projection.has_unread);
+    let last = chat.projection.last_message.expect("last message present");
+    assert_eq!(last.sender_display_name.as_deref(), Some("Bob"));
+    assert_eq!(last.plaintext, "hey there");
+    assert_eq!(last.kind, Some(9));
+    assert_eq!(last.timeline_at, 1_700_000_050);
+    assert!(!last.deleted);
+    assert_eq!(
+        chat.projection.last_read_message_id_hex.as_deref(),
+        Some("r1")
+    );
+    assert_eq!(chat.projection.last_read_timeline_at, Some(1_700_000_000));
+}
+
+#[test]
+fn parse_chat_defaults_projection_when_keys_absent() {
+    // Tolerant parse: a legacy/partial row (no projection keys) is still a chat.
+    let chat = parse_chat(&serde_json::json!({
+        "group_id": "aa",
+        "profile": {"name": "ops"}
+    }))
+    .expect("chat parses");
+
+    assert_eq!(chat.projection, ChatProjection::default());
+    assert_eq!(chat.projection.unread_count, 0);
+    assert!(!chat.projection.has_unread);
+    assert!(chat.projection.last_message.is_none());
+}
+
+#[test]
+fn status_bar_unread_total_sums_runtime_projections() {
+    // The status bar's `{u} unread` is the sum of the runtime projection counts —
+    // no local counting anywhere.
+    let chats = vec![
+        projected_chat("aa", "ops", 2, Some(10)),
+        projected_chat("bb", "eng", 0, Some(20)),
+        projected_chat("cc", "ops2", 5, Some(30)),
+    ];
+    assert_eq!(total_unread(&chats), 7);
+}
+
+#[test]
+fn chat_row_badge_and_preview_come_from_the_projection() {
+    let chat = projected_chat("aa", "ops", 2, Some(30));
+
+    let line = chat_row_line(&chat, false, chat.projection.unread_count);
+    assert_eq!(line_text(&line), "  ops (2)");
+
+    let preview = chat_preview_line(&chat).expect("a chat with a last message has a preview");
+    assert_eq!(line_text(&preview), "    Bob: hello");
+    assert_eq!(
+        preview.spans.last().expect("preview span").style.fg,
+        Some(Color::DarkGray)
+    );
+}
+
+#[test]
+fn chat_without_last_message_has_no_preview_line() {
+    let chat = projected_chat("aa", "ops", 0, None);
+    assert!(chat_preview_line(&chat).is_none());
+}
+
+#[test]
+fn chat_preview_renders_tombstone_and_group_system_summary() {
+    let mut deleted = projected_chat("aa", "ops", 0, Some(30));
+    deleted
+        .projection
+        .last_message
+        .as_mut()
+        .expect("last message")
+        .deleted = true;
+    assert_eq!(
+        line_text(&chat_preview_line(&deleted).expect("preview")),
+        "    message deleted"
+    );
+
+    let mut system = projected_chat("bb", "eng", 0, Some(30));
+    let last = system
+        .projection
+        .last_message
+        .as_mut()
+        .expect("last message");
+    last.kind = Some(GROUP_SYSTEM_KIND);
+    last.sender_display_name = Some("Alice".to_owned());
+    last.plaintext = r#"{"system_type":"member_added","data":{"subject":"carol"}}"#.to_owned();
+    assert_eq!(
+        line_text(&chat_preview_line(&system).expect("preview")),
+        "    Alice added carol"
+    );
+}
+
+#[test]
+fn chats_order_by_last_activity_preserving_selection() {
+    let mut chats = vec![
+        projected_chat("aa", "old", 0, Some(10)),
+        projected_chat("bb", "new", 0, Some(30)),
+        projected_chat("cc", "mid", 0, Some(20)),
+    ];
+    let mut selected = 0; // highlighting "aa"
+
+    resort_chats_preserving_selection(&mut chats, &mut selected);
+
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| chat.group_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bb", "cc", "aa"],
+        "chats order by last activity, newest first"
+    );
+    assert_eq!(
+        chats[selected].group_id, "aa",
+        "the highlight follows its chat across the reorder"
+    );
+}
+
+#[test]
+fn message_less_chats_keep_the_list_order_as_a_stable_fallback() {
+    // Equal-activity rows (here: all message-less) keep the order they came in —
+    // the documented stable fallback.
+    let mut chats = vec![
+        projected_chat("aa", "first", 0, None),
+        projected_chat("bb", "second", 0, None),
+        projected_chat("cc", "third", 0, None),
+    ];
+    sort_chats_by_activity(&mut chats);
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| chat.group_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aa", "bb", "cc"]
+    );
+}
+
+#[test]
+fn timeline_chat_list_row_folds_into_the_loaded_chat() {
+    let mut chats = vec![
+        projected_chat("aa", "ops", 0, Some(10)),
+        projected_chat("bb", "eng", 0, Some(20)),
+    ];
+    let mut selected = 0; // highlighting "aa"
+    let event = serde_json::json!({
+        "type": "timeline_projection_updated",
+        "group_id": "aa",
+        "chat_list_row": {
+            "unread_count": 3,
+            "has_unread": true,
+            "last_message": {
+                "sender_display_name": "Bob",
+                "plaintext": "new here",
+                "kind": 9,
+                "timeline_at": 30,
+                "deleted": false
+            }
+        }
+    });
+
+    let (group_id, projection) = timeline_chat_list_row(&event).expect("chat_list_row present");
+    assert!(fold_chat_projection(
+        &mut chats,
+        &mut selected,
+        &group_id,
+        projection
+    ));
+
+    // aa now has the newest activity (30), so it sorts to the top and the
+    // highlight follows it there.
+    assert_eq!(chats[0].group_id, "aa");
+    assert_eq!(chats[0].projection.unread_count, 3);
+    assert_eq!(chats[selected].group_id, "aa");
+    assert_eq!(
+        chats[1].projection.unread_count, 0,
+        "the other chat is untouched"
+    );
+}
+
+#[test]
+fn timeline_chat_list_row_is_none_without_a_projection() {
+    let ready = serde_json::json!({"type": "timeline_subscription_ready"});
+    assert!(timeline_chat_list_row(&ready).is_none());
+}
+
+#[test]
+fn chats_feed_default_projection_does_not_clobber_a_live_one() {
+    // A transient producer-side projection read failure degrades a chats-feed
+    // row to all-default keys. The full-row replace must not wipe a live badge
+    // and preview, so an entirely-default incoming projection keeps the
+    // existing non-default one.
+    let mut chats = vec![projected_chat("aa", "ops", 4, Some(30))];
+    let bare = ChatRow {
+        group_id: "aa".to_owned(),
+        name: "ops".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+    upsert_chat(&mut chats, bare, false);
+    assert_eq!(
+        chats[0].projection.unread_count, 4,
+        "an all-default feed row keeps the existing live badge"
+    );
+    assert!(
+        chats[0].projection.last_message.is_some(),
+        "the last-message preview is preserved too"
+    );
+}
+
+#[test]
+fn chats_feed_nonempty_projection_still_replaces() {
+    // A legitimate projection (here a read that lowers the badge) is not
+    // entirely default, so it still replaces the existing one.
+    let mut chats = vec![projected_chat("aa", "ops", 4, Some(30))];
+    let read = ChatRow {
+        group_id: "aa".to_owned(),
+        name: "ops".to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            last_message: Some(ChatLastMessage {
+                sender: Some("bob".to_owned()),
+                sender_display_name: Some("Bob".to_owned()),
+                plaintext: "hello".to_owned(),
+                kind: Some(9),
+                timeline_at: 40,
+                deleted: false,
+            }),
+            ..ChatProjection::default()
+        },
+    };
+    upsert_chat(&mut chats, read, false);
+    assert_eq!(
+        chats[0].projection.unread_count, 0,
+        "a non-default incoming projection replaces (a real read lowers the badge)"
+    );
+}
+
+#[test]
+fn notifications_for_other_chats_schedule_one_pending_relist() {
+    // N distinct NewMessage events for non-loaded chats, drained in one window,
+    // set exactly one pending re-list (coalesced by the debounce flag).
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+    for key in ["msg:1", "msg:2", "msg:3"] {
+        let event = parse_notification_event(&notification_json("NewMessage", "bb", key));
+        assert_eq!(
+            apply_notification_event(&mut seen, &mut pending, Some("aa"), event),
+            NotificationOutcome::ScheduledRelist
+        );
+    }
+    assert!(
+        pending,
+        "several NewMessage events set the single pending flag"
+    );
+    assert_eq!(seen.len(), 3);
+}
+
+#[test]
+fn duplicate_notification_key_does_not_retrigger() {
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+
+    let first = parse_notification_event(&notification_json("NewMessage", "bb", "msg:1"));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), first),
+        NotificationOutcome::ScheduledRelist
+    );
+
+    pending = false; // as the tick loop would, after performing the re-list
+    let duplicate = parse_notification_event(&notification_json("NewMessage", "bb", "msg:1"));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), duplicate),
+        NotificationOutcome::Ignored
+    );
+    assert!(!pending, "a duplicated emission does not re-schedule");
+}
+
+#[test]
+fn notification_for_the_loaded_chat_is_ignored() {
+    // The loaded pane's badge is kept fresh by the timeline feed + mark-read, so
+    // its NewMessage notifications never schedule a re-list.
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+    let event = parse_notification_event(&notification_json("NewMessage", "aa", "msg:1"));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), event),
+        NotificationOutcome::Ignored
+    );
+    assert!(!pending);
+}
+
+#[test]
+fn group_invite_notification_surfaces_a_notice() {
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+    let event = parse_notification_event(&serde_json::json!({
+        "type": "notification",
+        "group_id": "bb",
+        "notification": {
+            "trigger": "GroupInvite",
+            "group_id_hex": "bb",
+            "group_name": "Secret Room",
+            "notification_key": "invite:1"
+        }
+    }));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), event),
+        NotificationOutcome::Invite("invited to Secret Room".to_owned())
+    );
+    assert!(!pending, "an invite does not schedule a re-list this phase");
+}
+
+#[test]
+fn drain_notification_subscription_coalesces_to_one_pending_relist() {
+    let account_id = "aa".repeat(32);
+    let loaded_group = "aa".repeat(32);
+    let other_group = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_group_id = Some(loaded_group);
+    let (tx, rx) = mpsc::channel();
+    app.notification_subscription = Some(NotificationSubscription {
+        account_id: account_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    for key in ["m1", "m2", "m3"] {
+        tx.send(SubscriptionEvent::Result(notification_json(
+            "NewMessage",
+            &other_group,
+            key,
+        )))
+        .expect("send notification event");
+    }
+
+    assert!(app.drain_notification_subscription());
+    assert!(
+        app.pending_chat_relist,
+        "several NewMessage events in one drain set exactly one pending re-list"
+    );
+    assert_eq!(app.seen_notification_keys.len(), 3);
+}
+
+#[test]
+fn drain_notification_subscription_drops_other_accounts_events() {
+    // The runtime-wide feed carries every local account's notifications. An
+    // event routed to a different account must change nothing on this one: no
+    // notice, no pending re-list, no dedup-key insertion.
+    let account_id = "aa".repeat(32);
+    let other_account = "cc".repeat(32);
+    let other_group = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_group_id = None;
+    let (tx, rx) = mpsc::channel();
+    app.notification_subscription = Some(NotificationSubscription {
+        account_id: account_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    let mut new_message = notification_json("NewMessage", &other_group, "m1");
+    new_message["account_id"] = Value::String(other_account.clone());
+    tx.send(SubscriptionEvent::Result(new_message))
+        .expect("send new-message event");
+    let invite = serde_json::json!({
+        "type": "notification",
+        "account_id": other_account,
+        "notification": {
+            "trigger": "GroupInvite",
+            "group_name": "Secret Room",
+            "notification_key": "invite:1"
+        }
+    });
+    tx.send(SubscriptionEvent::Result(invite))
+        .expect("send invite event");
+
+    app.drain_notification_subscription();
+
+    assert!(
+        !app.pending_chat_relist,
+        "another account's message never arms a re-list"
+    );
+    assert!(
+        app.seen_notification_keys.is_empty(),
+        "another account's dedup key is never recorded"
+    );
+    assert_eq!(
+        app.status, "",
+        "another account's invite surfaces no notice on this account"
+    );
+}
+
+#[test]
+fn seen_notification_keys_are_bounded() {
+    // Dedup only needs to cover the recent event window, so the set is capped
+    // and evicts oldest-first instead of growing unbounded over a session.
+    let mut seen = SeenNotificationKeys::new();
+    for i in 0..(TUI_SEEN_NOTIFICATION_KEYS_LIMIT + 50) {
+        assert!(
+            seen.insert(format!("k{i}")),
+            "each distinct key is newly inserted"
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        TUI_SEEN_NOTIFICATION_KEYS_LIMIT,
+        "the dedup set is capped, not unbounded"
+    );
+    assert!(
+        seen.insert("k0".to_owned()),
+        "the oldest key aged out, so it is treated as new again"
+    );
+    let recent = format!("k{}", TUI_SEEN_NOTIFICATION_KEYS_LIMIT + 49);
+    assert!(
+        !seen.insert(recent),
+        "a key inside the recent window is still deduplicated"
+    );
+}
+
+#[test]
+fn tick_performs_the_pending_relist_exactly_once() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"chats":[]}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // no live subscriptions to drain
+    app.pending_chat_relist = true;
+
+    let changed = app.tick();
+
+    assert!(changed);
+    assert!(
+        !app.pending_chat_relist,
+        "tick runs the pending re-list once, then clears the debounce flag"
+    );
+}
+
+#[test]
+fn should_mark_loaded_chat_read_only_for_the_loaded_chat_with_unread() {
+    let with_unread = ChatProjection {
+        unread_count: 2,
+        ..ChatProjection::default()
+    };
+    let read = ChatProjection::default();
+    assert!(should_mark_loaded_chat_read(Some("aa"), "aa", &with_unread));
+    assert!(
+        !should_mark_loaded_chat_read(Some("aa"), "aa", &read),
+        "no unread on the loaded chat means nothing to mark"
+    );
+    assert!(
+        !should_mark_loaded_chat_read(Some("aa"), "bb", &with_unread),
+        "a non-loaded chat keeps its badge (the ambient path owns it)"
+    );
+    assert!(
+        !should_mark_loaded_chat_read(None, "aa", &with_unread),
+        "no loaded chat means nothing to mark"
+    );
+}
+
+#[test]
+fn timeline_fold_arms_a_mark_read_for_the_viewed_chat() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.chats = vec![projected_chat(&group_id, "general", 0, Some(10))];
+    app.selected_chat = 0;
+    let (tx, rx) = mpsc::channel();
+    app.timeline_subscription = Some(TimelineSubscription {
+        account_id: account_id.clone(),
+        group_id: group_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    // The viewed chat accrues unread while we read it; the timeline feed imports
+    // the growing count through its chat_list_row.
+    tx.send(SubscriptionEvent::Result(serde_json::json!({
+        "type": "timeline_projection_updated",
+        "group_id": group_id,
+        "chat_list_row": {"unread_count": 3, "has_unread": true},
+        "changes": []
+    })))
+    .expect("send chat_list_row");
+
+    assert!(app.drain_timeline_subscription());
+    assert!(
+        app.pending_mark_read,
+        "importing a nonzero count for the viewed chat schedules a mark-read"
+    );
+}
+
+#[test]
+fn tick_marks_the_viewed_chat_read_once_and_clears_the_badge() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"unread_count":0,"has_unread":false,"last_message":null}}"#,
+    );
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // no live subscriptions to drain
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.chats = vec![projected_chat(&group_id, "general", 3, Some(30))];
+    app.selected_chat = 0;
+    app.pending_mark_read = true;
+
+    assert!(app.tick());
+    assert_eq!(
+        app.chats[0].projection.unread_count, 0,
+        "tick folds the mark-read response and clears the viewed chat's badge"
+    );
+    assert!(
+        !app.pending_mark_read,
+        "a successful mark-read clears the flag"
+    );
+
+    // The folded projection is now zero, so a second tick re-arms nothing.
+    app.tick();
+    assert!(!app.pending_mark_read, "no re-arm once the badge is clear");
+}
+
+#[test]
+fn a_failed_relist_re_arms_for_the_next_tick() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // no live subscriptions to drain
+    app.pending_chat_relist = true;
+
+    app.tick();
+
+    assert!(
+        app.pending_chat_relist,
+        "a failed re-list re-arms instead of dropping the batch"
+    );
+    assert!(
+        app.status.contains("re-list failed"),
+        "the error still surfaces on the status line"
+    );
+}
+
+#[test]
+fn a_failed_mark_read_re_arms_for_the_next_tick() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default();
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.chats = vec![projected_chat(&group_id, "general", 3, Some(30))];
+    app.pending_mark_read = true;
+
+    app.tick();
+
+    assert!(
+        app.pending_mark_read,
+        "a failed mark-read re-arms for the next tick"
+    );
+    assert!(
+        app.status.contains("mark-read failed"),
+        "the error still surfaces on the status line"
+    );
+}
+
+#[test]
+fn opening_a_chat_marks_it_read_and_clears_the_badge() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    // The fake returns one response for every call; both `messages timeline list`
+    // and `chats mark-read` see the empty-timeline/read projection.
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"messages":[],"has_more_before":false,"unread_count":0,"has_unread":false,"last_message":null}}"#,
+    );
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // mark-read is a normal command, daemon or not
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            unread_count: 5,
+            has_unread: true,
+            ..ChatProjection::default()
+        },
+    }];
+    app.selected_chat = 0;
+
+    app.refresh_messages().expect("refresh messages");
+
+    assert_eq!(
+        app.chats[0].projection.unread_count, 0,
+        "opening a chat folds the mark-read response and clears the badge immediately"
+    );
+}
+
+#[test]
+fn mark_read_failure_keeps_the_badge_honest() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            unread_count: 5,
+            has_unread: true,
+            ..ChatProjection::default()
+        },
+    }];
+    app.selected_chat = 0;
+
+    let result = app.mark_selected_chat_read(&account_id, &group_id);
+
+    assert!(
+        result.is_err(),
+        "a failed mark-read is surfaced, not swallowed"
+    );
+    assert_eq!(
+        app.chats[0].projection.unread_count, 5,
+        "a failed mark-read never zeroes the badge locally"
+    );
 }
 
 #[cfg(not(windows))]
@@ -3479,6 +4083,7 @@ fn refresh_messages_loads_the_materialized_timeline_page() {
         group_id: group_id.to_owned(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     app.selected_chat = 0;
 
@@ -4119,6 +4724,7 @@ fn enter_opens_the_chat_and_focuses_messages() {
         group_id: group_id.clone(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     app.selected_chat = 0;
 
@@ -4232,6 +4838,7 @@ fn main_frame_shows_chats_and_messages_with_bars_and_toggled_diagnostics() {
         group_id: "bb".repeat(32),
         name: "ops-room".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     let mut row = timeline_row("m0", 0);
     row.from_display_name = Some("Al".to_owned());

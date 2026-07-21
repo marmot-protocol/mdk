@@ -55,11 +55,43 @@ pub(crate) struct AccountRow {
     pub(crate) local_signing: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ChatRow {
     pub(crate) group_id: String,
     pub(crate) name: String,
     pub(crate) archived: bool,
+    /// Runtime-backed unread + last-message projection. Bootstrapped from the
+    /// `chats list` row at load, then kept live by the timeline feed's
+    /// `chat_list_row` and the `chats mark-read` response. Phase 4 replaced the
+    /// TUI-local unread tally with this durable, restart-surviving state.
+    pub(crate) projection: ChatProjection,
+}
+
+/// The durable chat-list projection carried, key-for-key, on a `chats list`/
+/// `subscribe` row, the timeline feed's `chat_list_row`, and the `chats
+/// mark-read` response. Parsed tolerantly: a missing or null field takes its
+/// empty default so a partial object never fails to parse.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChatProjection {
+    pub(crate) unread_count: usize,
+    pub(crate) has_unread: bool,
+    pub(crate) last_message: Option<ChatLastMessage>,
+    pub(crate) last_read_message_id_hex: Option<String>,
+    pub(crate) last_read_timeline_at: Option<u64>,
+}
+
+/// The last-message preview embedded in a chat projection (`last_message`). The
+/// chat list renders `sender`/`plaintext` and orders by `timeline_at`; `kind`
+/// lets a group-system row render its summary instead of raw JSON. Every field
+/// is parsed tolerantly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChatLastMessage {
+    pub(crate) sender: Option<String>,
+    pub(crate) sender_display_name: Option<String>,
+    pub(crate) plaintext: String,
+    pub(crate) kind: Option<u64>,
+    pub(crate) timeline_at: u64,
+    pub(crate) deleted: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -174,6 +206,25 @@ pub(crate) struct TimelineSubscription {
 }
 
 impl Drop for TimelineSubscription {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The runtime-wide `notifications subscribe` feed (daemon-only). It is *not*
+/// account-scoped: the daemon ignores `--account` and streams every local
+/// account's notifications, so the drain filters events by the envelope account
+/// against `account_id` before acting on them. `account_id` is the selected
+/// account this subscription was opened for (the filter target), not a server
+/// key. Same child/reader/Drop lifecycle as the other feeds.
+pub(crate) struct NotificationSubscription {
+    pub(crate) account_id: String,
+    pub(crate) child: Child,
+    pub(crate) rx: Receiver<SubscriptionEvent>,
+}
+
+impl Drop for NotificationSubscription {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -708,7 +759,50 @@ pub(crate) fn parse_chat(value: &Value) -> Option<ChatRow> {
             .get("archived")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        projection: parse_chat_projection(value),
     })
+}
+
+/// Parse the five chat-projection keys off any object that carries them: a
+/// `chats list`/`subscribe` row, the timeline feed's `chat_list_row`, or the
+/// `chats mark-read` response. Every field is optional — a group with no
+/// projection yet (or a row missing a key) takes the empty default — so the
+/// parser never fails on a partial object.
+pub(crate) fn parse_chat_projection(value: &Value) -> ChatProjection {
+    ChatProjection {
+        unread_count: value
+            .get("unread_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0),
+        has_unread: value
+            .get("has_unread")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        last_message: value
+            .get("last_message")
+            .filter(|message| !message.is_null())
+            .map(parse_chat_last_message),
+        last_read_message_id_hex: non_empty_value_string(value, "last_read_message_id_hex"),
+        last_read_timeline_at: value.get("last_read_timeline_at").and_then(Value::as_u64),
+    }
+}
+
+fn parse_chat_last_message(value: &Value) -> ChatLastMessage {
+    ChatLastMessage {
+        sender: non_empty_value_string(value, "sender"),
+        sender_display_name: non_empty_value_string(value, "sender_display_name"),
+        plaintext: value_string(value, "plaintext").unwrap_or_default(),
+        kind: value.get("kind").and_then(Value::as_u64),
+        timeline_at: value
+            .get("timeline_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        deleted: value
+            .get("deleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
 }
 
 /// Inner app-event kind for durable group system rows (membership/admin/profile).
@@ -1796,6 +1890,71 @@ pub(crate) fn selected_chat_index(chats: &[ChatRow], group_id: Option<&str>) -> 
     group_id.and_then(|group_id| chats.iter().position(|chat| chat.group_id == group_id))
 }
 
+/// The activity timestamp a chat orders by: its last message's `timeline_at`, or
+/// `0` when it has no messages yet (message-less chats sort to the bottom).
+pub(crate) fn chat_activity(chat: &ChatRow) -> u64 {
+    chat.projection
+        .last_message
+        .as_ref()
+        .map_or(0, |message| message.timeline_at)
+}
+
+/// Order chats by last activity, newest first. A stable sort keyed only on
+/// activity, so equal-activity rows (all message-less chats, or same-second
+/// activity) keep the order `chats list` returned — the documented fallback.
+pub(crate) fn sort_chats_by_activity(chats: &mut [ChatRow]) {
+    chats.sort_by_key(|chat| std::cmp::Reverse(chat_activity(chat)));
+}
+
+/// Re-order chats by activity while keeping the highlight on the same chat by
+/// group id, so a background re-list or a live projection fold never yanks the
+/// selection (the Phase 4 selection-stability invariant). Falls back to the
+/// clamped previous index only when the selected group has vanished.
+pub(crate) fn resort_chats_preserving_selection(chats: &mut [ChatRow], selected_chat: &mut usize) {
+    let selected_group_id = chats.get(*selected_chat).map(|chat| chat.group_id.clone());
+    sort_chats_by_activity(chats);
+    *selected_chat = selected_chat_index(chats, selected_group_id.as_deref())
+        .unwrap_or_else(|| (*selected_chat).min(chats.len().saturating_sub(1)));
+}
+
+/// Fold a refreshed projection into the matching chat row — from the timeline
+/// feed's `chat_list_row` or the `chats mark-read` response — then re-order and
+/// preserve the selection. Returns whether a row matched `group_id`.
+pub(crate) fn fold_chat_projection(
+    chats: &mut [ChatRow],
+    selected_chat: &mut usize,
+    group_id: &str,
+    projection: ChatProjection,
+) -> bool {
+    let Some(row) = chats.iter_mut().find(|chat| chat.group_id == group_id) else {
+        return false;
+    };
+    row.projection = projection;
+    resort_chats_preserving_selection(chats, selected_chat);
+    true
+}
+
+/// Whether folding `projection` for `folded_group_id` should schedule a
+/// mark-read: it is the loaded (viewed) chat and still shows unread. Viewing is
+/// reading, so the loaded chat's badge is cleared by a `chats mark-read` (issued
+/// at most once per tick) rather than re-accruing as the timeline fold imports
+/// the runtime's growing count. Once mark-read folds the count back to zero this
+/// returns false, so it does not loop.
+pub(crate) fn should_mark_loaded_chat_read(
+    loaded_group_id: Option<&str>,
+    folded_group_id: &str,
+    projection: &ChatProjection,
+) -> bool {
+    loaded_group_id == Some(folded_group_id) && projection.unread_count > 0
+}
+
+/// The total unread count across all chats, summed from the runtime-backed
+/// per-chat projections. The status bar's `{u} unread` is this sum — no local
+/// counting.
+pub(crate) fn total_unread(chats: &[ChatRow]) -> usize {
+    chats.iter().map(|chat| chat.projection.unread_count).sum()
+}
+
 pub(crate) fn apply_chat_subscription_result(
     chats: &mut Vec<ChatRow>,
     selected_chat: &mut usize,
@@ -1806,10 +1965,8 @@ pub(crate) fn apply_chat_subscription_result(
         return None;
     }
     let chat = result.get("chat").and_then(parse_chat)?;
-    let previous_group_id = chats.get(*selected_chat).map(|chat| chat.group_id.clone());
     upsert_chat(chats, chat, show_archived_chats);
-    *selected_chat = selected_chat_index(chats, previous_group_id.as_deref())
-        .unwrap_or_else(|| (*selected_chat).min(chats.len().saturating_sub(1)));
+    resort_chats_preserving_selection(chats, selected_chat);
     Some(format!("live chat update: chats={}", chats.len()))
 }
 
@@ -1859,7 +2016,7 @@ pub(crate) fn group_state_subscription_label(result: &Value, group_id: &str) -> 
         .unwrap_or_else(|| shorten(group_id, 18))
 }
 
-pub(crate) fn upsert_chat(chats: &mut Vec<ChatRow>, chat: ChatRow, show_archived_chats: bool) {
+pub(crate) fn upsert_chat(chats: &mut Vec<ChatRow>, mut chat: ChatRow, show_archived_chats: bool) {
     if chat.archived && !show_archived_chats {
         chats.retain(|existing| existing.group_id != chat.group_id);
         return;
@@ -1868,6 +2025,17 @@ pub(crate) fn upsert_chat(chats: &mut Vec<ChatRow>, chat: ChatRow, show_archived
         .iter_mut()
         .find(|existing| existing.group_id == chat.group_id)
     {
+        // A chats-feed row whose projection collapsed to all-default keys is the
+        // producer conflating a transient projection read-failure with "empty".
+        // Merge, don't replace: keep the existing non-default projection so the
+        // full-row upsert never zeroes a live badge/preview. Every legitimate
+        // lowering (read, delete, reorder) arrives via mark-read/timeline/relist
+        // instead, never via this feed collapsing to defaults.
+        if chat.projection == ChatProjection::default()
+            && existing.projection != ChatProjection::default()
+        {
+            chat.projection = existing.projection.clone();
+        }
         *existing = chat;
     } else {
         chats.push(chat);
@@ -1948,33 +2116,9 @@ pub(crate) fn parse_daemon_stream_watch(value: &Value) -> Option<DaemonStreamWat
     })
 }
 
-pub(crate) fn apply_tui_subscription_result(
-    live_previews: &mut Vec<LiveStreamPreview>,
-    unread_counts: &mut HashMap<String, usize>,
-    selected_group_id: Option<&str>,
-    result: &Value,
-) -> Option<String> {
-    if is_initial_subscription_result(result) {
-        return None;
-    }
-    if let Some(group_id) = subscription_result_group_id(result)
-        && Some(group_id.as_str()) != selected_group_id
-    {
-        let status = subscription_result_counts_as_unread(result).then(|| {
-            let unread_count = unread_counts.entry(group_id.clone()).or_default();
-            *unread_count += 1;
-            format!(
-                "unread message in {}; count={}",
-                shorten(&group_id, 18),
-                unread_count
-            )
-        });
-        apply_subscription_result(live_previews, result);
-        return status;
-    }
-    apply_subscription_result(live_previews, result)
-}
-
+/// Whether a `messages subscribe` result is an initial-replay event rather than
+/// a live one. The plain feed exists only for QUIC stream previews now, so the
+/// drain skips these replays; unread is runtime-backed and never counted here.
 pub(crate) fn is_initial_subscription_result(result: &Value) -> bool {
     matches!(
         result.get("trigger").and_then(Value::as_str),
@@ -1982,29 +2126,175 @@ pub(crate) fn is_initial_subscription_result(result: &Value) -> bool {
     )
 }
 
-pub(crate) fn subscription_result_group_id(result: &Value) -> Option<String> {
-    match result.get("type").and_then(Value::as_str) {
-        Some(
-            "message" | "reaction" | "message_delete" | "media" | "agent_stream_start"
-            | "agent_stream_final",
-        ) => result
-            .get("message")
-            .and_then(|message| value_string(message, "group_id")),
-        Some("agent_stream_delta") => result
-            .get("agent_stream_delta")
-            .and_then(|delta| value_string(delta, "group_id")),
-        Some("stream_preview") => result
-            .get("stream_preview")
-            .and_then(|preview| value_string(preview, "group_id")),
-        _ => None,
+/// Extract the `chat_list_row` projection embedded on a
+/// `timeline_projection_updated` event, paired with the event's `group_id`. The
+/// `chats subscribe` feed does not push on unread/last-message changes, so this
+/// is the TUI's live source for the loaded chat's badge and preview. `None` for
+/// any event without a projection (ready, initial page, or a remove-only update).
+pub(crate) fn timeline_chat_list_row(result: &Value) -> Option<(String, ChatProjection)> {
+    if result.get("type").and_then(Value::as_str) != Some("timeline_projection_updated") {
+        return None;
+    }
+    let group_id = value_string(result, "group_id")?;
+    let chat_list_row = result.get("chat_list_row").filter(|row| !row.is_null())?;
+    Some((group_id, parse_chat_projection(chat_list_row)))
+}
+
+/// A parsed `notifications subscribe` event, reduced to what ambient state needs.
+/// The daemon wraps the runtime `NotificationUpdate` under a `notification`
+/// object; the trigger, group, dedup key, and group name all live there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NotificationEvent {
+    /// A new message landed in `group_id`.
+    NewMessage {
+        group_id: String,
+        notification_key: String,
+    },
+    /// A group invite arrived. Surfaced as a status-line notice this phase.
+    GroupInvite {
+        group_name: Option<String>,
+        notification_key: String,
+    },
+    /// Subscription-ready, an unrecognized trigger, or a malformed event.
+    Other,
+}
+
+/// Parse one `notifications subscribe` result into a [`NotificationEvent`]. Reads
+/// the nested `notification` object (the runtime DTO carries the real trigger and
+/// group); the envelope's top-level fields are only routing metadata.
+pub(crate) fn parse_notification_event(result: &Value) -> NotificationEvent {
+    if result.get("type").and_then(Value::as_str) != Some("notification") {
+        return NotificationEvent::Other;
+    }
+    let Some(notification) = result.get("notification") else {
+        return NotificationEvent::Other;
+    };
+    let Some(notification_key) = non_empty_value_string(notification, "notification_key")
+        .or_else(|| non_empty_value_string(result, "notification_key"))
+    else {
+        return NotificationEvent::Other;
+    };
+    match notification.get("trigger").and_then(Value::as_str) {
+        Some("NewMessage") => NotificationEvent::NewMessage {
+            group_id: value_string(notification, "group_id_hex")
+                .or_else(|| value_string(result, "group_id"))
+                .unwrap_or_default(),
+            notification_key,
+        },
+        Some("GroupInvite") => NotificationEvent::GroupInvite {
+            group_name: non_empty_value_string(notification, "group_name"),
+            notification_key,
+        },
+        _ => NotificationEvent::Other,
     }
 }
 
-pub(crate) fn subscription_result_counts_as_unread(result: &Value) -> bool {
-    matches!(
-        result.get("type").and_then(Value::as_str),
-        Some("message" | "reaction" | "media" | "agent_stream_final")
-    )
+/// The account an envelope on the runtime-wide `notifications subscribe` feed
+/// belongs to, read from the top-level `account_id`/`account_ref` routing
+/// fields the daemon stamps on every event. `None` when the envelope carries
+/// neither (kept then — there is nothing to reject against).
+pub(crate) fn notification_event_account(result: &Value) -> Option<String> {
+    non_empty_value_string(result, "account_id")
+        .or_else(|| non_empty_value_string(result, "account_ref"))
+}
+
+/// What a notification event asks the app to do, after dedup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NotificationOutcome {
+    /// Nothing to do: a duplicate key, a message in the loaded chat, or an
+    /// unrecognized event.
+    Ignored,
+    /// A new message in a non-loaded chat — schedule a debounced chats re-list.
+    ScheduledRelist,
+    /// A group invite — show this one-line status notice.
+    Invite(String),
+}
+
+/// A FIFO-bounded dedup set for notification `notification_key`s. Membership is
+/// O(1); once it holds `TUI_SEEN_NOTIFICATION_KEYS_LIMIT` keys, inserting a new
+/// one evicts the oldest. Invariant: dedup only needs to cover the recent event
+/// window — the runtime feed's duplicate emissions arrive close together — so
+/// aging out the oldest keys is safe: a long-evicted key re-arriving costs at
+/// worst one redundant ambient re-list, never incorrect state.
+#[derive(Debug, Default)]
+pub(crate) struct SeenNotificationKeys {
+    order: VecDeque<String>,
+    keys: HashSet<String>,
+}
+
+impl SeenNotificationKeys {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `key`, returning whether it was newly inserted (not already seen).
+    /// A new key past the cap evicts the oldest.
+    pub(crate) fn insert(&mut self, key: String) -> bool {
+        if !self.keys.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > TUI_SEEN_NOTIFICATION_KEYS_LIMIT
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.keys.remove(&oldest);
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
+/// Fold one notification event into ambient state, deduplicating by
+/// `notification_key`. A first-seen NewMessage for a chat other than the loaded
+/// pane sets `pending_relist` (the tick loop coalesces every such event since the
+/// last tick into a single re-list); a first-seen GroupInvite returns a notice.
+/// Re-applying a seen key is a no-op, so the duplicated emissions the runtime
+/// feed produces never trigger twice. A NewMessage for the loaded chat is
+/// ignored: its badge is kept fresh by the timeline feed and `chats mark-read`.
+pub(crate) fn apply_notification_event(
+    seen_keys: &mut SeenNotificationKeys,
+    pending_relist: &mut bool,
+    loaded_group_id: Option<&str>,
+    event: NotificationEvent,
+) -> NotificationOutcome {
+    let notification_key = match &event {
+        NotificationEvent::NewMessage {
+            notification_key, ..
+        }
+        | NotificationEvent::GroupInvite {
+            notification_key, ..
+        } => notification_key.clone(),
+        NotificationEvent::Other => return NotificationOutcome::Ignored,
+    };
+    if !seen_keys.insert(notification_key) {
+        return NotificationOutcome::Ignored;
+    }
+    match event {
+        NotificationEvent::NewMessage { group_id, .. } => {
+            if loaded_group_id == Some(group_id.as_str()) {
+                NotificationOutcome::Ignored
+            } else {
+                *pending_relist = true;
+                NotificationOutcome::ScheduledRelist
+            }
+        }
+        NotificationEvent::GroupInvite { group_name, .. } => {
+            let name = group_name
+                .map(|name| shorten(&terminal_safe_text(&name), 24))
+                .unwrap_or_else(|| "a group".to_owned());
+            NotificationOutcome::Invite(format!("invited to {name}"))
+        }
+        NotificationEvent::Other => NotificationOutcome::Ignored,
+    }
 }
 
 /// Apply one plain `messages subscribe` event to the account-wide live-stream
@@ -2012,8 +2302,8 @@ pub(crate) fn subscription_result_counts_as_unread(result: &Value) -> bool {
 /// message/reaction/media/delete rows drive nothing here; the plain feed is kept
 /// only for what the timeline feed does not carry — the QUIC preview types that
 /// render in the pane's bottom block, plus the preview cleanup when an agent
-/// stream's final row lands. Unread counting for off-screen groups is the
-/// caller's (`apply_tui_subscription_result`) job.
+/// stream's final row lands. Unread is runtime-backed (the chat projection), so
+/// nothing here counts messages.
 pub(crate) fn apply_subscription_result(
     live_previews: &mut Vec<LiveStreamPreview>,
     result: &Value,
@@ -2223,13 +2513,6 @@ pub(crate) fn group_members_status(result: &Value) -> String {
     format!("members: {}", member_ref_summary(&members))
 }
 
-pub(crate) fn retain_unread_counts_for_chats(
-    unread_counts: &mut HashMap<String, usize>,
-    chats: &[ChatRow],
-) {
-    unread_counts.retain(|group_id, _| chats.iter().any(|chat| chat.group_id == *group_id));
-}
-
 impl GroupDiagnostics {
     pub(crate) fn unavailable(group_id: &str, error: impl Into<String>) -> Self {
         Self {
@@ -2401,6 +2684,13 @@ pub(crate) fn message_subscription_args() -> Vec<String> {
         "--limit".to_owned(),
         "0".to_owned(),
     ]
+}
+
+/// Args for the runtime-wide notification subscription (`notifications
+/// subscribe`). Daemon-only; drives the debounced ambient badge refresh for
+/// non-selected chats.
+pub(crate) fn notification_subscription_args() -> Vec<String> {
+    vec!["notifications".to_owned(), "subscribe".to_owned()]
 }
 
 /// Args for the per-group materialized-timeline subscription. Passes `--limit`

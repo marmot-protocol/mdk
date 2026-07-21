@@ -914,6 +914,7 @@ impl TuiApp {
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
         self.ensure_selected_timeline_subscription();
+        self.ensure_selected_notification_subscription();
         Ok(())
     }
 
@@ -928,6 +929,7 @@ impl TuiApp {
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
         self.ensure_selected_timeline_subscription();
+        self.ensure_selected_notification_subscription();
         self.status = daemon_status_sentence(&self.daemon);
         Ok(())
     }
@@ -939,6 +941,7 @@ impl TuiApp {
         self.message_subscription = None;
         self.group_state_subscription = None;
         self.timeline_subscription = None;
+        self.notification_subscription = None;
         self.status = "daemon stopped".to_owned();
         Ok(())
     }
@@ -965,10 +968,10 @@ impl TuiApp {
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
-            self.unread_counts.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
+            self.notification_subscription = None;
             self.group_diagnostics = None;
             self.status = "no identities yet; create one from the login screen".to_owned();
         }
@@ -992,6 +995,7 @@ impl TuiApp {
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
+            self.notification_subscription = None;
             self.group_diagnostics = None;
             self.status = "no account selected".to_owned();
             return Ok(());
@@ -1004,6 +1008,7 @@ impl TuiApp {
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
+            self.notification_subscription = None;
             self.group_diagnostics = None;
             self.status =
                 "selected account is public-only; choose a local signing account".to_owned();
@@ -1021,11 +1026,14 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
             .unwrap_or_default();
-        retain_unread_counts_for_chats(&mut self.unread_counts, &self.chats);
+        sort_chats_by_activity(&mut self.chats);
         self.selected_chat =
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
         if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
             self.status = format!("chat subscription failed: {err}");
+        }
+        if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
+            self.status = format!("notification subscription failed: {err}");
         }
         if self.chats.is_empty() {
             self.clear_timeline_pane();
@@ -1065,7 +1073,6 @@ impl TuiApp {
         };
         self.messages_account_id = Some(account_id.clone());
         self.messages_group_id = Some(group_id.clone());
-        self.unread_counts.remove(&group_id);
         // Establish all three subscriptions regardless of any one's outcome. The
         // timeline feed drives the pane's live updates and its `ensure_*` also
         // kills a stale prior-group child, so a failed plain feed must not skip
@@ -1097,10 +1104,73 @@ impl TuiApp {
         } else {
             self.refresh_group_diagnostics(&account_id, &group_id);
         }
+        // Opening a chat clears its badge immediately: mark it read and fold the
+        // returned projection into the row rather than waiting for a push (the
+        // chats feed does not emit one after a local mark-read). A failure leaves
+        // the badge untouched — never zeroed locally — and surfaces on the status
+        // line behind any subscription error.
+        let mark_read_error = self
+            .mark_selected_chat_read(&account_id, &group_id)
+            .err()
+            .map(|err| format!("mark-read failed: {err}"));
         self.status = message_subscription_error
             .or(timeline_subscription_error)
             .or(group_state_subscription_error)
+            .or(mark_read_error)
             .unwrap_or_else(|| format!("loaded {} message(s)", self.timeline.len()));
+        Ok(())
+    }
+
+    /// Mark the loaded chat read up to its newest message and fold the refreshed
+    /// projection into its row, clearing the badge without waiting for a push.
+    /// The runtime read marker is forward-only, so re-marking is idempotent. On
+    /// failure the badge is left honest (never zeroed locally) and the error is
+    /// returned for the status line.
+    pub(crate) fn mark_selected_chat_read(
+        &mut self,
+        account_id: &str,
+        group_id: &str,
+    ) -> TuiResult<()> {
+        let result = self
+            .client
+            .run_json(Some(account_id), &["chats", "mark-read", group_id])?;
+        fold_chat_projection(
+            &mut self.chats,
+            &mut self.selected_chat,
+            group_id,
+            parse_chat_projection(&result),
+        );
+        Ok(())
+    }
+
+    /// Background chats re-list for ambient state: re-read `chats list` and
+    /// refresh each row's projection (unread + last-message) while preserving the
+    /// messages pane, its subscriptions, and the highlighted chat by group id.
+    /// Unlike `refresh_chats` this never reloads the timeline or resets
+    /// subscriptions; it is the debounced response to a notification for a
+    /// non-selected chat. Silent on success (ambient), so it never clobbers the
+    /// status line.
+    pub(crate) fn relist_chats(&mut self) -> TuiResult<()> {
+        let Some(account) = self.selected_account_row().cloned() else {
+            return Ok(());
+        };
+        if !account.local_signing {
+            return Ok(());
+        }
+        let previous_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
+        let mut args = vec!["chats".to_owned(), "list".to_owned()];
+        if self.show_archived_chats {
+            args.push("--include-archived".to_owned());
+        }
+        let result = self.client.run_json(Some(&account.account_id), &args)?;
+        self.chats = result
+            .get("chats")
+            .and_then(Value::as_array)
+            .map(|chats| chats.iter().filter_map(parse_chat).collect())
+            .unwrap_or_default();
+        sort_chats_by_activity(&mut self.chats);
+        self.selected_chat = selected_chat_index(&self.chats, previous_group_id.as_deref())
+            .unwrap_or_else(|| self.selected_chat.min(self.chats.len().saturating_sub(1)));
         Ok(())
     }
 
@@ -1293,6 +1363,35 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Keep the runtime-wide notification subscription alive for `account_id`.
+    /// Account-keyed (not per group) like the message feed, and daemon-only: with
+    /// no daemon it is dropped. Idempotent — a live child for the same account is
+    /// left in place. Same keyed re-spawn / Drop lifecycle as the other feeds.
+    pub(crate) fn ensure_notification_subscription(&mut self, account_id: &str) -> TuiResult<()> {
+        if !self.daemon.running {
+            self.notification_subscription = None;
+            return Ok(());
+        }
+        if self
+            .notification_subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.account_id == account_id)
+        {
+            return Ok(());
+        }
+
+        self.notification_subscription = None;
+        let args = notification_subscription_args();
+        let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
+        let rx = spawn_subscription_reader(&mut child, "notification")?;
+        self.notification_subscription = Some(NotificationSubscription {
+            account_id: account_id.to_owned(),
+            child,
+            rx,
+        });
+        Ok(())
+    }
+
     /// Clear the messages pane: drop the loaded timeline rows, reset the scroll
     /// model to its pinned default, and stop the per-group timeline subscription.
     pub(crate) fn clear_timeline_pane(&mut self) {
@@ -1363,12 +1462,29 @@ impl TuiApp {
         }
     }
 
+    /// Re-establish the runtime-wide notification subscription for the selected
+    /// local signing account, dropping it for no account or a public-only one.
+    /// Mirrors `ensure_selected_message_subscription`; both are account-wide.
+    pub(crate) fn ensure_selected_notification_subscription(&mut self) {
+        let Some(account) = self.selected_account_row().cloned() else {
+            self.notification_subscription = None;
+            return;
+        };
+        if !account.local_signing {
+            self.notification_subscription = None;
+            return;
+        }
+        if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
+            self.status = format!("notification subscription failed: {err}");
+        }
+    }
+
     /// Assign a status produced by a background drain, but only while the main
     /// view is showing. On the login/account-select screen the status line
     /// carries the nsec prompt and picker guidance; a live drain (a picker
     /// reached via `A` keeps its subscriptions running) must apply its state
     /// changes without clobbering that prompt.
-    fn set_drain_status(&mut self, status: String) {
+    pub(crate) fn set_drain_status(&mut self, status: String) {
         if self.screen == Screen::Main {
             self.status = status;
         }
@@ -1506,13 +1622,13 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
-                    let loaded_group_id = self.messages_group_id.clone();
-                    if let Some(status) = apply_tui_subscription_result(
-                        &mut self.live_stream_previews,
-                        &mut self.unread_counts,
-                        loaded_group_id.as_deref(),
-                        &result,
-                    ) {
+                    // The plain feed drives only QUIC stream previews now (unread
+                    // is runtime-backed). Skip initial replays, then apply preview
+                    // updates; no local counting happens here.
+                    if !is_initial_subscription_result(&result)
+                        && let Some(status) =
+                            apply_subscription_result(&mut self.live_stream_previews, &result)
+                    {
                         self.set_drain_status(status);
                     }
                 }
@@ -1550,6 +1666,27 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
+                    // The timeline feed is the live source for the loaded chat's
+                    // badge and preview: fold its `chat_list_row` into that chat's
+                    // row (the chats feed does not push these), then drive the pane.
+                    if let Some((group_id, projection)) = timeline_chat_list_row(&result) {
+                        // Viewing is reading: if the imported count for the
+                        // viewed chat is nonzero, schedule a mark-read so the
+                        // badge clears instead of re-accruing as we read.
+                        if should_mark_loaded_chat_read(
+                            loaded_group_id.as_deref(),
+                            &group_id,
+                            &projection,
+                        ) {
+                            self.pending_mark_read = true;
+                        }
+                        fold_chat_projection(
+                            &mut self.chats,
+                            &mut self.selected_chat,
+                            &group_id,
+                            projection,
+                        );
+                    }
                     apply_timeline_event(
                         &mut self.timeline,
                         &mut self.timeline_scroll,
@@ -1562,6 +1699,66 @@ impl TuiApp {
                 }
                 SubscriptionEvent::Ended => {
                     self.timeline_subscription = None;
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    /// Drain the runtime-wide notification feed. Each event folds through the
+    /// pure `apply_notification_event` reducer, which deduplicates by
+    /// `notification_key`: a NewMessage for a non-loaded chat sets the debounce
+    /// flag (tick coalesces to one re-list), a GroupInvite surfaces a status
+    /// notice, and everything else is ignored.
+    pub(crate) fn drain_notification_subscription(&mut self) -> bool {
+        let Some(subscription) = self.notification_subscription.as_ref() else {
+            return false;
+        };
+        // The feed is runtime-wide, so it carries every local account's events;
+        // filter by the envelope account against the account this subscription
+        // was opened for before acting on any of them.
+        let subscription_account_id = subscription.account_id.clone();
+        let mut events = Vec::new();
+        loop {
+            match subscription.rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(SubscriptionEvent::Ended);
+                    break;
+                }
+            }
+        }
+        if events.is_empty() {
+            return false;
+        }
+        let loaded_group_id = self.messages_group_id.clone();
+        for event in events {
+            match event {
+                SubscriptionEvent::Result(result) => {
+                    // Drop another account's notification before it can insert a
+                    // dedup key, arm a re-list, or surface a notice on this
+                    // account's status line.
+                    if notification_event_account(&result)
+                        .is_some_and(|account| account != subscription_account_id)
+                    {
+                        continue;
+                    }
+                    if let NotificationOutcome::Invite(notice) = apply_notification_event(
+                        &mut self.seen_notification_keys,
+                        &mut self.pending_chat_relist,
+                        loaded_group_id.as_deref(),
+                        parse_notification_event(&result),
+                    ) {
+                        self.set_drain_status(notice);
+                    }
+                }
+                SubscriptionEvent::Error(err) => {
+                    self.set_drain_status(format!("notification subscription failed: {err}"));
+                }
+                SubscriptionEvent::Ended => {
+                    self.notification_subscription = None;
                     break;
                 }
             }

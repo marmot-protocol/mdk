@@ -529,7 +529,16 @@ Main view controls:
 
 - `Tab`/`BackTab`: cycle the chat list, messages, and composer.
 - Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `A` reopens the
-  account picker.
+  account picker. Each row shows an unread badge (bold name plus `(N)`) and a dark-gray last-message preview (sender
+  plus truncated text), and the list orders by last activity, newest first. The badge and the status bar's unread
+  total come from the runtime's per-chat projection (`chats list`), so they survive a restart rather than being
+  counted in the TUI. Opening a chat clears its badge immediately (via `chats mark-read`); a chat you are viewing
+  updates its badge and preview live from the timeline feed, and other chats refresh from a background
+  `notifications subscribe` feed (a debounced `chats list` re-read on each new message elsewhere). A group invite
+  surfaces as a one-line status notice. A background refresh never moves the highlight off the chat you have
+  selected. These ambient updates require a running `wnd`: without a daemon, off-screen badges and previews
+  update only when you manually refresh (`/refresh`) or re-open the chat. The badge and unread total still
+  survive a restart either way, since they come from the runtime's durable `chats list` projection.
 - Messages: `j`/`k` or arrows move the message selection; `PageUp`/`PageDown` page; `G`/`End` jump to the newest
   message (and pin to the bottom), `g`/`Home` to the oldest. New messages stay pinned to the bottom while you are at
   the newest message and hold your position when you have scrolled up. Scrolling past the oldest loaded message loads
