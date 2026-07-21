@@ -2322,9 +2322,10 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         sender: row.get(5)?,
         plaintext: row.get(6)?,
         kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(8)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
-        })?,
+        // Timeline rows are a rebuildable projection. Degrade a corrupt source
+        // tag blob to no tags so one damaged row cannot poison every rebuild
+        // for the group; this matches the tolerant unread/search read paths.
+        tags: tags_from_json(row.get::<_, String>(8)?).unwrap_or_default(),
         recorded_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
         invalidated: row.get::<_, i64>(11)? != 0,

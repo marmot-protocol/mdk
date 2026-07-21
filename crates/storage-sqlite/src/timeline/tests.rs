@@ -170,6 +170,46 @@ fn oversized_reply_preview_target_sets_are_chunked() {
     assert_eq!(previews.len(), 2);
 }
 
+#[test]
+fn timeline_rebuild_tolerates_one_corrupt_source_tag_blob() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+    store
+        .record_app_event(&chat("corrupt", "alice", 10, "first"))
+        .unwrap();
+    store
+        .record_app_event(&chat("healthy", "bob", 20, "second"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE app_events SET tags_json = 'not-json'
+             WHERE group_id_hex = ?1 AND message_id_hex = 'corrupt'",
+            params![&group_id],
+        )
+        .unwrap();
+
+    store
+        .rebuild_message_timeline_for_group(&group_id)
+        .expect("a malformed tag blob must not poison the group rebuild");
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_id),
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(page.messages.len(), 2);
+    assert!(
+        page.messages
+            .iter()
+            .find(|message| message.message_id_hex == "corrupt")
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+}
+
 fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),
