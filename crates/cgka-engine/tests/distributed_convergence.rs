@@ -4450,6 +4450,65 @@ async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
 }
 
 #[tokio::test]
+async fn malformed_convergence_input_does_not_reset_quiescence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-malformed".into(),
+            description: "".into(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _pending) = evolution(invite);
+    let commit = route(commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .expect("valid commit buffered");
+
+    let mut malformed = commit.clone();
+    malformed.payload = b"not an OpenMLS message".to_vec();
+    carol
+        .buffer_openmls_convergence_message(&group_id, malformed, 1_900)
+        .expect_err("malformed input must fail before touching quiescence");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("malformed input should not pin syncing");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&carol_storage, &commit, MessageState::Processed);
+}
+
+#[tokio::test]
 async fn engine_queues_app_send_until_convergence_is_settled() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
