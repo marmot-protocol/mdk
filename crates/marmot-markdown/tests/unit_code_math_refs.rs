@@ -92,6 +92,18 @@ fn fenced_info_string_trimmed() {
 }
 
 #[test]
+fn fenced_info_string_strips_control_characters() {
+    for control in ['\u{0007}', '\u{001b}', '\u{007f}', '\u{0085}', '\u{009f}'] {
+        let input = format!("```rust{control}payload\ncode\n```");
+        assert_eq!(
+            parse_blocks(&input),
+            vec![fenced("rustpayload", "code\n")],
+            "control character {control:?} must not reach code-block metadata"
+        );
+    }
+}
+
+#[test]
 fn fenced_close_must_be_at_least_as_long() {
     // Opening `~~~~` (4) cannot be closed by `~~~` (3).
     let input = "~~~~\n~~~\nfoo\n~~~~";

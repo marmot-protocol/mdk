@@ -1276,7 +1276,11 @@ fn parse_fence_open(bytes: &[u8]) -> Option<(u8, usize, String)> {
         return None;
     }
     let trimmed = trim_ascii_ws(info_bytes);
-    let info = std::str::from_utf8(trimmed).ok()?.to_string();
+    let info = std::str::from_utf8(trimmed)
+        .ok()?
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
     Some((ch, i, info))
 }
 
