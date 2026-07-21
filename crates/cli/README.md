@@ -214,6 +214,7 @@ Message commands:
 ```sh
 wn --account <npub-or-hex> messages send <group-hex> "hello"
 wn --account <npub-or-hex> messages send --group <group-hex> "--text that starts with a dash"
+wn --account <npub-or-hex> messages send --group <group-hex> --reply-to <message-id> "replying to you"
 wn --account <npub-or-hex> messages list
 wn --account <npub-or-hex> messages list <group-hex> --limit 20
 wn --account <npub-or-hex> messages list <group-hex> --before <unix-seconds> --before-message-id <event-id>
@@ -229,6 +230,16 @@ wn --account <npub-or-hex> messages timeline list <group-hex> --limit 20
 wn --account <npub-or-hex> messages timeline search <group-hex> <query> --limit 20
 wn --account <npub-or-hex> messages timeline subscribe <group-hex>
 ```
+
+`messages send --reply-to <message-id>` sends the text as a reply to an existing message. It uses the same wire
+format other Marmot clients produce, so recipients see the row with its reply reference and a hydrated reply preview
+of the parent. Pass the group with `--group` and put `--reply-to` before the text when replying: the message text uses
+hyphen-tolerant parsing, so a `--reply-to` placed after the text (in either the positional-group or the `--group`
+form) is read as literal text rather than as the flag. Instead of silently sending that stray `--reply-to` as part of
+the body, the CLI rejects the mis-ordering with a clear error (code `reply_to_after_message_text`) so it fails loudly.
+The tradeoff: message text that is itself exactly `--reply-to` can no longer be sent. The parent id is not required to
+exist locally; a reply to a message you have not yet synced is still sent (its preview hydrates once the parent
+arrives). The JSON response is the same shape as a plain send.
 
 The `messages timeline` subcommands list, search, and subscribe to the materialized message timeline (the projection
 that interleaves messages, media, and agent-stream anchors/finals in conversation order).

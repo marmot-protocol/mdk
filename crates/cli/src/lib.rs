@@ -1159,8 +1159,12 @@ mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
+    use clap::Parser;
+
     use super::commands::account::{GlobalRelayDefaults, apply_global_relay_defaults};
-    use super::commands::messages::{apply_message_cursors, validate_message_list_cursors};
+    use super::commands::messages::{
+        apply_message_cursors, reject_misplaced_reply_to, validate_message_list_cursors,
+    };
     use super::commands::relay_stats::{relay_stats_output, relay_stats_plain};
     use super::commands::stream::{
         first_quic_candidate_is_loopback, parse_quic_candidate, quic_candidate_host,
@@ -1756,6 +1760,208 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    fn parse_send(argv: &[&str]) -> (Option<String>, Option<String>, Vec<String>) {
+        let cli = Cli::try_parse_from(argv.iter().copied()).expect("send args parse");
+        match cli.command {
+            Command::Message {
+                command:
+                    crate::MessageCommand::Send {
+                        group_flag,
+                        reply_to,
+                        args,
+                    },
+            }
+            | Command::Messages {
+                command:
+                    crate::MessageCommand::Send {
+                        group_flag,
+                        reply_to,
+                        args,
+                    },
+            } => (group_flag, reply_to, args),
+            other => panic!("expected a message send command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_send_reply_to_flag_parses_before_positional_text() {
+        // `--group` + `--reply-to` before the text: the canonical reply form.
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "messages",
+            "send",
+            "--group",
+            "GROUP",
+            "--reply-to",
+            "PARENT",
+            "hello",
+            "world",
+        ]);
+        assert_eq!(group_flag.as_deref(), Some("GROUP"));
+        assert_eq!(reply_to.as_deref(), Some("PARENT"));
+        assert_eq!(args, vec!["hello".to_owned(), "world".to_owned()]);
+
+        // Positional group works too, as long as `--reply-to` precedes the
+        // positional group (the older singular `message` surface shares the enum).
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "message",
+            "send",
+            "--reply-to",
+            "PARENT",
+            "GROUP",
+            "hi",
+        ]);
+        assert_eq!(group_flag, None);
+        assert_eq!(reply_to.as_deref(), Some("PARENT"));
+        assert_eq!(args, vec!["GROUP".to_owned(), "hi".to_owned()]);
+    }
+
+    #[test]
+    fn message_send_reply_to_after_positional_group_is_literal_text() {
+        // The trailing positional text uses `allow_hyphen_values`, so once a
+        // positional group is consumed everything after it (including a stray
+        // `--reply-to`) is literal message text — the same rule that lets
+        // `send --group <g> "--dash text"` work. Callers must use the `--group`
+        // form to attach `--reply-to`. This locks that intentional behavior.
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "messages",
+            "send",
+            "GROUP",
+            "--reply-to",
+            "PARENT",
+            "text",
+        ]);
+        assert_eq!(group_flag, None);
+        assert_eq!(reply_to, None);
+        assert_eq!(
+            args,
+            vec![
+                "GROUP".to_owned(),
+                "--reply-to".to_owned(),
+                "PARENT".to_owned(),
+                "text".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_send_reply_to_after_group_flag_text_is_literal_text() {
+        // The `--group` form carries the same footgun as the positional-group form
+        // above: the trailing message args use `allow_hyphen_values`, so a
+        // `--reply-to` placed *after* the text is swallowed as literal message text
+        // (`reply_to` stays `None`) instead of setting the reply target. The send
+        // handler turns this exact parse into a loud error (see
+        // `reject_misplaced_reply_to`); this locks the parse the guard fires on.
+        let (group_flag, reply_to, args) = parse_send(&[
+            "wn",
+            "messages",
+            "send",
+            "--group",
+            "GROUP",
+            "hello",
+            "--reply-to",
+            "PARENT",
+        ]);
+        assert_eq!(group_flag.as_deref(), Some("GROUP"));
+        assert_eq!(reply_to, None);
+        assert_eq!(
+            args,
+            vec![
+                "hello".to_owned(),
+                "--reply-to".to_owned(),
+                "PARENT".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn message_send_without_reply_to_leaves_it_unset() {
+        let (group_flag, reply_to, args) =
+            parse_send(&["wn", "messages", "send", "GROUP", "hello"]);
+        assert_eq!(group_flag, None);
+        assert_eq!(reply_to, None);
+        assert_eq!(args, vec!["GROUP".to_owned(), "hello".to_owned()]);
+    }
+
+    #[test]
+    fn message_send_stray_reply_to_in_text_is_rejected() {
+        // A `--reply-to` that lands *after* the message text is swallowed as
+        // literal text (see the parse-lock tests above). The send handler must
+        // reject that mis-ordering loudly instead of publishing a body carrying a
+        // stray `--reply-to <id>` that silently attaches to no reply.
+        let err = reject_misplaced_reply_to(
+            None,
+            &[
+                "hello".to_owned(),
+                "--reply-to".to_owned(),
+                "PARENT".to_owned(),
+            ],
+        )
+        .expect_err("a stray --reply-to in the message text must be rejected");
+        assert!(matches!(err, WnError::ReplyToAfterMessageText));
+    }
+
+    #[test]
+    fn message_send_reply_to_guard_allows_real_replies_and_plain_text() {
+        // A parsed `--reply-to` already did its job (the flag was consumed), so an
+        // identical token surviving in the body is fine and the guard stays quiet.
+        assert!(
+            reject_misplaced_reply_to(Some("PARENT"), &["--reply-to".to_owned(), "b".to_owned()])
+                .is_ok()
+        );
+        // Plain text with no stray flag is always fine.
+        assert!(reject_misplaced_reply_to(None, &["hello".to_owned(), "world".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn reply_to_after_message_text_error_renders_reply_to_code() {
+        let value = super::wn_error_json(&WnError::ReplyToAfterMessageText);
+        assert_eq!(value["code"], "reply_to_after_message_text");
+        assert_eq!(
+            value["message"],
+            "--reply-to must come before the message text; it was read as literal text here"
+        );
+    }
+
+    #[test]
+    fn message_send_reply_to_footgun_is_rejected_on_both_send_surfaces() {
+        // The guard lives on the shared `MessageCommand::Send` arm, so the plural
+        // `messages send` and the older singular `message send` are protected
+        // identically. With `--group`, the parsed positional args are the message
+        // text, so a trailing `--reply-to` is exactly what the guard rejects.
+        for argv in [
+            [
+                "wn",
+                "messages",
+                "send",
+                "--group",
+                "GROUP",
+                "hello",
+                "--reply-to",
+                "PARENT",
+            ],
+            [
+                "wn",
+                "message",
+                "send",
+                "--group",
+                "GROUP",
+                "hello",
+                "--reply-to",
+                "PARENT",
+            ],
+        ] {
+            let (group_flag, reply_to, text) = parse_send(&argv);
+            assert_eq!(group_flag.as_deref(), Some("GROUP"));
+            assert_eq!(reply_to, None);
+            let err = reject_misplaced_reply_to(reply_to.as_deref(), &text)
+                .expect_err("stray --reply-to must be rejected on both send surfaces");
+            assert!(matches!(err, WnError::ReplyToAfterMessageText));
+        }
     }
 
     #[test]

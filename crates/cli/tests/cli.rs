@@ -1392,9 +1392,18 @@ fn first_message_with_kind_and_target<'a>(
 
 /// First `e` tag value on a projected message's `tags` array.
 fn message_e_tag(message: &Value) -> Option<&str> {
+    message_tag_value(message, "e")
+}
+
+/// First `q` (quote/reply) tag value on a projected message's `tags` array.
+fn message_q_tag(message: &Value) -> Option<&str> {
+    message_tag_value(message, "q")
+}
+
+fn message_tag_value<'a>(message: &'a Value, name: &str) -> Option<&'a str> {
     message["tags"].as_array()?.iter().find_map(|tag| {
         let tag = tag.as_array()?;
-        if tag.first()?.as_str()? == "e" {
+        if tag.first()?.as_str()? == name {
             tag.get(1)?.as_str()
         } else {
             None
@@ -4164,6 +4173,209 @@ fn messages_react_unreact_and_delete_are_typed_app_messages() {
     );
     assert_eq!(retry["target_event_id"], target_message_id);
     assert_eq!(retry["retry_scope"], "group_convergence");
+}
+
+#[test]
+fn messages_send_reply_to_round_trips_into_timeline_reply_preview() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "replies", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    // Alice sends the message Bob will reply to.
+    let parent = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            group_id,
+            "original from alice",
+        ],
+    );
+    let parent_id = parent["message_ids"][0]
+        .as_str()
+        .expect("parent message id")
+        .to_owned();
+    sync_until_message(home.path(), test_relay_url(), &bob, "original from alice");
+
+    // Bob replies to Alice's message. `--reply-to` is additive input; the JSON
+    // response shape matches a plain send.
+    let reply = run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "send",
+            "--group",
+            group_id,
+            "--reply-to",
+            &parent_id,
+            "reply from bob",
+        ],
+    );
+    assert!(
+        reply["published"]
+            .as_u64()
+            .is_some_and(|published| published >= 1),
+        "reply should publish to at least one relay, got {reply}"
+    );
+    assert!(
+        reply["message_ids"][0].as_str().is_some(),
+        "reply response keeps the plain-send shape with message_ids, got {reply}"
+    );
+    sync_until_message(home.path(), test_relay_url(), &alice, "reply from bob");
+
+    // Alice's materialized timeline shows Bob's reply row with the reply
+    // reference and a hydrated preview of Alice's original text. This proves the
+    // send-side wire format (`q`/`e` tags on a kind-9 chat) matches the
+    // ingest-side reply parser.
+    let timeline = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "timeline",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    let bob_reply = timeline["messages"]
+        .as_array()
+        .expect("timeline messages")
+        .iter()
+        .find(|message| message["plaintext"] == "reply from bob")
+        .expect("bob reply row");
+    assert_eq!(
+        bob_reply["reply_to_message_id"].as_str(),
+        Some(parent_id.as_str())
+    );
+    assert_eq!(
+        bob_reply["reply_preview"]["plaintext"].as_str(),
+        Some("original from alice")
+    );
+    // The authoritative wire contract: the reply carries a `q` (quote) tag with
+    // the parent id, which timeline ingest reads into `reply_to_message_id`.
+    assert_eq!(message_q_tag(bob_reply), Some(parent_id.as_str()));
+}
+
+#[test]
+fn messages_send_reply_to_unknown_parent_still_sends() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "groups", "create", "dangling", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+
+    // A well-formed but locally-unknown parent id: replies to messages that have
+    // not synced yet are legitimate (the preview hydrates lazily on arrival), so
+    // the send must succeed rather than be rejected.
+    let unknown_parent = "ab".repeat(32);
+    let reply = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "send",
+            "--group",
+            group_id,
+            "--reply-to",
+            &unknown_parent,
+            "reply to a ghost",
+        ],
+    );
+    assert!(
+        reply["published"]
+            .as_u64()
+            .is_some_and(|published| published >= 1),
+        "reply to an unknown parent should still publish, got {reply}"
+    );
+
+    // The sender's own timeline carries the reply reference but no hydrated
+    // preview, because the parent is not present locally.
+    let timeline = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "messages",
+            "timeline",
+            "list",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    let reply_row = timeline["messages"]
+        .as_array()
+        .expect("timeline messages")
+        .iter()
+        .find(|message| message["plaintext"] == "reply to a ghost")
+        .expect("reply row");
+    assert_eq!(
+        reply_row["reply_to_message_id"].as_str(),
+        Some(unknown_parent.as_str())
+    );
+    assert!(
+        reply_row["reply_preview"].is_null(),
+        "an unknown parent hydrates no preview, got {}",
+        reply_row["reply_preview"]
+    );
+}
+
+#[test]
+fn messages_send_reply_to_after_text_errors_loudly_on_both_surfaces() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    // A `--reply-to` placed *after* the message text parses as literal text
+    // (allow_hyphen_values), so the reply target is silently dropped. The send
+    // handler must reject that loudly instead of publishing a message whose body
+    // carries a stray `--reply-to <id>`. The guard sits on the shared `Send` arm
+    // before any account/relay work, so the plural `messages send` and the older
+    // singular `message send` fail identically.
+    for namespace in ["messages", "message"] {
+        let error = run_json_error(
+            home.path(),
+            &[
+                namespace,
+                "send",
+                "--group",
+                "GROUP",
+                "hello",
+                "--reply-to",
+                "PARENT",
+            ],
+        );
+        assert_eq!(
+            error["code"], "reply_to_after_message_text",
+            "namespace={namespace}: {error}"
+        );
+        assert_eq!(
+            error["message"],
+            "--reply-to must come before the message text; it was read as literal text here",
+            "namespace={namespace}"
+        );
+    }
 }
 
 #[test]

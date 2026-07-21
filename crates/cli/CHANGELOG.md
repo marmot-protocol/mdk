@@ -31,6 +31,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   `wn daemon start`). They are forwarded to the `daemon start` child and to `create-identity`/`login` account setup
   so a first run with no relay configuration can supply relays without dead-ending. Flag passthrough only; no JSON
   response shapes changed.
+- `wn messages send` (and the older `wn message send`) accept `--reply-to <message-id>` to send the text as a reply to
+  an existing message. The reply carries the same `q`/`e` reference tags other Marmot clients produce, so recipients'
+  timelines parse it into `reply_to_message_id` with a hydrated `reply_preview`. `--reply-to` is additive input only:
+  the JSON response shape is unchanged, pass the group with `--group` when replying, and a reply to a not-yet-synced
+  parent is still sent (its preview hydrates when the parent arrives). No new runtime API was needed; the CLI routes
+  reply sends through the existing `MarmotAppRuntime::reply_to_message`. Because the trailing message text is
+  hyphen-tolerant, a `--reply-to` placed *after* the text is read as literal text; rather than silently sending that
+  stray flag as part of the body, the send now fails loudly with error code `reply_to_after_message_text` (put
+  `--reply-to` before the text with `--group`). Tradeoff: message text that is itself exactly `--reply-to` can no
+  longer be sent.
 - MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
   and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
   metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.
