@@ -143,6 +143,33 @@ fn oversized_timeline_id_sets_are_chunked() {
     );
 }
 
+#[test]
+fn oversized_reply_preview_target_sets_are_chunked() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+    let ids = (0..=SQLITE_BIND_PARAMETER_CHUNK)
+        .map(|index| format!("preview-{index:04}"))
+        .collect::<Vec<_>>();
+    store
+        .record_app_event(&chat(&ids[0], "alice", 10, "first"))
+        .unwrap();
+    store
+        .record_app_event(&chat(
+            &ids[SQLITE_BIND_PARAMETER_CHUNK],
+            "alice",
+            20,
+            "last",
+        ))
+        .unwrap();
+    let targets = ids
+        .into_iter()
+        .map(|message_id| (group_id.clone(), message_id))
+        .collect();
+
+    let previews = load_reply_previews(&store.lock().unwrap(), targets).unwrap();
+    assert_eq!(previews.len(), 2);
+}
+
 fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),

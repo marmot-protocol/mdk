@@ -2427,28 +2427,30 @@ fn load_reply_previews(
     for (group_id_hex, mut message_ids) in targets_by_group {
         message_ids.sort();
         message_ids.dedup();
-        let placeholders = std::iter::repeat_n("?", message_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch
-             FROM message_timeline
-             WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
-        );
-        let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
-        params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
-        params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
-        let mut stmt = conn.prepare(&sql).storage()?;
-        let group_previews = stmt
-            .query_map(params_from_iter(params.iter()), reply_preview_from_row)
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        for preview in group_previews {
-            previews.insert(
-                (group_id_hex.clone(), preview.message_id_hex.clone()),
-                preview,
+        for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch
+                 FROM message_timeline
+                 WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
             );
+            let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
+            params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+            let mut stmt = conn.prepare(&sql).storage()?;
+            let group_previews = stmt
+                .query_map(params_from_iter(params.iter()), reply_preview_from_row)
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            for preview in group_previews {
+                previews.insert(
+                    (group_id_hex.clone(), preview.message_id_hex.clone()),
+                    preview,
+                );
+            }
         }
     }
     Ok(previews)
