@@ -131,7 +131,9 @@ impl<S: StorageProvider> Engine<S> {
         // this epoch" entry behind when staging failed (the cleanup guard
         // clears the OpenMLS commit but nothing prunes `committed_from`),
         // which later mis-routed legitimate sibling commits into
-        // fail-closed fork recovery.
+        // fail-closed fork recovery. The post-staging counterpart —
+        // `publish_failed` after a successful `begin_pending` — is handled by
+        // `rollback_publish`, which removes the provisional entry again.
         let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         // Arm the cleanup guard before creating the snapshot so the snapshot is
         // released on early return / cancellation even before a pending commit
