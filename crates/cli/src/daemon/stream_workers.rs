@@ -654,6 +654,10 @@ pub(crate) async fn finish_stream_compose(
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
     if report.text.is_empty() {
+        // `Finish` consumes the compose task. A malformed terminal report
+        // cannot be retried, so remove its dead session instead of leaving a
+        // permanently closed sender in the registry.
+        workers.remove(&key);
         return daemon_error(
             cli.json,
             "stream_compose_failed",
@@ -661,6 +665,7 @@ pub(crate) async fn finish_stream_compose(
         );
     }
     if report.transcript_hash.is_none() {
+        workers.remove(&key);
         return daemon_error(
             cli.json,
             "stream_compose_failed",

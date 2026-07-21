@@ -865,6 +865,10 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
         chunk_count: 1,
         error: None,
     };
+    stub_compose_session_with_report(report)
+}
+
+fn stub_compose_session_with_report(report: StreamComposeReport) -> StreamComposeSession {
     let (tx, mut rx) = mpsc::channel::<StreamComposeCommand>(4);
     let (cancel_tx, _cancel_rx) = mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {
@@ -882,6 +886,74 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
         cancel_tx,
         handle,
         finalized: None,
+    }
+}
+
+#[tokio::test]
+async fn finish_stream_compose_removes_session_for_invalid_terminal_report() {
+    let defaults = DaemonDefaults {
+        home: PathBuf::from("/tmp/wn-daemon-home"),
+        socket: PathBuf::from("/tmp/wn-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon.log"),
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let cli = daemon_test_cli(crate::Command::Sync);
+
+    for (stream_id, text, transcript_hash) in [
+        (
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "",
+            Some("aa".to_owned()),
+        ),
+        (
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "hello",
+            None,
+        ),
+    ] {
+        let state = Arc::new(Mutex::new(DaemonState {
+            pid: 0,
+            started_at: 0,
+            last_runtime_activity: None,
+        }));
+        let mut runtime_host = AppRuntimeHost::default();
+        let mut workers = StreamComposeWorkers::default();
+        let key = stream_compose_key(None, stream_id);
+        let report = StreamComposeReport {
+            account: None,
+            group_id: "abcd".to_owned(),
+            stream_id: stream_id.to_owned(),
+            start_message_id: "ef01".to_owned(),
+            candidate: "quic://127.0.0.1:9000".to_owned(),
+            status: "streaming".to_owned(),
+            text: text.to_owned(),
+            transcript_hash,
+            chunk_count: 1,
+            error: None,
+        };
+        workers.insert(key.clone(), stub_compose_session_with_report(report));
+
+        let output = finish_stream_compose(
+            &cli,
+            &defaults,
+            state,
+            DaemonEventHub::new(),
+            &mut runtime_host,
+            &mut workers,
+            stream_id,
+        )
+        .await;
+
+        assert_ne!(output.code, 0);
+        assert!(
+            workers.get(&key).is_none(),
+            "a consumed compose task with an invalid report must be removed"
+        );
     }
 }
 
