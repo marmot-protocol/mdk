@@ -1610,6 +1610,7 @@ dependencies = [
 name = "fs-private"
 version = "0.9.4"
 dependencies = [
+ "libc",
  "tempfile",
 ]
 

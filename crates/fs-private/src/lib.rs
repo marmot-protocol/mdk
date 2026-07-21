@@ -27,6 +27,7 @@ pub fn set_private_file_mode(options: &mut OpenOptions) {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(PRIVATE_FILE_MODE);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     #[cfg(not(unix))]
     {
@@ -47,8 +48,17 @@ pub fn create_dir_all_private(path: &Path) -> io::Result<()> {
     builder.create(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let directory = options.open(path)?;
+        if !directory.metadata()?.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private directory target must be a directory",
+            ));
+        }
+        set_directory_handle_private(&directory)?;
     }
     Ok(())
 }
@@ -100,9 +110,11 @@ pub fn ensure_private_file(path: &Path) -> io::Result<()> {
 pub fn tighten_existing_private_file(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE)) {
-            Ok(()) => Ok(()),
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        match options.open(path) {
+            Ok(file) => set_handle_private(&file),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
@@ -138,6 +150,19 @@ fn set_handle_private(file: &std::fs::File) -> io::Result<()> {
     #[cfg(not(unix))]
     {
         let _ = file;
+        Ok(())
+    }
+}
+
+fn set_directory_handle_private(directory: &std::fs::File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory.set_permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
         Ok(())
     }
 }
@@ -329,6 +354,25 @@ mod unix_tests {
     }
 
     #[test]
+    fn private_file_helpers_do_not_follow_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("artifact");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(write_private(&link, b"replacement").is_err());
+        assert!(open_private_append(&link).is_err());
+        assert!(ensure_private_file(&link).is_err());
+        assert!(tighten_existing_private_file(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(mode_of(&target), 0o644);
+    }
+
+    #[test]
     fn ensure_private_db_files_tightens_main_db_and_stale_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("cache.sqlite");
@@ -355,6 +399,21 @@ mod unix_tests {
         create_dir_all_private(&path).unwrap();
         assert_eq!(mode_of(&path), 0o700);
         assert_eq!(mode_of(&dir.path().join("a")), 0o700);
+    }
+
+    #[test]
+    fn create_dir_all_private_does_not_follow_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("private");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(create_dir_all_private(&link).is_err());
+        assert_eq!(mode_of(&target), 0o755);
     }
 
     #[test]
