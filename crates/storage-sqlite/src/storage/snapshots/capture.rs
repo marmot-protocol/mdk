@@ -3,10 +3,12 @@ use super::rows::{
     Snapshot,
 };
 use crate::openmls_storage::mls_group_key;
-use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
+use crate::{
+    SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, deserialize, serialize,
+};
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::{GroupId, MemberId};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 pub(super) fn create(
     store: &SqliteAccountStorage,
@@ -18,11 +20,15 @@ pub(super) fn create(
         return create_on_connection(&conn, group_id, name);
     }
 
-    let mut conn = store.lock()?;
-    let tx = conn.transaction().storage()?;
-    create_on_connection(&tx, group_id, name)?;
-    tx.commit().storage()?;
-    Ok(())
+    retry_on_busy(|| {
+        let mut conn = store.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
+        create_on_connection(&tx, group_id, name)?;
+        tx.commit().storage()?;
+        Ok(())
+    })
 }
 
 fn create_on_connection(

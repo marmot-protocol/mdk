@@ -166,6 +166,62 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_create_and_rollback_retry_writer_contention() {
+        use crate::{SqlCipherKey, SqliteStorageOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot-contention.sqlite");
+        let key = SqlCipherKey::new("snapshot contention key").unwrap();
+        let options = SqliteStorageOptions {
+            busy_timeout_ms: 50,
+            ..SqliteStorageOptions::default()
+        };
+        let store = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+            .unwrap();
+        let original = sample_group(gid(1), 0, 1);
+        store.put_group(&original).unwrap();
+
+        let spawn_blocker = || {
+            let blocker_path = path.clone();
+            let blocker_options = options.clone();
+            let blocker_key = SqlCipherKey::new("snapshot contention key").unwrap();
+            let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                    &blocker_path,
+                    &blocker_key,
+                    blocker_options,
+                )
+                .unwrap();
+                let conn = blocker.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                lock_acquired_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                conn.execute_batch("COMMIT").unwrap();
+            });
+            lock_acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            handle
+        };
+
+        let blocker = spawn_blocker();
+        store
+            .create_group_snapshot(&original.id, "contended")
+            .expect("snapshot capture retries after transient contention");
+        blocker.join().unwrap();
+
+        let changed = sample_group(gid(1), 1, 1);
+        store.put_group(&changed).unwrap();
+        let blocker = spawn_blocker();
+        store
+            .rollback_group_to_snapshot(&original.id, "contended")
+            .expect("snapshot rollback retries after transient contention");
+        blocker.join().unwrap();
+        assert_eq!(store.get_group(&original.id).unwrap(), original);
+    }
+
+    #[test]
     fn snapshot_listing_and_release_are_group_scoped() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g1 = sample_group(gid(1), 0, 0);

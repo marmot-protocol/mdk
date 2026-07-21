@@ -4,13 +4,13 @@ use super::rows::{
 };
 use crate::openmls_storage::mls_group_key;
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, epoch_to_i64,
-    message_state_to_i64, serialize,
+    SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, created_at_to_i64,
+    deserialize, epoch_to_i64, message_state_to_i64, serialize,
 };
 use cgka_traits::group::Group;
 use cgka_traits::storage::{StorageError, StorageResult};
 use cgka_traits::types::GroupId;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 pub(super) fn rollback(
     store: &SqliteAccountStorage,
@@ -22,12 +22,16 @@ pub(super) fn rollback(
         return rollback_on_connection(&conn, group_id, name);
     }
 
-    let mls_group_key = mls_group_key(group_id)?;
-    let mut conn = store.lock()?;
-    let tx = conn.transaction().storage()?;
-    rollback_snapshot(&tx, group_id, name, &mls_group_key)?;
-    tx.commit().storage()?;
-    Ok(())
+    retry_on_busy(|| {
+        let mls_group_key = mls_group_key(group_id)?;
+        let mut conn = store.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .storage()?;
+        rollback_snapshot(&tx, group_id, name, &mls_group_key)?;
+        tx.commit().storage()?;
+        Ok(())
+    })
 }
 
 fn rollback_on_connection(
