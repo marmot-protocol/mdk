@@ -9,6 +9,7 @@
 //! (healthy, quarantine, and accepted are all valid outcomes). Exits 2 on usage,
 //! I/O, or parse failure.
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -25,6 +26,9 @@ const INCIDENT_NAME: &str = "fork-recovery-incident/v1";
 const MEMBERSHIP_INCIDENT_NAME: &str = "membership-fork-recovery-incident/v1";
 /// Vector name for a convergence incident.
 const CONVERGENCE_NAME: &str = "convergence-incident/v1";
+/// Match the workspace's audit-artifact ceiling and reject oversized forensic
+/// input before parsing can allocate from attacker-controlled JSON/NDJSON.
+const MAX_INCIDENT_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -34,7 +38,7 @@ fn main() -> ExitCode {
     };
     let out_dir = args.next().map(PathBuf::from);
 
-    let json = match std::fs::read_to_string(&path) {
+    let json = match read_incident_export(Path::new(&path)) {
         Ok(json) => json,
         Err(err) => {
             eprintln!("error: cannot read {}: {err}", path.to_string_lossy());
@@ -82,6 +86,24 @@ fn main() -> ExitCode {
         println!("advisory (liveness): {reason}");
     }
     code
+}
+
+fn read_incident_export(path: &Path) -> io::Result<String> {
+    read_utf8_limited(std::fs::File::open(path)?, MAX_INCIDENT_EXPORT_BYTES)
+}
+
+fn read_utf8_limited(reader: impl Read, max_bytes: u64) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("incident export exceeds {max_bytes} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn run_fork_recovery(export: &AgentStateExport, out_dir: Option<&Path>) -> ExitCode {
@@ -151,4 +173,24 @@ fn write_vector(vector: &VectorFixture, dir: &Path) -> std::io::Result<PathBuf> 
     let json = serde_json::to_string_pretty(vector).expect("vector serializes");
     std::fs::write(&path, format!("{json}\n"))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reader_rejects_input_past_the_limit() {
+        let error = read_utf8_limited(io::Cursor::new(b"0123456789"), 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 8 bytes"));
+    }
+
+    #[test]
+    fn bounded_reader_accepts_utf8_at_the_limit() {
+        assert_eq!(
+            read_utf8_limited(io::Cursor::new("ciao".as_bytes()), 4).unwrap(),
+            "ciao"
+        );
+    }
 }

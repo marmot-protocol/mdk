@@ -168,6 +168,7 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   enter VCS.
 - Real exports are the manual pre-PR verification set:
   `cargo run -p incident-replay -- <export.json | export.ndjson>`.
+  The CLI rejects inputs larger than 64 MiB before JSON/NDJSON parsing.
 
 ## Verification
 
