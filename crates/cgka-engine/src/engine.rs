@@ -742,6 +742,8 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
         )
         .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,

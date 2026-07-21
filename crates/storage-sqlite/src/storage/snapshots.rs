@@ -106,6 +106,48 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rollback_joins_outer_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let anchor_group = sample_group(gid(1), 0, 1);
+        let anchor_message = sample_message(mid(1), anchor_group.id.clone(), 0);
+        let anchor_queued = sample_queued_intent(mid(10), anchor_group.id.clone());
+        store.put_group(&anchor_group).unwrap();
+        store.put_message(&anchor_message).unwrap();
+        store.put_queued_outbound_intent(&anchor_queued).unwrap();
+        store
+            .create_group_snapshot(&anchor_group.id, "historical-anchor")
+            .unwrap();
+
+        let live_group = sample_group(gid(1), 1, 2);
+        let live_message = sample_message(mid(2), live_group.id.clone(), 1);
+        let live_queued = sample_queued_intent(mid(11), live_group.id.clone());
+        store.put_group(&live_group).unwrap();
+        store.put_message(&live_message).unwrap();
+        store.put_queued_outbound_intent(&live_queued).unwrap();
+
+        let result: cgka_traits::storage::StorageResult<()> = store.with_transaction(|storage| {
+            storage.rollback_group_to_snapshot(&live_group.id, "historical-anchor")?;
+            // Simulate restoring only part of the live record set before a
+            // process/error boundary interrupts the operation.
+            storage.put_message(&live_message)?;
+            Err(cgka_traits::storage::StorageError::Backend(
+                "injected after partial live restore".into(),
+            ))
+        });
+        assert!(result.is_err());
+
+        assert_eq!(store.get_group(&live_group.id).unwrap(), live_group);
+        assert_eq!(
+            store.list_messages(&live_group.id, EpochId(0)).unwrap(),
+            vec![anchor_message, live_message]
+        );
+        assert_eq!(
+            store.list_queued_outbound_intents(&live_group.id).unwrap(),
+            vec![anchor_queued, live_queued]
+        );
+    }
+
+    #[test]
     fn snapshot_listing_and_release_are_group_scoped() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g1 = sample_group(gid(1), 0, 0);

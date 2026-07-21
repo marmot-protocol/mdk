@@ -1183,6 +1183,51 @@ async fn hydration_recovers_interrupted_retained_anchor_probe() {
     );
 }
 
+// mdk#968: the apply snapshot is released transactionally with a completed
+// branch apply. If one survives a crash, hydration must restore the captured
+// pre-apply live state rather than accepting a partially rewound projection.
+#[tokio::test]
+async fn hydration_recovers_interrupted_convergence_apply() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    storage
+        .create_group_snapshot(&group_id, "openmls-apply-test-crash")
+        .expect("capture pre-apply live state");
+    let mut partial_group = live_group.clone();
+    partial_group.name = "partial historical apply".into();
+    partial_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&partial_group)
+        .expect("simulate partial rewind");
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydrate recovers interrupted apply");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-apply live state"
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).expect("hydrated epoch"),
+        live_group.epoch
+    );
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-apply-")),
+        "recovered apply snapshot must be released"
+    );
+}
+
 // A stale/garbage marker must never let a tampered group through: marker
 // mismatch forces full validation. A healthy group with a mismatched marker
 // still hydrates (full validation passes) and the marker is refreshed.

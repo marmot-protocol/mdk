@@ -1232,18 +1232,6 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
 
     let prepare_result = if has_new_commits && apply_start_epoch == current_epoch {
         retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
-    } else if apply_start_epoch < current_epoch {
-        let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
-        storage
-            .rollback_group_to_snapshot(group_id, &anchor_snapshot)
-            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))
-            .and_then(|()| {
-                restore_live_message_and_queue_records(
-                    storage,
-                    &live_message_records,
-                    &live_queued_outbound,
-                )
-            })
     } else {
         Ok(())
     };
@@ -1252,14 +1240,38 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
         return Err(err);
     }
 
-    let apply_result =
-        apply_openmls_canonicalization_result_inner(storage, group_id, result, &replay_messages);
+    // The historical rewind, restoration of the complete live input/queue set,
+    // selected-branch apply, and apply-snapshot release are one durable unit.
+    // SQLite snapshot rollback joins this outer transaction; a crash or error
+    // therefore returns to the pre-apply live state instead of committing an
+    // older message/queue image and rebuilding it row by row.
+    let apply_result = storage.with_transaction(|storage| {
+        if apply_start_epoch < current_epoch {
+            let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
+            storage
+                .rollback_group_to_snapshot(group_id, &anchor_snapshot)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            restore_live_message_and_queue_records(
+                storage,
+                &live_message_records,
+                &live_queued_outbound,
+            )?;
+        }
+
+        let observations = apply_openmls_canonicalization_result_inner(
+            storage,
+            group_id,
+            result,
+            &replay_messages,
+        )?;
+        storage
+            .release_group_snapshot(group_id, &snapshot)
+            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+        Ok(observations)
+    });
 
     match apply_result {
         Ok(observations) => {
-            storage
-                .release_group_snapshot(group_id, &snapshot)
-                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
             if result.selected_tip.is_some() {
                 retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)?;
             }
@@ -1374,6 +1386,37 @@ fn rollback_and_release_group_snapshot<S: StorageProvider>(
         .release_group_snapshot(group_id, snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     Ok(())
+}
+
+/// Restore a pre-apply live snapshot left by a process termination and release
+/// it before the group is hydrated.
+///
+/// A completed apply releases this snapshot in the same transaction as its
+/// state changes. Consequently any surviving snapshot identifies an
+/// interrupted apply. Restoring is also safe for snapshots left by older
+/// versions: the captured input records allow convergence to replay any branch
+/// work that had committed immediately before the crash.
+pub(crate) fn recover_interrupted_apply_snapshot<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<(), OpenMlsProjectionError> {
+    let snapshots = storage
+        .list_group_snapshots(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        .into_iter()
+        .filter(|name| name.starts_with(APPLY_SNAPSHOT_PREFIX))
+        .collect::<Vec<_>>();
+
+    let Some(snapshot) = snapshots.first() else {
+        return Ok(());
+    };
+    if snapshots.len() != 1 {
+        return Err(OpenMlsProjectionError::Snapshot(
+            "multiple interrupted convergence applies".into(),
+        ));
+    }
+
+    rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 
 fn restore_live_message_and_queue_records<S: StorageProvider>(
@@ -2326,8 +2369,10 @@ fn apply_snapshot_name(group_id: &GroupId, result: &CanonicalizationResult) -> S
         hasher.update(message_id.as_bytes());
     }
     let digest = hasher.finalize();
-    format!("openmls-apply-{}", hex::encode(&digest[..8]))
+    format!("{APPLY_SNAPSHOT_PREFIX}{}", hex::encode(&digest[..8]))
 }
+
+const APPLY_SNAPSHOT_PREFIX: &str = "openmls-apply-";
 
 fn tls_hex<T: TlsSerialize>(value: &T) -> Result<String, OpenMlsProjectionError> {
     value
