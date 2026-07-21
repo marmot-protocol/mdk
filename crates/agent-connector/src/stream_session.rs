@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -235,8 +235,11 @@ impl SendIdempotencyStore {
         drop(inner);
 
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            // Create missing directories privately, but preserve an existing
+            // operator-selected mode: this is also the control-socket parent
+            // and may intentionally be group-traversable with token auth.
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700).create(parent)?;
         }
         let temp_path = self.path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(&PersistedSendIdempotencyFile {

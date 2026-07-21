@@ -3432,6 +3432,29 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
 }
 
 #[test]
+fn send_idempotency_persist_preserves_existing_socket_directory_mode() {
+    use crate::stream_session::SendIdempotencyStore;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dev = dir.path().join("dev");
+    std::fs::create_dir(&dev).unwrap();
+    std::fs::set_permissions(&dev, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "key".to_owned(),
+        "fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+
+    assert_eq!(
+        std::fs::metadata(dev).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[test]
 fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
     use crate::stream_session::SendIdempotencyStore;
 
