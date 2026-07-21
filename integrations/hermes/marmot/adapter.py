@@ -422,8 +422,68 @@ def group_state_change_sentence(change: str, detail: Optional[str] = None) -> st
     return "The group state changed."
 
 
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_VALUES = {character: index for index, character in enumerate(_BECH32_CHARSET)}
+
+
+def _bech32_polymod(values: Iterable[int]) -> int:
+    generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    checksum = 1
+    for value in values:
+        top = checksum >> 25
+        checksum = ((checksum & 0x1FFFFFF) << 5) ^ value
+        for index, generator in enumerate(generators):
+            if (top >> index) & 1:
+                checksum ^= generator
+    return checksum
+
+
+def _convert_bits(values: Iterable[int], from_bits: int, to_bits: int) -> Optional[bytes]:
+    accumulator = 0
+    bit_count = 0
+    result = bytearray()
+    max_value = (1 << to_bits) - 1
+    for value in values:
+        if value < 0 or value >> from_bits:
+            return None
+        accumulator = (accumulator << from_bits) | value
+        bit_count += from_bits
+        while bit_count >= to_bits:
+            bit_count -= to_bits
+            result.append((accumulator >> bit_count) & max_value)
+    if bit_count >= from_bits or ((accumulator << (to_bits - bit_count)) & max_value):
+        return None
+    return bytes(result)
+
+
+def _npub_to_hex(value: str) -> Optional[str]:
+    if not value or len(value) > 90 or (value.lower() != value and value.upper() != value):
+        return None
+    normalized = value.lower()
+    separator = normalized.rfind("1")
+    if separator <= 0 or normalized[:separator] != "npub" or separator + 7 > len(normalized):
+        return None
+    try:
+        data = [_BECH32_VALUES[character] for character in normalized[separator + 1 :]]
+    except KeyError:
+        return None
+    hrp = normalized[:separator]
+    expanded_hrp = [ord(character) >> 5 for character in hrp]
+    expanded_hrp.extend([0])
+    expanded_hrp.extend(ord(character) & 31 for character in hrp)
+    if _bech32_polymod([*expanded_hrp, *data]) != 1:
+        return None
+    decoded = _convert_bits(data[:-6], 5, 8)
+    if decoded is None or len(decoded) != 32:
+        return None
+    return decoded.hex()
+
+
 def normalize_welcomer_id(entry: str | int) -> str:
-    return str(entry).strip().lower().removeprefix("0x")
+    normalized = str(entry).strip()
+    if normalized.lower().startswith("npub1"):
+        return _npub_to_hex(normalized) or ""
+    return normalized.lower().removeprefix("0x")
 
 
 async def sync_allowlist(
@@ -432,11 +492,12 @@ async def sync_allowlist(
     desired: Iterable[str | int],
 ) -> Dict[str, list[str]]:
     """Reconcile wn-agent's welcomer allowlist to exactly ``desired`` hex ids."""
-    want = {
-        normalize_welcomer_id(entry)
-        for entry in desired
-        if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(normalize_welcomer_id(entry))
-    }
+    desired_entries = list(desired)
+    normalized_desired = [normalize_welcomer_id(entry) for entry in desired_entries]
+    want = {entry for entry in normalized_desired if MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(entry)}
+    invalid_desired_count = sum(
+        1 for entry in normalized_desired if not MARMOT_ACCOUNT_ID_HEX_RE.fullmatch(entry)
+    )
     current = await client.allowlist_list(account_id_hex)
     have = {
         normalize_welcomer_id(entry)
@@ -450,10 +511,16 @@ async def sync_allowlist(
         if entry not in have:
             await client.allowlist_add(account_id_hex, entry)
             added.append(entry)
-    for entry in have:
-        if entry not in want:
-            await client.allowlist_remove(account_id_hex, entry)
-            removed.append(entry)
+    if desired_entries and not want and invalid_desired_count:
+        logger.warning(
+            "welcomer allowlist reconciliation preserved existing entries because all configured entries were invalid",
+            extra={"invalid_entry_count": invalid_desired_count},
+        )
+    else:
+        for entry in have:
+            if entry not in want:
+                await client.allowlist_remove(account_id_hex, entry)
+                removed.append(entry)
     return {"added": added, "removed": removed}
 
 
