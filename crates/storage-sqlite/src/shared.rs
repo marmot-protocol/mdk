@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -64,7 +63,8 @@ impl SqliteSharedStorage {
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| StorageError::Backend(err.to_string()))?;
+            fs_private::create_dir_all_private(parent)
+                .map_err(|err| StorageError::Backend(err.to_string()))?;
         }
         // The shared cache is unencrypted, so file-level 0600 (including
         // sidecars) is the only thing keeping it from other local users.
@@ -594,6 +594,7 @@ mod tests {
         let path = dir.path().join("shared").join("directory.sqlite");
         drop(SqliteSharedStorage::open(&path).unwrap());
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(mode(&path), 0o600);
 
         // A pre-existing permissive cache (from builds that created it at the
