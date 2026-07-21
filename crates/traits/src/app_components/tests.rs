@@ -359,14 +359,17 @@ fn group_avatar_url_rejects_documentation_ipv6_ranges() {
         "https://[2001:db8::1]/a.png",
         "https://[2001:db8:abcd:12::1]/a.png",
         "https://[3fff::1]/a.png",
-        "https://[3fff:ffff::1]/a.png",
+        "https://[3fff:0fff::1]/a.png",
     ] {
         assert!(
             validate_and_normalize_group_avatar_url(raw).is_err(),
             "{raw} should be rejected"
         );
     }
-    // A globally-routable IPv6 address is still accepted.
+    // Addresses immediately outside 3fff::/20 and other global-unicast IPv6
+    // addresses remain accepted.
+    assert!(validate_and_normalize_group_avatar_url("https://[3ffe::1]/a.png").is_ok());
+    assert!(validate_and_normalize_group_avatar_url("https://[3fff:1000::1]/a.png").is_ok());
     assert!(validate_and_normalize_group_avatar_url("https://[2606:4700::1]/a.png").is_ok());
 }
 

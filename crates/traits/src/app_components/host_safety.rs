@@ -111,7 +111,7 @@ pub fn is_public_ipv6(addr: Ipv6Addr) -> bool {
     }
     // Documentation 3fff::/20 (RFC 9637). It falls inside global-unicast
     // 2000::/3, so the terminal rule below would otherwise accept it.
-    if (first & 0xfff0) == 0x3ff0 {
+    if first == 0x3fff && (second & 0xf000) == 0 {
         return false;
     }
     // Only global unicast 2000::/3 is routable today; reject anything else not
