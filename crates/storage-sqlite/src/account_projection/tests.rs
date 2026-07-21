@@ -1555,6 +1555,71 @@ fn push_token(
 }
 
 #[test]
+fn push_token_apply_retries_concurrent_writer_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("push-token-contention.sqlite");
+    let key = SqlCipherKey::new("push token contention key").unwrap();
+    let options = SqliteStorageOptions {
+        busy_timeout_ms: 50,
+        ..SqliteStorageOptions::default()
+    };
+    let writer = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+        .expect("writer storage opens");
+    let group_id = "aa".repeat(32);
+    let member_id = "bb".repeat(32);
+
+    let spawn_blocker = || {
+        let blocker_path = path.clone();
+        let blocker_options = options.clone();
+        let blocker_key = SqlCipherKey::new("push token contention key").unwrap();
+        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                &blocker_path,
+                &blocker_key,
+                blocker_options,
+            )
+            .expect("blocker storage opens");
+            let conn = blocker.lock().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            lock_acquired_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        lock_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("blocker acquires write lock");
+        handle
+    };
+
+    let blocker = spawn_blocker();
+    assert!(
+        writer
+            .apply_group_push_token(&push_token(&group_id, &member_id, 100, "d1"))
+            .expect("token apply retries after transient contention")
+    );
+    blocker.join().unwrap();
+
+    let blocker = spawn_blocker();
+    assert!(
+        writer
+            .apply_group_push_token_tombstone(
+                &group_id,
+                &member_id,
+                0,
+                1,
+                &"cc".repeat(32),
+                200,
+                "r1",
+                200,
+            )
+            .expect("tombstone apply retries after transient contention")
+    );
+    blocker.join().unwrap();
+    assert!(writer.group_push_tokens(&group_id).unwrap().is_empty());
+}
+
+#[test]
 fn apply_group_push_token_keeps_sibling_leaves_distinct() {
     // Two devices of one account (same member id, same platform+server, different
     // leaf index) must coexist: leaf_index is part of the record key, so neither
