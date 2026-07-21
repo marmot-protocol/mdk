@@ -250,9 +250,9 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         &self,
         account_id_hex: &str,
     ) -> StorageResult<Option<PublicDirectoryUserRecord>> {
-        let conn = self.lock();
-        let Some(mut record) = self
-            .conn_ref(&conn)
+        let mut conn = self.lock();
+        let tx = conn.transaction().storage()?;
+        let Some(mut record) = tx
             .query_row(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
                         key_package_json, event_id_hex, event_kind, event_created_at
@@ -276,10 +276,10 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             .optional()
             .storage()?
         else {
+            tx.commit().storage()?;
             return Ok(None);
         };
-        let mut stmt = self
-            .conn_ref(&conn)
+        let mut stmt = tx
             .prepare(
                 "SELECT follow_account_id_hex FROM directory_user_follows
                  WHERE account_id_hex = ?1
@@ -291,6 +291,8 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
+        drop(stmt);
+        tx.commit().storage()?;
         Ok(Some(record))
     }
 
@@ -634,6 +636,21 @@ mod tests {
                 .unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn public_directory_user_reads_user_and_follows_in_one_transaction() {
+        let source = include_str!("shared.rs");
+        let body = source
+            .split("pub fn public_directory_user(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn public_directory_users(")
+            .next()
+            .unwrap();
+
+        assert!(body.contains("transaction()"));
+        assert!(body.contains("tx.commit()"));
     }
 
     #[test]
