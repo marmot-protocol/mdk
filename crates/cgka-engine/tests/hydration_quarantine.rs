@@ -350,6 +350,12 @@ impl MessageStorage for FlakyGroupRecordStorage {
     ) -> StorageResult<Vec<MessageRecord>> {
         self.inner.list_messages(group_id, at_or_after_epoch)
     }
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.put_ingress_dedup_marker(id)
+    }
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
+        self.inner.has_ingress_dedup_marker(id)
+    }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.create_group_snapshot(group_id, name)
     }

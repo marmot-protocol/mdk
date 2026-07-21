@@ -65,19 +65,28 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        // Reuse the existing join_welcome machinery. Map its error shapes
-        // to typed stale reasons where applicable.
+        // Reuse the existing join_welcome machinery. Any classifiable failure
+        // for this individual welcome is terminal input, not a failure of the
+        // transport drain: persist an account-scoped marker even when no group
+        // id could be recovered, then return a typed stale outcome. Storage and
+        // truly internal transition failures still propagate.
         match self.do_join_welcome(msg.clone()).await {
             Ok(gid) => {
                 self.persist_transport_message(msg, &gid, EpochId(0), MessageState::Processed)?;
                 Ok(IngestOutcome::Processed)
             }
-            Err(EngineError::Peeler(PeelerError::DecryptFailed)) => Ok(IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed,
-            }),
-            Err(EngineError::Peeler(PeelerError::Malformed(_))) => Ok(IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed,
-            }),
+            Err(EngineError::WelcomeAlreadyProcessed) => {
+                self.storage.put_ingress_dedup_marker(&msg.id)?;
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::AlreadySeen,
+                })
+            }
+            Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
+                self.storage.put_ingress_dedup_marker(&msg.id)?;
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                })
+            }
             Err(other) => Err(other),
         }
     }

@@ -89,6 +89,13 @@ pub trait MessageStorage {
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>>;
 
+    /// Persist a terminal duplicate-detection marker for inbound protocol
+    /// material that cannot yet be associated with a group (notably malformed
+    /// or rejected welcomes). Markers are account-device scoped and may be
+    /// keyed by either the transport id or a content-derived id.
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()>;
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool>;
+
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>>;
     fn rollback_group_to_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()>;

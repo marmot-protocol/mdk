@@ -550,6 +550,98 @@ async fn ingest_duplicate_message_id_returns_already_seen() {
 }
 
 #[tokio::test]
+async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut engine = build_client_with_storage(storage.clone(), b"malformed-welcome");
+    let message_id = MessageId::new(vec![0x67; 32]);
+    let msg = TransportMessage {
+        id: message_id.clone(),
+        payload: b"not an MLS welcome".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: engine.self_id(),
+        },
+    };
+
+    let outcome = engine
+        .ingest(msg.clone())
+        .await
+        .expect("malformed welcome is a per-message stale outcome");
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+    assert!(storage.has_ingress_dedup_marker(&message_id).unwrap());
+    drop(engine);
+
+    let mut reopened = build_client_with_storage(storage, b"malformed-welcome");
+    let replay = reopened
+        .ingest(msg)
+        .await
+        .expect("poisoned welcome must not hard-error after restart");
+    assert!(matches!(
+        replay,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+}
+
+#[tokio::test]
+async fn rewrapped_identical_welcome_uses_content_dedup() {
+    let mut alice = build_client(b"alice-welcome-content-dedup");
+    let mut bob = build_client(b"bob-welcome-content-dedup");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (_group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "content dedup".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected group create, got {other:?}"),
+    };
+
+    assert!(matches!(
+        bob.ingest(welcome.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    bob.drain_events();
+
+    let rewrapped = TransportMessage {
+        id: MessageId::new(vec![0x68; 32]),
+        ..welcome
+    };
+    let outcome = bob.ingest(rewrapped).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+    assert!(
+        bob.drain_events().is_empty(),
+        "content-duplicate welcome must not emit a second join"
+    );
+}
+
+#[tokio::test]
 async fn peel_deferred_message_retries_instead_of_short_circuiting() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client_with_peeler(b"bob", Box::new(FailOncePeeler::new()));

@@ -1692,6 +1692,8 @@ async fn join_rejects_welcome_whose_admin_set_lists_a_phantom_admin() {
     // {alice, bob, mallory}. Bob is included so the fork passes the join-time
     // `require_admin` author check (5d) and reaches the coupling check (5e);
     // mallory is a valid account key with NO leaf — the phantom that 5e rejects.
+    // Deterministic Welcome validation failures are surfaced as InvalidWelcome
+    // so transport ingest can terminalize poisoned input (#967).
     let forged_admins = encode_admin_policy_for_test(&[
         alice.self_id().as_slice().to_vec(),
         bob.self_id().as_slice().to_vec(),
@@ -1711,8 +1713,8 @@ async fn join_rejects_welcome_whose_admin_set_lists_a_phantom_admin() {
         .await
         .expect_err("a Welcome whose admin set lists a phantom admin must be rejected");
     assert!(
-        matches!(err, EngineError::Other(ref msg) if msg.contains("no member leaf")),
-        "expected admin-leaf-coupling rejection at join, got {err:?}"
+        matches!(err, EngineError::InvalidWelcome),
+        "expected terminal invalid-Welcome rejection, got {err:?}"
     );
     assert!(
         david.members(&group_id).is_err(),

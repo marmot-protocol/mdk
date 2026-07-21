@@ -866,15 +866,7 @@ async fn join_welcome_called_twice_for_same_welcome_errors_on_second_call() {
         .join_welcome(welcome)
         .await
         .expect_err("second join_welcome must error");
-    match err {
-        EngineError::Other(msg) => {
-            assert!(
-                msg.contains("already processed"),
-                "expected 'already processed' message, got: {msg}"
-            );
-        }
-        other => panic!("expected EngineError::Other(already processed), got {other:?}"),
-    }
+    assert!(matches!(err, EngineError::WelcomeAlreadyProcessed));
 }
 
 #[tokio::test]
@@ -914,13 +906,7 @@ async fn join_welcome_dedup_survives_engine_rebuild_on_same_storage() {
         .join_welcome(welcome)
         .await
         .expect_err("rebuilt engine must reject duplicate welcome");
-    match err {
-        EngineError::Other(msg) => assert!(
-            msg.contains("already processed"),
-            "expected 'already processed' message, got: {msg}"
-        ),
-        other => panic!("expected EngineError::Other(already processed), got {other:?}"),
-    }
+    assert!(matches!(err, EngineError::WelcomeAlreadyProcessed));
 }
 
 #[tokio::test]

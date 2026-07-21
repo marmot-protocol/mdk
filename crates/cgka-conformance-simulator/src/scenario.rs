@@ -748,6 +748,8 @@ fn observe_engine_error(error: &EngineError) -> String {
             "admin_policy"
         }
         EngineError::Serialize(_) => "invalid_admin_policy",
+        EngineError::InvalidWelcome => "invalid_welcome",
+        EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::InvalidTransition(_) => "invalid_transition",
         EngineError::UnknownGroup(_) => "unknown_group",
         EngineError::UnknownMember { .. } => "unknown_member",

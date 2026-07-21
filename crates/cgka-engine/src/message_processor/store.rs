@@ -15,6 +15,11 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         id: &MessageId,
     ) -> Result<Option<IngestOutcome>, EngineError> {
+        if self.storage.has_ingress_dedup_marker(id)? {
+            return Ok(Some(IngestOutcome::Stale {
+                reason: StaleReason::AlreadySeen,
+            }));
+        }
         let record = match self.storage.get_message(id) {
             Ok(record) => record,
             Err(StorageError::NotFound) => return Ok(None),

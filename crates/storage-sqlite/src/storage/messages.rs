@@ -9,6 +9,8 @@ use cgka_traits::storage::{MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
 use rusqlite::{OptionalExtension, params};
 
+const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
+
 impl MessageStorage for SqliteAccountStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
         // Single autocommit statement: safe to retry the whole statement on
@@ -100,6 +102,39 @@ impl MessageStorage for SqliteAccountStorage {
         records.iter().map(|record| deserialize(record)).collect()
     }
 
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
+        retry_on_busy(|| {
+            self.connection.with_transaction(|| {
+                let conn = self.lock()?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO cgka_ingress_dedup (id) VALUES (?1)",
+                    params![id.as_slice()],
+                )
+                .storage()?;
+                conn.execute(
+                    "DELETE FROM cgka_ingress_dedup
+                     WHERE insert_order NOT IN (
+                        SELECT insert_order FROM cgka_ingress_dedup
+                        ORDER BY insert_order DESC LIMIT ?1
+                     )",
+                    params![INGRESS_DEDUP_MARKER_CAPACITY],
+                )
+                .storage()?;
+                Ok(())
+            })
+        })
+    }
+
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cgka_ingress_dedup WHERE id = ?1)",
+                params![id.as_slice()],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         snapshots::create(self, group_id, name)
     }
@@ -187,6 +222,16 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::PeelDeferred
         );
+    }
+
+    #[test]
+    fn ingress_dedup_markers_are_group_independent_and_idempotent() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let id = mid(42);
+        assert!(!store.has_ingress_dedup_marker(&id).unwrap());
+        store.put_ingress_dedup_marker(&id).unwrap();
+        store.put_ingress_dedup_marker(&id).unwrap();
+        assert!(store.has_ingress_dedup_marker(&id).unwrap());
     }
 
     #[test]

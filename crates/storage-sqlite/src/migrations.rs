@@ -52,6 +52,8 @@ mod migration_0025_chat_notification_settings;
 mod migration_0026_message_drafts;
 #[path = "migrations/0027_app_event_moderation_grant.rs"]
 mod migration_0027_app_event_moderation_grant;
+#[path = "migrations/0028_ingress_dedup.rs"]
+mod migration_0028_ingress_dedup;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -198,6 +200,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 27,
         name: "0027_app_event_moderation_grant",
         apply: migration_0027_app_event_moderation_grant::apply,
+    },
+    Migration {
+        version: 28,
+        name: "0028_ingress_dedup",
+        apply: migration_0028_ingress_dedup::apply,
     },
 ];
 

@@ -36,6 +36,34 @@ use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
 
+pub(crate) fn welcome_content_dedup_id(
+    peeled: &cgka_traits::ingest::PeeledMessage,
+) -> Result<cgka_traits::types::MessageId, EngineError> {
+    match &peeled.content {
+        cgka_traits::ingest::PeeledContent::Welcome { bytes } => {
+            Ok(crate::message_processor::content_dedup_id(bytes))
+        }
+        _ => Err(EngineError::Peeler(
+            cgka_traits::error::PeelerError::Malformed("peeled content was not a Welcome".into()),
+        )),
+    }
+}
+
+pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::Peeler(cgka_traits::error::PeelerError::DecryptFailed)
+            | EngineError::Peeler(cgka_traits::error::PeelerError::Malformed(_))
+            | EngineError::Serialize(_)
+            | EngineError::InvalidWelcome
+            | EngineError::InvalidCredentialIdentity(_)
+            | EngineError::InvalidAccountIdentityProof(_)
+            | EngineError::MissingRequiredCapabilities { .. }
+            | EngineError::NotGroupAdmin { .. }
+            | EngineError::WelcomeAlreadyProcessed
+    )
+}
+
 /// MLS exporter input for the Nostr kind-445 group-event encryption key:
 /// `MLS-Exporter("marmot", "group-event", 32)`.
 pub(crate) const EXPORTER_LABEL: &str = "marmot";
@@ -429,7 +457,7 @@ impl<S: StorageProvider> Engine<S> {
         // skipped that. Without this check, a re-call would re-stage a
         // Welcome on top of an existing group, which is unsafe.
         if self.seen_message_ids.contains(&welcome_msg.id) {
-            return Err(EngineError::Other("welcome already processed".to_string()));
+            return Err(EngineError::WelcomeAlreadyProcessed);
         }
         if let Ok(record) = self.storage.get_message(&welcome_msg.id)
             && matches!(
@@ -439,7 +467,7 @@ impl<S: StorageProvider> Engine<S> {
                     | cgka_traits::message::MessageState::EpochInvalidated
             )
         {
-            return Err(EngineError::Other("welcome already processed".to_string()));
+            return Err(EngineError::WelcomeAlreadyProcessed);
         }
 
         // 2. Envelope check.
@@ -467,6 +495,32 @@ impl<S: StorageProvider> Engine<S> {
             .peel_welcome(&welcome_msg)
             .await
             .map_err(EngineError::Peeler)?;
+        let content_id = welcome_content_dedup_id(&peeled)?;
+        if self.storage.has_ingress_dedup_marker(&content_id)? {
+            self.storage.put_ingress_dedup_marker(&welcome_id)?;
+            return Err(EngineError::WelcomeAlreadyProcessed);
+        }
+
+        let result = self.do_join_peeled_welcome(welcome_msg, peeled).await;
+        match &result {
+            Ok(_) => {
+                self.storage.put_ingress_dedup_marker(&content_id)?;
+            }
+            Err(error) if terminal_welcome_error(error) => {
+                self.storage.put_ingress_dedup_marker(&welcome_id)?;
+                self.storage.put_ingress_dedup_marker(&content_id)?;
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    pub(crate) async fn do_join_peeled_welcome(
+        &mut self,
+        welcome_msg: TransportMessage,
+        peeled: cgka_traits::ingest::PeeledMessage,
+    ) -> Result<GroupId, EngineError> {
+        let welcome_id = welcome_msg.id.clone();
         let welcomer = peeled.sender.clone();
         let welcome_bytes = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome { bytes } => bytes,
@@ -520,7 +574,7 @@ impl<S: StorageProvider> Engine<S> {
             let provider =
                 EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
             openmls::group::ProcessedWelcome::new_from_welcome(&provider, &join_config, welcome)
-                .map_err(|e| EngineError::Backend(format!("process welcome: {e:?}")))?
+                .map_err(|_| EngineError::InvalidWelcome)?
         };
         let group_id = GroupId::new(
             processed
@@ -538,14 +592,14 @@ impl<S: StorageProvider> Engine<S> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let staged = processed
             .into_staged_welcome(&provider, None)
-            .map_err(|e| EngineError::Backend(format!("stage welcome: {e:?}")))?;
+            .map_err(|_| EngineError::InvalidWelcome)?;
         let welcome_sender = staged
             .welcome_sender()
-            .map_err(|e| EngineError::Backend(format!("welcome sender: {e:?}")))?;
+            .map_err(|_| EngineError::InvalidWelcome)?;
         let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
         let mls_group = staged
             .into_group(&provider)
-            .map_err(|e| EngineError::Backend(format!("into_group: {e:?}")))?;
+            .map_err(|_| EngineError::InvalidWelcome)?;
 
         debug_assert_eq!(
             group_id,
@@ -607,7 +661,11 @@ impl<S: StorageProvider> Engine<S> {
             &mls_group,
             &group_id,
             &crate::app_components::admins_of_group(&mls_group)?,
-        )?;
+        )
+        .map_err(|error| match error {
+            storage @ EngineError::Storage(_) => storage,
+            _ => EngineError::InvalidWelcome,
+        })?;
 
         // 6. Persist Marmot group record from signed group-context data.
         let mut group_record = Group {
