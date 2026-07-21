@@ -639,6 +639,13 @@ fn attach_app_witnesses(
                 .iter_mut()
                 .find(|candidate| candidate.id == *branch_id)
             {
+                // Shared-history traffic is not evidence that a branch was
+                // actually used. Only messages from branch epochs strictly
+                // after the divergence point can witness this candidate
+                // (convergence-v1, #964).
+                if *epoch <= candidate.fork_epoch {
+                    continue;
+                }
                 // Witness counting evaluates the retained app-payload window with
                 // the CANDIDATE's tip_epoch as the reference tip, not the global
                 // canonical tip (retained-history.md "App-payload retention" and
