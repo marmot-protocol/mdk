@@ -66,10 +66,18 @@ pub use conversions::{
 /// Convenience: turn an FFI string list of relay URLs into the engine's
 /// [`TransportEndpoint`] wrapper, dedup-stripped of empties.
 pub(crate) fn endpoints(urls: &[String]) -> Vec<TransportEndpoint> {
-    urls.iter()
-        .filter(|u| !u.trim().is_empty())
-        .map(|u| TransportEndpoint::from(u.as_str()))
-        .collect()
+    let mut endpoints = Vec::new();
+    for url in urls {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let endpoint = TransportEndpoint::from(url);
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints
 }
 
 pub(crate) fn optional_group_id_hex(
@@ -252,5 +260,24 @@ mod tests {
         // Absurdly large group ids are rejected at the FFI boundary instead of
         // allocating arbitrary host input.
         assert!(optional_group_id_hex(Some("ab".repeat(1025))).is_err());
+    }
+
+    #[test]
+    fn endpoints_trim_drop_empties_and_deduplicate_in_order() {
+        let urls = vec![
+            " wss://relay.one ".to_owned(),
+            "".to_owned(),
+            "wss://relay.two".to_owned(),
+            "wss://relay.one".to_owned(),
+            "  ".to_owned(),
+        ];
+
+        assert_eq!(
+            endpoints(&urls),
+            vec![
+                TransportEndpoint::from("wss://relay.one"),
+                TransportEndpoint::from("wss://relay.two"),
+            ]
+        );
     }
 }
