@@ -48,7 +48,21 @@ impl WelcomeStorage for SqliteAccountStorage {
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
-        records.iter().map(|record| deserialize(record)).collect()
+        let mut welcomes = Vec::with_capacity(records.len());
+        for record in records {
+            match deserialize(&record) {
+                Ok(welcome) => welcomes.push(welcome),
+                Err(StorageError::Serialization(_)) => {
+                    tracing::warn!(
+                        target: "storage_sqlite::welcomes",
+                        method = "list_welcomes",
+                        "skipping an undecodable pending welcome"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(welcomes)
     }
 }
 
@@ -118,6 +132,28 @@ mod tests {
             .query_row("SELECT count(*) FROM cgka_welcomes", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn list_welcomes_skips_an_undecodable_row() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let welcome = PendingWelcome {
+            message_id: mid(2),
+            group_id: gid(1),
+            welcome_bytes: vec![1, 2, 3],
+        };
+        store.put_welcome(&welcome).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_welcomes (message_id, group_id, record)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![mid(1).as_slice(), gid(1).as_slice(), b"not json"],
+            )
+            .unwrap();
+
+        assert_eq!(store.list_welcomes().unwrap(), vec![welcome]);
     }
 
     #[test]
