@@ -3381,7 +3381,7 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
     } = connector
         .send_final_response(
             &agent.account.account_id_hex,
-            &group_id_hex,
+            &group_id_hex.to_uppercase(),
             "idempotent reply".to_owned(),
             None,
             Some(key.clone()),
@@ -3411,7 +3411,7 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
     };
     assert_eq!(
         second_ids, first_ids,
-        "a repeated idempotency key must return the original message ids"
+        "a repeated idempotency key must return the original ids across equivalent hex casing"
     );
 
     // Observable proof there was no second underlying send: exactly one copy of
