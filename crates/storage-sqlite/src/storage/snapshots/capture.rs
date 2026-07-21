@@ -13,10 +13,25 @@ pub(super) fn create(
     group_id: &GroupId,
     name: &str,
 ) -> StorageResult<()> {
-    let mls_group_key = mls_group_key(group_id)?;
+    if store.connection.is_current_thread_transaction_owner() {
+        let conn = store.lock()?;
+        return create_on_connection(&conn, group_id, name);
+    }
+
     let mut conn = store.lock()?;
     let tx = conn.transaction().storage()?;
-    let group_blob: Vec<u8> = tx
+    create_on_connection(&tx, group_id, name)?;
+    tx.commit().storage()?;
+    Ok(())
+}
+
+fn create_on_connection(
+    conn: &rusqlite::Connection,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
+    let mls_group_key = mls_group_key(group_id)?;
+    let group_blob: Vec<u8> = conn
         .query_row(
             "SELECT record FROM cgka_groups WHERE id = ?1",
             params![group_id.as_slice()],
@@ -26,12 +41,12 @@ pub(super) fn create(
         .storage()?
         .ok_or(StorageError::NotFound)?;
     let group = deserialize(&group_blob)?;
-    let messages = messages(&tx, group_id)?;
-    let queued_outbound = queued_outbound(&tx, group_id)?;
-    let member_caps = member_capabilities(&tx, group_id)?;
-    let convergence_policy = convergence_policy(&tx, group_id)?;
-    let validated_tree_marker = validated_tree_marker(&tx, group_id)?;
-    let openmls_values = openmls_values(&tx, &mls_group_key)?;
+    let messages = messages(conn, group_id)?;
+    let queued_outbound = queued_outbound(conn, group_id)?;
+    let member_caps = member_capabilities(conn, group_id)?;
+    let convergence_policy = convergence_policy(conn, group_id)?;
+    let validated_tree_marker = validated_tree_marker(conn, group_id)?;
+    let openmls_values = openmls_values(conn, &mls_group_key)?;
 
     let snapshot = Snapshot {
         group,
@@ -42,20 +57,16 @@ pub(super) fn create(
         validated_tree_marker,
         openmls_values,
     };
-    tx.execute(
+    conn.execute(
         "INSERT OR REPLACE INTO cgka_group_snapshots (group_id, name, snapshot)
              VALUES (?1, ?2, ?3)",
         params![group_id.as_slice(), name, serialize(&snapshot)?],
     )
     .storage()?;
-    tx.commit().storage()?;
     Ok(())
 }
 
-fn messages(
-    tx: &rusqlite::Transaction<'_>,
-    group_id: &GroupId,
-) -> StorageResult<Vec<OrderedMessage>> {
+fn messages(tx: &rusqlite::Connection, group_id: &GroupId) -> StorageResult<Vec<OrderedMessage>> {
     let mut stmt = tx
         .prepare(
             "SELECT insert_order, record FROM cgka_messages
@@ -81,7 +92,7 @@ fn messages(
 }
 
 fn queued_outbound(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Vec<OrderedQueuedOutbound>> {
     let mut stmt = tx
@@ -109,7 +120,7 @@ fn queued_outbound(
 }
 
 fn member_capabilities(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Vec<MemberCapabilitiesSnapshot>> {
     let mut stmt = tx
@@ -136,7 +147,7 @@ fn member_capabilities(
 }
 
 fn convergence_policy(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Option<Vec<u8>>> {
     tx.query_row(
@@ -149,7 +160,7 @@ fn convergence_policy(
 }
 
 fn validated_tree_marker(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     group_id: &GroupId,
 ) -> StorageResult<Option<Vec<u8>>> {
     tx.query_row(
@@ -162,7 +173,7 @@ fn validated_tree_marker(
 }
 
 fn openmls_values(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     mls_group_key: &[u8],
 ) -> StorageResult<Vec<OpenMlsValueSnapshot>> {
     let mut stmt = tx

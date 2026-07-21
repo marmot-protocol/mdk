@@ -148,6 +148,24 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_create_joins_outer_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 1);
+        store.put_group(&group).unwrap();
+
+        let result: cgka_traits::storage::StorageResult<()> = store.with_transaction(|storage| {
+            storage.create_group_snapshot(&group.id, "nested")?;
+            Err(StorageError::Backend("force rollback".to_owned()))
+        });
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(message)) if message == "force rollback"
+        ));
+        assert!(store.list_group_snapshots(&group.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn snapshot_listing_and_release_are_group_scoped() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g1 = sample_group(gid(1), 0, 0);
