@@ -1094,7 +1094,10 @@ fn validate_fingerprint(value: &str) -> Result<(), AppError> {
             "token fingerprint must be redacted sha256".into(),
         ));
     };
-    if rest.len() != 24 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+    if rest.len() != 24
+        || !rest.chars().all(|c| c.is_ascii_hexdigit())
+        || rest.chars().any(|c| c.is_ascii_uppercase())
+    {
         return Err(AppError::InvalidPushGossip(
             "token fingerprint must be redacted sha256".into(),
         ));

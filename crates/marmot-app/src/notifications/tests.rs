@@ -284,6 +284,12 @@ fn token_fingerprint_is_redacted_and_stable() {
     );
 }
 
+#[test]
+fn token_fingerprint_validation_rejects_uppercase_hex() {
+    assert!(validate_fingerprint("sha256:0123456789abcdef01234567").is_ok());
+    assert!(validate_fingerprint("sha256:0123456789ABCDEF01234567").is_err());
+}
+
 fn timeline_target(kind: u64, plaintext: &str) -> TimelineMessageTarget {
     TimelineMessageTarget {
         sender: "bb".repeat(32),
