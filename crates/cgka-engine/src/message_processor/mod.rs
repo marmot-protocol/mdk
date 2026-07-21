@@ -89,6 +89,16 @@ pub(crate) struct DeferredPeelGroupState {
     attempts: std::collections::HashMap<MessageId, DeferredPeelAttempts>,
 }
 
+impl DeferredPeelGroupState {
+    fn has_capacity(&self) -> bool {
+        self.deferred_rows < MAX_PEEL_DEFERRED_ROWS_PER_GROUP
+    }
+
+    fn note_row_persisted(&mut self) {
+        self.deferred_rows += 1;
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct DeferredPeelAttempts {
     attempts: u32,
@@ -738,11 +748,11 @@ impl<S: StorageProvider> Engine<S> {
         Ok(out)
     }
 
-    /// Reserve capacity for one new `PeelDeferred` row, lazily counting the
-    /// group's retained rows on first use this session. Returns `false` when
-    /// the per-group flood cap is reached — the caller drops the message
-    /// unpersisted (mdk#339).
-    pub(crate) fn reserve_peel_deferred_slot(
+    /// Check capacity for one new `PeelDeferred` row, lazily counting the
+    /// group's retained rows on first use this session. This deliberately does
+    /// not consume a slot: the caller records the row only after its durable
+    /// write succeeds, so a storage error cannot leak in-memory capacity.
+    pub(crate) fn has_peel_deferred_capacity(
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, EngineError> {
@@ -762,11 +772,14 @@ impl<S: StorageProvider> Engine<S> {
             state.counted = true;
         }
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
-        if state.deferred_rows >= MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
-            return Ok(false);
-        }
-        state.deferred_rows += 1;
-        Ok(true)
+        Ok(state.has_capacity())
+    }
+
+    pub(crate) fn note_peel_deferred_row_persisted(&mut self, group_id: &GroupId) {
+        self.deferred_peel
+            .entry(group_id.clone())
+            .or_default()
+            .note_row_persisted();
     }
 
     /// Bookkeeping for a row leaving `PeelDeferred` (applied, reclassified,
@@ -1057,5 +1070,27 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
+    }
+}
+
+#[cfg(test)]
+mod deferred_peel_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_check_does_not_consume_slot_before_persist() {
+        let mut state = DeferredPeelGroupState {
+            counted: true,
+            ..Default::default()
+        };
+
+        assert!(state.has_capacity());
+        assert_eq!(
+            state.deferred_rows, 0,
+            "a failed write must consume no slot"
+        );
+
+        state.note_row_persisted();
+        assert_eq!(state.deferred_rows, 1);
     }
 }

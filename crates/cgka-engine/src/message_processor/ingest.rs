@@ -115,13 +115,16 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage.get_message(&msg.id),
                 Ok(record) if record.state == MessageState::PeelDeferred
             );
-            if already_retained || self.reserve_peel_deferred_slot(&group_id)? {
+            if already_retained || self.has_peel_deferred_capacity(&group_id)? {
                 self.persist_transport_message_for_existing_group(
                     msg,
                     &group_id,
                     EpochId(0),
                     MessageState::PeelDeferred,
                 )?;
+                if !already_retained {
+                    self.note_peel_deferred_row_persisted(&group_id);
+                }
                 self.audit_group(
                     &group_id,
                     crate::audit_helpers::message_state_changed_event(
@@ -320,7 +323,7 @@ impl<S: StorageProvider> Engine<S> {
                             self.storage.get_message(&msg.id),
                             Ok(record) if record.state == MessageState::PeelDeferred
                         );
-                        if !already_retained && !self.reserve_peel_deferred_slot(&group_id)? {
+                        if !already_retained && !self.has_peel_deferred_capacity(&group_id)? {
                             self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
                             if self.should_audit_peel_deferred_cap_rejection(&group_id) {
                                 self.audit_group(
@@ -348,6 +351,9 @@ impl<S: StorageProvider> Engine<S> {
                             current_epoch,
                             MessageState::PeelDeferred,
                         )?;
+                        if !already_retained {
+                            self.note_peel_deferred_row_persisted(&group_id);
+                        }
                         self.audit_group(
                             &group_id,
                             crate::audit_helpers::message_state_changed_event(
