@@ -45,6 +45,8 @@ pub enum ForkRecoveryError {
     NoForkResolution,
     #[error("fork_resolution has no source_epoch")]
     MissingSourceEpoch,
+    #[error("fork_resolution source_epoch cannot advance to a contested tip")]
+    SourceEpochOverflow,
     #[error("the winning branch's pre-commit snapshot was missing")]
     MissingSnapshot,
     #[error("expected exactly two committers at the contested tip, found {0}")]
@@ -93,7 +95,9 @@ pub fn recover_fork(export: &AgentStateExport) -> Result<RecoveredFork, ForkReco
         return Err(ForkRecoveryError::MissingSnapshot);
     }
     let source_epoch = source_epoch.ok_or(ForkRecoveryError::MissingSourceEpoch)?;
-    let contested_tip = source_epoch + 1; // rule 2: the racers land at source_epoch + 1.
+    let contested_tip = source_epoch
+        .checked_add(1)
+        .ok_or(ForkRecoveryError::SourceEpochOverflow)?; // rule 2: racers land at source + 1.
 
     // The competing commits are the group-state changes at the contested tip.
     let tip: Vec<(&str, &str)> = export

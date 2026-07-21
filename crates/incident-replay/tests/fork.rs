@@ -54,6 +54,17 @@ fn no_fork_resolution_is_quarantined() {
 }
 
 #[test]
+fn source_epoch_overflow_is_quarantined() {
+    let json = format!(
+        r#"{{ "events": [
+            {{ "kind": {{ "type": "fork_resolution", "source_epoch": {}, "winner": "incumbent" }} }}
+        ] }}"#,
+        u64::MAX
+    );
+    assert_eq!(recover(&json), Err(ForkRecoveryError::SourceEpochOverflow));
+}
+
+#[test]
 fn a_single_committer_at_the_tip_is_ambiguous() {
     let json = r#"{ "events": [
         { "kind": { "type": "fork_resolution", "source_epoch": 30, "invalidated_msg_id": "inv-1", "winner": "incumbent" } },
