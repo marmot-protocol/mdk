@@ -9,6 +9,19 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: added three full-view screens reached from the chat list — user search (`s` or `/users [query]`), your own
+  profile (`p`), and relay health (`h`) — each a one-shot load that returns to the main view on `Esc`. User search runs
+  `users search` (default radius `0..2`) over the cached follow graph; its two-region screen types the query in query
+  focus (`Enter` runs it) and navigates results in results focus, where `Enter` opens a profile card (`users show`),
+  `c` starts a new chat, and `a` adds the user to the open chat (guarded to when a chat is loaded) — both return to
+  the main view on the affected chat on success. Profile shows your
+  `profile show` fields (picture URL as literal text — no avatar fetch) and `follows list`; editing a field publishes
+  only that field via `profile update --<field>`, `f` follows (`follows add`) and `x` unfollows (`follows remove`), and
+  there is no nsec export. Relay health renders the redacted `relay-stats` snapshot — health summary, counters,
+  delivery spread with histogram p50/p99, sync timing, and per-relay first-deliverer/timing rows keyed by an opaque
+  device-local index — with no relay URLs shown (privacy decision); `r` refreshes and `j`/`k` scroll. The popup system
+  gained profile-field-edit, follow-by-pubkey, new-chat-name, unfollow, and add-to-chat purposes; help and the hints
+  lines cover the new screens. No JSON response shapes changed.
 - TUI: added a modal popup system and a group-detail screen. One `Option<Popup>` captures every key while open
   (the screen behind it is inert), with text-entry, confirm, list-picker, and dismiss-on-any-key card variants; the
   help overlay became a card, which fixes `q` under help quitting the app. `g` on the selected chat opens a

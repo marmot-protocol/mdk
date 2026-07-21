@@ -54,6 +54,20 @@ impl WnClient {
             .cloned()
     }
 
+    /// Append the first-run setup relay as a command-local `--relay` when no global
+    /// `--relay` already covers the child. `profile update` and `follows add|remove`
+    /// require a relay; `--relay` is a global clap flag, so this command-local
+    /// position lands in the same slot those handlers read. Mirrors
+    /// `account_setup_relay`'s only-when-absent rule, so a global relay is never
+    /// passed twice.
+    pub(crate) fn with_setup_relay(&self, mut args: Vec<String>) -> Vec<String> {
+        if let Some(relay) = self.account_setup_relay() {
+            args.push("--relay".to_owned());
+            args.push(relay);
+        }
+        args
+    }
+
     pub(crate) fn run_json<S>(&self, account: Option<&str>, args: &[S]) -> TuiResult<Value>
     where
         S: AsRef<str>,
@@ -585,17 +599,15 @@ impl TuiApp {
 
     pub(crate) fn update_profile_name(&mut self, name: String) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
-        let result = self.client.run_json(
-            Some(&account_id),
-            &[
-                "profile",
-                "update",
-                "--name",
-                &name,
-                "--display-name",
-                &name,
-            ],
-        )?;
+        let args = self.client.with_setup_relay(vec![
+            "profile".to_owned(),
+            "update".to_owned(),
+            "--name".to_owned(),
+            name.clone(),
+            "--display-name".to_owned(),
+            name.clone(),
+        ]);
+        let result = self.client.run_json(Some(&account_id), &args)?;
         self.refresh_accounts()?;
         let label = result
             .get("profile")
@@ -846,6 +858,184 @@ impl TuiApp {
         self.refresh_chats()?;
         self.status = format!("declined invite {}", shorten(group_id, 18));
         Ok(())
+    }
+
+    // ---- Phase 5b: user search, profile, and relay health ----
+
+    /// Enter the user-search screen. A query (from `/users <query>`) runs
+    /// immediately; an empty open lands on the query field awaiting input.
+    pub(crate) fn open_user_search(&mut self, query: Option<String>) {
+        let mut view = UserSearchView::default();
+        if let Some(query) = query
+            .map(|query| query.trim().to_owned())
+            .filter(|q| !q.is_empty())
+        {
+            view.query.set_value(query);
+        }
+        let run_now = !view.query.is_empty();
+        self.user_search = Some(view);
+        self.screen = Screen::UserSearch;
+        self.status = "user search".to_owned();
+        if run_now && let Err(err) = self.run_user_search() {
+            self.status = format!("error: {err}");
+        }
+    }
+
+    /// Run the one-shot `users search <query>` at the default radius and fold the
+    /// results into the view. An empty query is a no-op with a status hint.
+    pub(crate) fn run_user_search(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let query = self
+            .user_search
+            .as_ref()
+            .map(|view| view.query.value().trim().to_owned())
+            .unwrap_or_default();
+        if query.is_empty() {
+            self.status = "type a query, then Enter to search".to_owned();
+            return Ok(());
+        }
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["users", "search", &query])?;
+        let results = parse_user_search_results(&result);
+        let count = results.len();
+        if let Some(view) = self.user_search.as_mut() {
+            view.focus = if results.is_empty() {
+                UserSearchFocus::Query
+            } else {
+                UserSearchFocus::Results
+            };
+            view.results = results;
+            view.selected = 0;
+        }
+        self.status = format!("found {count} user(s)");
+        Ok(())
+    }
+
+    /// Open the dismiss-on-any-key profile card for the selected search result
+    /// (`users show <pubkey>`).
+    pub(crate) fn open_search_profile_card(&mut self) -> TuiResult<()> {
+        let Some(pubkey) = self
+            .user_search
+            .as_ref()
+            .and_then(UserSearchView::selected_result)
+            .map(|result| result.pubkey.clone())
+        else {
+            return Ok(());
+        };
+        let result = self.client.run_json(None, &["users", "show", &pubkey])?;
+        self.popup = Some(Popup::Card {
+            title: "Profile".to_owned(),
+            body: profile_card_lines(&result),
+        });
+        Ok(())
+    }
+
+    /// Enter the own-profile screen, loading fields (`profile show`) and follows
+    /// (`follows list`) as a one-shot read.
+    pub(crate) fn open_profile(&mut self) -> TuiResult<()> {
+        self.profile_view = None;
+        self.load_profile()?;
+        self.screen = Screen::Profile;
+        self.status = "profile".to_owned();
+        Ok(())
+    }
+
+    /// Load (or reload) the profile view, preserving and clamping the cursor so a
+    /// field edit or (un)follow never jumps the selection.
+    pub(crate) fn load_profile(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let show = self
+            .client
+            .run_json(Some(&account_id), &["profile", "show"])?;
+        let follows = self
+            .client
+            .run_json(Some(&account_id), &["follows", "list"])?;
+        let previous = self.profile_view.as_ref().map_or(0, |view| view.selected);
+        let mut view = parse_profile_view(&show, &follows);
+        view.selected = previous.min(view.row_count().saturating_sub(1));
+        self.profile_view = Some(view);
+        Ok(())
+    }
+
+    /// Publish a single profile field (`profile update --<field> <value>`). The
+    /// CLI fetches the current profile and overlays only this flag, so the other
+    /// fields survive. Reloads the profile and account list on success.
+    pub(crate) fn update_profile_field(
+        &mut self,
+        field: ProfileField,
+        value: String,
+    ) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let args = self.client.with_setup_relay(vec![
+            "profile".to_owned(),
+            "update".to_owned(),
+            field.flag().to_owned(),
+            value,
+        ]);
+        self.client.run_json(Some(&account_id), &args)?;
+        self.load_profile()?;
+        self.refresh_accounts()?;
+        self.status = format!("updated {}", field.label());
+        Ok(())
+    }
+
+    pub(crate) fn follow_user(&mut self, pubkey: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let args = self.client.with_setup_relay(vec![
+            "follows".to_owned(),
+            "add".to_owned(),
+            pubkey.to_owned(),
+        ]);
+        self.client.run_json(Some(&account_id), &args)?;
+        self.reload_follows()?;
+        self.status = format!("followed {}", shorten(pubkey, 18));
+        Ok(())
+    }
+
+    pub(crate) fn unfollow_user(&mut self, pubkey: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let args = self.client.with_setup_relay(vec![
+            "follows".to_owned(),
+            "remove".to_owned(),
+            pubkey.to_owned(),
+        ]);
+        self.client.run_json(Some(&account_id), &args)?;
+        self.reload_follows()?;
+        self.status = format!("unfollowed {}", shorten(pubkey, 18));
+        Ok(())
+    }
+
+    fn reload_follows(&mut self) -> TuiResult<()> {
+        if self.profile_view.is_some() {
+            self.load_profile()?;
+        }
+        Ok(())
+    }
+
+    /// Enter the relay-health screen, loading the redacted `relay-stats` snapshot.
+    /// `relay-stats` reads the live `wnd` runtime when a socket exists and falls
+    /// back to a fresh in-process read otherwise, so it always returns a snapshot.
+    pub(crate) fn open_relay_health(&mut self) -> TuiResult<()> {
+        let data = self.load_relay_health()?;
+        self.relay_health = Some(RelayHealthView { data, scroll: 0 });
+        self.screen = Screen::RelayHealth;
+        self.status = "relay health".to_owned();
+        Ok(())
+    }
+
+    /// Re-read `relay-stats`, preserving the scroll offset.
+    pub(crate) fn refresh_relay_health(&mut self) -> TuiResult<()> {
+        let data = self.load_relay_health()?;
+        let scroll = self.relay_health.as_ref().map_or(0, |view| view.scroll);
+        self.relay_health = Some(RelayHealthView { data, scroll });
+        self.status = "refreshed relay health".to_owned();
+        Ok(())
+    }
+
+    fn load_relay_health(&mut self) -> TuiResult<RelayHealthData> {
+        let result = self.client.run_json(None, &["relay-stats"])?;
+        Ok(parse_relay_health(&result, self.daemon.running))
     }
 
     pub(crate) fn update_selected_chat(

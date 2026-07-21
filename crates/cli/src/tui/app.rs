@@ -74,6 +74,15 @@ pub(crate) struct TuiApp {
     /// Group-detail screen state, loaded on entry and dropped on exit. Present
     /// only while `screen == Screen::GroupDetail`.
     pub(crate) group_detail: Option<GroupDetailView>,
+    /// User-search screen state (Phase 5b). Present only while
+    /// `screen == Screen::UserSearch`; a one-shot load, no per-view subscription.
+    pub(crate) user_search: Option<UserSearchView>,
+    /// Own-profile screen state (Phase 5b). Present only while
+    /// `screen == Screen::Profile`.
+    pub(crate) profile_view: Option<ProfileView>,
+    /// Relay-health screen state (Phase 5b). Present only while
+    /// `screen == Screen::RelayHealth`.
+    pub(crate) relay_health: Option<RelayHealthView>,
 }
 
 impl TuiApp {
@@ -113,6 +122,9 @@ impl TuiApp {
             status: "loading accounts".to_owned(),
             popup: None,
             group_detail: None,
+            user_search: None,
+            profile_view: None,
+            relay_health: None,
         })
     }
 
@@ -198,6 +210,15 @@ impl TuiApp {
         match self.screen {
             Screen::Login(LoginMode::NsecEntry) => self.input.insert_str(&text),
             Screen::Main if self.focus == Focus::Composer => self.input.insert_str(&text),
+            // Paste into the search query only while it has focus, mirroring
+            // where typed characters are accepted on that screen.
+            Screen::UserSearch => {
+                if let Some(view) = self.user_search.as_mut()
+                    && view.focus == UserSearchFocus::Query
+                {
+                    view.query.insert_str(&text);
+                }
+            }
             _ => {}
         }
     }
@@ -344,6 +365,9 @@ impl TuiApp {
         match self.screen {
             Screen::Login(mode) => return self.handle_login_key(mode, key),
             Screen::GroupDetail => return self.handle_group_detail_key(key),
+            Screen::UserSearch => return self.handle_user_search_key(key),
+            Screen::Profile => return self.handle_profile_key(key),
+            Screen::RelayHealth => return self.handle_relay_health_key(key),
             Screen::Main => {}
         }
 
@@ -376,6 +400,20 @@ impl TuiApp {
             }
             KeyCode::Char('I') if self.focus == Focus::Chats => {
                 if let Err(err) = self.open_invites() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            // Full-view screens entered from the chat list (Phase 5b).
+            KeyCode::Char('s') if self.focus == Focus::Chats => {
+                self.open_user_search(None);
+            }
+            KeyCode::Char('p') if self.focus == Focus::Chats => {
+                if let Err(err) = self.open_profile() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Char('h') if self.focus == Focus::Chats => {
+                if let Err(err) = self.open_relay_health() {
                     self.status = format!("error: {err}");
                 }
             }
@@ -741,6 +779,10 @@ impl TuiApp {
                 Ok(())
             }
             SlashCommand::ProfileName(name) => self.update_profile_name(name),
+            SlashCommand::UsersSearch { query } => {
+                self.open_user_search(query);
+                Ok(())
+            }
             SlashCommand::StreamCompose {
                 stream_id,
                 quic_candidates,
@@ -905,6 +947,35 @@ impl TuiApp {
             PopupSubmit::LeaveGroup { group_id } => self.leave_group(&group_id),
             PopupSubmit::AcceptInvite { group_id } => self.accept_invite(&group_id),
             PopupSubmit::DeclineInvite { group_id } => self.decline_invite(&group_id),
+            PopupSubmit::UpdateProfileField { field, value } => {
+                self.update_profile_field(field, value)
+            }
+            PopupSubmit::FollowUser { pubkey } => self.follow_user(&pubkey),
+            PopupSubmit::Unfollow { pubkey } => self.unfollow_user(&pubkey),
+            PopupSubmit::NewChat { name, pubkey } => {
+                self.create_chat(name, vec![pubkey])?;
+                self.reveal_chat_from_search();
+                Ok(())
+            }
+            PopupSubmit::AddUserToChat { group_id, pubkey } => {
+                self.add_group_member(&group_id, pubkey)?;
+                self.select_chat_by_group_id(&group_id)?;
+                self.reveal_chat_from_search();
+                Ok(())
+            }
+        }
+    }
+
+    /// After a user-search action opens a new chat or adds someone to the open one,
+    /// leave the search screen for the main view so the freshly selected chat is
+    /// visible. Mirrors the invite-accept return: the search screen would otherwise
+    /// hide the chat the action just targeted. A no-op off the search screen, so the
+    /// same submit reached from elsewhere (e.g. group detail) is unaffected.
+    fn reveal_chat_from_search(&mut self) {
+        if self.screen == Screen::UserSearch {
+            self.user_search = None;
+            self.screen = Screen::Main;
+            self.focus = Focus::Chats;
         }
     }
 
@@ -1045,5 +1116,255 @@ impl TuiApp {
                 },
             },
         );
+    }
+
+    /// Drop any Phase 5b full-view state and return to the main view. Shared by
+    /// the search/profile/relay-health `Esc` handlers (their data is a one-shot
+    /// load with no per-view subscription to tear down).
+    pub(crate) fn leave_screen(&mut self) {
+        self.user_search = None;
+        self.profile_view = None;
+        self.relay_health = None;
+        self.screen = Screen::Main;
+        self.focus = Focus::Chats;
+    }
+
+    /// User-search keys. `Esc` leaves the screen from either focus; otherwise the
+    /// query field or the result list handles the key per the screen's focus.
+    pub(crate) fn handle_user_search_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        if key.code == KeyCode::Esc {
+            self.leave_screen();
+            return Ok(());
+        }
+        match self.user_search.as_ref().map(|view| view.focus) {
+            Some(UserSearchFocus::Query) => self.handle_user_search_query_key(key),
+            Some(UserSearchFocus::Results) => self.handle_user_search_results_key(key),
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Query-focus keys: typing edits the query (so `j`/`k`/`?` are literal text),
+    /// `Enter` runs the search, and `Down` steps into the results.
+    fn handle_user_search_query_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                if let Err(err) = self.run_user_search() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Down => {
+                if let Some(view) = self.user_search.as_mut()
+                    && !view.results.is_empty()
+                {
+                    view.focus = UserSearchFocus::Results;
+                }
+            }
+            KeyCode::Left => self.with_search_query(Input::left),
+            KeyCode::Right => self.with_search_query(Input::right),
+            KeyCode::Home => self.with_search_query(Input::home),
+            KeyCode::End => self.with_search_query(Input::end),
+            KeyCode::Delete => self.with_search_query(Input::delete),
+            KeyCode::Backspace => self.with_search_query(Input::backspace),
+            KeyCode::Char(character) => {
+                if let Some(view) = self.user_search.as_mut() {
+                    view.query.insert(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn with_search_query(&mut self, edit: impl FnOnce(&mut Input)) {
+        if let Some(view) = self.user_search.as_mut() {
+            edit(&mut view.query);
+        }
+    }
+
+    /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
+    /// query), `Enter` opens the profile card, `c` starts a chat, `a` adds to the
+    /// open chat, and `i`/`/` return to the query.
+    fn handle_user_search_results_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(view) = self.user_search.as_mut() {
+                    if view.selected == 0 {
+                        view.focus = UserSearchFocus::Query;
+                    } else {
+                        view.select_up();
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(view) = self.user_search.as_mut() {
+                    view.select_down();
+                }
+            }
+            KeyCode::Enter => {
+                if let Err(err) = self.open_search_profile_card() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Char('c') => self.open_new_chat_with_user_popup(),
+            KeyCode::Char('a') => self.open_add_user_to_chat_popup(),
+            KeyCode::Char('i') | KeyCode::Char('/') => {
+                if let Some(view) = self.user_search.as_mut() {
+                    view.focus = UserSearchFocus::Query;
+                }
+            }
+            KeyCode::Char('?') => self.popup = Some(Popup::help()),
+            _ => {}
+        }
+    }
+
+    fn open_new_chat_with_user_popup(&mut self) {
+        let Some(result) = self
+            .user_search
+            .as_ref()
+            .and_then(UserSearchView::selected_result)
+        else {
+            return;
+        };
+        let pubkey = result.pubkey.clone();
+        let mut input = Input::default();
+        input.set_value(result.display_label());
+        self.popup = Some(Popup::Text {
+            purpose: TextPurpose::NewChatWithUser { pubkey },
+            title: "New Chat".to_owned(),
+            input,
+        });
+    }
+
+    /// Add the selected found user to the open chat. Guarded: only when a chat is
+    /// loaded (the open conversation); otherwise a status-line notice explains.
+    fn open_add_user_to_chat_popup(&mut self) {
+        let Some(result) = self
+            .user_search
+            .as_ref()
+            .and_then(UserSearchView::selected_result)
+        else {
+            return;
+        };
+        let pubkey = result.pubkey.clone();
+        let label = result.display_label();
+        let Some(group_id) = self.messages_group_id.clone() else {
+            self.status = "open a chat first to add a user to it".to_owned();
+            return;
+        };
+        self.popup = Some(Popup::Confirm {
+            purpose: ConfirmPurpose::AddUserToChat { group_id, pubkey },
+            title: "Add to Chat".to_owned(),
+            body: vec![format!(
+                "Add {} to the open chat?",
+                shorten(&terminal_safe_text(&label), 24)
+            )],
+        });
+    }
+
+    /// Profile-screen keys: `j`/`k` move the field/follow cursor, `Enter` edits
+    /// the selected field, `f` follows by pubkey, `x` unfollows the selected row.
+    pub(crate) fn handle_profile_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        match key.code {
+            KeyCode::Esc => self.leave_screen(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(view) = self.profile_view.as_mut() {
+                    view.select_up();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(view) = self.profile_view.as_mut() {
+                    view.select_down();
+                }
+            }
+            KeyCode::Enter => self.open_profile_edit_popup(),
+            KeyCode::Char('f') => {
+                self.popup = Some(Popup::Text {
+                    purpose: TextPurpose::FollowByPubkey,
+                    title: "Follow User".to_owned(),
+                    input: Input::default(),
+                });
+            }
+            KeyCode::Char('x') => self.open_unfollow_popup(),
+            KeyCode::Char('?') => self.popup = Some(Popup::help()),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Open the edit popup for the selected profile field, prefilled with its
+    /// current value. A no-op with a status notice when a follow row is selected.
+    fn open_profile_edit_popup(&mut self) {
+        let Some(view) = &self.profile_view else {
+            return;
+        };
+        let Some(ProfileTarget::Field(field)) = view.selected_target() else {
+            self.status = "select a field to edit; f follows, x unfollows".to_owned();
+            return;
+        };
+        let mut input = Input::default();
+        if let Some(value) = view.field_value(field) {
+            input.set_value(value.to_owned());
+        }
+        self.popup = Some(Popup::Text {
+            purpose: TextPurpose::EditProfileField { field },
+            title: format!("Edit {}", field.label()),
+            input,
+        });
+    }
+
+    fn open_unfollow_popup(&mut self) {
+        let Some(view) = &self.profile_view else {
+            return;
+        };
+        let Some(ProfileTarget::Follow(index)) = view.selected_target() else {
+            self.status = "select a follow to unfollow".to_owned();
+            return;
+        };
+        let Some(npub) = view.follows.get(index).cloned() else {
+            return;
+        };
+        self.popup = Some(Popup::Confirm {
+            purpose: ConfirmPurpose::Unfollow {
+                pubkey: npub.clone(),
+            },
+            title: "Unfollow".to_owned(),
+            body: vec![format!(
+                "Unfollow {}?",
+                shorten(&terminal_safe_text(&npub), 24)
+            )],
+        });
+    }
+
+    /// Relay-health keys: `r` refreshes, `j`/`k` and PageUp/PageDown scroll.
+    pub(crate) fn handle_relay_health_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        match key.code {
+            KeyCode::Esc => self.leave_screen(),
+            KeyCode::Char('r') => {
+                if let Err(err) = self.refresh_relay_health() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_relay_health(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_relay_health(1),
+            KeyCode::PageUp => self.scroll_relay_health(-10),
+            KeyCode::PageDown => self.scroll_relay_health(10),
+            KeyCode::Char('?') => self.popup = Some(Popup::help()),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn scroll_relay_health(&mut self, delta: i16) {
+        if let Some(view) = self.relay_health.as_mut() {
+            // Clamp downward scroll to the last content line so `j`/PageDown past the
+            // end parks at the bottom instead of scrolling into empty space, mirroring
+            // the timeline's clamped paging.
+            let max_scroll = relay_health_lines(&view.data).len().saturating_sub(1) as u16;
+            view.scroll = if delta < 0 {
+                view.scroll.saturating_sub(delta.unsigned_abs())
+            } else {
+                view.scroll.saturating_add(delta as u16).min(max_scroll)
+            };
+        }
     }
 }

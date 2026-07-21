@@ -65,6 +65,9 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "keys" => parse_keys_command(rest),
         "profile" => parse_profile_command(rest),
         "name" => parse_profile_name_command(rest),
+        "users" => Ok(SlashCommand::UsersSearch {
+            query: (!rest.is_empty()).then(|| rest.join(" ")),
+        }),
         "stream" => parse_stream_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),

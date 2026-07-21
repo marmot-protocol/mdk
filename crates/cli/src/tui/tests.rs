@@ -1704,6 +1704,9 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         status: String::new(),
         popup: None,
         group_detail: None,
+        user_search: None,
+        profile_view: None,
+        relay_health: None,
     }
 }
 
@@ -4478,7 +4481,24 @@ fn status_bar_line_strips_control_sequences_from_untrusted_fields() {
 fn hints_line_matches_the_keymap_per_screen_and_focus() {
     assert_eq!(
         hints_line(Screen::Main, Focus::Chats, true),
-        "j/k move  Enter open  g detail  I invites  A accounts  / cmd  ? help"
+        "j/k move  Enter open  g detail  s search  p profile  h relays  I invites  A accounts  ? help"
+    );
+    assert_eq!(
+        hints_line(Screen::Profile, Focus::Chats, true),
+        "j/k move  Enter edit  f follow  x unfollow  Esc back"
+    );
+    assert_eq!(
+        hints_line(Screen::RelayHealth, Focus::Chats, true),
+        "r refresh  j/k scroll  Esc back"
+    );
+    // The user-search screen's hint is focus-aware (rendered via `user_search_hint`).
+    assert_eq!(
+        user_search_hint(UserSearchFocus::Query),
+        "type query  Enter search  Down results  Esc back"
+    );
+    assert_eq!(
+        user_search_hint(UserSearchFocus::Results),
+        "j/k move  Enter profile  c chat  a add  i query  Esc back"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Messages, true),
@@ -6330,4 +6350,584 @@ fn composer_min_and_max_height_coexist_with_the_diagnostics_panel() {
 
     render_with("", 3);
     render_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj", 8);
+}
+
+// ---- Phase 5b: user search, profile, and relay health screens ----
+
+/// A fake `wn` that appends each invocation's argv (space-joined, one line per
+/// call) to a sidecar file, so a test can assert a multi-call flow's commands.
+#[cfg(unix)]
+fn test_appending_arg_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe = dir.join("wn-json");
+    let args_file = dir.join("recorded-args");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncat <<'JSON'\n{response}\nJSON\n",
+            args_file.display()
+        ),
+    )
+    .expect("write fake wn");
+    let mut permissions = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    (exe, args_file)
+}
+
+#[test]
+fn user_search_opens_from_s_and_esc_returns_to_main() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    // `s` opens the search screen without shelling out (there is no query to run).
+    app.handle_key(char_key('s')).expect("s opens user search");
+    assert_eq!(app.screen, Screen::UserSearch);
+    assert!(app.user_search.is_some());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves user search");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(app.user_search.is_none(), "search state dropped on exit");
+}
+
+#[test]
+fn profile_opens_from_p_and_esc_returns_to_main() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"npub":"npub1self","profile":{"name":"Al","display_name":"Alice"},"follows":[{"npub":"npub1bob"}]}}"#,
+    );
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('p')).expect("p opens profile");
+    assert_eq!(app.screen, Screen::Profile);
+    let view = app.profile_view.as_ref().expect("profile loaded");
+    assert_eq!(view.field_value(ProfileField::Name), Some("Al"));
+    assert_eq!(view.field_value(ProfileField::DisplayName), Some("Alice"));
+    assert_eq!(view.follows, vec!["npub1bob".to_owned()]);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves profile");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(app.profile_view.is_none());
+}
+
+#[test]
+fn relay_health_opens_from_h_and_esc_returns_to_main() {
+    let (_dir, client) =
+        test_json_client(r#"{"ok":true,"result":{"health":{"total_relays":2,"connected":2}}}"#);
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('h')).expect("h opens relay health");
+    assert_eq!(app.screen, Screen::RelayHealth);
+    let view = app.relay_health.as_ref().expect("relay health loaded");
+    assert_eq!(view.data.total_relays, 2);
+    assert_eq!(view.data.connected, 2);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves relay health");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(app.relay_health.is_none());
+}
+
+#[test]
+fn parse_user_search_results_reads_profile_and_match_attribution() {
+    let result = serde_json::json!({
+        "users": [
+            {"account_id_hex": "aa", "npub": "npubaa", "radius": 1, "matched_field": "name", "match_quality": "prefix", "profile": {"display_name": "Alice"}},
+            {"account_id_hex": "bb", "npub": "npubbb", "radius": 2, "matched_field": "npub", "match_quality": "contains"},
+        ]
+    });
+    let rows = parse_user_search_results(&result);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].display_label(), "Alice");
+    assert_eq!(rows[0].matched_field, "name");
+    assert_eq!(rows[0].match_quality, "prefix");
+    assert_eq!(rows[0].radius, 1);
+    // No display name/name falls back to a shortened npub.
+    assert_eq!(rows[1].display_label(), shorten("npubbb", 16));
+}
+
+#[test]
+fn user_search_runs_query_and_navigates_results() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"users":[{"account_id_hex":"aa","npub":"npubaa","radius":0,"matched_field":"name","match_quality":"exact","profile":{"display_name":"Alice"}},{"account_id_hex":"bb","npub":"npubbb","radius":1,"matched_field":"npub","match_quality":"prefix"}]}}"#,
+    );
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.open_user_search(None);
+    // Query focus: typed characters edit the query (j/k are literal text here).
+    for character in "ali".chars() {
+        app.handle_key(char_key(character)).expect("type query");
+    }
+    assert_eq!(app.user_search.as_ref().unwrap().query.value(), "ali");
+    // Enter runs the one-shot search and moves focus into the results.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("run search");
+    {
+        let view = app.user_search.as_ref().expect("search view");
+        assert_eq!(view.results.len(), 2);
+        assert_eq!(view.focus, UserSearchFocus::Results);
+        assert_eq!(view.selected, 0);
+    }
+    // Results focus: j/k navigate; k at the top returns to the query.
+    app.handle_key(char_key('j')).expect("j down");
+    assert_eq!(app.user_search.as_ref().unwrap().selected, 1);
+    app.handle_key(char_key('k')).expect("k up");
+    assert_eq!(app.user_search.as_ref().unwrap().selected, 0);
+    app.handle_key(char_key('k')).expect("k to query");
+    assert_eq!(
+        app.user_search.as_ref().unwrap().focus,
+        UserSearchFocus::Query
+    );
+}
+
+#[test]
+fn slash_users_query_runs_the_search_immediately() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"users":[{"account_id_hex":"aa","npub":"npubaa","radius":0,"matched_field":"name","match_quality":"exact"}]}}"#,
+    );
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.open_user_search(Some("alice".to_owned()));
+    let view = app.user_search.as_ref().expect("search view");
+    assert_eq!(view.query.value(), "alice");
+    assert_eq!(view.results.len(), 1);
+    assert_eq!(view.focus, UserSearchFocus::Results);
+}
+
+#[test]
+fn user_search_add_to_chat_is_guarded_on_no_loaded_chat() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    let view = UserSearchView {
+        results: vec![UserSearchResultRow {
+            pubkey: "aa".to_owned(),
+            npub: "npubaa".to_owned(),
+            display_name: Some("Alice".to_owned()),
+            matched_field: "name".to_owned(),
+            match_quality: "exact".to_owned(),
+            radius: 0,
+        }],
+        focus: UserSearchFocus::Results,
+        ..UserSearchView::default()
+    };
+    app.user_search = Some(view);
+    app.screen = Screen::UserSearch;
+    app.messages_group_id = None;
+
+    // No loaded chat: the add action is guarded to a status notice, no popup.
+    app.handle_key(char_key('a')).expect("a guarded");
+    assert!(app.popup.is_none(), "no popup without a loaded chat");
+    assert!(
+        app.status.contains("open a chat"),
+        "status explains the guard: {}",
+        app.status
+    );
+
+    // With a loaded chat: a confirm popup targets the open chat.
+    app.messages_group_id = Some("g1".to_owned());
+    app.handle_key(char_key('a')).expect("a add");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::AddUserToChat { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn parse_profile_view_reads_fields_and_follows() {
+    let show = serde_json::json!({
+        "npub": "npub1self",
+        "profile": {"name": "al", "display_name": "Alice", "about": "hi", "picture": "https://x/y.png"}
+    });
+    let follows = serde_json::json!({"follows": [{"npub": "npub1bob"}, {"npub": "npub1carol"}]});
+    let view = parse_profile_view(&show, &follows);
+    assert_eq!(view.npub, "npub1self");
+    assert_eq!(view.field_value(ProfileField::DisplayName), Some("Alice"));
+    // Picture URLs are stored (and rendered) as literal text, never fetched.
+    assert_eq!(
+        view.field_value(ProfileField::Picture),
+        Some("https://x/y.png")
+    );
+    assert_eq!(view.field_value(ProfileField::Nip05), None);
+    assert_eq!(
+        view.follows,
+        vec!["npub1bob".to_owned(), "npub1carol".to_owned()]
+    );
+    // A single cursor spans the six fields then the follows.
+    assert_eq!(view.row_count(), 6 + 2);
+    assert_eq!(
+        view.selected_target(),
+        Some(ProfileTarget::Field(ProfileField::Name))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_edit_publishes_only_the_selected_field() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.screen = Screen::Profile;
+    let mut view = ProfileView {
+        npub: "npub1self".to_owned(),
+        ..ProfileView::default()
+    };
+    view.fields[1] = Some("Al".to_owned()); // display_name
+    view.selected = 1;
+    app.profile_view = Some(view);
+
+    // Enter opens the edit popup for the selected field, prefilled.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("open edit popup");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Text {
+            purpose: TextPurpose::EditProfileField {
+                field: ProfileField::DisplayName
+            },
+            ..
+        })
+    ));
+    // Enter submits the prefilled value, publishing only --display-name.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("submit edit");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line.contains("profile update --display-name Al")),
+        "expected a single-field update argv, got:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("--about") && !recorded.contains("--picture"),
+        "only the changed field is published:\n{recorded}"
+    );
+}
+
+#[test]
+fn parse_relay_health_reads_counters_histograms_and_per_relay() {
+    let snapshot = serde_json::json!({
+        "metrics": {"active_accounts": 1, "inbound_events_seen": 10, "inbound_events_delivered": 9, "publish_attempts": 4, "publish_successes": 3},
+        "delivery_spread": {
+            "observed": 5, "corroborated": 3, "single_source": 2,
+            "spread": {"buckets": [{"upper_bound_ms": 50, "count": 3}, {"upper_bound_ms": 200, "count": 1}], "overflow_count": 0},
+            "per_relay": [{"relay_index": 0, "delivered_first": 3, "delivered_later": 1}]
+        },
+        "sync": {
+            "tracked_subscriptions": 2, "synced_subscriptions": 2,
+            "first_event": {"buckets": [{"upper_bound_ms": 100, "count": 4}], "overflow_count": 0},
+            "eose": {"buckets": [{"upper_bound_ms": 300, "count": 2}], "overflow_count": 0},
+            "per_relay": [{"relay_index": 0, "first_event": {"buckets": [{"upper_bound_ms": 100, "count": 2}], "overflow_count": 0}, "eose": {"buckets": [{"upper_bound_ms": 300, "count": 1}], "overflow_count": 0}}]
+        },
+        "health": {"sdk_backed": true, "total_relays": 3, "connected": 2, "connecting": 0, "disconnected": 1, "connection_attempts": 5, "connection_successes": 4}
+    });
+    let data = parse_relay_health(&snapshot, true);
+    assert_eq!(data.inbound_seen, 10);
+    assert_eq!(data.total_relays, 3);
+    assert_eq!(data.connected, 2);
+    assert_eq!(data.observed, 5);
+    assert_eq!(data.spread_samples, 4);
+    // p50 of 4 samples: ceil(0.5*4)=2 falls in the first (<=50ms) bucket.
+    assert_eq!(data.spread_p50, "50ms");
+    // p99 of 4: ceil(0.99*4)=4 reaches the second (<=200ms) bucket.
+    assert_eq!(data.spread_p99, "200ms");
+    assert_eq!(data.first_event_p50, "100ms");
+    assert_eq!(data.eose_p50, "300ms");
+    assert_eq!(data.per_relay.len(), 1);
+    assert_eq!(data.per_relay[0].relay_index, 0);
+    assert_eq!(data.per_relay[0].first_deliverer, "75%"); // 3/(3+1)
+    assert_eq!(data.per_relay[0].first_event_p50, "100ms");
+}
+
+#[test]
+fn histogram_percentile_label_is_honest_about_empty_and_overflow() {
+    let empty = serde_json::json!({"buckets": [], "overflow_count": 0});
+    assert_eq!(histogram_percentile_label(&empty, 0.5), "n/a");
+    // A distribution dominated by the overflow region is wider than measured.
+    let overflowing =
+        serde_json::json!({"buckets": [{"upper_bound_ms": 100, "count": 1}], "overflow_count": 9});
+    assert_eq!(histogram_percentile_label(&overflowing, 0.99), ">100ms");
+}
+
+#[test]
+fn relay_health_render_never_shows_relay_urls() {
+    // Relay URLs injected into unexpected fields must never reach the rendered
+    // output (decision 3: redacted rows, opaque indices, no URLs).
+    let snapshot = serde_json::json!({
+        "metrics": {"active_accounts": 1, "relay_url": "wss://leak.example"},
+        "delivery_spread": {
+            "observed": 2, "url": "ws://leak.two",
+            "spread": {"buckets": [{"upper_bound_ms": 50, "count": 2}], "overflow_count": 0},
+            "per_relay": [{"relay_index": 0, "relay_url": "wss://leak.three", "delivered_first": 2, "delivered_later": 0}]
+        },
+        "sync": {"per_relay": [{"relay_index": 0, "endpoint": "wss://leak.four", "first_event": {"buckets": [], "overflow_count": 0}, "eose": {"buckets": [], "overflow_count": 0}}]},
+        "health": {"total_relays": 1, "url": "wss://leak.five"}
+    });
+    let data = parse_relay_health(&snapshot, false);
+    let rendered = relay_health_lines(&data)
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect::<String>();
+    assert!(!rendered.contains("ws://"), "no ws:// urls in:\n{rendered}");
+    assert!(
+        !rendered.contains("wss://"),
+        "no wss:// urls in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("relay#0"),
+        "per-relay row keyed by opaque index:\n{rendered}"
+    );
+}
+
+#[test]
+fn user_search_frame_shows_query_and_results() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::UserSearch;
+    let mut view = UserSearchView {
+        results: vec![UserSearchResultRow {
+            pubkey: "aa".to_owned(),
+            npub: "npubALICE".to_owned(),
+            display_name: Some("Alice".to_owned()),
+            matched_field: "name".to_owned(),
+            match_quality: "prefix".to_owned(),
+            radius: 1,
+        }],
+        focus: UserSearchFocus::Results,
+        ..UserSearchView::default()
+    };
+    view.query.set_value("alice");
+    app.user_search = Some(view);
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("User Search"), "screen title present");
+    assert!(rendered.contains("alice"), "query text present");
+    assert!(rendered.contains("Alice"), "result label present");
+    assert!(rendered.contains("prefix"), "match quality present");
+    assert!(rendered.contains("radius 1"), "radius present");
+}
+
+#[test]
+fn profile_frame_shows_fields_and_follows() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Profile;
+    let mut view = ProfileView {
+        npub: "npubSELF".to_owned(),
+        follows: vec!["npubBOB".to_owned()],
+        ..ProfileView::default()
+    };
+    view.fields[1] = Some("Alice".to_owned());
+    app.profile_view = Some(view);
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("Profile"), "screen title present");
+    assert!(rendered.contains("display name"), "field label present");
+    assert!(rendered.contains("Alice"), "field value present");
+    assert!(rendered.contains("Fields"), "fields section present");
+    assert!(rendered.contains("Follows"), "follows section present");
+    assert!(rendered.contains("npubBOB"), "follow present");
+    assert!(rendered.contains("(unset)"), "unset field rendered");
+}
+
+#[test]
+fn relay_health_frame_shows_redacted_summary_without_urls() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::RelayHealth;
+    let data = parse_relay_health(
+        &serde_json::json!({
+            "health": {"total_relays": 2, "connected": 2},
+            "delivery_spread": {"per_relay": [{"relay_index": 0, "delivered_first": 1, "delivered_later": 0}], "spread": {"buckets": [], "overflow_count": 0}}
+        }),
+        true,
+    );
+    app.relay_health = Some(RelayHealthView { data, scroll: 0 });
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("Relay Health"), "screen title present");
+    assert!(rendered.contains("health:"), "health summary present");
+    assert!(
+        rendered.contains("relay#0"),
+        "per-relay opaque index present"
+    );
+    assert!(
+        !rendered.contains("ws://") && !rendered.contains("wss://"),
+        "no relay urls in the frame:\n{rendered}"
+    );
+}
+
+#[test]
+fn slash_command_parser_handles_users_search() {
+    assert_eq!(
+        parse_slash_command("/users"),
+        Ok(SlashCommand::UsersSearch { query: None })
+    );
+    assert_eq!(
+        parse_slash_command("/users alice smith"),
+        Ok(SlashCommand::UsersSearch {
+            query: Some("alice smith".to_owned())
+        })
+    );
+}
+
+#[test]
+fn help_card_documents_the_new_screens() {
+    let help = help_card_lines().join("\n");
+    assert!(help.contains("s search"), "help mentions user search");
+    assert!(help.contains("p profile"), "help mentions profile");
+    assert!(help.contains("h relays"), "help mentions relay health");
+    assert!(help.contains("/users"), "help mentions the /users command");
+}
+
+#[cfg(unix)]
+#[test]
+fn follows_child_invocation_borrows_the_setup_relay_only_without_a_global_relay() {
+    // `follows add`/`profile update` require a relay; without a launch-time global
+    // `--relay` the TUI lends the first configured setup relay so the child does not
+    // hard-fail. `--relay` is a global clap flag, so a command-local position lands
+    // in the same slot the handler reads, and it is never appended twice.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_arg_recording_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+    let mut client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: vec!["wss://discovery".to_owned()],
+        default_account_relays: vec!["wss://default".to_owned()],
+        secret_store: None,
+        keychain_service: None,
+    };
+    let mut app = test_tui_app(client.clone(), &account_id);
+    app.follow_user("npub1bob").expect("follow");
+    let args: Vec<String> = std::fs::read_to_string(&args_file)
+        .expect("args file")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        args.windows(2)
+            .any(|window| window == ["--relay", "wss://default"]),
+        "follows add borrows the default account relay: {args:?}"
+    );
+
+    // No relay configured at all: nothing is fabricated, so the child still reaches
+    // the CLI's clear MissingRelay error naming the setup flags.
+    client.discovery_relays.clear();
+    client.default_account_relays.clear();
+    let mut app = test_tui_app(client, &account_id);
+    app.follow_user("npub1bob").expect("follow");
+    let recorded = std::fs::read_to_string(&args_file).expect("args file");
+    assert!(
+        !recorded.lines().any(|line| line == "--relay"),
+        "no relay is invented when none is configured: {recorded:?}"
+    );
+}
+
+#[test]
+fn relay_health_scroll_clamps_to_content_height() {
+    let snapshot = serde_json::json!({
+        "metrics": {"active_accounts": 1, "inbound_events_seen": 10, "inbound_events_delivered": 9},
+        "delivery_spread": {
+            "observed": 5, "corroborated": 3, "single_source": 2,
+            "per_relay": [{"relay_index": 0, "delivered_first": 3, "delivered_later": 1}]
+        },
+        "sync": {"tracked_subscriptions": 2, "synced_subscriptions": 2, "per_relay": [{"relay_index": 0}]},
+        "health": {"sdk_backed": true, "total_relays": 3, "connected": 2, "connecting": 0, "disconnected": 1}
+    });
+    let data = parse_relay_health(&snapshot, true);
+    let max_scroll = relay_health_lines(&data).len().saturating_sub(1) as u16;
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.relay_health = Some(RelayHealthView { data, scroll: 0 });
+    app.screen = Screen::RelayHealth;
+
+    // PageDown far past the end parks at the last content line, never beyond.
+    for _ in 0..64 {
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .expect("page down");
+    }
+    assert_eq!(app.relay_health.as_ref().unwrap().scroll, max_scroll);
+    // Scrolling back up still works from the clamped position.
+    app.handle_key(char_key('k')).expect("k up");
+    assert_eq!(
+        app.relay_health.as_ref().unwrap().scroll,
+        max_scroll.saturating_sub(1)
+    );
+}
+
+fn user_search_app_with_selected_result(client: WnClient) -> TuiApp {
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.user_search = Some(UserSearchView {
+        results: vec![UserSearchResultRow {
+            pubkey: "bb".to_owned(),
+            npub: "npubbb".to_owned(),
+            display_name: Some("Bob".to_owned()),
+            matched_field: "name".to_owned(),
+            match_quality: "exact".to_owned(),
+            radius: 0,
+        }],
+        focus: UserSearchFocus::Results,
+        ..UserSearchView::default()
+    });
+    app.screen = Screen::UserSearch;
+    app
+}
+
+#[test]
+fn new_chat_from_search_navigates_into_the_created_chat() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"group_id":"abcd","chats":[{"group_id":"abcd","profile":{"name":"New Room"}}]}}"#,
+    );
+    let mut app = user_search_app_with_selected_result(client);
+    app.handle_key(char_key('c'))
+        .expect("c opens new-chat popup");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("submit new chat");
+    assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.selected_chat_row().map(|chat| chat.group_id.as_str()),
+        Some("abcd"),
+        "the new chat is selected"
+    );
+}
+
+#[test]
+fn add_to_open_chat_from_search_navigates_into_that_chat() {
+    let (_dir, client) = test_json_client(r#"{"ok":true,"result":{}}"#);
+    let mut app = user_search_app_with_selected_result(client);
+    app.chats = vec![
+        ChatRow {
+            group_id: "other".to_owned(),
+            name: "Other".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Open Room".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+    app.messages_group_id = Some("g1".to_owned());
+    app.handle_key(char_key('a'))
+        .expect("a opens add-to-chat popup");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("confirm add to chat");
+    assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.selected_chat_row().map(|chat| chat.group_id.as_str()),
+        Some("g1"),
+        "the affected chat is selected"
+    );
 }

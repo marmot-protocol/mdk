@@ -260,13 +260,17 @@ impl Focus {
 }
 
 /// The top-level screen the TUI is showing: the login/account-select flow, the
-/// chat-first main view, and (Phase 5) the group-detail screen. Profile, search,
-/// and health screens arrive in later Phase 5 slices.
+/// chat-first main view, and the Phase 5 full-view screens (group detail, user
+/// search, own profile, relay health). Each non-Main screen is a one-shot load
+/// entered by key or slash command; `Esc` returns to Main.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Screen {
     Login(LoginMode),
     Main,
     GroupDetail,
+    UserSearch,
+    Profile,
+    RelayHealth,
 }
 
 /// A single modal popup. While one is open it captures every key and the screen
@@ -303,21 +307,87 @@ pub(crate) enum Popup {
     Card { title: String, body: Vec<String> },
 }
 
-/// What a text-entry popup does on submit. Extends cleanly for 5b (create group,
-/// react-with-emoji, profile field edits) by adding variants here.
+/// What a text-entry popup does on submit. The per-purpose design keeps the
+/// popup count low: 5b adds profile-field edits, follow-by-pubkey, and the
+/// start-a-chat-with-a-found-user name prompt here rather than new `Popup` shapes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TextPurpose {
-    RenameGroup { group_id: String },
-    AddMemberByPubkey { group_id: String },
+    RenameGroup {
+        group_id: String,
+    },
+    AddMemberByPubkey {
+        group_id: String,
+    },
+    /// Edit one own-profile field; publishes only that field on submit.
+    EditProfileField {
+        field: ProfileField,
+    },
+    /// Follow a user by npub/hex from the profile screen.
+    FollowByPubkey,
+    /// Name a new chat started with a found user from the search screen.
+    NewChatWithUser {
+        pubkey: String,
+    },
 }
 
-/// What a confirm popup does on `y`/`Enter`. Extends for 5b (delete message,
-/// logout) by adding variants here.
+/// What a confirm popup does on `y`/`Enter`. 5b adds unfollow and
+/// add-found-user-to-the-current-chat here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConfirmPurpose {
     RemoveMember { group_id: String, pubkey: String },
     PromoteMember { group_id: String, pubkey: String },
     LeaveGroup { group_id: String },
+    Unfollow { pubkey: String },
+    AddUserToChat { group_id: String, pubkey: String },
+}
+
+/// An editable own-profile field. Each maps to exactly one `profile update`
+/// flag, so a single-field edit publishes only that field (the CLI fetches the
+/// current profile, overlays the flag, and republishes, preserving the rest).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileField {
+    Name,
+    DisplayName,
+    About,
+    Picture,
+    Nip05,
+    Lud16,
+}
+
+impl ProfileField {
+    /// The six editable fields, in display order.
+    pub(crate) const ALL: [ProfileField; 6] = [
+        ProfileField::Name,
+        ProfileField::DisplayName,
+        ProfileField::About,
+        ProfileField::Picture,
+        ProfileField::Nip05,
+        ProfileField::Lud16,
+    ];
+
+    /// The `profile update` flag that publishes this field alone.
+    pub(crate) fn flag(self) -> &'static str {
+        match self {
+            ProfileField::Name => "--name",
+            ProfileField::DisplayName => "--display-name",
+            ProfileField::About => "--about",
+            ProfileField::Picture => "--picture",
+            ProfileField::Nip05 => "--nip05",
+            ProfileField::Lud16 => "--lud16",
+        }
+    }
+
+    /// The human label shown in the profile screen and the edit popup title.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ProfileField::Name => "name",
+            ProfileField::DisplayName => "display name",
+            ProfileField::About => "about",
+            ProfileField::Picture => "picture",
+            ProfileField::Nip05 => "nip05",
+            ProfileField::Lud16 => "lud16",
+        }
+    }
 }
 
 /// What a list picker acts on. Extends for 5b (group picker for user search).
@@ -357,6 +427,11 @@ pub(crate) enum PopupSubmit {
     LeaveGroup { group_id: String },
     AcceptInvite { group_id: String },
     DeclineInvite { group_id: String },
+    UpdateProfileField { field: ProfileField, value: String },
+    FollowUser { pubkey: String },
+    Unfollow { pubkey: String },
+    NewChat { name: String, pubkey: String },
+    AddUserToChat { group_id: String, pubkey: String },
 }
 
 impl Popup {
@@ -485,6 +560,15 @@ fn text_purpose_submit(purpose: &TextPurpose, value: String) -> PopupSubmit {
             group_id: group_id.clone(),
             pubkey: value,
         },
+        TextPurpose::EditProfileField { field } => PopupSubmit::UpdateProfileField {
+            field: *field,
+            value,
+        },
+        TextPurpose::FollowByPubkey => PopupSubmit::FollowUser { pubkey: value },
+        TextPurpose::NewChatWithUser { pubkey } => PopupSubmit::NewChat {
+            name: value,
+            pubkey: pubkey.clone(),
+        },
     }
 }
 
@@ -500,6 +584,13 @@ fn confirm_purpose_submit(purpose: &ConfirmPurpose) -> PopupSubmit {
         },
         ConfirmPurpose::LeaveGroup { group_id } => PopupSubmit::LeaveGroup {
             group_id: group_id.clone(),
+        },
+        ConfirmPurpose::Unfollow { pubkey } => PopupSubmit::Unfollow {
+            pubkey: pubkey.clone(),
+        },
+        ConfirmPurpose::AddUserToChat { group_id, pubkey } => PopupSubmit::AddUserToChat {
+            group_id: group_id.clone(),
+            pubkey: pubkey.clone(),
         },
     }
 }
@@ -544,15 +635,17 @@ pub(crate) fn help_card_lines() -> Vec<String> {
     [
         "Chats + messages fill the screen; the composer, hints, and status sit below.",
         "Tab/BackTab cycle chats, messages, and composer. Ctrl-C quits.",
-        "Chats: j/k move; Enter opens; g group detail; I invites; A account picker.",
+        "Chats: j/k move; Enter opens; g detail; s search; p profile; h relays; I invites; A accounts.",
         "Messages: j/k or arrows move; PageUp/PageDown page; G/g newest/oldest.",
         "On the selected message: r react (Enter sends +), u unreact, d delete.",
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
         "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
+        "User search: type + Enter searches; Enter opens a card; c chat; a add to open chat.",
+        "Profile: j/k move; Enter edits a field; f follow; x unfollow. Relay health: r refresh.",
         "Popups capture every key; Esc or the shown key closes them.",
         "",
         "/refresh   /diagnostics   /account <npub-or-hex>   /create-identity",
-        "/login <nsec-or-npub>   /daemon status|start|stop",
+        "/login <nsec-or-npub>   /daemon status|start|stop   /users [query]",
         "/chat new|rename|describe|archive|unarchive|archived",
         "/members add|remove|list   /react [emoji]   /unreact   /delete   /retry <id>",
         "/keys fetch|rotate   /profile name <display-name>   /quit",
@@ -743,6 +836,468 @@ pub(crate) fn parse_invite_items(result: &Value) -> Vec<PickerItem> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ---- Phase 5b: user search, profile, and relay health screens ----
+
+/// Which region of the user-search screen has the keys. The screen has two
+/// regions (a query field and a result list) and one editable text sink, so a
+/// two-state focus disambiguates `Enter` (run the query vs open the selected
+/// result) without overloading it: in `Query` focus typing edits the query and
+/// `Enter` runs the search; in `Results` focus `j`/`k` navigate and `Enter`
+/// opens the selected user's profile card.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserSearchFocus {
+    Query,
+    Results,
+}
+
+/// One `users search` result row: the profile display fields plus the match
+/// attribution (`matched_field`/`match_quality`/`radius`) the CLI returns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserSearchResultRow {
+    pub(crate) pubkey: String,
+    pub(crate) npub: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) matched_field: String,
+    pub(crate) match_quality: String,
+    pub(crate) radius: u8,
+}
+
+impl UserSearchResultRow {
+    /// The primary label: the display/name, else a shortened npub.
+    pub(crate) fn display_label(&self) -> String {
+        self.display_name
+            .clone()
+            .unwrap_or_else(|| shorten(&self.npub, 16))
+    }
+}
+
+/// The user-search screen state: a reusable query [`Input`], the one-shot
+/// results, the selection, and which region has focus. `users search` is a
+/// one-shot call (no streaming), so the results only change on `Enter`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserSearchView {
+    pub(crate) query: Input,
+    pub(crate) results: Vec<UserSearchResultRow>,
+    pub(crate) selected: usize,
+    pub(crate) focus: UserSearchFocus,
+}
+
+impl Default for UserSearchView {
+    fn default() -> Self {
+        Self {
+            query: Input::default(),
+            results: Vec::new(),
+            selected: 0,
+            focus: UserSearchFocus::Query,
+        }
+    }
+}
+
+impl UserSearchView {
+    pub(crate) fn select_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub(crate) fn select_down(&mut self) {
+        if self.selected + 1 < self.results.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub(crate) fn selected_result(&self) -> Option<&UserSearchResultRow> {
+        self.results.get(self.selected)
+    }
+}
+
+/// Parse `users search` result rows from the `users` array.
+pub(crate) fn parse_user_search_results(result: &Value) -> Vec<UserSearchResultRow> {
+    result
+        .get("users")
+        .and_then(Value::as_array)
+        .map(|users| users.iter().filter_map(parse_user_search_result).collect())
+        .unwrap_or_default()
+}
+
+fn parse_user_search_result(value: &Value) -> Option<UserSearchResultRow> {
+    let pubkey =
+        value_string(value, "account_id_hex").or_else(|| value_string(value, "account_id"))?;
+    let profile = value.get("profile");
+    let display_name = profile
+        .and_then(|profile| non_empty_value_string(profile, "display_name"))
+        .or_else(|| profile.and_then(|profile| non_empty_value_string(profile, "name")));
+    Some(UserSearchResultRow {
+        pubkey,
+        npub: value_string(value, "npub").unwrap_or_default(),
+        display_name,
+        matched_field: value_string(value, "matched_field").unwrap_or_default(),
+        match_quality: value_string(value, "match_quality").unwrap_or_default(),
+        radius: value
+            .get("radius")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as u8,
+    })
+}
+
+/// The dismiss-on-any-key profile card body for a `users show` result. Picture
+/// URLs render as literal text (no fetch — remote avatars are out per the TUI
+/// decisions). Every field passes through `terminal_safe_text`.
+pub(crate) fn profile_card_lines(result: &Value) -> Vec<String> {
+    let user = result.get("user").unwrap_or(result);
+    let profile = user.get("profile");
+    let mut lines = Vec::new();
+    if let Some(name) = profile
+        .and_then(|profile| non_empty_value_string(profile, "display_name"))
+        .or_else(|| profile.and_then(|profile| non_empty_value_string(profile, "name")))
+    {
+        lines.push(terminal_safe_text(&name));
+    }
+    if let Some(npub) = non_empty_value_string(user, "npub") {
+        lines.push(format!("npub {}", terminal_safe_text(&shorten(&npub, 24))));
+    }
+    for (label, key) in [
+        ("about", "about"),
+        ("nip05", "nip05"),
+        ("lud16", "lud16"),
+        ("picture", "picture"),
+    ] {
+        if let Some(value) = profile.and_then(|profile| non_empty_value_string(profile, key)) {
+            lines.push(format!("{label}: {}", terminal_safe_text(&value)));
+        }
+    }
+    let follows = user
+        .get("follows")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    lines.push(format!("follows: {follows}"));
+    if lines.is_empty() {
+        lines.push("no profile metadata".to_owned());
+    }
+    lines
+}
+
+/// A selectable target on the profile screen: one of the six editable fields or
+/// one follow row. The screen threads a single cursor over the fields then the
+/// follows so `Enter`/`x`/`f` know what they act on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileTarget {
+    Field(ProfileField),
+    Follow(usize),
+}
+
+/// The own-profile screen state: the npub, the six editable fields (indexed by
+/// [`ProfileField::ALL`] order), the follow list (npubs), and a single cursor
+/// over fields-then-follows.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProfileView {
+    pub(crate) npub: String,
+    pub(crate) fields: [Option<String>; 6],
+    pub(crate) follows: Vec<String>,
+    pub(crate) selected: usize,
+}
+
+impl ProfileView {
+    /// Selectable rows: the six fields plus each follow.
+    pub(crate) fn row_count(&self) -> usize {
+        ProfileField::ALL.len() + self.follows.len()
+    }
+
+    pub(crate) fn field_value(&self, field: ProfileField) -> Option<&str> {
+        let index = ProfileField::ALL.iter().position(|f| *f == field)?;
+        self.fields[index].as_deref()
+    }
+
+    pub(crate) fn select_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub(crate) fn select_down(&mut self) {
+        if self.selected + 1 < self.row_count() {
+            self.selected += 1;
+        }
+    }
+
+    /// Resolve the cursor to a field or a follow row.
+    pub(crate) fn selected_target(&self) -> Option<ProfileTarget> {
+        let fields = ProfileField::ALL.len();
+        if self.selected < fields {
+            Some(ProfileTarget::Field(ProfileField::ALL[self.selected]))
+        } else {
+            let follow = self.selected - fields;
+            (follow < self.follows.len()).then_some(ProfileTarget::Follow(follow))
+        }
+    }
+}
+
+/// Build the profile view from a `profile show` result and a `follows list`
+/// result. Absent fields stay `None`; the follow list keeps npubs.
+pub(crate) fn parse_profile_view(show: &Value, follows: &Value) -> ProfileView {
+    let profile = show.get("profile");
+    let field = |key: &str| profile.and_then(|profile| non_empty_value_string(profile, key));
+    ProfileView {
+        npub: value_string(show, "npub").unwrap_or_default(),
+        fields: [
+            field("name"),
+            field("display_name"),
+            field("about"),
+            field("picture"),
+            field("nip05"),
+            field("lud16"),
+        ],
+        follows: parse_follow_npubs(follows),
+        selected: 0,
+    }
+}
+
+/// Parse the follow npubs from a `follows list` result's `follows` array.
+pub(crate) fn parse_follow_npubs(result: &Value) -> Vec<String> {
+    result
+        .get("follows")
+        .and_then(Value::as_array)
+        .map(|follows| {
+            follows
+                .iter()
+                .filter_map(|follow| {
+                    value_string(follow, "npub").or_else(|| value_string(follow, "account_id"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One relay's redacted health row, keyed by opaque device-local index. No relay
+/// URL exists in the source; the index is all that identifies a relay here.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RelayHealthRow {
+    pub(crate) relay_index: u32,
+    pub(crate) first_deliverer: String,
+    pub(crate) delivered_first: u64,
+    pub(crate) delivered_later: u64,
+    pub(crate) first_event_p50: String,
+    pub(crate) eose_p50: String,
+}
+
+/// The parsed, redacted `relay-stats` snapshot the health screen renders. All
+/// per-relay attribution is keyed by opaque index; there are no relay URLs in
+/// the source and none are stored here (decision 3).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RelayHealthData {
+    pub(crate) daemon_running: bool,
+    pub(crate) active_accounts: u64,
+    pub(crate) active_group_subscriptions: u64,
+    pub(crate) subscriptions_created: u64,
+    pub(crate) subscriptions_removed: u64,
+    pub(crate) inbound_seen: u64,
+    pub(crate) inbound_delivered: u64,
+    pub(crate) inbound_dropped: u64,
+    pub(crate) publish_attempts: u64,
+    pub(crate) publish_successes: u64,
+    pub(crate) publish_failures: u64,
+    pub(crate) observed: u64,
+    pub(crate) corroborated: u64,
+    pub(crate) single_source: u64,
+    pub(crate) spread_samples: u64,
+    pub(crate) spread_p50: String,
+    pub(crate) spread_p99: String,
+    pub(crate) tracked_subscriptions: u64,
+    pub(crate) synced_subscriptions: u64,
+    pub(crate) first_event_p50: String,
+    pub(crate) eose_p50: String,
+    pub(crate) sdk_backed: bool,
+    pub(crate) total_relays: u64,
+    pub(crate) connected: u64,
+    pub(crate) connecting: u64,
+    pub(crate) disconnected: u64,
+    pub(crate) connection_attempts: u64,
+    pub(crate) connection_successes: u64,
+    pub(crate) per_relay: Vec<RelayHealthRow>,
+}
+
+/// The relay-health screen state: the parsed snapshot and a line scroll offset.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RelayHealthView {
+    pub(crate) data: RelayHealthData,
+    pub(crate) scroll: u16,
+}
+
+fn u64_at(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or_default()
+}
+
+/// The upper bound (in ms) of the bucket a percentile falls in, mirroring the
+/// `relay-stats` CLI: `n/a` with no samples, `>Nms` when the percentile lands in
+/// the overflow region above the largest bucket, else `Nms`. Honest about what
+/// fixed-bucket histograms support — no interpolated value is invented.
+pub(crate) fn histogram_percentile_label(histogram: &Value, percentile: f64) -> String {
+    let buckets: Vec<(u64, u64)> = histogram
+        .get("buckets")
+        .and_then(Value::as_array)
+        .map(|buckets| {
+            buckets
+                .iter()
+                .filter_map(|bucket| {
+                    Some((
+                        bucket.get("upper_bound_ms")?.as_u64()?,
+                        bucket.get("count")?.as_u64()?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let overflow = u64_at(histogram, "overflow_count");
+    let total = buckets.iter().map(|(_, count)| count).sum::<u64>() + overflow;
+    if total == 0 {
+        return "n/a".to_owned();
+    }
+    let target = ((percentile.clamp(0.0, 1.0) * total as f64).ceil() as u64).max(1);
+    let mut cumulative = 0;
+    for (bound, count) in &buckets {
+        cumulative += count;
+        if cumulative >= target {
+            return format!("{bound}ms");
+        }
+    }
+    match buckets.last() {
+        Some((bound, _)) => format!(">{bound}ms"),
+        None => "n/a".to_owned(),
+    }
+}
+
+fn first_deliverer_label(delivered_first: u64, delivered_later: u64) -> String {
+    let total = delivered_first + delivered_later;
+    if total == 0 {
+        "n/a".to_owned()
+    } else {
+        format!("{:.0}%", delivered_first as f64 / total as f64 * 100.0)
+    }
+}
+
+/// Parse the redacted `relay-stats` snapshot into the health-screen view model.
+/// Reads only counters, opaque relay indices, and millisecond histograms — never
+/// any relay URL (there are none in the source).
+pub(crate) fn parse_relay_health(result: &Value, daemon_running: bool) -> RelayHealthData {
+    let metrics = result.get("metrics").cloned().unwrap_or(Value::Null);
+    let spread = result
+        .get("delivery_spread")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let sync = result.get("sync").cloned().unwrap_or(Value::Null);
+    let health = result.get("health").cloned().unwrap_or(Value::Null);
+    let spread_hist = spread.get("spread").cloned().unwrap_or(Value::Null);
+    let first_event = sync.get("first_event").cloned().unwrap_or(Value::Null);
+    let eose = sync.get("eose").cloned().unwrap_or(Value::Null);
+
+    let per_relay = build_relay_health_rows(&spread, &sync);
+
+    RelayHealthData {
+        daemon_running,
+        active_accounts: u64_at(&metrics, "active_accounts"),
+        active_group_subscriptions: u64_at(&metrics, "active_group_subscriptions"),
+        subscriptions_created: u64_at(&metrics, "subscriptions_created"),
+        subscriptions_removed: u64_at(&metrics, "subscriptions_removed"),
+        inbound_seen: u64_at(&metrics, "inbound_events_seen"),
+        inbound_delivered: u64_at(&metrics, "inbound_events_delivered"),
+        inbound_dropped: u64_at(&metrics, "inbound_events_dropped"),
+        publish_attempts: u64_at(&metrics, "publish_attempts"),
+        publish_successes: u64_at(&metrics, "publish_successes"),
+        publish_failures: u64_at(&metrics, "publish_failures"),
+        observed: u64_at(&spread, "observed"),
+        corroborated: u64_at(&spread, "corroborated"),
+        single_source: u64_at(&spread, "single_source"),
+        spread_samples: histogram_sample_count(&spread_hist),
+        spread_p50: histogram_percentile_label(&spread_hist, 0.5),
+        spread_p99: histogram_percentile_label(&spread_hist, 0.99),
+        tracked_subscriptions: u64_at(&sync, "tracked_subscriptions"),
+        synced_subscriptions: u64_at(&sync, "synced_subscriptions"),
+        first_event_p50: histogram_percentile_label(&first_event, 0.5),
+        eose_p50: histogram_percentile_label(&eose, 0.5),
+        sdk_backed: health
+            .get("sdk_backed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        total_relays: u64_at(&health, "total_relays"),
+        connected: u64_at(&health, "connected"),
+        connecting: u64_at(&health, "connecting"),
+        disconnected: u64_at(&health, "disconnected"),
+        connection_attempts: u64_at(&health, "connection_attempts"),
+        connection_successes: u64_at(&health, "connection_successes"),
+        per_relay,
+    }
+}
+
+fn relay_row_by_index(rows: Option<&Vec<Value>>, index: u32) -> Option<&Value> {
+    rows?
+        .iter()
+        .find(|row| row.get("relay_index").and_then(Value::as_u64) == Some(u64::from(index)))
+}
+
+fn histogram_sample_count(histogram: &Value) -> u64 {
+    let buckets = histogram
+        .get("buckets")
+        .and_then(Value::as_array)
+        .map(|buckets| buckets.iter().map(|bucket| u64_at(bucket, "count")).sum())
+        .unwrap_or(0);
+    buckets + u64_at(histogram, "overflow_count")
+}
+
+/// Join the per-relay delivery attribution and sync-timing rows by opaque relay
+/// index, mirroring the `relay-stats` CLI's per-relay rows.
+fn build_relay_health_rows(spread: &Value, sync: &Value) -> Vec<RelayHealthRow> {
+    let delivery = spread.get("per_relay").and_then(Value::as_array);
+    let latency = sync.get("per_relay").and_then(Value::as_array);
+    let mut indices: Vec<u32> = delivery
+        .into_iter()
+        .flatten()
+        .chain(latency.into_iter().flatten())
+        .filter_map(|row| row.get("relay_index").and_then(Value::as_u64))
+        .map(|index| index as u32)
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    indices
+        .into_iter()
+        .map(|index| {
+            let delivery_row = relay_row_by_index(delivery, index);
+            let latency_row = relay_row_by_index(latency, index);
+            let delivered_first = delivery_row
+                .map(|row| u64_at(row, "delivered_first"))
+                .unwrap_or(0);
+            let delivered_later = delivery_row
+                .map(|row| u64_at(row, "delivered_later"))
+                .unwrap_or(0);
+            RelayHealthRow {
+                relay_index: index,
+                first_deliverer: first_deliverer_label(delivered_first, delivered_later),
+                delivered_first,
+                delivered_later,
+                first_event_p50: latency_row
+                    .map(|row| {
+                        histogram_percentile_label(
+                            row.get("first_event").unwrap_or(&Value::Null),
+                            0.5,
+                        )
+                    })
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                eose_p50: latency_row
+                    .map(|row| {
+                        histogram_percentile_label(row.get("eose").unwrap_or(&Value::Null), 0.5)
+                    })
+                    .unwrap_or_else(|| "n/a".to_owned()),
+            }
+        })
+        .collect()
+}
+
+/// The user-search hints line, keyed by the screen's internal focus (the shared
+/// `hints_line` cannot see it, so `render_hints` calls this for the search screen).
+pub(crate) fn user_search_hint(focus: UserSearchFocus) -> &'static str {
+    match focus {
+        UserSearchFocus::Query => "type query  Enter search  Down results  Esc back",
+        UserSearchFocus::Results => "j/k move  Enter profile  c chat  a add  i query  Esc back",
+    }
 }
 
 /// The three states of the login screen: the create/login menu (no accounts),
@@ -940,8 +1495,16 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
         Screen::GroupDetail => {
             "j/k move  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
         }
+        // The search screen has an internal focus the shared signature cannot
+        // carry; `render_hints` calls `user_search_hint` instead. This arm keeps
+        // `hints_line` total and returns the query-focus hint as the fallback.
+        Screen::UserSearch => user_search_hint(UserSearchFocus::Query),
+        Screen::Profile => "j/k move  Enter edit  f follow  x unfollow  Esc back",
+        Screen::RelayHealth => "r refresh  j/k scroll  Esc back",
         Screen::Main => match focus {
-            Focus::Chats => "j/k move  Enter open  g detail  I invites  A accounts  / cmd  ? help",
+            Focus::Chats => {
+                "j/k move  Enter open  g detail  s search  p profile  h relays  I invites  A accounts  ? help"
+            }
             Focus::Messages => "j/k select  G/g ends  r react  u unreact  d delete  i compose",
             Focus::Composer => "Enter send  Esc clear",
         },
@@ -995,6 +1558,10 @@ pub(crate) enum SlashCommand {
     KeysFetch(String),
     KeysRotate,
     ProfileName(String),
+    /// Open the user-search screen, optionally pre-running a query.
+    UsersSearch {
+        query: Option<String>,
+    },
     StreamCompose {
         stream_id: Option<String>,
         quic_candidates: Vec<String>,
@@ -1136,6 +1703,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/keys rotate",
         description: "mint and publish a replacement KeyPackage",
+    },
+    SlashCommandSuggestion {
+        usage: "/users [query]",
+        description: "open user search (optionally run a query)",
     },
     SlashCommandSuggestion {
         usage: "/name <display-name>",

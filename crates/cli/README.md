@@ -529,7 +529,8 @@ Main view controls:
 
 - `Tab`/`BackTab`: cycle the chat list, messages, and composer.
 - Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `g` opens the
-  group-detail screen for the selected chat; `I` opens the pending-invites picker; `A` reopens the
+  group-detail screen for the selected chat; `s` opens user search; `p` opens your profile; `h` opens the relay-health
+  screen; `I` opens the pending-invites picker; `A` reopens the
   account picker. Each row shows an unread badge (bold name plus `(N)`) and a dark-gray last-message preview (sender
   plus truncated text), and the list orders by last activity, newest first. The badge and the status bar's unread
   total come from the runtime's per-chat projection (`chats list`), so they survive a restart rather than being
@@ -579,6 +580,30 @@ Invites (`I` from the chat list or group detail) opens a picker of pending invit
 list after each accept or decline and closing only once no invites remain; accepting from the group-detail screen
 returns to the main view. With no pending invites it shows an info card instead.
 
+User search (`s` from the chat list, or `/users [query]`) is a one-shot search over the cached follow-graph directory
+(`users search`, default radius `0..2`). The screen has two regions and a two-state focus: in query focus you type the
+query (so `j`/`k` are literal text) and `Enter` runs the search; once there are results, focus moves to the list where
+`j`/`k` (or arrows) navigate, `Enter` opens the selected user's profile card (`users show`, dismiss-on-any-key), `c`
+starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to the open chat (a confirm
+popup, guarded so it only offers this when a chat is loaded). `i` returns to the query, and `Esc` returns to the main
+view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
+attribution the search returns.
+
+Profile (`p` from the chat list) shows your own profile — name, display name, about, picture URL (as literal text; no
+avatar is fetched), nip05, lud16, and npub — from `profile show`, plus your follows from `follows list`. `j`/`k` move a
+single cursor over the six fields then the follows; `Enter` on a field opens a text popup prefilled with the current
+value and, on submit, publishes only that one field (`profile update --<field>`, which merges over the current profile
+so the other fields survive); `f` follows a user by npub/hex (`follows add`), and `x` unfollows the selected follow
+(confirm → `follows remove`). There is no nsec export anywhere. `Esc` returns to the main view.
+
+Relay health (`h` from the chat list) is a redacted, device-local telemetry dashboard from `relay-stats` (which reads
+the live `wnd` runtime when a socket exists and a fresh in-process read otherwise, so it always renders something —
+the header notes the daemon state). It shows the connection-health summary, lifecycle counters, cross-relay delivery
+spread (with p50/p99 derived from the fixed-bucket histograms, honest about `n/a` and `>Nms` overflow), subscription
+first-event/EOSE sync timing, and per-relay first-deliverer and timing rows keyed by an opaque device-local index.
+Per privacy decision, no relay URLs appear anywhere on this screen. `r` refreshes, `j`/`k` and PageUp/PageDown scroll,
+and `Esc` returns to the main view.
+
 Group MLS/component diagnostics are hidden by default; `/diagnostics` toggles a diagnostics panel between the
 messages pane and the composer.
 
@@ -614,6 +639,7 @@ Composer slash commands:
 /keys rotate
 /name <display-name>
 /profile name <display-name>
+/users [query]
 /stream [--stream-id <hex>] [--quic-candidate <quic-url>]
 /stream start [--stream-id <hex>] --quic-candidate <quic-url>
 /stream watch [--stream-id <hex>] [--insecure-local]

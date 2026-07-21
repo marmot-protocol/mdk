@@ -494,6 +494,9 @@ impl TuiApp {
             Screen::Login(mode) => self.render_login(frame, mode),
             Screen::Main => self.render_main(frame),
             Screen::GroupDetail => self.render_group_detail(frame),
+            Screen::UserSearch => self.render_user_search(frame),
+            Screen::Profile => self.render_profile(frame),
+            Screen::RelayHealth => self.render_relay_health(frame),
         }
         // A popup overlays whatever screen is showing. Cloned so the immutable
         // popup render can run inside this `&mut self` method without holding a
@@ -668,9 +671,15 @@ impl TuiApp {
     }
 
     fn render_hints(&self, frame: &mut Frame, area: Rect) {
+        // The user-search screen's hint depends on its internal focus, which the
+        // shared `hints_line` signature cannot carry; derive it here instead.
+        let text = match (self.screen, self.user_search.as_ref()) {
+            (Screen::UserSearch, Some(view)) => user_search_hint(view.focus),
+            _ => hints_line(self.screen, self.focus, self.entered_main),
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                hints_line(self.screen, self.focus, self.entered_main),
+                text,
                 Style::default().fg(Color::DarkGray),
             ))),
             area,
@@ -908,6 +917,70 @@ impl TuiApp {
         self.render_hints(frame, root[1]);
         self.render_status_bar(frame, root[2]);
     }
+
+    fn render_user_search(&self, frame: &mut Frame) {
+        let root = screen_body_layout(frame.area());
+        let lines = self
+            .user_search
+            .as_ref()
+            .map(user_search_lines)
+            .unwrap_or_else(|| vec![Line::from("loading user search...")]);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("User Search", true))
+                .wrap(Wrap { trim: false }),
+            root[0],
+        );
+        self.render_hints(frame, root[1]);
+        self.render_status_bar(frame, root[2]);
+    }
+
+    fn render_profile(&self, frame: &mut Frame) {
+        let root = screen_body_layout(frame.area());
+        let lines = self
+            .profile_view
+            .as_ref()
+            .map(profile_lines)
+            .unwrap_or_else(|| vec![Line::from("loading profile...")]);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("Profile", true))
+                .wrap(Wrap { trim: false }),
+            root[0],
+        );
+        self.render_hints(frame, root[1]);
+        self.render_status_bar(frame, root[2]);
+    }
+
+    fn render_relay_health(&self, frame: &mut Frame) {
+        let root = screen_body_layout(frame.area());
+        let (lines, scroll) = match self.relay_health.as_ref() {
+            Some(view) => (relay_health_lines(&view.data), view.scroll),
+            None => (vec![Line::from("loading relay health...")], 0),
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("Relay Health", true))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            root[0],
+        );
+        self.render_hints(frame, root[1]);
+        self.render_status_bar(frame, root[2]);
+    }
+}
+
+/// The shared full-view layout: a flexible body row over a one-line hints bar
+/// and a one-line status bar. Used by every Phase 5 screen.
+fn screen_body_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area)
 }
 
 /// The composer-style input line for a text popup: the prefix, the value split
@@ -979,5 +1052,188 @@ pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> Vec<Line<'st
     for relay in &view.relays {
         lines.push(Line::from(format!("  {}", terminal_safe_text(relay))));
     }
+    lines
+}
+
+/// The user-search screen body: the query field (with the cursor cell in query
+/// focus) then the result rows, each showing the display label, a shortened
+/// npub, and the `matched_field · match_quality · radius` attribution. Every
+/// name and npub passes through `terminal_safe_text`.
+pub(crate) fn user_search_lines(view: &UserSearchView) -> Vec<Line<'static>> {
+    let query_focused = view.focus == UserSearchFocus::Query;
+    let mut lines = input_field_lines(
+        &view.query.display(),
+        view.query.cursor(),
+        query_focused,
+        Some(Span::styled("search ", Style::default().fg(FOCUS_ACCENT))),
+    );
+    lines.push(Line::from(""));
+    if view.results.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no results — type a query and press Enter",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    }
+    lines.push(Line::from(format!("Results ({})", view.results.len())));
+    let results_focused = view.focus == UserSearchFocus::Results;
+    for (index, result) in view.results.iter().enumerate() {
+        let is_selected = results_focused && index == view.selected;
+        let marker = if is_selected { ">" } else { " " };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{marker} ")),
+            Span::styled(
+                shorten(&terminal_safe_text(&result.display_label()), 28),
+                row_label_style(is_selected, Color::Green),
+            ),
+            Span::styled(
+                format!("  {}", terminal_safe_text(&shorten(&result.npub, 18))),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {} · {} · radius {}",
+                terminal_safe_text(&result.matched_field),
+                terminal_safe_text(&result.match_quality),
+                result.radius
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+/// The own-profile screen body: the npub header, the six editable fields with a
+/// selection highlight (unset fields dimmed), then the follow list. Every value
+/// passes through `terminal_safe_text`; picture URLs render as literal text.
+pub(crate) fn profile_lines(view: &ProfileView) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Profile ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                shorten(&terminal_safe_text(&view.npub), 32),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from("Fields"),
+    ];
+    for (index, field) in ProfileField::ALL.iter().enumerate() {
+        let is_selected = index == view.selected;
+        let marker = if is_selected { ">" } else { " " };
+        let value_span = match view.field_value(*field) {
+            Some(value) => Span::raw(terminal_safe_text(value)),
+            None => Span::styled("(unset)".to_owned(), Style::default().fg(Color::DarkGray)),
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{marker} ")),
+            Span::styled(
+                format!("{}: ", field.label()),
+                row_label_style(is_selected, Color::Green),
+            ),
+            value_span,
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Follows ({})", view.follows.len())));
+    for (index, follow) in view.follows.iter().enumerate() {
+        let is_selected = ProfileField::ALL.len() + index == view.selected;
+        let marker = if is_selected { ">" } else { " " };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{marker} ")),
+            Span::styled(
+                shorten(&terminal_safe_text(follow), 28),
+                row_label_style(is_selected, Color::Green),
+            ),
+        ]));
+    }
+    lines
+}
+
+/// The relay-health screen body: a daemon-state and health-summary header, then
+/// the counters, delivery-spread, sync-timing, and per-relay sections. Every
+/// field is a counter, an opaque relay index, or a fixed percentile label — no
+/// relay URLs exist in the source and none are rendered (decision 3).
+pub(crate) fn relay_health_lines(data: &RelayHealthData) -> Vec<Line<'static>> {
+    let daemon = if data.daemon_running {
+        "on"
+    } else {
+        "off (in-process telemetry)"
+    };
+    vec![
+        Line::from(format!(
+            "daemon {daemon} · device-local, redacted (opaque relay indices, no URLs)"
+        )),
+        Line::from(format!(
+            "health: sdk_backed={} relays={} connected={} connecting={} disconnected={} attempts={} successes={}",
+            data.sdk_backed,
+            data.total_relays,
+            data.connected,
+            data.connecting,
+            data.disconnected,
+            data.connection_attempts,
+            data.connection_successes,
+        )),
+        Line::from(""),
+        Line::from("counters"),
+        Line::from(format!(
+            "  accounts={} group_subs={} created={} removed={}",
+            data.active_accounts,
+            data.active_group_subscriptions,
+            data.subscriptions_created,
+            data.subscriptions_removed,
+        )),
+        Line::from(format!(
+            "  inbound seen={} delivered={} dropped={}",
+            data.inbound_seen, data.inbound_delivered, data.inbound_dropped,
+        )),
+        Line::from(format!(
+            "  publish attempts={} successes={} failures={}",
+            data.publish_attempts, data.publish_successes, data.publish_failures,
+        )),
+        Line::from(""),
+        Line::from("delivery spread"),
+        Line::from(format!(
+            "  observed={} corroborated={} single_source={} samples={} p50={} p99={}",
+            data.observed,
+            data.corroborated,
+            data.single_source,
+            data.spread_samples,
+            data.spread_p50,
+            data.spread_p99,
+        )),
+        Line::from(""),
+        Line::from("sync timing"),
+        Line::from(format!(
+            "  tracked={} synced={} first_event_p50={} eose_p50={}",
+            data.tracked_subscriptions,
+            data.synced_subscriptions,
+            data.first_event_p50,
+            data.eose_p50,
+        )),
+        Line::from(""),
+    ]
+    .into_iter()
+    .chain(relay_health_per_relay_lines(&data.per_relay))
+    .collect()
+}
+
+fn relay_health_per_relay_lines(rows: &[RelayHealthRow]) -> Vec<Line<'static>> {
+    if rows.is_empty() {
+        return vec![Line::from("per-relay: none observed yet")];
+    }
+    let mut lines = vec![Line::from("per-relay (opaque device-local index)")];
+    lines.extend(rows.iter().map(|row| {
+        Line::from(format!(
+            "  relay#{} first_deliverer={} delivered_first={} delivered_later={} first_event_p50={} eose_p50={}",
+            row.relay_index,
+            row.first_deliverer,
+            row.delivered_first,
+            row.delivered_later,
+            row.first_event_p50,
+            row.eose_p50,
+        ))
+    }));
     lines
 }
