@@ -1,10 +1,10 @@
 use crate::{
-    SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, optional_u64_to_i64,
-    u64_to_i64, unix_now_seconds,
+    SelfMembership, SqliteAccountStorage, SqliteResultExt, bool_i64, i64_to_u64,
+    optional_u64_to_i64, u64_to_i64, unix_now_seconds,
 };
 use cgka_traits::app_components::{GROUP_AVATAR_URL_COMPONENT_ID, decode_group_avatar_url_v1};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
-use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, Params, params};
 use serde::{Deserialize, Serialize};
 
@@ -1046,11 +1046,6 @@ fn decoded_avatar_url(component_data_hex: Option<&str>) -> Option<String> {
 
 fn timeline_tuple_after(left_at: u64, left_id: &str, right_at: u64, right_id: &str) -> bool {
     left_at > right_at || (left_at == right_at && left_id > right_id)
-}
-
-fn i64_to_u64(value: i64) -> StorageResult<u64> {
-    u64::try_from(value)
-        .map_err(|_| StorageError::Serialization(format!("value does not fit in u64: {value}")))
 }
 
 #[cfg(test)]

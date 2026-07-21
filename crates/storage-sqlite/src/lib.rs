@@ -51,7 +51,7 @@ pub use timeline::{
 };
 
 pub(crate) use codec::{
-    SqliteResultExt, bool_i64, created_at_to_i64, deserialize, epoch_to_i64, message_state_to_i64,
-    optional_u64_to_i64, serialize, tags_from_json, u64_to_i64, unix_now_ms, unix_now_seconds,
-    unix_now_seconds_i64, usize_to_i64,
+    SqliteResultExt, bool_i64, created_at_to_i64, deserialize, epoch_to_i64, i64_to_u64,
+    message_state_to_i64, optional_u64_to_i64, serialize, tags_from_json, u64_to_i64, unix_now_ms,
+    unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
