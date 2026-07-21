@@ -2411,6 +2411,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sentence("group_renamed", "Crew"), 'The group was renamed to "Crew".')
         self.assertEqual(sentence("group_renamed", "  "), "The group was renamed.")
         self.assertEqual(sentence("group_avatar_changed"), "The group avatar was changed.")
+        self.assertEqual(
+            sentence("disappearing_timer_changed"),
+            "The disappearing-message timer was changed.",
+        )
         self.assertEqual(sentence("something_else"), "The group state changed.")
 
     async def test_ambient_events_are_quiet_and_attach_to_next_inbound(self):

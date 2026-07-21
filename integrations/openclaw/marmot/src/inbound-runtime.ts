@@ -77,6 +77,8 @@ function groupStateChangeSentence(change: string, detail?: string | null): strin
         : "The group was renamed.";
     case "group_avatar_changed":
       return "The group avatar was changed.";
+    case "disappearing_timer_changed":
+      return "The disappearing-message timer was changed.";
     default:
       return "The group state changed.";
   }

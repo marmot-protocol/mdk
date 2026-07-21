@@ -417,6 +417,8 @@ def group_state_change_sentence(change: str, detail: Optional[str] = None) -> st
         return f'The group was renamed to "{trimmed}".' if trimmed else "The group was renamed."
     if change == "group_avatar_changed":
         return "The group avatar was changed."
+    if change == "disappearing_timer_changed":
+        return "The disappearing-message timer was changed."
     return "The group state changed."
 
 

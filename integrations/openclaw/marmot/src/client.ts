@@ -180,7 +180,8 @@ export type AgentControlEvent =
       group_id_hex: string;
       /**
        * Coarse change kind: "member_added" | "member_removed" | "member_left" |
-       * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed".
+       * "admin_added" | "admin_removed" | "group_renamed" | "group_avatar_changed" |
+       * "disappearing_timer_changed".
        * Privacy: never carries a member pubkey.
        */
       change: string;

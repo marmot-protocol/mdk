@@ -374,7 +374,8 @@ pub enum AgentControlEvent {
         sender_account_id_hex: String,
     },
     /// A durable, MLS-authenticated change to group state was observed (a member
-    /// add/remove/leave, an admin grant/revoke, or a group rename/avatar change).
+    /// add/remove/leave, an admin grant/revoke, a group rename/avatar change,
+    /// or a disappearing-message timer change).
     /// Privacy: the subject member's pubkey is never surfaced — only a coarse
     /// `change` kind plus, for a rename, the new group display name in `detail`.
     GroupStateChanged {
@@ -382,7 +383,8 @@ pub enum AgentControlEvent {
         group_id_hex: String,
         /// Coarse change kind: `"member_added"`, `"member_removed"`,
         /// `"member_left"`, `"admin_added"`, `"admin_removed"`,
-        /// `"group_renamed"`, or `"group_avatar_changed"`.
+        /// `"group_renamed"`, `"group_avatar_changed"`, or
+        /// `"disappearing_timer_changed"`.
         change: String,
         /// The new group display name for `group_renamed`; `None` otherwise.
         /// Never carries a member pubkey.
