@@ -163,6 +163,28 @@ impl AppClient {
         Ok(())
     }
 
+    /// Repair an engine/projection tear left by a previously confirmed group
+    /// mutation whose trailing app-state write failed. Quarantined groups are
+    /// absent from `live_group_ids` and retain their dedicated recovery path.
+    pub(crate) fn reconcile_live_engine_groups(&mut self) -> Result<bool, AppError> {
+        let projected = self
+            .state
+            .groups
+            .iter()
+            .map(|group| group.group_id_hex.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let missing = self
+            .runtime
+            .live_group_ids()?
+            .into_iter()
+            .filter(|group_id| !projected.contains(hex::encode(group_id.as_slice()).as_str()))
+            .collect::<Vec<_>>();
+        for group_id in &missing {
+            self.add_group(group_id)?;
+        }
+        Ok(!missing.is_empty())
+    }
+
     pub(crate) fn admin_policy_for_group(
         &self,
         group_id: &GroupId,

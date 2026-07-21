@@ -729,6 +729,18 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Group ids that successfully hydrated into this live engine session.
+    /// Stored records quarantined during open are intentionally omitted: they
+    /// use the separate recovery surface and must not be projected as healthy.
+    pub fn live_group_ids(&self) -> Result<Vec<GroupId>, EngineError> {
+        Ok(self
+            .storage
+            .list_groups()?
+            .into_iter()
+            .filter(|group_id| self.epoch_manager.state(group_id).is_some())
+            .collect())
+    }
+
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,

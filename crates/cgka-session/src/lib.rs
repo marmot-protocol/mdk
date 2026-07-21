@@ -270,6 +270,10 @@ impl AccountDeviceSession {
         Ok(self.engine.group_record(group_id)?)
     }
 
+    pub fn live_group_ids(&self) -> SessionResult<Vec<GroupId>> {
+        Ok(self.engine.live_group_ids()?)
+    }
+
     /// The stored outbound welcome for `id` along with its group, for
     /// re-delivering a welcome whose publish failed after the commit was
     /// already confirmed (mdk#352).

@@ -278,9 +278,38 @@ impl AppClient {
         self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
-        self.add_group(&group_id)?;
-        self.sync_runtime_groups().await?;
-        self.app.save_state(&self.state)?;
+        // The engine group is already published and confirmed. Projection,
+        // state persistence, and subscription refresh are downstream repairable
+        // work; none can roll the group back, so none may turn this operation
+        // into a false failure that invites the caller to create a duplicate.
+        match self.add_group(&group_id) {
+            Ok(()) => {
+                if let Err(error) = self.app.save_state(&self.state) {
+                    tracing::warn!(
+                        target: "marmot_app::client",
+                        method = "create_group",
+                        error_kind = error.privacy_safe_kind(),
+                        "confirmed group creation outpaced projection persistence; account open will reconcile it"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "create_group",
+                    error_kind = error.privacy_safe_kind(),
+                    "confirmed group creation could not be projected immediately; account open will reconcile it"
+                );
+            }
+        }
+        if let Err(error) = self.sync_runtime_groups().await {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "create_group",
+                error_kind = error.privacy_safe_kind(),
+                "confirmed group creation could not refresh subscriptions immediately"
+            );
+        }
         self.queue_own_group_system_projection_updates(&effects);
         Ok(group_id)
     }

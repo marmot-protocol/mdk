@@ -72,6 +72,10 @@ where
         Ok(self.session.group_record(group_id)?)
     }
 
+    pub fn live_group_ids(&self) -> AccountResult<Vec<GroupId>> {
+        Ok(self.session.live_group_ids()?)
+    }
+
     /// Stored groups that failed session-open hydration and were skipped
     /// (mdk#151 / #417), paired with their coarse quarantine reason.
     /// Backs the application's per-group recovery surface (mdk#426).

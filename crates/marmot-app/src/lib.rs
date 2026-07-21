@@ -1077,7 +1077,7 @@ impl MarmotApp {
             lifecycle.ensure_running()?;
         }
         open.runtime.sync_transport_groups(rebuild_since).await?;
-        let client = AppClient {
+        let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
             adapter: open.adapter,
@@ -1090,6 +1090,19 @@ impl MarmotApp {
             epoch_stall: Default::default(),
             epoch_backfill_pending: false,
         };
+        if client.reconcile_live_engine_groups()? {
+            // Persist the repaired roster before any fallible network refresh,
+            // so another restart cannot lose the group again.
+            client.app.save_state(&client.state)?;
+            if let Err(error) = client.sync_runtime_groups().await {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "runtime_client",
+                    error_kind = error.privacy_safe_kind(),
+                    "reconciled engine groups but deferred their subscription refresh"
+                );
+            }
+        }
         // One-time upgrade backfill: derive `self_membership` for pre-0018 rows
         // from current engine state so groups the local account already left /
         // was removed from stop inflating `account_unread_total()`. Gated by a
