@@ -15,6 +15,10 @@ use crate::ast::{Alignment, Block, CodeBlockKind, Inline, ListItem, ListKind, Ta
 use crate::scanner;
 
 pub(crate) const MAX_CONTAINER_DEPTH: usize = 96;
+/// Hard cap on GFM table width. Once width is bounded, padding ragged rows is
+/// linear in the input row count instead of permitting an input-sized width
+/// multiplied by an input-sized row count.
+const MAX_TABLE_COLUMNS: usize = 128;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // populated in Phase 3 (link reference definitions)
@@ -1367,7 +1371,7 @@ fn parse_table_delim_row(line: &str) -> Option<Vec<Alignment>> {
         return None;
     }
     let cells = split_table_row(line);
-    if cells.is_empty() {
+    if cells.is_empty() || cells.len() > MAX_TABLE_COLUMNS {
         return None;
     }
     let mut alignments = Vec::with_capacity(cells.len());
