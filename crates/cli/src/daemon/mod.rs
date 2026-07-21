@@ -196,7 +196,18 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         worker_tasks.retain(|task| !task.is_finished());
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) => {
+                        // Accept failures such as temporary fd/resource
+                        // pressure are listener-local events, not a reason to
+                        // bypass daemon cleanup or tear down every worker.
+                        // Back off to avoid a hot retry loop while pressure
+                        // persists; shutdown remains observable next cycle.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 // Bound concurrent per-connection tasks like the connector and
                 // broker accept loops: beyond the cap the connection is closed
                 // instead of served.
