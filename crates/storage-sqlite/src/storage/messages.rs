@@ -13,31 +13,36 @@ const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
 
 impl MessageStorage for SqliteAccountStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
-        // Single autocommit statement: safe to retry the whole statement on
-        // transient lock contention (issue #484).
         let serialized = serialize(record)?;
         let epoch = epoch_to_i64(record.epoch)?;
-        retry_on_busy(|| {
-            self.lock()?
-                .execute(
-                    "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+        let write = || {
+            let conn = self.lock()?;
+            conn.execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                     group_id = excluded.group_id,
                     epoch = excluded.epoch,
                     state = excluded.state,
                     record = excluded.record",
-                    params![
-                        record.id.as_slice(),
-                        record.group_id.as_slice(),
-                        epoch,
-                        message_state_to_i64(record.state),
-                        serialized,
-                    ],
-                )
-                .storage()?;
+                params![
+                    record.id.as_slice(),
+                    record.group_id.as_slice(),
+                    epoch,
+                    message_state_to_i64(record.state),
+                    serialized,
+                ],
+            )
+            .storage()?;
             Ok(())
-        })
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            // Single autocommit statement: safe to retry as a complete unit on
+            // transient lock contention (issue #484).
+            retry_on_busy(write)
+        }
     }
 
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
@@ -268,6 +273,26 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::Processed
         );
+    }
+
+    #[test]
+    fn put_message_reuses_outer_engine_transaction() {
+        use cgka_traits::storage::{StorageError, StorageProvider};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let message = sample_message(mid(1), gid(1), 0);
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.put_message(&message)?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+
+        assert!(result.is_err());
+        assert!(matches!(
+            store.get_message(&message.id),
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[test]
