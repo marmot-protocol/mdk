@@ -102,20 +102,29 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         epoch: EpochId,
     ) -> Result<(), EngineError> {
-        self.sent_message_ids.insert(msg.id.clone());
         // Also remember and persist the content-derived id so our own commit /
         // app message echoed back inside a freshly re-wrapped transport envelope
         // (different transport id) is still classified `OwnEcho` by the
         // post-peel content check after the hot-process cache misses or the
         // engine restarts.
         let content_id = content_dedup_id(mls_bytes);
-        self.sent_message_ids.insert(content_id.clone());
         let openmls_msg = TransportMessage {
             payload: mls_bytes.to_vec(),
             ..msg.clone()
         };
-        self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)?;
-        self.persist_sent_openmls_content_marker(&openmls_msg, content_id, group_id, epoch)
+        self.storage.with_transaction(|_storage| {
+            self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)?;
+            self.persist_sent_openmls_content_marker(
+                &openmls_msg,
+                content_id.clone(),
+                group_id,
+                epoch,
+            )
+        })?;
+        // Do not seed the hot-process cache until both durable rows commit.
+        self.sent_message_ids.insert(msg.id.clone());
+        self.sent_message_ids.insert(content_id);
+        Ok(())
     }
 
     pub(crate) fn record_sent_openmls_message_with_leave_request(
