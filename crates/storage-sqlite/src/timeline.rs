@@ -1984,8 +1984,11 @@ fn timeline_query_sql(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
-        clauses.push("plaintext LIKE ? COLLATE NOCASE".to_owned());
-        params.push(rusqlite::types::Value::Text(format!("%{search}%")));
+        clauses.push("plaintext LIKE ? ESCAPE '\\' COLLATE NOCASE".to_owned());
+        params.push(rusqlite::types::Value::Text(format!(
+            "%{}%",
+            escape_like_literal(search)
+        )));
     }
     match pagination.direction {
         CursorDirection::Before => {
@@ -2039,6 +2042,17 @@ fn timeline_query_sql(
         ),
         params,
     ))
+}
+
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {

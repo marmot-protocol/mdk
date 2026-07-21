@@ -1187,6 +1187,44 @@ fn timeline_search_matches_plaintext_case_insensitively() {
 }
 
 #[test]
+fn timeline_search_treats_like_metacharacters_literally() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for (message_id, plaintext) in [
+        ("percent", "50% complete"),
+        ("percent-wildcard", "500 complete"),
+        ("underscore", "a_b"),
+        ("underscore-wildcard", "axb"),
+        ("backslash", r"path\name"),
+        ("backslash-absent", "pathname"),
+    ] {
+        store
+            .record_app_event(&chat(message_id, "alice", 1, plaintext))
+            .unwrap();
+    }
+
+    for (search, expected_id) in [
+        ("50%", "percent"),
+        ("a_b", "underscore"),
+        (r"path\name", "backslash"),
+    ] {
+        let page = store
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some("11".repeat(32)),
+                search: Some(search.to_owned()),
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.message_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec![expected_id]
+        );
+    }
+}
+
+#[test]
 fn sender_own_invalidated_message_stays_as_tombstone() {
     // Issue #111: a sender's own message invalidated by convergence (losing
     // branch) must not silently disappear; it stays with a status instead.
