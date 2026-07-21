@@ -2,7 +2,7 @@ use super::labels::{build_key, build_key_legacy};
 use super::{SqliteOpenMlsStorage, SqliteOpenMlsStorageError};
 use crate::connection::retry_on_busy;
 use openmls_traits::storage::{CURRENT_VERSION, Entity, Key};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 
 impl SqliteOpenMlsStorage {
@@ -32,7 +32,7 @@ impl SqliteOpenMlsStorage {
             // contention (issue #484).
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 write_value_on_connection(
                     &tx,
                     label,
@@ -98,7 +98,7 @@ impl SqliteOpenMlsStorage {
             // so retry it on transient lock contention (issue #484).
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 append_entity_on_connection(
                     &tx,
                     label,
@@ -138,7 +138,7 @@ impl SqliteOpenMlsStorage {
         } else {
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 remove_entity_on_connection(
                     &tx,
                     label,
@@ -236,7 +236,7 @@ impl SqliteOpenMlsStorage {
             // lock contention (issue #484).
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 delete_value_on_connection(&tx, storage_key.as_slice())?;
                 delete_value_on_connection(&tx, legacy_storage_key.as_slice())?;
                 tx.commit()?;
@@ -276,7 +276,7 @@ impl SqliteOpenMlsStorage {
             // retry it on transient lock contention (issue #484).
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 delete_group_labels_on_connection(&tx, group_key.as_slice(), labels)?;
                 tx.commit()?;
                 Ok(())
@@ -584,7 +584,10 @@ mod tests {
                 .unwrap_or(body);
             let body = body.split("\n    fn ").next().unwrap_or(body);
 
-            assert!(body.contains("transaction()"), "{function}");
+            assert!(
+                body.contains("transaction_with_behavior(TransactionBehavior::Immediate)"),
+                "{function}"
+            );
             assert!(!body.contains("read_raw_list"), "{function}");
             assert!(!body.contains("self.write_value"), "{function}");
         }
@@ -615,7 +618,7 @@ mod tests {
             .unwrap_or(body);
 
         assert!(
-            body.contains("transaction()"),
+            body.contains("transaction_with_behavior(TransactionBehavior::Immediate)"),
             "delete_group_labels must wrap its deletes in a single transaction"
         );
         assert!(

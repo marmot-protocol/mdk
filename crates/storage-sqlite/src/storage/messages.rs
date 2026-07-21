@@ -7,7 +7,7 @@ use crate::{
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
 
@@ -75,7 +75,9 @@ impl MessageStorage for SqliteAccountStorage {
             // and idempotent.
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
-                let tx = conn.transaction().storage()?;
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .storage()?;
                 update_message_state_on_connection(&tx, id, new_state)?;
                 tx.commit().storage()?;
                 Ok(())
@@ -247,7 +249,7 @@ mod tests {
             .nth(1)
             .expect("update_message_state body");
 
-        assert!(body.contains("transaction()"));
+        assert!(body.contains("transaction_with_behavior(TransactionBehavior::Immediate)"));
         assert!(!body.contains("self.get_message(id)"));
     }
 
