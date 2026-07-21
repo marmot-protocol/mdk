@@ -44,6 +44,24 @@ use marmot_app::AppMessageRecord;
 
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[test]
+fn profile_name_validation_rejects_non_whitespace_control_characters() {
+    use crate::validation::validate_profile_name;
+
+    assert_eq!(
+        validate_profile_name("  Alice\nAgent  ".to_owned()).unwrap(),
+        "Alice Agent"
+    );
+    for name in ["Alice\u{1b}[2J", "Alice\0Agent", "Alice\u{7}Agent"] {
+        assert!(matches!(
+            validate_profile_name(name.to_owned()),
+            Err(crate::ConnectorError::InvalidProfileName(
+                "control_characters"
+            ))
+        ));
+    }
+}
+
 fn test_config(
     home: &Path,
     socket: impl Into<std::path::PathBuf>,

@@ -199,6 +199,9 @@ pub(crate) fn validate_profile_name(value: String) -> Result<String, ConnectorEr
     if value.is_empty() {
         return Err(ConnectorError::InvalidProfileName("empty"));
     }
+    if value.chars().any(char::is_control) {
+        return Err(ConnectorError::InvalidProfileName("control_characters"));
+    }
     if value.chars().count() > MAX_PROFILE_NAME_CHARS {
         return Err(ConnectorError::InvalidProfileName("too_long"));
     }
