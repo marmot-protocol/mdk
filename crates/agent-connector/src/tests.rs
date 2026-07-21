@@ -45,6 +45,23 @@ use marmot_app::AppMessageRecord;
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[test]
+fn poisoned_connector_store_mutex_recovers_inner_state() {
+    let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
+    let panic_mutex = std::sync::Arc::clone(&mutex);
+
+    let panic_result = std::thread::spawn(move || {
+        let mut values = panic_mutex.lock().expect("initial lock should succeed");
+        values.push(2);
+        panic!("poison test mutex");
+    })
+    .join();
+    assert!(panic_result.is_err());
+
+    crate::lock_recover(&mutex).push(3);
+    assert_eq!(*crate::lock_recover(&mutex), vec![1, 2, 3]);
+}
+
+#[test]
 fn profile_name_validation_rejects_non_whitespace_control_characters() {
     use crate::validation::validate_profile_name;
 

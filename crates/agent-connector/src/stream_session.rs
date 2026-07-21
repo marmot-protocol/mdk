@@ -27,7 +27,7 @@ impl DebugFinalSendStore {
         &self,
         mut send: AgentControlDebugFinalSend,
     ) -> AgentControlDebugFinalSend {
-        let mut sends = self.sends.lock().expect("debug final send lock poisoned");
+        let mut sends = crate::lock_recover(&self.sends);
         let next_id = sends.len() + 1;
         send.message_ids_hex = vec![format!("{next_id:064x}")];
         sends.push(send.clone());
@@ -35,10 +35,7 @@ impl DebugFinalSendStore {
     }
 
     pub(crate) fn list(&self) -> Vec<AgentControlDebugFinalSend> {
-        self.sends
-            .lock()
-            .expect("debug final send lock poisoned")
-            .clone()
+        crate::lock_recover(&self.sends).clone()
     }
 }
 
@@ -112,9 +109,7 @@ impl SendIdempotencyStore {
     /// when the recorded request `fingerprint` matches. A key hit with a different
     /// fingerprint returns `None` (treated as a cache miss).
     pub(crate) fn get(&self, key: &str, fingerprint: &str) -> Option<Vec<String>> {
-        self.inner
-            .lock()
-            .expect("send idempotency lock poisoned")
+        crate::lock_recover(&self.inner)
             .seen
             .get(key)
             .filter(|(recorded, _)| recorded == fingerprint)
@@ -127,7 +122,7 @@ impl SendIdempotencyStore {
     /// is evicted once at capacity.
     pub(crate) fn record(&self, key: String, fingerprint: String, message_ids: Vec<String>) {
         let should_persist = {
-            let mut inner = self.inner.lock().expect("send idempotency lock poisoned");
+            let mut inner = crate::lock_recover(&self.inner);
             if inner.seen.contains_key(&key) {
                 return;
             }
@@ -177,7 +172,7 @@ impl SendIdempotencyStore {
     }
 
     fn load_from_disk(&self) {
-        let _guard = self.lock.lock().expect("send idempotency lock poisoned");
+        let _guard = crate::lock_recover(&self.lock);
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == ErrorKind::NotFound => return,
@@ -194,8 +189,7 @@ impl SendIdempotencyStore {
         };
         match serde_json::from_slice::<PersistedSendIdempotencyFile>(&bytes) {
             Ok(file) if file.version == SEND_IDEMPOTENCY_FILE_VERSION => {
-                *self.inner.lock().expect("send idempotency lock poisoned") =
-                    inner_from_persisted(file.entries);
+                *crate::lock_recover(&self.inner) = inner_from_persisted(file.entries);
             }
             Ok(_unsupported) => {
                 tracing::warn!(
@@ -217,8 +211,8 @@ impl SendIdempotencyStore {
     }
 
     fn persist_to_disk(&self) -> Result<(), ConnectorError> {
-        let _guard = self.lock.lock().expect("send idempotency lock poisoned");
-        let inner = self.inner.lock().expect("send idempotency lock poisoned");
+        let _guard = crate::lock_recover(&self.lock);
+        let inner = crate::lock_recover(&self.inner);
         let entries = inner
             .order
             .iter()
@@ -346,7 +340,7 @@ pub(crate) struct FinalizedStream {
 
 impl StreamSessionStore {
     pub(crate) fn insert(&self, stream_id_hex: String, session: ActiveStreamSession) {
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         if let Some(previous) = sessions.insert(stream_id_hex, session) {
             // Graceful cancel over the dedicated signal: let the replaced
             // session emit its live Abort and self-terminate. The cancel signal
@@ -366,7 +360,7 @@ impl StreamSessionStore {
 
     pub(crate) fn get(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         let session = sessions.get_mut(&stream_id_hex).ok_or_else(|| {
             ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
         })?;
@@ -387,7 +381,7 @@ impl StreamSessionStore {
         stream_id_hex: &str,
         session: &ActiveStreamSession,
     ) -> Option<ActiveStreamSession> {
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         match sessions.get(stream_id_hex) {
             Some(entry) if entry.tx.same_channel(&session.tx) => sessions.remove(stream_id_hex),
             _ => None,
@@ -410,7 +404,7 @@ impl StreamSessionStore {
         session: &ActiveStreamSession,
         finalized: FinalizedStream,
     ) -> bool {
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         match sessions.get_mut(stream_id_hex) {
             Some(entry) if entry.tx.same_channel(&session.tx) => {
                 entry.finalized = Some(finalized);
@@ -426,9 +420,7 @@ impl StreamSessionStore {
         stream_id_hex: &str,
     ) -> Result<ActiveStreamSession, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
-        self.sessions
-            .lock()
-            .expect("stream session lock poisoned")
+        crate::lock_recover(&self.sessions)
             .remove(&stream_id_hex)
             .ok_or_else(|| {
                 ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
@@ -451,7 +443,7 @@ impl StreamSessionStore {
     /// finish succeeds or the connector restarts.
     pub(crate) fn sweep_idle(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
-        let mut sessions = self.sessions.lock().expect("stream session lock poisoned");
+        let mut sessions = crate::lock_recover(&self.sessions);
         let stale: Vec<String> = sessions
             .iter()
             .filter(|(_, session)| {

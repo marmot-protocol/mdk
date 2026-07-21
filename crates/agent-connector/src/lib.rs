@@ -29,8 +29,8 @@ pub use error::ConnectorError;
 pub use socket::{bind_connector_socket, bind_connector_socket_with_mode, default_socket_path};
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_control::AgentControlEvent;
@@ -53,6 +53,15 @@ use crate::validation::{endpoint, validate_control_plane_config};
 pub(crate) const AGENT_SOCKET_DIR_MODE: u32 = 0o700;
 pub(crate) const AGENT_SOCKET_MODE: u32 = 0o600;
 pub(crate) const ALLOWLIST_DIR: &str = "agent-allowlist";
+
+/// Recover the protected value after a previous holder panicked instead of
+/// permanently bricking an in-memory connector store.
+pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 pub(crate) const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
 pub(crate) const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
