@@ -740,15 +740,30 @@ fn handle_app_message(
     decrypted_payload_ref: Option<String>,
     already_delivered: bool,
 ) {
-    // A message applied on a prior pass is re-admitted only so it can witness its
-    // branch again (see `attach_app_witnesses`). It must never be re-delivered or
-    // re-invalidated, so it takes no delivery disposition — it resolves as
-    // already-seen (which keeps the pass out of `Resolving`).
+    // A message applied on a prior pass is re-admitted so it can witness its
+    // branch again (see `attach_app_witnesses`). It must never be re-delivered,
+    // but a later reorg still has to withdraw it when its branch loses (#965).
     if already_delivered {
-        result.already_seen.push(AlreadySeen {
-            message_id: message.message_id.clone(),
-            kind: message.kind_name(),
-        });
+        let selected_still_decrypts = result
+            .selected_branch_id
+            .as_ref()
+            .is_some_and(|selected| decrypts_on_branches.contains(selected));
+        if result.selected_branch_id.is_some()
+            && !selected_still_decrypts
+            && !decrypts_on_branches.is_empty()
+        {
+            result.invalidated_app_messages.push(invalidated_app(
+                message,
+                epoch,
+                InvalidatedAppMessageReason::LosingBranch,
+                decrypted_payload_ref,
+            ));
+        } else {
+            result.already_seen.push(AlreadySeen {
+                message_id: message.message_id.clone(),
+                kind: message.kind_name(),
+            });
+        }
         return;
     }
     if epoch < input.state.retained_anchor_epoch {

@@ -3853,6 +3853,129 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
     }));
 }
 
+/// mdk#965: an app message delivered from the initially-selected branch must
+/// be withdrawn if a later-arriving competing commit wins a reorg.
+#[tokio::test]
+async fn late_reorg_invalidates_an_already_delivered_losing_branch_message() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "already-delivered-reorg".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, bob_pending) = evolution(bob_invite);
+    let commits = [route(alice_commit, &group_id), route(bob_commit, &group_id)];
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.confirm_published(bob_pending).await.unwrap();
+    let apps = [
+        send_app(&mut alice, &group_id, b"late reorg alice".to_vec()).await,
+        send_app(&mut bob, &group_id, b"late reorg bob".to_vec()).await,
+    ];
+    let winning_index = commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
+    let losing_index = 1 - winning_index;
+
+    // Settle and deliver the branch that will lose once the deterministic
+    // winner arrives late.
+    carol
+        .buffer_openmls_convergence_message(&group_id, commits[losing_index].clone(), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, apps[losing_index].clone(), 1_000)
+        .unwrap();
+    let first = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        first.accepted_app_messages,
+        vec![content_hex(&apps[losing_index])]
+    );
+    assert!(carol.drain_events().iter().any(|event| {
+        matches!(
+            event,
+            GroupEvent::MessageReceived { payload, .. }
+                if app_content(payload)
+                    == if losing_index == 0 {
+                        b"late reorg alice".as_slice()
+                    } else {
+                        b"late reorg bob".as_slice()
+                    }
+        )
+    }));
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commits[winning_index].clone(), 2_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, apps[winning_index].clone(), 2_000)
+        .unwrap();
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .unwrap();
+
+    assert!(second.invalidated_app_messages.iter().any(|invalidated| {
+        invalidated.message_id == content_hex(&apps[losing_index])
+            && invalidated.reason == InvalidatedAppMessageReason::LosingBranch
+    }));
+    assert_message_state(
+        &carol_storage,
+        &apps[losing_index],
+        MessageState::EpochInvalidated,
+    );
+    let losing_id = content_id(&apps[losing_index]);
+    assert!(carol.drain_events().iter().any(|event| {
+        matches!(
+            event,
+            GroupEvent::AppMessageInvalidated {
+                message_id,
+                reason: AppMessageInvalidationReason::LosingBranch,
+                ..
+            } if *message_id == losing_id
+        )
+    }));
+}
+
 #[tokio::test]
 async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
