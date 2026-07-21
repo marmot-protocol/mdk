@@ -216,6 +216,16 @@ impl MarmotRelayPlane {
         }
     }
 
+    pub(crate) fn sanitize_relay_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Result<Vec<TransportEndpoint>, String> {
+        self.inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, context)
+    }
+
     pub fn subscription_rebuild_since(
         &self,
         last_transport_timestamp: Option<u64>,

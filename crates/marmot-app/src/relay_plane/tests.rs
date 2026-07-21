@@ -242,6 +242,19 @@ async fn relay_plane_rejects_invalid_relay_endpoints_before_subscribing() {
     assert!(relay.subscriptions.lock().unwrap().is_empty());
 }
 
+#[test]
+fn notification_trigger_endpoints_use_the_relay_safety_policy() {
+    let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let err = plane
+        .sanitize_relay_endpoints(
+            vec![TransportEndpoint("ws://169.254.169.254".into())],
+            "notification trigger publish",
+        )
+        .expect_err("peer-controlled link-local relay hint must be rejected");
+
+    assert!(err.contains("host is not a public address"));
+}
+
 #[tokio::test]
 async fn relay_plane_deduplicates_canonical_relay_endpoints() {
     let relay = Arc::new(RecordingRelayClient::default());
