@@ -174,7 +174,35 @@ wn --account <npub-or-hex> chats unarchive <group-hex>
 wn --account <npub-or-hex> chats mute <group-hex> 1h
 wn --account <npub-or-hex> chats mute <group-hex> forever
 wn --account <npub-or-hex> chats unmute <group-hex>
+wn --account <npub-or-hex> chats mark-read <group-hex>
+wn --account <npub-or-hex> chats mark-read <group-hex> <message-id-hex>
 ```
+
+Each `chats list`, `chats list-archived`, and `chats subscribe`/`subscribe-archived` row carries the group
+record plus a per-chat projection so a chat list can render unread badges and a last-message preview without a
+second query: `unread_count` (number), `has_unread` (bool), `last_message` (the last chat message as
+`{ message_id_hex, sender, sender_display_name, plaintext, kind, timeline_at, deleted }`, or `null`), and the
+`last_read_message_id_hex` / `last_read_timeline_at` read marker (either may be `null`). These keys use the same
+names and `last_message` shape as the `chat_list_row` object on the `messages timeline subscribe` feed, so both
+feeds agree. A chat with no messages or reads yet reports empty defaults (`0` / `false` / `null`) rather than
+omitting the keys.
+
+On the `chats subscribe`/`subscribe-archived` feeds these projection keys refresh only when the feed emits a
+row, and the feed emits on group-state changes (create, rename, archive/unarchive, membership) — not on every
+new message or read. So the unread count and last-message preview on a subscribed row are a point-in-time
+snapshot taken at the last group-state emit, and live unread/last-message deltas ride the
+`messages timeline subscribe` feed's `chat_list_row` object instead. `chats mark-read` returns the refreshed
+projection directly in its own response.
+
+`chats mark-read <group-hex> [<message-id-hex>]` advances the chat's read marker and clears its unread count.
+With no message id it marks the newest message read (the "clear on chat open" case); with an explicit message id
+it marks read up to that message. The read marker is a forward-only high-water mark, so marking an older message
+leaves any newer ones unread and re-marking never moves it backward; an empty chat is a no-op success. A
+`<message-id-hex>` that is not a kind-9 chat message in the chat — foreign, non-existent, or a different event
+kind — likewise leaves the marker untouched and returns the current projection as success, the same silent
+contract as `messages react`/`delete` with unknown ids. It returns
+`account_id`, `npub`, `group_id`, and the same five projection keys as the `chats list` rows
+(`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
 
 Group commands:
 

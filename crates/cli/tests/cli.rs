@@ -4590,7 +4590,15 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
             && line["result"]["type"] == "chat"
             && line["result"]["chat"]["group_id"] == group_id
     });
-    assert_eq!(initial["result"]["chat"]["profile"]["name"], "general");
+    let initial_chat = &initial["result"]["chat"];
+    assert_eq!(initial_chat["profile"]["name"], "general");
+    // The streamed chat row carries the same additive projection keys as
+    // `chats list`, so a TUI can bootstrap unread badges from either feed.
+    assert_eq!(initial_chat["unread_count"], 0);
+    assert_eq!(initial_chat["has_unread"], false);
+    assert!(initial_chat["last_message"].is_null());
+    assert!(initial_chat.get("last_read_message_id_hex").is_some());
+    assert!(initial_chat.get("last_read_timeline_at").is_some());
 
     run_json(
         home.path(),
@@ -4611,6 +4619,31 @@ fn chats_subscribe_streams_initial_chat_rows_from_daemon() {
     });
     assert_eq!(updated["result"]["group_id"], group_id);
 
+    // The archived feed carries the same additive projection keys. Archive the
+    // chat and open `chats subscribe-archived` against the same running daemon:
+    // its initial snapshot row must expose the projection keys too.
+    run_json(
+        home.path(),
+        &["--account", &bob, "chats", "archive", group_id],
+    );
+    let archived_subscription = spawn_json_subscription(
+        home.path(),
+        &["--account", &bob, "chats", "subscribe-archived"],
+    );
+    let archived_initial = archived_subscription.wait_for(Duration::from_secs(20), |line| {
+        line["result"]["trigger"] == "InitialChat"
+            && line["result"]["type"] == "chat"
+            && line["result"]["chat"]["group_id"] == group_id
+    });
+    let archived_chat = &archived_initial["result"]["chat"];
+    assert_eq!(archived_chat["archived"], true);
+    assert_eq!(archived_chat["unread_count"], 0);
+    assert_eq!(archived_chat["has_unread"], false);
+    assert!(archived_chat.get("last_message").is_some());
+    assert!(archived_chat.get("last_read_message_id_hex").is_some());
+    assert!(archived_chat.get("last_read_timeline_at").is_some());
+
+    drop(archived_subscription);
     drop(subscription);
     stop_daemon(&socket, &mut child);
 }
@@ -4891,6 +4924,495 @@ fn chats_list_exposes_visible_groups() {
     let chats = run_json(home.path(), &["--account", &bob, "chats", "list"]);
     assert_eq!(chats["chats"][0]["group_id"], group_id);
     assert_eq!(chats["chats"][0]["profile"]["name"], "general");
+}
+
+#[test]
+fn chats_list_projects_unread_and_last_message() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    // A freshly joined chat with no messages still carries the additive
+    // projection keys, as empty defaults (never absent), alongside the existing
+    // group-record keys.
+    let bob_chats = run_json(home.path(), &["--account", &bob, "chats", "list"]);
+    let bob_row = &bob_chats["chats"][0];
+    assert_eq!(bob_row["group_id"], group_id);
+    assert_eq!(bob_row["profile"]["name"], "general");
+    assert_eq!(bob_row["archived"], false);
+    assert_eq!(bob_row["unread_count"], 0);
+    assert_eq!(bob_row["has_unread"], false);
+    assert!(bob_row["last_message"].is_null());
+    assert!(bob_row["last_read_message_id_hex"].is_null());
+    assert!(bob_row["last_read_timeline_at"].is_null());
+
+    // Alice sends first: a local send advances the sender's own read marker, so
+    // this establishes Alice's read state. Bob receives it.
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "seed",
+            "from",
+            "alice",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &bob, "seed from alice");
+
+    // Bob replies; Alice syncs and now has an unread message from Bob.
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "reply",
+            "from",
+            "bob",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &alice, "reply from bob");
+
+    let alice_chats = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    let alice_row = &alice_chats["chats"][0];
+    assert_eq!(alice_row["group_id"], group_id);
+    assert!(
+        alice_row["unread_count"]
+            .as_u64()
+            .expect("unread_count is a number")
+            >= 1,
+        "alice should carry at least one unread message: {alice_row}"
+    );
+    assert_eq!(alice_row["has_unread"], true);
+    // The last-message preview mirrors the timeline feed's `chat_list_row`
+    // `last_message` shape key-for-key.
+    assert_eq!(alice_row["last_message"]["sender"], bob);
+    assert_eq!(alice_row["last_message"]["plaintext"], "reply from bob");
+    assert_eq!(alice_row["last_message"]["deleted"], false);
+    assert!(
+        alice_row["last_message"]["timeline_at"].is_u64(),
+        "last_message.timeline_at should be a timestamp: {alice_row}"
+    );
+    assert!(
+        alice_row["last_message"]["message_id_hex"].is_string(),
+        "last_message.message_id_hex should be present: {alice_row}"
+    );
+    // Alice's own seed advanced her last-read marker.
+    assert!(
+        alice_row["last_read_message_id_hex"].is_string(),
+        "alice's read marker should point at her own seed message: {alice_row}"
+    );
+
+    // The CLI exposes no read-marker command today, so unread does not clear on
+    // re-list: the projection is durable, not a per-invocation tally.
+    let alice_again = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert!(
+        alice_again["chats"][0]["unread_count"]
+            .as_u64()
+            .expect("unread_count is a number")
+            >= 1
+    );
+}
+
+#[test]
+fn chats_mark_read_clears_unread_and_persists() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    // Alice sends first (establishing her own read marker), then Bob replies so
+    // Alice accrues one unread message from Bob.
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "seed",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &bob, "seed");
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "ping",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &alice, "ping");
+
+    let before = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert!(
+        before["chats"][0]["unread_count"]
+            .as_u64()
+            .expect("unread_count is a number")
+            >= 1,
+        "alice should have an unread message before mark-read: {before}"
+    );
+    let newest_id = before["chats"][0]["last_message"]["message_id_hex"]
+        .as_str()
+        .expect("last_message id")
+        .to_owned();
+
+    // `chats mark-read <group>` with no explicit id marks the newest timeline
+    // message read (chat-open semantics), clearing the unread count.
+    let marked = run_json(
+        home.path(),
+        &["--account", &alice, "chats", "mark-read", group_id],
+    );
+    assert_eq!(marked["group_id"], group_id);
+    assert_eq!(marked["account_id"], alice);
+    assert!(marked["npub"].is_string(), "npub present: {marked}");
+    assert_eq!(marked["unread_count"], 0);
+    assert_eq!(marked["has_unread"], false);
+    // The read marker now points at the newest message and carries a timestamp.
+    assert_eq!(marked["last_read_message_id_hex"], newest_id);
+    assert!(
+        marked["last_read_timeline_at"].is_u64(),
+        "last_read_timeline_at should be a timestamp: {marked}"
+    );
+
+    // Durable: a fresh `chats list` agrees the chat is now read.
+    let after = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    let after_row = &after["chats"][0];
+    assert_eq!(after_row["group_id"], group_id);
+    assert_eq!(after_row["unread_count"], 0);
+    assert_eq!(after_row["has_unread"], false);
+    assert_eq!(after_row["last_read_message_id_hex"], newest_id);
+}
+
+#[test]
+fn chats_mark_read_at_older_message_leaves_newer_unread() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    // Alice seeds (establishing her own marker), then Bob sends two messages
+    // Alice syncs one at a time so she can capture each id from the projection's
+    // last-message preview.
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "seed",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &bob, "seed");
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "older",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &alice, "older");
+    let older_id =
+        run_json(home.path(), &["--account", &alice, "chats", "list"])["chats"][0]["last_message"]
+            ["message_id_hex"]
+            .as_str()
+            .expect("older message id")
+            .to_owned();
+
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "newer",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &alice, "newer");
+    let newer_id =
+        run_json(home.path(), &["--account", &alice, "chats", "list"])["chats"][0]["last_message"]
+            ["message_id_hex"]
+            .as_str()
+            .expect("newer message id")
+            .to_owned();
+    assert_ne!(older_id, newer_id);
+
+    // Marking read at the older message advances the forward-only marker only up
+    // to it: the newer message stays unread.
+    let partial = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "chats",
+            "mark-read",
+            group_id,
+            &older_id,
+        ],
+    );
+    assert_eq!(partial["unread_count"], 1);
+    assert_eq!(partial["has_unread"], true);
+    assert_eq!(partial["last_read_message_id_hex"], older_id);
+
+    // Marking the newest read clears the rest.
+    let cleared = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "chats",
+            "mark-read",
+            group_id,
+            &newer_id,
+        ],
+    );
+    assert_eq!(cleared["unread_count"], 0);
+    assert_eq!(cleared["has_unread"], false);
+    assert_eq!(cleared["last_read_message_id_hex"], newer_id);
+
+    // Re-marking the older message never moves the marker backward (monotonic):
+    // the chat stays fully read and the marker stays at the newest message.
+    let monotonic = run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "chats",
+            "mark-read",
+            group_id,
+            &older_id,
+        ],
+    );
+    assert_eq!(monotonic["unread_count"], 0);
+    assert_eq!(monotonic["last_read_message_id_hex"], newer_id);
+}
+
+#[test]
+fn chats_mark_read_empty_chat_is_noop_success() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    // A chat with no messages has nothing to mark; mark-read succeeds as a no-op
+    // and reports the empty projection rather than erroring.
+    let marked = run_json(
+        home.path(),
+        &["--account", &bob, "chats", "mark-read", group_id],
+    );
+    assert_eq!(marked["group_id"], group_id);
+    assert_eq!(marked["account_id"], bob);
+    assert_eq!(marked["unread_count"], 0);
+    assert_eq!(marked["has_unread"], false);
+    assert!(marked["last_message"].is_null());
+    assert!(marked["last_read_message_id_hex"].is_null());
+    assert!(marked["last_read_timeline_at"].is_null());
+}
+
+#[test]
+fn chats_mark_read_unknown_message_id_is_silent_noop() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    // Alice seeds (establishing her own read marker at "seed"); Bob syncs it and
+    // reacts to it, producing a real kind-7 (reaction) event id — a valid event
+    // that is not a kind-9 chat message.
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &alice,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "seed",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &bob, "seed");
+    let seed_id = run_json(home.path(), &["--account", &bob, "chats", "list"])["chats"][0]
+        ["last_message"]["message_id_hex"]
+        .as_str()
+        .expect("seed message id")
+        .to_owned();
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "react",
+            group_id,
+            &seed_id,
+            "+",
+        ],
+    );
+
+    // Bob then sends a chat message so Alice accrues a genuine unread.
+    run_json(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "message",
+            "send",
+            "--group",
+            group_id,
+            "ping",
+        ],
+    );
+    sync_until_message(home.path(), test_relay_url(), &alice, "ping");
+    let reaction_sync =
+        sync_until_message_with_kind(home.path(), test_relay_url(), &alice, 7, &seed_id);
+    let reaction_id =
+        first_message_with_kind(&reaction_sync, 7).expect("reaction message")["message_id"]
+            .as_str()
+            .expect("reaction message id")
+            .to_owned();
+
+    // Baseline: Alice has an unread and her marker sits at her own seed.
+    let before = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    let before_row = &before["chats"][0];
+    let before_unread = before_row["unread_count"]
+        .as_u64()
+        .expect("unread_count is a number");
+    assert!(before_unread >= 1, "alice should have an unread: {before}");
+    let before_marker = before_row["last_read_message_id_hex"].clone();
+    assert!(before_marker.is_string(), "marker present: {before}");
+
+    // An id that is not a kind-9 chat message in this chat is not a markable
+    // target: `chats mark-read` leaves the marker untouched and returns the
+    // current projection as success — the same silent contract as
+    // `messages react`/`delete` with unknown ids (and, by forward-only
+    // semantics, the same observable outcome as re-marking an already-read older
+    // id). Pinned for both a bogus (non-existent) id and a real event of the
+    // wrong kind (a kind-7 reaction).
+    let bogus = "f".repeat(64);
+    for unknown in [bogus.as_str(), reaction_id.as_str()] {
+        let marked = run_json(
+            home.path(),
+            &["--account", &alice, "chats", "mark-read", group_id, unknown],
+        );
+        assert_eq!(
+            marked["unread_count"].as_u64(),
+            Some(before_unread),
+            "unknown id must not clear unread: {marked}"
+        );
+        assert_eq!(marked["has_unread"], true);
+        assert_eq!(marked["last_read_message_id_hex"], before_marker);
+    }
+
+    // Durable: a fresh list agrees the unread state never moved.
+    let after = run_json(home.path(), &["--account", &alice, "chats", "list"]);
+    assert_eq!(
+        after["chats"][0]["unread_count"].as_u64(),
+        Some(before_unread)
+    );
+    assert_eq!(after["chats"][0]["last_read_message_id_hex"], before_marker);
+}
+
+#[test]
+fn chats_list_archived_rows_carry_projection_keys() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let alice = create_account(home.path());
+    let bob = create_account(home.path());
+    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+
+    let created_group = run_json(
+        home.path(),
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+    let group_id = created_group["group_id"].as_str().expect("group id");
+    sync_until_joined(home.path(), test_relay_url(), &bob, group_id);
+
+    let archived = run_json(
+        home.path(),
+        &["--account", &bob, "chats", "archive", group_id],
+    );
+    assert_eq!(archived["group"]["archived"], true);
+
+    // `chats list-archived` goes through the same batched projection read as
+    // `chats list`, so its rows carry the same five additive projection keys
+    // (empty defaults for a chat with no messages or reads).
+    let listed = run_json(home.path(), &["--account", &bob, "chats", "list-archived"]);
+    let row = &listed["chats"][0];
+    assert_eq!(row["group_id"], group_id);
+    assert_eq!(row["archived"], true);
+    assert_eq!(row["unread_count"], 0);
+    assert_eq!(row["has_unread"], false);
+    assert!(row["last_message"].is_null());
+    assert!(row["last_read_message_id_hex"].is_null());
+    assert!(row["last_read_timeline_at"].is_null());
 }
 
 #[test]

@@ -52,6 +52,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   error code `reply_to_after_message_text` (put `--reply-to` before the text with `--group`). Tradeoff: the guard
   rejects any message whose text contains a bare `--reply-to` or `--reply-to=<id>` token anywhere (e.g.
   `hello --reply-to friend`), so such text can no longer be sent this way.
+- `chats list`, `chats list-archived`, and the `chats subscribe`/`subscribe-archived` feeds now project the runtime's
+  durable per-chat state onto each chat row as additive JSON keys, so a chat list can render unread badges and a
+  last-message preview without a second query. New keys: `unread_count` (number), `has_unread` (bool), `last_message`
+  (`{ message_id_hex, sender, sender_display_name, plaintext, kind, timeline_at, deleted }` or `null`),
+  `last_read_message_id_hex` (string or `null`), and `last_read_timeline_at` (number or `null`). The names and the
+  `last_message` shape match the `chat_list_row` object already emitted on the `messages timeline subscribe` feed so
+  the two feeds agree; a chat with no messages or reads yet reports empty defaults (`0`/`false`/`null`) rather than
+  omitting the keys. All existing chat-row keys are unchanged.
+- `chats mark-read <group-hex> [<message-id-hex>]` advances a chat's read marker and clears its unread count, giving the
+  chat-list projection a CLI read path (previously unread cleared only when the account itself sent into the chat). With
+  no message id it marks the newest message read (the "clear on chat open" case); with an explicit message id it marks
+  read up to that message. The read marker is a forward-only high-water mark, so marking an older message leaves newer
+  ones unread and re-marking never moves it backward; a chat with no messages is a no-op success. The JSON response
+  carries `account_id`, `npub`, `group_id`, and the refreshed projection as the same five keys the chat rows expose
+  (`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
 - MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
   and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
   metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.

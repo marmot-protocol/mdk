@@ -34,13 +34,14 @@ pub(crate) fn runtime_message_update_stream_response(
 
 pub(crate) fn chat_stream_response(
     group: marmot_app::AppGroupRecord,
+    chat_list_row: Option<marmot_app::ChatListRow>,
     trigger: &str,
 ) -> DaemonStreamResponse {
     let group_id = group.group_id_hex.clone();
     DaemonStreamResponse::ok(serde_json::json!({
         "trigger": trigger,
         "type": "chat",
-        "chat": crate::group_json(group),
+        "chat": crate::chat_json(group, chat_list_row),
         "group_id": group_id,
     }))
 }

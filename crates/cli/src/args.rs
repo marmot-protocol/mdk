@@ -400,6 +400,16 @@ pub(crate) enum ChatsCommand {
         #[arg(help = "Group id to unmute")]
         group: String,
     },
+    #[command(
+        name = "mark-read",
+        about = "Mark a chat read, clearing its unread count"
+    )]
+    MarkRead {
+        #[arg(help = "Group id to mark read")]
+        group: String,
+        #[arg(help = "Message id to mark read up to; defaults to the newest message")]
+        message_id: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]

@@ -13,8 +13,8 @@ use cgka_traits::app_event::{
 use clap::Parser;
 use marmot_account::{AccountHome, DEFAULT_KEYCHAIN_SERVICE_NAME};
 use marmot_app::{
-    AccountRelayListStatus, AppError, AppGroupRecord, MarmotApp, MarmotAppConfig, StreamStartView,
-    UserProfileMetadata, tag_value,
+    AccountRelayListStatus, AppError, AppGroupRecord, ChatListRow, MarmotApp, MarmotAppConfig,
+    StreamStartView, UserProfileMetadata, tag_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -860,6 +860,61 @@ pub(crate) fn group_json(group: AppGroupRecord) -> Value {
     })
 }
 
+/// Render a `chats` row: the group record (`group_json`) enriched with the
+/// runtime's durable per-chat projection state so a chat-list UI can bootstrap
+/// unread badges and a last-message preview without a second query. Consumed by
+/// `chats list`, `chats list-archived`, and the `chats subscribe`/
+/// `subscribe-archived` feeds so those surfaces stay byte-identical.
+pub(crate) fn chat_json(group: AppGroupRecord, chat_list_row: Option<ChatListRow>) -> Value {
+    let mut value = group_json(group);
+    insert_chat_projection(&mut value, chat_list_row);
+    value
+}
+
+/// Project the durable `ChatListRow` state onto a chats row as additive keys.
+///
+/// The field names and the `last_message` preview shape mirror the
+/// `chat_list_row` object embedded on every `timeline_projection_updated`
+/// event, so the snapshot feed (`chats list`/`subscribe`) and the live timeline
+/// feed agree key-for-key. The surface is deliberately the minimal reviewed set
+/// — unread state, a last-message preview, and the last-read marker — rather
+/// than the full `ChatListRow` (whose title/avatar/membership fields either
+/// duplicate `group_json` or are group-state concerns).
+///
+/// The keys are always present: a group with no projection row yet (or no
+/// messages/reads) reports empty defaults (`0`/`false`/`null`), matching the
+/// always-present `avatar_url` block convention rather than omitting keys.
+pub(crate) fn insert_chat_projection(value: &mut Value, chat_list_row: Option<ChatListRow>) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let (unread_count, has_unread, last_message, last_read_message_id_hex, last_read_timeline_at) =
+        match chat_list_row {
+            Some(row) => (
+                json!(row.unread_count),
+                json!(row.has_unread),
+                json!(row.last_message),
+                json!(row.last_read_message_id_hex),
+                json!(row.last_read_timeline_at),
+            ),
+            None => (
+                json!(0),
+                json!(false),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ),
+        };
+    object.insert("unread_count".to_owned(), unread_count);
+    object.insert("has_unread".to_owned(), has_unread);
+    object.insert("last_message".to_owned(), last_message);
+    object.insert(
+        "last_read_message_id_hex".to_owned(),
+        last_read_message_id_hex,
+    );
+    object.insert("last_read_timeline_at".to_owned(), last_read_timeline_at);
+}
+
 pub(crate) fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<String> {
     let account_id = parse_public_key(sender).ok()?;
     let profile = app
@@ -1203,9 +1258,80 @@ mod tests {
     };
     use super::{
         Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
-        default_home_from_env, npub_for_account_id, relay_endpoints,
+        default_home_from_env, insert_chat_projection, npub_for_account_id, relay_endpoints,
         resolve_dev_settlement_quiescence_ms, resolve_relay, run_from,
     };
+
+    use serde_json::json;
+
+    #[test]
+    fn chat_projection_emits_empty_defaults_when_no_row() {
+        // A group with no chat-list projection row yet keeps every base key and
+        // gains the projection keys as empty defaults (never absent).
+        let mut value = json!({ "group_id": "abcd", "archived": false });
+        insert_chat_projection(&mut value, None);
+        assert_eq!(value["group_id"], "abcd");
+        assert_eq!(value["archived"], false);
+        assert_eq!(value["unread_count"], 0);
+        assert_eq!(value["has_unread"], false);
+        assert!(value["last_message"].is_null());
+        assert!(value["last_read_message_id_hex"].is_null());
+        assert!(value["last_read_timeline_at"].is_null());
+    }
+
+    #[test]
+    fn chat_projection_mirrors_timeline_chat_list_row_fields() {
+        // `ChatListRow` is the exact type serialized as `chat_list_row` on the
+        // timeline feed; deserializing from that shape proves the chats row
+        // agrees key-for-key.
+        let row: marmot_app::ChatListRow = serde_json::from_value(json!({
+            "group_id_hex": "abcd",
+            "archived": false,
+            "pending_confirmation": false,
+            "title": "General",
+            "group_name": "General",
+            "avatar_url": null,
+            "avatar": null,
+            "last_message": {
+                "message_id_hex": "m1",
+                "sender": "bob_hex",
+                "sender_display_name": "Bob",
+                "plaintext": "hello alice",
+                "kind": 9,
+                "timeline_at": 1_700_000_050_u64,
+                "deleted": false
+            },
+            "unread_count": 3_u64,
+            "has_unread": true,
+            "unread_mention_count": 1_u64,
+            "has_unread_mention": true,
+            "first_unread_message_id_hex": "m0",
+            "last_read_message_id_hex": "r1",
+            "last_read_timeline_at": 1_700_000_000_u64,
+            "updated_at": 1_700_000_060_u64,
+            "self_membership": "Member"
+        }))
+        .expect("valid chat list row");
+
+        let mut value = json!({ "group_id": "abcd" });
+        insert_chat_projection(&mut value, Some(row));
+
+        assert_eq!(value["unread_count"], 3);
+        assert_eq!(value["has_unread"], true);
+        assert_eq!(value["last_read_message_id_hex"], "r1");
+        assert_eq!(value["last_read_timeline_at"], 1_700_000_000_u64);
+        // `last_message` is byte-identical to the timeline feed's preview.
+        assert_eq!(value["last_message"]["message_id_hex"], "m1");
+        assert_eq!(value["last_message"]["sender"], "bob_hex");
+        assert_eq!(value["last_message"]["sender_display_name"], "Bob");
+        assert_eq!(value["last_message"]["plaintext"], "hello alice");
+        assert_eq!(value["last_message"]["timeline_at"], 1_700_000_050_u64);
+        assert_eq!(value["last_message"]["deleted"], false);
+        // Minimal surface: mention state and the full row are not dumped here.
+        assert!(value.get("unread_mention_count").is_none());
+        assert!(value.get("first_unread_message_id_hex").is_none());
+        assert!(value.get("self_membership").is_none());
+    }
 
     use marmot_app::{
         AppMessageRecord, DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics,

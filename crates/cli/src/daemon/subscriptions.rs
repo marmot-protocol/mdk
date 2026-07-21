@@ -387,17 +387,69 @@ pub(crate) async fn handle_chats_subscription(
             return Ok(());
         }
     };
+    let mut projections = chat_list_projection_index(&runtime, &account_ref, include_archived);
     for chat in subscription.snapshot.drain(..) {
-        if !write_stream_response(stream, &chat_stream_response(chat, "InitialChat")).await {
+        let projection = projections.remove(&chat.group_id_hex);
+        if !write_stream_response(
+            stream,
+            &chat_stream_response(chat, projection, "InitialChat"),
+        )
+        .await
+        {
             return Ok(());
         }
     }
     while let Some(chat) = subscription.recv().await {
-        if !write_stream_response(stream, &chat_stream_response(chat, "ChatUpdated")).await {
+        let projection = chat_list_projection(&runtime, &account_ref, &chat.group_id_hex);
+        if !write_stream_response(
+            stream,
+            &chat_stream_response(chat, projection, "ChatUpdated"),
+        )
+        .await
+        {
             return Ok(());
         }
     }
     Ok(())
+}
+
+/// Read a group's durable chat-list projection for a single live `ChatUpdated`
+/// emit. A lookup failure degrades to `None` (empty projection defaults) rather
+/// than tearing down the stream — a transient projection read should never drop
+/// a live subscription. One emit refreshes one group, so the per-row read is the
+/// right shape here; batching the whole list per single-row emit would invert
+/// the win.
+fn chat_list_projection(
+    runtime: &marmot_app::MarmotAppRuntime,
+    account_ref: &str,
+    group_id_hex: &str,
+) -> Option<marmot_app::ChatListRow> {
+    runtime
+        .chat_list_row(account_ref, group_id_hex)
+        .ok()
+        .flatten()
+}
+
+/// Batch-read the chat-list projection for the initial `chats subscribe`
+/// snapshot: one hydrated read indexed by `group_id_hex`, instead of an N+1
+/// per-group [`chat_list_projection`] call across the whole snapshot. A read
+/// failure degrades to an empty index (every row falls back to empty projection
+/// defaults) rather than tearing the stream, matching the per-update posture. A
+/// group absent from the index yields the same empty defaults as an absent
+/// single-row read. `include_archived` matches the feed the snapshot came from.
+fn chat_list_projection_index(
+    runtime: &marmot_app::MarmotAppRuntime,
+    account_ref: &str,
+    include_archived: bool,
+) -> HashMap<String, marmot_app::ChatListRow> {
+    runtime
+        .chat_list(account_ref, include_archived)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.group_id_hex.clone(), row))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) async fn handle_group_state_subscription(
