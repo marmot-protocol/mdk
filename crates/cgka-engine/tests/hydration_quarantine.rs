@@ -1124,6 +1124,65 @@ async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
     );
 }
 
+// mdk#969: a crash after the retained-anchor probe durably rewinds the live
+// group leaves its pre-probe snapshot behind. Hydration must restore that
+// snapshot before it reads either the Marmot record or the OpenMLS group.
+#[tokio::test]
+async fn hydration_recovers_interrupted_retained_anchor_probe() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    let mut historical_group = live_group.clone();
+    historical_group.name = "historical anchor".into();
+    historical_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&historical_group)
+        .expect("plant historical group record");
+    storage
+        .create_group_snapshot(&group_id, "test-historical-anchor")
+        .expect("capture historical anchor");
+
+    storage.put_group(&live_group).expect("restore live record");
+    storage
+        .create_group_snapshot(&group_id, "openmls-retained-probe-test-crash")
+        .expect("capture pre-probe live state");
+    storage
+        .rollback_group_to_snapshot(&group_id, "test-historical-anchor")
+        .expect("simulate committed probe rewind");
+    drop(initial);
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("rewound group"),
+        historical_group,
+        "fixture must start in the crash-stranded historical state"
+    );
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydrate recovers orphaned probe");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-probe live state"
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).expect("hydrated epoch"),
+        live_group.epoch
+    );
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-retained-probe-")),
+        "recovered probe snapshot must be released"
+    );
+}
+
 // A stale/garbage marker must never let a tampered group through: marker
 // mismatch forces full validation. A healthy group with a mismatched marker
 // still hydrates (full validation passes) and the marker is refreshed.

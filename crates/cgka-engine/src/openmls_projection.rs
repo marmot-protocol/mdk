@@ -823,9 +823,10 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     group_id: &GroupId,
     work: StoredOpenMlsCanonicalizationWork,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+
     let live_snapshot = retained_anchor_probe_snapshot_name(group_id, work.replay_start_epoch);
-    storage
-        .create_group_snapshot(group_id, &live_snapshot)
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), live_snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
@@ -840,16 +841,42 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
         Err(e) => Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
     };
 
-    let rollback_result = storage
-        .rollback_group_to_snapshot(group_id, &live_snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")));
-    let release_result = storage
-        .release_group_snapshot(group_id, &live_snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")));
-
-    rollback_result?;
-    release_result?;
+    guard
+        .commit()
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     result
+}
+
+/// Recover the live state captured before a retained-anchor probe that was
+/// interrupted by process termination.
+///
+/// The probe snapshot is created before the durable rollback to the historical
+/// anchor. A surviving snapshot therefore always contains the newer live state
+/// that must win on the next open. More than one probe snapshot is not expected:
+/// convergence for a group is serialized and hydrate runs before new work. If
+/// storage contains several, fail closed instead of guessing which live state
+/// is newest.
+pub(crate) fn recover_interrupted_retained_anchor_probe<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<(), OpenMlsProjectionError> {
+    let probes = storage
+        .list_group_snapshots(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        .into_iter()
+        .filter(|name| name.starts_with(RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX))
+        .collect::<Vec<_>>();
+
+    let Some(snapshot) = probes.first() else {
+        return Ok(());
+    };
+    if probes.len() != 1 {
+        return Err(OpenMlsProjectionError::Snapshot(
+            "multiple interrupted retained-anchor probes".into(),
+        ));
+    }
+
+    rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 
 /// Whether the pass may reuse the candidates the BFS already materialized instead
@@ -2265,8 +2292,13 @@ fn retained_anchor_probe_snapshot_name(group_id: &GroupId, epoch: u64) -> String
     hasher.update(group_id.as_slice());
     hasher.update(epoch.to_be_bytes());
     let digest = hasher.finalize();
-    format!("openmls-retained-probe-{}", hex::encode(&digest[..8]))
+    format!(
+        "{RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX}{}",
+        hex::encode(&digest[..8])
+    )
 }
+
+const RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX: &str = "openmls-retained-probe-";
 
 fn replay_snapshot_name(group_id: &GroupId, messages: &[TransportMessage]) -> String {
     let mut hasher = Sha256::new();

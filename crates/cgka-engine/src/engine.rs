@@ -733,6 +733,16 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
+        // A retained-anchor convergence probe durably rewinds the group while
+        // it explores historical candidates. Process termination cannot run
+        // the in-process rollback guard, so restore its pre-probe live snapshot
+        // before loading any MLS or Marmot state.
+        crate::openmls_projection::recover_interrupted_retained_anchor_probe(
+            &self.storage,
+            group_id,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
