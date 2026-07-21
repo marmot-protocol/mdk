@@ -541,6 +541,23 @@ async fn connector_socket_bind_applies_configured_group_modes() {
 }
 
 #[tokio::test]
+async fn connector_socket_bind_preserves_preexisting_custom_parent_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_parent = dir.path().join("s");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let socket = shared_parent.join("a");
+
+    let listener = bind_connector_socket_with_mode(&socket, 0o700, 0o600).unwrap();
+
+    assert!(listener.local_addr().is_ok());
+    assert_eq!(
+        shared_parent.metadata().unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[tokio::test]
 async fn connector_control_plane_requires_token_for_group_shared_modes() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");

@@ -46,6 +46,7 @@ pub(crate) use marmot_app::AppMessageQuery;
 
 use crate::allowlist::AllowlistStore;
 use crate::event_projection::InboundCatchUpDriver;
+use crate::socket::bind_connector_socket_with_owned_home;
 use crate::stream_session::{DebugFinalSendStore, SendIdempotencyStore, StreamSessionStore};
 use crate::validation::{endpoint, validate_control_plane_config};
 
@@ -252,10 +253,11 @@ impl AgentConnector {
 
 pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
     validate_control_plane_config(&config)?;
-    let listener = bind_connector_socket_with_mode(
+    let listener = bind_connector_socket_with_owned_home(
         &config.socket,
         config.socket_dir_mode,
         config.socket_mode,
+        Some(&config.home),
     )?;
     let max_connections = config.max_connections;
     let connector = AgentConnector::open(config)?;

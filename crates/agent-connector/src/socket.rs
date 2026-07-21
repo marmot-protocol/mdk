@@ -1,7 +1,7 @@
 //! Unix-socket path resolution, binding, stale-socket recovery, and permission hardening.
 
 use std::io::ErrorKind;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 
@@ -23,8 +23,17 @@ pub fn bind_connector_socket_with_mode(
     socket_dir_mode: u32,
     socket_mode: u32,
 ) -> Result<UnixListener, ConnectorError> {
+    bind_connector_socket_with_owned_home(socket, socket_dir_mode, socket_mode, None)
+}
+
+pub(crate) fn bind_connector_socket_with_owned_home(
+    socket: &Path,
+    socket_dir_mode: u32,
+    socket_mode: u32,
+    owned_home: Option<&Path>,
+) -> Result<UnixListener, ConnectorError> {
     if let Some(parent) = socket.parent() {
-        prepare_socket_dir(parent, socket_dir_mode)?;
+        prepare_socket_dir(parent, socket_dir_mode, owned_home)?;
     }
     let listener = match bind_private(socket, socket_mode) {
         Ok(listener) => listener,
@@ -78,9 +87,15 @@ fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::R
     }
 }
 
-fn prepare_socket_dir(parent: &Path, mode: u32) -> std::io::Result<()> {
-    std::fs::create_dir_all(parent)?;
-    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode))
+fn prepare_socket_dir(parent: &Path, mode: u32, owned_home: Option<&Path>) -> std::io::Result<()> {
+    let existed = parent.try_exists()?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(mode).create(parent)?;
+    let is_connector_owned = owned_home.is_some_and(|home| parent == home.join("dev"));
+    if !existed || is_connector_owned {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn current_effective_uid() -> libc::uid_t {
