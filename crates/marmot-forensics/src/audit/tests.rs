@@ -1560,7 +1560,21 @@ fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
                 }],
                 ..ConvergenceCandidate::default()
             }],
-            rule_trace: Vec::new(),
+            rule_trace: vec![ConvergenceRuleEvaluation {
+                rule_name: "committer_identity_comparison".into(),
+                inputs: Some(serde_json::json!({
+                    "tip_committer_pubkey_hex": "11".repeat(32),
+                })),
+                result: serde_json::json!({
+                    "selected_committer": "22".repeat(32),
+                }),
+                scope: None,
+                candidate_branch_id: None,
+                other_candidate_branch_id: None,
+                decisive: Some(true),
+                selected_branch_id: Some("branch-1".into()),
+                rejected_branch_id: None,
+            }],
             selected_branch_id: Some("branch-1".into()),
             selected_fork_epoch: None,
             selected_tip_epoch: None,
@@ -1571,7 +1585,13 @@ fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
     drop(recorder);
 
     let contents = fs::read_to_string(&path).unwrap();
-    for secret in [&"dd".repeat(32), &"ee".repeat(32), &"ff".repeat(32)] {
+    for secret in [
+        &"11".repeat(32),
+        &"22".repeat(32),
+        &"dd".repeat(32),
+        &"ee".repeat(32),
+        &"ff".repeat(32),
+    ] {
         assert!(
             !contents.contains(secret),
             "obfuscated-mode log leaked {secret:?}: {contents}"
@@ -1579,4 +1599,8 @@ fn obfuscated_mode_scrubs_outbound_and_convergence_pubkeys() {
     }
     assert!(contents.contains("member-ref-1"), "{contents}");
     assert!(contents.contains("branch-1"), "{contents}");
+    assert!(
+        !contents.contains("committer_identity_comparison"),
+        "obfuscated-mode log retained an untyped rule trace: {contents}"
+    );
 }
