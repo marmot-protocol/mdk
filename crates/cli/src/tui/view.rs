@@ -493,6 +493,13 @@ impl TuiApp {
         match self.screen {
             Screen::Login(mode) => self.render_login(frame, mode),
             Screen::Main => self.render_main(frame),
+            Screen::GroupDetail => self.render_group_detail(frame),
+        }
+        // A popup overlays whatever screen is showing. Cloned so the immutable
+        // popup render can run inside this `&mut self` method without holding a
+        // borrow of `self.popup`.
+        if let Some(popup) = self.popup.clone() {
+            self.render_popup(frame, &popup, frame.area());
         }
     }
 
@@ -552,10 +559,6 @@ impl TuiApp {
         self.render_slash_suggestions(frame, composer_area);
         self.render_hints(frame, hints_area);
         self.render_status_bar(frame, status_area);
-
-        if self.show_help {
-            self.render_help(frame, centered_rect(70, 70, area));
-        }
     }
 
     fn render_login(&self, frame: &mut Frame, mode: LoginMode) {
@@ -814,7 +817,7 @@ impl TuiApp {
     }
 
     pub(crate) fn render_slash_suggestions(&self, frame: &mut Frame, composer_area: Rect) {
-        if self.focus != Focus::Composer || self.streaming.is_some() || self.show_help {
+        if self.focus != Focus::Composer || self.streaming.is_some() || self.popup.is_some() {
             return;
         }
         let lines = slash_suggestion_lines(self.input.value(), SLASH_SUGGESTION_LIMIT);
@@ -839,62 +842,142 @@ impl TuiApp {
         );
     }
 
-    pub(crate) fn render_help(&self, frame: &mut Frame, area: Rect) {
-        let lines = vec![
-            Line::from(Span::styled(
-                "White Noise TUI",
-                Style::default()
-                    .fg(FOCUS_ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(
-                "Chats + messages fill the screen; the composer, hints, and status sit below.",
-            ),
-            Line::from("Tab/BackTab cycle chats, messages, and composer. Ctrl-C quits."),
-            Line::from("Chats: j/k move; Enter opens the chat; A reopens the account picker."),
-            Line::from("Messages: j/k or arrows move; PageUp/PageDown page."),
-            Line::from(
-                "G/g jump newest/oldest; past oldest loads history; i/Enter focus composer.",
-            ),
-            Line::from("On the selected message: r react (Enter sends +), u unreact, d delete."),
-            Line::from(
-                "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
-            ),
-            Line::from(""),
-            Line::from("/refresh"),
-            Line::from("/diagnostics"),
-            Line::from("/account <npub-or-hex>"),
-            Line::from("/create-identity"),
-            Line::from("/login <nsec-or-npub>"),
-            Line::from("/daemon status"),
-            Line::from("/daemon start"),
-            Line::from("/daemon stop"),
-            Line::from("/chat new <name> [member-npub-or-hex ...]"),
-            Line::from("/chat rename <name>"),
-            Line::from("/chat describe <description>"),
-            Line::from("/chat archive"),
-            Line::from("/chat unarchive"),
-            Line::from("/chat archived [on|off]"),
-            Line::from("/members add <npub-or-hex> [...]"),
-            Line::from("/members remove <npub-or-hex> [...]"),
-            Line::from("/members list"),
-            Line::from("/react [emoji]"),
-            Line::from("/unreact"),
-            Line::from("/delete"),
-            Line::from("/retry <event-id>"),
-            Line::from("/keys fetch <npub-or-hex>"),
-            Line::from("/keys rotate"),
-            Line::from("/name <display-name>"),
-            Line::from("/profile name <display-name>"),
-            Line::from("/quit"),
-        ];
-        frame.render_widget(Clear, area);
+    /// Render the one open popup: a centered rect, `Clear` behind, cyan border,
+    /// the popup's title, its body (embedded input, confirm/card lines, or picker
+    /// rows), a blank spacer, and the bottom `[key] action` hint row.
+    pub(crate) fn render_popup(&self, frame: &mut Frame, popup: &Popup, area: Rect) {
+        let rect = centered_rect(70, 70, area);
+        frame.render_widget(Clear, rect);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        match popup {
+            Popup::Text { input, .. } => lines.push(input_cursor_line("> ", input)),
+            Popup::Confirm { body, .. } | Popup::Card { body, .. } => {
+                lines.extend(body.iter().map(|line| Line::from(terminal_safe_text(line))))
+            }
+            Popup::Picker {
+                items, selected, ..
+            } => {
+                for (index, item) in items.iter().enumerate() {
+                    let is_selected = index == *selected;
+                    let marker = if is_selected { ">" } else { " " };
+                    let line = Line::from(vec![
+                        Span::raw(format!("{marker} ")),
+                        Span::styled(
+                            shorten(&terminal_safe_text(&item.label), 40),
+                            row_label_style(is_selected, Color::Green),
+                        ),
+                    ]);
+                    lines.push(line);
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            popup_hint(popup),
+            Style::default().fg(Color::DarkGray),
+        )));
         frame.render_widget(
             Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("Help"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(terminal_safe_text(popup.title())),
+                )
                 .wrap(Wrap { trim: false }),
-            area,
+            rect,
         );
     }
+
+    fn render_group_detail(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(group_detail_lines(self.group_detail.as_ref()))
+                .block(panel_block("Group Detail", true))
+                .wrap(Wrap { trim: false }),
+            root[0],
+        );
+        self.render_hints(frame, root[1]);
+        self.render_status_bar(frame, root[2]);
+    }
+}
+
+/// The composer-style input line for a text popup: the prefix, the value split
+/// around a black-on-white cursor cell (a trailing space when the cursor is at
+/// the end). The value passes through `terminal_safe_text`.
+pub(crate) fn input_cursor_line(prefix: &str, input: &Input) -> Line<'static> {
+    let value = input.display();
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = input.cursor().min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let cursor_style = Style::default().fg(Color::Black).bg(Color::White);
+    let mut spans = vec![
+        Span::styled(prefix.to_owned(), Style::default().fg(FOCUS_ACCENT)),
+        Span::raw(terminal_safe_text(&before)),
+    ];
+    if cursor < chars.len() {
+        let at: String = chars[cursor].to_string();
+        let after: String = chars[cursor + 1..].iter().collect();
+        spans.push(Span::styled(terminal_safe_text(&at), cursor_style));
+        spans.push(Span::raw(terminal_safe_text(&after)));
+    } else {
+        spans.push(Span::styled(" ".to_owned(), cursor_style));
+    }
+    Line::from(spans)
+}
+
+/// The group-detail screen body: name and description header, the member list
+/// with admin/you badges and a selection highlight, then the relay hints. Every
+/// name, npub, and relay passes through `terminal_safe_text`.
+pub(crate) fn group_detail_lines(view: Option<&GroupDetailView>) -> Vec<Line<'static>> {
+    let Some(view) = view else {
+        return vec![Line::from("loading group detail...")];
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Group ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            shorten(&terminal_safe_text(&view.name), 48),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    if !view.description.is_empty() {
+        lines.push(Line::from(Span::styled(
+            terminal_safe_text(&view.description),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Members ({})", view.members.len())));
+    for (index, member) in view.members.iter().enumerate() {
+        let is_selected = index == view.selected;
+        let marker = if is_selected { ">" } else { " " };
+        let mut spans = vec![
+            Span::raw(format!("{marker} ")),
+            Span::styled(
+                shorten(&terminal_safe_text(&member.npub), 28),
+                row_label_style(is_selected, Color::Green),
+            ),
+        ];
+        if member.is_admin {
+            spans.push(Span::styled(" [admin]", Style::default().fg(Color::Yellow)));
+        }
+        if member.is_self {
+            spans.push(Span::styled(" (you)", Style::default().fg(Color::DarkGray)));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Relays ({})", view.relays.len())));
+    for relay in &view.relays {
+        lines.push(Line::from(format!("  {}", terminal_safe_text(relay))));
+    }
+    lines
 }

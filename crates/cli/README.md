@@ -528,14 +528,15 @@ Login screen controls:
 Main view controls:
 
 - `Tab`/`BackTab`: cycle the chat list, messages, and composer.
-- Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `A` reopens the
+- Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `g` opens the
+  group-detail screen for the selected chat; `I` opens the pending-invites picker; `A` reopens the
   account picker. Each row shows an unread badge (bold name plus `(N)`) and a dark-gray last-message preview (sender
   plus truncated text), and the list orders by last activity, newest first. The badge and the status bar's unread
   total come from the runtime's per-chat projection (`chats list`), so they survive a restart rather than being
   counted in the TUI. Opening a chat clears its badge immediately (via `chats mark-read`); a chat you are viewing
   updates its badge and preview live from the timeline feed, and other chats refresh from a background
   `notifications subscribe` feed (a debounced `chats list` re-read on each new message elsewhere). A group invite
-  surfaces as a one-line status notice. A background refresh never moves the highlight off the chat you have
+  surfaces as a one-line status notice that prompts `I` to open the invites picker. A background refresh never moves the highlight off the chat you have
   selected. These ambient updates require a running `wnd`: without a daemon, off-screen badges and previews
   update only when you manually refresh (`/refresh`) or re-open the chat. The badge and unread total still
   survive a restart either way, since they come from the runtime's durable `chats list` projection.
@@ -554,9 +555,29 @@ Main view controls:
   character, and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard newline, so
   multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8 rows), taking
   the space from the messages pane.
-- `?`: open help.
-- `Esc`: close the help popup or clear the composer input.
+- `?`: open the help popup.
+- `Esc`: clear the composer input (or, with a popup open, close it).
 - `Ctrl-C`: quit.
+
+Popups are modal: while one is open it captures every key and the screen behind it is inert. A text-entry popup
+submits on `Enter` (when non-empty) and cancels on `Esc`; a confirm popup takes `y`/`Enter` or `n`/`Esc`; a list
+picker moves with `j`/`k` and closes on `Esc`; and dismiss-on-any-key cards (help, info, errors) close on the next
+key. Because the help card is a popup, `q` under it closes the card instead of quitting.
+
+Group detail (`g` from the chat list) shows the selected group's members with admin badges (and a `(you)` marker),
+its relay hints, and its name and description; `Esc` returns to the main view. Its keys: `j`/`k` move the member
+selection; `A` adds a member by npub/hex (text popup → `groups add-members`); `x` removes the selected member
+(confirm → `groups remove-members`); `P` promotes the selected member to admin (confirm → `groups promote`); `R`
+renames the group (text popup prefilled with the current name → `groups rename`); `L` leaves the group. An admin
+cannot leave: `L` shows a "Cannot Leave Group" info card (sole admins are told to promote another member first,
+co-admins to step down as admin), while a non-admin gets a confirm popup (→ `groups leave`) and, on success, the
+chat leaves the list and the view returns to the main screen. `I` opens the invites picker from here too.
+
+Invites (`I` from the chat list or group detail) opens a picker of pending invites (`groups invites`): `a` or
+`Enter` accepts the highlighted invite (`groups accept`) and opens the newly joined chat, `d` declines it
+(`groups decline`), and `Esc` closes the picker. The picker stays open across actions, refolding the refreshed
+list after each accept or decline and closing only once no invites remain; accepting from the group-detail screen
+returns to the main view. With no pending invites it shows an info card instead.
 
 Group MLS/component diagnostics are hidden by default; `/diagnostics` toggles a diagnostics panel between the
 messages pane and the composer.

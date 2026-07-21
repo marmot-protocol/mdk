@@ -259,13 +259,490 @@ impl Focus {
     }
 }
 
-/// The top-level screen the TUI is showing. Phase 2 has exactly two: the
-/// login/account-select flow and the chat-first main view. Group detail,
-/// profile, search, and health screens arrive in Phase 5.
+/// The top-level screen the TUI is showing: the login/account-select flow, the
+/// chat-first main view, and (Phase 5) the group-detail screen. Profile, search,
+/// and health screens arrive in later Phase 5 slices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Screen {
     Login(LoginMode),
     Main,
+    GroupDetail,
+}
+
+/// A single modal popup. While one is open it captures every key and the screen
+/// behind it sees nothing (routed at the top of `handle_key`, ahead of the
+/// screen dispatch). `TuiApp` holds at most one as `Option<Popup>`.
+///
+/// The variants mirror the spec's interaction groups; the per-purpose enums are
+/// what keep the popup count low, so 5b extends by adding purpose variants (and
+/// their `PopupSubmit` arms), not new `Popup` shapes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Popup {
+    /// Text entry. `Enter` submits when non-empty, `Esc` cancels. Reuses the
+    /// composer's `Input` so cursor editing and masking behave identically.
+    Text {
+        purpose: TextPurpose,
+        title: String,
+        input: Input,
+    },
+    /// Confirm. `y`/`Enter` confirms, `n`/`Esc` cancels.
+    Confirm {
+        purpose: ConfirmPurpose,
+        title: String,
+        body: Vec<String>,
+    },
+    /// List picker. `j`/`k` (and arrows) navigate; per-purpose action keys act;
+    /// `Esc` closes.
+    Picker {
+        purpose: PickerPurpose,
+        title: String,
+        items: Vec<PickerItem>,
+        selected: usize,
+    },
+    /// Dismiss-on-any-key card: help, info, and error surfaces. Any key closes it.
+    Card { title: String, body: Vec<String> },
+}
+
+/// What a text-entry popup does on submit. Extends cleanly for 5b (create group,
+/// react-with-emoji, profile field edits) by adding variants here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TextPurpose {
+    RenameGroup { group_id: String },
+    AddMemberByPubkey { group_id: String },
+}
+
+/// What a confirm popup does on `y`/`Enter`. Extends for 5b (delete message,
+/// logout) by adding variants here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConfirmPurpose {
+    RemoveMember { group_id: String, pubkey: String },
+    PromoteMember { group_id: String, pubkey: String },
+    LeaveGroup { group_id: String },
+}
+
+/// What a list picker acts on. Extends for 5b (group picker for user search).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PickerPurpose {
+    Invites,
+}
+
+/// One row of a list-picker popup: an opaque id the action targets plus a
+/// display label. For invites, `id` is the group id.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PickerItem {
+    pub(crate) id: String,
+    pub(crate) label: String,
+}
+
+/// The outcome of routing one key into an open popup. `None` means the popup
+/// handled the key internally (edit/navigate) and stays open; `Dismiss` closes
+/// it with no side effect; `Submit` closes it and asks the app to run one CLI
+/// call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PopupAction {
+    None,
+    Dismiss,
+    Submit(PopupSubmit),
+}
+
+/// A resolved popup submission: exactly one CLI call, chosen by mapping the
+/// popup's purpose plus its captured value. The app executes it; canceling
+/// produces no `PopupSubmit` at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PopupSubmit {
+    RenameGroup { group_id: String, name: String },
+    AddMember { group_id: String, pubkey: String },
+    RemoveMember { group_id: String, pubkey: String },
+    PromoteMember { group_id: String, pubkey: String },
+    LeaveGroup { group_id: String },
+    AcceptInvite { group_id: String },
+    DeclineInvite { group_id: String },
+}
+
+impl Popup {
+    /// The help card: dismiss-on-any-key, so `q` under it closes the card instead
+    /// of quitting the app (the pre-popup help overlay had that bug).
+    pub(crate) fn help() -> Self {
+        Popup::Card {
+            title: "Help".to_owned(),
+            body: help_card_lines(),
+        }
+    }
+
+    /// A dismiss-on-any-key info card with a single-line body.
+    pub(crate) fn info(title: &str, message: &str) -> Self {
+        Popup::Card {
+            title: title.to_owned(),
+            body: vec![message.to_owned()],
+        }
+    }
+
+    /// The pending-invites list picker. Shared by the initial open and the
+    /// after-action refold so the title/purpose live in one place.
+    pub(crate) fn invites(items: Vec<PickerItem>, selected: usize) -> Self {
+        Popup::Picker {
+            purpose: PickerPurpose::Invites,
+            title: "Pending Invites".to_owned(),
+            items,
+            selected,
+        }
+    }
+
+    /// The card/confirm title (only these variants carry a shown title).
+    pub(crate) fn title(&self) -> &str {
+        match self {
+            Popup::Text { title, .. }
+            | Popup::Confirm { title, .. }
+            | Popup::Picker { title, .. }
+            | Popup::Card { title, .. } => title,
+        }
+    }
+}
+
+/// Route one key into an open popup, mutating its editing/navigation state in
+/// place and returning the resulting action. Pure over the popup and key so the
+/// capture-all-keys and submit/cancel flows are reducer-tested without a process.
+pub(crate) fn popup_key(popup: &mut Popup, key: KeyCode) -> PopupAction {
+    match popup {
+        // Any key dismisses a card. This is what makes `q` under help safe.
+        Popup::Card { .. } => PopupAction::Dismiss,
+        Popup::Text { purpose, input, .. } => match key {
+            KeyCode::Enter => {
+                let value = input.value().trim().to_owned();
+                if value.is_empty() {
+                    PopupAction::None
+                } else {
+                    PopupAction::Submit(text_purpose_submit(purpose, value))
+                }
+            }
+            KeyCode::Esc => PopupAction::Dismiss,
+            KeyCode::Backspace => {
+                input.backspace();
+                PopupAction::None
+            }
+            KeyCode::Delete => {
+                input.delete();
+                PopupAction::None
+            }
+            KeyCode::Left => {
+                input.left();
+                PopupAction::None
+            }
+            KeyCode::Right => {
+                input.right();
+                PopupAction::None
+            }
+            KeyCode::Home => {
+                input.home();
+                PopupAction::None
+            }
+            KeyCode::End => {
+                input.end();
+                PopupAction::None
+            }
+            KeyCode::Char(character) => {
+                input.insert(character);
+                PopupAction::None
+            }
+            _ => PopupAction::None,
+        },
+        Popup::Confirm { purpose, .. } => match key {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                PopupAction::Submit(confirm_purpose_submit(purpose))
+            }
+            KeyCode::Char('n') | KeyCode::Esc => PopupAction::Dismiss,
+            _ => PopupAction::None,
+        },
+        Popup::Picker {
+            purpose,
+            items,
+            selected,
+            ..
+        } => match key {
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                PopupAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < items.len() {
+                    *selected += 1;
+                }
+                PopupAction::None
+            }
+            KeyCode::Esc => PopupAction::Dismiss,
+            _ => picker_purpose_action(purpose, items.get(*selected), key),
+        },
+    }
+}
+
+fn text_purpose_submit(purpose: &TextPurpose, value: String) -> PopupSubmit {
+    match purpose {
+        TextPurpose::RenameGroup { group_id } => PopupSubmit::RenameGroup {
+            group_id: group_id.clone(),
+            name: value,
+        },
+        TextPurpose::AddMemberByPubkey { group_id } => PopupSubmit::AddMember {
+            group_id: group_id.clone(),
+            pubkey: value,
+        },
+    }
+}
+
+fn confirm_purpose_submit(purpose: &ConfirmPurpose) -> PopupSubmit {
+    match purpose {
+        ConfirmPurpose::RemoveMember { group_id, pubkey } => PopupSubmit::RemoveMember {
+            group_id: group_id.clone(),
+            pubkey: pubkey.clone(),
+        },
+        ConfirmPurpose::PromoteMember { group_id, pubkey } => PopupSubmit::PromoteMember {
+            group_id: group_id.clone(),
+            pubkey: pubkey.clone(),
+        },
+        ConfirmPurpose::LeaveGroup { group_id } => PopupSubmit::LeaveGroup {
+            group_id: group_id.clone(),
+        },
+    }
+}
+
+fn picker_purpose_action(
+    purpose: &PickerPurpose,
+    item: Option<&PickerItem>,
+    key: KeyCode,
+) -> PopupAction {
+    let Some(item) = item else {
+        return PopupAction::None;
+    };
+    match purpose {
+        PickerPurpose::Invites => match key {
+            KeyCode::Char('a') | KeyCode::Enter => PopupAction::Submit(PopupSubmit::AcceptInvite {
+                group_id: item.id.clone(),
+            }),
+            KeyCode::Char('d') => PopupAction::Submit(PopupSubmit::DeclineInvite {
+                group_id: item.id.clone(),
+            }),
+            _ => PopupAction::None,
+        },
+    }
+}
+
+/// The bottom `[key] action` hint row for a popup, chosen by its interaction
+/// group. Kept in lockstep with `popup_key`.
+pub(crate) fn popup_hint(popup: &Popup) -> &'static str {
+    match popup {
+        Popup::Text { .. } => "[Enter] submit  [Esc] cancel",
+        Popup::Confirm { .. } => "[y] yes  [n] no",
+        Popup::Picker {
+            purpose: PickerPurpose::Invites,
+            ..
+        } => "[a] accept  [d] decline  [j/k] move  [Esc] close",
+        Popup::Card { .. } => "[any key] dismiss",
+    }
+}
+
+/// The help-card body, mirrored by the README "TUI" section and the hints lines.
+pub(crate) fn help_card_lines() -> Vec<String> {
+    [
+        "Chats + messages fill the screen; the composer, hints, and status sit below.",
+        "Tab/BackTab cycle chats, messages, and composer. Ctrl-C quits.",
+        "Chats: j/k move; Enter opens; g group detail; I invites; A account picker.",
+        "Messages: j/k or arrows move; PageUp/PageDown page; G/g newest/oldest.",
+        "On the selected message: r react (Enter sends +), u unreact, d delete.",
+        "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
+        "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
+        "Popups capture every key; Esc or the shown key closes them.",
+        "",
+        "/refresh   /diagnostics   /account <npub-or-hex>   /create-identity",
+        "/login <nsec-or-npub>   /daemon status|start|stop",
+        "/chat new|rename|describe|archive|unarchive|archived",
+        "/members add|remove|list   /react [emoji]   /unreact   /delete   /retry <id>",
+        "/keys fetch|rotate   /profile name <display-name>   /quit",
+    ]
+    .iter()
+    .map(|line| (*line).to_owned())
+    .collect()
+}
+
+/// The exact admin-leave-guard messages, kept as constants so the guard branches
+/// and the tests reference one source of truth (verbatim from wn-tui's final
+/// commit).
+pub(crate) const CANNOT_LEAVE_TITLE: &str = "Cannot Leave Group";
+pub(crate) const LEAVE_SOLE_ADMIN_MESSAGE: &str =
+    "You're the only admin. Promote another member to admin before you can leave.";
+pub(crate) const LEAVE_CO_ADMIN_MESSAGE: &str =
+    "You're an admin of this group. Step down as admin before leaving.";
+
+/// The client-side leave guard: an admin cannot leave. `Blocked` carries the
+/// exact info-card body; a non-admin gets the normal confirm.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LeaveDecision {
+    Blocked(&'static str),
+    Confirm,
+}
+
+pub(crate) fn leave_group_decision(account_is_admin: bool, admin_count: usize) -> LeaveDecision {
+    if !account_is_admin {
+        return LeaveDecision::Confirm;
+    }
+    if admin_count <= 1 {
+        LeaveDecision::Blocked(LEAVE_SOLE_ADMIN_MESSAGE)
+    } else {
+        LeaveDecision::Blocked(LEAVE_CO_ADMIN_MESSAGE)
+    }
+}
+
+/// The loaded group-detail screen state. Owned as `Option<GroupDetailView>` and
+/// dropped when leaving the screen (no per-view subscriptions to tear down; the
+/// data is a one-shot load).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GroupDetailView {
+    pub(crate) group_id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) members: Vec<GroupMemberRow>,
+    pub(crate) relays: Vec<String>,
+    pub(crate) account_is_admin: bool,
+    pub(crate) admin_count: usize,
+    pub(crate) selected: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GroupMemberRow {
+    pub(crate) member_id: String,
+    pub(crate) npub: String,
+    pub(crate) is_admin: bool,
+    pub(crate) is_self: bool,
+}
+
+impl GroupDetailView {
+    pub(crate) fn select_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub(crate) fn select_down(&mut self) {
+        if self.selected + 1 < self.members.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub(crate) fn selected_member(&self) -> Option<&GroupMemberRow> {
+        self.members.get(self.selected)
+    }
+}
+
+/// Combine a group's members with its admin set into the group-detail view,
+/// tagging each member with admin/self flags and deriving the account's own
+/// admin status and the admin count that the leave guard needs.
+pub(crate) fn build_group_detail(
+    group_id: &str,
+    name: &str,
+    description: &str,
+    members: &[(String, String)],
+    admin_ids: &[String],
+    relays: &[String],
+    self_account_id: &str,
+) -> GroupDetailView {
+    let members = members
+        .iter()
+        .map(|(member_id, npub)| GroupMemberRow {
+            member_id: member_id.clone(),
+            npub: npub.clone(),
+            is_admin: admin_ids.iter().any(|admin| admin == member_id),
+            is_self: member_id == self_account_id,
+        })
+        .collect();
+    GroupDetailView {
+        group_id: group_id.to_owned(),
+        name: name.to_owned(),
+        description: description.to_owned(),
+        members,
+        relays: relays.to_vec(),
+        account_is_admin: admin_ids.iter().any(|admin| admin == self_account_id),
+        admin_count: admin_ids.len(),
+        selected: 0,
+    }
+}
+
+/// Parse `(member_id_hex, npub)` pairs from a `groups members` result.
+pub(crate) fn parse_group_members(result: &Value) -> Vec<(String, String)> {
+    result
+        .get("members")
+        .and_then(Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(|member| {
+                    Some((
+                        value_string(member, "member_id")?,
+                        value_string(member, "npub").unwrap_or_default(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse admin account-id hex strings from a `groups admins` result.
+pub(crate) fn parse_group_admins(result: &Value) -> Vec<String> {
+    result
+        .get("admins")
+        .and_then(Value::as_array)
+        .map(|admins| {
+            admins
+                .iter()
+                .filter_map(|admin| value_string(admin, "admin_id"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse relay hint strings from a `groups relays` result.
+pub(crate) fn parse_group_relays(result: &Value) -> Vec<String> {
+    result
+        .get("relays")
+        .and_then(Value::as_array)
+        .map(|relays| {
+            relays
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|relay| !relay.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse `(name, description)` from a `groups show` result's `profile` object.
+pub(crate) fn parse_group_profile(result: &Value) -> Option<(String, String)> {
+    let profile = result.get("profile")?;
+    Some((
+        value_string(profile, "name").unwrap_or_else(|| "unnamed".to_owned()),
+        value_string(profile, "description").unwrap_or_default(),
+    ))
+}
+
+/// Parse the pending-invite rows from a `groups invites` result into picker
+/// items: chat rows with `pending_confirmation: true`, id = group id.
+pub(crate) fn parse_invite_items(result: &Value) -> Vec<PickerItem> {
+    result
+        .get("invites")
+        .and_then(Value::as_array)
+        .map(|invites| {
+            invites
+                .iter()
+                .filter(|invite| {
+                    invite
+                        .get("pending_confirmation")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .filter_map(parse_chat)
+                .map(|chat| PickerItem {
+                    id: chat.group_id,
+                    label: chat.name,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The three states of the login screen: the create/login menu (no accounts),
@@ -460,8 +937,11 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
             "j/k navigate  Enter select  c create  l nsec  q quit"
         }
         Screen::Login(LoginMode::NsecEntry) => "Enter submit  Esc back",
+        Screen::GroupDetail => {
+            "j/k move  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
+        }
         Screen::Main => match focus {
-            Focus::Chats => "j/k navigate  Enter open  A accounts  / command  ? help  q quit",
+            Focus::Chats => "j/k move  Enter open  g detail  I invites  A accounts  / cmd  ? help",
             Focus::Messages => "j/k select  G/g ends  r react  u unreact  d delete  i compose",
             Focus::Composer => "Enter send  Esc clear",
         },
@@ -2291,7 +2771,7 @@ pub(crate) fn apply_notification_event(
             let name = group_name
                 .map(|name| shorten(&terminal_safe_text(&name), 24))
                 .unwrap_or_else(|| "a group".to_owned());
-            NotificationOutcome::Invite(format!("invited to {name}"))
+            NotificationOutcome::Invite(format!("invited to {name} — press I to view invites"))
         }
         NotificationEvent::Other => NotificationOutcome::Ignored,
     }

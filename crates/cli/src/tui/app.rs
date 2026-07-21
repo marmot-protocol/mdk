@@ -68,7 +68,12 @@ pub(crate) struct TuiApp {
     pub(crate) input: Input,
     pub(crate) streaming: Option<StreamComposer>,
     pub(crate) status: String,
-    pub(crate) show_help: bool,
+    /// The one open modal, or none. While set it captures every key (routed at
+    /// the top of `handle_key`) and overlays whatever screen is showing.
+    pub(crate) popup: Option<Popup>,
+    /// Group-detail screen state, loaded on entry and dropped on exit. Present
+    /// only while `screen == Screen::GroupDetail`.
+    pub(crate) group_detail: Option<GroupDetailView>,
 }
 
 impl TuiApp {
@@ -106,7 +111,8 @@ impl TuiApp {
             input: Input::default(),
             streaming: None,
             status: "loading accounts".to_owned(),
-            show_help: false,
+            popup: None,
+            group_detail: None,
         })
     }
 
@@ -162,6 +168,15 @@ impl TuiApp {
     /// is ignored, mirroring where typed characters are accepted.
     pub(crate) fn handle_paste(&mut self, text: String) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        // A popup is modal (mirroring `handle_key`): a text-entry popup takes the
+        // paste into its own input, and every other popup swallows it so nothing
+        // leaks into the composer hidden behind the popup.
+        if let Some(popup) = self.popup.as_mut() {
+            if let Popup::Text { input, .. } = popup {
+                input.insert_str(&text);
+            }
+            return;
+        }
         if self.streaming.is_some() {
             self.input.insert_str(&text);
             let mut stream_id = None;
@@ -302,6 +317,13 @@ impl TuiApp {
             self.running = false;
             return Ok(());
         }
+        // A popup is modal: it captures every key (behind only Ctrl-C) so the
+        // screen behind it — and the streaming and screen dispatch below — see
+        // nothing. This is what makes `q` under the help card close the card
+        // instead of quitting the app.
+        if self.popup.is_some() {
+            return self.handle_popup_key(key);
+        }
         // The streaming check sits ahead of the screen dispatch (behind only
         // Ctrl-C) so the invariant is structural: while a stream is open, keys go
         // to the composer and `tick()` keeps flushing regardless of which screen
@@ -321,12 +343,13 @@ impl TuiApp {
         }
         match self.screen {
             Screen::Login(mode) => return self.handle_login_key(mode, key),
+            Screen::GroupDetail => return self.handle_group_detail_key(key),
             Screen::Main => {}
         }
 
         match key.code {
             KeyCode::Char('?') if self.focus != Focus::Composer => {
-                self.show_help = !self.show_help;
+                self.popup = Some(Popup::help());
             }
             KeyCode::Char('q') if self.focus != Focus::Composer && self.input.is_empty() => {
                 self.running = false;
@@ -334,19 +357,27 @@ impl TuiApp {
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.previous(),
             KeyCode::Esc => {
-                self.show_help = false;
                 self.input.clear();
             }
             KeyCode::Char('/') if self.focus != Focus::Composer => {
-                self.show_help = false;
                 self.focus = Focus::Composer;
                 self.input.insert('/');
             }
             // Reopen the account picker from the chat list (the accounts pane is
             // gone; `A` is its replacement entry point).
             KeyCode::Char('A') if self.focus == Focus::Chats => {
-                self.show_help = false;
                 self.open_account_picker();
+            }
+            // Group detail and invites are entered from the chat list.
+            KeyCode::Char('g') if self.focus == Focus::Chats => {
+                if let Err(err) = self.open_group_detail() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Char('I') if self.focus == Focus::Chats => {
+                if let Err(err) = self.open_invites() {
+                    self.status = format!("error: {err}");
+                }
             }
             // Messages pane: the message-offset scroll model. `k`/Up and PageUp
             // may reach the oldest loaded row and page in older history.
@@ -373,17 +404,14 @@ impl TuiApp {
             // `r` and `d` prefill a slash command in the composer so Enter is the
             // visible action; `u` removes your own reaction immediately (no input).
             KeyCode::Char('r') if self.focus == Focus::Messages => {
-                self.show_help = false;
                 self.prefill_composer("/react ");
             }
             KeyCode::Char('u') if self.focus == Focus::Messages => {
-                self.show_help = false;
                 if let Err(err) = self.unreact_selected_message() {
                     self.status = format!("error: {err}");
                 }
             }
             KeyCode::Char('d') if self.focus == Focus::Messages => {
-                self.show_help = false;
                 self.prefill_composer("/delete");
             }
             // Chat list navigation.
@@ -409,7 +437,6 @@ impl TuiApp {
                 self.input.backspace();
             }
             KeyCode::Char(character) if self.focus == Focus::Composer => {
-                self.show_help = false;
                 self.input.insert(character);
             }
             _ => {}
@@ -646,7 +673,7 @@ impl TuiApp {
     pub(crate) fn run_slash_command(&mut self, command: SlashCommand) -> TuiResult<()> {
         match command {
             SlashCommand::Help => {
-                self.show_help = true;
+                self.popup = Some(Popup::help());
                 Ok(())
             }
             SlashCommand::Refresh => self.refresh_or_return_to_login(),
@@ -824,5 +851,199 @@ impl TuiApp {
         self.selected_chat_row()
             .map(|chat| chat.group_id.clone())
             .ok_or_else(|| TuiError::Cli("no chat selected".to_owned()))
+    }
+
+    /// Route a key into the open popup. The pure `popup_key` reducer owns the
+    /// edit/navigate/submit/cancel decision; the app only closes the popup and
+    /// runs the resolved CLI call, catching its error onto the status line so a
+    /// failed action never tears down the session.
+    pub(crate) fn handle_popup_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        let Some(popup) = self.popup.as_mut() else {
+            return Ok(());
+        };
+        match popup_key(popup, key.code) {
+            PopupAction::None => {}
+            PopupAction::Dismiss => self.popup = None,
+            PopupAction::Submit(submit) => {
+                // The invites picker stays open across actions so one
+                // accept/decline does not lose the user's place: capture the
+                // selection, run the action, then refold the refreshed list back
+                // into the picker (which closes it once empty). Every other popup
+                // is one-shot and closes on submit.
+                let refold = match &self.popup {
+                    Some(Popup::Picker {
+                        purpose: PickerPurpose::Invites,
+                        selected,
+                        ..
+                    }) => Some(*selected),
+                    _ => None,
+                };
+                self.popup = None;
+                if let Err(err) = self.run_popup_submit(submit) {
+                    self.status = format!("error: {err}");
+                }
+                if let Some(selected) = refold
+                    && let Err(err) = self.refold_invites_picker(selected)
+                {
+                    self.status = format!("error: {err}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_popup_submit(&mut self, submit: PopupSubmit) -> TuiResult<()> {
+        match submit {
+            PopupSubmit::RenameGroup { group_id, name } => self.rename_group(&group_id, name),
+            PopupSubmit::AddMember { group_id, pubkey } => self.add_group_member(&group_id, pubkey),
+            PopupSubmit::RemoveMember { group_id, pubkey } => {
+                self.remove_group_member(&group_id, pubkey)
+            }
+            PopupSubmit::PromoteMember { group_id, pubkey } => {
+                self.promote_group_member(&group_id, pubkey)
+            }
+            PopupSubmit::LeaveGroup { group_id } => self.leave_group(&group_id),
+            PopupSubmit::AcceptInvite { group_id } => self.accept_invite(&group_id),
+            PopupSubmit::DeclineInvite { group_id } => self.decline_invite(&group_id),
+        }
+    }
+
+    /// Group-detail screen keys. `Esc` drops the view and returns to the main
+    /// view; member/group actions open a popup that routes back through
+    /// `run_popup_submit`.
+    pub(crate) fn handle_group_detail_key(&mut self, key: KeyEvent) -> TuiResult<()> {
+        match key.code {
+            KeyCode::Esc => self.leave_group_detail(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(view) = self.group_detail.as_mut() {
+                    view.select_up();
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(view) = self.group_detail.as_mut() {
+                    view.select_down();
+                }
+            }
+            KeyCode::Char('A') => self.open_add_member_popup(),
+            KeyCode::Char('R') => self.open_rename_group_popup(),
+            KeyCode::Char('x') => self.open_remove_member_popup(),
+            KeyCode::Char('P') => self.open_promote_member_popup(),
+            KeyCode::Char('L') => self.open_leave_group_popup(),
+            KeyCode::Char('I') => {
+                if let Err(err) = self.open_invites() {
+                    self.status = format!("error: {err}");
+                }
+            }
+            KeyCode::Char('?') => self.popup = Some(Popup::help()),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn leave_group_detail(&mut self) {
+        self.group_detail = None;
+        self.screen = Screen::Main;
+        self.focus = Focus::Chats;
+    }
+
+    fn open_add_member_popup(&mut self) {
+        if let Some(view) = &self.group_detail {
+            self.popup = Some(Popup::Text {
+                purpose: TextPurpose::AddMemberByPubkey {
+                    group_id: view.group_id.clone(),
+                },
+                title: "Add Member".to_owned(),
+                input: Input::default(),
+            });
+        }
+    }
+
+    fn open_rename_group_popup(&mut self) {
+        if let Some(view) = &self.group_detail {
+            let mut input = Input::default();
+            input.set_value(view.name.clone());
+            self.popup = Some(Popup::Text {
+                purpose: TextPurpose::RenameGroup {
+                    group_id: view.group_id.clone(),
+                },
+                title: "Rename Group".to_owned(),
+                input,
+            });
+        }
+    }
+
+    fn open_remove_member_popup(&mut self) {
+        let Some(view) = &self.group_detail else {
+            return;
+        };
+        let Some(member) = view.selected_member() else {
+            return;
+        };
+        if member.is_self {
+            self.status = "cannot remove yourself; press L to leave".to_owned();
+            return;
+        }
+        self.popup = Some(Popup::Confirm {
+            purpose: ConfirmPurpose::RemoveMember {
+                group_id: view.group_id.clone(),
+                pubkey: member.npub.clone(),
+            },
+            title: "Remove Member".to_owned(),
+            body: vec![format!(
+                "Remove {}?",
+                shorten(&terminal_safe_text(&member.npub), 24)
+            )],
+        });
+    }
+
+    fn open_promote_member_popup(&mut self) {
+        let Some(view) = &self.group_detail else {
+            return;
+        };
+        let Some(member) = view.selected_member() else {
+            return;
+        };
+        if member.is_self {
+            self.status = "cannot promote yourself".to_owned();
+            return;
+        }
+        if member.is_admin {
+            self.status = "member is already an admin".to_owned();
+            return;
+        }
+        self.popup = Some(Popup::Confirm {
+            purpose: ConfirmPurpose::PromoteMember {
+                group_id: view.group_id.clone(),
+                pubkey: member.npub.clone(),
+            },
+            title: "Promote to Admin".to_owned(),
+            body: vec![format!(
+                "Promote {} to admin?",
+                shorten(&terminal_safe_text(&member.npub), 24)
+            )],
+        });
+    }
+
+    /// The admin-leave guard: an admin cannot leave (info card, sole-admin vs
+    /// step-down message); a non-admin gets the normal confirm popup.
+    fn open_leave_group_popup(&mut self) {
+        let Some(view) = &self.group_detail else {
+            return;
+        };
+        self.popup = Some(
+            match leave_group_decision(view.account_is_admin, view.admin_count) {
+                LeaveDecision::Blocked(message) => Popup::info(CANNOT_LEAVE_TITLE, message),
+                LeaveDecision::Confirm => Popup::Confirm {
+                    purpose: ConfirmPurpose::LeaveGroup {
+                        group_id: view.group_id.clone(),
+                    },
+                    title: "Leave Group".to_owned(),
+                    body: vec![format!(
+                        "Leave {}?",
+                        shorten(&terminal_safe_text(&view.name), 24)
+                    )],
+                },
+            },
+        );
     }
 }

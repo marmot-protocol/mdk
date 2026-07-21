@@ -9,6 +9,18 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: added a modal popup system and a group-detail screen. One `Option<Popup>` captures every key while open
+  (the screen behind it is inert), with text-entry, confirm, list-picker, and dismiss-on-any-key card variants; the
+  help overlay became a card, which fixes `q` under help quitting the app. `g` on the selected chat opens a
+  group-detail screen showing members (with admin and `(you)` badges), relays, and name/description loaded on entry
+  from `groups members`/`groups admins`/`groups relays`/`groups show`; from it `A` adds a member (`groups
+  add-members`), `x` removes one (`groups remove-members`), `P` promotes to admin (`groups promote`), `R` renames the
+  group (`groups rename`), and `L` leaves (`groups leave`) — an admin is blocked from leaving with a "Cannot Leave
+  Group" info card (sole-admin vs step-down message) while a non-admin gets a confirm, and `?` shows the help card.
+  `I` (from the chat list or group detail) opens a pending-invites picker over `groups invites`, accepting
+  (`groups accept`) or declining (`groups decline`) in place; the picker stays open across actions and closes only
+  once no invites remain, and accepting from the group-detail screen returns to the main view. The group-invite
+  status notice now prompts `I`. No JSON response shapes changed.
 - WN Agent control clients and the connector now speak the incompatible `marmot.agent-control.v2` protocol.
   `stream_begin` returns a random per-stream bearer capability that every later stream operation must present; exact
   request-id retries return the original begin receipt, and stream-id collisions no longer replace active sessions.

@@ -1605,12 +1605,12 @@ fn leading_question_mark_inserts_into_empty_composer() {
     let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
     app.focus = Focus::Composer;
     assert!(app.input.is_empty());
-    assert!(!app.show_help);
+    assert!(app.popup.is_none());
 
     app.handle_key(char_key('?')).expect("handle '?'");
 
     assert_eq!(app.input.value(), "?");
-    assert!(!app.show_help, "'?' in composer must not toggle help");
+    assert!(app.popup.is_none(), "'?' in composer must not open help");
 
     app.handle_key(char_key('h')).expect("handle 'h'");
     app.handle_key(char_key('i')).expect("handle 'i'");
@@ -1618,18 +1618,40 @@ fn leading_question_mark_inserts_into_empty_composer() {
 }
 
 #[test]
-fn question_mark_toggles_help_outside_composer() {
-    // '?' still toggles help when the composer is not focused.
+fn question_mark_opens_help_popup_outside_composer() {
+    // '?' opens the help popup when the composer is not focused; a second key
+    // (routed to the modal) dismisses the dismiss-on-any-key card.
     let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
     app.focus = Focus::Chats;
-    assert!(!app.show_help);
+    assert!(app.popup.is_none());
 
     app.handle_key(char_key('?')).expect("handle '?'");
-    assert!(app.show_help, "'?' outside composer toggles help on");
+    assert!(
+        matches!(app.popup, Some(Popup::Card { .. })),
+        "'?' outside composer opens the help card"
+    );
     assert!(app.input.is_empty());
 
     app.handle_key(char_key('?')).expect("handle '?'");
-    assert!(!app.show_help, "'?' outside composer toggles help off");
+    assert!(
+        app.popup.is_none(),
+        "a key under the help card dismisses it"
+    );
+}
+
+#[test]
+fn q_under_open_help_dismisses_the_card_without_quitting() {
+    // Regression: with the old boolean help overlay, `q` under help quit the
+    // app. As a modal card, `q` is captured and dismisses the card instead.
+    let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('?')).expect("open help");
+    assert!(app.popup.is_some());
+
+    app.handle_key(char_key('q')).expect("q under help");
+
+    assert!(app.popup.is_none(), "q dismisses the help card");
+    assert!(app.running, "q under help must not quit the app");
 }
 
 fn line_text(line: &Line<'_>) -> String {
@@ -1680,7 +1702,8 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         input: Input::default(),
         streaming: None,
         status: String::new(),
-        show_help: false,
+        popup: None,
+        group_detail: None,
     }
 }
 
@@ -1700,6 +1723,40 @@ fn test_unused_client() -> WnClient {
 fn test_json_client(response: &str) -> (tempfile::TempDir, WnClient) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let exe = test_json_executable(tempdir.path(), response);
+    let client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    (tempdir, client)
+}
+
+/// A fake `wn` whose `groups invites` calls return `first` on the first call and
+/// `rest` afterward, while every other subcommand returns a benign empty result.
+/// This lets a test drive the invites picker across an accept/decline where the
+/// refreshed list shrinks (the fixed-response fake cannot model that).
+#[cfg(unix)]
+fn test_invites_seq_client(first: &str, rest: &str) -> (tempfile::TempDir, WnClient) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let counter = tempdir.path().join("invites-seen");
+    let exe = tempdir.path().join("wn-json");
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  *\" invites \"*)\n    if [ -f '{counter}' ]; then\ncat <<'JSON'\n{rest}\nJSON\n    else\n      : > '{counter}'\ncat <<'JSON'\n{first}\nJSON\n    fi\n    ;;\n  *)\ncat <<'JSON'\n{{\"ok\":true,\"result\":{{}}}}\nJSON\n    ;;\nesac\n",
+        counter = counter.display(),
+    );
+    std::fs::write(&exe, script).expect("write fake wn");
+    let mut permissions = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
     let client = WnClient {
         exe,
         home: None,
@@ -2323,7 +2380,7 @@ fn group_invite_notification_surfaces_a_notice() {
     }));
     assert_eq!(
         apply_notification_event(&mut seen, &mut pending, Some("aa"), event),
-        NotificationOutcome::Invite("invited to Secret Room".to_owned())
+        NotificationOutcome::Invite("invited to Secret Room — press I to view invites".to_owned())
     );
     assert!(!pending, "an invite does not schedule a re-list this phase");
 }
@@ -4421,11 +4478,15 @@ fn status_bar_line_strips_control_sequences_from_untrusted_fields() {
 fn hints_line_matches_the_keymap_per_screen_and_focus() {
     assert_eq!(
         hints_line(Screen::Main, Focus::Chats, true),
-        "j/k navigate  Enter open  A accounts  / command  ? help  q quit"
+        "j/k move  Enter open  g detail  I invites  A accounts  / cmd  ? help"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Messages, true),
         "j/k select  G/g ends  r react  u unreact  d delete  i compose"
+    );
+    assert_eq!(
+        hints_line(Screen::GroupDetail, Focus::Chats, true),
+        "j/k move  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Composer, true),
@@ -4449,6 +4510,646 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
         hints_line(Screen::Login(LoginMode::NsecEntry), Focus::Chats, false),
         "Enter submit  Esc back"
     );
+}
+
+// ---- Phase 5a: popups, group detail, invites ----
+
+#[test]
+fn popup_key_text_entry_submits_purpose_and_cancels() {
+    let mut rename = Popup::Text {
+        purpose: TextPurpose::RenameGroup {
+            group_id: "g1".to_owned(),
+        },
+        title: "Rename Group".to_owned(),
+        input: Input::default(),
+    };
+    for character in "ops".chars() {
+        assert_eq!(
+            popup_key(&mut rename, KeyCode::Char(character)),
+            PopupAction::None
+        );
+    }
+    assert_eq!(
+        popup_key(&mut rename, KeyCode::Enter),
+        PopupAction::Submit(PopupSubmit::RenameGroup {
+            group_id: "g1".to_owned(),
+            name: "ops".to_owned(),
+        })
+    );
+
+    let mut add = Popup::Text {
+        purpose: TextPurpose::AddMemberByPubkey {
+            group_id: "g1".to_owned(),
+        },
+        title: "Add Member".to_owned(),
+        input: Input::default(),
+    };
+    // An empty submit is a no-op; Esc cancels with no side effect.
+    assert_eq!(popup_key(&mut add, KeyCode::Enter), PopupAction::None);
+    for character in "npub1".chars() {
+        popup_key(&mut add, KeyCode::Char(character));
+    }
+    assert_eq!(
+        popup_key(&mut add, KeyCode::Enter),
+        PopupAction::Submit(PopupSubmit::AddMember {
+            group_id: "g1".to_owned(),
+            pubkey: "npub1".to_owned(),
+        })
+    );
+    let mut cancel = Popup::Text {
+        purpose: TextPurpose::AddMemberByPubkey {
+            group_id: "g1".to_owned(),
+        },
+        title: "Add Member".to_owned(),
+        input: Input::default(),
+    };
+    assert_eq!(popup_key(&mut cancel, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
+fn popup_key_confirm_accepts_y_or_enter_and_cancels_n_or_esc() {
+    let leave = || Popup::Confirm {
+        purpose: ConfirmPurpose::LeaveGroup {
+            group_id: "g1".to_owned(),
+        },
+        title: "Leave Group".to_owned(),
+        body: Vec::new(),
+    };
+    let expect = PopupAction::Submit(PopupSubmit::LeaveGroup {
+        group_id: "g1".to_owned(),
+    });
+    assert_eq!(popup_key(&mut leave(), KeyCode::Char('y')), expect);
+    assert_eq!(popup_key(&mut leave(), KeyCode::Enter), expect);
+    assert_eq!(
+        popup_key(&mut leave(), KeyCode::Char('n')),
+        PopupAction::Dismiss
+    );
+    assert_eq!(popup_key(&mut leave(), KeyCode::Esc), PopupAction::Dismiss);
+    // A confirm ignores unrelated keys instead of acting on them.
+    assert_eq!(
+        popup_key(&mut leave(), KeyCode::Char('x')),
+        PopupAction::None
+    );
+}
+
+#[test]
+fn popup_key_card_dismisses_on_any_key() {
+    for key in [
+        KeyCode::Char('q'),
+        KeyCode::Char('j'),
+        KeyCode::Enter,
+        KeyCode::Esc,
+    ] {
+        assert_eq!(popup_key(&mut Popup::help(), key), PopupAction::Dismiss);
+    }
+}
+
+#[test]
+fn popup_key_invites_picker_navigates_accepts_and_declines() {
+    let items = vec![
+        PickerItem {
+            id: "g1".to_owned(),
+            label: "Room A".to_owned(),
+        },
+        PickerItem {
+            id: "g2".to_owned(),
+            label: "Room B".to_owned(),
+        },
+    ];
+    let picker = || Popup::Picker {
+        purpose: PickerPurpose::Invites,
+        title: "Pending Invites".to_owned(),
+        items: items.clone(),
+        selected: 0,
+    };
+    let mut accept = picker();
+    assert_eq!(popup_key(&mut accept, KeyCode::Down), PopupAction::None);
+    assert_eq!(
+        popup_key(&mut accept, KeyCode::Char('a')),
+        PopupAction::Submit(PopupSubmit::AcceptInvite {
+            group_id: "g2".to_owned(),
+        })
+    );
+    let mut decline = picker();
+    assert_eq!(
+        popup_key(&mut decline, KeyCode::Char('d')),
+        PopupAction::Submit(PopupSubmit::DeclineInvite {
+            group_id: "g1".to_owned(),
+        })
+    );
+    assert_eq!(popup_key(&mut decline, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
+fn leave_group_decision_covers_sole_admin_co_admin_and_non_admin() {
+    assert_eq!(
+        leave_group_decision(true, 1),
+        LeaveDecision::Blocked(LEAVE_SOLE_ADMIN_MESSAGE)
+    );
+    assert_eq!(
+        leave_group_decision(true, 3),
+        LeaveDecision::Blocked(LEAVE_CO_ADMIN_MESSAGE)
+    );
+    assert_eq!(leave_group_decision(false, 3), LeaveDecision::Confirm);
+    // The exact wn-tui messages, pinned so a reword is a deliberate change.
+    assert_eq!(
+        LEAVE_SOLE_ADMIN_MESSAGE,
+        "You're the only admin. Promote another member to admin before you can leave."
+    );
+    assert_eq!(
+        LEAVE_CO_ADMIN_MESSAGE,
+        "You're an admin of this group. Step down as admin before leaving."
+    );
+}
+
+#[test]
+fn build_group_detail_tags_admins_and_self() {
+    let members = vec![
+        ("aa".to_owned(), "npubself".to_owned()),
+        ("bb".to_owned(), "npubbob".to_owned()),
+    ];
+    let admins = vec!["aa".to_owned()];
+    let view = build_group_detail(
+        "g1",
+        "Ops",
+        "desc",
+        &members,
+        &admins,
+        &["wss://relay.example".to_owned()],
+        "aa",
+    );
+    assert!(view.members[0].is_admin && view.members[0].is_self);
+    assert!(!view.members[1].is_admin && !view.members[1].is_self);
+    assert!(view.account_is_admin);
+    assert_eq!(view.admin_count, 1);
+    assert_eq!(view.relays, vec!["wss://relay.example".to_owned()]);
+}
+
+#[test]
+fn group_detail_parsers_read_members_admins_relays_profile_and_invites() {
+    let result = serde_json::json!({
+        "members": [{"member_id": "aa", "npub": "npuba", "local": true}],
+        "admins": [{"admin_id": "aa", "npub": "npuba"}],
+        "relays": ["wss://relay.example", ""],
+        "profile": {"name": "Ops", "description": "the ops room"},
+    });
+    assert_eq!(
+        parse_group_members(&result),
+        vec![("aa".to_owned(), "npuba".to_owned())]
+    );
+    assert_eq!(parse_group_admins(&result), vec!["aa".to_owned()]);
+    // The empty relay string is filtered out.
+    assert_eq!(
+        parse_group_relays(&result),
+        vec!["wss://relay.example".to_owned()]
+    );
+    assert_eq!(
+        parse_group_profile(&result),
+        Some(("Ops".to_owned(), "the ops room".to_owned()))
+    );
+
+    let invites = serde_json::json!({
+        "invites": [
+            {"group_id": "g1", "profile": {"name": "Room A"}, "pending_confirmation": true},
+            {"group_id": "g2", "profile": {"name": "Room B"}, "pending_confirmation": false},
+        ]
+    });
+    assert_eq!(
+        parse_invite_items(&invites),
+        vec![PickerItem {
+            id: "g1".to_owned(),
+            label: "Room A".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn open_group_detail_loads_state_and_esc_returns_to_main() {
+    let self_id = "aa".repeat(32);
+    let bob_id = "bb".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"profile":{{"name":"Ops","description":"ops room"}},"members":[{{"member_id":"{self_id}","npub":"npubself"}},{{"member_id":"{bob_id}","npub":"npubbob"}}],"admins":[{{"admin_id":"{self_id}","npub":"npubself"}}],"relays":["wss://relay.example"]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &self_id);
+    app.focus = Focus::Chats;
+    app.chats = vec![ChatRow {
+        group_id: "cc".repeat(32),
+        name: "Ops".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    }];
+    app.selected_chat = 0;
+
+    app.handle_key(char_key('g')).expect("g opens group detail");
+
+    assert_eq!(app.screen, Screen::GroupDetail);
+    let view = app.group_detail.as_ref().expect("group detail loaded");
+    assert_eq!(view.members.len(), 2);
+    assert!(view.account_is_admin);
+    assert_eq!(view.admin_count, 1);
+    assert!(view.members[0].is_self);
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves group detail");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(
+        app.group_detail.is_none(),
+        "group-detail state is dropped on exit"
+    );
+}
+
+#[test]
+fn group_detail_leave_guard_blocks_admins_and_confirms_non_admins() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops".to_owned(),
+        description: String::new(),
+        members: Vec::new(),
+        relays: Vec::new(),
+        account_is_admin: true,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('L')).expect("L (sole admin)");
+    match &app.popup {
+        Some(Popup::Card { title, body }) => {
+            assert_eq!(title, CANNOT_LEAVE_TITLE);
+            assert_eq!(body[0], LEAVE_SOLE_ADMIN_MESSAGE);
+        }
+        other => panic!("expected sole-admin info card, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.group_detail.as_mut().unwrap().admin_count = 2;
+    app.handle_key(char_key('L')).expect("L (co-admin)");
+    match &app.popup {
+        Some(Popup::Card { body, .. }) => assert_eq!(body[0], LEAVE_CO_ADMIN_MESSAGE),
+        other => panic!("expected co-admin info card, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.group_detail.as_mut().unwrap().account_is_admin = false;
+    app.handle_key(char_key('L')).expect("L (non-admin)");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::LeaveGroup { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: String::new(),
+        members: vec![GroupMemberRow {
+            member_id: "bb".to_owned(),
+            npub: "npubbob".to_owned(),
+            is_admin: false,
+            is_self: false,
+        }],
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('A')).expect("A add member");
+    match &app.popup {
+        Some(Popup::Text { purpose, input, .. }) => {
+            assert_eq!(
+                *purpose,
+                TextPurpose::AddMemberByPubkey {
+                    group_id: "g1".to_owned()
+                }
+            );
+            assert!(input.is_empty(), "add-member starts empty");
+        }
+        other => panic!("expected add-member text popup, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.handle_key(char_key('R')).expect("R rename");
+    match &app.popup {
+        Some(Popup::Text { purpose, input, .. }) => {
+            assert_eq!(
+                *purpose,
+                TextPurpose::RenameGroup {
+                    group_id: "g1".to_owned()
+                }
+            );
+            assert_eq!(
+                input.value(),
+                "Ops Room",
+                "rename prefills the current name"
+            );
+        }
+        other => panic!("expected rename text popup, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.handle_key(char_key('P')).expect("P promote");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::PromoteMember { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn question_mark_in_group_detail_opens_the_help_card() {
+    // `?` is bound to the help card on the group-detail screen too, so the same
+    // help is reachable there and not only from the main chat list.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: String::new(),
+        members: Vec::new(),
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('?')).expect("? in group detail");
+
+    assert!(
+        matches!(app.popup, Some(Popup::Card { .. })),
+        "'?' opens the help card on the group-detail screen"
+    );
+}
+
+#[test]
+fn promote_yourself_is_blocked_with_a_status_not_a_confirm() {
+    // Mirrors the remove-self guard: you cannot promote yourself, so `P` on your
+    // own row sets a status line instead of opening a confirm popup.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: String::new(),
+        members: vec![GroupMemberRow {
+            member_id: "aa".to_owned(),
+            npub: "npubme".to_owned(),
+            is_admin: false,
+            is_self: true,
+        }],
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('P')).expect("P promote self");
+
+    assert!(
+        app.popup.is_none(),
+        "promoting yourself opens no confirm popup"
+    );
+    assert!(
+        app.status.contains("promote yourself"),
+        "a clear status explains the block, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn popup_captures_keys_so_the_screen_behind_it_is_inert() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    app.chats = vec![
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "one".to_owned(),
+            archived: false,
+            projection: ChatProjection::default(),
+        },
+        ChatRow {
+            group_id: "g2".to_owned(),
+            name: "two".to_owned(),
+            archived: false,
+            projection: ChatProjection::default(),
+        },
+    ];
+    app.selected_chat = 0;
+    app.popup = Some(Popup::help());
+
+    app.handle_key(char_key('j')).expect("j under popup");
+
+    assert_eq!(
+        app.selected_chat, 0,
+        "the chat list behind the popup does not move"
+    );
+    assert!(
+        app.popup.is_none(),
+        "the dismiss-on-any-key card closed instead"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invites_picker_accept_closes_the_popup_once_the_last_invite_is_gone() {
+    let account_id = "aa".repeat(32);
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Invited Room"},"pending_confirmation":true}]}}"#;
+    let empty = r#"{"ok":true,"result":{"invites":[]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(one, empty);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    assert!(matches!(app.popup, Some(Popup::Picker { .. })));
+
+    app.handle_key(char_key('a')).expect("accept invite");
+    assert!(
+        app.popup.is_none(),
+        "the picker closes once the refreshed list is empty"
+    );
+    assert!(
+        app.status.contains("accepted invite"),
+        "status should confirm the accept, got {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invites_picker_decline_closes_the_popup_once_the_last_invite_is_gone() {
+    let account_id = "aa".repeat(32);
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Invited Room"},"pending_confirmation":true}]}}"#;
+    let empty = r#"{"ok":true,"result":{"invites":[]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(one, empty);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    app.handle_key(char_key('d')).expect("decline invite");
+
+    assert!(app.popup.is_none());
+    assert!(
+        app.status.contains("declined invite"),
+        "status should confirm the decline, got {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invites_picker_stays_open_after_accepting_one_of_several() {
+    // Accepting one invite refolds the refreshed list back into the still-open
+    // picker instead of closing after a single action.
+    let account_id = "aa".repeat(32);
+    let two = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Room D"},"pending_confirmation":true},{"group_id":"eeee","profile":{"name":"Room E"},"pending_confirmation":true}]}}"#;
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"eeee","profile":{"name":"Room E"},"pending_confirmation":true}]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(two, one);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    match &app.popup {
+        Some(Popup::Picker { items, .. }) => assert_eq!(items.len(), 2, "two invites shown"),
+        other => panic!("expected the invites picker, got {other:?}"),
+    }
+
+    app.handle_key(char_key('a'))
+        .expect("accept the first invite");
+
+    match &app.popup {
+        Some(Popup::Picker {
+            items, selected, ..
+        }) => {
+            assert_eq!(
+                items.len(),
+                1,
+                "the picker stays open with the remaining invite"
+            );
+            assert!(*selected < items.len(), "the selection is clamped in range");
+        }
+        other => panic!("expected the picker to stay open, got {other:?}"),
+    }
+    assert!(
+        app.status.contains("accepted invite"),
+        "status confirms the accept, got {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn accepting_an_invite_from_group_detail_returns_to_main() {
+    // Accepting via `I` from the group-detail screen leaves that (now stale)
+    // screen so the refreshed chat list and selection are visible.
+    let account_id = "aa".repeat(32);
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Invited Room"},"pending_confirmation":true}]}}"#;
+    let empty = r#"{"ok":true,"result":{"invites":[]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(one, empty);
+    let mut app = test_tui_app(client, &account_id);
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g0".to_owned(),
+        name: "Old Room".to_owned(),
+        description: String::new(),
+        members: Vec::new(),
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    app.handle_key(char_key('a')).expect("accept invite");
+
+    assert_eq!(
+        app.screen,
+        Screen::Main,
+        "accepting returns to the main view"
+    );
+    assert!(
+        app.group_detail.is_none(),
+        "the stale group-detail view is cleared"
+    );
+    assert!(app.popup.is_none(), "the sole invite emptied the picker");
+}
+
+#[test]
+fn empty_invites_shows_an_info_card_not_a_picker() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"invites":[]}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I with no invites");
+
+    assert!(matches!(app.popup, Some(Popup::Card { .. })));
+}
+
+#[test]
+fn popup_overlay_frame_shows_title_body_and_hint() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.popup = Some(Popup::Confirm {
+        purpose: ConfirmPurpose::LeaveGroup {
+            group_id: "g1".to_owned(),
+        },
+        title: "Leave Group".to_owned(),
+        body: vec!["Leave ops-room?".to_owned()],
+    });
+
+    let rendered = rendered_buffer(&mut app);
+
+    assert!(rendered.contains("Leave Group"), "popup title present");
+    assert!(rendered.contains("Leave ops-room?"), "popup body present");
+    assert!(rendered.contains("[y] yes"), "popup hint present");
+}
+
+#[test]
+fn group_detail_frame_shows_members_with_badges_and_relays() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: "the ops".to_owned(),
+        members: vec![
+            GroupMemberRow {
+                member_id: "aa".to_owned(),
+                npub: "npubself".to_owned(),
+                is_admin: true,
+                is_self: true,
+            },
+            GroupMemberRow {
+                member_id: "bb".to_owned(),
+                npub: "npubbob".to_owned(),
+                is_admin: false,
+                is_self: false,
+            },
+        ],
+        relays: vec!["wss://relay.example".to_owned()],
+        account_is_admin: true,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    let rendered = rendered_buffer(&mut app);
+
+    assert!(rendered.contains("Ops Room"), "group name present");
+    assert!(rendered.contains("npubself"), "member npub present");
+    assert!(rendered.contains("[admin]"), "admin badge present");
+    assert!(rendered.contains("(you)"), "self badge present");
+    assert!(rendered.contains("Relays"), "relay section present");
+    assert!(rendered.contains("relay.example"), "relay hint present");
 }
 
 #[test]
@@ -4855,10 +5556,7 @@ fn main_frame_shows_chats_and_messages_with_bars_and_toggled_diagnostics() {
         !rendered.contains("Accounts"),
         "the accounts pane is gone from the main view"
     );
-    assert!(
-        rendered.contains("j/k navigate"),
-        "chats hints line present"
-    );
+    assert!(rendered.contains("g detail"), "chats hints line present");
     assert!(rendered.contains("daemon"), "status bar present");
     assert!(
         !rendered.contains("Diagnostics"),
@@ -5263,19 +5961,18 @@ fn messages_d_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
 }
 
 #[test]
-fn messages_u_dismisses_the_help_overlay_like_r_and_d() {
-    // `r` and `d` already clear the help overlay; `u` should too, for one-liner
-    // consistency. The dismissal happens regardless of whether the unreact call
-    // itself succeeds (here it errors into the status line with no selection).
+fn message_accelerator_under_open_help_dismisses_the_card_and_does_not_act() {
+    // The help card is a modal: a message-accelerator key (`u`) under it is
+    // captured by the popup and dismisses the card instead of unreacting.
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.focus = Focus::Messages;
-    app.show_help = true;
+    app.popup = Some(Popup::help());
     app.messages_account_id = Some("aa".repeat(32));
     app.messages_group_id = Some("bb".repeat(32));
 
     app.handle_key(char_key('u')).expect("u");
 
-    assert!(!app.show_help, "u dismisses the help overlay like r and d");
+    assert!(app.popup.is_none(), "u under the help card dismisses it");
 }
 
 #[test]
@@ -5531,6 +6228,58 @@ fn handle_paste_is_ignored_on_the_login_menu_and_when_messages_focused() {
     assert!(
         messages.input.is_empty(),
         "paste is ignored when the messages pane is focused"
+    );
+}
+
+#[test]
+fn handle_paste_into_a_text_popup_lands_in_its_input_not_the_composer() {
+    // Pasting an npub into the Add Member text popup fills the popup's input,
+    // never the composer hidden behind it.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    app.popup = Some(Popup::Text {
+        purpose: TextPurpose::AddMemberByPubkey {
+            group_id: "g1".to_owned(),
+        },
+        title: "Add Member".to_owned(),
+        input: Input::default(),
+    });
+
+    app.handle_paste("npub1pasted".to_owned());
+
+    match &app.popup {
+        Some(Popup::Text { input, .. }) => {
+            assert_eq!(input.value(), "npub1pasted", "paste fills the popup input");
+        }
+        other => panic!("expected the text popup to stay open, got {other:?}"),
+    }
+    assert!(
+        app.input.is_empty(),
+        "the composer behind the popup stays untouched"
+    );
+}
+
+#[test]
+fn handle_paste_under_a_card_leaves_the_composer_untouched() {
+    // A dismiss-on-any-key card has no text field; a paste under it is swallowed
+    // and must not leak into the composer hidden behind it.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    app.input.set_value("draft");
+    app.popup = Some(Popup::help());
+
+    app.handle_paste("leaked".to_owned());
+
+    assert_eq!(
+        app.input.value(),
+        "draft",
+        "paste does not leak into the composer behind the card"
+    );
+    assert!(
+        matches!(app.popup, Some(Popup::Card { .. })),
+        "the card stays open"
     );
 }
 

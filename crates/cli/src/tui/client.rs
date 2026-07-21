@@ -656,6 +656,198 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Enter the group-detail screen for the selected chat, loading its data
+    /// (one-shot; no per-view subscriptions). A fresh selection starts at the top.
+    pub(crate) fn open_group_detail(&mut self) -> TuiResult<()> {
+        let group_id = self.require_selected_group()?;
+        self.group_detail = None;
+        self.load_group_detail(&group_id)?;
+        self.screen = Screen::GroupDetail;
+        self.status = "group detail".to_owned();
+        Ok(())
+    }
+
+    /// Load (or reload) the group-detail view: members with admin badges from
+    /// `groups members` + `groups admins`, relay hints from `groups relays`, and
+    /// name/description from `groups show`. The member selection is preserved and
+    /// clamped across reloads so a membership change never jumps the cursor.
+    pub(crate) fn load_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let members_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "members", group_id])?;
+        let admins_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "admins", group_id])?;
+        let relays_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "relays", group_id])?;
+        let show_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "show", group_id])?;
+        let (name, description) = parse_group_profile(&show_result).unwrap_or_else(|| {
+            (
+                self.selected_chat_row()
+                    .map(|chat| chat.name.clone())
+                    .unwrap_or_default(),
+                String::new(),
+            )
+        });
+        let members = parse_group_members(&members_result);
+        let admins = parse_group_admins(&admins_result);
+        let relays = parse_group_relays(&relays_result);
+        let previous = self.group_detail.as_ref().map_or(0, |view| view.selected);
+        let mut view = build_group_detail(
+            group_id,
+            &name,
+            &description,
+            &members,
+            &admins,
+            &relays,
+            &account_id,
+        );
+        view.selected = previous.min(view.members.len().saturating_sub(1));
+        self.group_detail = Some(view);
+        Ok(())
+    }
+
+    fn reload_group_detail_if_active(&mut self, group_id: &str) -> TuiResult<()> {
+        if matches!(self.screen, Screen::GroupDetail) {
+            self.load_group_detail(group_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rename_group(&mut self, group_id: &str, name: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self.client.run_json(
+            Some(&account_id),
+            &["groups", "rename", group_id, name.as_str()],
+        )?;
+        let status = publish_status("renamed group", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.refresh_chats()?;
+        self.status = status;
+        Ok(())
+    }
+
+    pub(crate) fn add_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let mut args = vec![
+            "groups".to_owned(),
+            "add-members".to_owned(),
+            group_id.to_owned(),
+        ];
+        args.extend(unique_member_refs(vec![pubkey]));
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        let status = publish_status("added member(s)", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.status = status;
+        Ok(())
+    }
+
+    pub(crate) fn remove_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let mut args = vec![
+            "groups".to_owned(),
+            "remove-members".to_owned(),
+            group_id.to_owned(),
+        ];
+        args.extend(unique_member_refs(vec![pubkey]));
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        let status = publish_status("removed member(s)", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.status = status;
+        Ok(())
+    }
+
+    pub(crate) fn promote_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self.client.run_json(
+            Some(&account_id),
+            &["groups", "promote", group_id, pubkey.as_str()],
+        )?;
+        let status = publish_status("promoted admin", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.status = status;
+        Ok(())
+    }
+
+    /// Leave the group and return to the main view. On success the chat is gone
+    /// from the list, so the group-detail state is dropped and the chats are
+    /// re-listed before the screen shows again.
+    pub(crate) fn leave_group(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "leave", group_id])?;
+        let status = publish_status("left group", &result);
+        self.leave_group_detail();
+        self.refresh_chats()?;
+        self.status = status;
+        Ok(())
+    }
+
+    /// Open the pending-invites list picker (`groups invites`). An empty result
+    /// shows an info card rather than an empty picker.
+    pub(crate) fn open_invites(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "invites"])?;
+        let items = parse_invite_items(&result);
+        self.popup = Some(if items.is_empty() {
+            Popup::info("Invites", "No pending invites.")
+        } else {
+            Popup::invites(items, 0)
+        });
+        Ok(())
+    }
+
+    /// After an accept/decline from the invites picker, re-read the pending
+    /// invites and refold the refreshed list back into the still-open picker,
+    /// clamping the selection so one action does not lose the user's place. An
+    /// empty result closes the picker; the accept/decline status already reports
+    /// the outcome.
+    pub(crate) fn refold_invites_picker(&mut self, prev_selected: usize) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "invites"])?;
+        let items = parse_invite_items(&result);
+        self.popup = match items.len() {
+            0 => None,
+            len => Some(Popup::invites(items, prev_selected.min(len - 1))),
+        };
+        Ok(())
+    }
+
+    /// Accept a pending invite, then refresh the chat list and select the newly
+    /// joined chat so it is immediately open. Accepting from the group-detail
+    /// screen returns to the main view: that screen shows the previously selected
+    /// group, which the refreshed list and selection have now moved past.
+    pub(crate) fn accept_invite(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        self.client
+            .run_json(Some(&account_id), &["groups", "accept", group_id])?;
+        self.refresh_chats()?;
+        self.select_chat_by_group_id(group_id)?;
+        if self.screen == Screen::GroupDetail {
+            self.leave_group_detail();
+        }
+        self.status = format!("accepted invite {}", shorten(group_id, 18));
+        Ok(())
+    }
+
+    pub(crate) fn decline_invite(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        self.client
+            .run_json(Some(&account_id), &["groups", "decline", group_id])?;
+        self.refresh_chats()?;
+        self.status = format!("declined invite {}", shorten(group_id, 18));
+        Ok(())
+    }
+
     pub(crate) fn update_selected_chat(
         &mut self,
         name: Option<String>,
