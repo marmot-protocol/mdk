@@ -409,8 +409,7 @@ pub(crate) async fn download_encrypted_media(
         allow_loopback_blob_endpoints,
     )
     .await?;
-    let actual_encrypted_hash = hex::encode(Sha256::digest(&encrypted));
-    if actual_encrypted_hash != reference.ciphertext_sha256 {
+    if !encrypted_media_hash_matches(&encrypted, &reference.ciphertext_sha256) {
         return Err(AppError::InvalidEncryptedMedia(
             "encrypted blob hash does not match media reference".into(),
         ));
@@ -448,6 +447,10 @@ pub(crate) async fn download_encrypted_media(
         file_name: reference.file_name,
         media_type,
     })
+}
+
+fn encrypted_media_hash_matches(encrypted: &[u8], expected_hash: &str) -> bool {
+    hex::encode(Sha256::digest(encrypted)).eq_ignore_ascii_case(expected_hash)
 }
 
 async fn fetch_encrypted_media_blob(

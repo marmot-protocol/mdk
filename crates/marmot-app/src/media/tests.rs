@@ -28,6 +28,14 @@ fn valid_hash() -> String {
     "11".repeat(32)
 }
 
+#[test]
+fn encrypted_media_integrity_accepts_uppercase_hex() {
+    let encrypted = b"encrypted media bytes";
+    let uppercase_hash = hex::encode(Sha256::digest(encrypted)).to_ascii_uppercase();
+
+    assert!(encrypted_media_hash_matches(encrypted, &uppercase_hash));
+}
+
 fn tag_with_locator(locator: String) -> Vec<String> {
     let mut tag = valid_imeta_tag();
     tag[2] = format!("locator blossom-v1 {locator}");
