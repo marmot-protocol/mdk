@@ -1161,6 +1161,7 @@ fn try_uri_autolink(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         return None;
     }
     j += 1;
+    let body_start = j;
     while j < bytes.len() {
         let c = bytes[j];
         if c == b'>' {
@@ -1174,10 +1175,32 @@ fn try_uri_autolink(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     if bytes.get(j) != Some(&b'>') {
         return None;
     }
+    if is_nsec_autolink_body(&bytes[body_start..j]) {
+        return None;
+    }
     let url = std::str::from_utf8(&bytes[scheme_start..j])
         .ok()?
         .to_string();
     Some((url, j + 1))
+}
+
+/// Keep Nostr private keys literal even when wrapped in a generic URI
+/// autolink such as `<nostr:nsec1...>` or `<web+nostr:nsec1...>`.
+fn is_nsec_autolink_body(body: &[u8]) -> bool {
+    let Some(data) = body.strip_prefix(b"nsec1") else {
+        return false;
+    };
+    (6..=1019).contains(&data.len())
+        && data.iter().copied().all(|byte| {
+            matches!(
+                byte,
+                b'0' | b'2'..=b'9'
+                    | b'a'
+                    | b'c'..=b'h'
+                    | b'j'..=b'n'
+                    | b'p'..=b'z'
+            )
+        })
 }
 
 /// `<email@host>` per CommonMark §6.4.

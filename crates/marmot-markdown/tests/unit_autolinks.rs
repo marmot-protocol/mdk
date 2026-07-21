@@ -121,6 +121,13 @@ fn nostr_inside_uri_autolink_stays_text() {
     assert_eq!(parse_inlines(s), vec![t("x "), uri(&s[3..s.len() - 1])]);
 }
 
+#[test]
+fn nsec_inside_uri_autolinks_stays_literal() {
+    for input in ["x <nostr:nsec1qqqqqq>", "x <web+nostr:nsec1qqqqqq>"] {
+        assert_eq!(parse_inlines(input), vec![t(input)]);
+    }
+}
+
 // ----- Bare URLs (GFM-style extended autolinks) ------------------------
 
 #[test]
