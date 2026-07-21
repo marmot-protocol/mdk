@@ -121,22 +121,9 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .clone()
         .map(|logs_dir| logs_dir.join("wnd.log"))
         .unwrap_or_else(|| default_log_path(&home));
-    if let Some(parent) = socket.parent() {
-        prepare_socket_dir(parent, &home)?;
-    }
-    if let Some(parent) = pid_path.parent() {
-        create_private_dir_all(parent)?;
-    }
-    remove_stale_socket(&socket).await?;
-    remove_stale_pid(&pid_path).await?;
-
-    // Bind via a 0700 staging dir so the socket is never reachable at
-    // umask-default permissions, even under a caller-supplied `--socket`
-    // whose parent dir the daemon does not own.
-    let listener = fs_private::bind_unix_listener_private(&socket, DAEMON_SOCKET_MODE)?;
-    listener.set_nonblocking(true)?;
-    let listener = UnixListener::from_std(listener)?;
-    write_pid_file(&pid_path)?;
+    // Resolve every fallible relay setting before binding the socket or
+    // writing the pid file. Startup validation must not leave externally
+    // visible artifacts behind on failure.
     let hidden_relay = crate::resolve_relay(args.relay)?;
     let mut discovery_relays = normalize_relay_list(args.discovery_relays)?;
     let mut default_account_relays = normalize_relay_list(args.default_account_relays)?;
@@ -158,6 +145,22 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .or_else(|| discovery_relays.first().cloned())
         .or_else(|| default_account_relays.first().cloned())
         .ok_or(crate::WnError::MissingRelay)?;
+    if let Some(parent) = socket.parent() {
+        prepare_socket_dir(parent, &home)?;
+    }
+    if let Some(parent) = pid_path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    remove_stale_socket(&socket).await?;
+    remove_stale_pid(&pid_path).await?;
+
+    // Bind via a 0700 staging dir so the socket is never reachable at
+    // umask-default permissions, even under a caller-supplied `--socket`
+    // whose parent dir the daemon does not own.
+    let listener = fs_private::bind_unix_listener_private(&socket, DAEMON_SOCKET_MODE)?;
+    listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(listener)?;
+    write_pid_file(&pid_path)?;
     let defaults = DaemonDefaults {
         home,
         socket: socket.clone(),

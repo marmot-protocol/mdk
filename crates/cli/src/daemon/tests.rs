@@ -9,6 +9,35 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[tokio::test]
+async fn run_server_validates_relays_before_creating_runtime_artifacts() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_path = home.path().to_path_buf();
+    let socket = default_socket_path(&home_path);
+    let pid_path = default_pid_path(&home_path);
+    let args = DaemonArgs {
+        home: Some(home_path),
+        data_dir: None,
+        logs_dir: None,
+        socket: None,
+        relay: None,
+        discovery_relays: vec!["not a relay URL".to_owned()],
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+
+    run_server(args)
+        .await
+        .expect_err("invalid relay configuration should fail startup");
+
+    assert!(!socket.exists(), "failed startup must not leave a socket");
+    assert!(
+        !pid_path.exists(),
+        "failed startup must not leave a pid file"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn daemon_pid_and_log_writers_create_private_files() {
