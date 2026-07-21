@@ -157,6 +157,12 @@ fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
         validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
         Err("encrypted media endpoint URL must not point at a non-routable address".into())
     );
+    for raw in ["https://localhost./", "https://sub.localhost./"] {
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url(raw, false),
+            Err("encrypted media https endpoint must not point at localhost".into())
+        );
+    }
 }
 
 /// Regression for #374: the spec's invalidity list (group-encrypted-media-v1.md)
@@ -467,6 +473,8 @@ fn group_avatar_url_rejects_localhost_and_non_routable_hosts() {
     for raw in [
         "https://localhost/a.png",
         "https://app.localhost/a.png",
+        "https://localhost./a.png",
+        "https://app.localhost./a.png",
         "https://127.0.0.1/a.png",
         "https://10.0.0.5/a.png",
         "https://192.168.1.2/a.png",

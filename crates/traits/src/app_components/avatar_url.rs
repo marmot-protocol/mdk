@@ -3,7 +3,7 @@
 use url::{Host, Url};
 
 use super::codec::{decode_var_bytes, encode_var_bytes};
-use super::host_safety::{reject_non_routable_ipv4, reject_non_routable_ipv6};
+use super::host_safety::{is_loopback_host, reject_non_routable_ipv4, reject_non_routable_ipv6};
 use super::{GROUP_AVATAR_HINT_MAX_LEN, GROUP_AVATAR_URL_MAX_LEN};
 
 /// Decoded `marmot.group.avatar-url.v1` state. An absent avatar is an empty `url`.
@@ -112,13 +112,12 @@ pub fn validate_and_normalize_group_avatar_url(raw: &str) -> Result<String, Stri
     if url.fragment().is_some() {
         return Err("group avatar URL must not include a fragment".into());
     }
-    match url.host().ok_or("group avatar URL must include a host")? {
-        Host::Domain(domain) => {
-            let lowered = domain.to_ascii_lowercase();
-            if lowered == "localhost" || lowered.ends_with(".localhost") {
-                return Err("group avatar URL must not point at localhost".into());
-            }
-        }
+    let host = url.host().ok_or("group avatar URL must include a host")?;
+    if is_loopback_host(host.clone()) {
+        return Err("group avatar URL must not point at localhost".into());
+    }
+    match host {
+        Host::Domain(_) => {}
         Host::Ipv4(addr) => reject_non_routable_ipv4(addr)?,
         Host::Ipv6(addr) => reject_non_routable_ipv6(addr)?,
     }
