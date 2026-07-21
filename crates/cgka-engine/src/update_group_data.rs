@@ -262,20 +262,6 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        // Mirror projected app-facing fields at send time. Rollback
-        // re-derives from the unmerged MLS app component.
-        if let Ok(mut g) = self.storage.get_group(&group_id) {
-            for update in &updates {
-                if update.component_id == GROUP_PROFILE_COMPONENT_ID {
-                    let (name, description) =
-                        crate::app_components::decode_group_profile(&update.data)?;
-                    g.name = name;
-                    g.description = description;
-                }
-            }
-            self.storage.put_group(&g)?;
-        }
-
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
         let commit_priority = mls_group
             .pending_commit()
@@ -294,6 +280,45 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
+
+        // Mirror projected app-facing fields only after the state-machine
+        // transition succeeds. A projection read/write failure must rewind the
+        // pending slot before returning; the still-armed cleanup guard then
+        // clears the staged OpenMLS commit and releases its snapshot.
+        let projection = (|| -> Result<(), EngineError> {
+            let mut group = self.storage.get_group(&group_id)?;
+            for update in &updates {
+                if update.component_id == GROUP_PROFILE_COMPONENT_ID {
+                    let (name, description) =
+                        crate::app_components::decode_group_profile(&update.data)?;
+                    group.name = name;
+                    group.description = description;
+                }
+            }
+            self.storage.put_group(&group)?;
+            Ok(())
+        })();
+        if let Err(err) = projection {
+            if self.epoch_manager.rollback_publish(pending_ref).is_err() {
+                tracing::warn!(
+                    target: "cgka_engine::update_group_data",
+                    method = "do_send_update_app_components",
+                    "state-machine rollback failed after group record projection failure"
+                );
+            }
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    Some("pending_publish"),
+                    "stable",
+                    pre_commit_epoch,
+                    "update_group_data_stage_failed",
+                    Some(pending_ref),
+                    Some("group_evolution"),
+                ),
+            );
+            return Err(err);
+        }
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(

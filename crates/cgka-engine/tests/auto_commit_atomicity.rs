@@ -500,3 +500,68 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     assert_eq!(record.members.len(), 2);
     assert!(!record.members.iter().any(|m| m.id == bob_member_id));
 }
+
+/// A profile projection failure occurs after the MLS commit is staged. It must
+/// rewind the pending state and clear the staged commit rather than leaving a
+/// projected record that no caller can confirm or roll back (mdk#824).
+#[tokio::test]
+async fn update_group_data_record_write_failure_leaves_group_stable() {
+    let fault = PutGroupFault::default();
+    let (mut alice, handle) = build_fault_selfremove_client(b"alice-ugd", fault.clone());
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "preserve me".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let snapshot_baseline = handle.list_group_snapshots(&group_id).unwrap().len();
+
+    fault.arm(1);
+    let failed = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("failed rename".into()),
+            description: None,
+        })
+        .await;
+    assert!(failed.is_err(), "injected projection failure must surface");
+
+    let record = handle.get_group(&group_id).unwrap();
+    assert_eq!(record.name, "original");
+    assert_eq!(record.description, "preserve me");
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(0));
+    assert_eq!(
+        handle.list_group_snapshots(&group_id).unwrap().len(),
+        snapshot_baseline,
+        "failed staging must release its recovery snapshot"
+    );
+
+    let retry = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("successful rename".into()),
+            description: None,
+        })
+        .await
+        .expect("group must remain usable after compensation");
+    let pending = match retry {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let record = handle.get_group(&group_id).unwrap();
+    assert_eq!(record.name, "successful rename");
+    assert_eq!(record.description, "preserve me");
+}
