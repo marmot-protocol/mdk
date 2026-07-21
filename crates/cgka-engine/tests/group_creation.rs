@@ -24,6 +24,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -925,7 +926,7 @@ async fn join_welcome_rejected_when_client_no_longer_supports_required_capabilit
         build_client_on_storage(b"carol", selfremove_registry(), carol_storage.clone());
     let carol_kp = capable_carol.fresh_key_package().await.unwrap();
 
-    let (_gid, result) = alice
+    let (group_id, result) = alice
         .create_group(CreateGroupRequest {
             name: "requires-self-remove".into(),
             description: "".into(),
@@ -948,7 +949,7 @@ async fn join_welcome_rejected_when_client_no_longer_supports_required_capabilit
     // Downgraded carol: same identity + storage (so she can decrypt the
     // Welcome) but an empty registry (no SelfRemove support).
     let mut downgraded_carol =
-        build_client_on_storage(b"carol", FeatureRegistry::new(), carol_storage);
+        build_client_on_storage(b"carol", FeatureRegistry::new(), carol_storage.clone());
     let err = downgraded_carol
         .join_welcome(welcome)
         .await
@@ -968,6 +969,14 @@ async fn join_welcome_rejected_when_client_no_longer_supports_required_capabilit
         }
         other => panic!("expected MissingRequiredCapabilities, got {other:?}"),
     }
+
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    assert!(
+        openmls::group::MlsGroup::load(carol_storage.mls_storage(), &mls_group_id)
+            .expect("rejected-Welcome storage remains readable")
+            .is_none(),
+        "a rejected Welcome must roll back the newly stored OpenMLS group"
+    );
 }
 
 #[tokio::test]

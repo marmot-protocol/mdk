@@ -596,9 +596,11 @@ impl<S: StorageProvider> Engine<S> {
             self.clear_live_openmls_group(&group_id)?;
         }
         // Building a group from a staged Welcome performs the same multi-row
-        // OpenMLS store as group creation. Make that store atomic; Marmot
-        // post-validation remains immediately below and is deliberately kept
-        // as a separate concern from this partial-write fix.
+        // OpenMLS store as group creation. Keep that store, every Marmot
+        // post-check, the discoverable group record, capability cache, and the
+        // durable Welcome disposition in one transaction. A rejected Welcome
+        // must roll the freshly stored OpenMLS rows back instead of leaving an
+        // MLS-only orphan that blocks a corrected re-invite.
         let (mls_group, welcome_sender_id) = self.storage.with_transaction(|storage| {
             let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
             let staged = processed
@@ -611,90 +613,92 @@ impl<S: StorageProvider> Engine<S> {
             let mls_group = staged
                 .into_group(&provider)
                 .map_err(|_| EngineError::InvalidWelcome)?;
+
+            debug_assert_eq!(
+                group_id,
+                GroupId::new(mls_group.group_id().as_slice().to_vec())
+            );
+
+            // 5b. Reject the Welcome if any member leaf carries an invalid
+            // Marmot credential identity (foundation/identity.md,
+            // joining.md:65).
+            validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+
+            // 5c. Reject active required capabilities this client cannot
+            // apply, including required agent-stream roles.
+            let mut group_required =
+                crate::capability_manager::required_capabilities_from_group(&mls_group);
+            crate::message_processor::merge_capabilities(
+                &mut group_required,
+                &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+            );
+            let had = crate::capabilities::self_supported_capabilities(
+                &self.registry,
+                self.ciphersuite,
+                &self.supported_app_components,
+            );
+            let missing = group_required.missing_from(&had);
+            if !missing.is_empty() {
+                return Err(EngineError::MissingRequiredCapabilities {
+                    required: Box::new(group_required),
+                    had: Box::new(had),
+                });
+            }
+
+            // 5d. The authenticated Welcome sender must be an admin.
+            crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+
+            // 5e. Every advertised admin must have a current member leaf.
+            crate::app_components::reject_admins_without_member_leaf(
+                &mls_group,
+                &group_id,
+                &crate::app_components::admins_of_group(&mls_group)?,
+            )
+            .map_err(|error| match error {
+                storage @ EngineError::Storage(_) => storage,
+                _ => EngineError::InvalidWelcome,
+            })?;
+
+            // 6. Make the committed OpenMLS group discoverable through the
+            // Marmot record and cache this device's capabilities.
+            let mut group_record = Group {
+                id: group_id.clone(),
+                name: String::new(),
+                description: String::new(),
+                epoch: EpochId(mls_group.epoch().as_u64()),
+                members: marmot_members(&mls_group),
+                required_capabilities: crate::capability_manager::required_capabilities_from_group(
+                    &mls_group,
+                ),
+                removed: false,
+                join_epoch: EpochId(mls_group.epoch().as_u64()),
+            };
+            mirror_app_components_into_record(&mls_group, &mut group_record);
+            storage.put_group(&group_record)?;
+            crate::capability_manager::cache_self_capabilities(
+                storage,
+                &group_id,
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
+
+            // Direct join callers need the same durable dedup disposition as
+            // the transport-ingest path.
+            let payload = StoredMessagePayload::raw_transport(welcome_msg)
+                .encode()
+                .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+            storage.put_message(&MessageRecord {
+                id: welcome_id.clone(),
+                group_id: group_id.clone(),
+                epoch: EpochId(mls_group.epoch().as_u64()),
+                state: MessageState::Processed,
+                payload,
+            })?;
+
             Ok::<_, EngineError>((mls_group, welcome_sender_id))
         })?;
 
-        debug_assert_eq!(
-            group_id,
-            GroupId::new(mls_group.group_id().as_slice().to_vec())
-        );
-
-        // 5b. Reject the Welcome if any member leaf carries an invalid Marmot
-        // credential identity (foundation/identity.md, joining.md:65). The
-        // Welcome embeds the full ratchet tree, so every current member's
-        // credential is checked here at join ingress.
-        validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
-
-        // 5c. Reject the Welcome if the resulting group has active required
-        // capabilities (MLS extensions, proposal types, or Marmot app
-        // components) this client cannot apply. The create/invite paths run the
-        // symmetric `missing_from` check; joining.md:65 and convergence.md:19
-        // require it here too. `had` is this client's CURRENT runtime support
-        // (feature registry + supported app components), so a group requiring
-        // more than this client can process is rejected even if a stale or
-        // over-broad KeyPackage was consumed.
-        //
-        // This also covers the agent-text-stream-QUIC join self-check (#177,
-        // agent-text-stream-quic-v1.md): the group's `required_member_roles`
-        // mask is translated into role-Feature capabilities and folded into
-        // `group_required`, so a joiner that does not advertise every required
-        // role capability is rejected here before it joins.
-        let mut group_required =
-            crate::capability_manager::required_capabilities_from_group(&mls_group);
-        crate::message_processor::merge_capabilities(
-            &mut group_required,
-            &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
-        );
-        let had = crate::capabilities::self_supported_capabilities(
-            &self.registry,
-            self.ciphersuite,
-            &self.supported_app_components,
-        );
-        let missing = group_required.missing_from(&had);
-        if !missing.is_empty() {
-            return Err(EngineError::MissingRequiredCapabilities {
-                required: Box::new(group_required),
-                had: Box::new(had),
-            });
-        }
-
-        // 5d. Reject Welcome forks authored by a non-admin member. OpenMLS
-        // verifies the GroupInfo signature; Marmot additionally requires the
-        // signer leaf's MLS-authenticated account identity to be authorized for
-        // admin-gated member additions (joining.md, admin-policy-v1.md).
-        crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
-
-        // 5e. Admin-leaf coupling on the joined group (mdk#737): reject a
-        // Welcome whose admin set lists an admin with no member leaf. The
-        // Welcome embeds the full ratchet tree, so every current member's leaf
-        // is present here — a phantom/pre-provisioned admin is detectable and
-        // must be rejected, mirroring the check every commit seam enforces so a
-        // joiner never silently accepts a group with a pre-provisioned admin.
-        crate::app_components::reject_admins_without_member_leaf(
-            &mls_group,
-            &group_id,
-            &crate::app_components::admins_of_group(&mls_group)?,
-        )
-        .map_err(|error| match error {
-            storage @ EngineError::Storage(_) => storage,
-            _ => EngineError::InvalidWelcome,
-        })?;
-
-        // 6. Persist Marmot group record from signed group-context data.
-        let mut group_record = Group {
-            id: group_id.clone(),
-            name: String::new(),
-            description: String::new(),
-            epoch: EpochId(mls_group.epoch().as_u64()),
-            members: marmot_members(&mls_group),
-            required_capabilities: crate::capability_manager::required_capabilities_from_group(
-                &mls_group,
-            ),
-            removed: false,
-            join_epoch: EpochId(mls_group.epoch().as_u64()),
-        };
-        mirror_app_components_into_record(&mls_group, &mut group_record);
-        self.storage.put_group(&group_record)?;
         // #740: index this joined group's transport routing id for O(1) inbound
         // resolution (see `Engine::transport_group_id_index`).
         if let Ok(transport_group_id) =
@@ -703,17 +707,6 @@ impl<S: StorageProvider> Engine<S> {
             self.transport_group_id_index
                 .insert(transport_group_id, group_id.clone());
         }
-
-        // Cache self's capabilities. Other members' capabilities arrive as
-        // we ingest commits that touched their leaves; join-via-welcome
-        // alone does not give us KeyPackage-level access to other members.
-        crate::capability_manager::cache_self_capabilities(
-            &self.storage,
-            &group_id,
-            &mls_group,
-            self.identity.self_id(),
-            self.ciphersuite,
-        )?;
 
         // 7. State machine: Stable at the post-welcome epoch.
         let joined_epoch = EpochId(mls_group.epoch().as_u64());
@@ -731,21 +724,6 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.audit_group_context(&group_id, "join_welcome");
-
-        // 8. Persist durable dedup state for direct `join_welcome`
-        // callers. The ingest path records the welcome after this
-        // method returns, but callers using the trait method directly
-        // need restart-safe duplicate detection too.
-        let payload = StoredMessagePayload::raw_transport(welcome_msg)
-            .encode()
-            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        self.storage.put_message(&MessageRecord {
-            id: welcome_id.clone(),
-            group_id: group_id.clone(),
-            epoch: EpochId(mls_group.epoch().as_u64()),
-            state: MessageState::Processed,
-            payload,
-        })?;
 
         // 9. Emit event + register for in-process dedup.
         self.events_buf
