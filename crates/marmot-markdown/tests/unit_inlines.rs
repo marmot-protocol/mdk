@@ -105,6 +105,16 @@ fn code_span_unmatched_opening_run_is_not_rescanned() {
 }
 
 #[test]
+fn distinct_unclosed_code_span_runs_do_not_rescan_the_suffix() {
+    let mut input = String::new();
+    for run_len in (1..=512).rev() {
+        input.push_str(&"`".repeat(run_len));
+        input.push('x');
+    }
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
+#[test]
 fn code_span_no_escapes_inside() {
     assert_eq!(parse_inlines("`\\n`"), vec![code("\\n")]);
 }

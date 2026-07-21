@@ -213,6 +213,7 @@ impl BracketDelim {
 /// Tokenize the raw paragraph/heading text. First-match-wins.
 pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline> {
     let bytes = raw.as_bytes();
+    let code_span_index = CodeSpanIndex::new(bytes);
     let mut out: Vec<Inline> = Vec::new();
     // Entity decoding only ever shrinks bytes (e.g. `&amp;` → `&`), so
     // `raw.len()` is a safe upper bound. Pre-sizing avoids the doubling
@@ -271,7 +272,7 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 i += 1;
             }
             b'`' => {
-                if let Some((content, end)) = try_code_span(bytes, i) {
+                if let Some((content, end)) = try_code_span(bytes, i, &code_span_index) {
                     flush_text(&mut out, &mut buf, &delims);
                     out.push(Inline::Code(content));
                     i = end;
@@ -581,31 +582,46 @@ fn trailing_space_count(buf: &str) -> usize {
     buf.bytes().rev().take_while(|&b| b == b' ').count()
 }
 
+/// Backtick runs indexed once by length. Without this, every unmatched opener
+/// rescans the remaining suffix, making distinct adversarial run lengths
+/// superlinear in the input size.
+struct CodeSpanIndex {
+    by_len: HashMap<usize, Vec<(usize, usize)>>,
+}
+
+impl CodeSpanIndex {
+    fn new(bytes: &[u8]) -> Self {
+        let mut by_len: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'`' {
+                i += 1;
+                continue;
+            }
+            let end = skip_backtick_run(bytes, i);
+            by_len.entry(end - i).or_default().push((i, end));
+            i = end;
+        }
+        Self { by_len }
+    }
+
+    fn next_run(&self, run_len: usize, after_start: usize) -> Option<(usize, usize)> {
+        let runs = self.by_len.get(&run_len)?;
+        let next = runs.partition_point(|(start, _)| *start <= after_start);
+        runs.get(next).copied()
+    }
+}
+
 /// Try to consume a code span starting at byte `i` (pointing at `` ` ``).
 /// Returns the (normalized content, end-index-just-past-closing-run).
-fn try_code_span(bytes: &[u8], i: usize) -> Option<(String, usize)> {
-    let mut j = i;
-    while j < bytes.len() && bytes[j] == b'`' {
-        j += 1;
-    }
-    let run_len = j - i;
-    let mut k = j;
-    while k < bytes.len() {
-        if bytes[k] == b'`' {
-            let mut m = k;
-            while m < bytes.len() && bytes[m] == b'`' {
-                m += 1;
-            }
-            if m - k == run_len {
-                let content = normalize_code_span(&bytes[j..k]);
-                return Some((content, m));
-            }
-            k = m;
-        } else {
-            k += 1;
-        }
-    }
-    None
+fn try_code_span(bytes: &[u8], i: usize, index: &CodeSpanIndex) -> Option<(String, usize)> {
+    let content_start = skip_backtick_run(bytes, i);
+    let run_len = content_start - i;
+    let (closing_start, closing_end) = index.next_run(run_len, i)?;
+    Some((
+        normalize_code_span(&bytes[content_start..closing_start]),
+        closing_end,
+    ))
 }
 
 fn skip_backtick_run(bytes: &[u8], i: usize) -> usize {
