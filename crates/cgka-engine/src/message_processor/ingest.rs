@@ -321,7 +321,7 @@ impl<S: StorageProvider> Engine<S> {
                             Ok(record) if record.state == MessageState::PeelDeferred
                         );
                         if !already_retained && !self.reserve_peel_deferred_slot(&group_id)? {
-                            self.seen_message_ids.insert(msg.id.clone());
+                            self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
                             if self.should_audit_peel_deferred_cap_rejection(&group_id) {
                                 self.audit_group(
                                     &group_id,

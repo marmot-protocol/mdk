@@ -122,6 +122,11 @@ pub struct Engine<S: StorageProvider> {
     /// out of the cap is still classified by storage.
     pub(crate) seen_message_ids: BoundedIdSet<MessageId>,
 
+    /// One-shot marker for a cap-dropped, unpersisted ingest. The outer
+    /// `do_ingest` epilogue must not promote that retryable id into the
+    /// terminal `seen_message_ids` cache.
+    pub(crate) retryable_unpersisted_ingest_id: Option<MessageId>,
+
     /// MessageIds this engine has produced via `send` or `create_group` /
     /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
     /// bounces back via ingest before we filter it client-side.
@@ -360,6 +365,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             auto_proposal_buf: VecDeque::new(),
             pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
+            retryable_unpersisted_ingest_id: None,
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
