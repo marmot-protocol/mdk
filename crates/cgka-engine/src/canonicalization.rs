@@ -957,6 +957,23 @@ mod witness_window_tests {
     use super::*;
 
     #[test]
+    fn v1_default_policy_constants_are_pinned() {
+        assert_eq!(
+            CanonicalizationPolicy::default(),
+            CanonicalizationPolicy {
+                convergence: ConvergencePolicy {
+                    max_rewind_commits: 5,
+                    witness_quorum_senders_per_epoch: 2,
+                    witness_quorum_epochs: 1,
+                    max_witness_override_depth: 1,
+                },
+                app_message_past_epoch_limit: 5,
+                settlement_quiescence_ms: 1_000,
+            }
+        );
+    }
+
+    #[test]
     fn app_message_expired_is_relative_to_the_passed_reference_tip() {
         // app_message_expired must gate on the reference tip it is GIVEN, so the
         // witness path can pass the candidate's tip_epoch (not the global canonical
