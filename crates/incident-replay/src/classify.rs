@@ -291,7 +291,8 @@ fn epoch_divergence(export: &AgentStateExport) -> Option<QuarantineReason> {
                 .range(epoch + 1..)
                 .map(|(_, first_seen)| *first_seen)
                 .min()?;
-            let mode = if last_seen > moved_past + CATCH_UP_GRACE_MS {
+            let catch_up_deadline = moved_past.saturating_add(CATCH_UP_GRACE_MS);
+            let mode = if last_seen > catch_up_deadline {
                 BehindMode::ActiveWhileBehind
             } else {
                 BehindMode::WentDark

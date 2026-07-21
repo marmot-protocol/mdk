@@ -123,6 +123,35 @@ fn an_active_engine_two_epochs_behind_quarantines_as_active_while_behind() {
 }
 
 #[test]
+fn catch_up_deadline_saturates_for_hostile_wall_timestamps() {
+    let json = format!(
+        r#"{{ "events": [
+            {{ "engine_id": "engine-b", "wall_time_ms": {},
+               "kind": {{ "type": "group_state_changed", "epoch": 4 }} }},
+            {{ "engine_id": "engine-a", "wall_time_ms": {},
+               "kind": {{ "type": "group_state_changed", "epoch": 6 }} }}
+        ] }}"#,
+        u64::MAX,
+        u64::MAX - 1
+    );
+    let export = parse(&json).expect("hostile timestamps still parse");
+
+    assert_eq!(
+        classify(&export),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::WentDark,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
 fn one_epoch_of_lag_is_routine_propagation_not_divergence() {
     assert_eq!(
         classify(&load("healthy-lagging-engine.json")),
