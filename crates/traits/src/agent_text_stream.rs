@@ -340,11 +340,9 @@ impl AgentTextStreamRecordV1 {
                 self.stream_id.len(),
             ));
         }
-        if !is_known_record_type(self.record_type) {
-            return Err(AgentTextStreamRecordError::UnknownRecordType(
-                self.record_type,
-            ));
-        }
+        // Unknown record types are valid framing. Receivers ignore semantics
+        // they do not understand so newer advisory records do not tear down an
+        // otherwise valid preview stream.
         // The frame field carries ciphertext on the wire, so the struct bound
         // is the `ciphertext<0..2^16-1>` field bound. The tighter plaintext
         // policy cap (`max_plaintext_frame_len`, app-profile max 65519) is
@@ -372,6 +370,9 @@ pub enum AgentTextStreamRecordError {
     EmptyStreamId,
     #[error("agent text stream id is too long: {0}")]
     StreamIdTooLong(usize),
+    /// Retained for source compatibility with callers that matched the former
+    /// strict decoder; v1 framing now accepts unknown types for forward
+    /// compatibility and does not emit this variant.
     #[error("unknown agent text stream record type: {0:#04x}")]
     UnknownRecordType(u8),
     #[error("agent text stream plaintext frame is too large: {0}")]
@@ -480,18 +481,6 @@ fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     encode_quic_varint(bytes.len() as u64, &mut prefix);
     hasher.update(&prefix);
     hasher.update(bytes);
-}
-
-fn is_known_record_type(record_type: u8) -> bool {
-    matches!(
-        record_type,
-        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
-            | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA
-            | AGENT_TEXT_STREAM_RECORD_STATUS
-            | AGENT_TEXT_STREAM_RECORD_CHECKPOINT
-            | AGENT_TEXT_STREAM_RECORD_ABORT
-            | AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE
-    )
 }
 
 fn take_exact<'a>(
@@ -740,9 +729,10 @@ mod tests {
             record_type: 0xff,
             ..AgentTextStreamRecordV1::text_delta(vec![0x11; 32], 1, "x")
         };
+        let encoded_unknown = unknown_type.encode().unwrap();
         assert_eq!(
-            unknown_type.encode(),
-            Err(AgentTextStreamRecordError::UnknownRecordType(0xff))
+            AgentTextStreamRecordV1::decode(&encoded_unknown).unwrap(),
+            unknown_type
         );
 
         let empty_stream = AgentTextStreamRecordV1::text_delta(Vec::new(), 1, "x");
