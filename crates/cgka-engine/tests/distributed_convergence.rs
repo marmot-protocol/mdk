@@ -5426,6 +5426,50 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
 }
 
 #[tokio::test]
+async fn restart_schedules_groups_with_durable_queued_intents() {
+    let (mut alice, alice_storage) = build_client(b"alice-restart-queued");
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "restart queued".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    alice_storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"durable-restart-intent".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, b"send after restart"),
+            },
+            created_at_ms: 1,
+        })
+        .unwrap();
+    drop(alice);
+
+    let mut restarted = build_client_with_storage(b"alice-restart-queued", alice_storage);
+    restarted
+        .hydrate_stable_groups_from_storage()
+        .expect("session-open hydration succeeds");
+    let scheduled = restarted.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&group_id),
+        "hydration must schedule durable queued work without new traffic; got {scheduled:?}"
+    );
+}
+
+#[tokio::test]
 async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolves() {
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");

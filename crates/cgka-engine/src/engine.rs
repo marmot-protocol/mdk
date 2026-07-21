@@ -904,6 +904,22 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.audit_group_context(group_id, "hydrate_stable_group");
+
+        // Startup must recreate the in-memory scheduling edge for durable
+        // convergence work. Otherwise queued user sends and stored branch
+        // inputs remain asleep after a process restart until unrelated traffic
+        // happens to touch the group.
+        let has_queued_intents = !self
+            .storage
+            .list_queued_outbound_intents(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .is_empty();
+        let has_convergence_inputs = self
+            .has_pending_convergence_inputs(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        if has_queued_intents || has_convergence_inputs {
+            self.schedule_pending_convergence_group(group_id);
+        }
         Ok(group.epoch)
     }
 

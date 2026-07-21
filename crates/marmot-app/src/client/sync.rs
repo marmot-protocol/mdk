@@ -94,6 +94,10 @@ impl AppClient {
     /// projection lookups are best-effort.
     pub(crate) async fn drain_pending_session_events(&mut self) -> Result<SyncSummary, AppError> {
         let effects = self.runtime.drain().await?;
+        // Session open seeds this list from durable queued/convergence input.
+        // Preserve that scheduling edge even when hydration emitted no app
+        // events; the worker drains this set immediately after startup sync.
+        self.remember_pending_convergence_effects(&effects);
         fail_if_publish_failed(&effects)?;
         let mut summary = SyncSummary::default();
         if effects.events.is_empty() {
