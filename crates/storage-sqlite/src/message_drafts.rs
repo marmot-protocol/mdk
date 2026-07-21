@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::{SqliteAccountStorage, SqliteResultExt, unix_now_ms};
+use crate::{SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, unix_now_ms};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -157,7 +157,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<StoredMessageDraft> {
         validate_waveform_samples(media_attachments)?;
         let now_ms = unix_now_ms();
-        let saved = {
+        retry_on_busy(|| {
             let mut conn = self.lock()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -189,10 +189,8 @@ impl SqliteAccountStorage {
                 StorageError::Backend("saved message draft could not be reloaded".to_owned())
             })?;
             tx.commit().storage()?;
-            saved
-        };
-
-        Ok(saved)
+            Ok(saved)
+        })
     }
 
     /// Delete one draft and its cascading attachment rows.
@@ -739,6 +737,61 @@ mod tests {
             storage.save_message_draft(&"33".repeat(16), "draft", None, &[]),
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[test]
+    fn saving_draft_retries_concurrent_writer_contention() {
+        use crate::{SqlCipherKey, SqliteStorageOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("draft-contention.sqlite");
+        let key = SqlCipherKey::new("draft contention key").unwrap();
+        let options = SqliteStorageOptions {
+            busy_timeout_ms: 50,
+            ..SqliteStorageOptions::default()
+        };
+        let storage =
+            SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+                .unwrap();
+        let group_id_hex = "55".repeat(16);
+        storage
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    seen_events: vec![],
+                    last_transport_timestamp: None,
+                    groups: vec![group(&group_id_hex)],
+                },
+                100,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+
+        let blocker_path = path.clone();
+        let blocker_key = SqlCipherKey::new("draft contention key").unwrap();
+        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                &blocker_path,
+                &blocker_key,
+                options,
+            )
+            .unwrap();
+            let conn = blocker.lock().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            lock_acquired_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        lock_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let saved = storage
+            .save_message_draft(&group_id_hex, "survives contention", None, &[])
+            .expect("draft save retries after transient contention");
+        blocker.join().unwrap();
+        assert_eq!(saved.content, "survives contention");
     }
 
     #[test]
