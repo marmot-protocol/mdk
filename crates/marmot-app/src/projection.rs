@@ -908,32 +908,6 @@ impl LegacyAccountProjectionDb {
         Ok(())
     }
 
-    pub(crate) fn remove_stale_group_push_tokens(
-        &self,
-        group_id_hex: &str,
-        active_members: &[String],
-    ) -> Result<usize, AppError> {
-        if active_members.is_empty() {
-            let removed = self.conn.execute(
-                "DELETE FROM group_push_tokens WHERE group_id_hex = ?1",
-                params![group_id_hex],
-            )?;
-            return Ok(removed);
-        }
-        let active = active_members
-            .iter()
-            .map(|member| format!("'{}'", member.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "DELETE FROM group_push_tokens
-             WHERE group_id_hex = ?1
-               AND member_id_hex NOT IN ({active})"
-        );
-        let removed = self.conn.execute(&sql, params![group_id_hex])?;
-        Ok(removed)
-    }
-
     pub(crate) fn prune_group_messages_before(
         &self,
         group_id_hex: &str,
