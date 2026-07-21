@@ -1415,7 +1415,7 @@ fn timeline_stream_plain_output_is_human_readable() {
 }
 
 #[test]
-fn message_subscription_filters_stream_updates_by_account_when_present() {
+fn message_subscription_filters_stream_updates_fail_closed_without_account() {
     let scoped_delta = DaemonStreamResponse::ok(serde_json::json!({
         "type": "agent_stream_delta",
         "agent_stream_delta": {
@@ -1445,9 +1445,27 @@ fn message_subscription_filters_stream_updates_by_account_when_present() {
         Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     ));
-    assert!(stream_response_matches_subscription(
+    assert!(!stream_response_matches_subscription(
         &accountless_preview,
         Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ));
+}
+
+#[test]
+fn background_stream_watch_requires_account_scope() {
+    let cli = daemon_test_cli(crate::Command::Stream {
+        command: crate::StreamCommand::Watch {
+            group: "aa".repeat(32),
+            stream_id: None,
+            server_cert_der_hex: None,
+            insecure_local: true,
+            background: true,
+        },
+    });
+
+    assert_eq!(
+        new_stream_watch_start(&cli).unwrap_err(),
+        "background stream watch requires --account"
+    );
 }

@@ -194,9 +194,13 @@ pub(crate) fn new_stream_watch_start(
         .map(crate::commands::stream::normalize_hex)
         .transpose()
         .map_err(|err| err.to_string())?;
+    let account = cli
+        .account
+        .clone()
+        .ok_or_else(|| "background stream watch requires --account".to_owned())?;
     let started_at = unix_now();
     Ok(marmot_app::AgentStreamWatchStart {
-        account: cli.account.clone(),
+        account: Some(account),
         group_id,
         stream_id,
         started_at,

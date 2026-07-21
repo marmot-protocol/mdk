@@ -368,7 +368,7 @@ pub(crate) fn value_matches_group_and_account(
         .get("account")
         .or_else(|| value.get("account_id"))
         .and_then(serde_json::Value::as_str)
-        .is_none_or(|event_account| event_account == account_id)
+        .is_some_and(|event_account| event_account == account_id)
 }
 
 pub(crate) fn mark_stream_response_seen(
