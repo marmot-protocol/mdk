@@ -37,6 +37,7 @@ fn decode_numeric(b: &[u8], start: usize) -> Option<(String, usize)> {
         Some(&b'x') | Some(&b'X') => (true, start + 1),
         _ => (false, start),
     };
+    let max_digits = if hex { 6 } else { 7 };
     let mut code: u32 = 0;
     let mut k = val_start;
     while k < b.len() {
@@ -57,6 +58,9 @@ fn decode_numeric(b: &[u8], start: usize) -> Option<(String, usize)> {
         let base = if hex { 16 } else { 10 };
         code = code.saturating_mul(base).saturating_add(digit);
         k += 1;
+        if k - val_start > max_digits {
+            return None;
+        }
     }
     if k == val_start || b.get(k) != Some(&b';') {
         return None;

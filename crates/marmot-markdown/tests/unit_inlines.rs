@@ -208,7 +208,7 @@ fn entity_decimal_numeric() {
 
 #[test]
 fn entity_decimal_numeric_allows_leading_zeroes() {
-    assert_eq!(parse_inlines("&#0000000065;"), vec![t("A")]);
+    assert_eq!(parse_inlines("&#0000065;"), vec![t("A")]);
 }
 
 #[test]
@@ -218,7 +218,13 @@ fn entity_hex_numeric_lower() {
 
 #[test]
 fn entity_hex_numeric_allows_leading_zeroes() {
-    assert_eq!(parse_inlines("&#x0000000041;"), vec![t("A")]);
+    assert_eq!(parse_inlines("&#x000041;"), vec![t("A")]);
+}
+
+#[test]
+fn entity_numeric_rejects_overlong_digit_runs() {
+    assert_eq!(parse_inlines("&#00000065;"), vec![t("&#00000065;")]);
+    assert_eq!(parse_inlines("&#x0000041;"), vec![t("&#x0000041;")]);
 }
 
 #[test]
