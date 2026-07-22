@@ -7,6 +7,9 @@ set -euo pipefail
 socket_dir="$(dirname "$MARMOT_AGENT_SOCKET")"
 install -d -m "${MARMOT_AGENT_SOCKET_DIR_MODE:-0770}" "$socket_dir"
 install -d -m 0700 "$MARMOT_HOME" "$OPENCLAW_HOME"
+: "${MARMOT_OUTBOUND_MEDIA_DIR:=$MARMOT_HOME/dev/outbound-media}"
+export MARMOT_OUTBOUND_MEDIA_DIR
+install -d -m 0700 "$MARMOT_OUTBOUND_MEDIA_DIR"
 
 if [ ! -f "$MARMOT_AGENT_AUTH_TOKEN_FILE" ]; then
     ( umask 0177; head -c 32 /dev/urandom | xxd -p -c 64 > "$MARMOT_AGENT_AUTH_TOKEN_FILE" )
@@ -36,6 +39,7 @@ wn-agent \
     --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE" \
     --socket-dir-mode "${MARMOT_AGENT_SOCKET_DIR_MODE:-0770}" \
     --socket-mode "${MARMOT_AGENT_SOCKET_MODE:-0660}" \
+    --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR" \
     "${relay_args[@]}" \
     "${extra_args[@]}" &
 

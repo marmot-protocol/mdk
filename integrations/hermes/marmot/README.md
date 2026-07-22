@@ -322,8 +322,12 @@ does not touch an allowlist managed directly on `wn-agent`.
 
 Inbound attachments are downloaded through `wn-agent`, re-staged under
 `$MARMOT_HOME/dev/inbound-media` (override with `MARMOT_INBOUND_MEDIA_DIR`),
-and the wn-agent temp file is removed. Outbound local-path sends must stay
-within `MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory).
+and the wn-agent temp file is removed. Outbound source paths must stay within
+`MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory). Hermes
+then stages a private copy under `MARMOT_OUTBOUND_MEDIA_DIR` (defaults to
+`$MARMOT_HOME/dev/outbound-media`), sends only that path, and removes it after
+the connector responds. `wn-agent` must independently allow that exact staging
+directory with `--media-allowed-root`; without one, path sends fail closed.
 
 ## Behavior
 

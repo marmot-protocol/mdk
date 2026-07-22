@@ -7,9 +7,10 @@
 // (see src/live.ts) and are only declared as capabilities once backed by
 // contract tests.
 
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, dirname, extname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -44,6 +45,8 @@ export interface MarmotMessageAdapterDeps {
   nowMs?: () => number;
   /** Override the temp-file writer used to materialize a buffer-only media source (tests). */
   writeTempMedia?: (fileName: string, bytes: Buffer) => Promise<string>;
+  /** Override the connector-shared outbound staging directory (tests/deployments). */
+  outboundMediaDir?: string;
 }
 
 /** Build an OpenClaw `MessageReceipt` from wn-agent's durable message ids. */
@@ -164,9 +167,8 @@ function isLocalMediaUrl(mediaUrl: string): boolean {
 }
 
 /**
- * A resolved outbound media upload, plus an optional cleanup for any temp file
- * staged on the connector host. The cleanup is present only for the remote-URL
- * case (a temp file we created); an already-local path is left untouched.
+ * A resolved outbound media upload plus cleanup for the private copy staged in
+ * the connector-shared outbound directory.
  */
 export interface ResolvedOutboundMediaUpload {
   upload: AgentControlMediaUpload;
@@ -178,9 +180,9 @@ export interface ResolvedOutboundMediaUpload {
  * to. OpenClaw hands the channel the approved roots on the send ctx
  * (`mediaLocalRoots`, or `mediaAccess.localRoots`); when neither is present we
  * fall back to OpenClaw's default media-store roots. We never honor a `"any"`
- * sentinel here: the connector reads the resolved path verbatim, so an
- * unrestricted root would reintroduce the arbitrary-file-read this guard exists
- * to close. An empty configured allowlist means "nothing is allowed".
+ * sentinel here: the gateway reads and stages the source, so an unrestricted
+ * source root would reintroduce the arbitrary-file-read this guard exists to
+ * close. An empty configured allowlist means "nothing is allowed".
  */
 function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly string[] {
   const configured = ctx.mediaLocalRoots ?? ctx.mediaAccess?.localRoots;
@@ -192,17 +194,14 @@ function resolveAllowedMediaRoots(ctx: ChannelMessageSendMediaContext): readonly
  * read by path. Handles two cases the ctx can express with the real SDK types:
  *
  * 1. A local filesystem path or `file://` URL — validated against the send's
- *    allowlisted media roots (`assertLocalMediaAllowed`) and then used directly
- *    (no cleanup). The connector reads this path verbatim, so without the guard
+ *    allowlisted media roots (`assertLocalMediaAllowed`), then copied to the
+ *    connector-shared staging root. Without the source guard
  *    an agent-influenced `mediaUrl` (e.g. `~/.ssh/id_rsa`) would let a prompt-
  *    injected agent exfiltrate any connector-host file into a group. This
  *    mirrors the inbound trust model, where downloaded media is re-staged under
  *    an allowlisted root before the agent's image tool can read it.
  * 2. A non-local URL with a `mediaReadFile` host accessor — the bytes are read
- *    through that already-authorized host reader and written to a temp file so
- *    the connector still gets a path, and a `cleanup` is returned to remove that
- *    temp file+dir after the send. No path allowlist applies because the path is
- *    one we just minted under our own temp dir, not a caller-supplied path.
+ *    through that already-authorized host reader and staged the same way.
  *
  * Returns `null` when the ctx provides only a remote URL and no buffer accessor;
  * the connector reads a path it cannot be given in that case (see Seam 2 note).
@@ -219,34 +218,47 @@ async function resolveOutboundMediaUpload(
   if (isLocalMediaUrl(mediaUrl)) {
     const localPath = mediaUrl.startsWith("file://") ? fileURLToPath(mediaUrl) : mediaUrl;
     // Defense against exfiltration via a tool/prompt-influenced path: the
-    // connector reads this path unconditionally, so confine it to the send's
-    // allowlisted media roots before handing it over. Throws on violation.
+    // Keep OpenClaw's source policy as the first layer; wn-agent independently
+    // confines the staged path it ultimately reads. Throws on violation.
     await assertLocalMediaAllowed(localPath, resolveAllowedMediaRoots(ctx));
     const fileName = basename(localPath) || "attachment";
+    const path = await writeTempMedia(fileName, await readFile(localPath));
     return {
-      upload: { path: localPath, media_type: mimeFromExtension(fileName), file_name: fileName },
+      upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
+      cleanup: () => rm(path, { force: true }),
     };
   }
-  const readFile = ctx.mediaReadFile;
-  if (readFile) {
-    const bytes = await readFile(mediaUrl);
+  const mediaReadFile = ctx.mediaReadFile;
+  if (mediaReadFile) {
+    const bytes = await mediaReadFile(mediaUrl);
     const fileName = basename(new URL(mediaUrl).pathname) || "attachment";
     const path = await writeTempMedia(fileName, bytes);
     return {
       upload: { path, media_type: mimeFromExtension(fileName), file_name: fileName },
-      // The staged temp file lives under a dedicated mkdtemp dir; remove the
-      // whole dir so nothing is left behind after the send.
-      cleanup: () => rm(dirname(path), { recursive: true, force: true }),
+      cleanup: () => rm(path, { force: true }),
     };
   }
   return null;
 }
 
-/** Default temp-file writer: materialize media bytes under a fresh temp dir (0600). */
-async function defaultWriteTempMedia(fileName: string, bytes: Buffer): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "marmot-media-"));
-  const path = join(dir, fileName || "attachment");
-  await writeFile(path, bytes, { mode: 0o600 });
+function defaultOutboundMediaDir(): string {
+  if (process.env.MARMOT_OUTBOUND_MEDIA_DIR) {
+    return process.env.MARMOT_OUTBOUND_MEDIA_DIR;
+  }
+  return join(process.env.MARMOT_HOME ?? join(homedir(), ".marmot"), "dev", "outbound-media");
+}
+
+/** Stage bytes under the connector-approved root; each copy is group-readable for split-user deployments. */
+async function defaultWriteTempMedia(
+  fileName: string,
+  bytes: Buffer,
+  outboundMediaDir = defaultOutboundMediaDir(),
+): Promise<string> {
+  await mkdir(outboundMediaDir, { recursive: true, mode: 0o700 });
+  const safeName = basename(fileName || "attachment") || "attachment";
+  const path = join(outboundMediaDir, `${randomUUID()}-${safeName}`);
+  await writeFile(path, bytes, { flag: "wx", mode: 0o640 });
+  await chmod(path, 0o640);
   return path;
 }
 
@@ -259,7 +271,10 @@ async function defaultWriteTempMedia(fileName: string, bytes: Buffer): Promise<s
  */
 export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
   const now = deps.nowMs ?? (() => Date.now());
-  const writeTempMedia = deps.writeTempMedia ?? defaultWriteTempMedia;
+  const writeTempMedia =
+    deps.writeTempMedia ??
+    ((fileName: string, bytes: Buffer) =>
+      defaultWriteTempMedia(fileName, bytes, deps.outboundMediaDir));
   // Lives in the adapter closure: maps each durable message id we return back to
   // the account+group it was sent to, so an agent delete can be routed by id.
   const sentTargets = new SentMessageTargetCache();
@@ -331,8 +346,8 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
           });
           return { receipt: receiptFromMessageIds(response.message_ids_hex, now(), "media") };
         } finally {
-          // Remove any temp file we staged for a remote URL, even if the send
-          // threw. The already-local case has no cleanup.
+          // Remove the staged copy even if the connector send threw. The
+          // original source remains untouched.
           await resolved.cleanup?.().catch(() => undefined);
         }
       },

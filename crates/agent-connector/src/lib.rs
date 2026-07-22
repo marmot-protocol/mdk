@@ -8,6 +8,7 @@ mod error;
 mod event_projection;
 mod inbound;
 mod invite_policy;
+mod media_roots;
 mod media_temp;
 mod messaging;
 mod quic;
@@ -135,6 +136,9 @@ pub struct AgentConnectorConfig {
     pub dev_allow_any_invites: bool,
     pub debug_controls: bool,
     pub auth_token: Option<String>,
+    /// Roots from which control clients may request outbound plaintext media.
+    /// Empty is fail-closed: every path-based media send is denied.
+    pub media_allowed_roots: Vec<PathBuf>,
     /// Cap on concurrently served control connections; connections beyond it
     /// are closed at accept time. Must be nonzero.
     pub max_connections: usize,
@@ -169,6 +173,7 @@ impl AgentConnectorConfig {
             dev_allow_any_invites: false,
             debug_controls: false,
             auth_token: None,
+            media_allowed_roots: Vec::new(),
             max_connections: MAX_CONTROL_CONNECTIONS,
             allow_insecure_local_broker: false,
             allow_loopback_relays: false,
@@ -183,6 +188,7 @@ pub struct AgentConnector {
     pub(crate) dev_allow_any_invites: bool,
     pub(crate) debug_controls: bool,
     pub(crate) auth_token: Option<String>,
+    pub(crate) media_allowed_roots: media_roots::MediaAllowedRoots,
     pub(crate) allow_insecure_local_broker: bool,
     pub(crate) debug_events: broadcast::Sender<AgentControlEvent>,
     pub(crate) debug_final_sends: DebugFinalSendStore,
@@ -202,6 +208,8 @@ pub struct AgentConnector {
 
 impl AgentConnector {
     pub fn open(config: AgentConnectorConfig) -> Result<Self, ConnectorError> {
+        let media_allowed_roots =
+            media_roots::MediaAllowedRoots::prepare(&config.media_allowed_roots)?;
         let account_home = AccountHome::open(&config.home);
         let relays = config.relays;
         let app = MarmotApp::with_relays_and_account_home_and_config(
@@ -221,6 +229,7 @@ impl AgentConnector {
             dev_allow_any_invites: config.dev_allow_any_invites,
             debug_controls: config.debug_controls,
             auth_token: config.auth_token,
+            media_allowed_roots,
             allow_insecure_local_broker: config.allow_insecure_local_broker,
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),

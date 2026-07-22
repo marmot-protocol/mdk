@@ -25,6 +25,8 @@ This setup is ready for dogfood or a supervised production pilot when all of the
 - The phone and the agent computer use the same public relay set.
 - QUIC broker candidates are configured only when the broker is reachable from the phone.
 - The agent account has a published KeyPackage and an invite allowlist entry for the human account that will invite it.
+- Outbound media uses one dedicated staging directory that is writable by Hermes and read-only to `wn-agent`; the
+  connector allows no other plaintext path roots.
 
 Do not run this as an unattended production service until the manual phone test at the end passes with real device logs.
 
@@ -41,6 +43,7 @@ Current pilot values:
 ```sh
 MARMOT_RELAYS=wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
 MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450
+MARMOT_OUTBOUND_MEDIA_DIR=/var/lib/marmot-media/outbound
 ```
 
 ## Control Plane Modes
@@ -53,6 +56,7 @@ wn-agent \
   --socket /run/marmot-agent/wn-agent.sock \
   --socket-dir-mode 0700 \
   --socket-mode 0600 \
+  --media-allowed-root /var/lib/marmot-media/outbound \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 ```
@@ -74,6 +78,7 @@ wn-agent \
   --auth-token-file /etc/marmot-agent/control.token \
   --socket-dir-mode 0770 \
   --socket-mode 0660 \
+  --media-allowed-root /var/lib/marmot-media/outbound \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 
@@ -102,6 +107,8 @@ sudo useradd --system --home /var/lib/hermes-agent --groups marmot-agent hermes-
 sudo install -d -m 0700 -o marmot-agent -g marmot-agent /var/lib/marmot-agent
 sudo install -d -m 0700 -o hermes-agent -g hermes-agent /var/lib/hermes-agent
 sudo install -d -m 0770 -o marmot-agent -g marmot-agent /run/marmot-agent
+sudo install -d -m 0750 -o hermes-agent -g marmot-agent /var/lib/marmot-media
+sudo install -d -m 2750 -o hermes-agent -g marmot-agent /var/lib/marmot-media/outbound
 
 sudo install -m 0640 -o root -g marmot-agent \
   packaging/systemd/hermes-marmot.env.example /etc/marmot-agent/hermes-marmot.env
@@ -111,6 +118,13 @@ sudo install -m 0644 packaging/systemd/hermes-gateway.service.example /etc/syste
 
 Edit `/etc/marmot-agent/hermes-marmot.env` before starting services. Set the public relay URLs that the phone will also
 use, optional `MARMOT_ACCOUNT_ID_HEX`, optional `MARMOT_GROUP_ID_HEX`, and optional `MARMOT_QUIC_CANDIDATES`.
+
+Hermes validates each original outbound media path, copies it into `MARMOT_OUTBOUND_MEDIA_DIR` as a random `0640`
+regular file, and deletes the copy after `wn-agent` responds. The setgid directory keeps the `marmot-agent` group on
+new files: Hermes has owner write access while `wn-agent` has group read/traverse access only. The connector opens the
+configured root at startup and rejects every path by default, every path outside it, and symlink or non-regular-file
+targets inside it. In a split-container deployment, mount this same directory `rw` in the gateway container and `ro`
+in the connector container. Do not allow `/`, either service user's home, or a general-purpose data directory.
 
 Start and inspect:
 

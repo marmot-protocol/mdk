@@ -15,6 +15,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
@@ -538,6 +539,13 @@ def resolve_inbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) ->
     return resolve_marmot_home(extra, socket_path) / "dev" / "inbound-media"
 
 
+def resolve_outbound_media_dir(extra: Dict[str, Any], socket_path: str | Path) -> Path:
+    configured = _first_config_value(extra, "outbound_media_dir", env="MARMOT_OUTBOUND_MEDIA_DIR")
+    if configured:
+        return Path(str(configured)).expanduser()
+    return resolve_marmot_home(extra, socket_path) / "dev" / "outbound-media"
+
+
 def resolve_allowed_media_roots(extra: Dict[str, Any], socket_path: str | Path) -> list[Path]:
     configured = extra.get("media_local_roots")
     if configured is None:
@@ -574,6 +582,33 @@ def assert_local_media_allowed(path: Path, allowed_roots: list[Path]) -> None:
     if any(path_is_under_root(resolved, root) for root in allowed_roots):
         return
     raise AgentControlError("Marmot media path is outside allowed local roots")
+
+
+def stage_outbound_media_file(source: Path, staging_root: Path, *, file_name: str) -> Path:
+    staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe_name = Path(str(file_name or source.name or "attachment")).name or "attachment"
+    destination = staging_root / f"{uuid.uuid4().hex}-{safe_name}"
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(source, source_flags)
+    try:
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            raise AgentControlError("Marmot media path is not a readable file")
+        destination_fd = os.open(destination, destination_flags, 0o640)
+        try:
+            os.fchmod(destination_fd, 0o640)
+            with os.fdopen(os.dup(source_fd), "rb") as source_file, os.fdopen(
+                os.dup(destination_fd), "wb"
+            ) as destination_file:
+                shutil.copyfileobj(source_file, destination_file)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+    return destination
 
 
 def valid_profile_name(name: Any) -> Optional[str]:
@@ -1326,6 +1361,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self.welcomer_allowlist = resolve_welcomer_allowlist(extra)
         self._allowed_media_roots = resolve_allowed_media_roots(extra, self.socket_path)
         self._inbound_media_dir = resolve_inbound_media_dir(extra, self.socket_path)
+        self._outbound_media_dir = resolve_outbound_media_dir(extra, self.socket_path)
         self.profile_name_onboarding_enabled = resolve_profile_name_onboarding_enabled(extra)
         self.profile_name_onboarding = (
             ProfileNameOnboardingStore(resolve_profile_onboarding_state_path(extra, self.socket_path))
@@ -1829,24 +1865,37 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except AgentControlError as exc:
             return SendResult(success=False, error=str(exc))
 
+        try:
+            staged_path = stage_outbound_media_file(
+                local_path.resolve(),
+                self._outbound_media_dir,
+                file_name=file_name,
+            )
+        except Exception as exc:
+            logger.debug("Marmot outbound media staging failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=False)
+
         account_id = await self._ensure_account_id()
         chat_id = _normalize_hex(chat_id, "chat_id")
         try:
-            response = await self.client.send_media(
-                account_id,
-                chat_id,
-                [
-                    {
-                        "path": str(local_path),
-                        "media_type": str(media_type or "application/octet-stream"),
-                        "file_name": str(file_name or local_path.name or "attachment"),
-                    }
-                ],
-                caption=caption,
-            )
-        except Exception as exc:
-            logger.debug("Marmot send_media failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+            try:
+                response = await self.client.send_media(
+                    account_id,
+                    chat_id,
+                    [
+                        {
+                            "path": str(staged_path),
+                            "media_type": str(media_type or "application/octet-stream"),
+                            "file_name": str(file_name or local_path.name or "attachment"),
+                        }
+                    ],
+                    caption=caption,
+                )
+            except Exception as exc:
+                logger.debug("Marmot send_media failed: %s", exc)
+                return SendResult(success=False, error=str(exc), retryable=is_retryable(exc))
+        finally:
+            staged_path.unlink(missing_ok=True)
 
         message_ids = tuple(response.get("message_ids_hex") or ())
         message_id = message_ids[-1] if message_ids else None

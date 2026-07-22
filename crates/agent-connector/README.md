@@ -45,8 +45,10 @@ This crate does not own the stable control DTOs or stream composition rules. Kee
 Start the connector with the same public relay set the phone app uses:
 
 ```sh
+install -d -m 0700 ~/.marmot-agent/dev/outbound-media
 cargo run -p agent-connector --bin wn-agent -- \
   --home ~/.marmot-agent \
+  --media-allowed-root ~/.marmot-agent/dev/outbound-media \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
 ```
@@ -82,6 +84,18 @@ Production connectors accept pending group invites only when the MLS-authenticat
 Local development may use `--dev-allow-any-invites` together with `--debug-controls`. The connector warns when this
 mode is active and accepts any authenticated welcomer, but it still rejects a welcome whose authenticated author is
 missing. Do not enable either development option in production.
+
+## Outbound Media Paths
+
+Path-based media sends are denied unless `wn-agent` starts with one or more `--media-allowed-root PATH` options. The
+connector opens each root at startup, then accepts only regular files reached beneath that directory handle without
+following symlinks. Hermes and OpenClaw validate their original media source, stage a short-lived copy under
+`$MARMOT_OUTBOUND_MEDIA_DIR`, send that staged path, and remove it after the connector responds.
+
+Use a dedicated staging directory, never `/`, a home directory, or a broad application data tree. For split Unix
+users, make the gateway the directory owner and give the connector's shared group read/traverse access; staged files
+are created `0640`. In split-container deployments, mount the same directory read-write in the gateway and read-only
+in the connector. Omitting `--media-allowed-root` deliberately leaves media sends disabled.
 
 ## Hermes Install
 

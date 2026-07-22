@@ -28,6 +28,7 @@ MARMOT_INSTALL_PREFIX="${MARMOT_INSTALL_PREFIX:-${HOME}/.local}"
 OPENCLAW_HOME="${OPENCLAW_HOME:-${HOME}}"
 MARMOT_HOME="${MARMOT_HOME:-${HOME}/.marmot-agents/openclaw}"
 MARMOT_AGENT_SOCKET_OVERRIDE="${MARMOT_AGENT_SOCKET:-}"
+MARMOT_OUTBOUND_MEDIA_DIR_OVERRIDE="${MARMOT_OUTBOUND_MEDIA_DIR:-}"
 MARMOT_AGENT_LABEL="${MARMOT_AGENT_LABEL:-openclaw-agent}"
 MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-wn-agent-openclaw}"
 MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-org.marmot.wn-agent.openclaw}"
@@ -351,7 +352,8 @@ install_macos_service() {
         return 0
     fi
 
-    run mkdir -p "$plist_dir" "$logs_dir" || return 1
+    run mkdir -p "$plist_dir" "$logs_dir" "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
+    run chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
     {
         printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
         printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">'
@@ -366,6 +368,8 @@ install_macos_service() {
         plist_string "$MARMOT_HOME"
         plist_string "--socket"
         plist_string "$MARMOT_AGENT_SOCKET"
+        plist_string "--media-allowed-root"
+        plist_string "$MARMOT_OUTBOUND_MEDIA_DIR"
         for relay in "${RELAYS[@]}"; do
             plist_string "--relay"
             plist_string "$relay"
@@ -415,14 +419,15 @@ install_linux_user_service() {
         return 0
     fi
 
-    run mkdir -p "$service_dir" "$MARMOT_HOME/logs" || return 1
+    run mkdir -p "$service_dir" "$MARMOT_HOME/logs" "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
+    run chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR" || return 1
     {
         printf '%s\n' '[Unit]'
         printf '%s\n' 'Description=Marmot wn-agent connector'
         printf '%s\n' 'After=network-online.target'
         printf '\n'
         printf '%s\n' '[Service]'
-        printf 'ExecStart=%q --home %q --socket %q' "$program" "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
+        printf 'ExecStart=%q --home %q --socket %q --media-allowed-root %q' "$program" "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET" "$MARMOT_OUTBOUND_MEDIA_DIR"
         for relay in "${RELAYS[@]}"; do printf ' --relay %q' "$relay"; done
         printf '\n'
         printf '%s\n' 'Restart=always'
@@ -462,7 +467,7 @@ install_user_service() {
 start_temp_agent() {
     if [ "$NO_START_WN_AGENT" -eq 1 ]; then return 0; fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] wn-agent --home %q --socket %q' "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
+        printf '[dry-run] wn-agent --home %q --socket %q --media-allowed-root %q' "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET" "$MARMOT_OUTBOUND_MEDIA_DIR"
         local relay
         for relay in "${RELAYS[@]}"; do printf ' --relay %q' "$relay"; done
         printf '\n'
@@ -472,8 +477,9 @@ start_temp_agent() {
         log "found existing wn-agent socket: $MARMOT_AGENT_SOCKET"
         return 0
     fi
-    run mkdir -p "$MARMOT_HOME"
-    local -a args=(--home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET")
+    run mkdir -p "$MARMOT_HOME" "$MARMOT_OUTBOUND_MEDIA_DIR"
+    run chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR"
+    local -a args=(--home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR")
     local relay
     for relay in "${RELAYS[@]}"; do args+=(--relay "$relay"); done
     log "starting temporary wn-agent for bootstrap"
@@ -699,6 +705,8 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         done
     fi
 fi
+
+MARMOT_OUTBOUND_MEDIA_DIR="${MARMOT_OUTBOUND_MEDIA_DIR_OVERRIDE:-$MARMOT_HOME/dev/outbound-media}"
 
 validate_welcomer_inputs
 

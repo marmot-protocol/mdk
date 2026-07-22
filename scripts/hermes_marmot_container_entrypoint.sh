@@ -11,6 +11,7 @@ fi
 : "${MARMOT_AGENT_AUTH_TOKEN_FILE:=$MARMOT_HOME/control.token}"
 : "${MARMOT_AGENT_SOCKET_DIR_MODE:=0770}"
 : "${MARMOT_AGENT_SOCKET_MODE:=0660}"
+: "${MARMOT_OUTBOUND_MEDIA_DIR:=$MARMOT_HOME/dev/outbound-media}"
 : "${MARMOT_RELAYS:=${MARMOT_RELAY:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}}"
 : "${MARMOT_QUIC_CANDIDATES:=quic://quic-broker.ipf.dev:4450}"
 : "${HERMES_MARMOT_AUTO_BOOTSTRAP:=1}"
@@ -29,13 +30,16 @@ export MARMOT_AGENT_SOCKET
 export MARMOT_AGENT_AUTH_TOKEN_FILE
 export MARMOT_AGENT_SOCKET_DIR_MODE
 export MARMOT_AGENT_SOCKET_MODE
+export MARMOT_OUTBOUND_MEDIA_DIR
 export MARMOT_RELAYS
 export MARMOT_QUIC_CANDIDATES
 export MARMOT_PROFILE_NAME_ONBOARDING
 export PATH="/opt/hermes-agent/.venv/bin:$PATH"
 
 mkdir -p "$MARMOT_HOME" "$HERMES_HOME/plugins" "$(dirname "$MARMOT_AGENT_SOCKET")"
+mkdir -p "$MARMOT_OUTBOUND_MEDIA_DIR"
 chmod 0700 "$MARMOT_HOME" "$HERMES_HOME" || true
+chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR" || true
 
 if [ ! -f "$MARMOT_AGENT_AUTH_TOKEN_FILE" ]; then
     token_parent="$(dirname "$MARMOT_AGENT_AUTH_TOKEN_FILE")"
@@ -56,6 +60,7 @@ wn_agent_args=(
     --auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE"
     --socket-dir-mode "$MARMOT_AGENT_SOCKET_DIR_MODE"
     --socket-mode "$MARMOT_AGENT_SOCKET_MODE"
+    --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR"
 )
 
 IFS=',' read -r -a configured_relays <<<"$MARMOT_RELAYS"

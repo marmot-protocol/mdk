@@ -20,7 +20,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/hermes-agent /run/marmot-agent
+ReadWritePaths=/var/lib/hermes-agent /var/lib/marmot-media/outbound /run/marmot-agent
 
 [Install]
 WantedBy=multi-user.target

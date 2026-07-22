@@ -15,6 +15,7 @@ ExecStart=/usr/local/bin/wn-agent \
   --auth-token-file ${MARMOT_AGENT_AUTH_TOKEN_FILE} \
   --socket-dir-mode ${MARMOT_AGENT_SOCKET_DIR_MODE} \
   --socket-mode ${MARMOT_AGENT_SOCKET_MODE} \
+  --media-allowed-root ${MARMOT_OUTBOUND_MEDIA_DIR} \
   --relay ${MARMOT_RELAY_EU} \
   --relay ${MARMOT_RELAY_US}
 Restart=on-failure
@@ -29,6 +30,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/marmot-agent /run/marmot-agent
+ReadOnlyPaths=/var/lib/marmot-media/outbound
 
 [Install]
 WantedBy=multi-user.target

@@ -128,6 +128,7 @@ describe("createMarmotMessageAdapter", () => {
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
         nowMs: () => 5678,
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
 
       const ctx = {
@@ -147,10 +148,11 @@ describe("createMarmotMessageAdapter", () => {
         caption: "look at this",
       });
       expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-        path: filePath,
         media_type: "image/png",
         file_name: "cat.png",
       });
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
+      expect(calls.sendMedia[0]?.attachments[0]?.path).toContain(join(tmpRoot, "staging"));
       expect(result.receipt.parts[0]).toMatchObject({ kind: "media", index: 0 });
       expect(result.receipt.sentAt).toBe(5678);
     } finally {
@@ -166,6 +168,7 @@ describe("createMarmotMessageAdapter", () => {
       const calls = emptyClientCalls();
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
       const ctx = {
         cfg: {},
@@ -178,10 +181,10 @@ describe("createMarmotMessageAdapter", () => {
       await adapter.send!.media!(ctx);
 
       expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-        path: filePath,
         media_type: "video/mp4",
         file_name: "clip.mp4",
       });
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
       // An empty caption is sent as null.
       expect(calls.sendMedia[0]?.caption).toBeNull();
     } finally {
@@ -305,6 +308,7 @@ describe("createMarmotMessageAdapter", () => {
       const calls = emptyClientCalls();
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
       const ctx = {
         cfg: {},
@@ -318,10 +322,10 @@ describe("createMarmotMessageAdapter", () => {
 
       expect(calls.sendMedia).toHaveLength(1);
       expect(calls.sendMedia[0]?.attachments[0]).toMatchObject({
-        path: filePath,
         media_type: "image/png",
         file_name: "photo.png",
       });
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
@@ -335,6 +339,7 @@ describe("createMarmotMessageAdapter", () => {
       const calls = emptyClientCalls();
       const adapter = createMarmotMessageAdapter({
         resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
+        outboundMediaDir: join(tmpRoot, "staging"),
       });
       const ctx = {
         cfg: {},
@@ -347,7 +352,8 @@ describe("createMarmotMessageAdapter", () => {
       await adapter.send!.media!(ctx);
 
       expect(calls.sendMedia).toHaveLength(1);
-      expect(calls.sendMedia[0]?.attachments[0]?.path).toBe(filePath);
+      expect(calls.sendMedia[0]?.attachments[0]?.path).not.toBe(filePath);
+      expect(calls.sendMedia[0]?.attachments[0]?.path).toContain(join(tmpRoot, "staging"));
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

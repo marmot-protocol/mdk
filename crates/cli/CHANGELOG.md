@@ -55,6 +55,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn-agent` now denies path-based media sends by default and accepts only regular, non-symlink files beneath explicit
+  repeatable `--media-allowed-root` directories. Bundled Hermes and OpenClaw launchers stage short-lived copies in a
+  dedicated approved directory and clean them up after each send.
 - `wn-agent` replaced the ambiguous `--allow-any` invite bypass with `--dev-allow-any-invites`, requires
   `--debug-controls` alongside it, warns when the policy is active, and still rejects welcomes that lack an
   MLS-authenticated author.

@@ -278,6 +278,7 @@ write_env_file() {
         printf 'export HERMES_HOME=%q\n' "$hermes_home"
         printf 'export MARMOT_HOME=%q\n' "$marmot_home"
         printf 'export MARMOT_AGENT_SOCKET=%q\n' "$marmot_home/dev/wn-agent.sock"
+        printf 'export MARMOT_OUTBOUND_MEDIA_DIR=%q\n' "$marmot_home/dev/outbound-media"
         printf 'export MARMOT_AGENT_AUTH_TOKEN_FILE=%q\n' "$auth_token_file"
         printf 'export MARMOT_AGENT_SOCKET_DIR_MODE=%q\n' "$socket_dir_mode"
         printf 'export MARMOT_AGENT_SOCKET_MODE=%q\n' "$socket_mode"
@@ -311,9 +312,12 @@ write_helper_scripts() {
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 cd "$MDK_REPO"
+mkdir -p "$MARMOT_OUTBOUND_MEDIA_DIR"
+chmod 0700 "$MARMOT_OUTBOUND_MEDIA_DIR"
 wn_agent_control_args=(
     --socket-dir-mode "${MARMOT_AGENT_SOCKET_DIR_MODE:-0700}"
     --socket-mode "${MARMOT_AGENT_SOCKET_MODE:-0600}"
+    --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR"
 )
 if [ -n "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" ]; then
     wn_agent_control_args+=(--auth-token-file "$MARMOT_AGENT_AUTH_TOKEN_FILE")

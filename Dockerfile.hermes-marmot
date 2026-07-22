@@ -40,6 +40,7 @@ ENV MARMOT_HOME=/data/marmot-agent \
     MARMOT_AGENT_AUTH_TOKEN_FILE=/data/marmot-agent/control.token \
     MARMOT_AGENT_SOCKET_DIR_MODE=0770 \
     MARMOT_AGENT_SOCKET_MODE=0660 \
+    MARMOT_OUTBOUND_MEDIA_DIR=/run/marmot-media/outbound \
     MARMOT_RELAYS=wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat \
     MARMOT_QUIC_CANDIDATES=quic://quic-broker.ipf.dev:4450 \
     HERMES_MARMOT_STREAMING=1 \

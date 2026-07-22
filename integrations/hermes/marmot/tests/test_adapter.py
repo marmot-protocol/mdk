@@ -2961,6 +2961,7 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
                     self.media_sends = []
 
                 async def send_media(self, account_id_hex, group_id_hex, attachments, *, caption=None, reply_to_message_id_hex=None):
+                    self.assert_staged = Path(attachments[0]["path"]).read_bytes()
                     self.media_sends.append((account_id_hex, group_id_hex, attachments, caption))
                     return {"type": "final_sent", "message_ids_hex": ["99" * 32]}
 
@@ -2973,7 +2974,12 @@ class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(len(fake_client.media_sends), 1)
-            self.assertEqual(fake_client.media_sends[0][2][0]["path"], str(image_path))
+            staged_path = Path(fake_client.media_sends[0][2][0]["path"])
+            self.assertEqual(fake_client.assert_staged, b"png")
+            self.assertTrue(str(staged_path).startswith(str(Path(tmpdir) / "dev" / "outbound-media")))
+            self.assertNotEqual(staged_path, image_path)
+            self.assertFalse(staged_path.exists())
+            self.assertTrue(image_path.exists())
             self.assertEqual(fake_client.media_sends[0][3], "look")
 
     async def test_outbound_media_outside_allowlist_is_rejected(self):

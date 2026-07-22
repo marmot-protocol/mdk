@@ -30,6 +30,8 @@ pub enum ConnectorError {
     InvalidProfileName(&'static str),
     #[error("connector operation timed out: {0}")]
     OperationTimedOut(&'static str),
+    #[error("outbound media path denied: {0}")]
+    MediaPathDenied(&'static str),
 }
 
 impl ConnectorError {
@@ -47,6 +49,7 @@ impl ConnectorError {
             Self::Stream(_) => "stream_error",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::OperationTimedOut(_) => "operation_timed_out",
+            Self::MediaPathDenied(_) => "media_path_denied",
         }
     }
 
@@ -60,6 +63,7 @@ impl ConnectorError {
             Self::Stream(_) => "agent stream request failed",
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::OperationTimedOut(_) => "connector operation timed out",
+            Self::MediaPathDenied(_) => "media path is not allowed",
             Self::Io(_) => "connector I/O failed",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",
         }

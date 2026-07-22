@@ -184,6 +184,7 @@ fn test_config(
     config.relays = relays;
     config.dev_allow_any_invites = dev_allow_any_invites;
     config.debug_controls = debug_controls;
+    config.media_allowed_roots = Vec::new();
     // The white-box suite drives streams at loopback brokers and connects to an
     // in-process `MockRelay` at loopback; production defaults keep both off (see
     // `allow_insecure_local_broker` / `allow_loopback_relays`).

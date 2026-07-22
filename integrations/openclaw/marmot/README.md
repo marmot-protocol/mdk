@@ -168,6 +168,7 @@ advanced shared deployment can point both gateways at one `wn-agent`:
 | `blockStreaming` / `streaming.block.enabled` | `MARMOT_BLOCK_STREAMING` | `true` when QUIC candidates are configured and Marmot streaming is not `off` |
 | `debounceMs` | `MARMOT_DEBOUNCE_MS` | `0` (off; coalesce rapid same-sender/group messages into one turn) |
 | `groupActivation` | `MARMOT_GROUP_ACTIVATION` | `mention` (reply only when addressed in 3+ member groups; `always` replies to every message) |
+| — | `MARMOT_OUTBOUND_MEDIA_DIR` | `$MARMOT_HOME/dev/outbound-media` (short-lived connector-approved staging copies) |
 | `mentionPatterns` | `MARMOT_MENTION_PATTERNS` | — (extra case-insensitive trigger phrases; the configured agent name is always a trigger) |
 | `profileNameOnboarding` | `MARMOT_PROFILE_NAME_ONBOARDING` | `true` |
 | `dm.policy` / `dm.allowFrom` | — | `allowlist` |
@@ -252,8 +253,12 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   `InboundMediaFacts` (`{ path, contentType, kind }`), which OpenClaw
   base64-encodes for a vision model. Outbound — the message adapter declares
   `media` and maps an agent reply's `mediaUrl` (resolved to a local path via
-  `mediaReadFile` when needed) onto `send_media` (`wn-agent` encrypts + uploads
-  to Blossom; the content key never leaves it). The vision model actually
+  `mediaReadFile` when needed) onto `send_media`. The adapter retains OpenClaw's
+  local-root check, stages a short-lived copy under `MARMOT_OUTBOUND_MEDIA_DIR`,
+  and cleans it up after the response; `wn-agent` independently requires that
+  path beneath a startup `--media-allowed-root` and rejects symlinks and
+  non-regular files. `wn-agent` encrypts + uploads to Blossom; the content key
+  never leaves it. The vision model actually
   receiving the image is confirmed on the docker harness.
 - **Live QUIC previews** (`src/live.ts`): progressive agent reply blocks drive an
   append-only preview (`stream_begin`/`append`/`finalize`); a non-append-only

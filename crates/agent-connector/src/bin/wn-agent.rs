@@ -58,6 +58,12 @@ struct ServeArgs {
     )]
     auth_token_file: Option<PathBuf>,
     #[arg(
+        long = "media-allowed-root",
+        value_name = "PATH",
+        help = "Allow outbound media reads beneath this directory; may be repeated (default: deny all)"
+    )]
+    media_allowed_roots: Vec<PathBuf>,
+    #[arg(
         long,
         value_name = "OCTAL",
         default_value = "0700",
@@ -222,6 +228,7 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         dev_allow_any_invites: args.dev_allow_any_invites,
         debug_controls: args.debug_controls,
         auth_token,
+        media_allowed_roots: args.media_allowed_roots,
         max_connections: args.max_connections,
         allow_insecure_local_broker: args.insecure_local_broker,
         allow_loopback_relays: args.allow_loopback_relays,
