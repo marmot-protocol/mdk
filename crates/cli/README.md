@@ -235,9 +235,11 @@ wn --account <npub-or-hex> messages timeline subscribe <group-hex>
 format other Marmot clients produce, so recipients see the row with its reply reference and a hydrated reply preview
 of the parent. Pass the group with `--group` and put `--reply-to` before the text when replying: the message text uses
 hyphen-tolerant parsing, so a `--reply-to` placed after the text (in either the positional-group or the `--group`
-form) is read as literal text rather than as the flag. Instead of silently sending that stray `--reply-to` as part of
-the body, the CLI rejects the mis-ordering with a clear error (code `reply_to_after_message_text`) so it fails loudly.
-The tradeoff: message text that is itself exactly `--reply-to` can no longer be sent. The parent id is not required to
+form, and in either spelling: `--reply-to <id>` or `--reply-to=<id>`) is read as literal text rather than as the flag.
+Instead of silently sending that stray `--reply-to` as part of the body, the CLI rejects the mis-ordering with a clear
+error (code `reply_to_after_message_text`) so it fails loudly. The tradeoff: the guard rejects any message whose text
+contains a bare `--reply-to` or `--reply-to=<id>` token anywhere (e.g. `hello --reply-to friend`), so such text can no
+longer be sent this way. The parent id is not required to
 exist locally; a reply to a message you have not yet synced is still sent (its preview hydrates once the parent
 arrives). The JSON response is the same shape as a plain send.
 
