@@ -103,6 +103,7 @@ source "$default_root/env.sh"
 [ ! -e "$default_root" ]
 
 [ -x "$repo_root/scripts/install-openclaw-marmot.sh" ]
+"$repo_root/integrations/test_installer_systemd_service.sh" openclaw
 installer_dry_run="$(
     env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
         WN_AGENT_SHA="9.9.9" \
@@ -150,6 +151,12 @@ case "$installer_dry_run" in
     *"wn-agent-openclaw.service"* | *"org.marmot.wn-agent.openclaw.plist"* ) ;;
     *) echo "OpenClaw installer dry-run did not use the OpenClaw-specific service identity" >&2; exit 1;;
 esac
+if [ "$(uname -s)" = Linux ]; then
+    case "$installer_dry_run" in
+        *"would enable/start, or restart if already active, systemd user service: wn-agent-openclaw.service"* ) ;;
+        *) echo "OpenClaw installer dry-run did not describe active-service upgrade behavior" >&2; exit 1;;
+    esac
+fi
 case "$installer_stdin_dry_run" in
     *"openclaw-marmot-plugin-9.9.9.tgz"* ) ;;
     *) echo "OpenClaw installer stdin dry-run did not use expected plugin asset" >&2; exit 1;;

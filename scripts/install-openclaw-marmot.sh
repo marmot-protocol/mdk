@@ -392,6 +392,16 @@ install_macos_service() {
     log "installed and started LaunchAgent: $label"
 }
 
+enable_or_restart_systemd_user_service() {
+    local service="$1"
+    if systemctl --user is-active --quiet "$service"; then
+        run systemctl --user enable "$service" || return 1
+        run systemctl --user restart "$service" || return 1
+    else
+        run systemctl --user enable --now "$service" || return 1
+    fi
+}
+
 install_linux_user_service() {
     local service_dir service program relay
     if ! command -v systemctl >/dev/null 2>&1; then return 1; fi
@@ -401,7 +411,7 @@ install_linux_user_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service"
+        log "would enable/start, or restart if already active, systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
         return 0
     fi
 
@@ -426,8 +436,8 @@ install_linux_user_service() {
         warn "systemctl --user daemon-reload failed; falling back to a temporary wn-agent process"
         return 1
     fi
-    if ! run systemctl --user enable --now "$MARMOT_AGENT_SERVICE_NAME.service"; then
-        warn "systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service failed; falling back to a temporary wn-agent process"
+    if ! enable_or_restart_systemd_user_service "$MARMOT_AGENT_SERVICE_NAME.service"; then
+        warn "could not enable/start systemd user service $MARMOT_AGENT_SERVICE_NAME.service; falling back to a temporary wn-agent process"
         return 1
     fi
     log "installed and started systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
