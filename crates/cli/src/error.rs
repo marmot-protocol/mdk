@@ -389,7 +389,7 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "reply_to_after_message_text",
             "message": err.to_string(),
             "repair": {
-                "reply": "put --reply-to before the text: wn messages send --group <group> --reply-to <message-id> <text>",
+                "reorder": "put --reply-to before the text: wn messages send --group <group> --reply-to <message-id> <text>",
             },
         }),
         WnError::EmptyRelayUrl => json!({
