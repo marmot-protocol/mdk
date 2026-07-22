@@ -4,20 +4,22 @@
 use incident_replay::{ForkCommitKind, ForkRecoveryError, RecoveredFork, parse, recover_fork};
 
 /// A pure two-committer group-metadata fork: alpha and beta both `topic_changed`
-/// at epoch 31 (= source 30 + 1); the invalidated commit was published by beta.
+/// at epoch 31 (= source 30 + 1); the invalidated commit belongs to member-beta.
+/// Account refs deliberately differ from member refs so this fixture catches
+/// accidental cross-namespace attribution.
 fn pure_fork_json(winner_change: &str) -> String {
     format!(
         r#"{{
           "events": [
             {{ "kind": {{ "type": "fork_resolution", "source_epoch": 30,
                           "invalidated_msg_id": "inv-1", "winner": "incumbent" }} }},
-            {{ "account_ref": "alpha",
+            {{ "account_ref": "observer-account-a",
                "kind": {{ "type": "group_state_changed", "epoch": 31, "change_kind": "{winner_change}",
-                          "actor_member_ref": "alpha" }} }},
-            {{ "account_ref": "beta",
+                          "actor_member_ref": "member-alpha", "origin_commit_id": "winner-1" }} }},
+            {{ "account_ref": "observer-account-b",
                "kind": {{ "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed",
-                          "actor_member_ref": "beta" }} }},
-            {{ "account_ref": "beta",
+                          "actor_member_ref": "member-beta", "origin_commit_id": "inv-1" }} }},
+            {{ "account_ref": "unrelated-publisher-account",
                "kind": {{ "type": "publish_outcome", "msg_id": "inv-1" }} }}
           ]
         }}"#
@@ -78,11 +80,11 @@ fn a_single_committer_at_the_tip_is_ambiguous() {
 
 #[test]
 fn an_unattributable_invalidated_commit_makes_the_winner_unrecoverable() {
-    // No publish event ties `inv-1` to a committer.
+    // No group-state origin commit id ties `inv-1` to a committer.
     let json = r#"{ "events": [
         { "kind": { "type": "fork_resolution", "source_epoch": 30, "invalidated_msg_id": "inv-1", "winner": "incumbent" } },
-        { "account_ref": "alpha", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "alpha" } },
-        { "account_ref": "beta", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "beta" } }
+        { "account_ref": "account-alpha", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "member-alpha", "origin_commit_id": "alpha-commit" } },
+        { "account_ref": "account-beta", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "member-beta", "origin_commit_id": "beta-commit" } }
     ] }"#;
     assert_eq!(recover(json), Err(ForkRecoveryError::UnrecoverableWinner));
 }

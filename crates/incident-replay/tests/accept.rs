@@ -8,9 +8,9 @@ use incident_replay::{accept, parse, recover_fork};
 const PURE_METADATA_FORK: &str = r#"{
   "events": [
     { "kind": { "type": "fork_resolution", "source_epoch": 30, "invalidated_msg_id": "inv-1", "winner": "incumbent" } },
-    { "account_ref": "alpha", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "alpha" } },
-    { "account_ref": "beta", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "beta" } },
-    { "account_ref": "beta", "kind": { "type": "publish_outcome", "msg_id": "inv-1" } }
+    { "account_ref": "observer-account-a", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "member-alpha", "origin_commit_id": "winner-1" } },
+    { "account_ref": "observer-account-b", "kind": { "type": "group_state_changed", "epoch": 31, "change_kind": "topic_changed", "actor_member_ref": "member-beta", "origin_commit_id": "inv-1" } },
+    { "account_ref": "unrelated-publisher-account", "kind": { "type": "publish_outcome", "msg_id": "inv-1" } }
   ]
 }"#;
 

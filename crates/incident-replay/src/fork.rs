@@ -100,7 +100,7 @@ pub fn recover_fork(export: &AgentStateExport) -> Result<RecoveredFork, ForkReco
         .ok_or(ForkRecoveryError::SourceEpochOverflow)?; // rule 2: racers land at source + 1.
 
     // The competing commits are the group-state changes at the contested tip.
-    let tip: Vec<(&str, &str)> = export
+    let tip: Vec<(&str, &str, Option<&str>)> = export
         .events
         .iter()
         .filter_map(|event| match &event.kind {
@@ -108,12 +108,17 @@ pub fn recover_fork(export: &AgentStateExport) -> Result<RecoveredFork, ForkReco
                 epoch: Some(epoch),
                 change_kind: Some(change_kind),
                 actor_member_ref: Some(actor),
-            } if *epoch == contested_tip => Some((actor.as_str(), change_kind.as_str())),
+                origin_commit_id,
+            } if *epoch == contested_tip => Some((
+                actor.as_str(),
+                change_kind.as_str(),
+                origin_commit_id.as_deref(),
+            )),
             _ => None,
         })
         .collect();
 
-    let committers: BTreeSet<&str> = tip.iter().map(|(actor, _)| *actor).collect();
+    let committers: BTreeSet<&str> = tip.iter().map(|(actor, _, _)| *actor).collect();
     if committers.len() != 2 {
         return Err(ForkRecoveryError::AmbiguousCommitters(committers.len()));
     }
@@ -125,7 +130,7 @@ pub fn recover_fork(export: &AgentStateExport) -> Result<RecoveredFork, ForkReco
     // race — `member_added` on one branch, `admin_added` on the other — is not
     // mixed.)
     let mut kinds: Vec<ForkCommitKind> = Vec::new();
-    for (_, change_kind) in &tip {
+    for (_, change_kind, _) in &tip {
         let kind = commit_kind(change_kind)?;
         if !kinds.contains(&kind) {
             kinds.push(kind);
@@ -141,23 +146,15 @@ pub fn recover_fork(export: &AgentStateExport) -> Result<RecoveredFork, ForkReco
     // whose accept path label-searches for the ordering that makes the designated
     // winner's branch survive. The membership fork is winner-agnostic
     // (`member_count == 3` is the survival proof, so accept is a single run with
-    // no label search), and real observer-recorded exports cannot even provide
-    // the join it would need: `account_ref` on a publish event is the *observing*
-    // engine, while the committers are `actor_member_ref` (MLS member ids) — a
-    // disjoint id space, so the publisher never matches a committer. Gating this
-    // to `GroupData` is what lets a real membership fork recover.
+    // no label search).
     if commit == ForkCommitKind::GroupData {
-        // The account that published the invalidated commit is the loser; the
-        // winner is the other committer. If the invalidated commit can't be
-        // attributed to one of the two committers, the winner is unrecoverable.
-        let loser = invalidated
-            .and_then(|inv| {
-                export
-                    .events
-                    .iter()
-                    .find(|e| e.published_msg_id() == Some(inv))
+        // The group-state row originated by the invalidated commit identifies
+        // the loser in the same member-ref namespace as the committer set.
+        let loser = invalidated.and_then(|invalidated| {
+            tip.iter().find_map(|(actor, _, origin_commit_id)| {
+                (*origin_commit_id == Some(invalidated)).then_some(*actor)
             })
-            .and_then(|event| event.account_ref.as_deref());
+        });
         if !loser.is_some_and(|loser| committers.contains(loser)) {
             return Err(ForkRecoveryError::UnrecoverableWinner);
         }

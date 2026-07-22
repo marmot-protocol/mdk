@@ -39,8 +39,7 @@ pub struct Pagination {
 
 /// One forensic audit event. The classifier reads `kind` plus the envelope's
 /// `engine_id` and `wall_time_ms` (the liveness gates aggregate per-engine
-/// activity from them); extraction also uses the event-level `account_ref`
-/// (the acting account).
+/// activity from them).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditEvent {
     #[serde(default)]
@@ -50,19 +49,6 @@ pub struct AuditEvent {
     #[serde(default)]
     pub wall_time_ms: Option<u64>,
     pub kind: EventKind,
-}
-
-impl AuditEvent {
-    /// The `msg_id` this event reports publishing, if it is a publish event.
-    /// Paired with `account_ref`, it attributes a message to its publisher.
-    pub fn published_msg_id(&self) -> Option<&str> {
-        match &self.kind {
-            EventKind::PublishOutcome { msg_id } | EventKind::PublishAttempt { msg_id } => {
-                msg_id.as_deref()
-            }
-            _ => None,
-        }
-    }
 }
 
 /// The event kinds the classifier reasons about. Every other kind maps to
@@ -113,9 +99,13 @@ pub enum EventKind {
         change_kind: Option<String>,
         #[serde(default)]
         actor_member_ref: Option<String>,
+        /// Commit message that originated this canonical state change. This
+        /// joins a fork invalidation to its actor without crossing identity
+        /// namespaces.
+        #[serde(default)]
+        origin_commit_id: Option<String>,
     },
-    /// A publish attempt/outcome carrying the `msg_id`; with the event-level
-    /// `account_ref` this attributes a message to the account that published it.
+    /// A publish attempt/outcome carrying the `msg_id`.
     PublishOutcome {
         #[serde(default)]
         msg_id: Option<String>,
