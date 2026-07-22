@@ -163,6 +163,12 @@ Unix-domain only and use the existing socket mode plus bearer-token options:
 `--auth-token-file`, group-readable socket modes, and
 `MARMOT_AGENT_AUTH_TOKEN_FILE`.
 
+That bearer is a full-daemon credential, not an account selector or a read-only
+integration key. A holder can read all inbound plaintext and perform every
+control operation for every account in that connector home. Share a connector
+only among integrations in the same trust boundary. For a less-trusted plugin,
+gateway, or tenant, use another `wn-agent` home, socket, token, and account.
+
 ## Development Paths
 
 Each integration has its own README and AGENTS file for local details. Common

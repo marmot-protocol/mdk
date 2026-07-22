@@ -149,6 +149,10 @@ impl AgentConnector {
         peer_authorized_by_uid: bool,
         auth_token: Option<&str>,
     ) -> Result<(), ConnectorError> {
+        // A configured token deliberately replaces peer-UID authorization and
+        // grants the whole local control API. There are no per-command or
+        // per-account scopes: deployments that do not share one trust boundary
+        // must use separate connector instances, sockets, homes, and tokens.
         if let Some(expected) = self.auth_token.as_deref() {
             if auth_token_matches(expected, auth_token) {
                 return Ok(());

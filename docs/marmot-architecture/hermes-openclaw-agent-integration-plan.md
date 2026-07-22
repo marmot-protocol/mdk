@@ -201,7 +201,9 @@ Deployment constraint:
 
 - Hermes/OpenClaw and `wn-agent` must run as the same Unix user with mode `0600`, or as local users in a shared Unix group
   with a configured auth token, mode `0660`, and a non-world-accessible parent directory.
-- No TCP control listener exists in v1. Split-host gateways require a later TLS-authenticated control plane.
+- The configured token replaces peer-UID authorization and grants every control operation for every hosted account. It
+  has no read-only, command, or per-account scopes; separate trust domains require separate connector instances.
+- No TCP control listener exists in v2. Split-host gateways require a later TLS-authenticated control plane.
 
 ## Workstream 4: Invite Authorization And Welcomer Metadata
 

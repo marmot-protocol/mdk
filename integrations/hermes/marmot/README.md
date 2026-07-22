@@ -308,6 +308,11 @@ export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agents/hermes/control.token"
 `MARMOT_AGENT_AUTH_TOKEN_FILE` for shell and service-manager setups so the token
 does not appear in process environments by default.
 
+This is a full-control connector credential: it is not limited to the selected
+Hermes account or group. Any holder can subscribe to all plaintext and operate
+every account in that connector home. Do not share the connector/token with an
+untrusted plugin or tenant; give that boundary its own `wn-agent` instance.
+
 ### Group activation (multi-party groups)
 
 By default the adapter only runs an agent turn in a multi-party group when the

@@ -21,6 +21,8 @@ This setup is ready for dogfood or a supervised production pilot when all of the
 - The control socket is either same-UID only (`0700` parent, `0600` socket) or token-gated for group sharing.
 - The token file is not checked into source, is group-readable only when two service users need it, and is rotated on host
   compromise.
+- The connector serves exactly one trusted gateway boundary; untrusted plugins, gateways, or tenants use separate
+  connector homes, sockets, tokens, and agent accounts.
 - At least one public Nostr relay is configured for durable Marmot traffic.
 - The phone and the agent computer use the same public relay set.
 - QUIC broker candidates are configured only when the broker is reachable from the phone.
@@ -86,8 +88,11 @@ export MARMOT_AGENT_AUTH_TOKEN_FILE=/etc/marmot-agent/control.token
 ```
 
 Use this when Hermes and `wn-agent` run as separate local users in the same Unix group. World-readable or world-writable
-control socket modes are rejected at startup. Remote control-plane access is out of scope for this v1 path; keep the
-gateway and connector on the same host, VM, or container boundary.
+control socket modes are rejected at startup. The token grants the complete control API, including unfiltered plaintext
+subscriptions and every hosted account's send, delete, account, allowlist, key-package, and media operations. Token mode
+does not retain a same-UID restriction and has no narrower scopes. Do not share this token with a less-trusted plugin or
+tenant; deploy a separate connector boundary instead. Remote control-plane access is out of scope for this v2 path;
+keep the gateway and connector on the same host, VM, or container boundary.
 
 ## Service Manager Setup
 

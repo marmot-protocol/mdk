@@ -99,6 +99,11 @@ Configure with environment variables:
 | `WN_OPENCODE_ACTIVATION` | `always` | Only `always` is supported today |
 | `RUST_LOG` | `info,wn_opencode=info` | tracing filter |
 
+The optional bearer token grants the complete `wn-agent` control API for every
+account in its home; the harness sender allowlist does not narrow that token's
+authority. Do not give it to an untrusted harness. Use a separate connector
+home, socket, token, and account for a separate trust boundary.
+
 The reply limit is byte-based, not character-based. The default is 30KB, well
 below Marmot's roughly 60KB message ceiling. Splitting prefers paragraph,
 newline, then space boundaries and never splits a UTF-8 code point.

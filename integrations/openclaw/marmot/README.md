@@ -183,6 +183,9 @@ no TCP listener). If OpenClaw and `wn-agent` run as different local users, start
 `wn-agent` with `--auth-token-file` + group-readable socket modes (`0660`) and
 set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
 [`crates/agent-connector/README.md`](../../../crates/agent-connector/README.md).
+The token grants the full connector API for every hosted account, not only the
+configured OpenClaw channel account. Use a separate connector home/socket/token
+for any plugin or tenant that is not in the same trust boundary.
 
 - **Inbound → agent turn** (`src/dispatch.ts`): the inbound bridge feeds each
   received Marmot message (`chatId` = Marmot group id, `userId` = sender) into

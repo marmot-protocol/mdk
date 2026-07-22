@@ -54,7 +54,7 @@ struct ServeArgs {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Require this local control-plane bearer token file for every request"
+        help = "Require this full-control local bearer token file for every request"
     )]
     auth_token_file: Option<PathBuf>,
     #[arg(
@@ -126,9 +126,9 @@ struct BootstrapArgs {
         help = "Reuse this local signing account instead of selecting by label"
     )]
     account_id_hex: Option<String>,
-    #[arg(long, value_name = "TOKEN", help = "Control-plane auth token")]
+    #[arg(long, value_name = "TOKEN", help = "Full-control bearer token")]
     auth_token: Option<String>,
-    #[arg(long, value_name = "PATH", help = "Control-plane auth token file")]
+    #[arg(long, value_name = "PATH", help = "Full-control bearer token file")]
     auth_token_file: Option<PathBuf>,
     #[arg(
         long,
