@@ -168,12 +168,17 @@ mod tests {
         let ffi = SecureDeleteExpiredResultFfi::from(SecureDeleteExpiredResult {
             pruned_messages: 2,
             media_ciphertext_sha256: vec!["aa".repeat(32), "bb".repeat(32)],
+            media_plaintext_sha256: vec!["cc".repeat(32), "dd".repeat(32)],
         });
 
         assert_eq!(ffi.pruned_messages, 2);
         assert_eq!(
             ffi.media_ciphertext_sha256,
             vec!["aa".repeat(32), "bb".repeat(32)]
+        );
+        assert_eq!(
+            ffi.media_plaintext_sha256,
+            vec!["cc".repeat(32), "dd".repeat(32)]
         );
     }
 

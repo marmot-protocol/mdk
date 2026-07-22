@@ -182,6 +182,10 @@ pub struct SecurePruneAppEventsResult {
     /// Sorted set of encrypted-media blob ids referenced by pruned messages.
     /// Callers should treat this as an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
+    /// Sorted set of plaintext content hashes referenced by pruned messages.
+    /// Host apps can use these to evict content-addressed decrypted caches
+    /// without listing media records before the prune removes them.
+    pub media_plaintext_sha256: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -774,9 +778,14 @@ pub(crate) fn secure_prune_app_events_before_tx(
     let mut pruned_message_ids = BTreeSet::new();
     let mut affected_message_ids = BTreeSet::new();
     let mut media_ciphertext_sha256 = BTreeSet::new();
+    let mut media_plaintext_sha256 = BTreeSet::new();
     for event in &pruned_events {
         pruned_message_ids.insert(event.message_id_hex.clone());
-        collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
+        collect_media_hashes(
+            &event.tags,
+            &mut media_ciphertext_sha256,
+            &mut media_plaintext_sha256,
+        );
         affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
             tx,
             group_id_hex,
@@ -812,6 +821,7 @@ pub(crate) fn secure_prune_app_events_before_tx(
     Ok(SecurePruneAppEventsResult {
         pruned_messages: pruned,
         media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
+        media_plaintext_sha256: media_plaintext_sha256.into_iter().collect(),
     })
 }
 
@@ -1456,14 +1466,22 @@ fn group_and_message_id_values(
     values
 }
 
-fn collect_media_ciphertext_hashes(tags: &[Vec<String>], out: &mut BTreeSet<String>) {
+fn collect_media_hashes(
+    tags: &[Vec<String>],
+    ciphertext_out: &mut BTreeSet<String>,
+    plaintext_out: &mut BTreeSet<String>,
+) {
     let mut malformed_media_hashes = 0usize;
     for tag in tags
         .iter()
         .filter(|tag| tag.first().is_some_and(|name| name == "imeta"))
     {
         for field in tag.iter().skip(1) {
-            let Some(hash) = field.strip_prefix("ciphertext_sha256 ") else {
+            let (hash, out) = if let Some(hash) = field.strip_prefix("ciphertext_sha256 ") {
+                (hash, &mut *ciphertext_out)
+            } else if let Some(hash) = field.strip_prefix("plaintext_sha256 ") {
+                (hash, &mut *plaintext_out)
+            } else {
                 continue;
             };
             let hash = hash.trim().to_ascii_lowercase();

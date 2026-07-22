@@ -695,6 +695,10 @@ pub struct SecureDeleteExpiredResult {
     /// list is sorted for deterministic output, but callers should treat it as
     /// an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
+    /// Plaintext content hashes for those same pruned media attachments. Host
+    /// apps can directly evict content-addressed decrypted caches from this
+    /// result instead of listing the group's media before deletion.
+    pub media_plaintext_sha256: Vec<String>,
 }
 
 impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
@@ -702,6 +706,7 @@ impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
         Self {
             pruned_messages: value.pruned_messages as u64,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
+            media_plaintext_sha256: value.media_plaintext_sha256,
         }
     }
 }

@@ -722,6 +722,7 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
     let secret = "secure-prune-disk-secret-586-plaintext";
     let secret_filename = "secure-prune-disk-secret-586.png";
     let media_hash = "ca".repeat(32);
+    let plaintext_hash = "cb".repeat(32);
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -740,6 +741,7 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         "imeta".to_owned(),
         "v encrypted-media-v1".to_owned(),
         format!("ciphertext_sha256 {media_hash}"),
+        format!("plaintext_sha256 {plaintext_hash}"),
         "m image/png".to_owned(),
         format!("filename {secret_filename}"),
         format!("locator blossom-v1 https://blossom.example/{media_hash}"),
@@ -765,6 +767,7 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
     let outcome = store.secure_prune_app_events_before("aa", 15).unwrap();
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash.clone()]);
+    assert_eq!(outcome.media_plaintext_sha256, vec![plaintext_hash]);
     assert!(
         store
             .chat_list_row("aa")

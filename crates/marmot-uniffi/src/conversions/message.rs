@@ -46,6 +46,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
 pub struct SecureDeleteExpiredResultFfi {
     pub pruned_messages: u64,
     pub media_ciphertext_sha256: Vec<String>,
+    pub media_plaintext_sha256: Vec<String>,
 }
 
 impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
@@ -53,6 +54,7 @@ impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
         Self {
             pruned_messages: value.pruned_messages,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
+            media_plaintext_sha256: value.media_plaintext_sha256,
         }
     }
 }
