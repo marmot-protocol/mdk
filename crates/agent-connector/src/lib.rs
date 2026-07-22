@@ -68,6 +68,7 @@ pub(crate) const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
 /// Whole-operation deadline for control-socket I/O and request-scoped name
 /// resolution. A peer cannot reset it by trickling bytes or partial progress.
 pub(crate) const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CONTROL_BUSY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RETRY_BASE: Duration = Duration::from_secs(5);
@@ -92,8 +93,11 @@ pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
 /// control plane is local and authenticated, but the threat model includes a
 /// prompt-injected/compromised gateway; each connection holds a spawned task
 /// plus, for `SubscribeInbound`, runtime/debug subscriptions and a delivered
-/// cursor, so beyond the cap new connections are closed instead of accepted.
+/// cursor, so beyond the cap new connections receive `server_busy` and close.
 pub const MAX_CONTROL_CONNECTIONS: usize = 64;
+/// Long-lived inbound subscriptions are capped separately so one-shot sends,
+/// stream finalization, and policy operations retain connection capacity.
+pub(crate) const MAX_CONTROL_SUBSCRIPTIONS: usize = 16;
 
 pub(crate) async fn with_control_operation_timeout<T, F>(
     operation: &'static str,
@@ -190,6 +194,7 @@ pub struct AgentConnector {
     /// Kept separate from `connection_errors` so expected backpressure does
     /// not muddy fault-rate diagnostics.
     connections_refused: Arc<AtomicU64>,
+    subscription_limiter: Arc<Semaphore>,
 }
 
 impl AgentConnector {
@@ -224,6 +229,7 @@ impl AgentConnector {
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
             connections_refused: Arc::new(AtomicU64::new(0)),
+            subscription_limiter: Arc::new(Semaphore::new(MAX_CONTROL_SUBSCRIPTIONS)),
         })
     }
 
@@ -300,7 +306,7 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
     connector.start().await?;
     let connection_limiter = Arc::new(Semaphore::new(max_connections));
     loop {
-        let (stream, _peer_addr) = match listener.accept().await {
+        let (mut stream, _peer_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
                 let connection_error =
@@ -332,7 +338,19 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
                 error_code = "connection_limit_exceeded",
                 "refusing control connection beyond the concurrency cap"
             );
-            drop(stream);
+            let response = agent_control::AgentControlEnvelope::new(
+                None,
+                agent_control::AgentControlResponse::Error {
+                    code: "server_busy".to_owned(),
+                    message: "agent connector connection capacity is busy".to_owned(),
+                },
+            );
+            let _ = crate::connection::write_control_frame_with_timeout(
+                &mut stream,
+                &response,
+                CONTROL_BUSY_RESPONSE_TIMEOUT,
+            )
+            .await;
             continue;
         };
         let connector = connector.clone();

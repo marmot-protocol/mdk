@@ -15,6 +15,19 @@ use crate::{
     with_control_operation_timeout_after,
 };
 
+pub(crate) fn try_acquire_inbound_subscription(
+    request: &AgentControlRequest,
+    limiter: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    if !matches!(request, AgentControlRequest::SubscribeInbound { .. }) {
+        return Ok(None);
+    }
+    std::sync::Arc::clone(limiter)
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| ())
+}
+
 pub(crate) async fn write_control_frame<W, T>(
     writer: &mut W,
     message: &T,
@@ -69,11 +82,28 @@ impl AgentConnector {
             write_control_frame(&mut write_half, &response).await?;
             return Ok(());
         }
+        let subscription_permit =
+            match try_acquire_inbound_subscription(&request.payload, &self.subscription_limiter) {
+                Ok(permit) => permit,
+                Err(()) => {
+                    let response = AgentControlEnvelope::new(
+                        request.id,
+                        AgentControlResponse::Error {
+                            code: "server_busy".to_owned(),
+                            message: "agent connector subscription capacity is busy".to_owned(),
+                        },
+                    );
+                    write_control_frame(&mut write_half, &response).await?;
+                    return Ok(());
+                }
+            };
         if let AgentControlRequest::SubscribeInbound {
             account_id_hex,
             group_id_hex,
         } = request.payload
         {
+            let _subscription_permit = subscription_permit
+                .expect("SubscribeInbound admission must hold a subscription permit");
             return self
                 .stream_inbound_events(
                     request.id,

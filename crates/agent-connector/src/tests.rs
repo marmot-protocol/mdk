@@ -106,6 +106,38 @@ async fn control_frame_write_timeout_includes_flush() {
 }
 
 #[test]
+fn inbound_subscription_quota_preserves_one_shot_capacity() {
+    let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let subscription = AgentControlRequest::SubscribeInbound {
+        account_id_hex: None,
+        group_id_hex: None,
+    };
+
+    let first = crate::connection::try_acquire_inbound_subscription(&subscription, &limiter)
+        .expect("first subscription should be admitted")
+        .expect("subscription should hold a permit");
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(&subscription, &limiter).is_err(),
+        "a second subscription must hit the dedicated cap"
+    );
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(
+            &AgentControlRequest::AccountList,
+            &limiter,
+        )
+        .expect("one-shot requests bypass the subscription cap")
+        .is_none()
+    );
+
+    drop(first);
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(&subscription, &limiter)
+            .expect("released subscription capacity should be reusable")
+            .is_some()
+    );
+}
+
+#[test]
 fn poisoned_connector_store_mutex_recovers_inner_state() {
     let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
     let panic_mutex = std::sync::Arc::clone(&mutex);
@@ -747,8 +779,8 @@ async fn connector_socket_caps_concurrent_connections() {
     assert_eq!(response.id.as_deref(), Some("req-held"));
     assert_eq!(response.payload, AgentControlResponse::Ack);
 
-    // A second concurrent connection is over the cap: the connector closes
-    // it at accept time without serving a response.
+    // A second concurrent connection is over the global cap and receives a
+    // typed busy response rather than an ambiguous empty close.
     let refused = UnixStream::connect(&socket).await.unwrap();
     let (refused_read, mut refused_write) = tokio::io::split(refused);
     let mut refused_read = BufReader::new(refused_read);
@@ -756,16 +788,17 @@ async fn connector_socket_caps_concurrent_connections() {
         Some("req-refused".to_owned()),
         AgentControlRequest::AccountList,
     );
-    // The write may race the server-side close; only the read matters.
     let _ = write_frame(&mut refused_write, &request).await;
-    let refused_result: Result<Option<AgentControlEnvelope<AgentControlResponse>>, _> =
+    let refused_response: AgentControlEnvelope<AgentControlResponse> =
         timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut refused_read))
             .await
-            .unwrap();
-    assert!(
-        matches!(refused_result, Ok(None) | Err(_)),
-        "over-cap connection must be closed without a response"
-    );
+            .expect("busy response should not time out")
+            .expect("busy response should be a valid frame")
+            .expect("busy response should not be empty");
+    assert!(matches!(
+        refused_response.payload,
+        AgentControlResponse::Error { ref code, .. } if code == "server_busy"
+    ));
 
     // Dropping the held connection frees the permit for a new connection.
     drop(held_read);

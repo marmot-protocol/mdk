@@ -62,6 +62,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `wnd` now caps long-lived subscriptions at 64 within its 256-connection global ceiling, preserving one-shot status,
   shutdown, and command capacity. Quota rejection is reported as the typed `server_busy` protocol error instead of an
   empty response that could be mistaken for a stopped daemon.
+- `wn-agent` now caps `SubscribeInbound` streams at 16 within its 64-connection global ceiling, and both quota
+  boundaries return a typed `server_busy` response so subscriptions cannot starve durable one-shot operations.
 - Public Nostr relay connections now require `wss://`; `ws://` is limited to loopback development relays behind
   `WN_ALLOW_LOOPBACK_RELAYS`.
 - Received-message chronology and retention now use the MLS-authenticated inner app-event timestamp instead of the
