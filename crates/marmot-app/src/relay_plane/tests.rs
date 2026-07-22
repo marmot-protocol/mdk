@@ -265,7 +265,7 @@ fn notification_trigger_endpoints_use_the_relay_safety_policy() {
     let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
     let err = plane
         .sanitize_relay_endpoints(
-            vec![TransportEndpoint("ws://169.254.169.254".into())],
+            vec![TransportEndpoint("wss://169.254.169.254".into())],
             "notification trigger publish",
         )
         .expect_err("peer-controlled link-local relay hint must be rejected");
