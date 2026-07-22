@@ -28,6 +28,8 @@ pub enum ConnectorError {
     Stream(String),
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
+    #[error("connector operation timed out: {0}")]
+    OperationTimedOut(&'static str),
 }
 
 impl ConnectorError {
@@ -44,6 +46,7 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidProfileName(_) => "invalid_profile_name",
+            Self::OperationTimedOut(_) => "operation_timed_out",
         }
     }
 
@@ -56,6 +59,7 @@ impl ConnectorError {
             Self::Json(_) | Self::Control(_) => "invalid control request",
             Self::Stream(_) => "agent stream request failed",
             Self::InvalidProfileName(_) => "invalid profile name",
+            Self::OperationTimedOut(_) => "connector operation timed out",
             Self::Io(_) => "connector I/O failed",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",
         }

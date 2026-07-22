@@ -44,6 +44,24 @@ use marmot_app::AppMessageRecord;
 
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[tokio::test]
+async fn control_operation_timeout_bounds_a_stalled_whole_operation() {
+    let started = tokio::time::Instant::now();
+    let error = crate::with_control_operation_timeout_after(
+        "test_stalled_operation",
+        Duration::from_millis(10),
+        std::future::pending::<()>(),
+    )
+    .await
+    .expect_err("a stalled operation must time out");
+
+    assert!(matches!(
+        error,
+        crate::ConnectorError::OperationTimedOut("test_stalled_operation")
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
 #[test]
 fn poisoned_connector_store_mutex_recovers_inner_state() {
     let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));

@@ -28,6 +28,7 @@ pub use bootstrap::{
 pub use error::ConnectorError;
 pub use socket::{bind_connector_socket, bind_connector_socket_with_mode, default_socket_path};
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -64,6 +65,9 @@ pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub(crate) const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 pub(crate) const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
+/// Whole-operation deadline for control-socket I/O and request-scoped name
+/// resolution. A peer cannot reset it by trickling bytes or partial progress.
+pub(crate) const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RETRY_BASE: Duration = Duration::from_secs(5);
@@ -90,6 +94,29 @@ pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
 /// plus, for `SubscribeInbound`, runtime/debug subscriptions and a delivered
 /// cursor, so beyond the cap new connections are closed instead of accepted.
 pub const MAX_CONTROL_CONNECTIONS: usize = 64;
+
+pub(crate) async fn with_control_operation_timeout<T, F>(
+    operation: &'static str,
+    future: F,
+) -> Result<T, ConnectorError>
+where
+    F: Future<Output = T>,
+{
+    with_control_operation_timeout_after(operation, CONTROL_OPERATION_TIMEOUT, future).await
+}
+
+async fn with_control_operation_timeout_after<T, F>(
+    operation: &'static str,
+    timeout_after: Duration,
+    future: F,
+) -> Result<T, ConnectorError>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(timeout_after, future)
+        .await
+        .map_err(|_| ConnectorError::OperationTimedOut(operation))
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentConnectorConfig {

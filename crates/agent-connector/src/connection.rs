@@ -6,10 +6,10 @@ use agent_control::{
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
-use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::socket::current_effective_uid;
 use crate::validation::{auth_token_matches, unsupported_request_message};
+use crate::{AgentConnector, with_control_operation_timeout};
 
 impl AgentConnector {
     pub(crate) async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
@@ -18,7 +18,11 @@ impl AgentConnector {
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
         let Some(request): Option<AgentControlEnvelope<AgentControlRequest>> =
-            read_envelope(&mut reader).await?
+            with_control_operation_timeout(
+                "initial_control_frame_read",
+                read_envelope(&mut reader),
+            )
+            .await??
         else {
             return Ok(());
         };
