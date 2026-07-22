@@ -166,7 +166,10 @@ fn pad32(name: &[u8]) -> Vec<u8> {
     }
 }
 
-struct MockPeeler;
+#[derive(Default)]
+struct MockPeeler {
+    welcome_sender: Option<MemberId>,
+}
 
 fn hash_id(bytes: &[u8]) -> MessageId {
     use std::collections::hash_map::DefaultHasher;
@@ -200,7 +203,7 @@ impl TransportPeeler for MockPeeler {
         Ok(PeeledMessage {
             id: msg.id.clone(),
             group_id: None,
-            sender: None,
+            sender: self.welcome_sender.clone(),
             content: PeeledContent::Welcome {
                 bytes: msg.payload.clone(),
             },
@@ -251,7 +254,7 @@ fn build_client_with_components(
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .supported_app_components(components)
-        .peeler(Box::new(MockPeeler))
+        .peeler(Box::new(MockPeeler::default()))
         .build()
         .expect("build engine")
 }
@@ -274,7 +277,23 @@ fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
-        .peeler(Box::new(MockPeeler))
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .expect("build engine")
+}
+
+fn build_client_with_welcome_sender(
+    identity: &[u8],
+    registry: FeatureRegistry,
+    welcome_sender: MemberId,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .feature_registry(registry)
+        .peeler(Box::new(MockPeeler {
+            welcome_sender: Some(welcome_sender),
+        }))
         .build()
         .expect("build engine")
 }
@@ -288,7 +307,7 @@ fn build_client_on_storage(
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
-        .peeler(Box::new(MockPeeler))
+        .peeler(Box::new(MockPeeler::default()))
         .build()
         .expect("build engine")
 }
@@ -999,7 +1018,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .supported_app_components(components)
-        .peeler(Box::new(MockPeeler))
+        .peeler(Box::new(MockPeeler::default()))
         .build()
         .expect("build capable carol");
     let mut capable_carol = capable_carol;
@@ -1032,7 +1051,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
     let mut downgraded_carol = EngineBuilder::new(carol_storage)
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
-        .peeler(Box::new(MockPeeler))
+        .peeler(Box::new(MockPeeler::default()))
         .build()
         .expect("build downgraded carol");
     let err = downgraded_carol
@@ -1090,7 +1109,13 @@ async fn confirm_published_transitions_to_stable_and_emits_group_created() {
 #[tokio::test]
 async fn two_engine_happy_path_create_and_join() {
     let mut alice = build_client(b"alice-id", selfremove_registry());
-    let mut bob = build_client(b"bob-id", selfremove_registry());
+    let alice_id = alice.self_id();
+    let transport_claimed_sender = MemberId::new(pad32(b"mallory-id"));
+    let mut bob = build_client_with_welcome_sender(
+        b"bob-id",
+        selfremove_registry(),
+        transport_claimed_sender.clone(),
+    );
 
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -1137,10 +1162,13 @@ async fn two_engine_happy_path_create_and_join() {
     // Bob's event buffer carries the GroupJoined event.
     let events = bob.drain_events();
     assert_eq!(events.len(), 1);
-    matches!(
-        events[0],
-        cgka_traits::engine::GroupEvent::GroupJoined { .. }
-    );
+    assert!(matches!(
+        &events[0],
+        cgka_traits::engine::GroupEvent::GroupJoined {
+            welcomer: Some(welcomer),
+            ..
+        } if *welcomer == alice_id && *welcomer != transport_claimed_sender
+    ));
 }
 
 #[tokio::test]
@@ -1213,7 +1241,7 @@ async fn audit_log_records_welcome_recipient_expectation() {
     let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
-        .peeler(Box::new(MockPeeler))
+        .peeler(Box::new(MockPeeler::default()))
         .recorder(Box::new(recorder))
         .build()
         .expect("build alice with recorder");

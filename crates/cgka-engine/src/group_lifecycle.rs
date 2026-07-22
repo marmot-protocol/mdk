@@ -527,7 +527,6 @@ impl<S: StorageProvider> Engine<S> {
         peeled: cgka_traits::ingest::PeeledMessage,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
-        let welcomer = peeled.sender.clone();
         let welcome_bytes = match peeled.content {
             cgka_traits::ingest::PeeledContent::Welcome { bytes } => bytes,
             _ => {
@@ -730,7 +729,7 @@ impl<S: StorageProvider> Engine<S> {
             .push_back(cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: welcome_id.clone(),
-                welcomer,
+                welcomer: Some(welcome_sender_id.clone()),
             });
         if let Some(new_seconds) =
             crate::app_components::message_retention_seconds_of_group(&mls_group)?

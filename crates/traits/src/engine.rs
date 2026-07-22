@@ -339,6 +339,8 @@ pub enum GroupEvent {
     GroupJoined {
         group_id: GroupId,
         via_welcome: MessageId,
+        /// MLS-authenticated Welcome author derived from the GroupInfo signer
+        /// leaf. Transport-wrapper authorship is not used for attribution.
         welcomer: Option<MemberId>,
     },
     MessageReceived {
