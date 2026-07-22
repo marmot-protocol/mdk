@@ -3485,7 +3485,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
 /// `app_payload` unit tests (empty `MemberId` rejected outright) and the
 /// emit-side backstop in `emit_application_replay_events`.
 #[tokio::test]
-async fn convergence_app_message_with_unresolvable_sender_emits_no_event_and_lands_terminal() {
+async fn terminal_undecryptable_app_emits_invalidation_without_message_received() {
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -3559,11 +3559,28 @@ async fn convergence_app_message_with_unresolvable_sender_emits_no_event_and_lan
             .contains(&content_hex(&forged_msg)),
         "forged-attribution app message must not be accepted"
     );
+    assert!(result.invalidated_app_messages.iter().any(|invalidated| {
+        invalidated.message_id == content_hex(&forged_msg)
+            && invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState
+    }));
     // Message epoch (2) is at the settled tip (2): the failed validation is
     // terminal, not retryable — the message cannot re-enter convergence.
     assert_message_state(&carol_storage, &forged_msg, MessageState::EpochInvalidated);
 
     let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated {
+                group_id: event_group,
+                message_id,
+                epoch: EpochId(2),
+                reason: AppMessageInvalidationReason::UndecryptableInCanonicalState,
+                ..
+            } if *event_group == group_id && *message_id == content_id(&forged_msg)
+        )),
+        "terminal at-tip decrypt miss must emit AppMessageInvalidated, got {events:?}"
+    );
     for event in &events {
         if let GroupEvent::MessageReceived {
             sender, payload, ..

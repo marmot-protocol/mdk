@@ -236,11 +236,13 @@ in `tests/`; this section exists so a future contributor can grep for the rule t
     (`BeyondAnchor`, `LosingBranch`, `BeyondAppRetention`, dropped) and only `Buffered` for retryable cases
     (`UndecryptableInCanonicalState` for future-epoch app messages). The stored-convergence persistence path
     (`openmls_projection::persist_openmls_canonicalization_dispositions`) honours the same split: a
-    `UndecryptableInCanonicalState` app message is persisted `Retryable` (not terminal `EpochInvalidated`), and
-    `distributed_convergence` neither marks it seen nor emits `AppMessageInvalidated`, so it re-enters convergence
-    once the awaited commit advances the epoch (mdk#144).
+    future-epoch `UndecryptableInCanonicalState` app message is persisted `Retryable` (not terminal
+    `EpochInvalidated`), and `distributed_convergence` neither marks it seen nor emits `AppMessageInvalidated`, so it
+    re-enters convergence once the awaited commit advances the epoch (mdk#144). At or below the resulting tip, the
+    same reason is terminal and does emit the invalidation (mdk#995).
   - **Test:** covered by distributed-convergence integration tests, incl.
-    `future_epoch_app_message_stays_retryable_until_commit_arrives`
+    `future_epoch_app_message_stays_retryable_until_commit_arrives` and
+    `terminal_undecryptable_app_emits_invalidation_without_message_received`
 
 - **Item:** **Sm3** Capability-cache self-id assertion
   - **What changed:** `cache_self_capabilities` now errors with `EngineError::Backend` if `MlsGroup::own_leaf_node()`

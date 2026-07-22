@@ -800,12 +800,10 @@ impl<S: StorageProvider> Engine<S> {
         result: &CanonicalizationResult,
     ) -> Result<(), OpenMlsProjectionError> {
         for invalidated in &result.invalidated_app_messages {
-            // `UndecryptableInCanonicalState` is retryable: the message
-            // targets a future epoch we cannot peel yet and will be re-fed on
-            // a later canonicalize pass. Emitting `AppMessageInvalidated` here
-            // would tell the app the message is permanently gone (the client
-            // invalidates the timeline source row), so skip it for that reason.
-            if invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState {
+            // A future-epoch decrypt miss is retryable and must not be
+            // announced as permanently gone. The same reason at or below the
+            // resulting tip is terminal, however, and must reach the app.
+            if invalidated_app_is_retryable(result, invalidated) {
                 continue;
             }
             self.events_buf
@@ -1005,11 +1003,9 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         for invalidated in &result.invalidated_app_messages {
-            // Skip the retryable reason: a future-epoch app message must stay
-            // eligible for a later canonicalize pass. Marking it seen would
-            // make canonicalization treat it as `AlreadySeen` and drop it
-            // before the awaited commit advances the epoch.
-            if invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState {
+            // A future-epoch app message must stay eligible for a later pass.
+            // Terminal at-or-below-tip decrypt misses are remembered normally.
+            if invalidated_app_is_retryable(result, invalidated) {
                 continue;
             }
             if let Ok(bytes) = hex::decode(&invalidated.message_id) {
@@ -1018,6 +1014,14 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
     }
+}
+
+fn invalidated_app_is_retryable(
+    result: &CanonicalizationResult,
+    invalidated: &crate::canonicalization::InvalidatedAppMessage,
+) -> bool {
+    invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState
+        && invalidated.epoch > result.selected_tip.unwrap_or(result.previous_tip)
 }
 
 /// The single commit id this convergence pass applied, hex-decoded to a
