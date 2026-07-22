@@ -1,4 +1,4 @@
-// TypeScript client for the `marmot.agent-control.v1` control protocol
+// TypeScript client for the `marmot.agent-control.v2` control protocol
 // (`crates/agent-control/src/lib.rs`). Newline-delimited JSON over a local Unix
 // socket. Faithful port of the Python `MarmotAgentControlClient`
 // (`integrations/hermes/marmot/adapter.py`): one connection per request with
@@ -11,7 +11,7 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 
-export const AGENT_CONTROL_PROTOCOL_V1 = "marmot.agent-control.v1";
+export const AGENT_CONTROL_PROTOCOL_V2 = "marmot.agent-control.v2";
 export const MAX_AGENT_CONTROL_FRAME_BYTES = 1024 * 1024;
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -68,6 +68,7 @@ export interface AppEventSentResponse {
 export interface StreamBegunResponse {
   type: "stream_begun";
   stream_id_hex: string;
+  stream_capability: string;
   start_message_id_hex: string;
   quic_candidates: string[];
 }
@@ -255,6 +256,16 @@ function optionalHex(value: string | null | undefined, field = "hex"): string | 
   return normalizeHex(value, field);
 }
 
+function normalizeStreamCapability(value: string): string {
+  const capability = normalizeHex(value, "stream_capability");
+  if (capability.length !== 64) {
+    throw new AgentControlError("stream_capability must encode exactly 32 bytes", {
+      code: "invalid_stream_capability",
+    });
+  }
+  return capability;
+}
+
 export class MarmotAgentControlClient {
   readonly socketPath: string;
   private readonly authToken: string | null;
@@ -303,7 +314,7 @@ export class MarmotAgentControlClient {
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       text: String(text ?? ""),
       reply_to_message_id_hex: optionalHex(replyToMessageIdHex, "reply_to_message_id_hex"),
-      // Additive, v1-compatible: only sent when supplied, so the connector dedups
+      // Optional on the wire: only sent when supplied, so the connector dedups
       // a retry that reuses the same key instead of double-posting.
       ...(key ? { idempotency_key: key } : {}),
     })) as unknown as FinalSentResponse;
@@ -330,6 +341,7 @@ export class MarmotAgentControlClient {
       streamIdHex?: string | null;
       parentMessageIdHex?: string | null;
       quicCandidates?: Iterable<string>;
+      requestId?: string;
     } = {},
   ): Promise<StreamBegunResponse> {
     const quicCandidates = [...(options.quicCandidates ?? [])]
@@ -339,7 +351,7 @@ export class MarmotAgentControlClient {
       options.parentMessageIdHex,
       "parent_message_id_hex",
     );
-    return (await this.request(
+    const response = (await this.request(
       {
         type: "stream_begin",
         account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
@@ -348,37 +360,56 @@ export class MarmotAgentControlClient {
         ...(parentMessageIdHex ? { parent_message_id_hex: parentMessageIdHex } : {}),
         quic_candidates: quicCandidates,
       },
-      { timeoutMs: this.previewRequestTimeoutMs },
+      { timeoutMs: this.previewRequestTimeoutMs, requestId: options.requestId },
     )) as unknown as StreamBegunResponse;
+    return {
+      ...response,
+      stream_capability: normalizeStreamCapability(response.stream_capability),
+    };
   }
 
-  async streamAppend(streamIdHex: string, appendText: string): Promise<Envelope> {
+  async streamAppend(
+    streamIdHex: string,
+    streamCapability: string,
+    appendText: string,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_append",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         append_text: String(appendText ?? ""),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
     );
   }
 
-  async streamStatus(streamIdHex: string, status: string): Promise<Envelope> {
+  async streamStatus(
+    streamIdHex: string,
+    streamCapability: string,
+    status: string,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_status",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         status: String(status ?? ""),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
     );
   }
 
-  async streamProgress(streamIdHex: string, text: string): Promise<Envelope> {
+  async streamProgress(
+    streamIdHex: string,
+    streamCapability: string,
+    text: string,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_progress",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         text: String(text ?? ""),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
@@ -387,6 +418,7 @@ export class MarmotAgentControlClient {
 
   async streamFinalize(
     streamIdHex: string,
+    streamCapability: string,
     finalText: string,
     transcriptHashHex: string,
     chunkCount: number,
@@ -398,6 +430,7 @@ export class MarmotAgentControlClient {
     return (await this.request({
       type: "stream_finalize",
       stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+      stream_capability: normalizeStreamCapability(streamCapability),
       final_text: String(finalText ?? ""),
       transcript_hash_hex: normalizeHex(transcriptHashHex, "transcript_hash_hex"),
       chunk_count: Math.trunc(chunkCount),
@@ -405,11 +438,16 @@ export class MarmotAgentControlClient {
     })) as unknown as StreamFinalizedResponse;
   }
 
-  async streamCancel(streamIdHex: string, reason?: string | null): Promise<Envelope> {
+  async streamCancel(
+    streamIdHex: string,
+    streamCapability: string,
+    reason?: string | null,
+  ): Promise<Envelope> {
     return this.request(
       {
         type: "stream_cancel",
         stream_id_hex: normalizeHex(streamIdHex, "stream_id_hex"),
+        stream_capability: normalizeStreamCapability(streamCapability),
         reason: reason == null ? null : String(reason),
       },
       { timeoutMs: this.previewRequestTimeoutMs },
@@ -665,7 +703,7 @@ export class MarmotAgentControlClient {
 
   private writeEnvelope(socket: Socket, requestId: string, payload: Envelope): Promise<void> {
     const envelope: Envelope = {
-      marmot_agent_control: AGENT_CONTROL_PROTOCOL_V1,
+      marmot_agent_control: AGENT_CONTROL_PROTOCOL_V2,
       id: requestId,
       ...payload,
     };
@@ -697,7 +735,7 @@ export class MarmotAgentControlClient {
 }
 
 function validateEnvelope(frame: Envelope, requestId: string): void {
-  if (frame.marmot_agent_control !== AGENT_CONTROL_PROTOCOL_V1) {
+  if (frame.marmot_agent_control !== AGENT_CONTROL_PROTOCOL_V2) {
     throw new AgentControlError(
       `wrong agent control protocol: ${String(frame.marmot_agent_control)}`,
       { code: "wrong_protocol" },

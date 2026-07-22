@@ -6,7 +6,7 @@ routing. `wn-agent` owns the Marmot account, MLS group state, Nostr transport,
 durable encrypted sends, and QUIC live-preview stream records.
 
 The plugin is intentionally thin and **control-plane only**: it speaks the
-`marmot.agent-control.v1` newline-delimited JSON protocol to `wn-agent` over a
+`marmot.agent-control.v2` newline-delimited JSON protocol to `wn-agent` over a
 local Unix socket. It never opens a QUIC connection, encrypts a record, or talks
 to a relay — all of that stays in `wn-agent`. It is the OpenClaw counterpart of
 the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
@@ -272,6 +272,9 @@ set `MARMOT_AGENT_AUTH_TOKEN_FILE`. See
   `MARMOT_BLOCK_STREAMING`. Like a Telegram preview,
   this is driven by the channel's reply `deliver` callback, not a core-driven
   live adapter (that SDK seam does not exist yet).
+  The plugin keeps one stable request id across retries of the initial
+  `stream_begin`, retains the returned v2 stream capability in memory, and
+  presents it on every later operation. It never logs or persists that bearer.
   - `block` is the best live-preview mode because it naturally maps onto Marmot's
     append-only stream. `partial`/`progress` can emit windowed OpenClaw preview
     text; the plugin treats those modes as best-effort live previews and recovers

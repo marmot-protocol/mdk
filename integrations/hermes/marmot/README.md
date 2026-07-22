@@ -4,6 +4,11 @@ This directory is a Hermes platform plugin for the local `wn-agent` connector.
 Hermes runs the agent and tools. `wn-agent` owns the Marmot account, MLS state,
 Nostr transport, final encrypted sends, and QUIC live-preview stream records.
 
+For live previews, the plugin retries `stream_begin` with one stable v2 request
+id and retains the returned stream capability in memory for subsequent append,
+status, finalize, and cancel calls. The capability is a bearer secret and must
+not be logged or persisted.
+
 For a real Hermes install, install it by copying or symlinking this directory to:
 
 ```sh

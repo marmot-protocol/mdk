@@ -10,7 +10,7 @@ import {
   normalizeHex,
 } from "../src/client.js";
 
-const PROTOCOL = "marmot.agent-control.v1";
+const PROTOCOL = "marmot.agent-control.v2";
 const HEX32 = (b: string) => b.repeat(32);
 
 function send(socket: Socket, id: unknown, payload: Record<string, unknown>): void {
@@ -55,6 +55,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
       send(socket, id, {
         type: "stream_begun",
         stream_id_hex: HEX32("ee"),
+        stream_capability: HEX32("55"),
         start_message_id_hex: HEX32("ff"),
         quic_candidates: [],
         echoed_parent_message_id_hex: req.parent_message_id_hex ?? null,
@@ -66,6 +67,7 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         stream_id_hex: req.stream_id_hex ?? HEX32("ee"),
         message_ids_hex: [HEX32("99")],
         echoed_idempotency_key: req.idempotency_key ?? null,
+        echoed_stream_capability: req.stream_capability ?? null,
       });
       break;
     case "group_info":
@@ -188,15 +190,21 @@ describe("MarmotAgentControlClient", () => {
   it("forwards an idempotency_key on stream_finalize when supplied, and omits it otherwise", async () => {
     const withKey = (await client.streamFinalize(
       HEX32("ee"),
+      HEX32("55"),
       "done",
       HEX32("aa"),
       1,
       "stream-key-1",
-    )) as unknown as { echoed_idempotency_key?: string | null };
+    )) as unknown as {
+      echoed_idempotency_key?: string | null;
+      echoed_stream_capability?: string | null;
+    };
     expect(withKey.echoed_idempotency_key).toBe("stream-key-1");
+    expect(withKey.echoed_stream_capability).toBe(HEX32("55"));
 
     const withoutKey = (await client.streamFinalize(
       HEX32("ee"),
+      HEX32("55"),
       "done",
       HEX32("aa"),
       1,

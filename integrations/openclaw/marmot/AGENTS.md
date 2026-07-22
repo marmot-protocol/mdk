@@ -7,7 +7,7 @@ The OpenClaw counterpart of `integrations/hermes/marmot`. Read `README.md` first
 
 - A thin, **control-plane-only** OpenClaw channel plugin. `wn-agent` owns the
   Marmot account, MLS state, Nostr transport, and QUIC previews; this plugin
-  only speaks `marmot.agent-control.v1` (NDJSON over a Unix socket).
+  only speaks `marmot.agent-control.v2` (NDJSON over a Unix socket).
 - Keep transcript hashing byte-for-byte with the authoritative Rust
   `AgentTextStreamTranscriptV1` (`crates/traits/src/agent_text_stream.rs`).
 - No QUIC, crypto, relay, or MLS logic here.

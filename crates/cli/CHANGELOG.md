@@ -9,6 +9,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- WN Agent control clients and the connector now speak the incompatible `marmot.agent-control.v2` protocol.
+  `stream_begin` returns a random per-stream bearer capability that every later stream operation must present; exact
+  request-id retries return the original begin receipt, and stream-id collisions no longer replace active sessions.
 - TUI: adopted a chat-first shell. A screen model replaces the fixed four-pane dashboard: a login/account-select
   screen (create identity, nsec login, or pick from several accounts) opens when there is no single obvious account,
   and the main view is the chat list plus the message timeline plus the composer, with the reclaimed space going to

@@ -32,7 +32,7 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
-PROTOCOL = "marmot.agent-control.v1"
+PROTOCOL = "marmot.agent-control.v2"
 MAX_FRAME_BYTES = 1024 * 1024
 DEFAULT_SOCKET_HOME = "~/.marmot"
 DEFAULT_STREAM_CHUNK_BYTES = 1024
@@ -51,6 +51,7 @@ TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # is reused across these attempts so a retry after a post-write timeout dedups at
 # the connector instead of double-posting. Mirrors OpenClaw dispatch ([100, 300]ms).
 SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
+STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
@@ -864,9 +865,9 @@ class MarmotAgentControlClient:
             "text": str(text or ""),
             "reply_to_message_id_hex": reply_to_message_id_hex,
         }
-        # Additive, v1-compatible: only sent when supplied so an old connector's
-        # frame stays unchanged. When present, the connector dedups a retry that
-        # reuses the same key instead of double-posting an unrecallable message.
+        # Optional on the wire: only sent when supplied. When present, the
+        # connector dedups a retry that reuses the same key instead of
+        # double-posting an unrecallable message.
         if key:
             payload["idempotency_key"] = key
         return await self.request(payload)
@@ -971,6 +972,7 @@ class MarmotAgentControlClient:
         stream_id_hex: Optional[str] = None,
         parent_message_id_hex: Optional[str] = None,
         quic_candidates: Iterable[str] = (),
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "type": "stream_begin",
@@ -984,33 +986,55 @@ class MarmotAgentControlClient:
                 parent_message_id_hex,
                 "parent_message_id_hex",
             )
-        return await self.request(payload, timeout=self.preview_request_timeout)
+        return await self.request(
+            payload,
+            request_id=request_id,
+            timeout=self.preview_request_timeout,
+        )
 
-    async def stream_append(self, stream_id_hex: str, append_text: str) -> Dict[str, Any]:
+    async def stream_append(
+        self,
+        stream_id_hex: str,
+        stream_capability: str,
+        append_text: str,
+    ) -> Dict[str, Any]:
         return await self.request(
             {
                 "type": "stream_append",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
+                "stream_capability": _normalize_stream_capability(stream_capability),
                 "append_text": str(append_text or ""),
             },
             timeout=self.preview_request_timeout,
         )
 
-    async def stream_status(self, stream_id_hex: str, status: str) -> Dict[str, Any]:
+    async def stream_status(
+        self,
+        stream_id_hex: str,
+        stream_capability: str,
+        status: str,
+    ) -> Dict[str, Any]:
         return await self.request(
             {
                 "type": "stream_status",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
+                "stream_capability": _normalize_stream_capability(stream_capability),
                 "status": str(status or ""),
             },
             timeout=self.preview_request_timeout,
         )
 
-    async def stream_progress(self, stream_id_hex: str, text: str) -> Dict[str, Any]:
+    async def stream_progress(
+        self,
+        stream_id_hex: str,
+        stream_capability: str,
+        text: str,
+    ) -> Dict[str, Any]:
         return await self.request(
             {
                 "type": "stream_progress",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
+                "stream_capability": _normalize_stream_capability(stream_capability),
                 "text": str(text or ""),
             },
             timeout=self.preview_request_timeout,
@@ -1019,6 +1043,7 @@ class MarmotAgentControlClient:
     async def stream_finalize(
         self,
         stream_id_hex: str,
+        stream_capability: str,
         final_text: str,
         transcript_hash_hex: str,
         chunk_count: int,
@@ -1029,6 +1054,7 @@ class MarmotAgentControlClient:
             {
                 "type": "stream_finalize",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
+                "stream_capability": _normalize_stream_capability(stream_capability),
                 "final_text": str(final_text or ""),
                 "transcript_hash_hex": _normalize_hex(transcript_hash_hex, "transcript_hash_hex"),
                 "chunk_count": int(chunk_count),
@@ -1036,11 +1062,17 @@ class MarmotAgentControlClient:
             }
         )
 
-    async def stream_cancel(self, stream_id_hex: str, reason: Optional[str] = None) -> Dict[str, Any]:
+    async def stream_cancel(
+        self,
+        stream_id_hex: str,
+        stream_capability: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
         return await self.request(
             {
                 "type": "stream_cancel",
                 "stream_id_hex": _normalize_hex(stream_id_hex, "stream_id_hex"),
+                "stream_capability": _normalize_stream_capability(stream_capability),
                 "reason": reason,
             },
             timeout=self.preview_request_timeout,
@@ -1234,6 +1266,7 @@ class MarmotLiveStream:
         account_id_hex: str,
         group_id_hex: str,
         stream_id_hex: str,
+        stream_capability: str,
         start_message_id_hex: str,
         chunk_bytes: int,
     ):
@@ -1241,6 +1274,7 @@ class MarmotLiveStream:
         self.account_id_hex = account_id_hex
         self.group_id_hex = group_id_hex
         self.stream_id_hex = stream_id_hex
+        self.stream_capability = stream_capability
         self.start_message_id_hex = start_message_id_hex
         self.text = AppendOnlyTextState()
         self.transcript = AgentTextStreamTranscript(
@@ -1269,12 +1303,34 @@ class MarmotLiveStream:
         }
         if parent_message_id_hex is not None:
             begin_options["parent_message_id_hex"] = parent_message_id_hex
-        response = await client.stream_begin(account_id_hex, group_id_hex, **begin_options)
+        begin_request_id = uuid.uuid4().hex
+        response: Optional[Dict[str, Any]] = None
+        for attempt in range(len(STREAM_BEGIN_RETRY_BACKOFF_S) + 1):
+            try:
+                response = await client.stream_begin(
+                    account_id_hex,
+                    group_id_hex,
+                    request_id=begin_request_id,
+                    **begin_options,
+                )
+                break
+            except Exception as exc:
+                if attempt < len(STREAM_BEGIN_RETRY_BACKOFF_S) and is_retryable(exc):
+                    await asyncio.sleep(STREAM_BEGIN_RETRY_BACKOFF_S[attempt])
+                    continue
+                raise
+        if response is None:
+            raise AgentControlError(
+                "Marmot stream begin failed without a response",
+                code="unexpected_stream_begin_response",
+                retryable=True,
+            )
         return cls(
             client=client,
             account_id_hex=account_id_hex,
             group_id_hex=group_id_hex,
             stream_id_hex=response["stream_id_hex"],
+            stream_capability=_normalize_stream_capability(response["stream_capability"]),
             start_message_id_hex=response["start_message_id_hex"],
             chunk_bytes=effective_stream_chunk_bytes(
                 chunk_bytes,
@@ -1290,12 +1346,12 @@ class MarmotLiveStream:
         # Commit local transcript/append-only state only AFTER the remote append
         # succeeds, so a failed append leaves the stream consistent and the same
         # text re-appendable (mirrors live.ts update() lines 99-116).
-        await self.client.stream_append(self.stream_id_hex, suffix)
+        await self.client.stream_append(self.stream_id_hex, self.stream_capability, suffix)
         self.transcript.append_text(suffix)
         self.text.commit(next_text)
 
     async def status(self, status: str) -> None:
-        await self.client.stream_status(self.stream_id_hex, status)
+        await self.client.stream_status(self.stream_id_hex, self.stream_capability, status)
         self.transcript.append_status(status)
 
     async def finalize(self, final_text: str) -> Dict[str, Any]:
@@ -1305,6 +1361,7 @@ class MarmotLiveStream:
             try:
                 response = await self.client.stream_finalize(
                     self.stream_id_hex,
+                    self.stream_capability,
                     final_text,
                     self.transcript.hash_hex,
                     self.transcript.chunk_count,
@@ -1332,7 +1389,11 @@ class MarmotLiveStream:
 
     async def cancel(self, reason: Optional[str] = None) -> None:
         if not self.finalized:
-            await self.client.stream_cancel(self.stream_id_hex, reason)
+            await self.client.stream_cancel(
+                self.stream_id_hex,
+                self.stream_capability,
+                reason,
+            )
 
 
 class MarmotPlatformAdapter(BasePlatformAdapter):
@@ -3126,6 +3187,16 @@ def _normalize_hex(value: Any, field: str = "hex") -> str:
     except ValueError as exc:
         raise AgentControlError(f"{field} must be hexadecimal", code="invalid_hex") from exc
     return text
+
+
+def _normalize_stream_capability(value: Any) -> str:
+    capability = _normalize_hex(value, "stream_capability")
+    if len(capability) != 64:
+        raise AgentControlError(
+            "stream_capability must encode exactly 32 bytes",
+            code="invalid_stream_capability",
+        )
+    return capability
 
 
 def _optional_hex(value: Any, field: str = "hex") -> Optional[str]:

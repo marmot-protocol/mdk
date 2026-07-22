@@ -1,6 +1,6 @@
 //! Active agent text-stream compose sessions, the debug final-send recorder, and idle sweeping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -112,7 +112,7 @@ impl SendIdempotencyStore {
         crate::lock_recover(&self.inner)
             .seen
             .get(key)
-            .filter(|(recorded, _)| recorded == fingerprint)
+            .filter(|(recorded, _)| constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()))
             .map(|(_, ids)| ids.clone())
     }
 
@@ -304,9 +304,39 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = u8::from(left.len() != right.len());
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= left_byte ^ right_byte;
+    }
+    difference == 0
+}
+
+const STREAM_BEGIN_RECEIPT_CAPACITY: usize = 1024;
+
 #[derive(Clone, Default)]
 pub(crate) struct StreamSessionStore {
     sessions: Arc<Mutex<HashMap<String, ActiveStreamSession>>>,
+    begin_receipts: Arc<Mutex<StreamBeginReceiptStore>>,
+}
+
+#[derive(Default)]
+struct StreamBeginReceiptStore {
+    order: VecDeque<String>,
+    by_request_id: HashMap<String, StreamBeginReceipt>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StreamBeginReceipt {
+    pub(crate) fingerprint: String,
+    pub(crate) stream_id_hex: String,
+    pub(crate) stream_capability: String,
+    pub(crate) start_message_id_hex: String,
+    pub(crate) quic_candidates: Vec<String>,
+    pub(crate) policy_max_plaintext_frame_len: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -314,6 +344,7 @@ pub(crate) struct ActiveStreamSession {
     pub(crate) account_label: String,
     pub(crate) group_id: GroupId,
     pub(crate) stream_id: Vec<u8>,
+    pub(crate) stream_capability: [u8; 32],
     pub(crate) start_message_id_hex: String,
     pub(crate) tx: mpsc::Sender<StreamComposeCommand>,
     pub(crate) cancel_tx: mpsc::Sender<()>,
@@ -339,34 +370,74 @@ pub(crate) struct FinalizedStream {
 }
 
 impl StreamSessionStore {
-    pub(crate) fn insert(&self, stream_id_hex: String, session: ActiveStreamSession) {
+    pub(crate) fn insert_new(
+        &self,
+        stream_id_hex: String,
+        session: ActiveStreamSession,
+    ) -> Result<(), ConnectorError> {
         let mut sessions = crate::lock_recover(&self.sessions);
-        if let Some(previous) = sessions.insert(stream_id_hex, session) {
-            // Graceful cancel over the dedicated signal: let the replaced
-            // session emit its live Abort and self-terminate. The cancel signal
-            // can't be starved by a full command queue, so only force-abort if
-            // the cancel channel itself is gone.
-            match previous.cancel_tx.try_send(()) {
-                // Delivered, or a cancel is already queued (`Full`): the session
-                // will still observe a cancel and emit its `Abort`, so leave it
-                // to self-terminate gracefully.
-                Ok(()) | Err(TrySendError::Full(())) => {}
-                // The receiver is gone: the session can no longer publish an
-                // `Abort`, so force-abort the task to reclaim its resources.
-                Err(TrySendError::Closed(())) => previous.abort.abort(),
-            }
+        if sessions.contains_key(&stream_id_hex) {
+            return Err(ConnectorError::StreamIdInUse);
         }
+        sessions.insert(stream_id_hex, session);
+        Ok(())
     }
 
-    pub(crate) fn get(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
+    pub(crate) fn get_authorized(
+        &self,
+        stream_id_hex: &str,
+        stream_capability: &str,
+    ) -> Result<ActiveStreamSession, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
         let mut sessions = crate::lock_recover(&self.sessions);
-        let session = sessions.get_mut(&stream_id_hex).ok_or_else(|| {
-            ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
-        })?;
+        let session = sessions
+            .get_mut(&stream_id_hex)
+            .ok_or(ConnectorError::StreamCapabilityDenied)?;
+        if !stream_capability_matches(&session.stream_capability, stream_capability) {
+            return Err(ConnectorError::StreamCapabilityDenied);
+        }
         // Touching the session on any command keeps it alive against the idle sweep.
         session.last_activity = Instant::now();
         Ok(session.clone())
+    }
+
+    pub(crate) fn stream_id_reserved(&self, stream_id_hex: &str) -> bool {
+        if crate::lock_recover(&self.sessions).contains_key(stream_id_hex) {
+            return true;
+        }
+        crate::lock_recover(&self.begin_receipts)
+            .by_request_id
+            .values()
+            .any(|receipt| receipt.stream_id_hex == stream_id_hex)
+    }
+
+    pub(crate) fn begin_receipt(
+        &self,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<StreamBeginReceipt>, ConnectorError> {
+        let receipts = crate::lock_recover(&self.begin_receipts);
+        let Some(receipt) = receipts.by_request_id.get(request_id) else {
+            return Ok(None);
+        };
+        if !constant_time_eq(receipt.fingerprint.as_bytes(), fingerprint.as_bytes()) {
+            return Err(ConnectorError::StreamBeginRequestConflict);
+        }
+        Ok(Some(receipt.clone()))
+    }
+
+    pub(crate) fn record_begin_receipt(&self, request_id: String, receipt: StreamBeginReceipt) {
+        let mut receipts = crate::lock_recover(&self.begin_receipts);
+        if receipts.by_request_id.contains_key(&request_id) {
+            return;
+        }
+        if receipts.order.len() >= STREAM_BEGIN_RECEIPT_CAPACITY
+            && let Some(evicted) = receipts.order.pop_front()
+        {
+            receipts.by_request_id.remove(&evicted);
+        }
+        receipts.order.push_back(request_id.clone());
+        receipts.by_request_id.insert(request_id, receipt);
     }
 
     /// Remove the entry for `stream_id_hex` only when it is still the same
@@ -415,6 +486,48 @@ impl StreamSessionStore {
         }
     }
 
+    pub(crate) fn remove_authorized(
+        &self,
+        stream_id_hex: &str,
+        stream_capability: &str,
+    ) -> Result<ActiveStreamSession, ConnectorError> {
+        let stream_id_hex = normalize_hex(stream_id_hex)?;
+        let mut sessions = crate::lock_recover(&self.sessions);
+        let session = sessions
+            .get(&stream_id_hex)
+            .ok_or(ConnectorError::StreamCapabilityDenied)?;
+        if !stream_capability_matches(&session.stream_capability, stream_capability) {
+            return Err(ConnectorError::StreamCapabilityDenied);
+        }
+        sessions
+            .remove(&stream_id_hex)
+            .ok_or(ConnectorError::StreamCapabilityDenied)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_for_test(
+        &self,
+        stream_id_hex: &str,
+    ) -> Result<ActiveStreamSession, ConnectorError> {
+        let stream_id_hex = normalize_hex(stream_id_hex)?;
+        crate::lock_recover(&self.sessions)
+            .get(&stream_id_hex)
+            .cloned()
+            .ok_or(ConnectorError::StreamCapabilityDenied)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(&self, stream_id_hex: String, session: ActiveStreamSession) {
+        self.insert_new(stream_id_hex, session)
+            .expect("test stream id must be unused");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, stream_id_hex: &str) -> Result<ActiveStreamSession, ConnectorError> {
+        self.get_for_test(stream_id_hex)
+    }
+
+    #[cfg(test)]
     pub(crate) fn remove(
         &self,
         stream_id_hex: &str,
@@ -422,9 +535,7 @@ impl StreamSessionStore {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
         crate::lock_recover(&self.sessions)
             .remove(&stream_id_hex)
-            .ok_or_else(|| {
-                ConnectorError::Stream(format!("no active stream session for {stream_id_hex}"))
-            })
+            .ok_or(ConnectorError::StreamCapabilityDenied)
     }
 
     /// Abort and drop every session whose last activity is older than `max_idle`.
@@ -470,4 +581,25 @@ impl StreamSessionStore {
         }
         stale.len()
     }
+}
+
+fn stream_capability_matches(expected: &[u8; 32], provided_hex: &str) -> bool {
+    let decoded = hex::decode(provided_hex).unwrap_or_default();
+    let mut provided = [0u8; 32];
+    if decoded.len() == provided.len() {
+        provided.copy_from_slice(&decoded);
+    }
+    let mut difference = u8::from(decoded.len() != provided.len());
+    for (expected_byte, provided_byte) in expected.iter().zip(provided) {
+        difference |= expected_byte ^ provided_byte;
+    }
+    difference == 0
+}
+
+pub(crate) fn normalize_stream_capability(provided_hex: &str) -> Result<String, ConnectorError> {
+    let decoded = hex::decode(provided_hex).map_err(|_| ConnectorError::StreamCapabilityDenied)?;
+    if decoded.len() != 32 {
+        return Err(ConnectorError::StreamCapabilityDenied);
+    }
+    Ok(hex::encode(decoded))
 }

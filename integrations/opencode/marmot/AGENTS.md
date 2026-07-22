@@ -6,7 +6,7 @@ Read `README.md` first.
 ## Scope
 
 - A dedicated **control-plane-only** harness. `wn-agent` owns the Marmot account, MLS state, Nostr transport, durable
-  sends, and allowlist-backed invite handling; this crate only speaks `marmot.agent-control.v1` over the local Unix
+  sends, and allowlist-backed invite handling; this crate only speaks `marmot.agent-control.v2` over the local Unix
   socket and runs `opencode`.
 - Every message from an allowed sender is treated as a prompt. This is intentionally a pure harness, not a gateway
   plugin with mention activation, media handling, profile onboarding, or live previews.

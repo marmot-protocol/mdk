@@ -152,6 +152,11 @@ Initial requests:
 Important protocol rule: `StreamAppend` carries append-only text. If a gateway has full replacement text, the shim must
 compute the suffix before it calls `StreamAppend`.
 
+The implemented `marmot.agent-control.v2` stream lifecycle also binds every active stream to a random 256-bit bearer
+capability returned by `StreamBegin`. All later stream operations require it. The begin envelope id is a retry key:
+identical retries return the original receipt and capability, while conflicting retry inputs or an occupied explicit
+stream id are rejected without replacing the active session.
+
 If suffix computation fails, the shim has two v1 choices:
 
 - cancel the preview and send only a final message;

@@ -12,8 +12,12 @@ Current integrations:
 All three are intentionally thin at the Marmot boundary. They do not own MLS
 state, Nostr transport, local account storage, relay access, QUIC preview
 transport, or durable encrypted sends. `wn-agent` owns those concerns and exposes
-the local `marmot.agent-control.v1` newline-delimited JSON protocol over a Unix
+the local `marmot.agent-control.v2` newline-delimited JSON protocol over a Unix
 socket.
+
+Live-preview clients retain the v2 `stream_capability` returned by `stream_begin` only for the life of that preview and
+present it on every later stream operation. They also reuse one stable envelope request id when retrying a timed-out
+`stream_begin`; capabilities and control bearer tokens must never appear in logs.
 
 ## Default Install Topology
 

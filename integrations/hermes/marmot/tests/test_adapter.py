@@ -175,7 +175,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "final_sent",
                     "message_ids_hex": ["aa", "bb"],
@@ -195,13 +195,12 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["type"], "final_sent")
         self.assertEqual(response["message_ids_hex"], ["aa", "bb"])
-        self.assertEqual(requests[0]["marmot_agent_control"], "marmot.agent-control.v1")
+        self.assertEqual(requests[0]["marmot_agent_control"], "marmot.agent-control.v2")
         self.assertEqual(requests[0]["type"], "send_final")
         self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
         self.assertEqual(requests[0]["group_id_hex"], "22" * 32)
         self.assertEqual(requests[0]["reply_to_message_id_hex"], "33" * 32)
-        # Additive, v1-compatible: the key is omitted from the wire when not
-        # supplied so an old connector's frame stays byte-identical.
+        # Optional on the wire: the key is omitted when not supplied.
         self.assertNotIn("idempotency_key", requests[0])
 
     async def test_send_final_includes_idempotency_key_only_when_supplied(self):
@@ -213,7 +212,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "final_sent",
                     "message_ids_hex": ["aa"],
@@ -242,10 +241,11 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": [],
                 },
@@ -274,7 +274,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "stream_finalized",
                     "stream_id_hex": request["stream_id_hex"],
@@ -286,13 +286,14 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         await self.start_server(handler)
         client = self.adapter.MarmotAgentControlClient(self.socket_path)
 
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1, idempotency_key="key-1")
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1, idempotency_key="   ")
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1)
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="key-1")
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1, idempotency_key="   ")
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
 
         self.assertEqual(requests[0]["idempotency_key"], "key-1")
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
+        self.assertTrue(all(request["stream_capability"] == "33" * 32 for request in requests))
 
     async def test_auth_token_is_written_when_configured(self):
         requests = []
@@ -303,7 +304,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "account_list",
                     "accounts": [],
@@ -328,7 +329,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "profile_published",
                     "account_id_hex": request["account_id_hex"],
@@ -358,7 +359,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "app_event_sent",
                     "message_ids_hex": ["22" * 32],
@@ -403,7 +404,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "ack",
                 },
@@ -411,7 +412,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "inbound_message",
                     "account_id_hex": "11" * 32,
@@ -442,7 +443,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "ack",
                 },
@@ -451,7 +452,7 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": request["id"],
                     "type": "inbound_message",
                     "account_id_hex": "11" * 32,
@@ -1535,20 +1536,22 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 stream_id_hex=None,
                 parent_message_id_hex=None,
                 quic_candidates=(),
+                request_id=None,
             ):
                 self.stream_begin_parents.append(parent_message_id_hex)
                 index = len(self.stream_begin_parents)
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": f"{index:02x}" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": f"{index + 16:02x}" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 return {"type": "ack"}
 
         fake_client = FakeClient()
@@ -1619,6 +1622,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 stream_id_hex=None,
                 parent_message_id_hex=None,
                 quic_candidates=(),
+                request_id=None,
             ):
                 self.stream_begin_args = (
                     account_id_hex,
@@ -1629,15 +1633,16 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {
                     "type": "stream_finalized",
@@ -1694,20 +1699,21 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_finalizes = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                     "policy_max_plaintext_frame_len": 4,
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {
                     "type": "stream_finalized",
@@ -1747,16 +1753,17 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_begins = []
                 self.stream_appends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 self.stream_begins.append((account_id_hex, group_id_hex, tuple(quic_candidates)))
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
@@ -1783,19 +1790,20 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends = []
                 self.stream_cancels = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1826,22 +1834,23 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_appends = []
                 self.stream_cancels = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 self.next_stream += 1
                 stream_byte = f"{0x54 + self.next_stream:02x}"
                 start_byte = f"{0x64 + self.next_stream:02x}"
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": stream_byte * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": start_byte * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1873,21 +1882,22 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.next_stream = 0
                 self.stream_cancels = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 self.next_stream += 1
                 stream_byte = f"{0x54 + self.next_stream:02x}"
                 start_byte = f"{0x64 + self.next_stream:02x}"
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": stream_byte * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": start_byte * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -1920,19 +1930,20 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_finalizes = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {
                     "type": "stream_finalized",
@@ -1975,18 +1986,19 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_cancels = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text))
                 return {
                     "type": "stream_finalized",
@@ -1994,7 +2006,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "message_ids_hex": ["77" * 32],
                 }
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -2038,23 +2050,24 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_cancels = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.stream_appends.append((stream_id_hex, append_text))
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 self.stream_finalizes.append((stream_id_hex, final_text, transcript_hash_hex, chunk_count))
                 return {"type": "stream_finalized", "stream_id_hex": stream_id_hex}
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 
@@ -2206,15 +2219,16 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.appends = []
                 self.fail_next = True
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 self.appends.append((stream_id_hex, append_text))
                 if self.fail_next:
                     self.fail_next = False
@@ -2324,7 +2338,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await write_json_line(
                 writer,
                 {
-                    "marmot_agent_control": "marmot.agent-control.v1",
+                    "marmot_agent_control": "marmot.agent-control.v2",
                     "id": requests[-1]["id"],
                     "type": "ack",
                 },
@@ -2338,7 +2352,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 client = self.adapter_module.MarmotAgentControlClient(socket_path)
                 # The dead stream_tool method is gone; stream_progress exists.
                 self.assertFalse(hasattr(client, "stream_tool"))
-                response = await client.stream_progress("55" * 32, "Working...")
+                response = await client.stream_progress("55" * 32, "33" * 32, "Working...")
             finally:
                 server.close()
                 await server.wait_closed()
@@ -2764,11 +2778,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.preview_request_timeout, 8.0)
 
         await client.stream_begin("11" * 32, "22" * 32, quic_candidates=["quic://x"])
-        await client.stream_append("55" * 32, "hi")
-        await client.stream_status("55" * 32, "thinking")
-        await client.stream_progress("55" * 32, "Working...")
-        await client.stream_cancel("55" * 32, "done")
-        await client.stream_finalize("55" * 32, "final", "ab" * 32, 1)
+        await client.stream_append("55" * 32, "33" * 32, "hi")
+        await client.stream_status("55" * 32, "33" * 32, "thinking")
+        await client.stream_progress("55" * 32, "33" * 32, "Working...")
+        await client.stream_cancel("55" * 32, "33" * 32, "done")
+        await client.stream_finalize("55" * 32, "33" * 32, "final", "ab" * 32, 1)
         await client.send_final("11" * 32, "22" * 32, "durable")
 
         by_type = dict(seen)
@@ -2784,6 +2798,51 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
+    async def test_stream_begin_retries_with_the_same_request_id(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.request_ids = []
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                self.request_ids.append(request_id)
+                if len(self.request_ids) == 1:
+                    raise adapter_module.AgentControlError(
+                        "timed out waiting for stream begin",
+                        code="timeout",
+                        retryable=True,
+                    )
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+        client = FakeClient()
+        stream = await adapter_module.MarmotLiveStream.begin(
+            client=client,
+            account_id_hex="11" * 32,
+            group_id_hex="22" * 32,
+            quic_candidates=(),
+            chunk_bytes=1024,
+        )
+
+        self.assertTrue(client.request_ids[0])
+        self.assertEqual(client.request_ids[1], client.request_ids[0])
+        self.assertEqual(stream.stream_capability, "33" * 32)
+
     async def test_stream_finalize_retries_retryable_failure_with_same_idempotency_key(self):
         adapter_module = self.adapter_module
 
@@ -2792,20 +2851,22 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_finalizes = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
             async def stream_finalize(
                 self,
                 stream_id_hex,
+                stream_capability,
                 final_text,
                 transcript_hash_hex,
                 chunk_count,
@@ -2859,24 +2920,25 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
                 self.stream_cancels = []
                 self.final_sends = []
 
-            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=()):
+            async def stream_begin(self, account_id_hex, group_id_hex, *, stream_id_hex=None, quic_candidates=(), request_id=None):
                 return {
                     "type": "stream_begun",
                     "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
                     "start_message_id_hex": "66" * 32,
                     "quic_candidates": list(quic_candidates),
                 }
 
-            async def stream_append(self, stream_id_hex, append_text):
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
                 return {"type": "ack"}
 
-            async def stream_finalize(self, stream_id_hex, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
+            async def stream_finalize(self, stream_id_hex, stream_capability, final_text, transcript_hash_hex, chunk_count, idempotency_key=None):
                 raise adapter_module.AgentControlError(
                     "transcript hash mismatch",
                     code="stream_finalize_rejected",
                 )
 
-            async def stream_cancel(self, stream_id_hex, reason=None):
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
                 self.stream_cancels.append((stream_id_hex, reason))
                 return {"type": "ack"}
 

@@ -48,7 +48,7 @@ Primary implementation areas:
 - `crates/marmot-uniffi` - UniFFI bindings over the app runtime.
 - `crates/marmot-markdown` - CommonMark and nostr display parser for app messages.
 - `crates/marmot-forensics` - append-only JSONL forensic audit schema and recorder traits.
-- `crates/agent-control` - `marmot.agent-control.v1` control-protocol DTOs and newline-delimited JSON framing.
+- `crates/agent-control` - `marmot.agent-control.v2` control-protocol DTOs and newline-delimited JSON framing.
 - `crates/agent-stream-compose` - reusable live-preview stream composition over the QUIC broker publisher.
 - `crates/agent-connector` - local `wn-agent` connector daemon bridging agent control and stream composition.
 - `crates/cli` - CLI app surface plus `wnd` daemon and `wn tui`.

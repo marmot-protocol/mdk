@@ -114,7 +114,11 @@ impl AgentConnector {
                 )
                 .await;
         }
-        let response = match self.handle_request(request.payload).await {
+        let envelope_request_id = request.id.clone();
+        let response = match self
+            .handle_request(envelope_request_id.as_deref(), request.payload)
+            .await
+        {
             Ok(response) => response,
             Err(err) => self.error_response("handle_connection", &err),
         };
@@ -161,6 +165,7 @@ impl AgentConnector {
 
     async fn handle_request(
         &self,
+        request_id: Option<&str>,
         request: AgentControlRequest,
     ) -> Result<AgentControlResponse, ConnectorError> {
         match request {
@@ -229,6 +234,7 @@ impl AgentConnector {
                 quic_candidates,
             } => {
                 self.stream_begin_response(
+                    request_id,
                     &account_id_hex,
                     &group_id_hex,
                     stream_id_hex,
@@ -239,21 +245,31 @@ impl AgentConnector {
             }
             AgentControlRequest::StreamAppend {
                 stream_id_hex,
+                stream_capability,
                 append_text,
             } => {
-                self.stream_append_response(&stream_id_hex, append_text)
+                self.stream_append_response(&stream_id_hex, &stream_capability, append_text)
                     .await
             }
             AgentControlRequest::StreamStatus {
                 stream_id_hex,
+                stream_capability,
                 status,
-            } => self.stream_status_response(&stream_id_hex, status).await,
+            } => {
+                self.stream_status_response(&stream_id_hex, &stream_capability, status)
+                    .await
+            }
             AgentControlRequest::StreamProgress {
                 stream_id_hex,
+                stream_capability,
                 text,
-            } => self.stream_progress_response(&stream_id_hex, text).await,
+            } => {
+                self.stream_progress_response(&stream_id_hex, &stream_capability, text)
+                    .await
+            }
             AgentControlRequest::StreamFinalize {
                 stream_id_hex,
+                stream_capability,
                 final_text,
                 transcript_hash_hex,
                 chunk_count,
@@ -261,6 +277,7 @@ impl AgentConnector {
             } => {
                 self.stream_finalize_response(
                     &stream_id_hex,
+                    &stream_capability,
                     final_text,
                     &transcript_hash_hex,
                     chunk_count,
@@ -268,9 +285,11 @@ impl AgentConnector {
                 )
                 .await
             }
-            AgentControlRequest::StreamCancel { stream_id_hex, .. } => {
-                self.stream_cancel_response(&stream_id_hex)
-            }
+            AgentControlRequest::StreamCancel {
+                stream_id_hex,
+                stream_capability,
+                ..
+            } => self.stream_cancel_response(&stream_id_hex, &stream_capability),
             AgentControlRequest::AccountCreate {
                 label,
                 publish_key_package,

@@ -194,13 +194,19 @@ Release.
 
 ## Control Plane Security
 
-The v1 control plane is local-only:
+The v2 control plane is local-only:
 
 - Unix socket only;
 - default parent directory mode `0700`;
 - default socket mode `0600`;
 - same effective UID required;
 - no TCP listener.
+
+Live-preview sessions have a second, narrower bearer boundary. `StreamBegin` requires a nonempty envelope request id
+and returns a fresh 256-bit capability. Every later stream operation must present that capability, which is compared
+without data-dependent early exit and is never logged or persisted. A begin retry must reuse its original request id;
+an exact retry returns the original capability, while a different request or a colliding stream id is rejected without
+replacing the active session.
 
 When the gateway and `wn-agent` run as different local service users, use a bearer token file plus group-readable socket
 modes:

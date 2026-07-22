@@ -8,6 +8,7 @@ use agent_stream_compose::{
 };
 use cgka_traits::{GroupId, MessageId};
 use marmot_app::AgentTextStreamFinishRequest;
+use rand::{RngCore, rngs::OsRng};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::OpenBrokerTextPublisher;
@@ -17,7 +18,9 @@ use crate::quic::{
     broker_trust_for_candidate, first_quic_candidate, parse_quic_candidate,
     resolve_quic_candidate_addr,
 };
-use crate::stream_session::{ActiveStreamSession, FinalizedStream};
+use crate::stream_session::{
+    ActiveStreamSession, FinalizedStream, StreamBeginReceipt, normalize_stream_capability,
+};
 use crate::validation::{normalize_hex, transcript_hash_from_hex, unix_now_seconds};
 use crate::{
     AgentConnector, STREAM_COMPOSE_CHANNEL_DEPTH, STREAM_COMPOSE_CHUNK_BYTES,
@@ -25,13 +28,15 @@ use crate::{
 };
 
 /// Current schema version for persisted `stream_finalize` request fingerprints.
-pub(crate) const STREAM_FINALIZE_FINGERPRINT_VERSION: u8 = 1;
+pub(crate) const STREAM_FINALIZE_FINGERPRINT_VERSION: u8 = 2;
+pub(crate) const STREAM_BEGIN_FINGERPRINT_VERSION: u8 = 1;
 
 /// Server-derived fingerprint of a `stream_finalize` request. A retry can return
 /// cached message ids only when the stream id and sealed transcript exactly
 /// match the first successful finalize for the idempotency key.
 pub(crate) fn stream_finalize_fingerprint(
     stream_id_hex: &str,
+    stream_capability: &str,
     final_text: &str,
     transcript_hash: &[u8; 32],
     chunk_count: u64,
@@ -41,6 +46,7 @@ pub(crate) fn stream_finalize_fingerprint(
     let preimage = serde_json::json!([
         STREAM_FINALIZE_FINGERPRINT_VERSION,
         stream_id_hex,
+        stream_capability,
         final_text,
         hex::encode(transcript_hash),
         chunk_count,
@@ -50,8 +56,39 @@ pub(crate) fn stream_finalize_fingerprint(
     hex::encode(Sha256::digest(bytes))
 }
 
+fn stream_begin_fingerprint(
+    account_id_hex: &str,
+    group_id_hex: &str,
+    requested_stream_id_hex: Option<&str>,
+    parent_message_id_hex: Option<&str>,
+    quic_candidates: &[String],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let preimage = serde_json::json!([
+        STREAM_BEGIN_FINGERPRINT_VERSION,
+        account_id_hex,
+        group_id_hex,
+        requested_stream_id_hex,
+        parent_message_id_hex,
+        quic_candidates,
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("stream_begin fingerprint cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn begun_response(receipt: StreamBeginReceipt) -> AgentControlResponse {
+    AgentControlResponse::StreamBegun {
+        stream_id_hex: receipt.stream_id_hex,
+        stream_capability: receipt.stream_capability,
+        start_message_id_hex: receipt.start_message_id_hex,
+        quic_candidates: receipt.quic_candidates,
+        policy_max_plaintext_frame_len: receipt.policy_max_plaintext_frame_len,
+    }
+}
+
 fn stream_finalize_idempotency_key(key: &str) -> String {
-    format!("stream_finalize:{key}")
+    format!("stream_finalize_v2:{key}")
 }
 
 struct StreamFinalizeIdempotency {
@@ -62,22 +99,32 @@ struct StreamFinalizeIdempotency {
 impl AgentConnector {
     pub(crate) async fn stream_begin_response(
         &self,
+        request_id: Option<&str>,
         account_id_hex: &str,
         group_id_hex: &str,
         stream_id_hex: Option<String>,
         parent_message_id_hex: Option<String>,
         quic_candidates: Vec<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        let request_id = request_id
+            .map(str::trim)
+            .filter(|request_id| !request_id.is_empty() && request_id.len() <= 128)
+            .ok_or(ConnectorError::InvalidStreamBeginRequestId)?
+            .to_owned();
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id_hex = normalize_hex(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        let stream_id = stream_id_hex
+        let requested_stream_id_hex = stream_id_hex
             .map(|stream_id_hex| -> Result<Vec<u8>, ConnectorError> {
-                Ok(hex::decode(normalize_hex(&stream_id_hex)?)?)
+                let stream_id = hex::decode(normalize_hex(&stream_id_hex)?)?;
+                if stream_id.len() != 32 {
+                    return Err(ConnectorError::Stream(
+                        "stream id must be exactly 32 bytes".into(),
+                    ));
+                }
+                Ok(stream_id)
             })
-            .transpose()?
-            .unwrap_or_else(transport_quic_stream::random_stream_id);
-        let stream_id_hex = hex::encode(&stream_id);
+            .transpose()?;
         let parent_message_id_hex = parent_message_id_hex
             .map(|parent_message_id_hex| -> Result<String, ConnectorError> {
                 let normalized = normalize_hex(&parent_message_id_hex)?;
@@ -89,6 +136,40 @@ impl AgentConnector {
                 Ok(normalized)
             })
             .transpose()?;
+        let requested_stream_id_hex = requested_stream_id_hex.as_deref().map(hex::encode);
+        let fingerprint = stream_begin_fingerprint(
+            &account.account_id_hex,
+            &group_id_hex,
+            requested_stream_id_hex.as_deref(),
+            parent_message_id_hex.as_deref(),
+            &quic_candidates,
+        );
+
+        // Serialize begin reservation + publication so a retry with the same
+        // envelope id waits for and receives the original receipt, while two
+        // different requests can never race past the stream-id collision gate.
+        let _begin_guard = self.stream_begin_lock.lock().await;
+        if let Some(receipt) = self.streams.begin_receipt(&request_id, &fingerprint)? {
+            return Ok(begun_response(receipt));
+        }
+
+        let (stream_id, stream_id_hex) = if let Some(stream_id_hex) = requested_stream_id_hex {
+            if self.streams.stream_id_reserved(&stream_id_hex) {
+                return Err(ConnectorError::StreamIdInUse);
+            }
+            (hex::decode(&stream_id_hex)?, stream_id_hex)
+        } else {
+            loop {
+                let stream_id = transport_quic_stream::random_stream_id();
+                let stream_id_hex = hex::encode(&stream_id);
+                if !self.streams.stream_id_reserved(&stream_id_hex) {
+                    break (stream_id, stream_id_hex);
+                }
+            }
+        };
+        let mut stream_capability = [0u8; 32];
+        OsRng.fill_bytes(&mut stream_capability);
+        let stream_capability_hex = hex::encode(stream_capability);
         let candidate = first_quic_candidate(&quic_candidates)?;
         let parsed_candidate = parse_quic_candidate(&candidate)?;
         let broker_addr =
@@ -157,12 +238,13 @@ impl AgentConnector {
             cancel_rx,
             report,
         ));
-        self.streams.insert(
+        self.streams.insert_new(
             stream_id_hex.clone(),
             ActiveStreamSession {
                 account_label: account.label,
                 group_id,
                 stream_id,
+                stream_capability,
                 start_message_id_hex: start_message_id_hex.clone(),
                 tx,
                 cancel_tx,
@@ -170,21 +252,29 @@ impl AgentConnector {
                 last_activity: Instant::now(),
                 finalized: None,
             },
-        );
-        Ok(AgentControlResponse::StreamBegun {
+        )?;
+        let receipt = StreamBeginReceipt {
+            fingerprint,
             stream_id_hex,
+            stream_capability: stream_capability_hex,
             start_message_id_hex,
             quic_candidates,
             policy_max_plaintext_frame_len,
-        })
+        };
+        self.streams
+            .record_begin_receipt(request_id, receipt.clone());
+        Ok(begun_response(receipt))
     }
 
     pub(crate) async fn stream_append_response(
         &self,
         stream_id_hex: &str,
+        stream_capability: &str,
         append_text: String,
     ) -> Result<AgentControlResponse, ConnectorError> {
-        let session = self.streams.get(stream_id_hex)?;
+        let session = self
+            .streams
+            .get_authorized(stream_id_hex, stream_capability)?;
         let (respond, response) = oneshot::channel();
         session
             .tx
@@ -204,9 +294,12 @@ impl AgentConnector {
     pub(crate) async fn stream_status_response(
         &self,
         stream_id_hex: &str,
+        stream_capability: &str,
         status: String,
     ) -> Result<AgentControlResponse, ConnectorError> {
-        let session = self.streams.get(stream_id_hex)?;
+        let session = self
+            .streams
+            .get_authorized(stream_id_hex, stream_capability)?;
         let (respond, response) = oneshot::channel();
         session
             .tx
@@ -223,9 +316,12 @@ impl AgentConnector {
     pub(crate) async fn stream_progress_response(
         &self,
         stream_id_hex: &str,
+        stream_capability: &str,
         text: String,
     ) -> Result<AgentControlResponse, ConnectorError> {
-        let session = self.streams.get(stream_id_hex)?;
+        let session = self
+            .streams
+            .get_authorized(stream_id_hex, stream_capability)?;
         let (respond, response) = oneshot::channel();
         session
             .tx
@@ -242,15 +338,22 @@ impl AgentConnector {
     pub(crate) async fn stream_finalize_response(
         &self,
         stream_id_hex: &str,
+        stream_capability: &str,
         final_text: String,
         transcript_hash_hex: &str,
         chunk_count: u64,
         idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
+        let stream_capability = normalize_stream_capability(stream_capability)?;
         let transcript_hash = transcript_hash_from_hex(transcript_hash_hex)?;
-        let fingerprint =
-            stream_finalize_fingerprint(&stream_id_hex, &final_text, &transcript_hash, chunk_count);
+        let fingerprint = stream_finalize_fingerprint(
+            &stream_id_hex,
+            &stream_capability,
+            &final_text,
+            &transcript_hash,
+            chunk_count,
+        );
         let idempotency_key = idempotency_key
             .as_deref()
             .map(str::trim)
@@ -268,7 +371,9 @@ impl AgentConnector {
         // expectation is validated inside the compose task, atomically with
         // its teardown. On mismatch the session stays registered and the
         // compose task keeps running, so finalize is retryable (#366).
-        let session = self.streams.get(&stream_id_hex)?;
+        let session = self
+            .streams
+            .get_authorized(&stream_id_hex, &stream_capability)?;
 
         // Retry fast-path: a prior finalize already validated the transcript and
         // the compose task exited, but the durable finish below failed. The
@@ -411,8 +516,11 @@ impl AgentConnector {
     pub(crate) fn stream_cancel_response(
         &self,
         stream_id_hex: &str,
+        stream_capability: &str,
     ) -> Result<AgentControlResponse, ConnectorError> {
-        let session = self.streams.remove(stream_id_hex)?;
+        let session = self
+            .streams
+            .remove_authorized(stream_id_hex, stream_capability)?;
         // Send a graceful cancel over the dedicated cancel signal and let the
         // compose session drain it: the session emits a live `Abort` record (so
         // online subscribers observe the cancellation) and shuts itself down.

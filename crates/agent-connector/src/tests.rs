@@ -497,6 +497,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx: idle_tx,
             cancel_tx: idle_cancel_tx,
@@ -516,6 +517,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![2]),
             stream_id: vec![0xbb],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx: active_tx,
             cancel_tx: active_cancel_tx,
@@ -570,6 +572,7 @@ async fn stream_session_sweep_spares_finalized_session_despite_idle() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx,
             cancel_tx,
@@ -1408,6 +1411,7 @@ async fn stream_session_store_resolves_non_canonical_stream_id() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa, 0xbb],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx,
             cancel_tx,
@@ -1463,6 +1467,7 @@ async fn stream_session_sweep_does_not_force_abort_when_cancel_already_queued() 
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx,
             cancel_tx,
@@ -2093,7 +2098,52 @@ async fn connector_socket_composes_and_finalizes_stream() {
     .unwrap();
     let listener = bind_connector_socket(&socket).unwrap();
 
+    let missing_begin_id = connector
+        .stream_begin_response(
+            None,
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            Some(stream_id_hex.clone()),
+            Some(parent_message_id_hex.clone()),
+            vec!["quic://127.0.0.1:9".to_owned()],
+        )
+        .await;
+    assert!(matches!(
+        missing_begin_id,
+        Err(crate::ConnectorError::InvalidStreamBeginRequestId)
+    ));
+
+    let begin_request = AgentControlRequest::StreamBegin {
+        account_id_hex: agent.account.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        stream_id_hex: Some(stream_id_hex.clone()),
+        parent_message_id_hex: Some(parent_message_id_hex.clone()),
+        quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+    };
     let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin",
+        begin_request.clone(),
+    )
+    .await;
+    let first_begun_payload = begun.payload.clone();
+
+    let retried_begin = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin",
+        begin_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        retried_begin.payload, first_begun_payload,
+        "an identical begin retry must return the original capability and receipt"
+    );
+
+    let conflicting_retry = serve_control_request_once(
         &connector,
         &listener,
         &socket,
@@ -2102,13 +2152,32 @@ async fn connector_socket_composes_and_finalizes_stream() {
             account_id_hex: agent.account.account_id_hex.clone(),
             group_id_hex: group_id_hex.clone(),
             stream_id_hex: Some(stream_id_hex.clone()),
-            parent_message_id_hex: Some(parent_message_id_hex.clone()),
+            parent_message_id_hex: None,
             quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
         },
     )
     .await;
+    let AgentControlResponse::Error { code, .. } = conflicting_retry.payload else {
+        panic!("expected conflicting stream-begin retry error");
+    };
+    assert_eq!(code, "stream_begin_request_conflict");
+
+    let colliding_begin = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin-collision",
+        begin_request,
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = colliding_begin.payload else {
+        panic!("expected stream-id collision error");
+    };
+    assert_eq!(code, "stream_id_in_use");
+
     let AgentControlResponse::StreamBegun {
         stream_id_hex: begun_stream_id_hex,
+        stream_capability,
         start_message_id_hex,
         quic_candidates,
         ..
@@ -2117,6 +2186,9 @@ async fn connector_socket_composes_and_finalizes_stream() {
         panic!("expected stream begun response");
     };
     assert_eq!(begun_stream_id_hex, stream_id_hex);
+    assert_eq!(stream_capability.len(), 64);
+    assert_eq!(hex::decode(&stream_capability).unwrap().len(), 32);
+    assert_eq!(stream_capability, stream_capability.to_ascii_lowercase());
     assert_eq!(quic_candidates, vec!["quic://127.0.0.1:9"]);
     let stored = connector
         .runtime
@@ -2132,6 +2204,14 @@ async fn connector_socket_composes_and_finalizes_stream() {
         .iter()
         .find(|message| message.message_id_hex == start_message_id_hex)
         .expect("stream start must be in the local app projection");
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|message| message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START)
+            .count(),
+        1,
+        "begin retries and collisions must not publish another start event"
+    );
     assert_eq!(start.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
     assert_eq!(
         start
@@ -2150,6 +2230,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         "req-stream-append",
         AgentControlRequest::StreamAppend {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             append_text: "hello stream".to_owned(),
         },
     )
@@ -2163,6 +2244,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         "req-stream-status",
         AgentControlRequest::StreamStatus {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             status: "thinking".to_owned(),
         },
     )
@@ -2184,6 +2266,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         "req-stream-finalize",
         AgentControlRequest::StreamFinalize {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability,
             final_text: "hello stream".to_owned(),
             transcript_hash_hex,
             chunk_count: 2,
@@ -2261,6 +2344,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
     )
     .await;
     let AgentControlResponse::StreamBegun {
+        stream_capability,
         start_message_id_hex,
         ..
     } = begun.payload
@@ -2275,6 +2359,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-append",
         AgentControlRequest::StreamAppend {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             append_text: "hello stream".to_owned(),
         },
     )
@@ -2295,6 +2380,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-finalize-mismatch",
         AgentControlRequest::StreamFinalize {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             final_text: "hello stream".to_owned(),
             transcript_hash_hex: first_hash,
             chunk_count: 7,
@@ -2316,6 +2402,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-append-again",
         AgentControlRequest::StreamAppend {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             append_text: " again".to_owned(),
         },
     )
@@ -2338,6 +2425,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-finalize",
         AgentControlRequest::StreamFinalize {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability,
             final_text: "hello stream again".to_owned(),
             transcript_hash_hex: corrected_hash,
             chunk_count: 2,
@@ -2421,10 +2509,12 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         },
     )
     .await;
-    assert!(matches!(
-        begun.payload,
-        AgentControlResponse::StreamBegun { .. }
-    ));
+    let AgentControlResponse::StreamBegun {
+        stream_capability, ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
 
     // Reconstruct the exact state left after a validated finalize whose durable
     // publish then failed: the compose task has exited (abort it here to prove
@@ -2452,6 +2542,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let mismatch = connector
         .stream_finalize_response(
             &stream_id_hex,
+            &stream_capability,
             "different final".to_owned(),
             &hex::encode(transcript_hash),
             1,
@@ -2473,6 +2564,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let finalized = connector
         .stream_finalize_response(
             &stream_id_hex,
+            &stream_capability,
             "frozen final".to_owned(),
             &hex::encode(transcript_hash),
             1,
@@ -2499,6 +2591,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let retried_after_success = connector
         .stream_finalize_response(
             &stream_id_hex,
+            &stream_capability,
             "frozen final".to_owned(),
             &hex::encode(transcript_hash),
             1,
@@ -2514,6 +2607,22 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         panic!("expected stream finalized response");
     };
     assert_eq!(retried_ids, message_ids_hex);
+
+    let wrong_capability = hex::encode([0x99; 32]);
+    let wrong_capability_retry = connector
+        .stream_finalize_response(
+            &stream_id_hex,
+            &wrong_capability,
+            "frozen final".to_owned(),
+            &hex::encode(transcript_hash),
+            1,
+            Some("frozen-finalize".to_owned()),
+        )
+        .await;
+    assert!(
+        wrong_capability_retry.is_err(),
+        "a finalized idempotency receipt must remain bound to its capability"
+    );
 }
 
 #[tokio::test]
@@ -2569,10 +2678,30 @@ async fn connector_socket_cancels_stream_session() {
         },
     )
     .await;
-    assert!(matches!(
-        begun.payload,
-        AgentControlResponse::StreamBegun { .. }
-    ));
+    let AgentControlResponse::StreamBegun {
+        stream_capability, ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+
+    let wrong_capability = hex::encode([0x99; 32]);
+    let denied_cancel = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-cancel-denied",
+        AgentControlRequest::StreamCancel {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: wrong_capability,
+            reason: Some("unauthorized".to_owned()),
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = denied_cancel.payload else {
+        panic!("expected denied cancel error");
+    };
+    assert_eq!(code, "stream_capability_denied");
 
     let status = serve_control_request_once(
         &connector,
@@ -2581,6 +2710,7 @@ async fn connector_socket_cancels_stream_session() {
         "req-stream-status",
         AgentControlRequest::StreamStatus {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             status: "thinking".to_owned(),
         },
     )
@@ -2594,6 +2724,7 @@ async fn connector_socket_cancels_stream_session() {
         "req-stream-cancel",
         AgentControlRequest::StreamCancel {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             reason: Some("gateway_replaced_text".to_owned()),
         },
     )
@@ -2607,6 +2738,7 @@ async fn connector_socket_cancels_stream_session() {
         "req-stream-append-after-cancel",
         AgentControlRequest::StreamAppend {
             stream_id_hex,
+            stream_capability,
             append_text: "late".to_owned(),
         },
     )
@@ -2614,7 +2746,7 @@ async fn connector_socket_cancels_stream_session() {
     let AgentControlResponse::Error { code, .. } = append_after_cancel.payload else {
         panic!("expected append-after-cancel error");
     };
-    assert_eq!(code, "stream_error");
+    assert_eq!(code, "stream_capability_denied");
 }
 
 async fn connect_with_retry(socket: &Path) -> UnixStream {
