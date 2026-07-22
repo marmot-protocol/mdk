@@ -19,7 +19,8 @@ use crate::quic::{
     resolve_quic_candidate_addr,
 };
 use crate::stream_session::{
-    ActiveStreamSession, FinalizedStream, StreamBeginReceipt, normalize_stream_capability,
+    ActiveStreamSession, FinalizedStream, StreamBeginReceipt, StreamBeginReservation,
+    normalize_stream_capability,
 };
 use crate::validation::{normalize_hex, transcript_hash_from_hex, unix_now_seconds};
 use crate::{
@@ -145,26 +146,31 @@ impl AgentConnector {
             &quic_candidates,
         );
 
-        // Serialize begin reservation + publication so a retry with the same
-        // envelope id waits for and receives the original receipt, while two
-        // different requests can never race past the stream-id collision gate.
-        let _begin_guard = self.stream_begin_lock.lock().await;
-        if let Some(receipt) = self.streams.begin_receipt(&request_id, &fingerprint)? {
-            return Ok(begun_response(receipt));
-        }
-
-        let (stream_id, stream_id_hex) = if let Some(stream_id_hex) = requested_stream_id_hex {
-            if self.streams.stream_id_reserved(&stream_id_hex) {
-                return Err(ConnectorError::StreamIdInUse);
-            }
-            (hex::decode(&stream_id_hex)?, stream_id_hex)
-        } else {
-            loop {
-                let stream_id = transport_quic_stream::random_stream_id();
-                let stream_id_hex = hex::encode(&stream_id);
-                if !self.streams.stream_id_reserved(&stream_id_hex) {
-                    break (stream_id, stream_id_hex);
+        // Reserve only the idempotency key and globally unique stream id under
+        // the store's short synchronous critical section. DNS and runtime I/O
+        // happen after it is released, so an unrelated begin cannot be stalled
+        // by a slow candidate. Same-request followers wait for the leader's
+        // receipt; cancellation-safe reservation guards wake them to retry.
+        let (stream_id, stream_id_hex, begin_reservation) = loop {
+            match self.streams.reserve_stream_begin(
+                request_id.clone(),
+                fingerprint.clone(),
+                requested_stream_id_hex.clone(),
+            )? {
+                StreamBeginReservation::Completed(receipt) => {
+                    return Ok(begun_response(receipt));
                 }
+                StreamBeginReservation::Wait(mut completion) => {
+                    let already_completed = *completion.borrow();
+                    if !already_completed {
+                        let _ = completion.changed().await;
+                    }
+                }
+                StreamBeginReservation::Leader {
+                    stream_id,
+                    stream_id_hex,
+                    guard,
+                } => break (stream_id, stream_id_hex, guard),
             }
         };
         let mut stream_capability = [0u8; 32];
@@ -261,8 +267,7 @@ impl AgentConnector {
             quic_candidates,
             policy_max_plaintext_frame_len,
         };
-        self.streams
-            .record_begin_receipt(request_id, receipt.clone());
+        begin_reservation.complete(receipt.clone());
         Ok(begun_response(receipt))
     }
 

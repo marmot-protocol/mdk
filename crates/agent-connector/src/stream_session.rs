@@ -1,6 +1,6 @@
 //! Active agent text-stream compose sessions, the debug final-send recorder, and idle sweeping.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use cgka_traits::GroupId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::watch;
 
 use crate::error::ConnectorError;
 use crate::validation::normalize_hex;
@@ -327,6 +328,14 @@ pub(crate) struct StreamSessionStore {
 struct StreamBeginReceiptStore {
     order: VecDeque<String>,
     by_request_id: HashMap<String, StreamBeginReceipt>,
+    in_flight_by_request_id: HashMap<String, InFlightStreamBegin>,
+    reserved_stream_ids: HashSet<String>,
+}
+
+struct InFlightStreamBegin {
+    fingerprint: String,
+    stream_id_hex: String,
+    completion: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -337,6 +346,42 @@ pub(crate) struct StreamBeginReceipt {
     pub(crate) start_message_id_hex: String,
     pub(crate) quic_candidates: Vec<String>,
     pub(crate) policy_max_plaintext_frame_len: Option<u32>,
+}
+
+pub(crate) enum StreamBeginReservation {
+    Completed(StreamBeginReceipt),
+    Wait(watch::Receiver<bool>),
+    Leader {
+        stream_id: Vec<u8>,
+        stream_id_hex: String,
+        guard: StreamBeginReservationGuard,
+    },
+}
+
+pub(crate) struct StreamBeginReservationGuard {
+    store: StreamSessionStore,
+    request_id: String,
+    stream_id_hex: String,
+    active: bool,
+}
+
+impl StreamBeginReservationGuard {
+    pub(crate) fn complete(mut self, receipt: StreamBeginReceipt) {
+        let completed =
+            self.store
+                .complete_stream_begin(&self.request_id, &self.stream_id_hex, receipt);
+        debug_assert!(completed, "active StreamBegin reservation must still exist");
+        self.active = !completed;
+    }
+}
+
+impl Drop for StreamBeginReservationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.store
+                .release_stream_begin(&self.request_id, &self.stream_id_hex);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -401,43 +446,135 @@ impl StreamSessionStore {
         Ok(session.clone())
     }
 
-    pub(crate) fn stream_id_reserved(&self, stream_id_hex: &str) -> bool {
-        if crate::lock_recover(&self.sessions).contains_key(stream_id_hex) {
-            return true;
+    pub(crate) fn reserve_stream_begin(
+        &self,
+        request_id: String,
+        fingerprint: String,
+        requested_stream_id_hex: Option<String>,
+    ) -> Result<StreamBeginReservation, ConnectorError> {
+        // Keep the lock order stable: active sessions first, then begin state.
+        // No DNS, runtime, or broker work runs while either mutex is held.
+        let sessions = crate::lock_recover(&self.sessions);
+        let mut receipts = crate::lock_recover(&self.begin_receipts);
+
+        if let Some(receipt) = receipts.by_request_id.get(&request_id) {
+            if !constant_time_eq(receipt.fingerprint.as_bytes(), fingerprint.as_bytes()) {
+                return Err(ConnectorError::StreamBeginRequestConflict);
+            }
+            return Ok(StreamBeginReservation::Completed(receipt.clone()));
         }
-        crate::lock_recover(&self.begin_receipts)
-            .by_request_id
-            .values()
-            .any(|receipt| receipt.stream_id_hex == stream_id_hex)
+        if let Some(in_flight) = receipts.in_flight_by_request_id.get(&request_id) {
+            if !constant_time_eq(in_flight.fingerprint.as_bytes(), fingerprint.as_bytes()) {
+                return Err(ConnectorError::StreamBeginRequestConflict);
+            }
+            return Ok(StreamBeginReservation::Wait(
+                in_flight.completion.subscribe(),
+            ));
+        }
+
+        let (stream_id, stream_id_hex) = if let Some(stream_id_hex) = requested_stream_id_hex {
+            if sessions.contains_key(&stream_id_hex)
+                || receipts.reserved_stream_ids.contains(&stream_id_hex)
+                || receipts
+                    .by_request_id
+                    .values()
+                    .any(|receipt| receipt.stream_id_hex == stream_id_hex)
+            {
+                return Err(ConnectorError::StreamIdInUse);
+            }
+            (hex::decode(&stream_id_hex)?, stream_id_hex)
+        } else {
+            loop {
+                let stream_id = transport_quic_stream::random_stream_id();
+                let stream_id_hex = hex::encode(&stream_id);
+                if !sessions.contains_key(&stream_id_hex)
+                    && !receipts.reserved_stream_ids.contains(&stream_id_hex)
+                    && !receipts
+                        .by_request_id
+                        .values()
+                        .any(|receipt| receipt.stream_id_hex == stream_id_hex)
+                {
+                    break (stream_id, stream_id_hex);
+                }
+            }
+        };
+        let (completion, _receiver) = watch::channel(false);
+        receipts.reserved_stream_ids.insert(stream_id_hex.clone());
+        receipts.in_flight_by_request_id.insert(
+            request_id.clone(),
+            InFlightStreamBegin {
+                fingerprint,
+                stream_id_hex: stream_id_hex.clone(),
+                completion,
+            },
+        );
+        drop(receipts);
+        drop(sessions);
+
+        Ok(StreamBeginReservation::Leader {
+            stream_id,
+            stream_id_hex: stream_id_hex.clone(),
+            guard: StreamBeginReservationGuard {
+                store: self.clone(),
+                request_id,
+                stream_id_hex,
+                active: true,
+            },
+        })
     }
 
-    pub(crate) fn begin_receipt(
+    fn complete_stream_begin(
         &self,
         request_id: &str,
-        fingerprint: &str,
-    ) -> Result<Option<StreamBeginReceipt>, ConnectorError> {
-        let receipts = crate::lock_recover(&self.begin_receipts);
-        let Some(receipt) = receipts.by_request_id.get(request_id) else {
-            return Ok(None);
-        };
-        if !constant_time_eq(receipt.fingerprint.as_bytes(), fingerprint.as_bytes()) {
-            return Err(ConnectorError::StreamBeginRequestConflict);
+        stream_id_hex: &str,
+        receipt: StreamBeginReceipt,
+    ) -> bool {
+        let mut receipts = crate::lock_recover(&self.begin_receipts);
+        let matches = receipts
+            .in_flight_by_request_id
+            .get(request_id)
+            .is_some_and(|in_flight| in_flight.stream_id_hex == stream_id_hex);
+        if !matches {
+            return false;
         }
-        Ok(Some(receipt.clone()))
+        let completion = receipts
+            .in_flight_by_request_id
+            .remove(request_id)
+            .expect("checked in-flight reservation")
+            .completion;
+        receipts.reserved_stream_ids.remove(stream_id_hex);
+        if !receipts.by_request_id.contains_key(request_id) {
+            if receipts.order.len() >= STREAM_BEGIN_RECEIPT_CAPACITY
+                && let Some(evicted) = receipts.order.pop_front()
+            {
+                receipts.by_request_id.remove(&evicted);
+            }
+            receipts.order.push_back(request_id.to_owned());
+            receipts
+                .by_request_id
+                .insert(request_id.to_owned(), receipt);
+        }
+        drop(receipts);
+        let _ = completion.send(true);
+        true
     }
 
-    pub(crate) fn record_begin_receipt(&self, request_id: String, receipt: StreamBeginReceipt) {
+    fn release_stream_begin(&self, request_id: &str, stream_id_hex: &str) {
         let mut receipts = crate::lock_recover(&self.begin_receipts);
-        if receipts.by_request_id.contains_key(&request_id) {
+        let matches = receipts
+            .in_flight_by_request_id
+            .get(request_id)
+            .is_some_and(|in_flight| in_flight.stream_id_hex == stream_id_hex);
+        if !matches {
             return;
         }
-        if receipts.order.len() >= STREAM_BEGIN_RECEIPT_CAPACITY
-            && let Some(evicted) = receipts.order.pop_front()
-        {
-            receipts.by_request_id.remove(&evicted);
-        }
-        receipts.order.push_back(request_id.clone());
-        receipts.by_request_id.insert(request_id, receipt);
+        let in_flight = receipts
+            .in_flight_by_request_id
+            .remove(request_id)
+            .expect("checked in-flight reservation");
+        receipts.reserved_stream_ids.remove(stream_id_hex);
+        drop(receipts);
+        let _ = in_flight.completion.send(true);
     }
 
     /// Remove the entry for `stream_id_hex` only when it is still the same

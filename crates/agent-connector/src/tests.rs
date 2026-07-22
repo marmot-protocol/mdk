@@ -1476,6 +1476,109 @@ async fn stream_session_store_resolves_non_canonical_stream_id() {
 }
 
 #[tokio::test]
+async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
+    use crate::stream_session::{StreamBeginReceipt, StreamBeginReservation, StreamSessionStore};
+
+    let store = StreamSessionStore::default();
+    let first_stream_id = hex::encode([0x11; 32]);
+    let second_stream_id = hex::encode([0x22; 32]);
+
+    let first_guard = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("first request must lead its reservation"),
+    };
+
+    let mut follower = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Wait(completion) => completion,
+        _ => panic!("same-request retry must wait for the leader"),
+    };
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-a".to_owned(),
+            "different-fingerprint".to_owned(),
+            Some(first_stream_id.clone()),
+        ),
+        Err(crate::ConnectorError::StreamBeginRequestConflict)
+    ));
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-b".to_owned(),
+            "fingerprint-b".to_owned(),
+            Some(first_stream_id.clone()),
+        ),
+        Err(crate::ConnectorError::StreamIdInUse)
+    ));
+
+    // A distinct request and stream id becomes a leader immediately while A
+    // is still in flight. Its DNS/runtime work can therefore run concurrently.
+    let second_guard = match store
+        .reserve_stream_begin(
+            "request-b".to_owned(),
+            "fingerprint-b".to_owned(),
+            Some(second_stream_id),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("unrelated request must not wait behind request A"),
+    };
+    drop(second_guard);
+
+    // Cancelling/failing the leader releases its stream id and wakes followers
+    // so one can retry as the new leader.
+    drop(first_guard);
+    timeout(Duration::from_secs(1), follower.changed())
+        .await
+        .expect("cancelled leader must wake followers")
+        .expect("reservation watch remains valid through wakeup");
+
+    let retry_guard = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("retry must lead after the cancelled reservation is released"),
+    };
+    let receipt = StreamBeginReceipt {
+        fingerprint: "fingerprint-a".to_owned(),
+        stream_id_hex: first_stream_id,
+        stream_capability: hex::encode([0x33; 32]),
+        start_message_id_hex: hex::encode([0x44; 32]),
+        quic_candidates: vec!["quic://broker.example:443".to_owned()],
+        policy_max_plaintext_frame_len: Some(1024),
+    };
+    retry_guard.complete(receipt.clone());
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            None,
+        ),
+        Ok(StreamBeginReservation::Completed(completed))
+            if completed.stream_id_hex == receipt.stream_id_hex
+                && completed.stream_capability == receipt.stream_capability
+    ));
+}
+
+#[tokio::test]
 async fn stream_session_sweep_does_not_force_abort_when_cancel_already_queued() {
     use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
     use agent_stream_compose::StreamComposeCommand;
