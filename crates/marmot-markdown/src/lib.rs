@@ -34,6 +34,15 @@
 //! time. Only autolinks — `<scheme:body>` and `<email@host>` — get
 //! structured treatment.
 //!
+//! ## Untrusted destinations
+//!
+//! Link, image, and autolink destinations are preserved and classified with
+//! [`LinkDestinationKind`]. Classification is descriptive, not permission to
+//! navigate or fetch. Renderers must inspect it before binding a destination
+//! to a WebView, OS opener, deep-link handler, or image loader. Dangerous and
+//! sensitive destinations should remain inert by default; recognized families
+//! still require the client's normal navigation, privacy, and network policy.
+//!
 //! ## Example
 //!
 //! ```
@@ -83,10 +92,13 @@ pub use destination::classify_link_destination;
 ///   but never parsed as LaTeX).
 /// - Nostr bare mentions (`@npub1…`) and URIs (`nostr:<hrp>1…`) for the
 ///   whitelisted HRPs `npub`, `note`, `nevent`, `nprofile`, `naddr`,
-///   `nrelay`. `nsec` is deliberately rejected — we never render private
-///   keys as ergonomic anchors. Bare `nostr:` URIs whose body isn't valid
-///   bech32 stay as literal text (they are *not* downgraded to a generic
-///   bare-URL autolink).
+///   `nrelay`. `nsec` is deliberately rejected from the ergonomic
+///   [`Inline::NostrMention`] / [`Inline::NostrUri`] entity forms. Bare
+///   `nostr:` URIs whose body isn't valid bech32 stay as literal text (they are
+///   *not* downgraded to a generic bare-URL autolink). When private-key text is
+///   deliberately used as an explicit destination or angle-bracket autolink,
+///   it is preserved with [`LinkDestinationKind::Sensitive`] so the client can
+///   display it without making it actionable.
 ///
 /// Bech32 strings are validated for *shape* only (no checksum).
 pub fn parse(input: &str) -> Document {
