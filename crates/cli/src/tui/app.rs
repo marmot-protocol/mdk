@@ -465,6 +465,11 @@ impl TuiApp {
             KeyCode::Char('d') if self.focus == Focus::Messages => {
                 self.prefill_composer("/delete");
             }
+            // `R` prefills `/reply ` (draft-protected, like `r`/`d`) and names the
+            // reply target on the status line; the target resolves at submit.
+            KeyCode::Char('R') if self.focus == Focus::Messages => {
+                self.begin_reply();
+            }
             // Open the selected message's downloaded image full-size.
             KeyCode::Char('o') if self.focus == Focus::Messages => {
                 self.open_selected_image_viewer();
@@ -680,6 +685,25 @@ impl TuiApp {
         }
     }
 
+    /// `R` accelerator: prefill `/reply ` (draft-protected via `prefill_composer`)
+    /// and, when the prefill takes, set a status line naming the reply target so
+    /// the pending reply is visible. The target itself resolves at submit; this
+    /// status line is informational only.
+    fn begin_reply(&mut self) {
+        let had_draft = !self.input.is_empty();
+        self.prefill_composer("/reply ");
+        if !had_draft && let Some(row) = self.selected_timeline_row() {
+            self.status = reply_target_status(row);
+        }
+    }
+
+    /// The currently selected timeline row (newest by default), if any.
+    pub(crate) fn selected_timeline_row(&self) -> Option<&TimelineRow> {
+        self.timeline_scroll
+            .resolved_selection(self.timeline.len())
+            .and_then(|index| self.timeline.get(index))
+    }
+
     pub(crate) fn submit_input(&mut self) -> TuiResult<()> {
         let input = self.input.value().trim().to_owned();
         self.input.clear();
@@ -873,6 +897,7 @@ impl TuiApp {
             SlashCommand::React { emoji } => self.react_to_selected_message(emoji),
             SlashCommand::Unreact => self.unreact_selected_message(),
             SlashCommand::Delete => self.delete_selected_message(),
+            SlashCommand::Reply { text } => self.send_reply(text),
             SlashCommand::Retry { event_id } => self.retry_message(event_id),
             SlashCommand::Image { file_path, caption } => self.send_image(file_path, caption),
             SlashCommand::KeysFetch(account) => {

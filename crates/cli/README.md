@@ -548,12 +548,16 @@ Main view controls:
   the previous page of history. `i` or `Enter` focuses the composer.
 - Messages, on the selected message: `r` reacts (it prefills `/react ` in the composer, so `Enter` sends the default
   `+` and typing an emoji first customizes it); `u` removes your own reaction immediately; `d` deletes your own
-  message (it prefills `/delete`, so `Enter` is the visible confirmation). Counts update live in both directions from
-  the timeline projection; the list is not reloaded. The `r` and `d` prefills are skipped when the composer already
-  holds a draft, so an in-progress message is never clobbered (a status-line notice explains the skip). These also
-  work as the `/react`, `/unreact`, and `/delete` slash commands, which error to the status line when no message is
-  selected (and `/delete` when the message is not yours). `o` opens the selected message's downloaded image full-size
-  in a dismiss-on-any-key viewer (see "Inbound media" below).
+  message (it prefills `/delete`, so `Enter` is the visible confirmation); `R` replies (it prefills `/reply ` and
+  shows the reply target on the status line, so you type the reply and `Enter` sends it). Counts update live in both
+  directions from the timeline projection; the list is not reloaded, and a sent reply upserts optimistically the same
+  way a plain send does. The `r`, `d`, and `R` prefills are skipped when the composer already holds a draft, so an
+  in-progress message is never clobbered (a status-line notice explains the skip). These also work as the `/react`,
+  `/unreact`, `/delete`, and `/reply <text>` slash commands, which resolve the target at submit and error to the
+  status line when no message is selected (and `/delete` when the message is not yours). `/reply` sends
+  `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
+  text as the guard requires. `o` opens the selected message's downloaded image full-size in a dismiss-on-any-key
+  viewer (see "Inbound media" below).
 - Inbound media: an image attachment renders inline in the message pane on terminals with a graphics protocol
   (Kitty, iTerm2, or Sixel; iTerm2 is detected via `ITERM_SESSION_ID`). Each image is downloaded and decoded in the
   background — never blocking the event loop — and its placeholder walks `[img name]` -> `[downloading name...]` ->

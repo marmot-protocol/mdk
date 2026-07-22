@@ -643,7 +643,7 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "Tab/BackTab cycle chats, messages, and composer. Ctrl-C quits.",
         "Chats: j/k move; Enter opens; g detail; s search; p profile; h relays; I invites; A accounts.",
         "Messages: j/k or arrows move; PageUp/PageDown page; G/g newest/oldest.",
-        "On the selected message: r react (Enter sends +), u unreact, d delete.",
+        "On the selected message: r react (Enter sends +), u unreact, d delete, R reply.",
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
         "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
         "User search: type + Enter searches; Enter opens a card; c chat; a add to open chat.",
@@ -653,7 +653,7 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "/refresh   /diagnostics   /account <npub-or-hex>   /create-identity",
         "/login <nsec-or-npub>   /daemon status|start|stop   /users [query]",
         "/chat new|rename|describe|archive|unarchive|archived",
-        "/members add|remove|list   /react [emoji]   /unreact   /delete   /retry <id>",
+        "/members add|remove|list   /react [emoji]   /unreact   /delete   /reply <text>   /retry <id>",
         "/keys fetch|rotate   /profile name <display-name>   /quit",
     ]
     .iter()
@@ -1511,7 +1511,9 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
             Focus::Chats => {
                 "j/k move  Enter open  g detail  s search  p profile  h relays  I invites  A accounts  ? help"
             }
-            Focus::Messages => "j/k select  G/g ends  r react  u unreact  d delete  i compose",
+            Focus::Messages => {
+                "j/k select  G/g ends  r react  u unreact  d delete  R reply  i compose"
+            }
             Focus::Composer => "Enter send  Esc clear",
         },
     }
@@ -1552,6 +1554,12 @@ pub(crate) enum SlashCommand {
     Unreact,
     /// Delete the selected message (own messages only).
     Delete,
+    /// Reply to the selected message. The text is required; the target message
+    /// resolves at submit against the selected row (like react/delete). The `R`
+    /// accelerator prefills `/reply ` in the composer.
+    Reply {
+        text: String,
+    },
     /// Retry a failed outbound event by id. Not a selected-message accelerator:
     /// timeline rows carry no failed-send state to target from (see the README).
     Retry {
@@ -1693,6 +1701,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/delete",
         description: "delete the selected message (own messages only)",
+    },
+    SlashCommandSuggestion {
+        usage: "/reply <text>",
+        description: "reply to the selected message",
     },
     SlashCommandSuggestion {
         usage: "/retry <event-id>",
@@ -3077,6 +3089,28 @@ mod timeline {
             Span::raw(" ".repeat(indent)),
             Span::styled(label, timeline_muted_italic_style()),
         ])
+    }
+
+    /// The `R`-accelerator status line naming the reply target:
+    /// `replying to <name>: "<first 30 chars>"`. Mirrors `timeline_reply_line`'s
+    /// clip and terminal-control stripping; the author falls back to a shortened
+    /// sender id when the row carries no display name.
+    pub(crate) fn reply_target_status(row: &TimelineRow) -> String {
+        let name = match row.from_display_name.as_deref() {
+            Some(name) if !name.is_empty() => terminal_safe_text(name),
+            _ => terminal_safe_text(&shorten(&row.from, 12)),
+        };
+        let body = if row.deleted {
+            "message deleted".to_owned()
+        } else {
+            terminal_safe_text(&row.display_text)
+        };
+        let clipped = body.chars().take(30).collect::<String>();
+        if body.chars().count() > 30 {
+            format!("replying to {name}: \"{clipped}...\"")
+        } else {
+            format!("replying to {name}: \"{clipped}\"")
+        }
     }
 
     /// The reactions line rendered below a message: yellow `<emoji> <count>` pairs

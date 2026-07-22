@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: `R` on the selected message replies to it. It prefills `/reply ` in the composer (draft-protected like the `r`
+  and `d` accelerators) and names the reply target on the status line; you type the reply and `Enter` sends it. Also
+  available as the `/reply <text>` slash command. The target resolves at submit against the selected row (a clear
+  status-line error when nothing is selected), the send runs `messages send --group <loaded-group> --reply-to
+  <selected-message-id> <text>` with `--reply-to` before the text as the guard requires, and the sent reply upserts
+  optimistically without a list reload.
 - TUI: added three full-view screens reached from the chat list — user search (`s` or `/users [query]`), your own
   profile (`p`), and relay health (`h`) — each a one-shot load that returns to the main view on `Esc`. User search runs
   `users search` (default radius `0..2`) over the cached follow graph; its two-region screen types the query in query

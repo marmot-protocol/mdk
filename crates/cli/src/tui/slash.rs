@@ -60,6 +60,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
                 Err("/delete does not accept arguments".to_owned())
             }
         }
+        "reply" => parse_reply_command(rest),
         "retry" => parse_retry_command(rest),
         "image" => parse_image_command(rest),
         "keys" => parse_keys_command(rest),
@@ -268,6 +269,18 @@ pub(crate) fn parse_react_command(args: Vec<String>) -> Result<SlashCommand, Str
         }),
         _ => Err("/react expects an optional single emoji".to_owned()),
     }
+}
+
+/// `/reply <text>`: reply to the selected message. The text is required and joins
+/// the remaining words; the target message resolves at submit against the
+/// selected row. The `R` accelerator prefills `/reply ` in the composer.
+pub(crate) fn parse_reply_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    if args.is_empty() {
+        return Err("/reply requires message text".to_owned());
+    }
+    Ok(SlashCommand::Reply {
+        text: args.join(" "),
+    })
 }
 
 /// `/retry <event-id>`: retries a failed outbound event by id (not the selected

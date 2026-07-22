@@ -186,6 +186,22 @@ pub(crate) fn media_upload_send_args(
     args
 }
 
+/// Build the argv for a reply send: `messages send --group <g> --reply-to <id>
+/// <text>`. The `--reply-to` flag must precede the trailing text; a `--reply-to`
+/// placed after the text is swallowed as literal message text and rejected by
+/// the CLI send guard (`reply_to_after_message_text`).
+pub(crate) fn reply_send_args(group_id: &str, reply_to: &str, text: &str) -> Vec<String> {
+    vec![
+        "messages".to_owned(),
+        "send".to_owned(),
+        "--group".to_owned(),
+        group_id.to_owned(),
+        "--reply-to".to_owned(),
+        reply_to.to_owned(),
+        text.to_owned(),
+    ]
+}
+
 pub(crate) fn spawn_subscription_reader(
     child: &mut Child,
     label: &'static str,
@@ -260,6 +276,58 @@ impl TuiApp {
                 deleted: false,
                 reactions: Vec::new(),
                 reply: None,
+                attachments: Vec::new(),
+            };
+            if let TimelineFoldOutcome::Inserted(index) =
+                apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
+            {
+                self.timeline_scroll.on_insert(index, self.timeline.len());
+            }
+        } else {
+            self.refresh_messages()?;
+        }
+        self.status = status;
+        Ok(())
+    }
+
+    /// Send the composer text as a reply to the selected message
+    /// (`messages send --group <g> --reply-to <id> <text>`). The `--reply-to`
+    /// flag goes before the trailing text: the CLI send guard treats a
+    /// `--reply-to` that lands after the text as literal message text and rejects
+    /// it (`reply_to_after_message_text`). The target resolves here, at submit,
+    /// with the same clear error the other interactions use when nothing is
+    /// selected. No list refetch: mirrors `send_message`'s optimistic row, which
+    /// the timeline projection upserts over by id once the reply lands.
+    pub(crate) fn send_reply(&mut self, text: String) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let reply_to = self.selected_timeline_message_id()?;
+        let args = reply_send_args(&group_id, &reply_to, &text);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = self.client.run_json(Some(&account_id), &arg_refs)?;
+        let status = publish_status("sent reply", &result);
+        if let Some(message_id) = result
+            .get("message_ids")
+            .and_then(Value::as_array)
+            .and_then(|ids| ids.first())
+            .and_then(Value::as_str)
+        {
+            let now = unix_now_seconds();
+            let row = TimelineRow {
+                message_id: message_id.to_owned(),
+                direction: "sent".to_owned(),
+                from: account_id,
+                from_display_name: None,
+                plaintext: text.clone(),
+                display_text: text,
+                timeline_at: now,
+                received_at: now,
+                deleted: false,
+                reactions: Vec::new(),
+                reply: Some(TimelineReply {
+                    reply_to_message_id: reply_to,
+                    preview: None,
+                }),
                 attachments: Vec::new(),
             };
             if let TimelineFoldOutcome::Inserted(index) =

@@ -4776,7 +4776,7 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Messages, true),
-        "j/k select  G/g ends  r react  u unreact  d delete  i compose"
+        "j/k select  G/g ends  r react  u unreact  d delete  R reply  i compose"
     );
     assert_eq!(
         hints_line(Screen::GroupDetail, Focus::Chats, true),
@@ -6251,6 +6251,136 @@ fn messages_d_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
         app.status.contains("draft"),
         "the status line explains why r/d was suppressed, got {}",
         app.status
+    );
+}
+
+#[test]
+fn slash_command_parser_handles_reply() {
+    assert_eq!(
+        parse_slash_command("/reply hello there"),
+        Ok(SlashCommand::Reply {
+            text: "hello there".to_owned()
+        }),
+        "/reply joins the trailing words into the reply text"
+    );
+    assert_eq!(
+        parse_slash_command("/reply \"quoted body\""),
+        Ok(SlashCommand::Reply {
+            text: "quoted body".to_owned()
+        })
+    );
+    assert!(
+        parse_slash_command("/reply").is_err(),
+        "a bare /reply has no text to send"
+    );
+}
+
+#[test]
+fn reply_send_args_places_reply_to_flag_before_text() {
+    // The CLI send guard treats a `--reply-to` after the text as literal message
+    // text and rejects it, so the flag must precede the trailing text.
+    let args = reply_send_args("group-hex", "parent-id", "the reply body");
+    assert_eq!(
+        args,
+        vec![
+            "messages".to_owned(),
+            "send".to_owned(),
+            "--group".to_owned(),
+            "group-hex".to_owned(),
+            "--reply-to".to_owned(),
+            "parent-id".to_owned(),
+            "the reply body".to_owned(),
+        ]
+    );
+    let flag = args
+        .iter()
+        .position(|arg| arg == "--reply-to")
+        .expect("flag");
+    let text = args
+        .iter()
+        .position(|arg| arg == "the reply body")
+        .expect("text");
+    assert!(flag < text, "--reply-to must come before the trailing text");
+}
+
+#[test]
+fn messages_r_capital_prefills_reply_and_names_the_target_on_the_status_line() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Alice".to_owned());
+    row.display_text = "hello world".to_owned();
+    app.timeline = vec![row];
+
+    app.handle_key(char_key('R')).expect("R");
+
+    assert_eq!(app.focus, Focus::Composer, "R focuses the composer");
+    assert_eq!(
+        app.input.value(),
+        "/reply ",
+        "R prefills the reply command so typing then Enter sends"
+    );
+    assert_eq!(
+        app.status, "replying to Alice: \"hello world\"",
+        "R names the reply target on the status line"
+    );
+}
+
+#[test]
+fn messages_r_capital_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.input.set_value("half-written draft");
+    app.timeline = vec![timeline_row("m0", 0)];
+
+    app.handle_key(char_key('R')).expect("R");
+
+    assert_eq!(
+        app.input.value(),
+        "half-written draft",
+        "R must not clobber an existing composer draft"
+    );
+    assert!(
+        app.status.contains("draft"),
+        "the status line explains why R was suppressed, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn reply_without_a_selected_message_errors_at_submit() {
+    // The target resolves at submit; an empty pane surfaces the same clear error
+    // the other interactions use, before any subprocess runs.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+
+    let error = app
+        .send_reply("no target".to_owned())
+        .expect_err("a reply with nothing selected is rejected");
+    assert!(
+        matches!(error, TuiError::Cli(message) if message.contains("no message selected")),
+        "expected a no-message-selected error"
+    );
+}
+
+#[test]
+fn reply_target_status_clips_long_text_and_strips_terminal_controls() {
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Bob".to_owned());
+    row.display_text = "0123456789012345678901234567890123".to_owned();
+    assert_eq!(
+        reply_target_status(&row),
+        "replying to Bob: \"012345678901234567890123456789...\"",
+        "the preview clips at 30 chars with an ellipsis"
+    );
+
+    row.from_display_name = Some("a\u{1b}\u{7}\u{202e}b".to_owned());
+    row.display_text = "safe".to_owned();
+    assert_eq!(
+        reply_target_status(&row),
+        "replying to ab: \"safe\"",
+        "terminal control sequences are stripped from the target preview"
     );
 }
 
