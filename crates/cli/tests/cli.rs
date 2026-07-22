@@ -1095,32 +1095,6 @@ fn run_json_until_success(home: &std::path::Path, args: &[&str], timeout: Durati
     );
 }
 
-fn poll_json_until(
-    home: &std::path::Path,
-    args: &[&str],
-    timeout: Duration,
-    predicate: impl Fn(&Value) -> bool,
-) -> Value {
-    let deadline = Instant::now() + timeout;
-    let mut last_value = None;
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        match try_run_json(home, args) {
-            Ok(value) if predicate(&value) => return value,
-            Ok(value) => last_value = Some(value),
-            Err(error) => last_error = Some(error),
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!(
-        "wn did not reach expected JSON state\nlast_value={}\nlast_error={}",
-        last_value
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "<none>".to_owned()),
-        last_error.as_deref().unwrap_or("<none>")
-    );
-}
-
 fn poll_json_without_relay_until(
     home: &std::path::Path,
     args: &[&str],
@@ -3318,6 +3292,22 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         .expect("wnd should start");
     wait_for_daemon(&socket);
 
+    let subscription = spawn_json_subscription(
+        home.path(),
+        &[
+            "--account",
+            &bob,
+            "messages",
+            "subscribe",
+            group_id,
+            "--limit",
+            "20",
+        ],
+    );
+    subscription.wait_for(Duration::from_secs(20), |line| {
+        line["result"]["trigger"] == "SubscriptionReady" && line["result"]["group_id"] == group_id
+    });
+
     let watch = run_json(
         home.path(),
         &[
@@ -3364,18 +3354,18 @@ fn daemon_background_stream_watch_records_brokered_preview() {
         Duration::from_secs(5),
     );
 
-    let status = poll_json_until(
-        home.path(),
-        &["daemon", "status"],
-        Duration::from_secs(60),
-        |status| {
-            status
-                .get("stream_watches")
-                .and_then(Value::as_array)
-                .and_then(|watches| watches.iter().find(|watch| watch["watch_id"] == watch_id))
-                .is_some_and(|watch| watch["status"] == "completed")
-        },
+    let completed = subscription.wait_for(Duration::from_secs(20), |line| {
+        line["result"]["trigger"] == "StreamPreviewCompleted"
+            && line["result"]["stream_preview"]["watch_id"] == watch_id
+    });
+    assert_eq!(
+        completed["result"]["stream_preview"]["text"],
+        "daemon preview text"
     );
+
+    // The completion update is published only after the watch report has been
+    // finalized, so status must expose it immediately without a polling race.
+    let status = run_json(home.path(), &["daemon", "status"]);
     let stream_watch = status["stream_watches"]
         .as_array()
         .and_then(|watches| watches.iter().find(|watch| watch["watch_id"] == watch_id))
@@ -3385,6 +3375,7 @@ fn daemon_background_stream_watch_records_brokered_preview() {
     assert_eq!(stream_watch["text"], "daemon preview text");
     assert_eq!(stream_watch["transcript_hash"], sent["transcript_hash"]);
 
+    drop(subscription);
     stop_daemon(&socket, &mut child);
 }
 
