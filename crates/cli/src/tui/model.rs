@@ -305,6 +305,10 @@ pub(crate) enum Popup {
     },
     /// Dismiss-on-any-key card: help, info, and error surfaces. Any key closes it.
     Card { title: String, body: Vec<String> },
+    /// Full-size inline-image viewer (the `o` key). Any key closes it. Holds only
+    /// the plaintext hash keying the decoded protocol in `MediaState`; the pixels
+    /// live on the app, not in this pure enum.
+    Image { title: String, hash: String },
 }
 
 /// What a text-entry popup does on submit. The per-purpose design keeps the
@@ -469,7 +473,8 @@ impl Popup {
             Popup::Text { title, .. }
             | Popup::Confirm { title, .. }
             | Popup::Picker { title, .. }
-            | Popup::Card { title, .. } => title,
+            | Popup::Card { title, .. }
+            | Popup::Image { title, .. } => title,
         }
     }
 }
@@ -479,8 +484,9 @@ impl Popup {
 /// capture-all-keys and submit/cancel flows are reducer-tested without a process.
 pub(crate) fn popup_key(popup: &mut Popup, key: KeyCode) -> PopupAction {
     match popup {
-        // Any key dismisses a card. This is what makes `q` under help safe.
-        Popup::Card { .. } => PopupAction::Dismiss,
+        // Any key dismisses a card or the image viewer. This is what makes `q`
+        // under help safe.
+        Popup::Card { .. } | Popup::Image { .. } => PopupAction::Dismiss,
         Popup::Text { purpose, input, .. } => match key {
             KeyCode::Enter => {
                 let value = input.value().trim().to_owned();
@@ -626,7 +632,7 @@ pub(crate) fn popup_hint(popup: &Popup) -> &'static str {
             purpose: PickerPurpose::Invites,
             ..
         } => "[a] accept  [d] decline  [j/k] move  [Esc] close",
-        Popup::Card { .. } => "[any key] dismiss",
+        Popup::Card { .. } | Popup::Image { .. } => "[any key] dismiss",
     }
 }
 
@@ -1951,7 +1957,10 @@ mod timeline {
     use ratatui::widgets::{Paragraph, Wrap};
     use serde_json::Value;
 
-    use super::super::{TIMELINE_MESSAGE_SEPARATOR_ROWS, TUI_MESSAGE_SCROLLBACK_LIMIT};
+    use super::super::{
+        MEDIA_IMAGE_ROWS, TIMELINE_MESSAGE_SEPARATOR_ROWS, TUI_MESSAGE_SCROLLBACK_LIMIT,
+    };
+    use std::collections::HashMap;
 
     /// A row of the materialized message timeline (`messages timeline`), as folded by
     /// the runtime: reactions, reply preview, deletion tombstones, and structured
@@ -1996,12 +2005,117 @@ mod timeline {
         pub(crate) deleted: bool,
     }
 
-    /// A media attachment placeholder parsed from a row's `media.imeta` tags. Phase 1
-    /// keeps only the fields needed to render a placeholder; no download yet.
+    /// A media attachment parsed from a row's `media.imeta` tags: mime and
+    /// filename for the placeholder, plus the plaintext SHA-256 hash that keys
+    /// inbound-media download/decode state and is the argument `wn media download`
+    /// takes.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub(crate) struct TimelineAttachment {
         pub(crate) mime: Option<String>,
         pub(crate) filename: Option<String>,
+        /// Plaintext SHA-256 hex (`imeta` `plaintext_sha256`). `None` when the tag
+        /// carried none, in which case the attachment cannot be downloaded.
+        pub(crate) plaintext_hash: Option<String>,
+    }
+
+    impl TimelineAttachment {
+        /// Whether this attachment is an inline image (mime `image/*`).
+        pub(crate) fn is_image(&self) -> bool {
+            self.mime
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"))
+        }
+
+        /// The plaintext hash to download by, but only for images that carry one.
+        pub(crate) fn image_hash(&self) -> Option<&str> {
+            self.is_image().then_some(self.plaintext_hash.as_deref())?
+        }
+
+        /// The display name for a placeholder, sanitized, defaulting to `file`.
+        pub(crate) fn display_name(&self) -> String {
+            self.filename
+                .as_deref()
+                .map(terminal_safe_text)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "file".to_owned())
+        }
+    }
+
+    /// How an inbound image, keyed by plaintext hash, is progressing. Set by the
+    /// pure reducer in `media.rs`; the `Ready` transition also builds the terminal
+    /// protocol, so `Ready` implies a drawable protocol exists.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum MediaStatus {
+        Downloading,
+        Decoding,
+        Ready,
+        Failed(String),
+    }
+
+    /// A borrowed, `Copy` snapshot of media state for the pure layout functions:
+    /// per-hash statuses plus whether the terminal has an image protocol. The
+    /// `Default` (no statuses, unsupported) reproduces the pre-media placeholder
+    /// behavior, so callers that do not render images pass it and stay unchanged.
+    #[derive(Clone, Copy, Default)]
+    pub(crate) struct MediaView<'a> {
+        statuses: Option<&'a HashMap<String, MediaStatus>>,
+        supported: bool,
+    }
+
+    /// How one attachment lays out in the message pane.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum MediaSlot {
+        /// A reserved block of `rows` blank lines; the renderer draws the decoded
+        /// image over it.
+        Image { rows: u16 },
+        /// A single placeholder text line.
+        Placeholder(String),
+    }
+
+    impl<'a> MediaView<'a> {
+        /// Build a view over a live status map for a capability-detected terminal.
+        pub(crate) fn new(statuses: &'a HashMap<String, MediaStatus>, supported: bool) -> Self {
+            Self {
+                statuses: Some(statuses),
+                supported,
+            }
+        }
+
+        fn status(&self, hash: &str) -> Option<&MediaStatus> {
+            self.statuses.and_then(|statuses| statuses.get(hash))
+        }
+
+        /// Decide how an attachment lays out. The placeholder ladder mirrors
+        /// `tui.md`: `[img name]` before download and when the terminal has no
+        /// image protocol, `[downloading name...]`, `[loading name...]` while
+        /// decoding, `[name failed: err]` on error, and a reserved image block
+        /// once `Ready`.
+        pub(crate) fn slot(&self, attachment: &TimelineAttachment) -> MediaSlot {
+            let name = attachment.display_name();
+            if !attachment.is_image() {
+                return MediaSlot::Placeholder(format!("[file {name}]"));
+            }
+            let placeholder_img = || MediaSlot::Placeholder(format!("[img {name}]"));
+            let Some(hash) = attachment.image_hash().filter(|_| self.supported) else {
+                return placeholder_img();
+            };
+            match self.status(hash) {
+                Some(MediaStatus::Ready) => MediaSlot::Image {
+                    rows: MEDIA_IMAGE_ROWS,
+                },
+                Some(MediaStatus::Downloading) => {
+                    MediaSlot::Placeholder(format!("[downloading {name}...]"))
+                }
+                Some(MediaStatus::Decoding) => {
+                    MediaSlot::Placeholder(format!("[loading {name}...]"))
+                }
+                Some(MediaStatus::Failed(error)) => MediaSlot::Placeholder(format!(
+                    "[{name} failed: {}]",
+                    terminal_safe_text(error)
+                )),
+                None => placeholder_img(),
+            }
+        }
     }
 
     /// Parse a materialized timeline row. Returns `None` for rows the pane does not
@@ -2105,25 +2219,52 @@ mod timeline {
             .unwrap_or_default()
     }
 
-    /// Parse one `imeta` tag (an array of space-delimited `key value` strings) into a
-    /// placeholder attachment, reading only `m` (mime) and `filename` for Phase 1.
+    /// Parse one `imeta` tag (an array of space-delimited `key value` strings)
+    /// into an attachment, reading `m` (mime), `filename`, and `plaintext_sha256`
+    /// (the download key). Other fields (locators, ciphertext hash, nonce) are
+    /// resolved server-side by `wn media download` and not needed here.
     fn parse_timeline_attachment(entry: &Value) -> Option<TimelineAttachment> {
         let fields = entry.as_array()?;
         let mut mime = None;
         let mut filename = None;
+        let mut plaintext_hash = None;
         for field in fields.iter().filter_map(Value::as_str) {
             match field.split_once(' ') {
                 Some(("m", value)) => mime = non_empty_string(value),
                 Some(("filename", value)) => filename = non_empty_string(value),
+                Some(("plaintext_sha256", value)) => plaintext_hash = valid_plaintext_hash(value),
                 _ => {}
             }
         }
-        (mime.is_some() || filename.is_some()).then_some(TimelineAttachment { mime, filename })
+        (mime.is_some() || filename.is_some()).then_some(TimelineAttachment {
+            mime,
+            filename,
+            plaintext_hash,
+        })
     }
 
     fn non_empty_string(value: &str) -> Option<String> {
         let value = value.trim();
         (!value.is_empty()).then(|| value.to_owned())
+    }
+
+    /// Accept an `imeta` `plaintext_sha256` only when it is exactly 64 lowercase
+    /// hex characters — the shape storage always emits (`hex::encode`). This is
+    /// the security boundary for inbound media: the hash is later joined into the
+    /// on-disk cache path and passed on the `wn media download` argv, so anything
+    /// path-like or otherwise attacker-shaped (traversal segments, separators,
+    /// wrong length, non-hex) must be rejected here. Uppercase hex is rejected
+    /// rather than normalized: storage never emits it, so its presence is
+    /// anomalous. A rejected hash leaves the attachment with `plaintext_hash:
+    /// None`, which renders as a plain placeholder and never downloads, so no
+    /// downstream code needs its own path validation.
+    fn valid_plaintext_hash(value: &str) -> Option<String> {
+        let value = value.trim();
+        let is_lower_hex = value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'));
+        is_lower_hex.then(|| value.to_owned())
     }
 
     /// A parsed `messages timeline subscribe` event. The caller filters
@@ -2590,10 +2731,39 @@ mod timeline {
     /// untrusted string passes through `terminal_safe_text`. Selection highlight is
     /// applied by the renderer; this returns only the content lines (the blank
     /// separator counted by `timeline_row_height` is added when rendering).
+    /// Convenience wrapper over `timeline_row_lines_media` with an empty media
+    /// view (all placeholders), used by the reducer tests; the live renderer
+    /// always passes a real view.
+    #[cfg(test)]
     pub(crate) fn timeline_row_lines(
         row: &TimelineRow,
         selected_account: Option<&AccountRow>,
     ) -> Vec<Line<'static>> {
+        timeline_row_lines_media(row, selected_account, MediaView::default())
+    }
+
+    /// As `timeline_row_lines`, but laying out attachments through `media`: a
+    /// ready image reserves a blank block the renderer draws over; everything
+    /// else is a placeholder text line. `timeline_row_lines` is this with an empty
+    /// view, so both share one implementation and never diverge.
+    pub(crate) fn timeline_row_lines_media(
+        row: &TimelineRow,
+        selected_account: Option<&AccountRow>,
+        media: MediaView,
+    ) -> Vec<Line<'static>> {
+        timeline_row_layout(row, selected_account, media).0
+    }
+
+    /// The row's rendered lines plus, for each ready image, the line index at
+    /// which its reserved blank block begins. Both `timeline_row_lines_media` and
+    /// `timeline_row_image_blocks` read this one layout, so a drawn image lands
+    /// exactly on its reserved blanks no matter where the image sits among the
+    /// row's attachments.
+    fn timeline_row_layout(
+        row: &TimelineRow,
+        selected_account: Option<&AccountRow>,
+        media: MediaView,
+    ) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
         let prefix = format!("[{}] ", local_hhmm(row.timeline_at));
         let author_prefix = format!("{}: ", terminal_safe_text(&timeline_author_label(row)));
         let indent = prefix.chars().count() + author_prefix.chars().count();
@@ -2616,7 +2786,7 @@ mod timeline {
                 Span::styled(author_prefix, author_style),
                 Span::styled("message deleted", timeline_muted_italic_style()),
             ]));
-            return lines;
+            return (lines, Vec::new());
         }
         for (index, part) in row.display_text.split('\n').enumerate() {
             let part = terminal_safe_text(part);
@@ -2636,21 +2806,52 @@ mod timeline {
         if !row.reactions.is_empty() {
             lines.push(timeline_reactions_line(&row.reactions, indent));
         }
+        let mut images = Vec::new();
         for attachment in &row.attachments {
-            lines.push(timeline_attachment_line(attachment, indent));
+            match media.slot(attachment) {
+                // A reserved block of blank lines; the renderer draws the decoded
+                // image over it. Blank lines never wrap, so the reserved height
+                // and the drawn height stay exact and in lockstep. Record where
+                // the block starts so the image is drawn on exactly these lines,
+                // wherever the image sits among the attachments.
+                MediaSlot::Image { rows } => {
+                    if let Some(hash) = attachment.image_hash() {
+                        images.push((hash.to_owned(), lines.len()));
+                    }
+                    for _ in 0..rows {
+                        lines.push(Line::from(""));
+                    }
+                }
+                MediaSlot::Placeholder(label) => {
+                    lines.push(timeline_attachment_line(&label, indent));
+                }
+            }
         }
-        lines
+        (lines, images)
     }
 
     /// The rendered height of a timeline row at `width`: the wrapped line count of
     /// its content plus the blank separator row. The separator makes a row's block
     /// height, so the visibility walk and the renderer stay in lockstep.
+    #[cfg(test)]
     pub(crate) fn timeline_row_height(
         row: &TimelineRow,
         selected_account: Option<&AccountRow>,
         width: u16,
     ) -> u16 {
-        let lines = timeline_row_lines(row, selected_account);
+        timeline_row_height_media(row, selected_account, width, MediaView::default())
+    }
+
+    /// As `timeline_row_height`, counting the reserved image block through
+    /// `media` so the visibility walk and the renderer agree once an image is
+    /// ready.
+    pub(crate) fn timeline_row_height_media(
+        row: &TimelineRow,
+        selected_account: Option<&AccountRow>,
+        width: u16,
+        media: MediaView,
+    ) -> u16 {
+        let lines = timeline_row_lines_media(row, selected_account, media);
         let content = if width == 0 {
             lines.len()
         } else {
@@ -2664,13 +2865,56 @@ mod timeline {
     }
 
     /// The rendered height of every row at `width`, for the visibility walk.
+    #[cfg(test)]
     pub(crate) fn timeline_row_heights(
         rows: &[TimelineRow],
         selected_account: Option<&AccountRow>,
         width: u16,
     ) -> Vec<u16> {
+        timeline_row_heights_media(rows, selected_account, width, MediaView::default())
+    }
+
+    /// As `timeline_row_heights`, media-aware for the live renderer.
+    pub(crate) fn timeline_row_heights_media(
+        rows: &[TimelineRow],
+        selected_account: Option<&AccountRow>,
+        width: u16,
+        media: MediaView,
+    ) -> Vec<u16> {
         rows.iter()
-            .map(|row| timeline_row_height(row, selected_account, width))
+            .map(|row| timeline_row_height_media(row, selected_account, width, media))
+            .collect()
+    }
+
+    /// The ready-image blocks in a row: `(hash, top_offset, rows)`, where
+    /// `top_offset` is rows below the top of the row's rendered block. Each
+    /// offset is the wrapped height of the lines above that image's reserved
+    /// block in the actual row layout, so the drawn image lands on its blanks
+    /// even when a placeholder (a file, or a not-yet-ready image) follows it.
+    pub(crate) fn timeline_row_image_blocks(
+        row: &TimelineRow,
+        selected_account: Option<&AccountRow>,
+        width: u16,
+        media: MediaView,
+    ) -> Vec<(String, u16, u16)> {
+        let (lines, images) = timeline_row_layout(row, selected_account, media);
+        images
+            .into_iter()
+            .map(|(hash, start)| {
+                // Wrapping is per-line, so the wrapped height of the lines above
+                // the block is exactly the block's top row.
+                let offset = if width == 0 {
+                    u16::try_from(start).unwrap_or(u16::MAX)
+                } else {
+                    u16::try_from(
+                        Paragraph::new(lines[..start].to_vec())
+                            .wrap(Wrap { trim: false })
+                            .line_count(width),
+                    )
+                    .unwrap_or(u16::MAX)
+                };
+                (hash, offset, MEDIA_IMAGE_ROWS)
+            })
             .collect()
     }
 
@@ -2851,25 +3095,12 @@ mod timeline {
 
     /// A placeholder line for a media attachment: `[img name]` for images,
     /// `[file name]` otherwise. Phase 1 renders no inline media.
-    fn timeline_attachment_line(attachment: &TimelineAttachment, indent: usize) -> Line<'static> {
-        let name = attachment
-            .filename
-            .as_deref()
-            .map(terminal_safe_text)
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "file".to_owned());
-        let label = if attachment
-            .mime
-            .as_deref()
-            .is_some_and(|mime| mime.starts_with("image/"))
-        {
-            format!("[img {name}]")
-        } else {
-            format!("[file {name}]")
-        };
+    /// An attachment placeholder line: an indented, muted `[...]` label already
+    /// chosen by `MediaView::slot`.
+    fn timeline_attachment_line(label: &str, indent: usize) -> Line<'static> {
         Line::from(vec![
             Span::raw(" ".repeat(indent)),
-            Span::styled(label, Style::default().fg(Color::DarkGray)),
+            Span::styled(label.to_owned(), Style::default().fg(Color::DarkGray)),
         ])
     }
 }

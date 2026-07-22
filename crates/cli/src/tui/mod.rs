@@ -23,12 +23,14 @@ use crate::{Cli, CliOutput, SecretStoreKind};
 
 mod app;
 mod client;
+mod media;
 mod model;
 mod slash;
 mod view;
 
 pub(crate) use app::*;
 pub(crate) use client::*;
+pub(crate) use media::*;
 pub(crate) use model::*;
 pub(crate) use slash::*;
 pub(crate) use view::*;
@@ -46,6 +48,15 @@ const TUI_TIMELINE_PAGE_SIZE: usize = 100;
 /// Blank rows rendered below each timeline message as a separator; counted in a
 /// row's rendered height so the visibility walk and the renderer agree.
 const TIMELINE_MESSAGE_SEPARATOR_ROWS: u16 = 1;
+/// Rows reserved for a decoded inline image at its message's position; the
+/// renderer draws the aspect-fit image over this block. Counted in the row's
+/// height so the scroll model stays in lockstep.
+const MEDIA_IMAGE_ROWS: u16 = 8;
+/// The most inbound-media downloads allowed to run at once. Each spawns a
+/// subprocess and a worker thread, so an unbounded fan-out (a screen full of
+/// images) would spike process/thread pressure. The remainder stay untracked
+/// and are slotted on later ticks as running downloads complete.
+const MEDIA_MAX_IN_FLIGHT: usize = 3;
 const TUI_LIVE_STREAM_PREVIEW_LIMIT: usize = 128;
 /// Cap on the notification-key dedup set. Dedup only needs to cover the recent
 /// event window (the runtime feed emits duplicates close together), so the set

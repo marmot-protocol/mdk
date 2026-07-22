@@ -2,6 +2,8 @@
 
 use super::*;
 
+use ratatui_image::StatefulImage;
+
 pub(crate) fn daemon_status_sentence(daemon: &DaemonView) -> String {
     if !daemon.running {
         return "daemon not running".to_owned();
@@ -500,10 +502,52 @@ impl TuiApp {
         }
         // A popup overlays whatever screen is showing. Cloned so the immutable
         // popup render can run inside this `&mut self` method without holding a
-        // borrow of `self.popup`.
+        // borrow of `self.popup`. The image viewer needs `&mut self` for its
+        // protocol, so it renders through a dedicated method.
         if let Some(popup) = self.popup.clone() {
-            self.render_popup(frame, &popup, frame.area());
+            if let Popup::Image { title, hash } = &popup {
+                self.render_image_popup(frame, title, hash);
+            } else {
+                self.render_popup(frame, &popup, frame.area());
+            }
         }
+    }
+
+    /// Render the full-size image viewer popup: a centered card with a cyan
+    /// border, the decoded image aspect-fit inside, and a dismiss hint. Falls
+    /// back to a text card if the protocol is somehow gone.
+    fn render_image_popup(&mut self, frame: &mut Frame, title: &str, hash: &str) {
+        let rect = centered_rect(80, 80, frame.area());
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(terminal_safe_text(title));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        // Reserve the bottom row for the dismiss hint; the image fills the rest.
+        let image_area = Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        let hint_area = Rect {
+            y: inner.y + inner.height.saturating_sub(1),
+            height: 1,
+            ..inner
+        };
+        if let Some(protocol) = self.media.protocol_mut(hash) {
+            frame.render_stateful_widget(StatefulImage::new(), image_area, protocol);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[any key] dismiss",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            hint_area,
+        );
     }
 
     fn render_main(&mut self, frame: &mut Frame) {
@@ -763,9 +807,16 @@ impl TuiApp {
         };
 
         let selected_account = self.message_account_row();
-        let heights = timeline_row_heights(&self.timeline, selected_account, inner_width);
+        let media = self.media.view();
+        let heights =
+            timeline_row_heights_media(&self.timeline, selected_account, inner_width, media);
         let total = self.timeline.len();
         let selected = self.timeline_scroll.resolved_selection(total);
+
+        // Ready images to draw over their reserved blocks, collected as owned
+        // `(hash, rect)` so the immutable `self` borrows (media view, account) end
+        // before the `&mut self.media` render pass below.
+        let mut image_draws: Vec<(String, Rect)> = Vec::new();
 
         // One algorithm decides both the reported visible range and what is drawn,
         // so the follow-scroll feedback and the rendered rows never diverge.
@@ -777,14 +828,47 @@ impl TuiApp {
         ) {
             Some((first, last)) => {
                 let mut lines = Vec::new();
+                // Rows below the pane's top edge, tracking each row's block start so
+                // reserved image blocks can be turned into absolute rects.
+                let mut cursor_y: u16 = 0;
+                // `index` addresses three parallel collections (the timeline rows,
+                // their heights, and the selection), so a range loop reads clearer
+                // than zipping them.
+                #[allow(clippy::needless_range_loop)]
                 for index in first..=last {
-                    let mut row_lines = timeline_row_lines(&self.timeline[index], selected_account);
+                    let mut row_lines =
+                        timeline_row_lines_media(&self.timeline[index], selected_account, media);
                     if selected == Some(index) {
                         row_lines = highlight_timeline_lines(row_lines);
                     }
                     lines.extend(row_lines);
                     // Blank separator row, counted in each row's rendered height.
                     lines.push(Line::from(""));
+
+                    for (hash, offset, rows) in timeline_row_image_blocks(
+                        &self.timeline[index],
+                        selected_account,
+                        inner_width,
+                        media,
+                    ) {
+                        let rect = Rect {
+                            x: area.x + 1,
+                            y: area.y + 1 + cursor_y + offset,
+                            width: inner_width,
+                            height: rows,
+                        };
+                        let inner = Rect {
+                            x: area.x + 1,
+                            y: area.y + 1,
+                            width: inner_width,
+                            height: inner_height,
+                        };
+                        let clipped = rect.intersection(inner);
+                        if clipped.height > 0 && clipped.width > 0 {
+                            image_draws.push((hash, clipped));
+                        }
+                    }
+                    cursor_y = cursor_y.saturating_add(heights[index]);
                 }
                 (
                     timeline_pane_title(total, first, last),
@@ -812,6 +896,14 @@ impl TuiApp {
                 .wrap(Wrap { trim: false }),
             area,
         );
+
+        // Draw each ready image over its reserved block. The blank lines above
+        // gave it the space; `StatefulImage` aspect-fits within the rect.
+        for (hash, rect) in image_draws {
+            if let Some(protocol) = self.media.protocol_mut(&hash) {
+                frame.render_stateful_widget(StatefulImage::new(), rect, protocol);
+            }
+        }
     }
 
     pub(crate) fn render_composer(&self, frame: &mut Frame, area: Rect) {
@@ -879,6 +971,8 @@ impl TuiApp {
                     lines.push(line);
                 }
             }
+            // Rendered by `render_image_popup`, not here; `render` routes it away.
+            Popup::Image { .. } => {}
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(

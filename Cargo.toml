@@ -59,6 +59,11 @@ clap = { version = "4.6", features = ["derive"] }
 # unstable-rendered-line-info exposes Paragraph::line_count for wrap-aware TUI scroll math.
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
+# Inbound-media rendering in the TUI. `default-features = false` is load-bearing:
+# ratatui-image's defaults pull `chafa-dyn`, which needs the system libchafa C
+# library and would break CI and packaging (dependency verdict in tui.md).
+ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # General-category lookups for the terminal untrusted-text sanitizer (drop the
 # whole Cf format class instead of a drifting hardcoded denylist).
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }

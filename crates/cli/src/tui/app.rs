@@ -83,6 +83,9 @@ pub(crate) struct TuiApp {
     /// Relay-health screen state (Phase 5b). Present only while
     /// `screen == Screen::RelayHealth`.
     pub(crate) relay_health: Option<RelayHealthView>,
+    /// Inbound-media state (Phase 6): terminal image capability, per-hash
+    /// download/decode status, and the decoded protocols the renderer draws.
+    pub(crate) media: MediaState,
 }
 
 impl TuiApp {
@@ -125,11 +128,16 @@ impl TuiApp {
             user_search: None,
             profile_view: None,
             relay_health: None,
+            media: MediaState::new(),
         })
     }
 
     pub(crate) fn run(&mut self) -> TuiResult<()> {
         let mut terminal = ratatui::init();
+        // Detect the terminal's image capability once, now that raw mode is on and
+        // before the event loop starts reading stdin. Detection failure leaves
+        // media placeholders in place (no image protocol).
+        self.media.detect_capability();
         // Bracketed paste delivers a paste as one `Event::Paste(text)` instead of a
         // burst of key events, so a multi-line paste keeps its newlines instead of
         // firing Enter (send) on every line. Best-effort chrome: ignore failures
@@ -231,6 +239,11 @@ impl TuiApp {
         changed |= self.drain_message_subscription();
         changed |= self.drain_timeline_subscription();
         changed |= self.drain_notification_subscription();
+        // Fold completed media downloads/decodes in, then start downloads for any
+        // newly-visible image the terminal can render. Both are off-loop: the
+        // subprocess and decode run on worker threads; this only folds results.
+        changed |= self.media.drain();
+        changed |= self.ensure_media_downloads();
         // Debounce: notification drains coalesce every NewMessage for a
         // non-loaded chat since the last tick into this one pending flag, so at
         // most one background `chats list` re-read runs per tick. Cleared before
@@ -452,6 +465,10 @@ impl TuiApp {
             KeyCode::Char('d') if self.focus == Focus::Messages => {
                 self.prefill_composer("/delete");
             }
+            // Open the selected message's downloaded image full-size.
+            KeyCode::Char('o') if self.focus == Focus::Messages => {
+                self.open_selected_image_viewer();
+            }
             // Chat list navigation.
             KeyCode::Up | KeyCode::Char('k') if self.focus != Focus::Composer => {
                 self.move_selection(-1);
@@ -480,6 +497,107 @@ impl TuiApp {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Start a background download+decode for every image in the loaded timeline
+    /// that the terminal can render and has not been requested yet. Idempotent:
+    /// once a hash is tracked it is skipped, so this is safe to call every tick.
+    /// The subprocess and decode run off-loop in `spawn_media_download`.
+    pub(crate) fn ensure_media_downloads(&mut self) -> bool {
+        if !self.media.supported() {
+            return false;
+        }
+        let (Some(account_id), Some(group_id)) = (
+            self.messages_account_id.clone(),
+            self.messages_group_id.clone(),
+        ) else {
+            return false;
+        };
+        let candidates: Vec<String> = self
+            .timeline
+            .iter()
+            .flat_map(|row| row.attachments.iter())
+            .filter_map(TimelineAttachment::image_hash)
+            .filter(|hash| !self.media.is_tracked(hash))
+            .map(str::to_owned)
+            .collect();
+        // Cap concurrent downloads: `downloads_to_start` returns at most the free
+        // in-flight slots (and dedups a hash that appears twice), so a timeline
+        // full of images does not spawn a subprocess and thread for each at once.
+        // The unstarted remainder is picked up on later ticks as workers finish.
+        let mut started = false;
+        for hash in self.media.downloads_to_start(&candidates) {
+            let output_path = match self.media_cache_path(&hash) {
+                Ok(path) => path,
+                Err(err) => {
+                    self.set_drain_status(format!("media cache: {err}"));
+                    continue;
+                }
+            };
+            let args = [
+                "media".to_owned(),
+                "download".to_owned(),
+                group_id.clone(),
+                hash.clone(),
+                "--output".to_owned(),
+                output_path.to_string_lossy().into_owned(),
+            ];
+            let command = self.client.command(Some(&account_id), &args);
+            let tx = self.media.begin_download(hash.clone());
+            spawn_media_download(command, output_path, hash, tx);
+            started = true;
+        }
+        started
+    }
+
+    /// The per-hash cache path for a decrypted download, under the TUI home when
+    /// one is set (else a private temp dir). Passed as `--output` so the CLI does
+    /// not write the file's basename into the current directory. The directory is
+    /// created restrictive-by-construction; the CLI writes the file privately.
+    fn media_cache_path(&self, hash: &str) -> TuiResult<PathBuf> {
+        let cache_dir = self
+            .client
+            .home
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("tui-media-cache");
+        fs_private::create_dir_all_private(&cache_dir)?;
+        Ok(cache_dir.join(hash))
+    }
+
+    /// Open the selected message's downloaded image full-size, or explain on the
+    /// status line why it cannot (no capability, not downloaded, or no image).
+    fn open_selected_image_viewer(&mut self) {
+        let total = self.timeline.len();
+        let Some(index) = self.timeline_scroll.resolved_selection(total) else {
+            self.status = "no message selected".to_owned();
+            return;
+        };
+        // Clone the row so the timeline borrow ends before the popup/status write.
+        let Some(row) = self.timeline.get(index).cloned() else {
+            return;
+        };
+        let ready = row.attachments.iter().find_map(|attachment| {
+            let hash = attachment.image_hash()?;
+            self.media
+                .is_ready(hash)
+                .then(|| (attachment.display_name(), hash.to_owned()))
+        });
+        match ready {
+            Some((name, hash)) => {
+                self.popup = Some(Popup::Image {
+                    title: format!("Image: {name}"),
+                    hash,
+                });
+            }
+            None if !self.media.supported() => {
+                self.status = "this terminal has no image protocol".to_owned();
+            }
+            None if row.attachments.iter().any(|a| a.image_hash().is_some()) => {
+                self.status = "image not downloaded yet".to_owned();
+            }
+            None => self.status = "no image on the selected message".to_owned(),
+        }
     }
 
     pub(crate) fn move_selection(&mut self, delta: isize) {

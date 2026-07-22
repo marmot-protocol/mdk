@@ -1707,6 +1707,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         user_search: None,
         profile_view: None,
         relay_health: None,
+        media: MediaState::new(),
     }
 }
 
@@ -2850,7 +2851,7 @@ fn parse_timeline_row_reads_media_imeta_mime_and_filename() {
                     "v encrypted-media-v1",
                     "locator blossom-v1 https://blossom.example/abc",
                     "ciphertext_sha256 deadbeef",
-                    "plaintext_sha256 cafebabe",
+                    "plaintext_sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "nonce 00112233",
                     "m image/png",
                     "filename pixel.png"
@@ -2872,13 +2873,56 @@ fn parse_timeline_row_reads_media_imeta_mime_and_filename() {
             TimelineAttachment {
                 mime: Some("image/png".to_owned()),
                 filename: Some("pixel.png".to_owned()),
+                plaintext_hash: Some("aa".repeat(32)),
             },
             TimelineAttachment {
                 mime: Some("application/pdf".to_owned()),
                 filename: Some("spec.pdf".to_owned()),
+                plaintext_hash: None,
             },
         ]
     );
+}
+
+/// A malicious member can put anything in the `imeta` `plaintext_sha256` field.
+/// The parse boundary is the only place that decides whether a hash is trusted:
+/// it must reject any value that is not exactly 64 lowercase hex characters,
+/// dropping the attachment to `plaintext_hash: None` (a plain placeholder that
+/// never downloads and never reaches the cache path or the `wn media download`
+/// argv). Storage always emits lowercase hex (`hex::encode`), so uppercase is
+/// not a legitimate hash and is rejected too, rather than normalized.
+#[test]
+fn parse_timeline_attachment_rejects_unsafe_plaintext_hash() {
+    let hostile = [
+        "../../../../etc/passwd", // path traversal
+        "aa/bb",                  // path separator, right length family
+        "nothex_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", // non-hex
+        "aaaa",                   // too short
+        &"aa".repeat(33),         // too long (66 chars)
+        &"AA".repeat(32),         // uppercase hex, correct length
+    ];
+    for value in hostile {
+        let row = serde_json::json!({
+            "message_id": "m",
+            "media": { "imeta": [["imeta", "m image/png", "filename x.png",
+                format!("plaintext_sha256 {value}")]] }
+        });
+        let attachment = &parse_timeline_row(&row).expect("row parses").attachments[0];
+        assert_eq!(
+            attachment.plaintext_hash, None,
+            "unsafe hash {value:?} must be rejected at the parse boundary"
+        );
+    }
+
+    // A genuine 64-char lowercase-hex hash is accepted unchanged.
+    let good = "0123456789abcdef".repeat(4);
+    let row = serde_json::json!({
+        "message_id": "m",
+        "media": { "imeta": [["imeta", "m image/png", "filename x.png",
+            format!("plaintext_sha256 {good}")]] }
+    });
+    let attachment = &parse_timeline_row(&row).expect("row parses").attachments[0];
+    assert_eq!(attachment.plaintext_hash, Some(good));
 }
 
 #[test]
@@ -3659,15 +3703,245 @@ fn timeline_row_lines_render_attachment_placeholders() {
         TimelineAttachment {
             mime: Some("image/png".to_owned()),
             filename: Some("pixel.png".to_owned()),
+            plaintext_hash: Some("cafebabe".to_owned()),
         },
         TimelineAttachment {
             mime: Some("application/pdf".to_owned()),
             filename: Some("spec.pdf".to_owned()),
+            plaintext_hash: None,
         },
     ];
+    // With an empty (unsupported) media view, an image with a hash still shows the
+    // `[img ...]` placeholder — capability detection has not enabled rendering.
     let lines = timeline_row_lines(&row, None);
     assert_eq!(line_text(&lines[1]).trim_start(), "[img pixel.png]");
     assert_eq!(line_text(&lines[2]).trim_start(), "[file spec.pdf]");
+}
+
+// ---- Phase 6: inbound media ----
+
+fn image_attachment(hash: &str) -> TimelineAttachment {
+    TimelineAttachment {
+        mime: Some("image/png".to_owned()),
+        filename: Some("pixel.png".to_owned()),
+        plaintext_hash: Some(hash.to_owned()),
+    }
+}
+
+/// A media state with an image-capable (halfblocks) picker and one decoded,
+/// ready image, built without a terminal or network via the test hooks.
+fn media_with_ready_image(hash: &str) -> MediaState {
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    // Larger than the halfblocks font cell (10x20) so it occupies cells, and
+    // vertically varied so the encoder emits half-block glyphs (a uniform image
+    // collapses each cell to a space).
+    let mut buffer = image::RgbImage::new(200, 160);
+    for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(x % 256) as u8, y.wrapping_mul(3) as u8, 200]);
+    }
+    media.apply_for_test(MediaLoad::Decoded {
+        hash: hash.to_owned(),
+        image: Box::new(image::DynamicImage::ImageRgb8(buffer)),
+    });
+    media
+}
+
+#[test]
+fn media_view_slot_walks_the_placeholder_ladder() {
+    let hash = "cafebabe";
+    let attachment = image_attachment(hash);
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[img pixel.png]".to_owned())
+    );
+    media.begin_download(hash.to_owned());
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[downloading pixel.png...]".to_owned())
+    );
+    media.apply_for_test(MediaLoad::Downloaded {
+        hash: hash.to_owned(),
+    });
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[loading pixel.png...]".to_owned())
+    );
+    media.apply_for_test(MediaLoad::Failed {
+        hash: hash.to_owned(),
+        error: "boom".to_owned(),
+    });
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[pixel.png failed: boom]".to_owned())
+    );
+}
+
+#[test]
+fn media_view_slot_ready_image_reserves_a_block() {
+    let media = media_with_ready_image("cafebabe");
+    assert!(media.is_ready("cafebabe"));
+    assert_eq!(
+        media.view().slot(&image_attachment("cafebabe")),
+        MediaSlot::Image { rows: 8 }
+    );
+}
+
+#[test]
+fn media_view_slot_without_capability_stays_placeholder() {
+    // No picker: an image never advances past `[img ...]`; no download is armed.
+    let media = MediaState::new();
+    assert!(!media.supported());
+    assert_eq!(
+        media.view().slot(&image_attachment("cafebabe")),
+        MediaSlot::Placeholder("[img pixel.png]".to_owned())
+    );
+}
+
+#[test]
+fn media_view_slot_non_image_is_a_file_placeholder() {
+    let attachment = TimelineAttachment {
+        mime: Some("application/pdf".to_owned()),
+        filename: Some("spec.pdf".to_owned()),
+        plaintext_hash: Some("cafebabe".to_owned()),
+    };
+    let media = media_with_ready_image("cafebabe");
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[file spec.pdf]".to_owned())
+    );
+}
+
+#[test]
+fn media_drain_folds_duplicate_decoded_events_idempotently() {
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    for _ in 0..2 {
+        media.apply_for_test(MediaLoad::Decoded {
+            hash: "cafebabe".to_owned(),
+            image: Box::new(image::DynamicImage::new_rgb8(2, 2)),
+        });
+    }
+    assert!(media.is_ready("cafebabe"));
+}
+
+#[test]
+fn media_downloads_are_capped_at_three_in_flight() {
+    // Ten images all want to download. The cap keeps at most three workers in
+    // flight; the rest are slotted as running downloads complete.
+    let hashes: Vec<String> = (0..10).map(|i| format!("hash{i}")).collect();
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+
+    for _ in 0..1000 {
+        for hash in media.downloads_to_start(&hashes) {
+            media.begin_download(hash);
+        }
+        assert!(
+            media.in_flight() <= 3,
+            "never more than three downloads run at once"
+        );
+        if hashes.iter().all(|hash| media.is_ready(hash)) {
+            break;
+        }
+        // A worker completes, freeing one in-flight slot for the next tick.
+        if let Some(hash) = hashes
+            .iter()
+            .find(|hash| media.is_tracked(hash) && !media.is_ready(hash))
+        {
+            media.apply_for_test(MediaLoad::Decoded {
+                hash: hash.clone(),
+                image: Box::new(image::DynamicImage::new_rgb8(2, 2)),
+            });
+        }
+    }
+
+    assert!(
+        hashes.iter().all(|hash| media.is_ready(hash)),
+        "all ten images are eventually tracked as completions arrive"
+    );
+}
+
+#[test]
+fn timeline_row_height_media_reserves_rows_for_a_ready_image() {
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+
+    let placeholder_height = timeline_row_height(&row, None, 80);
+    let media = media_with_ready_image("cafebabe");
+    let ready_height = timeline_row_height_media(&row, None, 80, media.view());
+
+    // A ready image reserves 8 rows where the placeholder used one line.
+    assert_eq!(ready_height, placeholder_height + 7);
+}
+
+#[test]
+fn timeline_row_image_blocks_locates_the_reserved_block() {
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    let media = media_with_ready_image("cafebabe");
+
+    let blocks = timeline_row_image_blocks(&row, None, 80, media.view());
+    assert_eq!(blocks.len(), 1);
+    let (hash, offset, rows) = &blocks[0];
+    assert_eq!(hash, "cafebabe");
+    // One content line above the block, so it starts at row 1 and reserves 8.
+    assert_eq!(*offset, 1);
+    assert_eq!(*rows, 8);
+}
+
+#[test]
+fn timeline_row_image_blocks_place_image_before_a_trailing_file_placeholder() {
+    // A ready image followed by a non-image attachment: the file placeholder
+    // renders *after* the image block, so it must not push the image's offset
+    // down. Deriving the offset from the row layout (not by subtracting from the
+    // bottom) keeps the drawn image on its reserved blanks.
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![
+        image_attachment("cafebabe"),
+        TimelineAttachment {
+            mime: Some("application/pdf".to_owned()),
+            filename: Some("spec.pdf".to_owned()),
+            plaintext_hash: None,
+        },
+    ];
+    let media = media_with_ready_image("cafebabe");
+
+    let blocks = timeline_row_image_blocks(&row, None, 80, media.view());
+    assert_eq!(blocks.len(), 1);
+    let (hash, offset, rows) = &blocks[0];
+    assert_eq!(hash, "cafebabe");
+    // One content line above the image; the trailing file placeholder sits below
+    // the block and must not shift it.
+    assert_eq!(*offset, 1);
+    assert_eq!(*rows, 8);
+}
+
+#[test]
+fn ready_image_renders_over_its_placeholder_in_the_message_pane() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+    app.media = media_with_ready_image("cafebabe");
+
+    let rendered = rendered_buffer(&mut app);
+    // The halfblocks protocol draws half-block glyphs, and the `[img ...]`
+    // placeholder is gone because the image filled its reserved block.
+    assert!(
+        rendered.contains('▀') || rendered.contains('▄'),
+        "expected halfblock image cells"
+    );
+    assert!(
+        !rendered.contains("pixel.png"),
+        "the placeholder should be replaced by the image"
+    );
 }
 
 #[test]

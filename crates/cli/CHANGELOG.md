@@ -75,6 +75,14 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
+  loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
+  decode, delivering the result over an `mpsc` channel drained on tick) and drawn inline via `ratatui-image` on
+  terminals with a graphics protocol (Kitty/iTerm2/Sixel; iTerm2 forced via `ITERM_SESSION_ID`). Placeholders walk
+  `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or `[name failed: err]`, and stay
+  `[img name]` where no image protocol exists. `o` opens the selected message's image full-size in a dismiss-on-any-key
+  viewer. Decrypted files cache under the TUI home in `tui-media-cache/`. No JSON response shapes changed (the
+  existing `media download --json` `output_path` is passed via `--output`).
 - TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
   `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
   accelerators `r` (prefills `/react `), `u` (removes your reaction immediately), and `d` (prefills `/delete`) drive
