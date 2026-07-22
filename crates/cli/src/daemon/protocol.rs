@@ -2,6 +2,9 @@
 
 use super::*;
 
+pub(crate) const DAEMON_SERVER_BUSY_CODE: &str = "server_busy";
+pub(crate) const DAEMON_SERVER_BUSY_MESSAGE: &str = "daemon connection capacity is busy";
+
 #[derive(Debug)]
 pub(crate) struct BoundedMessageSubscriptionIds {
     pub(crate) ids: HashSet<String>,
@@ -61,6 +64,8 @@ pub enum DaemonClientError {
     EmptyResponse,
     #[error("daemon request is {size} bytes, exceeding the {limit} byte limit")]
     RequestTooLarge { size: usize, limit: usize },
+    #[error("{DAEMON_SERVER_BUSY_MESSAGE}")]
+    ServerBusy,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -121,7 +126,13 @@ pub struct DaemonStreamResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DaemonStreamError {
+    #[serde(default = "default_daemon_stream_error_code")]
+    pub code: String,
     pub message: String,
+}
+
+fn default_daemon_stream_error_code() -> String {
+    "stream_error".to_owned()
 }
 
 impl DaemonStreamResponse {
@@ -134,9 +145,14 @@ impl DaemonStreamResponse {
     }
 
     pub(crate) fn err(message: impl Into<String>) -> Self {
+        Self::err_with_code("stream_error", message)
+    }
+
+    pub(crate) fn err_with_code(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             result: None,
             error: Some(DaemonStreamError {
+                code: code.into(),
                 message: message.into(),
             }),
             stream_end: false,
@@ -432,7 +448,19 @@ pub(crate) async fn send_request(
     if response.is_empty() {
         return Err(DaemonClientError::EmptyResponse);
     }
-    Ok(serde_json::from_slice(&response)?)
+    decode_daemon_output(&response)
+}
+
+pub(crate) fn decode_daemon_output(response: &[u8]) -> Result<CliOutput, DaemonClientError> {
+    let response: serde_json::Value = serde_json::from_slice(response)?;
+    if response
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        == Some(DAEMON_SERVER_BUSY_CODE)
+    {
+        return Err(DaemonClientError::ServerBusy);
+    }
+    Ok(serde_json::from_value(response)?)
 }
 
 pub(crate) async fn stream_request(

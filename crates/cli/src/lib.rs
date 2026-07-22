@@ -619,6 +619,9 @@ fn should_fallback_to_local_after_daemon_execute_error(
 fn daemon_execute_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
     match err {
         err @ daemon::DaemonClientError::Connect { .. } => daemon_client_error(json_output, err),
+        err @ daemon::DaemonClientError::ServerBusy => {
+            daemon_client_error_with_code(json_output, "server_busy", err)
+        }
         err => daemon_execute_state_unknown_error(json_output, err),
     }
 }
@@ -655,6 +658,14 @@ fn daemon_execute_state_unknown_error(
 }
 
 fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> CliOutput {
+    daemon_client_error_with_code(json_output, "daemon_unavailable", err)
+}
+
+fn daemon_client_error_with_code(
+    json_output: bool,
+    code: &str,
+    err: daemon::DaemonClientError,
+) -> CliOutput {
     if json_output {
         return CliOutput {
             code: 1,
@@ -663,7 +674,7 @@ fn daemon_client_error(json_output: bool, err: daemon::DaemonClientError) -> Cli
                 serde_json::to_string(&json!({
                     "ok": false,
                     "error": {
-                        "code": "daemon_unavailable",
+                        "code": code,
                         "message": err.to_string(),
                     }
                 }))

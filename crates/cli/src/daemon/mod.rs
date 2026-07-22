@@ -68,6 +68,10 @@ const DAEMON_SOCKET_MODE: u32 = 0o600;
 /// relative to real CLI/TUI use (a handful of subscriptions plus one-shot
 /// commands).
 const MAX_DAEMON_CONNECTIONS: usize = 256;
+/// Long-lived streaming requests have a separate ceiling so they cannot
+/// consume the global pool needed by status, shutdown, and one-shot commands.
+const MAX_DAEMON_SUBSCRIPTIONS: usize = 64;
+const DAEMON_BUSY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 
 type SharedDaemonWorkers = Arc<AsyncMutex<DaemonWorkers>>;
 
@@ -191,6 +195,7 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
     }
     let mut worker_tasks: Vec<JoinHandle<()>> = Vec::new();
     let connection_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_CONNECTIONS));
+    let subscription_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_SUBSCRIPTIONS));
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let shutdown_result = loop {
         worker_tasks.retain(|task| !task.is_finished());
@@ -212,12 +217,14 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                 // broker accept loops: beyond the cap the connection is closed
                 // instead of served.
                 let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
-                    // Dropped without a log line: the repo-wide direct-output
-                    // audit forbids println!/eprintln! in library sources and
-                    // the daemon library is intentionally log-free at runtime.
-                    // The refused client observes its connection close without
-                    // a response.
-                    drop(stream);
+                    // Return a protocol-level error that both one-shot and
+                    // streaming clients can decode. Bound this tiny rejection
+                    // write so a non-reading over-cap peer cannot wedge accept.
+                    let _ = tokio::time::timeout(
+                        DAEMON_BUSY_RESPONSE_TIMEOUT,
+                        write_daemon_server_busy(stream),
+                    )
+                    .await;
                     continue;
                 };
                 let defaults = defaults.clone();
@@ -225,9 +232,19 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
                 let events = events.clone();
                 let workers = workers.clone();
                 let shutdown_tx = shutdown_tx.clone();
+                let subscription_limiter = subscription_limiter.clone();
                 worker_tasks.push(tokio::spawn(async move {
                     let _permit = permit;
-                    handle_daemon_connection(stream, defaults, state, events, workers, shutdown_tx).await;
+                    handle_daemon_connection(
+                        stream,
+                        defaults,
+                        state,
+                        events,
+                        workers,
+                        shutdown_tx,
+                        subscription_limiter,
+                    )
+                    .await;
                 }));
             }
             _ = shutdown_rx.recv() => {
@@ -254,6 +271,7 @@ async fn handle_daemon_connection(
     events: DaemonEventHub,
     workers: SharedDaemonWorkers,
     shutdown_tx: mpsc::UnboundedSender<()>,
+    subscription_limiter: Arc<tokio::sync::Semaphore>,
 ) {
     if let Err(err) = authorize_daemon_peer(&stream) {
         write_daemon_output(
@@ -287,6 +305,19 @@ async fn handle_daemon_connection(
             return;
         }
     };
+
+    let _subscription_permit =
+        match try_acquire_daemon_subscription(&request, &subscription_limiter) {
+            Ok(permit) => permit,
+            Err(()) => {
+                let response = DaemonStreamResponse::err_with_code(
+                    DAEMON_SERVER_BUSY_CODE,
+                    DAEMON_SERVER_BUSY_MESSAGE,
+                );
+                let _ = write_stream_response(&mut stream, &response).await;
+                return;
+            }
+        };
 
     match request {
         DaemonRequest::Status => {
@@ -394,6 +425,51 @@ async fn handle_daemon_connection(
                 .await;
         }
     }
+}
+
+fn daemon_request_is_subscription(request: &DaemonRequest) -> bool {
+    matches!(
+        request,
+        DaemonRequest::MessagesSubscribe { .. }
+            | DaemonRequest::ChatsSubscribe { .. }
+            | DaemonRequest::GroupStateSubscribe { .. }
+            | DaemonRequest::NotificationsSubscribe { .. }
+    )
+}
+
+fn try_acquire_daemon_subscription(
+    request: &DaemonRequest,
+    limiter: &Arc<tokio::sync::Semaphore>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+    if !daemon_request_is_subscription(request) {
+        return Ok(None);
+    }
+    Arc::clone(limiter)
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| ())
+}
+
+fn daemon_server_busy_frame() -> Vec<u8> {
+    let mut frame = serde_json::to_vec(&serde_json::json!({
+        "code": 1,
+        "stdout": "",
+        "stderr": format!("error: {DAEMON_SERVER_BUSY_MESSAGE}\n"),
+        "result": null,
+        "error": {
+            "code": DAEMON_SERVER_BUSY_CODE,
+            "message": DAEMON_SERVER_BUSY_MESSAGE,
+        },
+        "stream_end": false,
+    }))
+    .expect("static daemon busy response serializes");
+    frame.push(b'\n');
+    frame
+}
+
+async fn write_daemon_server_busy(mut stream: UnixStream) {
+    let _ = stream.write_all(&daemon_server_busy_frame()).await;
+    let _ = stream.shutdown().await;
 }
 
 async fn daemon_status_output(

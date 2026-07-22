@@ -518,6 +518,56 @@ fn daemon_peer_authorization_rejects_mismatched_uid_value() {
     assert!(!daemon_peer_uid_authorized(other_uid, current_uid));
 }
 
+#[test]
+fn daemon_subscription_quota_reserves_capacity_for_one_shot_requests() {
+    let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let subscription = DaemonRequest::MessagesSubscribe {
+        cli: Box::new(daemon_test_cli(crate::Command::Whoami)),
+    };
+
+    let first = try_acquire_daemon_subscription(&subscription, &limiter)
+        .expect("first subscription should be admitted")
+        .expect("subscription should hold a permit");
+    assert!(
+        try_acquire_daemon_subscription(&subscription, &limiter).is_err(),
+        "a second subscription must hit the dedicated cap"
+    );
+    assert!(
+        try_acquire_daemon_subscription(&DaemonRequest::Status, &limiter)
+            .expect("one-shot requests bypass the subscription cap")
+            .is_none()
+    );
+
+    drop(first);
+    assert!(
+        try_acquire_daemon_subscription(&subscription, &limiter)
+            .expect("released subscription capacity should be reusable")
+            .is_some()
+    );
+}
+
+#[test]
+fn daemon_busy_frame_is_typed_for_one_shot_and_streaming_clients() {
+    let frame = daemon_server_busy_frame();
+
+    assert!(matches!(
+        decode_daemon_output(&frame),
+        Err(DaemonClientError::ServerBusy)
+    ));
+    let streaming: DaemonStreamResponse =
+        serde_json::from_slice(&frame).expect("busy frame should decode for stream clients");
+    let error = streaming.error.expect("busy frame should carry an error");
+    assert_eq!(error.code, DAEMON_SERVER_BUSY_CODE);
+    assert_eq!(error.message, DAEMON_SERVER_BUSY_MESSAGE);
+
+    let legacy: DaemonStreamResponse = serde_json::from_value(serde_json::json!({
+        "error": {"message": "legacy daemon error"},
+        "stream_end": false,
+    }))
+    .expect("new clients should accept pre-code daemon errors");
+    assert_eq!(legacy.error.expect("legacy error").code, "stream_error");
+}
+
 #[tokio::test]
 async fn daemon_request_reader_rejects_oversized_requests() {
     let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");

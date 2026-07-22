@@ -340,16 +340,20 @@ pub(crate) async fn stop_daemon(json: bool, socket: &Path) -> CliOutput {
             serde_json::json!({"running": false, "socket": socket}),
             0,
         ),
+        Err(err @ DaemonClientError::ServerBusy) => {
+            daemon_error(json, DAEMON_SERVER_BUSY_CODE, err.to_string())
+        }
         Err(err) => daemon_error(json, "daemon_unavailable", err.to_string()),
     }
 }
 
 pub(crate) async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
-    let status = DaemonClient::new(socket)
-        .status()
-        .await
-        .ok()
-        .unwrap_or_else(|| {
+    let status = match DaemonClient::new(socket).status().await {
+        Ok(status) => status,
+        Err(err @ DaemonClientError::ServerBusy) => {
+            return daemon_error(json, DAEMON_SERVER_BUSY_CODE, err.to_string());
+        }
+        Err(_) => {
             let home = socket
                 .parent()
                 .and_then(Path::parent)
@@ -370,7 +374,8 @@ pub(crate) async fn status_daemon(json: bool, socket: &Path) -> CliOutput {
                 relay_health: None,
                 stream_watches: Vec::new(),
             }
-        });
+        }
+    };
     let plain = if status.running {
         format!("daemon running\nsocket: {}", socket.display())
     } else {
