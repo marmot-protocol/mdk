@@ -1965,6 +1965,47 @@ mod tests {
     }
 
     #[test]
+    fn message_send_stray_reply_to_equals_form_is_rejected() {
+        // The equals spelling `--reply-to=PARENT` placed *after* the text is also
+        // swallowed as one literal `allow_hyphen_values` token (verified: it parses
+        // to `reply_to=None`, args `["hello", "--reply-to=PARENT"]`). An exact-token
+        // guard would miss it and publish a body carrying a stray reply flag, so the
+        // guard must reject the `=` form on both send surfaces too.
+        let cases: [&[&str]; 2] = [
+            &[
+                "wn",
+                "messages",
+                "send",
+                "--group",
+                "GROUP",
+                "hello",
+                "--reply-to=PARENT",
+            ],
+            &[
+                "wn",
+                "messages",
+                "send",
+                "GROUP",
+                "hello",
+                "--reply-to=PARENT",
+            ],
+        ];
+        for argv in cases {
+            let (group_flag, reply_to, args) = parse_send(argv);
+            assert_eq!(reply_to, None);
+            // Mirror the handler: the positional-group form drops the leading group.
+            let text = if group_flag.is_some() {
+                args.as_slice()
+            } else {
+                &args[1..]
+            };
+            let err = reject_misplaced_reply_to(reply_to.as_deref(), text)
+                .expect_err("a stray --reply-to=<id> in the text must be rejected");
+            assert!(matches!(err, WnError::ReplyToAfterMessageText));
+        }
+    }
+
+    #[test]
     fn message_list_cursors_accept_valid_compound_and_no_cursor() {
         assert!(validate_message_list_cursors(None, None, None, None).is_ok());
         assert!(validate_message_list_cursors(Some(101), Some("d"), None, None).is_ok());

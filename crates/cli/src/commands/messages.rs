@@ -43,16 +43,22 @@ fn message_target_and_text(
 /// The trailing message args use `allow_hyphen_values`, so a `--reply-to` placed
 /// *after* the text (in the `--group` form) or after the positional group id is
 /// swallowed as literal text instead of setting `reply_to` (see the parse-lock
-/// tests in `lib.rs`). Sending anyway would publish a body carrying a stray
-/// `--reply-to <id>` that attaches to no reply — a silent footgun. When
-/// `reply_to` was already parsed the flag did its job, so we only guard the
-/// `None` case. Tradeoff: message text that is itself exactly `--reply-to` can no
-/// longer be sent; put `--reply-to` before the text with `--group` to reply.
+/// tests in `lib.rs`). Both spellings are swallowed: the separate-value form
+/// `--reply-to <id>` and the equals form `--reply-to=<id>` (a single token).
+/// Sending anyway would publish a body carrying a stray reply flag that attaches
+/// to no reply — a silent footgun. When `reply_to` was already parsed the flag
+/// did its job, so we only guard the `None` case. Tradeoff: the guard rejects any
+/// message whose text contains a bare `--reply-to` / `--reply-to=…` token
+/// anywhere (e.g. `hello --reply-to friend`), so such text can no longer be sent;
+/// put `--reply-to` before the text with `--group` to reply.
 pub(crate) fn reject_misplaced_reply_to(
     reply_to: Option<&str>,
     text: &[String],
 ) -> Result<(), WnError> {
-    if reply_to.is_none() && text.iter().any(|token| token == "--reply-to") {
+    let has_stray_flag = text
+        .iter()
+        .any(|token| token == "--reply-to" || token.starts_with("--reply-to="));
+    if reply_to.is_none() && has_stray_flag {
         return Err(WnError::ReplyToAfterMessageText);
     }
     Ok(())
