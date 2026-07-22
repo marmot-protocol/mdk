@@ -3731,7 +3731,14 @@ fn image_attachment(hash: &str) -> TimelineAttachment {
 /// A media state with an image-capable (halfblocks) picker and one decoded,
 /// ready image, built without a terminal or network via the test hooks.
 fn media_with_ready_image(hash: &str) -> MediaState {
-    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    media_ready_image_with_picker(ratatui_image::picker::Picker::halfblocks(), hash)
+}
+
+/// As `media_with_ready_image`, but adopting a specific `picker`. Used to prove
+/// the inline renderer stays cell-exact even when the terminal reports (or is
+/// mis-detected as) a pixel protocol such as iTerm2/Kitty/Sixel.
+fn media_ready_image_with_picker(picker: ratatui_image::picker::Picker, hash: &str) -> MediaState {
+    let mut media = MediaState::with_test_picker(picker);
     // Larger than the halfblocks font cell (10x20) so it occupies cells, and
     // vertically varied so the encoder emits half-block glyphs (a uniform image
     // collapses each cell to a space).
@@ -3744,6 +3751,25 @@ fn media_with_ready_image(hash: &str) -> MediaState {
         image: Box::new(image::DynamicImage::ImageRgb8(buffer)),
     });
     media
+}
+
+/// Each terminal row of a full frame render, top to bottom, as a string. Unlike
+/// `rendered_buffer` (which flattens the whole grid) this keeps row boundaries so
+/// a test can assert *where* content lands — e.g. that an image block never draws
+/// onto the following message's row.
+fn rendered_rows(app: &mut TuiApp) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    let buffer = terminal.backend().buffer().clone();
+    let area = buffer.area;
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
 }
 
 #[test]
@@ -3941,6 +3967,163 @@ fn ready_image_renders_over_its_placeholder_in_the_message_pane() {
     assert!(
         !rendered.contains("pixel.png"),
         "the placeholder should be replaced by the image"
+    );
+}
+
+/// Row index of the first rendered row containing `needle`, or `None`.
+fn row_index_containing(rows: &[String], needle: &str) -> Option<usize> {
+    rows.iter().position(|row| row.contains(needle))
+}
+
+/// Render `app` and return the row index where the second timeline message
+/// ("SENTINELREPLY") lands. Used to observe how far the first message's image
+/// slot pushes it down — measure (row height) must equal draw (rendered rows).
+fn second_message_row(app: &mut TuiApp) -> usize {
+    let rows = rendered_rows(app);
+    row_index_containing(&rows, "SENTINELREPLY")
+        .unwrap_or_else(|| panic!("second message not rendered:\n{}", rows.join("\n")))
+}
+
+fn image_row_pair() -> Vec<TimelineRow> {
+    let mut first = timeline_row("m0", 0);
+    first.from_display_name = Some("Al".to_owned());
+    first.display_text = "look".to_owned();
+    first.attachments = vec![image_attachment("cafebabe")];
+    let mut second = timeline_row("m1", 1);
+    second.from_display_name = Some("Bo".to_owned());
+    second.display_text = "SENTINELREPLY".to_owned();
+    vec![first, second]
+}
+
+#[test]
+fn ready_image_reserves_exactly_its_block_and_placeholders_reserve_one_row() {
+    // measure==draw: the rows a message occupies in the height model must equal
+    // the rows it draws. Observe it through where the *next* message lands. Every
+    // placeholder ladder state is one row, so the second message sits at the same
+    // row; a ready image reserves MEDIA_IMAGE_ROWS, pushing it down by exactly the
+    // difference. A block that drew more (or fewer) rows than it measured would
+    // move the next message and occlude/leave a gap — the reported symptom.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    app.timeline = image_row_pair();
+
+    // `[img ...]` placeholder: capable terminal, image not yet requested.
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    let img_row = second_message_row(&mut app);
+
+    // `[downloading ...]`
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    app.media.begin_download("cafebabe".to_owned());
+    assert_eq!(
+        second_message_row(&mut app),
+        img_row,
+        "the downloading placeholder is one row, like [img ...]"
+    );
+
+    // `[loading ...]`
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    app.media.begin_download("cafebabe".to_owned());
+    app.media.apply_for_test(MediaLoad::Downloaded {
+        hash: "cafebabe".to_owned(),
+    });
+    assert_eq!(
+        second_message_row(&mut app),
+        img_row,
+        "the loading placeholder is one row, like [img ...]"
+    );
+
+    // `[... failed: ...]`
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    app.media.apply_for_test(MediaLoad::Failed {
+        hash: "cafebabe".to_owned(),
+        error: "boom".to_owned(),
+    });
+    assert_eq!(
+        second_message_row(&mut app),
+        img_row,
+        "the failed placeholder is one row, like [img ...]"
+    );
+
+    // Ready image: reserves MEDIA_IMAGE_ROWS rows where the placeholder used one.
+    app.media = media_with_ready_image("cafebabe");
+    let ready_row = second_message_row(&mut app);
+    assert_eq!(
+        ready_row - img_row,
+        usize::from(MEDIA_IMAGE_ROWS) - 1,
+        "a ready image reserves exactly MEDIA_IMAGE_ROWS rows, pushing the next \
+         message down by the block minus the one placeholder row it replaced"
+    );
+}
+
+#[test]
+fn ready_image_never_draws_onto_the_next_message_row() {
+    // Symptom 1, cell-exact form: the image must stay inside its reserved block
+    // and never draw onto (occlude) the following message's row.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    app.timeline = image_row_pair();
+    app.media = media_with_ready_image("cafebabe");
+
+    let rows = rendered_rows(&mut app);
+    let sentinel_row = row_index_containing(&rows, "SENTINELREPLY")
+        .expect("second message must remain visible below the image");
+    let last_glyph_row = rows
+        .iter()
+        .rposition(|row| row.contains('▀') || row.contains('▄'))
+        .expect("the ready image must draw halfblock glyphs");
+    assert!(
+        last_glyph_row < sentinel_row,
+        "image glyphs (last at row {last_glyph_row}) must stay above the next \
+         message (row {sentinel_row}); an image drawn onto it is the occlusion bug"
+    );
+}
+
+#[test]
+fn inline_images_render_cell_exact_not_a_pixel_protocol() {
+    // A terminal that reports (or is mis-detected as) a pixel protocol must not
+    // make the inline timeline draw a pixel-protocol image. In a scrolling message
+    // list a pixel image (iTerm2/Kitty/Sixel) maps its reserved cell block to
+    // pixels via a font size and stores image bytes terminal-side; if the detected
+    // font is off it overflows the block (occluding the next message) and cannot be
+    // erased on scroll. The renderer must adopt the cell-exact halfblocks protocol
+    // regardless of what the terminal reported.
+    //
+    // Structural guard: the picker here is force-set to a pixel protocol and then
+    // handed to `MediaState` through the *same* `adopt_picker` chokepoint the
+    // runtime's `detect_capability` uses (via the `with_test_picker` hook, which
+    // now just delegates to it). This test therefore fails if anyone removes or
+    // bypasses the chokepoint's cell-exact normalization — not merely if a
+    // test-only normalization is dropped.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+
+    // Build the media state the way a pixel-protocol terminal (iTerm2 answers the
+    // Kitty query and would be force-set to iTerm2) hands the picker over.
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
+    app.media = media_ready_image_with_picker(picker, "cafebabe");
+
+    let rendered = rendered_buffer(&mut app);
+    // No raw pixel-protocol control sequence may be emitted into a cell: the iTerm2
+    // inline-image marker (OSC 1337) is the mechanism that overflows the block.
+    assert!(
+        !rendered.contains("1337"),
+        "an iTerm2 pixel escape must never be drawn inline in the scrolling timeline"
+    );
+    // The reserved block is filled by cell-exact halfblock glyphs instead.
+    assert!(
+        rendered.contains('▀') || rendered.contains('▄'),
+        "expected a cell-exact halfblock image in the reserved block"
     );
 }
 

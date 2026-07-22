@@ -490,9 +490,9 @@ real time.
 
 `wn tui` is a Ratatui interface over the real `wn --json` command surface. It opens on a login screen when it has
 no single obvious account, then drops into a chat-first main view: the chat list on the left, the materialized
-message timeline on the right (with reactions, reply context, deletion tombstones, and inline images on graphics-capable
-terminals with `[img name]`/`[file name]` placeholders otherwise), the composer below them, and a one-line hints bar
-plus a one-line status bar at the bottom.
+message timeline on the right (with reactions, reply context, deletion tombstones, and inline images as cell-exact
+half-blocks on image-capable terminals, with `[img name]`/`[file name]` placeholders otherwise), the composer below
+them, and a one-line hints bar plus a one-line status bar at the bottom.
 
 ```sh
 wn tui
@@ -560,13 +560,15 @@ Main view controls:
   `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
   text as the guard requires. `o` opens the selected message's downloaded image full-size in a dismiss-on-any-key
   viewer (see "Inbound media" below).
-- Inbound media: an image attachment renders inline in the message pane on terminals with a graphics protocol
-  (Kitty, iTerm2, or Sixel; iTerm2 is detected via `ITERM_SESSION_ID`). Each image is downloaded and decoded in the
-  background — never blocking the event loop — and its placeholder walks `[img name]` -> `[downloading name...]` ->
-  `[loading name...]` -> the inline image, or `[name failed: err]` on error. Terminals without an image protocol keep
-  the `[img name]` placeholder (and non-image attachments always show `[file name]`). Downloaded files are cached
-  under the TUI home in `tui-media-cache/` (a private directory), so passing `--home` keeps the cache with the
-  account data.
+- Inbound media: an image attachment renders inline in the message pane as cell-exact half-block glyphs (`▀` colored
+  cells) on any image-capable terminal. The rendering is deliberately cell-exact rather than a native pixel image
+  (iTerm2/Kitty/Sixel): half-blocks are ordinary colored cells bounded strictly to the reserved block, so an image can
+  never overdraw a neighboring message or leave a terminal-side artifact behind when you scroll. Each image is
+  downloaded and decoded in the background — never blocking the event loop — and its placeholder walks `[img name]` ->
+  `[downloading name...]` -> `[loading name...]` -> the inline image, or `[name failed: err]` on error. A terminal
+  with no image capability keeps the `[img name]` placeholder (and non-image attachments always show `[file name]`).
+  The `o` full-size viewer uses the same cell-exact rendering. Downloaded files are cached under the TUI home in
+  `tui-media-cache/` (a private directory), so passing `--home` keeps the cache with the account data.
 - Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
   character, and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard newline, so
   multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8 rows), taking
