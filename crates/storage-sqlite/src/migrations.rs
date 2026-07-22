@@ -52,6 +52,8 @@ mod migration_0025_chat_notification_settings;
 mod migration_0026_message_drafts;
 #[path = "migrations/0027_app_event_moderation_grant.rs"]
 mod migration_0027_app_event_moderation_grant;
+#[path = "migrations/0028_pending_push_registration_shares.rs"]
+mod migration_0028_pending_push_registration_shares;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -198,6 +200,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 27,
         name: "0027_app_event_moderation_grant",
         apply: migration_0027_app_event_moderation_grant::apply,
+    },
+    Migration {
+        version: 28,
+        name: "0028_pending_push_registration_shares",
+        apply: migration_0028_pending_push_registration_shares::apply,
     },
 ];
 
@@ -441,6 +448,61 @@ mod tests {
             "message_draft_attachments",
             "plaintext"
         ));
+    }
+
+    #[test]
+    fn pending_push_registration_migration_backfills_joined_groups() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..27]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (
+                group_id_hex, endpoint, self_membership, updated_at
+             ) VALUES ('joined', 'relay', 'member', 1),
+                      ('left', 'relay', 'left', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO push_registration (
+                account_label, account_id_hex, platform, token_fingerprint,
+                token_bytes, server_pubkey_hex, created_at_ms, updated_at_ms,
+                last_shared_at_ms
+             ) VALUES ('alice', 'aa', 1, 'fingerprint', X'01', 'bb', 10, 11, 12)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let pending = conn
+            .query_row(
+                "SELECT group_id_hex, token_fingerprint, registration_updated_at_ms,
+                        queued_at_ms
+                 FROM pending_push_registration_shares",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pending,
+            ("joined".to_owned(), "fingerprint".to_owned(), 11, 11)
+        );
+        let last_shared_at_ms: Option<i64> = conn
+            .query_row(
+                "SELECT last_shared_at_ms FROM push_registration WHERE account_label = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_shared_at_ms, None);
     }
 
     #[test]
@@ -837,6 +899,10 @@ mod tests {
                 "{table}.{column} should cascade when a group is deleted"
             );
         }
+        assert_eq!(
+            foreign_key(&conn, "pending_push_registration_shares", "group_id_hex"),
+            Some(("account_groups".to_owned(), "CASCADE".to_owned()))
+        );
     }
 
     #[test]
@@ -849,6 +915,13 @@ mod tests {
             "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
              VALUES (?1, ?2, 0, 0, ?3)",
             params![vec![0x01_u8; 4], orphan_group, vec![0xAA_u8]],
+        ));
+        assert_foreign_key_error(conn.execute(
+            "INSERT INTO pending_push_registration_shares (
+                group_id_hex, token_fingerprint, registration_updated_at_ms,
+                queued_at_ms
+             ) VALUES ('orphan', 'fingerprint', 1, 1)",
+            [],
         ));
         assert_foreign_key_error(conn.execute(
             "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)

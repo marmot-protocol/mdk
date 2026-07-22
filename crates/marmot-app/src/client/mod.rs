@@ -281,6 +281,11 @@ impl AppClient {
         self.add_group(&group_id)?;
         self.sync_runtime_groups().await?;
         self.app.save_state(&self.state)?;
+        self.app.set_group_self_membership(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            SelfMembership::Member,
+        )?;
         self.queue_own_group_system_projection_updates(&effects);
         Ok(group_id)
     }

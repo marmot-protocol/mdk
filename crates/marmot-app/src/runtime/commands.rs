@@ -20,8 +20,9 @@ use crate::{
     AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint, AppError,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppQuarantinedGroup,
     GroupInviteDeclineResult, GroupPushDebugInfo, MediaAttachmentReference, MediaDownloadResult,
-    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, PushRegistration,
-    SecureDeleteExpiredResult, SendSummary,
+    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, SecureDeleteExpiredResult,
+    SendSummary,
 };
 
 impl AccountManager {
@@ -648,18 +649,60 @@ impl AccountManager {
     pub(crate) async fn share_push_registration(
         &self,
         account_ref: &str,
-    ) -> Result<usize, AppError> {
+    ) -> Result<PushRegistrationShareOutcome, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
             .send(AccountWorkerCommand::SharePushRegistration { respond })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let published = account_worker_response(response).await?;
-        if published > 0 {
+        let outcome = account_worker_response(response).await?;
+        if outcome.succeeded_groups > 0 {
             self.schedule_audit_log_tracker_update("share_push_registration");
         }
-        Ok(published)
+        Ok(outcome)
+    }
+
+    /// Enqueue a serialized best-effort share without waiting for relay I/O.
+    pub(crate) async fn schedule_push_registration_share(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SharePushRegistration { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        drop(response);
+        Ok(())
+    }
+
+    pub(crate) async fn upsert_push_registration(
+        &self,
+        account_ref: &str,
+        platform: PushPlatform,
+        raw_token: &str,
+        server_pubkey_hex: &str,
+        relay_hint: Option<String>,
+    ) -> Result<PushRegistrationSyncResult, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UpsertPushRegistration {
+                platform,
+                raw_token: Zeroizing::new(raw_token.to_owned()),
+                server_pubkey_hex: server_pubkey_hex.to_owned(),
+                relay_hint,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        let result = account_worker_response(response).await?;
+        if result.share.succeeded_groups > 0 {
+            self.schedule_audit_log_tracker_update("upsert_push_registration");
+        }
+        Ok(result)
     }
 
     pub(crate) async fn remove_push_registration(

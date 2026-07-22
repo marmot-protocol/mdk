@@ -1338,7 +1338,9 @@ fn push_registration_preserves_created_at_when_token_rotates() {
     store
         .upsert_push_registration(registration.clone(), vec![1, 2, 3])
         .unwrap();
-    store.mark_push_registration_shared("alice", 11).unwrap();
+    store
+        .mark_push_registration_shared("alice", "first", 10, 11)
+        .unwrap();
     let mut rotated = registration;
     rotated.token_fingerprint = "second".to_owned();
     rotated.updated_at_ms = 12;
@@ -1351,6 +1353,181 @@ fn push_registration_preserves_created_at_when_token_rotates() {
     assert_eq!(stored.registration.created_at_ms, 10);
     assert_eq!(stored.registration.last_shared_at_ms, None);
     assert_eq!(stored.token_bytes, vec![4, 5, 6]);
+}
+
+#[test]
+fn push_registration_tracks_partial_completion_per_group_and_requeues_on_refresh() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "first".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+
+    store
+        .upsert_push_registration(registration.clone(), vec![1, 2, 3])
+        .unwrap();
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), true)
+        .unwrap();
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["aa".to_owned(), "bb".to_owned()]
+    );
+    assert!(
+        store
+            .complete_push_registration_share("aa", "first", 10)
+            .unwrap()
+    );
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["bb".to_owned()]
+    );
+    store
+        .mark_push_registration_shared("alice", "first", 10, 11)
+        .unwrap();
+
+    let mut refreshed = registration;
+    refreshed.updated_at_ms = 10;
+    let stored = store
+        .upsert_push_registration(refreshed, vec![1, 2, 3])
+        .unwrap();
+
+    assert_eq!(stored.registration.last_shared_at_ms, None);
+    assert_eq!(stored.registration.updated_at_ms, 11);
+    assert_eq!(
+        store.pending_push_registration_shares("first", 11).unwrap(),
+        vec!["aa".to_owned(), "bb".to_owned()]
+    );
+    assert!(
+        !store
+            .complete_push_registration_share("aa", "first", 10)
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_push_registration_share("aa", "first", 11)
+            .unwrap()
+    );
+    assert!(
+        store
+            .complete_push_registration_share("bb", "first", 11)
+            .unwrap()
+    );
+    assert!(
+        store
+            .mark_push_registration_shared("alice", "first", 11, 12)
+            .unwrap()
+    );
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), false)
+        .unwrap();
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), true)
+        .unwrap();
+    assert_eq!(
+        store.pending_push_registration_shares("first", 11).unwrap(),
+        vec!["aa".to_owned(), "bb".to_owned()]
+    );
+    assert_eq!(
+        store
+            .push_registration("alice")
+            .unwrap()
+            .unwrap()
+            .registration
+            .last_shared_at_ms,
+        None
+    );
+}
+
+#[test]
+fn push_registration_completion_is_version_guarded_and_membership_scoped() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let mut registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "first".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration.clone(), vec![1])
+        .unwrap();
+    store
+        .set_group_self_membership("bb", SelfMembership::Left)
+        .unwrap();
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["aa".to_owned()]
+    );
+
+    registration.token_fingerprint = "second".to_owned();
+    registration.updated_at_ms = 20;
+    store
+        .upsert_push_registration(registration, vec![2])
+        .unwrap();
+    assert!(
+        !store
+            .complete_push_registration_share("aa", "first", 10)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .pending_push_registration_shares("second", 20)
+            .unwrap(),
+        vec!["aa".to_owned()]
+    );
+
+    store
+        .set_group_self_membership("bb", SelfMembership::Member)
+        .unwrap();
+    assert_eq!(
+        store
+            .pending_push_registration_shares("second", 20)
+            .unwrap(),
+        vec!["aa".to_owned(), "bb".to_owned()]
+    );
+    store.clear_push_registration("alice").unwrap();
+    assert!(
+        store
+            .pending_push_registration_shares("second", 20)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1398,6 +1575,22 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .unwrap();
     insert_read_and_chat_rows(&store, "aa");
     insert_protocol_group_marker(&store, &[0xaa]);
+    store
+        .upsert_push_registration(
+            AccountPushRegistration {
+                account_label: "alice".to_owned(),
+                account_id_hex: "11".repeat(32),
+                platform: 1,
+                token_fingerprint: "push".to_owned(),
+                server_pubkey_hex: "22".repeat(32),
+                relay_hint: None,
+                created_at_ms: 10,
+                updated_at_ms: 10,
+                last_shared_at_ms: None,
+            },
+            vec![1],
+        )
+        .unwrap();
 
     assert!(store.delete_local_group_data("aa").unwrap());
 
@@ -1411,6 +1604,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "chat_list_rows",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "pending_push_registration_shares",
         "encrypted_media_epoch_secrets",
     ] {
         assert_eq!(group_row_count(&store, table, "aa"), 0, "{table}");
@@ -1422,6 +1616,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "message_timeline",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "pending_push_registration_shares",
         "encrypted_media_epoch_secrets",
     ] {
         assert!(group_row_count(&store, table, "bb") > 0, "{table}");
