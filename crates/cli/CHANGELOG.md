@@ -9,6 +9,19 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: made the armed message-interaction state durable and guarded reaction content, fixing a field report where a
+  user armed `/react` (via `r`), did not register the prefill, typed a whole message, and published his prose as a
+  reaction. While the composer begins with `/react`, `/reply`, or `/delete`, the hints line now shows a persistent
+  hint recomputed each frame from the composer text and the selected row — `reacting to <sender>: <preview> — Enter
+  sends the reaction, Esc clears` — instead of a one-shot status a later event could overwrite. `Esc` clears an armed
+  interaction prefill (pristine or edited) as that escape hatch, while leaving a hand-typed draft intact; `Ctrl-U` is
+  the readline kill-line that clears the whole composer whatever it holds (armed prefill or hand-typed draft) and also
+  clears the masked nsec-entry field, so the idle composer hint reads `Enter send  Ctrl-U clear`. `/react` accepts
+  only one emoji — exactly one grapheme cluster carrying a non-ASCII scalar (real emoji, including ZWJ families, skin
+  tones, flags, and keycaps), or the NIP-25 `+`/`-` sentinels — and refuses anything else (multi-word prose,
+  plain-ASCII tokens, and non-Latin or accented words like `café`, `你好吗`, and `привет`) with `reactions are a single
+  emoji (Enter sends the default +); Esc clears`. The `messages react` CLI command stays protocol-faithful and is
+  unchanged. No JSON response shapes changed.
 - TUI: `R` on the selected message replies to it. It prefills `/reply` followed by a space in the composer
   (draft-protected like the `r`
   and `d` accelerators) and names the reply target on the status line; you type the reply and `Enter` sends it. Also

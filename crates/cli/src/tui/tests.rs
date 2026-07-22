@@ -4967,7 +4967,7 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Composer, true),
-        "Enter send  Esc clear"
+        "Enter send  Ctrl-U clear"
     );
     assert_eq!(
         hints_line(Screen::Login(LoginMode::Menu), Focus::Chats, false),
@@ -6365,6 +6365,106 @@ fn slash_command_parser_handles_message_interactions() {
 }
 
 #[test]
+fn react_content_guard_rejects_typed_prose() {
+    // The field defect: `/react ` was prefilled, the user typed a whole message,
+    // and the prose published as a NIP-25 reaction. The guard now refuses content
+    // that is not a single emoji cluster and teaches the escape hatch on the way
+    // out. Prose spans more than one grapheme cluster, or is an all-ASCII token.
+    let hint = "reactions are a single emoji (Enter sends the default +); Esc clears";
+    for prose in [
+        "/react hello world",                              // whitespace between words
+        "/react \"hello world\"",                          // quoted -> one whitespaced arg
+        "/react hello",                                    // a plain-ASCII word is not an emoji
+        "/react 👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍", // a wall of emoji is not one reaction
+    ] {
+        assert_eq!(
+            parse_slash_command(prose),
+            Err(hint.to_owned()),
+            "{prose:?} must be refused with the teaching hint"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_accepts_the_default_and_real_emoji() {
+    // The guard must never break the sanctioned reactions: the `+` default and a
+    // single emoji, including multi-scalar ZWJ families, skin tones, and flags.
+    for (input, emoji) in [
+        ("/react", "+"),     // bare -> default +
+        ("/react +", "+"),   // the explicit + sentinel
+        ("/react 👍", "👍"), // single-scalar emoji
+        ("/react 👍🏾", "👍🏾"), // emoji + skin-tone modifier
+        ("/react 👨‍👩‍👧‍👦", "👨‍👩‍👧‍👦"), // ZWJ family: many scalars, one emoji
+        ("/react 🏳️‍🌈", "🏳️‍🌈"), // rainbow flag: base + VS16 + ZWJ + rainbow
+    ] {
+        assert_eq!(
+            parse_slash_command(input),
+            Ok(SlashCommand::React {
+                emoji: emoji.to_owned()
+            }),
+            "{input:?} must be accepted unchanged"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_accepts_counterintuitive_single_graphemes() {
+    // Regression pins for the accepted survivors that look like edge cases but are
+    // each exactly one non-ASCII grapheme cluster: the NIP-25 `-` downvote, the
+    // keycap and copyright emoji (base + variation/keycap scalars), and a lone CJK
+    // character (the documented, acceptable ceiling — one cluster, non-ASCII).
+    for (input, emoji) in [
+        ("/react -", "-"),   // NIP-25 dislike sentinel
+        ("/react 1️⃣", "1️⃣"), // keycap: '1' + VS16 + combining enclosing keycap
+        ("/react ©️", "©️"), // copyright + VS16
+        ("/react 你", "你"), // a single CJK character is one non-ASCII cluster
+    ] {
+        assert_eq!(
+            parse_slash_command(input),
+            Ok(SlashCommand::React {
+                emoji: emoji.to_owned()
+            }),
+            "{input:?} is one non-ASCII grapheme cluster and must be accepted"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_rejects_non_latin_and_accented_prose() {
+    // The length/ASCII heuristic let short non-Latin and accented prose through:
+    // `café`, `你好吗`, and `привет` all published. Real reactions are a single
+    // grapheme cluster, so multi-character words are refused whatever their
+    // script. `你好吗` is frozen here so this intent cannot silently regress.
+    let hint = "reactions are a single emoji (Enter sends the default +); Esc clears";
+    for prose in [
+        "/react café",   // Latin-1 accented word (4 clusters)
+        "/react 你好吗", // CJK prose (3 clusters)
+        "/react привет", // Cyrillic word (6 clusters)
+        "/react 👍👍",   // a run of emoji is not one reaction
+    ] {
+        assert_eq!(
+            parse_slash_command(prose),
+            Err(hint.to_owned()),
+            "{prose:?} must be refused: a reaction is one grapheme cluster"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_accepts_the_nip25_downvote_sentinel() {
+    // NIP-25 defines `-` as the dislike sentinel, and `messages react` already
+    // accepts it. A lone `-` is a single unambiguous token with no typed-prose
+    // risk, so the TUI guard must let it through alongside the `+` default.
+    assert_eq!(
+        parse_slash_command("/react -"),
+        Ok(SlashCommand::React {
+            emoji: "-".to_owned()
+        }),
+        "the NIP-25 - downvote sentinel must be accepted"
+    );
+}
+
+#[test]
 fn messages_r_prefills_the_react_command_in_the_composer() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.focus = Focus::Messages;
@@ -6434,6 +6534,200 @@ fn messages_d_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
         app.status.contains("draft"),
         "the status line explains why r/d was suppressed, got {}",
         app.status
+    );
+}
+
+#[test]
+fn armed_interaction_hint_names_the_action_and_target() {
+    // While the composer holds an interaction command, the hint tells the user
+    // what Enter will do and to which message — the durable signal the field
+    // report was missing. Recomputed from the composer text and selected row.
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Alice".to_owned());
+    row.display_text = "hello world".to_owned();
+
+    assert_eq!(
+        armed_interaction_hint("/react ", Some(&row)).as_deref(),
+        Some("reacting to Alice: \"hello world\" — Enter sends the reaction, Esc clears")
+    );
+    assert_eq!(
+        armed_interaction_hint("/reply ", Some(&row)).as_deref(),
+        Some("replying to Alice: \"hello world\" — Enter sends the reply, Esc clears")
+    );
+    assert_eq!(
+        armed_interaction_hint("/delete", Some(&row)).as_deref(),
+        Some("deleting Alice: \"hello world\" — Enter deletes, Esc clears")
+    );
+    // An edited prefill (the trapped scenario: `/react ` then typed prose) stays
+    // armed, so the escape-hatch hint persists.
+    assert_eq!(
+        armed_interaction_hint("/react this is not an emoji", Some(&row)).as_deref(),
+        Some("reacting to Alice: \"hello world\" — Enter sends the reaction, Esc clears")
+    );
+}
+
+#[test]
+fn armed_interaction_hint_is_none_for_drafts_and_unrelated_commands() {
+    let row = timeline_row("m0", 0);
+    // A hand-typed chat draft is not an armed interaction.
+    assert_eq!(armed_interaction_hint("hello everyone", Some(&row)), None);
+    // An unrelated slash command that merely shares a prefix must not match.
+    assert_eq!(armed_interaction_hint("/refresh", Some(&row)), None);
+    assert_eq!(armed_interaction_hint("/chat new ops", Some(&row)), None);
+    // A word that only starts like a command (no boundary) must not match.
+    assert_eq!(armed_interaction_hint("/reactor", Some(&row)), None);
+}
+
+#[test]
+fn render_hints_shows_the_persistent_armed_interaction_hint() {
+    // The armed hint replaces the static keymap in the hints bar while the
+    // composer holds an interaction command, so the pending action stays visible
+    // even if a later status event fires. Clearing the composer restores the
+    // normal keymap.
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut app = test_tui_app(test_unused_client(), account_id);
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Alice".to_owned());
+    row.display_text = "hello world".to_owned();
+    app.timeline = vec![row];
+    app.input.set_value("/react ");
+
+    let armed = rendered_buffer(&mut app);
+    assert!(
+        armed.contains("reacting to Alice") && armed.contains("Esc clears"),
+        "armed hint must name the action and target, got: {armed:?}"
+    );
+    assert!(
+        !armed.contains("r react  u unreact"),
+        "the static messages keymap must be replaced while armed, got: {armed:?}"
+    );
+
+    app.input.clear();
+    let idle = rendered_buffer(&mut app);
+    assert!(
+        idle.contains("r react  u unreact"),
+        "the static keymap returns once the composer is cleared, got: {idle:?}"
+    );
+}
+
+#[test]
+fn armed_interaction_hint_handles_an_empty_timeline() {
+    // Armed with nothing selected (empty timeline): the hint still shows so the
+    // escape hatch is visible; the submit path reports "no message selected".
+    assert_eq!(
+        armed_interaction_hint("/react ", None).as_deref(),
+        Some("reacting to the selected message — Enter sends the reaction, Esc clears")
+    );
+}
+
+#[test]
+fn esc_clears_an_armed_interaction_prefill() {
+    // Esc is the escape hatch the armed hint advertises. It clears an interaction
+    // prefill — pristine or edited — so a user who armed a reaction by accident
+    // (the field defect) can back out instead of publishing prose as a reaction.
+    for armed in [
+        "/react ",
+        "/react this is not an emoji",
+        "/reply hi",
+        "/delete",
+    ] {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.focus = Focus::Composer;
+        app.input.set_value(armed);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc");
+
+        assert!(
+            app.input.is_empty(),
+            "Esc must clear the armed interaction {armed:?}, left {:?}",
+            app.input.value()
+        );
+    }
+}
+
+#[test]
+fn esc_preserves_a_hand_typed_draft() {
+    // Esc must not silently destroy text the user wrote by hand: a chat draft (or
+    // any non-interaction slash command) survives Esc, matching the draft
+    // protection that keeps r/d/R from clobbering it.
+    for draft in ["hello everyone", "/chat new ops"] {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.focus = Focus::Composer;
+        app.input.set_value(draft);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc");
+
+        assert_eq!(
+            app.input.value(),
+            draft,
+            "Esc must preserve a hand-typed draft, not destroy it"
+        );
+    }
+}
+
+#[test]
+fn ctrl_u_clears_the_composer_regardless_of_state() {
+    // Ctrl-U is the readline kill-line: it empties the composer whatever it holds
+    // — a hand-typed draft (which Esc deliberately preserves) or an armed
+    // interaction prefill — so the composer hint can honestly name a key that
+    // always clears the field.
+    for content in ["a half-typed draft", "/chat new ops", "/react ", "/delete"] {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.focus = Focus::Composer;
+        app.input.set_value(content);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("ctrl-u");
+
+        assert!(
+            app.input.is_empty(),
+            "Ctrl-U must clear the composer holding {content:?}, left {:?}",
+            app.input.value()
+        );
+    }
+}
+
+#[test]
+fn armed_hint_and_send_target_resolve_to_the_same_selected_row() {
+    // The armed hint names a row and Enter sends to a row: both must be the same
+    // row. Arm /react, move the selection off the default newest row, and pin that
+    // the hint names the NEW row's sender while the send target
+    // (`selected_timeline_message_id`, the resolution the Enter path uses) points
+    // at that same row — so the hint can never advertise a different message than
+    // the one that gets reacted to.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    let mut oldest = timeline_row("m0", 0);
+    oldest.from_display_name = Some("Oldest".to_owned());
+    let mut middle = timeline_row("m1", 1);
+    middle.from_display_name = Some("Middle".to_owned());
+    let mut newest = timeline_row("m2", 2);
+    newest.from_display_name = Some("Newest".to_owned());
+    app.timeline = vec![oldest, middle, newest];
+
+    // Move the selection off the default newest row, then arm /react via `r`.
+    app.focus = Focus::Messages;
+    app.handle_key(char_key('k')).expect("select up");
+    app.handle_key(char_key('r')).expect("arm react");
+
+    let target = app
+        .selected_timeline_message_id()
+        .expect("a row is selected");
+    assert_eq!(target, "m1", "the send target follows the moved selection");
+
+    let selected = app.selected_timeline_row().expect("a row is selected");
+    assert_eq!(
+        selected.message_id, target,
+        "the hint row and the send target are the same resolution"
+    );
+
+    let hint = armed_interaction_hint(app.input.value(), Some(selected))
+        .expect("an armed /react shows a hint");
+    assert!(
+        hint.contains("reacting to Middle") && !hint.contains("Newest"),
+        "the armed hint names the selected row's sender, got: {hint:?}"
     );
 }
 

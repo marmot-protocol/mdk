@@ -716,10 +716,19 @@ impl TuiApp {
 
     fn render_hints(&self, frame: &mut Frame, area: Rect) {
         // The user-search screen's hint depends on its internal focus, which the
-        // shared `hints_line` signature cannot carry; derive it here instead.
+        // shared `hints_line` signature cannot carry; derive it here instead. On
+        // the main view, an armed interaction command in the composer replaces the
+        // static keymap with a persistent "what Enter does, Esc clears" hint,
+        // recomputed here each frame so it survives later status events.
         let text = match (self.screen, self.user_search.as_ref()) {
-            (Screen::UserSearch, Some(view)) => user_search_hint(view.focus),
-            _ => hints_line(self.screen, self.focus, self.entered_main),
+            (Screen::UserSearch, Some(view)) => user_search_hint(view.focus).to_owned(),
+            (Screen::Main, _) => {
+                armed_interaction_hint(self.input.value(), self.selected_timeline_row())
+                    .unwrap_or_else(|| {
+                        hints_line(self.screen, self.focus, self.entered_main).to_owned()
+                    })
+            }
+            _ => hints_line(self.screen, self.focus, self.entered_main).to_owned(),
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

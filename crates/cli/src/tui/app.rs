@@ -393,7 +393,13 @@ impl TuiApp {
             }
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.previous(),
-            KeyCode::Esc => {
+            // Esc is the escape hatch the armed-interaction hint advertises: it
+            // clears an armed `/react`/`/reply`/`/delete` prefill (pristine or
+            // edited) so a user who armed a reaction by accident can back out. A
+            // hand-typed draft is never an armed command, so Esc leaves it intact
+            // — Esc must not silently destroy text the user wrote by hand, the
+            // same reason r/d/R refuse to clobber a draft.
+            KeyCode::Esc if is_armed_interaction(self.input.value()) => {
                 self.input.clear();
             }
             KeyCode::Char('/') if self.focus != Focus::Composer => {
@@ -495,6 +501,17 @@ impl TuiApp {
             KeyCode::Delete if self.focus == Focus::Composer => self.input.delete(),
             KeyCode::Backspace if self.focus == Focus::Composer => {
                 self.input.backspace();
+            }
+            // Ctrl-U is the readline kill-line: an unconditional composer clear
+            // whatever the field holds — an armed interaction prefill or a
+            // hand-typed draft — so the composer hint can name a key that always
+            // clears. It precedes the plain-Char insert so Ctrl-U is never typed
+            // as a literal `u`.
+            KeyCode::Char('u')
+                if self.focus == Focus::Composer
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.input.clear();
             }
             KeyCode::Char(character) if self.focus == Focus::Composer => {
                 self.input.insert(character);
@@ -807,6 +824,12 @@ impl TuiApp {
             KeyCode::End => self.input.end(),
             KeyCode::Delete => self.input.delete(),
             KeyCode::Backspace => self.input.backspace(),
+            // Ctrl-U kill-line, shared with the composer: the nsec field reuses the
+            // same `Input`, so the readline convention carries over and clearing
+            // key material promptly is safety-positive. Nothing else binds it here.
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.clear();
+            }
             KeyCode::Char(character) => self.input.insert(character),
             _ => {}
         }

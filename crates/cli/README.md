@@ -554,7 +554,16 @@ Main view controls:
   shows the reply target on the status line, so you type the reply and `Enter` sends it). Counts update live in both
   directions from the timeline projection; the list is not reloaded, and a sent reply upserts optimistically the same
   way a plain send does. The `r`, `d`, and `R` prefills are skipped when the composer already holds a draft, so an
-  in-progress message is never clobbered (a status-line notice explains the skip). These also work as the `/react`,
+  in-progress message is never clobbered (a status-line notice explains the skip). While the composer holds one of
+  these prefills, the hints line shows a persistent reminder of what `Enter` will do and to which message (for
+  example `reacting to <sender>: <preview> — Enter sends the reaction, Esc clears`), recomputed each frame so it stays
+  visible until you send or clear; `Esc` clears the armed prefill (pristine or after you have typed into it) as that
+  escape hatch, while a hand-typed draft is left intact (use `Ctrl-U` to clear a hand-typed draft). `/react` accepts
+  only one emoji — exactly one grapheme cluster carrying a non-ASCII scalar (real emoji, including ZWJ families, skin
+  tones, flags, and keycaps), or the NIP-25 `+`/`-` sentinels. Anything else — multi-word prose, plain-ASCII tokens,
+  and non-Latin or accented words like `café`, `你好吗`, or `привет` — is refused with a status-line error that names
+  the contract and the escape hatch (`reactions are a single emoji (Enter sends the default +); Esc clears`), so typed
+  prose is never published as a reaction. These also work as the `/react`,
   `/unreact`, `/delete`, and `/reply <text>` slash commands, which resolve the target at submit and error to the
   status line when no message is selected (and `/delete` when the message is not yours). `/reply` sends
   `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
@@ -570,11 +579,15 @@ Main view controls:
   The `o` full-size viewer uses the same cell-exact rendering. Downloaded files are cached under the TUI home in
   `tui-media-cache/` (a private directory), so passing `--home` keeps the cache with the account data.
 - Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
-  character, and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard newline, so
-  multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8 rows), taking
-  the space from the messages pane.
+  character, `Ctrl-U` clears the whole composer (a readline kill-line that empties it whatever it holds — armed prefill
+  or hand-typed draft), and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard
+  newline, so multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8
+  rows), taking the space from the messages pane.
 - `?`: open the help popup.
-- `Esc`: clear the composer input (or, with a popup open, close it).
+- `Esc`: clear an armed message-interaction prefill (`/react`, `/reply`, or `/delete`, whether untouched or after you
+  have typed into it); a hand-typed draft is left intact so `Esc` never destroys text you wrote — use `Ctrl-U` to
+  clear a hand-typed draft. With a popup open, `Esc` closes it.
+- `Ctrl-U`: clear the whole composer (readline kill-line), whatever it holds. Also clears the masked nsec-entry field.
 - `Ctrl-C`: quit.
 
 Popups are modal: while one is open it captures every key and the screen behind it is inert. A text-entry popup
@@ -673,7 +686,10 @@ Composer slash commands:
 visible-chat list. Member commands operate on the selected chat and call the same group membership commands exposed by
 the CLI.
 `/react`, `/unreact`, and `/delete` operate on the selected message in the messages pane and call the real
-`messages react|unreact|delete` commands; `/react` defaults to the `+` emoji. On success they only update the status
+`messages react|unreact|delete` commands; `/react` defaults to the `+` emoji. `/react` also guards its content: it is a
+single emoji or the `+` default, so content with whitespace, plain ASCII text, or too long for one emoji is rejected
+with a status-line error rather than published as a reaction (the guard lives in the TUI; the `messages react` CLI
+command stays protocol-faithful). On success they only update the status
 line — the timeline projection folds the reaction or tombstone into the existing row, so the list is not reloaded.
 `/retry <event-id>` retries a failed outbound event by id; it takes the id as an argument rather than acting on the
 selected message, because timeline rows do not carry per-message failed-send state to target from.

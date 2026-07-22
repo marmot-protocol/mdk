@@ -1514,9 +1514,73 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
             Focus::Messages => {
                 "j/k select  G/g ends  r react  u unreact  d delete  R reply  i compose"
             }
-            Focus::Composer => "Enter send  Esc clear",
+            Focus::Composer => "Enter send  Ctrl-U clear",
         },
     }
+}
+
+/// A composer prefix that arms a selected-message interaction, paired with the
+/// verb and the Enter action the persistent hint advertises. When the composer
+/// begins with one of these, Enter acts on the selected message instead of
+/// sending a chat message, so the armed state must stay visible until resolved.
+struct ArmedInteraction {
+    command: &'static str,
+    verb: &'static str,
+    action: &'static str,
+}
+
+const ARMED_INTERACTIONS: &[ArmedInteraction] = &[
+    ArmedInteraction {
+        command: "/react",
+        verb: "reacting to",
+        action: "Enter sends the reaction",
+    },
+    ArmedInteraction {
+        command: "/reply",
+        verb: "replying to",
+        action: "Enter sends the reply",
+    },
+    ArmedInteraction {
+        command: "/delete",
+        verb: "deleting",
+        action: "Enter deletes",
+    },
+];
+
+/// The armed interaction the composer text begins with, if any: `input` is the
+/// command exactly (`/delete`) or the command followed by whitespace (`/react `,
+/// `/reply hello`). Matching on the whole command word (not a bare prefix) keeps
+/// `/refresh` and `/reactor` from counting. Shared by the persistent armed hint
+/// and the `Esc` escape hatch so they agree on what "armed" means.
+fn armed_interaction(input: &str) -> Option<&'static ArmedInteraction> {
+    ARMED_INTERACTIONS.iter().find(|armed| {
+        input
+            .strip_prefix(armed.command)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(|ch: char| ch.is_whitespace()))
+    })
+}
+
+/// True when the composer holds an armed selected-message interaction, so `Esc`
+/// should clear it as the escape hatch rather than leaving the user trapped.
+pub(crate) fn is_armed_interaction(input: &str) -> bool {
+    armed_interaction(input).is_some()
+}
+
+/// The persistent hint shown while the composer holds an armed interaction: what
+/// Enter will do and to which message, plus the `Esc` escape hatch. Recomputed
+/// from the composer text and the selected row at render time (not stored as a
+/// one-shot status a later event would overwrite), so the armed state stays
+/// visible until the command is sent or cleared. `None` when not armed.
+pub(crate) fn armed_interaction_hint(input: &str, row: Option<&TimelineRow>) -> Option<String> {
+    let armed = armed_interaction(input)?;
+    let target = match row {
+        Some(row) => timeline_target_label(row),
+        None => "the selected message".to_owned(),
+    };
+    Some(format!(
+        "{} {target} — {}, Esc clears",
+        armed.verb, armed.action
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3091,11 +3155,11 @@ mod timeline {
         ])
     }
 
-    /// The `R`-accelerator status line naming the reply target:
-    /// `replying to <name>: "<first 30 chars>"`. Mirrors `timeline_reply_line`'s
-    /// clip and terminal-control stripping; the author falls back to a shortened
-    /// sender id when the row carries no display name.
-    pub(crate) fn reply_target_status(row: &TimelineRow) -> String {
+    /// `<name>: "<first 30 chars>"` for a timeline row: the sender's display name
+    /// (falling back to a shortened id) and a clipped, terminal-control-stripped
+    /// body preview. Shared by the reply status line and the armed-interaction
+    /// hint so they name the target identically.
+    pub(crate) fn timeline_target_label(row: &TimelineRow) -> String {
         let name = match row.from_display_name.as_deref() {
             Some(name) if !name.is_empty() => terminal_safe_text(name),
             _ => terminal_safe_text(&shorten(&row.from, 12)),
@@ -3107,10 +3171,18 @@ mod timeline {
         };
         let clipped = body.chars().take(30).collect::<String>();
         if body.chars().count() > 30 {
-            format!("replying to {name}: \"{clipped}...\"")
+            format!("{name}: \"{clipped}...\"")
         } else {
-            format!("replying to {name}: \"{clipped}\"")
+            format!("{name}: \"{clipped}\"")
         }
+    }
+
+    /// The `R`-accelerator status line naming the reply target:
+    /// `replying to <name>: "<first 30 chars>"`. Mirrors `timeline_reply_line`'s
+    /// clip and terminal-control stripping; the author falls back to a shortened
+    /// sender id when the row carries no display name.
+    pub(crate) fn reply_target_status(row: &TimelineRow) -> String {
+        format!("replying to {}", timeline_target_label(row))
     }
 
     /// The reactions line rendered below a message: yellow `<emoji> <count>` pairs
