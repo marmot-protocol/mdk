@@ -546,9 +546,11 @@ Main view controls:
   message (and pin to the bottom), `g`/`Home` to the oldest. New messages stay pinned to the bottom while you are at
   the newest message and hold your position when you have scrolled up. Scrolling past the oldest loaded message loads
   the previous page of history. `i` or `Enter` focuses the composer.
-- Messages, on the selected message: `r` reacts (it prefills `/react ` in the composer, so `Enter` sends the default
+- Messages, on the selected message: `r` reacts (it prefills `/react` followed by a space in the composer, so
+  `Enter` sends the default
   `+` and typing an emoji first customizes it); `u` removes your own reaction immediately; `d` deletes your own
-  message (it prefills `/delete`, so `Enter` is the visible confirmation); `R` replies (it prefills `/reply ` and
+  message (it prefills `/delete`, so `Enter` is the visible confirmation); `R` replies (it prefills `/reply`
+  followed by a space and
   shows the reply target on the status line, so you type the reply and `Enter` sends it). Counts update live in both
   directions from the timeline projection; the list is not reloaded, and a sent reply upserts optimistically the same
   way a plain send does. The `r`, `d`, and `R` prefills are skipped when the composer already holds a draft, so an

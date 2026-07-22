@@ -9,7 +9,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
-- TUI: `R` on the selected message replies to it. It prefills `/reply ` in the composer (draft-protected like the `r`
+- TUI: `R` on the selected message replies to it. It prefills `/reply` followed by a space in the composer
+  (draft-protected like the `r`
   and `d` accelerators) and names the reply target on the status line; you type the reply and `Enter` sends it. Also
   available as the `/reply <text>` slash command. The target resolves at submit against the selected row (a clear
   status-line error when nothing is selected), the send runs `messages send --group <loaded-group> --reply-to
@@ -91,7 +92,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   existing `media download --json` `output_path` is passed via `--output`).
 - TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
   `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
-  accelerators `r` (prefills `/react `), `u` (removes your reaction immediately), and `d` (prefills `/delete`) drive
+  accelerators `r` (prefills `/react` followed by a space), `u` (removes your reaction immediately), and `d`
+  (prefills `/delete`) drive
   them from the messages pane. Reaction and deletion results fold in from the timeline projection, so the list is not
   reloaded on success. `/delete` is refused for messages you did not send, and `/retry` takes an event id rather than
   acting on the selection because timeline rows carry no per-message failed-send state. No JSON response shapes
