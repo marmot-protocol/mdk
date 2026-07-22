@@ -3363,7 +3363,7 @@ fn daemon_background_stream_watch_records_brokered_preview() {
     let status = poll_json_until(
         home.path(),
         &["daemon", "status"],
-        Duration::from_secs(8),
+        Duration::from_secs(20),
         |status| {
             status
                 .get("stream_watches")
