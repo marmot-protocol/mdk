@@ -2,10 +2,17 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{HarnessError, Result};
 
-pub(crate) fn parse_repo_picker(text: &str) -> Option<(String, String)> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RepoPicker {
+    Absent,
+    Invalid,
+    Valid { path: String, prompt: String },
+}
+
+pub(crate) fn parse_repo_picker(text: &str) -> RepoPicker {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('/') {
-        return None;
+        return RepoPicker::Absent;
     }
 
     let rest = &trimmed[1..];
@@ -16,21 +23,24 @@ pub(crate) fn parse_repo_picker(text: &str) -> Option<(String, String)> {
         .unwrap_or(rest.len());
     let path = &rest[..end];
     if path.is_empty() {
-        return None;
+        return RepoPicker::Invalid;
     }
     for segment in path.split('/') {
         if segment.is_empty() || matches!(segment, "." | "..") {
-            return None;
+            return RepoPicker::Invalid;
         }
         if !segment
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         {
-            return None;
+            return RepoPicker::Invalid;
         }
     }
 
-    Some((path.to_owned(), rest[end..].trim_start().to_owned()))
+    RepoPicker::Valid {
+        path: path.to_owned(),
+        prompt: rest[end..].trim_start().to_owned(),
+    }
 }
 
 pub(crate) async fn resolve_repo(name: &str, home: &Path) -> Result<PathBuf> {
@@ -41,7 +51,12 @@ pub(crate) async fn resolve_repo(name: &str, home: &Path) -> Result<PathBuf> {
     let home_canonical = tokio::fs::canonicalize(home)
         .await
         .map_err(|_| repo_error("Cannot read $HOME."))?;
-    if canonical == home_canonical || !canonical.starts_with(&home_canonical) {
+    if canonical == home_canonical {
+        return Err(repo_error(format!(
+            "Repo ~/{name} resolves to $HOME; refusing."
+        )));
+    }
+    if !canonical.starts_with(&home_canonical) {
         return Err(repo_error(format!(
             "Repo ~/{name} resolves outside $HOME; refusing."
         )));
@@ -88,7 +103,10 @@ mod tests {
     fn parse_repo_picker_matches_bare_name() {
         assert_eq!(
             parse_repo_picker("/whitenoise"),
-            Some(("whitenoise".to_owned(), String::new()))
+            RepoPicker::Valid {
+                path: "whitenoise".to_owned(),
+                prompt: String::new(),
+            }
         );
     }
 
@@ -96,7 +114,10 @@ mod tests {
     fn parse_repo_picker_matches_name_with_rest() {
         assert_eq!(
             parse_repo_picker("/whitenoise fix the build"),
-            Some(("whitenoise".to_owned(), "fix the build".to_owned()))
+            RepoPicker::Valid {
+                path: "whitenoise".to_owned(),
+                prompt: "fix the build".to_owned(),
+            }
         );
     }
 
@@ -104,35 +125,50 @@ mod tests {
     fn parse_repo_picker_matches_nested_path() {
         assert_eq!(
             parse_repo_picker("/projects/mdk"),
-            Some(("projects/mdk".to_owned(), String::new()))
+            RepoPicker::Valid {
+                path: "projects/mdk".to_owned(),
+                prompt: String::new(),
+            }
         );
         assert_eq!(
             parse_repo_picker("/projects/mdk fix the build"),
-            Some(("projects/mdk".to_owned(), "fix the build".to_owned()))
+            RepoPicker::Valid {
+                path: "projects/mdk".to_owned(),
+                prompt: "fix the build".to_owned(),
+            }
         );
     }
 
     #[test]
     fn parse_repo_picker_rejects_bare_slash_or_empty_segments() {
-        assert_eq!(parse_repo_picker("/"), None);
-        assert_eq!(parse_repo_picker("//whitenoise"), None);
-        assert_eq!(parse_repo_picker("/whitenoise/"), None);
-        assert_eq!(parse_repo_picker("/whitenoise//subdir"), None);
+        assert_eq!(parse_repo_picker("/"), RepoPicker::Invalid);
+        assert_eq!(parse_repo_picker("//whitenoise"), RepoPicker::Invalid);
+        assert_eq!(parse_repo_picker("/whitenoise/"), RepoPicker::Invalid);
+        assert_eq!(
+            parse_repo_picker("/whitenoise//subdir"),
+            RepoPicker::Invalid
+        );
     }
 
     #[test]
     fn parse_repo_picker_rejects_dot_segments() {
-        assert_eq!(parse_repo_picker("/."), None);
-        assert_eq!(parse_repo_picker("/.."), None);
-        assert_eq!(parse_repo_picker("/projects/.."), None);
-        assert_eq!(parse_repo_picker("/projects/./mdk"), None);
-        assert_eq!(parse_repo_picker("/../etc"), None);
+        assert_eq!(parse_repo_picker("/."), RepoPicker::Invalid);
+        assert_eq!(parse_repo_picker("/.."), RepoPicker::Invalid);
+        assert_eq!(parse_repo_picker("/projects/.."), RepoPicker::Invalid);
+        assert_eq!(parse_repo_picker("/projects/./mdk"), RepoPicker::Invalid);
+        assert_eq!(parse_repo_picker("/../etc"), RepoPicker::Invalid);
+    }
+
+    #[test]
+    fn parse_repo_picker_rejects_invalid_characters() {
+        assert_eq!(parse_repo_picker("/projects/mdk!"), RepoPicker::Invalid);
+        assert_eq!(parse_repo_picker("/projects/🦀"), RepoPicker::Invalid);
     }
 
     #[test]
     fn parse_repo_picker_ignores_non_picker_text() {
-        assert_eq!(parse_repo_picker("hello"), None);
-        assert_eq!(parse_repo_picker(" hello"), None);
+        assert_eq!(parse_repo_picker("hello"), RepoPicker::Absent);
+        assert_eq!(parse_repo_picker(" hello"), RepoPicker::Absent);
     }
 
     #[tokio::test]
@@ -181,6 +217,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let err = resolve_repo(".", home.path()).await.unwrap_err();
         assert_eq!(err.privacy_safe_kind(), "config");
+        assert_eq!(err.to_string(), "Repo ~/. resolves to $HOME; refusing.");
     }
 
     #[cfg(unix)]

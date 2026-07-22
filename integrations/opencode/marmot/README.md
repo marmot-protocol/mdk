@@ -120,7 +120,8 @@ Examples:
 
 When the message is only the picker, `wn-opencode` stores the workdir and asks
 for the next prompt. Symlinks that resolve outside `$HOME` are rejected after
-canonicalization.
+canonicalization. Picker-looking messages with invalid segments are rejected
+and are not forwarded to OpenCode as prompts.
 
 ## Security Notes
 

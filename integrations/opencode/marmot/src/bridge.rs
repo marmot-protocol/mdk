@@ -14,7 +14,7 @@ use crate::config::{Config, dirs_home};
 use crate::control::ControlClient;
 use crate::error::{HarnessError, Result};
 use crate::opencode::{Invocation, Outcome, RunFailure, RunnerEvent};
-use crate::repo_picker::{parse_repo_picker, resolve_repo, validate_session_cwd};
+use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{SessionRecord, SessionStore};
 
 pub(crate) const TRACE_TARGET: &str = "wn_opencode";
@@ -600,8 +600,21 @@ async fn resolve_cwd_and_prompt(
         return Ok(Some((cwd, inbound.text.clone())));
     }
 
-    let Some((name, rest)) = parse_repo_picker(&inbound.text) else {
-        return Ok(Some((dirs_home(), inbound.text.clone())));
+    let (name, rest) = match parse_repo_picker(&inbound.text) {
+        RepoPicker::Absent => return Ok(Some((dirs_home(), inbound.text.clone()))),
+        RepoPicker::Invalid => {
+            send_reply(
+                ctx,
+                &inbound.account_ref,
+                &inbound.group_ref,
+                &inbound.message_ref,
+                "[wn-opencode] Invalid workdir picker. Use /<path> with non-empty path segments containing only ASCII letters, digits, '.', '_', or '-'. Do not use '.' or '..' segments.",
+                0,
+            )
+            .await?;
+            return Ok(None);
+        }
+        RepoPicker::Valid { path, prompt } => (path, prompt),
     };
     let cwd = match resolve_repo(&name, &dirs_home()).await {
         Ok(cwd) => cwd,
