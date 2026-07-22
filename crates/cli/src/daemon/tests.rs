@@ -89,6 +89,39 @@ fn daemon_pid_and_log_writers_create_private_files() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn daemon_socket_parent_rejects_symlink_without_chmodding_target() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("target");
+    let dev = home.path().join("dev");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&target, &dev).unwrap();
+
+    prepare_socket_dir(&dev, home.path()).expect_err("symlinked daemon parent must be rejected");
+
+    assert_eq!(
+        target.metadata().unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_socket_parent_rejects_group_writable_custom_directory() {
+    let home = tempfile::tempdir().expect("home");
+    let custom_root = tempfile::tempdir().expect("custom root");
+    let parent = custom_root.path().join("shared");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    prepare_socket_dir(&parent, home.path())
+        .expect_err("same-UID daemon must reject group-writable custom parent");
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn daemon_socket_is_owner_only_after_bind() {

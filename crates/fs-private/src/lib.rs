@@ -21,6 +21,234 @@ pub const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Highest meaningful permission value (`suid|sgid|sticky` + `rwxrwxrwx`).
 const MAX_MODE: u32 = 0o7777;
 
+/// How [`prepare_directory_path`] handles a leaf directory that already
+/// exists.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistingDirectoryMode {
+    /// Leave an externally managed directory's mode unchanged.
+    Preserve,
+    /// Apply the configured mode through the opened directory descriptor.
+    Enforce,
+}
+
+/// An opened directory returned by [`prepare_directory_path`]. Keeping this
+/// value alive keeps the verified leaf open while a caller creates an artifact
+/// beneath it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct PreparedDirectory {
+    _directory: std::fs::File,
+    mode: u32,
+    uid: libc::uid_t,
+    created: bool,
+}
+
+#[cfg(unix)]
+impl PreparedDirectory {
+    #[must_use]
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn uid(&self) -> libc::uid_t {
+        self.uid
+    }
+
+    #[must_use]
+    pub fn was_created(&self) -> bool {
+        self.created
+    }
+}
+
+/// Open or create every component of `path` relative to directory
+/// descriptors, refusing symlinks at every step.
+///
+/// Missing components are created at `mode` (subject only to a temporarily
+/// more-restrictive umask) and immediately brought to the requested mode via
+/// `fchmod`. Existing ancestors are never chmodded. The leaf follows `policy`,
+/// allowing owned directories to be enforced while externally managed socket
+/// parents are preserved and validated by the caller.
+#[cfg(unix)]
+pub fn prepare_directory_path(
+    path: &Path,
+    mode: u32,
+    policy: ExistingDirectoryMode,
+) -> io::Result<PreparedDirectory> {
+    use std::ffi::{CString, OsString};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    if mode > MAX_MODE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory mode is out of range",
+        ));
+    }
+    let platform_mode = libc::mode_t::try_from(mode).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory mode is unsupported on this platform",
+        )
+    })?;
+
+    // macOS exposes stable root aliases such as `/var -> private/var` and
+    // `/tmp -> private/tmp`. Resolve only such a first, root-owned component;
+    // every caller-controlled component below it is still opened with
+    // `O_NOFOLLOW`. Without this narrow normalization, ordinary temp-backed
+    // homes could never use the descriptor walk.
+    let normalized_path = resolve_root_owned_alias(path)?;
+    let path = normalized_path.as_deref().unwrap_or(path);
+
+    let mut components = Vec::<OsString>::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => components.push(component.to_owned()),
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory path must not contain parent traversal",
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported directory path prefix",
+                ));
+            }
+        }
+    }
+    if components.is_empty() && policy == ExistingDirectoryMode::Enforce {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to change the current or root directory mode",
+        ));
+    }
+
+    let start = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let mut options = OpenOptions::new();
+    use std::os::unix::fs::OpenOptionsExt;
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut current: OwnedFd = options.open(start)?.into();
+    let mut leaf_created = false;
+
+    for (index, component) in components.iter().enumerate() {
+        let component = CString::new(component.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory component contains a NUL byte",
+            )
+        })?;
+        let mut created = false;
+        let next = match open_directory_at(current.as_raw_fd(), &component) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let result = unsafe {
+                    libc::mkdirat(current.as_raw_fd(), component.as_ptr(), platform_mode)
+                };
+                if result == 0 {
+                    created = true;
+                } else {
+                    let mkdir_error = io::Error::last_os_error();
+                    if mkdir_error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(mkdir_error);
+                    }
+                }
+                open_directory_at(current.as_raw_fd(), &component)?
+            }
+            Err(error) => return Err(error),
+        };
+        if created {
+            fchmod_directory(next.as_raw_fd(), platform_mode)?;
+        }
+        if index + 1 == components.len() {
+            leaf_created = created;
+        }
+        current = next;
+    }
+
+    if policy == ExistingDirectoryMode::Enforce && !leaf_created {
+        fchmod_directory(current.as_raw_fd(), platform_mode)?;
+    }
+
+    let directory = std::fs::File::from(current);
+    let metadata = directory.metadata()?;
+    let prepared = PreparedDirectory {
+        mode: metadata.mode() & MAX_MODE,
+        uid: metadata.uid(),
+        created: leaf_created,
+        _directory: directory,
+    };
+
+    fn open_directory_at(parent: libc::c_int, component: &CString) -> io::Result<OwnedFd> {
+        let descriptor = unsafe {
+            libc::openat(
+                parent,
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    }
+
+    fn fchmod_directory(descriptor: libc::c_int, mode: libc::mode_t) -> io::Result<()> {
+        if unsafe { libc::fchmod(descriptor, mode) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn resolve_root_owned_alias(path: &Path) -> io::Result<Option<std::path::PathBuf>> {
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Component;
+
+        if !path.is_absolute() {
+            return Ok(None);
+        }
+        let mut components = path.components();
+        if components.next() != Some(Component::RootDir) {
+            return Ok(None);
+        }
+        let Some(Component::Normal(first)) = components.next() else {
+            return Ok(None);
+        };
+        let alias = Path::new("/").join(first);
+        let metadata = match std::fs::symlink_metadata(&alias) {
+            Ok(metadata) if metadata.file_type().is_symlink() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let root = std::fs::metadata("/")?;
+        if metadata.uid() != 0 || root.uid() != 0 || root.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing non-root-owned directory alias",
+            ));
+        }
+        let mut resolved = std::fs::canonicalize(&alias)?;
+        for component in components {
+            resolved.push(component.as_os_str());
+        }
+        Ok(Some(resolved))
+    }
+
+    Ok(prepared)
+}
+
 /// Configure `options` to create files owner-only (0600). No-op off Unix.
 pub fn set_private_file_mode(options: &mut OpenOptions) {
     #[cfg(unix)]
@@ -413,6 +641,59 @@ mod unix_tests {
         symlink(&target, &link).unwrap();
 
         assert!(create_dir_all_private(&link).is_err());
+        assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn prepare_directory_path_preserves_or_enforces_existing_leaf_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let preserved = prepare_directory_path(&path, 0o700, ExistingDirectoryMode::Preserve)
+            .expect("preserve existing directory");
+        assert!(!preserved.was_created());
+        assert_eq!(preserved.mode() & 0o777, 0o750);
+        drop(preserved);
+
+        let enforced = prepare_directory_path(&path, 0o700, ExistingDirectoryMode::Enforce)
+            .expect("enforce owned directory mode");
+        assert_eq!(enforced.mode() & 0o777, 0o700);
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    #[test]
+    fn prepare_directory_path_creates_each_component_at_requested_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("first");
+        let leaf = parent.join("second");
+        let prepared = prepare_directory_path(&leaf, 0o770, ExistingDirectoryMode::Preserve)
+            .expect("create descriptor-relative directory path");
+        assert!(prepared.was_created());
+        assert_eq!(prepared.mode() & 0o777, 0o770);
+        assert_eq!(mode_of(&parent), 0o770);
+        assert_eq!(mode_of(&leaf), 0o770);
+    }
+
+    #[test]
+    fn prepare_directory_path_rejects_symlinks_in_any_component() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            prepare_directory_path(&link.join("child"), 0o700, ExistingDirectoryMode::Enforce)
+                .is_err()
+        );
+        assert!(!target.join("child").exists());
+        assert_eq!(mode_of(&target), 0o755);
+        assert!(prepare_directory_path(&link, 0o700, ExistingDirectoryMode::Enforce).is_err());
         assert_eq!(mode_of(&target), 0o755);
     }
 

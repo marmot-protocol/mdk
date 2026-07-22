@@ -125,16 +125,30 @@ pub(crate) async fn run_daemon_command(cli: Cli, command: DaemonCommand) -> CliO
     }
 }
 
-pub(crate) fn prepare_socket_dir(parent: &Path, home: &Path) -> std::io::Result<()> {
-    let existed = parent.try_exists()?;
-    std::fs::create_dir_all(parent)?;
-    if !existed || is_daemon_owned_socket_dir(parent, home) {
-        std::fs::set_permissions(
-            parent,
-            std::fs::Permissions::from_mode(DAEMON_SOCKET_DIR_MODE),
-        )?;
+pub(crate) fn prepare_socket_dir(
+    parent: &Path,
+    home: &Path,
+) -> std::io::Result<fs_private::PreparedDirectory> {
+    let policy = if is_daemon_owned_socket_dir(parent, home) {
+        fs_private::ExistingDirectoryMode::Enforce
+    } else {
+        fs_private::ExistingDirectoryMode::Preserve
+    };
+    let prepared = fs_private::prepare_directory_path(parent, DAEMON_SOCKET_DIR_MODE, policy)?;
+    if prepared.mode() & 0o007 != 0 || prepared.mode() & 0o020 != 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "daemon socket directory has unsafe on-disk permissions",
+        ));
     }
-    Ok(())
+    let effective_uid = current_effective_uid();
+    if prepared.uid() != effective_uid && prepared.uid() != 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "daemon socket directory must be owned by the service user or root",
+        ));
+    }
+    Ok(prepared)
 }
 
 pub(crate) fn is_daemon_owned_socket_dir(parent: &Path, home: &Path) -> bool {

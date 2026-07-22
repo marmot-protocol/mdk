@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::process::CommandExt;
 
 use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
 use clap::Parser;
@@ -149,9 +149,10 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .or_else(|| discovery_relays.first().cloned())
         .or_else(|| default_account_relays.first().cloned())
         .ok_or(crate::WnError::MissingRelay)?;
-    if let Some(parent) = socket.parent() {
-        prepare_socket_dir(parent, &home)?;
-    }
+    let _socket_parent_guard = socket
+        .parent()
+        .map(|parent| prepare_socket_dir(parent, &home))
+        .transpose()?;
     if let Some(parent) = pid_path.parent() {
         create_private_dir_all(parent)?;
     }

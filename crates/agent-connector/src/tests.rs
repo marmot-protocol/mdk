@@ -673,6 +673,42 @@ async fn connector_socket_bind_preserves_preexisting_custom_parent_mode() {
 }
 
 #[tokio::test]
+async fn connector_socket_bind_rejects_symlinked_parent_without_chmodding_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("dev");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&target, &link).unwrap();
+
+    let error = bind_connector_socket_with_mode(&link.join("wn-agent.sock"), 0o700, 0o600)
+        .expect_err("symlinked socket parent must be rejected");
+
+    assert_eq!(error.code(), "io_error");
+    assert_eq!(
+        target.metadata().unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!target.join("wn-agent.sock").exists());
+}
+
+#[tokio::test]
+async fn connector_socket_bind_rejects_unconfigured_group_writable_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_parent = dir.path().join("shared");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    let error = bind_connector_socket_with_mode(&shared_parent.join("wn-agent.sock"), 0o700, 0o600)
+        .expect_err("unexpected group write access must be rejected");
+
+    assert_eq!(error.code(), "io_error");
+    assert!(!shared_parent.join("wn-agent.sock").exists());
+}
+
+#[tokio::test]
 async fn connector_control_plane_requires_token_for_group_shared_modes() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");
