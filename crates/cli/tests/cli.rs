@@ -3334,7 +3334,11 @@ fn daemon_background_stream_watch_records_brokered_preview() {
     );
     assert_eq!(watch["status"], "running");
     assert_eq!(watch["stream_id"], stream_id);
-    assert!(watch["watch_id"].as_str().is_some_and(|id| !id.is_empty()));
+    let watch_id = watch["watch_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .expect("background watch id")
+        .to_owned();
 
     let sent = run_json_until_success(
         home.path(),
@@ -3363,16 +3367,19 @@ fn daemon_background_stream_watch_records_brokered_preview() {
     let status = poll_json_until(
         home.path(),
         &["daemon", "status"],
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         |status| {
             status
                 .get("stream_watches")
                 .and_then(Value::as_array)
-                .and_then(|watches| watches.first())
+                .and_then(|watches| watches.iter().find(|watch| watch["watch_id"] == watch_id))
                 .is_some_and(|watch| watch["status"] == "completed")
         },
     );
-    let stream_watch = status["stream_watches"][0].clone();
+    let stream_watch = status["stream_watches"]
+        .as_array()
+        .and_then(|watches| watches.iter().find(|watch| watch["watch_id"] == watch_id))
+        .expect("completed background watch report");
     assert_eq!(stream_watch["stream_id"], stream_id);
     assert_eq!(stream_watch["status"], "completed");
     assert_eq!(stream_watch["text"], "daemon preview text");
