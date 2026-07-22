@@ -1442,7 +1442,9 @@ fn parent_invalidation_keeps_parent_as_tombstone_and_reply_preview() {
         .iter()
         .find(|m| m.message_id_hex == "reply")
         .expect("reply kept");
-    assert!(reply.reply_preview.is_some());
+    let preview = reply.reply_preview.as_ref().expect("reply preview");
+    assert_eq!(preview.invalidation_status.as_deref(), Some("LosingBranch"));
+    assert_eq!(preview.plaintext, "the original");
 }
 
 #[test]

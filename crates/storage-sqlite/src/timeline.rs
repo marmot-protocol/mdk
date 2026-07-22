@@ -129,6 +129,9 @@ pub struct TimelineReplyPreview {
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub deleted: bool,
+    /// Set when convergence invalidated the previewed message. Content remains
+    /// available so the application can choose whether to show or hide it.
+    pub invalidation_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2447,7 +2450,8 @@ fn load_reply_previews(
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch
+                "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch,
+                        invalidation_status
                  FROM message_timeline
                  WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
             );
@@ -2493,6 +2497,7 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
         source_epoch: row
             .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),
+        invalidation_status: row.get(8)?,
     })
 }
 

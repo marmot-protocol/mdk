@@ -210,6 +210,7 @@ mod tests {
                 media: None,
                 agent_text_stream: None,
                 deleted: false,
+                invalidation_status: Some("LosingBranch".to_owned()),
             }),
             media: Some(serde_json::json!({
                 "imeta": [["imeta", "url https://blob.example/file"]]
