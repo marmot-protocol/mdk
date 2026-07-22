@@ -5022,13 +5022,10 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
     .unwrap();
 
     // The bootstrap relay must NOT have the profile (outbox ignored it).
-    app.refresh_profile_for_account_id(&id, vec![endpoint(&other_url)])
-        .await
-        .unwrap();
     let from_other = app
-        .directory_entry_for_account_id(&id)
+        .fetch_current_user_profile_for_account_id(&id, vec![endpoint(&other_url)])
+        .await
         .unwrap()
-        .and_then(|entry| entry.profile)
         .and_then(|profile| profile.name);
     assert_ne!(
         from_other.as_deref(),
@@ -5037,13 +5034,10 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
     );
 
     // The account's NIP-65 (home) relay SHOULD have it.
-    app.refresh_profile_for_account_id(&id, vec![endpoint(&home_url)])
-        .await
-        .unwrap();
     let from_home = app
-        .directory_entry_for_account_id(&id)
+        .fetch_current_user_profile_for_account_id(&id, vec![endpoint(&home_url)])
+        .await
         .unwrap()
-        .and_then(|entry| entry.profile)
         .and_then(|profile| profile.name);
     assert_eq!(
         from_home.as_deref(),
