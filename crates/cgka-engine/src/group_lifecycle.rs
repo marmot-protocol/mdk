@@ -27,10 +27,13 @@ use cgka_traits::group::{Group, Member};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::AuditEventKind;
 use openmls::group::{MlsGroup, MlsGroupCreateConfig};
-use openmls::prelude::{BasicCredential, Extension, Extensions, MlsMessageBodyIn, MlsMessageIn};
+use openmls::prelude::{
+    BasicCredential, CreationFromExternalError, Extension, Extensions, MlsMessageBodyIn,
+    MlsMessageIn, WelcomeError,
+};
 use openmls::treesync::Node;
 use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
@@ -62,6 +65,21 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
             | EngineError::NotGroupAdmin { .. }
             | EngineError::WelcomeAlreadyProcessed
     )
+}
+
+fn classify_openmls_welcome_error<StorageError: std::fmt::Debug>(
+    error: WelcomeError<StorageError>,
+) -> EngineError {
+    match error {
+        WelcomeError::StorageError(_)
+        | WelcomeError::PublicGroupError(CreationFromExternalError::WriteToStorageError(_)) => {
+            // OpenMLS storage errors are backend-specific and cannot be converted
+            // into the Marmot storage error type generically. Keep them retryable
+            // without leaking backend details into a user-visible error string.
+            EngineError::Backend("OpenMLS Welcome storage failure".into())
+        }
+        _ => EngineError::InvalidWelcome,
+    }
 }
 
 /// MLS exporter input for the Nostr kind-445 group-event encryption key:
@@ -507,14 +525,17 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::WelcomeAlreadyProcessed);
         }
 
-        let result = self.do_join_peeled_welcome(welcome_msg, peeled).await;
+        let result = self
+            .do_join_peeled_welcome(welcome_msg, peeled, content_id.clone())
+            .await;
         match &result {
-            Ok(_) => {
-                self.storage.put_ingress_dedup_marker(&content_id)?;
-            }
+            Ok(_) => {}
             Err(error) if terminal_welcome_error(error) => {
-                self.storage.put_ingress_dedup_marker(&welcome_id)?;
-                self.storage.put_ingress_dedup_marker(&content_id)?;
+                self.storage.with_transaction(|storage| {
+                    storage.put_ingress_dedup_marker(&welcome_id)?;
+                    storage.put_ingress_dedup_marker(&content_id)?;
+                    Ok::<_, EngineError>(())
+                })?;
             }
             Err(_) => {}
         }
@@ -525,6 +546,7 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         welcome_msg: TransportMessage,
         peeled: cgka_traits::ingest::PeeledMessage,
+        content_id: MessageId,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
         let welcome_bytes = match peeled.content {
@@ -554,9 +576,11 @@ impl<S: StorageProvider> Engine<S> {
         //
         // Use the two-step OpenMLS welcome API so we can read the target group
         // id and clear stale local OpenMLS state BEFORE the join is staged.
-        // `ProcessedWelcome::new_from_welcome` decrypts the GroupInfo (consuming
-        // the KeyPackage init key material — OpenMLS contract, so it runs
-        // exactly once) and exposes the group id via the unverified group info.
+        // `ProcessedWelcome::new_from_welcome` decrypts the GroupInfo and
+        // consumes the KeyPackage init key material. It therefore belongs in
+        // the same transaction as every later join write: a rejected or
+        // backend-failed attempt must restore the KeyPackage so the identical
+        // Welcome remains retryable.
         // If leftover live OpenMLS state survives for this group id (a re-add
         // after a prior removal, or state that outlived a missed removal commit
         // / restart) AND we are not currently an active member, clear ONLY that
@@ -575,128 +599,137 @@ impl<S: StorageProvider> Engine<S> {
         // only for the group being re-joined. We never clear a group we are
         // still an active member of.
         let join_config = join_config(self.max_past_epochs);
-        let processed = {
-            let provider =
-                EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-            openmls::group::ProcessedWelcome::new_from_welcome(&provider, &join_config, welcome)
-                .map_err(|_| EngineError::InvalidWelcome)?
-        };
-        let group_id = GroupId::new(
-            processed
-                .unverified_group_info()
-                .group_id()
-                .as_slice()
-                .to_vec(),
-        );
-        // The first provider borrow has ended; the clear takes `&mut self`. Done
-        // before the staged welcome is built so `into_staged_welcome` does not
-        // hit `GroupAlreadyExists`.
-        if self.local_state_is_stale_for_rejoin(&group_id) {
-            self.clear_live_openmls_group(&group_id)?;
-        }
         // Building a group from a staged Welcome performs the same multi-row
-        // OpenMLS store as group creation. Keep that store, every Marmot
-        // post-check, the discoverable group record, capability cache, and the
-        // durable Welcome disposition in one transaction. A rejected Welcome
-        // must roll the freshly stored OpenMLS rows back instead of leaving an
-        // MLS-only orphan that blocks a corrected re-invite.
-        let (mls_group, welcome_sender_id) = self.storage.with_transaction(|storage| {
-            let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-            let staged = processed
-                .into_staged_welcome(&provider, None)
-                .map_err(|_| EngineError::InvalidWelcome)?;
-            let welcome_sender = staged
-                .welcome_sender()
-                .map_err(|_| EngineError::InvalidWelcome)?;
-            let welcome_sender_id = crate::identity::validated_member_id_of_leaf(welcome_sender)?;
-            let mls_group = staged
-                .into_group(&provider)
-                .map_err(|_| EngineError::InvalidWelcome)?;
+        // OpenMLS store as group creation. Keep KeyPackage consumption, stale
+        // live-state clearing, that store, every Marmot post-check, the
+        // discoverable group record, capability cache, and both durable
+        // Welcome dispositions in one transaction.
+        let (group_id, mls_group, welcome_sender_id) =
+            self.storage.with_transaction(|storage| {
+                let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                let processed = openmls::group::ProcessedWelcome::new_from_welcome(
+                    &provider,
+                    &join_config,
+                    welcome,
+                )
+                .map_err(classify_openmls_welcome_error)?;
+                let group_id = GroupId::new(
+                    processed
+                        .unverified_group_info()
+                        .group_id()
+                        .as_slice()
+                        .to_vec(),
+                );
 
-            debug_assert_eq!(
-                group_id,
-                GroupId::new(mls_group.group_id().as_slice().to_vec())
-            );
+                let local_state_is_stale = match storage.get_group(&group_id) {
+                    Ok(group) => !group
+                        .members
+                        .iter()
+                        .any(|member| &member.id == self.identity.self_id()),
+                    Err(cgka_traits::storage::StorageError::NotFound) => false,
+                    Err(error) => return Err(EngineError::Storage(error)),
+                };
+                if local_state_is_stale {
+                    self.clear_live_openmls_group_on_storage(storage, &group_id)?;
+                }
 
-            // 5b. Reject the Welcome if any member leaf carries an invalid
-            // Marmot credential identity (foundation/identity.md,
-            // joining.md:65).
-            validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+                let staged = processed
+                    .into_staged_welcome(&provider, None)
+                    .map_err(classify_openmls_welcome_error)?;
+                let welcome_sender = staged
+                    .welcome_sender()
+                    .map_err(|_| EngineError::InvalidWelcome)?;
+                let welcome_sender_id =
+                    crate::identity::validated_member_id_of_leaf(welcome_sender)?;
+                let mls_group = staged
+                    .into_group(&provider)
+                    .map_err(classify_openmls_welcome_error)?;
 
-            // 5c. Reject active required capabilities this client cannot
-            // apply, including required agent-stream roles.
-            let mut group_required =
-                crate::capability_manager::required_capabilities_from_group(&mls_group);
-            crate::message_processor::merge_capabilities(
-                &mut group_required,
-                &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
-            );
-            let had = crate::capabilities::self_supported_capabilities(
-                &self.registry,
-                self.ciphersuite,
-                &self.supported_app_components,
-            );
-            let missing = group_required.missing_from(&had);
-            if !missing.is_empty() {
-                return Err(EngineError::MissingRequiredCapabilities {
-                    required: Box::new(group_required),
-                    had: Box::new(had),
-                });
-            }
+                debug_assert_eq!(
+                    group_id,
+                    GroupId::new(mls_group.group_id().as_slice().to_vec())
+                );
 
-            // 5d. The authenticated Welcome sender must be an admin.
-            crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+                // 5b. Reject the Welcome if any member leaf carries an invalid
+                // Marmot credential identity (foundation/identity.md,
+                // joining.md:65).
+                validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
 
-            // 5e. Every advertised admin must have a current member leaf.
-            crate::app_components::reject_admins_without_member_leaf(
-                &mls_group,
-                &group_id,
-                &crate::app_components::admins_of_group(&mls_group)?,
-            )
-            .map_err(|error| match error {
-                storage @ EngineError::Storage(_) => storage,
-                _ => EngineError::InvalidWelcome,
-            })?;
+                // 5c. Reject active required capabilities this client cannot
+                // apply, including required agent-stream roles.
+                let mut group_required =
+                    crate::capability_manager::required_capabilities_from_group(&mls_group);
+                crate::message_processor::merge_capabilities(
+                    &mut group_required,
+                    &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
+                );
+                let had = crate::capabilities::self_supported_capabilities(
+                    &self.registry,
+                    self.ciphersuite,
+                    &self.supported_app_components,
+                );
+                let missing = group_required.missing_from(&had);
+                if !missing.is_empty() {
+                    return Err(EngineError::MissingRequiredCapabilities {
+                        required: Box::new(group_required),
+                        had: Box::new(had),
+                    });
+                }
 
-            // 6. Make the committed OpenMLS group discoverable through the
-            // Marmot record and cache this device's capabilities.
-            let mut group_record = Group {
-                id: group_id.clone(),
-                name: String::new(),
-                description: String::new(),
-                epoch: EpochId(mls_group.epoch().as_u64()),
-                members: marmot_members(&mls_group),
-                required_capabilities: crate::capability_manager::required_capabilities_from_group(
+                // 5d. The authenticated Welcome sender must be an admin.
+                crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+
+                // 5e. Every advertised admin must have a current member leaf.
+                crate::app_components::reject_admins_without_member_leaf(
                     &mls_group,
-                ),
-                removed: false,
-                join_epoch: EpochId(mls_group.epoch().as_u64()),
-            };
-            mirror_app_components_into_record(&mls_group, &mut group_record);
-            storage.put_group(&group_record)?;
-            crate::capability_manager::cache_self_capabilities(
-                storage,
-                &group_id,
-                &mls_group,
-                self.identity.self_id(),
-                self.ciphersuite,
-            )?;
+                    &group_id,
+                    &crate::app_components::admins_of_group(&mls_group)?,
+                )
+                .map_err(|error| match error {
+                    storage @ EngineError::Storage(_) => storage,
+                    _ => EngineError::InvalidWelcome,
+                })?;
 
-            // Direct join callers need the same durable dedup disposition as
-            // the transport-ingest path.
-            let payload = StoredMessagePayload::raw_transport(welcome_msg)
-                .encode()
-                .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-            storage.put_message(&MessageRecord {
-                id: welcome_id.clone(),
-                group_id: group_id.clone(),
-                epoch: EpochId(mls_group.epoch().as_u64()),
-                state: MessageState::Processed,
-                payload,
+                // 6. Make the committed OpenMLS group discoverable through the
+                // Marmot record and cache this device's capabilities.
+                let mut group_record = Group {
+                    id: group_id.clone(),
+                    name: String::new(),
+                    description: String::new(),
+                    epoch: EpochId(mls_group.epoch().as_u64()),
+                    members: marmot_members(&mls_group),
+                    required_capabilities:
+                        crate::capability_manager::required_capabilities_from_group(&mls_group),
+                    removed: false,
+                    join_epoch: EpochId(mls_group.epoch().as_u64()),
+                };
+                mirror_app_components_into_record(&mls_group, &mut group_record);
+                storage.put_group(&group_record)?;
+                crate::capability_manager::cache_self_capabilities(
+                    storage,
+                    &group_id,
+                    &mls_group,
+                    self.identity.self_id(),
+                    self.ciphersuite,
+                )?;
+
+                // Direct join callers need the same durable dedup disposition as
+                // the transport-ingest path.
+                let payload = StoredMessagePayload::raw_transport(welcome_msg)
+                    .encode()
+                    .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+                storage.put_message(&MessageRecord {
+                    id: welcome_id.clone(),
+                    group_id: group_id.clone(),
+                    epoch: EpochId(mls_group.epoch().as_u64()),
+                    state: MessageState::Processed,
+                    payload,
+                })?;
+                storage.put_ingress_dedup_marker(&welcome_id)?;
+                storage.put_ingress_dedup_marker(&content_id)?;
+
+                Ok::<_, EngineError>((group_id, mls_group, welcome_sender_id))
             })?;
-
-            Ok::<_, EngineError>((mls_group, welcome_sender_id))
-        })?;
 
         // #740: index this joined group's transport routing id for O(1) inbound
         // resolution (see `Engine::transport_group_id_index`).
@@ -775,23 +808,6 @@ impl<S: StorageProvider> Engine<S> {
 
         self.replay_buffered_messages(&group_id).await?;
         Ok(group_id)
-    }
-
-    /// Whether leftover local state for `group_id` is stale for a fresh join —
-    /// i.e. a Marmot group record exists but the local identity is NOT a member
-    /// of it. True means a re-add Welcome would otherwise restage onto leftover
-    /// state and should tear it down first; false covers both "no local state"
-    /// (a genuine first join) and "we are still an active member" (must NOT be
-    /// torn down). Best-effort: a record that fails to load is treated as not
-    /// stale so the normal join path surfaces any real storage error.
-    fn local_state_is_stale_for_rejoin(&self, group_id: &GroupId) -> bool {
-        match self.storage.get_group(group_id) {
-            Ok(group) => !group
-                .members
-                .iter()
-                .any(|member| &member.id == self.identity.self_id()),
-            Err(_) => false,
-        }
     }
 
     pub(crate) fn do_members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
@@ -1050,5 +1066,30 @@ pub(crate) fn mirror_app_components_into_record(
     }
     if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
         record.required_capabilities.app_components = components;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openmls_welcome_storage_errors_remain_retryable() {
+        let direct = classify_openmls_welcome_error(WelcomeError::StorageError("busy"));
+        assert!(matches!(direct, EngineError::Backend(_)));
+        assert!(!terminal_welcome_error(&direct));
+
+        let nested = classify_openmls_welcome_error(WelcomeError::PublicGroupError(
+            CreationFromExternalError::WriteToStorageError("busy"),
+        ));
+        assert!(matches!(nested, EngineError::Backend(_)));
+        assert!(!terminal_welcome_error(&nested));
+    }
+
+    #[test]
+    fn invalid_openmls_welcome_errors_remain_terminal() {
+        let invalid = classify_openmls_welcome_error(WelcomeError::<&str>::UnableToDecrypt);
+        assert!(matches!(invalid, EngineError::InvalidWelcome));
+        assert!(terminal_welcome_error(&invalid));
     }
 }

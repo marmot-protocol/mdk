@@ -1048,15 +1048,15 @@ impl<S: StorageProvider> Engine<S> {
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every
     /// retained artifact in place.
     ///
-    /// Called when the local member is removed from a group (the inbound
-    /// removal-commit apply paths). It deletes the OpenMLS-owned rows for the
-    /// group — ratchet tree, group context, epoch/message secrets, resumption
-    /// PSKs, own-leaf index/nodes, group state/config, the proposal queue, and
-    /// the current-epoch encryption key pairs — via `MlsGroup::delete`. That is
-    /// enough to stop a later re-add Welcome from failing with
-    /// `GroupAlreadyExists` when OpenMLS stages the fresh join, and to keep
-    /// OpenMLS from stacking the re-join on stale epoch keypairs / message
-    /// secrets / own-leaf index (mdk#557).
+    /// Called inside the authenticated re-join transaction when a removed
+    /// local member receives a fresh Welcome. It deletes the OpenMLS-owned rows
+    /// for the group — ratchet tree, group context, epoch/message secrets,
+    /// resumption PSKs, own-leaf index/nodes, group state/config, the proposal
+    /// queue, and the current-epoch encryption key pairs — via
+    /// `MlsGroup::delete`. That is enough to stop the re-add Welcome from
+    /// failing with `GroupAlreadyExists` when OpenMLS stages the fresh join,
+    /// and to keep OpenMLS from stacking the re-join on stale epoch keypairs /
+    /// message secrets / own-leaf index (mdk#557).
     ///
     /// Crucially it does NOT delete the Marmot `cgka_groups` record, the retained
     /// anchor snapshots, the stored commit/message history, or the convergence
@@ -1074,13 +1074,14 @@ impl<S: StorageProvider> Engine<S> {
     /// group, and the bookkeeping is reset when the group is re-joined.
     ///
     /// No identifiers are logged (observability.md privacy rule).
-    pub(crate) fn clear_live_openmls_group(
-        &mut self,
+    pub(crate) fn clear_live_openmls_group_on_storage(
+        &self,
+        storage_provider: &S,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
-            self.storage.mls_storage(),
+            storage_provider.mls_storage(),
         );
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(

@@ -20,7 +20,7 @@ use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
-use cgka_traits::error::PeelerError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
@@ -381,6 +381,69 @@ fn build_selfremove_client(identity: &[u8]) -> cgka_engine::Engine<SqliteAccount
         .peeler(Box::new(MockPeeler))
         .build()
         .expect("build engine")
+}
+
+/// A backend failure after OpenMLS consumes the joining KeyPackage must roll
+/// the complete Welcome attempt back. The identical transport object remains
+/// retryable and no terminal ingress marker may escape the failed attempt.
+#[tokio::test]
+async fn welcome_record_failure_restores_key_package_for_retry() {
+    let mut alice = build_selfremove_client(b"alice-welcome-atomic");
+    let fault = PutGroupFault::default();
+    let (mut bob, bob_storage) =
+        build_fault_selfremove_client(b"bob-welcome-atomic", fault.clone());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome atomicity".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    fault.arm(1);
+    let failed = bob
+        .join_welcome(welcome.clone())
+        .await
+        .expect_err("injected group-record write must fail the join");
+    assert!(
+        matches!(failed, EngineError::Storage(StorageError::Busy(_))),
+        "storage fault must stay retryable, got {failed:?}"
+    );
+    assert!(
+        !bob_storage.has_ingress_dedup_marker(&welcome.id).unwrap(),
+        "failed attempt must not leave a terminal transport marker"
+    );
+    assert!(
+        matches!(
+            bob_storage.get_group(&group_id),
+            Err(StorageError::NotFound)
+        ),
+        "failed attempt must not leave a discoverable group"
+    );
+
+    let joined = bob
+        .join_welcome(welcome.clone())
+        .await
+        .expect("the identical Welcome must succeed after the transient fault");
+    assert_eq!(joined, group_id);
+    assert!(
+        bob_storage.has_ingress_dedup_marker(&welcome.id).unwrap(),
+        "successful attempt must commit its transport marker"
+    );
 }
 
 /// A `put_group` failure during auto-commit staging must leave no torn group
