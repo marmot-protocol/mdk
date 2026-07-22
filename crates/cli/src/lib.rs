@@ -876,7 +876,14 @@ pub(crate) fn validate_relay_url(relay: impl AsRef<str>) -> Result<String, WnErr
         return Err(WnError::EmptyRelayUrl);
     }
     let parsed = url::Url::parse(relay).map_err(|_| WnError::InvalidRelayUrl(relay.to_owned()))?;
-    if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host().is_none() {
+    let Some(host) = parsed.host() else {
+        return Err(WnError::InvalidRelayUrl(relay.to_owned()));
+    };
+    let scheme_allowed = parsed.scheme() == "wss"
+        || (parsed.scheme() == "ws"
+            && wn_allow_loopback_relays()
+            && cgka_traits::app_components::is_loopback_host(host));
+    if !scheme_allowed {
         return Err(WnError::InvalidRelayUrl(relay.to_owned()));
     }
     Ok(relay.to_owned())
@@ -1608,6 +1615,10 @@ mod tests {
         assert!(matches!(
             relay_endpoints(vec!["mailto:relay@example.com".to_owned()]),
             Err(WnError::InvalidRelayUrl(value)) if value == "mailto:relay@example.com"
+        ));
+        assert!(matches!(
+            resolve_relay(Some("ws://relay.example".to_owned())),
+            Err(WnError::InvalidRelayUrl(value)) if value == "ws://relay.example"
         ));
         assert_eq!(
             resolve_relay(Some(" wss://relay.example/path ".to_owned())).unwrap(),

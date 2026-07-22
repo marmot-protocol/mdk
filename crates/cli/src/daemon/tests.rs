@@ -4,7 +4,6 @@ use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
 };
-use nostr_relay_builder::MockRelay;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -95,8 +94,7 @@ fn daemon_pid_and_log_writers_create_private_files() {
 async fn daemon_socket_is_owner_only_after_bind() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let relay = MockRelay::run().await.expect("start mock relay");
-    let relay_url = relay.url().await.to_string();
+    let relay_url = "wss://relay.example".to_owned();
     let args = DaemonArgs {
         home: Some(home.path().to_path_buf()),
         data_dir: None,
@@ -608,8 +606,7 @@ async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
     // client's Ping/Status/Shutdown request.
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let relay = MockRelay::run().await.expect("start mock relay");
-    let relay_url = relay.url().await.to_string();
+    let relay_url = "wss://relay.example".to_owned();
     let args = DaemonArgs {
         home: Some(home.path().to_path_buf()),
         data_dir: None,

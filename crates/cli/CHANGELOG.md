@@ -50,6 +50,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Public Nostr relay connections now require `wss://`; `ws://` is limited to loopback development relays behind
+  `WN_ALLOW_LOOPBACK_RELAYS`.
 - Received-message chronology and retention now use the MLS-authenticated inner app-event timestamp instead of the
   replayable outer Nostr event timestamp. Runtime, daemon JSON, and MarmotKit surfaces expose that send time alongside
   the device-local observation time.

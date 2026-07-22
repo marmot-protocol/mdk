@@ -65,11 +65,11 @@ pub struct MarmotAppConfig {
     /// an in-process `MockRelay`). A loopback relay URL is VALID
     /// routing/relay-list state, but production MUST NOT open a socket to one;
     /// the relay-safety chokepoint rejects non-public relay hosts before they
-    /// reach the pool. This gate admits loopback only — private/link-local/CGNAT
+    /// reach the pool. Public relays always require `wss://`; this gate admits
+    /// `ws://` only for loopback — private/link-local/CGNAT and public plaintext
     /// relay hosts stay rejected even when it is set. Defaults to `false`; test
     /// harnesses set `true`. Mirrors `allow_loopback_blob_endpoints`; does not
-    /// affect routing-component validity (decode still accepts loopback
-    /// endpoints).
+    /// affect routing-component validity (decode still accepts `ws://`).
     pub allow_loopback_relay_endpoints: bool,
     /// Dev/test override for the convergence settlement quiescence window, in
     /// milliseconds. `None` (the default) uses the protocol-pinned value

@@ -74,6 +74,15 @@ fn nostr_routing_round_trips_canonical_state() {
 }
 
 #[test]
+fn nostr_routing_keeps_plaintext_relays_structurally_representable() {
+    let routing = NostrRoutingV1::new([0x42; 32], vec!["ws://relay.example".into()]).unwrap();
+    assert_eq!(
+        decode_nostr_routing_v1(&encode_nostr_routing_v1(&routing).unwrap()).unwrap(),
+        routing
+    );
+}
+
+#[test]
 fn encrypted_media_policy_round_trips_ordered_endpoints() {
     let policy = EncryptedMediaPolicyV1::blossom_default(
         vec![
