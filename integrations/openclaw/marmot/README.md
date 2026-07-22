@@ -132,9 +132,10 @@ relay, phone, or OpenClaw gateway.
 ## Docker phone test
 
 A Compose profile builds a container with `wn-agent`, OpenClaw, this plugin, and
-`qrencode`. It starts `wn-agent` with `MARMOT_AGENT_ALLOW_ANY=1` so the first
-phone invite lands without pre-seeding an allowlist (use an explicit allowlist
-for a real deployment).
+`qrencode`. It starts `wn-agent` with `MARMOT_AGENT_DEV_ALLOW_ANY_INVITES=1`
+and `MARMOT_AGENT_DEBUG_CONTROLS=1` so the first invite from an authenticated
+phone lands without pre-seeding an allowlist (use an explicit allowlist and
+omit both development options for a real deployment).
 
 ```sh
 export OPENAI_API_KEY=...        # or ANTHROPIC_API_KEY / OPENROUTER_API_KEY / ...
@@ -294,7 +295,7 @@ validated by running the local `openclaw-gateway` harness (below).
 ## Local gateway harness
 
 `just openclaw-gateway-up` brings up a fully local stack — the in-repo
-`nostr-rs-relay` + QUIC broker + `wn-agent` (with `--allow-any` and
+`nostr-rs-relay` + QUIC broker + `wn-agent` (with `--dev-allow-any-invites` and
 `--debug-controls`) + a real OpenClaw gateway with this plugin installed — with
 no public relays and no phone required. This is the harness for wiring and
 validating the inbound and live-preview paths above: inject an inbound message

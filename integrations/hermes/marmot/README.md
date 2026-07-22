@@ -224,8 +224,9 @@ Hermes in the first agent-stream start message. Run logs in another terminal whi
 just hermes-phone-test-logs
 ```
 
-For this manual test the container starts `wn-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
-without knowing the phone account id ahead of time. Use an explicit allowlist for a real deployment.
+For this manual test the container starts `wn-agent` with `MARMOT_AGENT_DEV_ALLOW_ANY_INVITES=1` and
+`MARMOT_AGENT_DEBUG_CONTROLS=1`, so the first invite from an authenticated phone can land without knowing the phone
+account id ahead of time. Use an explicit allowlist and omit both development options for a real deployment.
 
 In the phone-test container, `MARMOT_PROFILE_NAME_ONBOARDING=1` makes the Marmot Hermes adapter ask on the first
 encrypted chat message whether to publish a public Nostr profile name for the agent account. Reply with the name to

@@ -65,9 +65,15 @@ for relay in "${configured_relays[@]}"; do
     [ -z "$relay" ] || wn_agent_args+=(--relay "$relay")
 done
 
-case "${MARMOT_AGENT_ALLOW_ANY:-1}" in
+case "${MARMOT_AGENT_DEV_ALLOW_ANY_INVITES:-1}" in
     1|true|TRUE|yes|YES)
-        wn_agent_args+=(--allow-any)
+        wn_agent_args+=(--dev-allow-any-invites)
+        ;;
+esac
+
+case "${MARMOT_AGENT_DEBUG_CONTROLS:-0}" in
+    1|true|TRUE|yes|YES)
+        wn_agent_args+=(--debug-controls)
         ;;
 esac
 

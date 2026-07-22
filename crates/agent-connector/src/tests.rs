@@ -176,13 +176,13 @@ fn test_config(
     home: &Path,
     socket: impl Into<std::path::PathBuf>,
     relays: Vec<String>,
-    allow_any: bool,
+    dev_allow_any_invites: bool,
     debug_controls: bool,
 ) -> AgentConnectorConfig {
     let mut config = AgentConnectorConfig::new(home);
     config.socket = socket.into();
     config.relays = relays;
-    config.allow_any = allow_any;
+    config.dev_allow_any_invites = dev_allow_any_invites;
     config.debug_controls = debug_controls;
     // The white-box suite drives streams at loopback brokers and connects to an
     // in-process `MockRelay` at loopback; production defaults keep both off (see
@@ -1612,7 +1612,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
 }
 
 #[tokio::test]
-async fn connector_policy_allow_any_accepts_unlisted_welcomer() {
+async fn connector_policy_dev_allow_any_accepts_unlisted_authenticated_welcomer() {
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -1640,7 +1640,7 @@ async fn connector_policy_allow_any_accepts_unlisted_welcomer() {
         socket.clone(),
         vec![relay_url],
         true,
-        false,
+        true,
     )));
     assert!(matches!(
         send_control_request(&socket, "req-ready", AgentControlRequest::AccountList)
@@ -1667,6 +1667,33 @@ async fn connector_policy_allow_any_accepts_unlisted_welcomer() {
     human_runtime.shutdown().await;
     server.abort();
     let _ = server.await;
+}
+
+#[test]
+fn dev_allow_any_invites_still_requires_an_authenticated_welcomer() {
+    assert!(crate::invite_policy::invite_policy_allows(
+        true, true, false
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        true, false, false
+    ));
+}
+
+#[test]
+fn dev_allow_any_invites_requires_debug_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        true,
+        false,
+    );
+    config.debug_controls = false;
+
+    let error = crate::validation::validate_control_plane_config(&config)
+        .expect_err("dev allow-any must require debug controls");
+    assert_eq!(error.code(), "unsafe_control_plane_config");
 }
 
 #[tokio::test]

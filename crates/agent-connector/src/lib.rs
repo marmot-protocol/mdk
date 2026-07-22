@@ -129,7 +129,10 @@ pub struct AgentConnectorConfig {
     pub socket_dir_mode: u32,
     pub socket_mode: u32,
     pub relays: Vec<String>,
-    pub allow_any: bool,
+    /// Dev/test-only bypass for the welcomer allowlist. Requires
+    /// `debug_controls`; a pending invite still needs an authenticated MLS
+    /// welcomer identity.
+    pub dev_allow_any_invites: bool,
     pub debug_controls: bool,
     pub auth_token: Option<String>,
     /// Cap on concurrently served control connections; connections beyond it
@@ -163,7 +166,7 @@ impl AgentConnectorConfig {
             socket_dir_mode: AGENT_SOCKET_DIR_MODE,
             socket_mode: AGENT_SOCKET_MODE,
             relays: Vec::new(),
-            allow_any: false,
+            dev_allow_any_invites: false,
             debug_controls: false,
             auth_token: None,
             max_connections: MAX_CONTROL_CONNECTIONS,
@@ -177,7 +180,7 @@ impl AgentConnectorConfig {
 pub struct AgentConnector {
     pub(crate) account_home: AccountHome,
     pub(crate) allowlists: AllowlistStore,
-    pub(crate) allow_any: bool,
+    pub(crate) dev_allow_any_invites: bool,
     pub(crate) debug_controls: bool,
     pub(crate) auth_token: Option<String>,
     pub(crate) allow_insecure_local_broker: bool,
@@ -215,7 +218,7 @@ impl AgentConnector {
         Ok(Self {
             account_home,
             allowlists,
-            allow_any: config.allow_any,
+            dev_allow_any_invites: config.dev_allow_any_invites,
             debug_controls: config.debug_controls,
             auth_token: config.auth_token,
             allow_insecure_local_broker: config.allow_insecure_local_broker,
@@ -295,6 +298,13 @@ impl AgentConnector {
 
 pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
     validate_control_plane_config(&config)?;
+    if config.dev_allow_any_invites {
+        tracing::warn!(
+            target: "agent_connector",
+            method = "serve_socket",
+            "DANGER: dev allow-any invite policy is enabled; authenticated welcomers bypass the allowlist"
+        );
+    }
     let listener = bind_connector_socket_with_owned_home(
         &config.socket,
         config.socket_dir_mode,

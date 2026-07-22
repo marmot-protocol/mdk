@@ -65,7 +65,8 @@ services:
       MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
       MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
       MARMOT_AGENT_SOCKET_MODE: "0660"
-      MARMOT_AGENT_ALLOW_ANY: "1"
+      MARMOT_AGENT_DEV_ALLOW_ANY_INVITES: "1"
+      MARMOT_AGENT_DEBUG_CONTROLS: "1"
       MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
       MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
       HERMES_MARMOT_AUTO_BOOTSTRAP: "1"
@@ -107,7 +108,8 @@ services:
       MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
       MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
       MARMOT_AGENT_SOCKET_MODE: "0660"
-      MARMOT_AGENT_ALLOW_ANY: "1"
+      MARMOT_AGENT_DEV_ALLOW_ANY_INVITES: "1"
+      MARMOT_AGENT_DEBUG_CONTROLS: "1"
       MARMOT_RELAYS: wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat
       MARMOT_QUIC_CANDIDATES: quic://quic-broker.ipf.dev:4450
       MARMOT_STREAM_MODE: ${MARMOT_STREAM_MODE:-block}
@@ -130,7 +132,8 @@ services:
 
   # Self-contained local harness: a real OpenClaw gateway + Marmot plugin +
   # wn-agent wired to the in-repo nostr relay + QUIC broker (no public relays,
-  # no phone needed). wn-agent runs with --allow-any + --debug-controls so an
+  # no phone needed). wn-agent runs with --dev-allow-any-invites +
+  # --debug-controls so an
   # inbound message can be injected over the control socket to wire/validate the
   # inbound->agent turn dispatch and live-preview paths.
   openclaw-gateway:
@@ -148,7 +151,7 @@ services:
       MARMOT_AGENT_AUTH_TOKEN_FILE: /data/marmot-agent/control.token
       MARMOT_AGENT_SOCKET_DIR_MODE: "0770"
       MARMOT_AGENT_SOCKET_MODE: "0660"
-      MARMOT_AGENT_ALLOW_ANY: "1"
+      MARMOT_AGENT_DEV_ALLOW_ANY_INVITES: "1"
       MARMOT_AGENT_DEBUG_CONTROLS: "1"
       MARMOT_RELAYS: ws://nostr-rs-relay:8080
       MARMOT_QUIC_CANDIDATES: quic://quic-broker:4450

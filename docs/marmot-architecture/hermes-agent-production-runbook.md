@@ -176,8 +176,9 @@ Watch logs during the phone test:
 just hermes-phone-test-logs
 ```
 
-The Compose phone-test profile sets `MARMOT_AGENT_ALLOW_ANY=1` so the phone can invite the agent before you know the
-phone account id. For a real deployment, disable allow-any and add the phone account id to the `wn-agent` allowlist.
+The Compose phone-test profile sets `MARMOT_AGENT_DEV_ALLOW_ANY_INVITES=1` together with
+`MARMOT_AGENT_DEBUG_CONTROLS=1` so an authenticated phone can invite the agent before you know the phone account id.
+For a real deployment, omit both development options and add the phone account id to the `wn-agent` allowlist.
 
 From the phone:
 

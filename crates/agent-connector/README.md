@@ -74,6 +74,15 @@ Check the installed or locally built version with:
 wn-agent --version
 ```
 
+## Invite Policy
+
+Production connectors accept pending group invites only when the MLS-authenticated welcomer is on the configured
+`--allow-welcomer` list. An empty allowlist rejects every invite.
+
+Local development may use `--dev-allow-any-invites` together with `--debug-controls`. The connector warns when this
+mode is active and accepts any authenticated welcomer, but it still rejects a welcome whose authenticated author is
+missing. Do not enable either development option in production.
+
 ## Hermes Install
 
 Versioned WN Agent builds publish the `wn-agent` binary, the Hermes Marmot plugin, and an installer script on GitHub

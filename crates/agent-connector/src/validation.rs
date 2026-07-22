@@ -146,6 +146,12 @@ pub(crate) fn validate_control_plane_config(
         ));
     }
 
+    if config.dev_allow_any_invites && !config.debug_controls {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(
+            "dev allow-any invites requires debug controls",
+        ));
+    }
+
     if config.auth_token.is_none()
         && (config.socket_dir_mode != AGENT_SOCKET_DIR_MODE
             || config.socket_mode != AGENT_SOCKET_MODE)

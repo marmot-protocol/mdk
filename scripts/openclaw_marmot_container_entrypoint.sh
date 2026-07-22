@@ -19,8 +19,8 @@ for relay in "${relays[@]}"; do
 done
 
 extra_args=()
-if [ "${MARMOT_AGENT_ALLOW_ANY:-0}" = "1" ]; then
-    extra_args+=(--allow-any)
+if [ "${MARMOT_AGENT_DEV_ALLOW_ANY_INVITES:-0}" = "1" ]; then
+    extra_args+=(--dev-allow-any-invites)
 fi
 if [ "${MARMOT_AGENT_DEBUG_CONTROLS:-0}" = "1" ]; then
     extra_args+=(--debug-controls)

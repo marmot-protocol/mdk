@@ -48,9 +48,9 @@ struct ServeArgs {
     relay: Vec<String>,
     #[arg(
         long,
-        help = "Accept all welcome invites without consulting the allowlist"
+        help = "Dev/test only: accept invites from any authenticated welcomer; requires --debug-controls"
     )]
-    allow_any: bool,
+    dev_allow_any_invites: bool,
     #[arg(
         long,
         value_name = "PATH",
@@ -219,13 +219,18 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         socket_dir_mode,
         socket_mode,
         relays: args.relay,
-        allow_any: args.allow_any,
+        dev_allow_any_invites: args.dev_allow_any_invites,
         debug_controls: args.debug_controls,
         auth_token,
         max_connections: args.max_connections,
         allow_insecure_local_broker: args.insecure_local_broker,
         allow_loopback_relays: args.allow_loopback_relays,
     };
+    if config.dev_allow_any_invites && config.debug_controls {
+        eprintln!(
+            "wn-agent: WARNING dev allow-any invite policy enabled; authenticated welcomers bypass the allowlist"
+        );
+    }
     match serve_socket(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

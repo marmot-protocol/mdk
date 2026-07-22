@@ -55,6 +55,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn-agent` replaced the ambiguous `--allow-any` invite bypass with `--dev-allow-any-invites`, requires
+  `--debug-controls` alongside it, warns when the policy is active, and still rejects welcomes that lack an
+  MLS-authenticated author.
 - `wn-agent` now applies a 15-second whole-operation deadline to the initial unauthenticated control frame and to
   request-scoped QUIC candidate DNS lookup, preventing silent or slow peers from pinning connection permits forever.
 - Every `wn-agent` control response and inbound-subscription event write now has the same 15-second whole-frame

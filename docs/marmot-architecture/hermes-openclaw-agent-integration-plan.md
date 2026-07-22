@@ -230,7 +230,9 @@ Connector policy:
 
 - if `welcomer` is in the account allowlist, call `accept_group_invite`;
 - if `welcomer` is absent or not allowed, call `decline_group_invite`;
-- if `--allow-any` is set, accept all welcomes and log only aggregate counts;
+- if the development-only `--dev-allow-any-invites` and `--debug-controls` flags are both set, accept welcomes from
+  any authenticated welcomer and emit a privacy-safe warning;
+- a missing authenticated welcomer always fails closed, including in development mode;
 - empty allowlist means reject all welcomes.
 
 Decline currently means leave the group and archive local projection state. That is acceptable for v1, but the plan
@@ -373,7 +375,7 @@ Connector checks:
 
 - allowlist accepts an invite from an allowed welcomer;
 - allowlist declines an invite from an unknown welcomer;
-- missing welcomer fails closed unless `--allow-any` is set;
+- missing welcomer always fails closed, including with `--dev-allow-any-invites`;
 - decline leaves and archives the pending group projection;
 - `SubscribeInbound` filters by account and group;
 - final send produces a normal projected received message on another client;
