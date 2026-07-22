@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use marmot_markdown::{Block, Inline, parse};
+use marmot_markdown::{Block, Inline, classify_link_destination, parse};
 
 mod common;
 use common::{parse_blocks, parse_inlines, t};
@@ -10,6 +10,7 @@ fn link(dest: &str, title: Option<&str>, children: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: title.map(|t| t.to_string()),
         children,
+        classification: classify_link_destination(dest),
     }
 }
 fn image(dest: &str, title: Option<&str>, alt: Vec<Inline>) -> Inline {
@@ -17,6 +18,7 @@ fn image(dest: &str, title: Option<&str>, alt: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: title.map(|t| t.to_string()),
         alt,
+        classification: classify_link_destination(dest),
     }
 }
 
@@ -107,6 +109,62 @@ fn inline_link_with_title() {
         parse_inlines("[foo](/url \"t\")"),
         vec![link("/url", Some("t"), vec![t("foo")])]
     );
+}
+
+#[test]
+fn explicit_destinations_are_preserved_and_classified() {
+    let cases = [
+        (
+            "[verify](javascript:alert(1))",
+            "javascript:alert(1)",
+            marmot_markdown::LinkDestinationKind::Dangerous,
+            false,
+        ),
+        (
+            "![key](nsec1qqqqqq)",
+            "nsec1qqqqqq",
+            marmot_markdown::LinkDestinationKind::Sensitive,
+            true,
+        ),
+    ];
+    for (input, expected_dest, expected_classification, is_image) in cases {
+        let parsed = parse_inlines(input);
+        match &parsed[0] {
+            Inline::Link {
+                dest,
+                classification,
+                ..
+            } if !is_image => {
+                assert_eq!(dest, expected_dest);
+                assert_eq!(*classification, expected_classification);
+            }
+            Inline::Image {
+                dest,
+                classification,
+                ..
+            } if is_image => {
+                assert_eq!(dest, expected_dest);
+                assert_eq!(*classification, expected_classification);
+            }
+            other => panic!("unexpected parsed destination for {input}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn reference_destination_is_preserved_and_classified() {
+    let blocks = parse_blocks("[verify][target]\n\n[target]: file:///etc/passwd");
+    let Block::Paragraph { inlines } = &blocks[0] else {
+        panic!("expected paragraph");
+    };
+    assert!(matches!(
+        &inlines[0],
+        Inline::Link {
+            dest,
+            classification: marmot_markdown::LinkDestinationKind::Dangerous,
+            ..
+        } if dest == "file:///etc/passwd"
+    ));
 }
 
 #[test]

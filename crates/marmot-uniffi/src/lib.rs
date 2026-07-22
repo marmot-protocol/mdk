@@ -36,8 +36,8 @@ pub use errors::MarmotKitError;
 pub use external_signer::ExternalAccountSignerFfi;
 pub use markdown::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
-    MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownListItemFfi, MarkdownListKindFfi,
-    MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
+    MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
+    MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
 };
 
 uniffi::setup_scaffolding!();

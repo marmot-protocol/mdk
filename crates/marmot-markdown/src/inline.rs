@@ -12,7 +12,7 @@ use crate::ast::{
     AutolinkKind, Block, Document, Inline, ListItem, NostrEntity, NostrHrp, TableCell,
 };
 use crate::block::LinkRef;
-use crate::destination::classify_autolink_destination;
+use crate::destination::{classify_autolink_destination, classify_link_destination};
 use crate::entity;
 use crate::nostr;
 use crate::scanner;
@@ -1010,6 +1010,7 @@ fn absorb_link(
     }
 
     let kind_is_image = opener.kind == b'!';
+    let classification = classify_link_destination(&dest);
     // Children = items after the placeholder.
     let children: Vec<Inline> = out.drain(opener.out_pos + 1..).collect();
     // Drop the placeholder Text("[" / "![").
@@ -1019,12 +1020,14 @@ fn absorb_link(
             dest,
             title,
             alt: children,
+            classification,
         });
     } else {
         out.push(Inline::Link {
             dest,
             title,
             children,
+            classification,
         });
     }
     // Pop all delimiters from opener_idx onward (any inner unclosed openers

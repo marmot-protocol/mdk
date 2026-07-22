@@ -87,11 +87,17 @@ pub enum Inline {
         dest: String,
         title: Option<String>,
         children: Vec<Inline>,
+        /// Renderer-facing classification. The original destination is
+        /// preserved; clients decide whether it should be actionable.
+        classification: LinkDestinationKind,
     },
     Image {
         dest: String,
         title: Option<String>,
         alt: Vec<Inline>,
+        /// Renderer-facing classification. Clients decide whether fetching
+        /// this untrusted destination is appropriate.
+        classification: LinkDestinationKind,
     },
     Autolink {
         url: String,

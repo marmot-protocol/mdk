@@ -30,6 +30,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 - Markdown autolinks now carry a renderer-facing destination classification across Rust and MarmotKit surfaces. The
   original destination is preserved, while web, contact, app, public Nostr, relative, unknown, dangerous, and
   sensitive targets are distinguished for client policy.
+- Explicit Markdown links and images now carry the same destination classification, including reference-style links,
+  so clients can independently decide whether to navigate to or fetch an untrusted target.
 - `wn tui` gained optional `--discovery-relays` and `--default-account-relays` flags (comma-separated, matching
   `wn daemon start`). They are forwarded to the `daemon start` child and to `create-identity`/`login` account setup
   so a first run with no relay configuration can supply relays without dead-ending. Flag passthrough only; no JSON

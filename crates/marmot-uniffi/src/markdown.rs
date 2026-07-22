@@ -117,11 +117,13 @@ pub enum MarkdownInlineFfi {
         dest: String,
         title: Option<String>,
         children: Vec<MarkdownInlineFfi>,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Image {
         dest: String,
         title: Option<String>,
         alt: Vec<MarkdownInlineFfi>,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Autolink {
         url: String,
@@ -391,15 +393,23 @@ fn markdown_inline_from_md(value: &MdInline, depth: usize) -> MarkdownInlineFfi 
             dest,
             title,
             children,
+            classification,
         } => MarkdownInlineFfi::Link {
             dest: dest.clone(),
             title: title.clone(),
             children: markdown_inlines_from_md(children, depth + 1),
+            classification: (*classification).into(),
         },
-        MdInline::Image { dest, title, alt } => MarkdownInlineFfi::Image {
+        MdInline::Image {
+            dest,
+            title,
+            alt,
+            classification,
+        } => MarkdownInlineFfi::Image {
             dest: dest.clone(),
             title: title.clone(),
             alt: markdown_inlines_from_md(alt, depth + 1),
+            classification: (*classification).into(),
         },
         MdInline::Autolink {
             url,
@@ -521,7 +531,36 @@ mod tests {
         ));
         assert!(matches!(
             inlines[4],
-            MarkdownInlineFfi::Link { ref dest, .. } if dest == "https://example.com"
+            MarkdownInlineFfi::Link {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Web,
+                ..
+            } if dest == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn bridges_explicit_destination_classification_without_dropping_targets() {
+        let document =
+            parse_markdown_document("[verify](javascript:alert(1)) ![key](nostr:ncryptsec1qqqqqq)");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Link {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Dangerous,
+                ..
+            } if dest == "javascript:alert(1)"
+        ));
+        assert!(matches!(
+            inlines[2],
+            MarkdownInlineFfi::Image {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Sensitive,
+                ..
+            } if dest == "nostr:ncryptsec1qqqqqq"
         ));
     }
 
