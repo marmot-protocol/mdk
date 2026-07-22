@@ -404,7 +404,6 @@ pub(crate) fn runtime_message_json(
     account_id_hex: &str,
     account_label: &str,
 ) -> serde_json::Value {
-    let now = unix_now();
     let is_own_sender = message.sender == account_id_hex || message.sender == account_label;
     let from_display_name = if is_own_sender {
         None
@@ -422,7 +421,7 @@ pub(crate) fn runtime_message_json(
         "kind": message.kind,
         "tags": message.tags,
         "recorded_at": message.recorded_at,
-        "received_at": now,
+        "received_at": message.received_at,
     });
     if let Some(agent_text_stream) =
         crate::agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext)

@@ -1436,6 +1436,7 @@ pub(crate) fn received_message_update_from_record(
         kind: record.kind,
         tags: record.tags,
         recorded_at: record.recorded_at,
+        received_at: record.received_at,
     };
     let received = RuntimeMessageReceived {
         account_id_hex: account_id_hex.to_owned(),

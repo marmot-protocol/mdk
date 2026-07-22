@@ -832,6 +832,7 @@ fn runtime_message_json_marks_account_label_sender_as_me() {
         kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         recorded_at: 0,
+        received_at: 0,
     };
 
     let value = runtime_message_json(
@@ -1090,6 +1091,7 @@ fn runtime_message_json_carries_named_peer_display_name() {
         kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         recorded_at: 0,
+        received_at: 0,
     };
 
     let value = runtime_message_json(
@@ -1112,11 +1114,10 @@ fn runtime_message_json_carries_named_peer_display_name() {
 
 #[test]
 fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
-    // Live payloads must echo the message's own source timestamp under
-    // `recorded_at` (so they match replay/snapshot payloads) while stamping
-    // `received_at` with the live delivery time.
+    // Live payloads preserve both timestamps assigned during authenticated
+    // ingest rather than replacing observation time during JSON rendering.
     let source_recorded_at = 1_700_000_000;
-    let before = unix_now();
+    let source_received_at = 1_700_000_123;
     let message = marmot_app::ReceivedMessage {
         message_id_hex: "03".to_owned(),
         source_message_id_hex: "source-03".to_owned(),
@@ -1128,6 +1129,7 @@ fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
         kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         recorded_at: source_recorded_at,
+        received_at: source_received_at,
     };
 
     let value = runtime_message_json(
@@ -1135,16 +1137,8 @@ fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "Alice Example",
     );
-    let after = unix_now();
-
     assert_eq!(value["recorded_at"], source_recorded_at);
-    let received_at = value["received_at"]
-        .as_u64()
-        .expect("received_at should be a unix timestamp");
-    assert!(
-        (before..=after).contains(&received_at),
-        "received_at {received_at} should be a live timestamp in [{before}, {after}]"
-    );
+    assert_eq!(value["received_at"], source_received_at);
     assert_ne!(
         value["recorded_at"], value["received_at"],
         "recorded_at must track source time, not the live received_at"

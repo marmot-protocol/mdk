@@ -115,6 +115,7 @@ fn received_message(
         kind,
         tags,
         recorded_at: 42,
+        received_at: 84,
     }
 }
 

@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_traits::MessageId;
@@ -78,6 +79,14 @@ pub use telemetry::{
 };
 
 const DELIVERY_BUFFER: usize = 1024;
+
+fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NostrSubscription {
@@ -409,7 +418,7 @@ impl NostrTransportAdapter {
             .event
             .to_transport_message()
             .map_err(|e| TransportAdapterError::Backend(format!("Nostr event mapping: {e}")))?;
-        let now = Timestamp(relay_event.event.created_at);
+        let received_at = Timestamp(unix_now_seconds());
         let routes = {
             let state = self.state.read().await;
             state.routes_for(&message, &relay_event.endpoint)
@@ -422,7 +431,7 @@ impl NostrTransportAdapter {
                     account_id: route.account_id,
                     group_id_hint: route.group_id_hint,
                     message: message.clone(),
-                    received_at: now,
+                    received_at,
                     source: TransportDeliverySource {
                         transport: TransportSource(NOSTR_SOURCE.into()),
                         plane: route.plane,
@@ -767,6 +776,7 @@ impl NostrTransportAdapter {
     ) -> Result<usize, TransportAdapterError> {
         let mut delivered = 0;
         let mut seen_routes = HashSet::new();
+        let received_at = Timestamp(unix_now_seconds());
         for endpoint in endpoints {
             let routes = {
                 let state = self.state.read().await;
@@ -786,7 +796,7 @@ impl NostrTransportAdapter {
                         account_id: route.account_id,
                         group_id_hint: route.group_id_hint,
                         message: message.clone(),
-                        received_at: message.timestamp,
+                        received_at,
                         source: TransportDeliverySource {
                             transport: TransportSource(NOSTR_SOURCE.into()),
                             plane: route.plane,

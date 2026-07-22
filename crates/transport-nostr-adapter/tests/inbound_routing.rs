@@ -534,6 +534,10 @@ async fn group_subscription_id_fans_out_to_matching_accounts_and_replays_route_a
     assert!(accounts.contains(&bob));
     assert_eq!(first.group_id_hint, Some(group_id.clone()));
     assert_eq!(second.group_id_hint, Some(group_id));
+    assert_eq!(first.message.timestamp, Timestamp(1_700_000_010));
+    assert_eq!(second.message.timestamp, Timestamp(1_700_000_010));
+    assert_eq!(first.received_at, second.received_at);
+    assert_ne!(first.received_at, first.message.timestamp);
 
     let replayed = adapter
         .handle_relay_event(NostrRelayEvent {

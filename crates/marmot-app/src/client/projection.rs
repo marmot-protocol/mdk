@@ -336,10 +336,11 @@ impl AppClient {
                         continue;
                     }
                 };
-                match self
-                    .app
-                    .record_account_app_event(&self.state.label, &projection)
-                {
+                match self.app.record_account_app_event_at(
+                    &self.state.label,
+                    &projection,
+                    recorded_at,
+                ) {
                     Ok(update) => updates.push(update),
                     Err(_err) => {
                         tracing::warn!(

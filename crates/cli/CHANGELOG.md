@@ -50,6 +50,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Received-message chronology and retention now use the MLS-authenticated inner app-event timestamp instead of the
+  replayable outer Nostr event timestamp. Runtime, daemon JSON, and MarmotKit surfaces expose that send time alongside
+  the device-local observation time.
 - WN Agent, Hermes, and OpenClaw now carry the triggering prompt message id on agent text-stream start events through
   the protocol `parent` tag, preserving the durable reply chain after timeline reloads.
 - Encrypted media uploads now fail over, in order, across a default list of Blossom endpoints that accept opaque

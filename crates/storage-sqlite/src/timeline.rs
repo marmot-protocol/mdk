@@ -100,7 +100,10 @@ pub struct TimelineMessageRecord {
     pub plaintext: String,
     pub kind: u64,
     pub tags: Vec<Vec<String>>,
+    /// Authenticated inner app-event time for app messages; local observation
+    /// time for synthesized rows that have no inner timestamp.
     pub timeline_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreview>,

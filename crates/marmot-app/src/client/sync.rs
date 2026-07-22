@@ -109,7 +109,7 @@ impl AppClient {
         // drops it rather than emitting a schema-invalid `message_ids` entry
         // (see `schema_valid_message_ids`).
         let source_message_id_hex = String::new();
-        let source_recorded_at = unix_now_seconds();
+        let source_received_at = unix_now_seconds();
         let mut routes_dirty = false;
         for event in &effects.events {
             let before = self.state.groups.len();
@@ -127,7 +127,8 @@ impl AppClient {
                 event,
                 group_projection.as_ref(),
                 &source_message_id_hex,
-                source_recorded_at,
+                source_received_at,
+                None,
                 self.app.allow_loopback_blob_endpoints(),
             );
             let updated_group =
@@ -316,20 +317,22 @@ impl AppClient {
         summary: &mut SyncSummary,
     ) -> Result<(), AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
-        let source_recorded_at = delivery.message.timestamp.0;
+        let outer_transport_at = delivery.message.timestamp.0;
+        let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
         let effects = self.runtime.ingest_delivery(delivery).await?;
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_effects(&effects.effects);
-        self.remember_transport_cursor(source_recorded_at);
+        self.remember_transport_cursor(outer_transport_at);
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
         self.observe_account_device_effects(
             &effects.effects,
             display_names,
             summary,
             &source_message_id_hex,
-            source_recorded_at,
+            source_received_at,
+            Some(outer_transport_at),
         )
         .await?;
 
@@ -431,13 +434,14 @@ impl AppClient {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
         let source_message_id_hex = String::new();
-        let source_recorded_at = unix_now_seconds();
+        let source_received_at = unix_now_seconds();
         self.observe_account_device_effects(
             &effects,
             &display_names,
             &mut summary,
             &source_message_id_hex,
-            source_recorded_at,
+            source_received_at,
+            None,
         )
         .await?;
         self.prune_plaintext_retention_for_group(group_id)?;
@@ -451,7 +455,8 @@ impl AppClient {
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
-        source_recorded_at: u64,
+        source_received_at: u64,
+        outer_transport_at: Option<u64>,
     ) -> Result<(), AppError> {
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
@@ -497,7 +502,8 @@ impl AppClient {
                 event,
                 group_projection.as_ref(),
                 source_message_id_hex,
-                source_recorded_at,
+                source_received_at,
+                outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
             ) {
                 if notifications::is_push_gossip_kind(message.kind) {
@@ -565,14 +571,16 @@ impl AppClient {
                     kind: message.kind,
                     tags: message.tags.clone(),
                     source_epoch: Some(message.source_epoch),
-                    recorded_at: Some(source_recorded_at),
+                    recorded_at: Some(message.recorded_at),
                     // Received app messages are not synthesized system rows.
                     origin_commit_id: None,
                     moderation_grant,
                 };
-                let projection_update = self
-                    .app
-                    .record_account_app_event(&self.state.label, &message_projection)?;
+                let projection_update = self.app.record_account_app_event_at(
+                    &self.state.label,
+                    &message_projection,
+                    message.received_at,
+                )?;
                 summary.projection_updates.push(projection_update);
                 self.prune_plaintext_retention_for_group(&message.group_id)?;
             }
@@ -664,7 +672,7 @@ impl AppClient {
         }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
-        let system_updates = self.project_group_system_rows(&effects.events, source_recorded_at);
+        let system_updates = self.project_group_system_rows(&effects.events, source_received_at);
         summary.projection_updates.extend(system_updates);
         Ok(())
     }

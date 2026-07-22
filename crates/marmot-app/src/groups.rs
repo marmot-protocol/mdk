@@ -961,7 +961,8 @@ pub(crate) fn decode_received_event(
     group_id: &GroupId,
     source_epoch: u64,
     source_message_id_hex: &str,
-    source_recorded_at: u64,
+    source_received_at: u64,
+    outer_transport_at: Option<u64>,
     allow_loopback_http: bool,
 ) -> Option<ReceivedMessage> {
     let event = match MarmotInnerEvent::decode(payload) {
@@ -982,6 +983,15 @@ pub(crate) fn decode_received_event(
             "rejecting MLS application message: inner author is not the authenticated sender",
         );
         return None;
+    }
+    if outer_transport_at.is_some_and(|outer| {
+        outer.abs_diff(event.created_at) > crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs()
+    }) {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "outer transport timestamp differs materially from authenticated app timestamp",
+        );
     }
     // The decoder does not police inner tag names — they are opaque application
     // content (e.g. a `p` reaction/mention target or an `e` reference). Routing
@@ -1019,7 +1029,8 @@ pub(crate) fn decode_received_event(
         plaintext: event.content,
         kind: event.kind,
         tags: event.tags,
-        recorded_at: source_recorded_at,
+        recorded_at: event.created_at,
+        received_at: source_received_at,
     })
 }
 
@@ -1031,7 +1042,8 @@ pub(crate) fn observe_event(
     event: &GroupEvent,
     group_projection: Option<&EventGroupProjection<'_>>,
     source_message_id_hex: &str,
-    source_recorded_at: u64,
+    source_received_at: u64,
+    outer_transport_at: Option<u64>,
     allow_loopback_http: bool,
 ) -> Option<ReceivedMessage> {
     match event {
@@ -1092,7 +1104,8 @@ pub(crate) fn observe_event(
                 group_id,
                 epoch.0,
                 source_message_id_hex,
-                source_recorded_at,
+                source_received_at,
+                outer_transport_at,
                 allow_loopback_http,
             ) else {
                 summary.events.push(event.clone());
@@ -1452,6 +1465,7 @@ mod inner_tag_tests {
             1,
             &"00".repeat(32),
             0,
+            None,
             false,
         )
     }

@@ -258,6 +258,8 @@ pub struct TransportDelivery {
     /// still validates through the message envelope and peeler.
     pub group_id_hint: Option<GroupId>,
     pub message: TransportMessage,
+    /// Local wall-clock observation time assigned by the receiving adapter.
+    /// This is distinct from any publisher-controlled transport timestamp.
     pub received_at: Timestamp,
     pub source: TransportDeliverySource,
 }

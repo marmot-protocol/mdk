@@ -312,6 +312,7 @@ fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
         kind: MARMOT_APP_EVENT_KIND_REACTION,
         tags: vec![vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]],
         recorded_at: 0,
+        received_at: 0,
     }
 }
 
@@ -327,6 +328,7 @@ fn received_chat(plaintext: &str, tags: Vec<Vec<String>>) -> ReceivedMessage {
         kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
         tags,
         recorded_at: 0,
+        received_at: 0,
     }
 }
 

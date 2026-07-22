@@ -175,7 +175,10 @@ pub struct TimelineMessageRecordFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub tags: Vec<MessageTagFfi>,
+    /// Authenticated inner app-event time, or observation time for synthesized
+    /// rows without an inner timestamp.
     pub timeline_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
