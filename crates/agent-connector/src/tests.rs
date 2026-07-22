@@ -62,6 +62,49 @@ async fn control_operation_timeout_bounds_a_stalled_whole_operation() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+#[tokio::test]
+async fn control_frame_write_timeout_includes_flush() {
+    struct FlushStallingWriter;
+
+    impl tokio::io::AsyncWrite for FlushStallingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    let response = AgentControlEnvelope::new(None, AgentControlResponse::Ack);
+    let error = crate::connection::write_control_frame_with_timeout(
+        &mut FlushStallingWriter,
+        &response,
+        Duration::from_millis(10),
+    )
+    .await
+    .expect_err("a stalled flush must time out");
+
+    assert!(matches!(
+        error,
+        crate::ConnectorError::OperationTimedOut("control_frame_write")
+    ));
+}
+
 #[test]
 fn poisoned_connector_store_mutex_recovers_inner_state() {
     let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));

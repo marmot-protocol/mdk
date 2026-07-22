@@ -105,7 +105,7 @@ where
     with_control_operation_timeout_after(operation, CONTROL_OPERATION_TIMEOUT, future).await
 }
 
-async fn with_control_operation_timeout_after<T, F>(
+pub(crate) async fn with_control_operation_timeout_after<T, F>(
     operation: &'static str,
     timeout_after: Duration,
     future: F,

@@ -3,13 +3,46 @@
 use agent_control::{
     AgentControlEnvelope, AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
-use tokio::io::BufReader;
+use serde::Serialize;
+use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
 
 use crate::error::ConnectorError;
 use crate::socket::current_effective_uid;
 use crate::validation::{auth_token_matches, unsupported_request_message};
-use crate::{AgentConnector, with_control_operation_timeout};
+use crate::{
+    AgentConnector, CONTROL_OPERATION_TIMEOUT, with_control_operation_timeout,
+    with_control_operation_timeout_after,
+};
+
+pub(crate) async fn write_control_frame<W, T>(
+    writer: &mut W,
+    message: &T,
+) -> Result<(), ConnectorError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_control_frame_with_timeout(writer, message, CONTROL_OPERATION_TIMEOUT).await
+}
+
+pub(crate) async fn write_control_frame_with_timeout<W, T>(
+    writer: &mut W,
+    message: &T,
+    timeout_after: std::time::Duration,
+) -> Result<(), ConnectorError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    with_control_operation_timeout_after(
+        "control_frame_write",
+        timeout_after,
+        write_frame(writer, message),
+    )
+    .await??;
+    Ok(())
+}
 
 impl AgentConnector {
     pub(crate) async fn handle_connection(&self, stream: UnixStream) -> Result<(), ConnectorError> {
@@ -33,7 +66,7 @@ impl AgentConnector {
                 request.id,
                 self.error_response("authorize_control_request", &err),
             );
-            write_frame(&mut write_half, &response).await?;
+            write_control_frame(&mut write_half, &response).await?;
             return Ok(());
         }
         if let AgentControlRequest::SubscribeInbound {
@@ -56,7 +89,7 @@ impl AgentConnector {
             Err(err) => self.error_response("handle_connection", &err),
         };
         let response = AgentControlEnvelope::new(request.id, response);
-        write_frame(&mut write_half, &response).await?;
+        write_control_frame(&mut write_half, &response).await?;
         Ok(())
     }
 

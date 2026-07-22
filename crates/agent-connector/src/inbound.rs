@@ -2,7 +2,7 @@
 
 use agent_control::{
     AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
-    AgentControlResponse, read_envelope, write_frame,
+    AgentControlResponse, read_envelope,
 };
 use marmot_app::AppMessageQuery;
 use tokio::io::{AsyncBufRead, AsyncWrite};
@@ -10,6 +10,7 @@ use tokio::sync::broadcast;
 
 use crate::AgentConnector;
 use crate::DELIVERED_INBOUND_CURSOR_CAPACITY;
+use crate::connection::write_control_frame;
 use crate::error::ConnectorError;
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpEvent, control_event_from_debug_event,
@@ -36,7 +37,7 @@ impl AgentConnector {
         let (mut catch_up_events, _catch_up_subscription) = self.inbound_catch_up.subscribe();
 
         let response = AgentControlEnvelope::new(request_id.clone(), AgentControlResponse::Ack);
-        write_frame(writer, &response).await?;
+        write_control_frame(writer, &response).await?;
 
         // Request the initial catch-up without blocking this drain loop. catch_up_accounts() can
         // block for up to APP_RUNTIME_ACCOUNT_READY_WAIT per account and can itself emit many
@@ -67,7 +68,7 @@ impl AgentConnector {
                             request_id.clone(),
                             self.error_response("stream_inbound_events", &err),
                         );
-                        write_frame(writer, &response).await?;
+                        write_control_frame(writer, &response).await?;
                         return Ok(());
                     }
                     continue;
@@ -167,7 +168,7 @@ impl AgentConnector {
                                             request_id.clone(),
                                             replayed,
                                         );
-                                        write_frame(writer, &envelope).await?;
+                                        write_control_frame(writer, &envelope).await?;
                                     }
                                     continue;
                                 }
@@ -240,7 +241,7 @@ impl AgentConnector {
                 );
             }
             let envelope = AgentControlEnvelope::new(request_id.clone(), event);
-            write_frame(writer, &envelope).await?;
+            write_control_frame(writer, &envelope).await?;
         }
     }
 

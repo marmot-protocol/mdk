@@ -57,6 +57,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - `wn-agent` now applies a 15-second whole-operation deadline to the initial unauthenticated control frame and to
   request-scoped QUIC candidate DNS lookup, preventing silent or slow peers from pinning connection permits forever.
+- Every `wn-agent` control response and inbound-subscription event write now has the same 15-second whole-frame
+  deadline, including socket flush, so a non-reading client cannot retain a connection permit indefinitely.
 - Public Nostr relay connections now require `wss://`; `ws://` is limited to loopback development relays behind
   `WN_ALLOW_LOOPBACK_RELAYS`.
 - Received-message chronology and retention now use the MLS-authenticated inner app-event timestamp instead of the
