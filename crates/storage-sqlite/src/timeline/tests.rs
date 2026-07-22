@@ -130,7 +130,7 @@ fn oversized_timeline_id_sets_are_chunked() {
     let conn = store.lock().unwrap();
     assert_eq!(
         reply_message_ids_for_targets_tx(&conn, &"11".repeat(32), &ids).unwrap(),
-        vec!["reply".to_owned()]
+        BTreeSet::from(["reply".to_owned()])
     );
     let records =
         timeline_records_by_ids_tx(&conn, &"11".repeat(32), ids.iter().cloned().collect()).unwrap();

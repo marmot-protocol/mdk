@@ -1830,9 +1830,9 @@ fn reply_message_ids_for_targets_tx(
     tx: &Connection,
     group_id_hex: &str,
     target_message_ids: &[String],
-) -> StorageResult<Vec<String>> {
+) -> StorageResult<BTreeSet<String>> {
     if target_message_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeSet::new());
     }
     let mut message_ids = BTreeSet::new();
     for chunk in target_message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
@@ -1856,7 +1856,7 @@ fn reply_message_ids_for_targets_tx(
             .storage()?;
         message_ids.extend(chunk_ids);
     }
-    Ok(message_ids.into_iter().collect())
+    Ok(message_ids)
 }
 
 fn reaction_target_message_id_tx(
