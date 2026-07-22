@@ -192,7 +192,7 @@ fn render_inline(i: &Inline, out: &mut String) {
                 title_attr
             ));
         }
-        Inline::Autolink { url, kind } => {
+        Inline::Autolink { url, kind, .. } => {
             let href = match kind {
                 AutolinkKind::Uri => url.clone(),
                 AutolinkKind::Email => format!("mailto:{url}"),

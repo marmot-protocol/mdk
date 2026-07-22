@@ -50,6 +50,7 @@
 
 pub mod ast;
 mod block;
+mod destination;
 mod entity;
 mod inline;
 mod nostr;
@@ -59,9 +60,10 @@ mod scanner;
 pub const MAX_CONTAINER_DEPTH: usize = block::MAX_CONTAINER_DEPTH;
 
 pub use ast::{
-    Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, ListItem, ListKind,
-    NostrEntity, NostrHrp, TableCell,
+    Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, LinkDestinationKind, ListItem,
+    ListKind, NostrEntity, NostrHrp, TableCell,
 };
+pub use destination::classify_link_destination;
 
 /// Parse a CommonMark document (with this crate's nostr and GFM extensions)
 /// into a [`Document`].

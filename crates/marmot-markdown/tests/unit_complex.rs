@@ -8,8 +8,8 @@
 //! sibling unit tests; nothing here introduces new spec interpretations.
 
 use marmot_markdown::{
-    Alignment, AutolinkKind, Block, CodeBlockKind, Inline, ListItem, ListKind, NostrEntity,
-    NostrHrp, TableCell, parse,
+    Alignment, AutolinkKind, Block, CodeBlockKind, Inline, LinkDestinationKind, ListItem, ListKind,
+    NostrEntity, NostrHrp, TableCell, parse,
 };
 
 mod common;
@@ -359,6 +359,7 @@ fn autolink_and_nostr_uri_share_paragraph() {
             Inline::Autolink {
                 url: "https://example.com".into(),
                 kind: AutolinkKind::Uri,
+                classification: LinkDestinationKind::Web,
             },
             t(" and "),
             nuri(NostrHrp::Npub, &npub_str()),

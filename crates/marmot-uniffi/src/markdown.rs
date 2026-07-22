@@ -7,8 +7,8 @@ use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{
     Alignment as MdAlignment, AutolinkKind as MdAutolinkKind, Block as MdBlock,
     CodeBlockKind as MdCodeBlockKind, Document as MdDocument, Inline as MdInline,
-    ListItem as MdListItem, ListKind as MdListKind, NostrEntity as MdNostrEntity,
-    NostrHrp as MdNostrHrp, TableCell as MdTableCell,
+    LinkDestinationKind as MdLinkDestinationKind, ListItem as MdListItem, ListKind as MdListKind,
+    NostrEntity as MdNostrEntity, NostrHrp as MdNostrHrp, TableCell as MdTableCell,
 };
 
 const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
@@ -126,6 +126,7 @@ pub enum MarkdownInlineFfi {
     Autolink {
         url: String,
         kind: MarkdownAutolinkKindFfi,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Math {
         content: String,
@@ -142,6 +143,18 @@ pub enum MarkdownInlineFfi {
 pub enum MarkdownAutolinkKindFfi {
     Uri,
     Email,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MarkdownLinkDestinationKindFfi {
+    Web,
+    Contact,
+    App,
+    Nostr,
+    Relative,
+    Unknown,
+    Dangerous,
+    Sensitive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -388,9 +401,14 @@ fn markdown_inline_from_md(value: &MdInline, depth: usize) -> MarkdownInlineFfi 
             title: title.clone(),
             alt: markdown_inlines_from_md(alt, depth + 1),
         },
-        MdInline::Autolink { url, kind } => MarkdownInlineFfi::Autolink {
+        MdInline::Autolink {
+            url,
+            kind,
+            classification,
+        } => MarkdownInlineFfi::Autolink {
             url: url.clone(),
             kind: (*kind).into(),
+            classification: (*classification).into(),
         },
         MdInline::Math(content) => MarkdownInlineFfi::Math {
             content: content.clone(),
@@ -409,6 +427,21 @@ impl From<MdAutolinkKind> for MarkdownAutolinkKindFfi {
         match value {
             MdAutolinkKind::Uri => Self::Uri,
             MdAutolinkKind::Email => Self::Email,
+        }
+    }
+}
+
+impl From<MdLinkDestinationKind> for MarkdownLinkDestinationKindFfi {
+    fn from(value: MdLinkDestinationKind) -> Self {
+        match value {
+            MdLinkDestinationKind::Web => Self::Web,
+            MdLinkDestinationKind::Contact => Self::Contact,
+            MdLinkDestinationKind::App => Self::App,
+            MdLinkDestinationKind::Nostr => Self::Nostr,
+            MdLinkDestinationKind::Relative => Self::Relative,
+            MdLinkDestinationKind::Unknown => Self::Unknown,
+            MdLinkDestinationKind::Dangerous => Self::Dangerous,
+            MdLinkDestinationKind::Sensitive => Self::Sensitive,
         }
     }
 }
@@ -527,7 +560,27 @@ mod tests {
         };
         assert!(matches!(
             inlines[1],
-            MarkdownInlineFfi::Autolink { ref url, .. } if url == "marmot://profile/npub1abc"
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                classification: MarkdownLinkDestinationKindFfi::App,
+                ..
+            } if url == "marmot://profile/npub1abc"
+        ));
+    }
+
+    #[test]
+    fn bridges_dangerous_autolink_classification_without_dropping_url() {
+        let document = parse_markdown_document("<javascript:alert(1)>");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                classification: MarkdownLinkDestinationKindFfi::Dangerous,
+                ..
+            } if url == "javascript:alert(1)"
         ));
     }
 

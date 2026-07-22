@@ -129,7 +129,8 @@
           {
             "Autolink": {
               "url": "https://nostr.com",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Web"
             }
           },
           {
@@ -138,7 +139,8 @@
           {
             "Autolink": {
               "url": "a@b.co",
-              "kind": "Email"
+              "kind": "Email",
+              "classification": "Contact"
             }
           },
           {
