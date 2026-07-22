@@ -32,6 +32,9 @@ RUN cargo build --locked --release -p agent-connector --bin wn-agent \
     && install -m 0755 scripts/openclaw_marmot_container_entrypoint.sh /usr/local/bin/openclaw-marmot-entrypoint \
     && ( cd integrations/openclaw/marmot && pnpm install && pnpm build )
 
+# Development phone-test image only. Do not copy the permissive invite/debug
+# controls below into a production image; use an explicit invite allowlist and
+# omit both MARMOT_AGENT_DEV_ALLOW_ANY_INVITES and MARMOT_AGENT_DEBUG_CONTROLS.
 ENV MARMOT_HOME=/data/marmot-agent \
     OPENCLAW_HOME=/data/openclaw-home \
     MARMOT_AGENT_SOCKET=/run/marmot-agent/wn-agent.sock \
