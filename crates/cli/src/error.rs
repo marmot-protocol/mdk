@@ -29,6 +29,8 @@ pub(crate) enum WnError {
     EmptyMessage,
     #[error("group id is required")]
     MissingGroupId,
+    #[error("--reply-to must come before the message text; it was read as literal text here")]
+    ReplyToAfterMessageText,
     #[error("relay URL cannot be empty")]
     EmptyRelayUrl,
     #[error("invalid relay URL: {0}")]
@@ -382,6 +384,13 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
         WnError::MissingGroupId => json!({
             "code": "missing_group_id",
             "message": err.to_string(),
+        }),
+        WnError::ReplyToAfterMessageText => json!({
+            "code": "reply_to_after_message_text",
+            "message": err.to_string(),
+            "repair": {
+                "reorder": "put --reply-to before the text: wn messages send --group <group> --reply-to <message-id> <text>",
+            },
         }),
         WnError::EmptyRelayUrl => json!({
             "code": "empty_relay_url",

@@ -622,6 +622,12 @@ pub(crate) enum MessageCommand {
         #[arg(long = "group", value_name = "GROUP", help = "Group id to send to")]
         group_flag: Option<String>,
         #[arg(
+            long = "reply-to",
+            value_name = "MESSAGE_ID",
+            help = "Send as a reply to this message id (use with --group, before the text)"
+        )]
+        reply_to: Option<String>,
+        #[arg(
             value_name = "GROUP_OR_TEXT",
             allow_hyphen_values = true,
             help = "Either GROUP TEXT... or TEXT... when --group is provided"

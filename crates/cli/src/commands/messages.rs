@@ -38,6 +38,32 @@ fn message_target_and_text(
     Ok((group, args))
 }
 
+/// Reject a `--reply-to` that landed inside the resolved message `text`.
+///
+/// The trailing message args use `allow_hyphen_values`, so a `--reply-to` placed
+/// *after* the text (in the `--group` form) or after the positional group id is
+/// swallowed as literal text instead of setting `reply_to` (see the parse-lock
+/// tests in `lib.rs`). Both spellings are swallowed: the separate-value form
+/// `--reply-to <id>` and the equals form `--reply-to=<id>` (a single token).
+/// Sending anyway would publish a body carrying a stray reply flag that attaches
+/// to no reply — a silent footgun. When `reply_to` was already parsed the flag
+/// did its job, so we only guard the `None` case. Tradeoff: the guard rejects any
+/// message whose text contains a bare `--reply-to` / `--reply-to=…` token
+/// anywhere (e.g. `hello --reply-to friend`), so such text can no longer be sent;
+/// put `--reply-to` before the text with `--group` to reply.
+pub(crate) fn reject_misplaced_reply_to(
+    reply_to: Option<&str>,
+    text: &[String],
+) -> Result<(), WnError> {
+    let has_stray_flag = text
+        .iter()
+        .any(|token| token == "--reply-to" || token.starts_with("--reply-to="));
+    if reply_to.is_none() && has_stray_flag {
+        return Err(WnError::ReplyToAfterMessageText);
+    }
+    Ok(())
+}
+
 pub(crate) async fn message_command(
     account_home: &AccountHome,
     app: &MarmotApp,
@@ -56,20 +82,40 @@ pub(crate) async fn message_command_with_runtime(
     account_flag: Option<String>,
 ) -> Result<CommandOutput, WnError> {
     match command {
-        MessageCommand::Send { group_flag, args } => {
+        MessageCommand::Send {
+            group_flag,
+            reply_to,
+            args,
+        } => {
             let (group, text) = message_target_and_text(group_flag, args)?;
             if text.is_empty() {
                 return Err(WnError::EmptyMessage);
             }
+            reject_misplaced_reply_to(reply_to.as_deref(), &text)?;
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
             app.status(&account.label)?;
             let group_id_hex = normalize_group_id_hex(&group)?;
             let group_id = GroupId::new(hex::decode(&group_id_hex)?);
             let payload = text.join(" ");
-            let summary = runtime
-                .send_message(&account.label, &group_id, payload.into_bytes())
-                .await?;
+            // A `--reply-to` send routes through the reply-capable runtime API,
+            // which emits a kind-9 chat carrying `q`/`e` reference tags to the
+            // parent. That is the exact wire format timeline ingest parses back
+            // into `reply_to_message_id` + a hydrated `reply_preview`. A plain
+            // send stays on the raw-payload path. The response shape is identical
+            // either way, so `--reply-to` is additive input only.
+            let summary = match reply_to.as_deref() {
+                Some(reply_to) => {
+                    runtime
+                        .reply_to_message(&account.label, &group_id, reply_to, &payload)
+                        .await?
+                }
+                None => {
+                    runtime
+                        .send_message(&account.label, &group_id, payload.into_bytes())
+                        .await?
+                }
+            };
             Ok(CommandOutput {
                 plain: format!("sent message published={}", summary.published),
                 json: json!({
