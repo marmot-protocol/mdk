@@ -1,16 +1,11 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-use super::{ENCRYPTED_MEDIA_VERSION, MediaAttachmentReference};
+use super::{EncryptedMediaVersion, MediaAttachmentReference};
 use crate::AppError;
 
-pub(crate) fn canonical_media_type(value: &str) -> Result<String, AppError> {
-    // Per encrypted-media.md ("Media Type Canonicalization") sender and
-    // receiver MUST trim ASCII whitespace ONLY. `str::trim` strips every
-    // Unicode White_Space code point (a superset), so a peer sending an `m`
-    // value with a non-ASCII whitespace edge would derive a different file_key
-    // and AAD than this client. The same canonical value feeds the group-image
-    // AAD path, so this trim must stay ASCII-only on both surfaces.
+pub(crate) fn canonical_media_type_v1(value: &str) -> Result<String, AppError> {
+    // Frozen V1 uses Rust's complete ASCII-whitespace set, including VT.
     let media_type = value
         .split(';')
         .next()
@@ -26,6 +21,56 @@ pub(crate) fn canonical_media_type(value: &str) -> Result<String, AppError> {
         "image/jpg" => "image/jpeg".to_owned(),
         other => other.to_owned(),
     })
+}
+
+pub(crate) fn canonical_media_type_v2(value: &str) -> Result<String, AppError> {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c| matches!(c, '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' | ' '))
+        .to_ascii_lowercase();
+    let mut segments = media_type.split('/');
+    let type_ = segments.next().unwrap_or_default();
+    let subtype = segments.next().unwrap_or_default();
+    if type_.is_empty()
+        || subtype.is_empty()
+        || segments.next().is_some()
+        || type_.len() > 64
+        || subtype.len() > 64
+        || media_type.len() > 128
+        || !type_.bytes().all(is_http_token_byte)
+        || !subtype.bytes().all(is_http_token_byte)
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "media type is not a canonicalizable MIME type".into(),
+        ));
+    }
+    Ok(match media_type.as_str() {
+        "image/jpg" => "image/jpeg".to_owned(),
+        other => other.to_owned(),
+    })
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 pub(crate) fn validate_sha256_hex(value: &str, label: &str) -> Result<(), AppError> {
@@ -57,6 +102,7 @@ pub(crate) fn media_nonce_from_reference(
 
 pub(crate) fn derive_media_file_key(
     media_secret: &[u8],
+    version: EncryptedMediaVersion,
     file_hash: &[u8; 32],
     media_type: &str,
     file_name: &str,
@@ -65,16 +111,24 @@ pub(crate) fn derive_media_file_key(
         AppError::InvalidEncryptedMedia("invalid encrypted-media component secret".into())
     })?;
     let mut key = [0_u8; 32];
-    hkdf.expand(&media_key_info(file_hash, media_type, file_name), &mut key)
-        .map_err(|_| AppError::InvalidEncryptedMedia("media key derivation failed".into()))?;
+    hkdf.expand(
+        &media_key_info(version, file_hash, media_type, file_name),
+        &mut key,
+    )
+    .map_err(|_| AppError::InvalidEncryptedMedia("media key derivation failed".into()))?;
     Ok(key)
 }
 
-fn media_key_info(file_hash: &[u8; 32], media_type: &str, file_name: &str) -> Vec<u8> {
-    let mut info = Vec::with_capacity(
-        ENCRYPTED_MEDIA_VERSION.len() + 1 + 32 + 1 + media_type.len() + 1 + file_name.len() + 4,
-    );
-    info.extend_from_slice(ENCRYPTED_MEDIA_VERSION.as_bytes());
+fn media_key_info(
+    version: EncryptedMediaVersion,
+    file_hash: &[u8; 32],
+    media_type: &str,
+    file_name: &str,
+) -> Vec<u8> {
+    let version = version.as_str();
+    let mut info =
+        Vec::with_capacity(version.len() + 1 + 32 + 1 + media_type.len() + 1 + file_name.len() + 4);
+    info.extend_from_slice(version.as_bytes());
     info.push(0);
     info.extend_from_slice(file_hash);
     info.push(0);
@@ -86,11 +140,16 @@ fn media_key_info(file_hash: &[u8; 32], media_type: &str, file_name: &str) -> Ve
     info
 }
 
-pub(crate) fn media_aad(file_hash: &[u8; 32], media_type: &str, file_name: &str) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(
-        ENCRYPTED_MEDIA_VERSION.len() + 1 + 32 + 1 + media_type.len() + 1 + file_name.len(),
-    );
-    aad.extend_from_slice(ENCRYPTED_MEDIA_VERSION.as_bytes());
+pub(crate) fn media_aad(
+    version: EncryptedMediaVersion,
+    file_hash: &[u8; 32],
+    media_type: &str,
+    file_name: &str,
+) -> Vec<u8> {
+    let version = version.as_str();
+    let mut aad =
+        Vec::with_capacity(version.len() + 1 + 32 + 1 + media_type.len() + 1 + file_name.len());
+    aad.extend_from_slice(version.as_bytes());
     aad.push(0);
     aad.extend_from_slice(file_hash);
     aad.push(0);

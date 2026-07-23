@@ -1200,6 +1200,52 @@ fn avatar_url_round_trips_through_account_projection() {
 }
 
 #[test]
+fn encrypted_media_v2_round_trips_through_account_projection() {
+    let mut group = AppGroupRecord::new(
+        "bb".to_owned(),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0xBB; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "current group".to_owned(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+    group.protocol_profile = AppProtocolProfile::Current;
+    group.encrypted_media = AppGroupEncryptedMediaComponent::new_v2(
+        cgka_traits::app_components::EncryptedMediaPolicyV2::blossom_default([
+            "https://blossom.primal.net".to_owned(),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+
+    let restored =
+        app_group_from_stored_group(stored_group_from_app_group(&group)).expect("restore V2 group");
+    assert_eq!(restored.protocol_profile, AppProtocolProfile::Current);
+    assert_eq!(
+        restored.encrypted_media.component_id,
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+    );
+    assert_eq!(
+        restored.encrypted_media.media_format,
+        cgka_traits::app_components::ENCRYPTED_MEDIA_FORMAT_V2
+    );
+    assert_eq!(restored.encrypted_media, group.encrypted_media);
+}
+
+#[test]
+fn key_package_capabilities_advertise_both_frozen_v1_and_current_v2_support() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let supported = app.supported_app_component_ids();
+    assert!(supported.contains(&GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID));
+    assert!(supported.contains(&GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID));
+}
+
+#[test]
 fn notification_settings_default_local_notifications_on_for_new_account() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -2107,9 +2153,9 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
 }
 
 #[test]
-fn received_media_message_with_malformed_reference_is_rejected() {
-    // PR #328 review Finding 2: structural malformation (here a bad
-    // ciphertext hash) still drops the message, unlike out-of-policy locators.
+fn received_media_message_with_malformed_reference_keeps_the_message() {
+    // A structural malformation (here a bad ciphertext hash) invalidates only
+    // this attachment under the adopted V2 attachment-local rule.
     let mut event = build(AppMessageIntent::Media {
         attachments: vec![MediaAttachmentReference {
             locators: vec![MediaLocator {
@@ -2129,8 +2175,8 @@ fn received_media_message_with_malformed_reference_is_rejected() {
         caption: None,
     });
     // Corrupt the ciphertext hash in the serialized imeta tag, then recompute
-    // the canonical id so the message passes id/sender checks and the only
-    // remaining failure is the structural media-reference check.
+    // the canonical id so the message passes id/sender checks. The malformed
+    // attachment must remain local to attachment rendering.
     for tag in &mut event.tags {
         for field in tag.iter_mut() {
             if let Some(rest) = field.strip_prefix("ciphertext_sha256 ") {
@@ -2152,8 +2198,8 @@ fn received_media_message_with_malformed_reference_is_rejected() {
         groups::decode_received_event(
             &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
         )
-        .is_none(),
-        "a structurally malformed media reference must drop the message",
+        .is_some(),
+        "a malformed attachment is omitted locally; it must not drop its carrying message",
     );
 }
 

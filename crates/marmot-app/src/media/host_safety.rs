@@ -4,7 +4,7 @@ use cgka_traits::app_components::{BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_ENDPO
 pub(crate) use cgka_traits::app_components::{is_loopback_host, reject_non_public_ip};
 use url::{Host, Url};
 
-use super::MediaLocator;
+use super::{EncryptedMediaVersion, MediaLocator};
 use crate::AppError;
 
 /// Structurally validate one locator. Per encrypted-media.md Validation a
@@ -16,6 +16,7 @@ use crate::AppError;
 /// NOT invalidate the reference or drop the containing message here.
 pub(crate) fn validate_locator(
     locator: &MediaLocator,
+    version: EncryptedMediaVersion,
     allow_loopback_http: bool,
 ) -> Result<(), AppError> {
     if locator.kind.trim().is_empty() || locator.value.trim().is_empty() {
@@ -36,9 +37,21 @@ pub(crate) fn validate_locator(
     // fetched (`fetch_encrypted_media_blob` filters to them), so a non-Blossom
     // locator skips this check — it is unfetchable-by-this-client, not unsafe.
     if locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
-        validate_blossom_fetch_url(&url, allow_loopback_http).map_err(|err| {
-            AppError::InvalidAppMessagePayload(format!("media locator URL is unsafe: {err}"))
-        })?;
+        match version {
+            EncryptedMediaVersion::V1 => {
+                validate_blossom_fetch_url(&url, allow_loopback_http).map_err(|err| {
+                    AppError::InvalidAppMessagePayload(format!(
+                        "media locator URL is unsafe: {err}"
+                    ))
+                })?;
+            }
+            EncryptedMediaVersion::V2 if !matches!(url.scheme(), "http" | "https") => {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "Blossom media locator URL scheme must be http or https".into(),
+                ));
+            }
+            EncryptedMediaVersion::V2 => {}
+        }
     }
     Ok(())
 }

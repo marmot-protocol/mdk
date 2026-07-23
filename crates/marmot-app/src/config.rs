@@ -55,11 +55,11 @@ pub struct MarmotAppConfig {
     pub cursor_persistence: CursorPersistence,
     /// Dev/test gate for loopback-HTTP blob endpoints. A loopback-HTTP endpoint
     /// (e.g. `http://127.0.0.1:PORT`) is VALID component state for everyone, but
-    /// per group-encrypted-media-v1.md a client MUST NOT upload to or download
-    /// from one unless explicitly configured for dev/test. Defaults to `false`
-    /// so production builds treat such endpoints as unusable rather than issuing
-    /// requests to the local host. This does not affect component validity
-    /// (decode still accepts loopback endpoints).
+    /// local destination policy forbids contacting it unless explicitly
+    /// configured for dev/test. Defaults to `false` so production builds treat
+    /// such endpoints as unusable rather than issuing requests to the local
+    /// host. This does not affect V2 component validity; frozen V1 reference
+    /// validation retains its own legacy unsafe-host rule.
     pub allow_loopback_blob_endpoints: bool,
     /// Dev/test gate for loopback relay endpoints (e.g. `ws://127.0.0.1:PORT`,
     /// an in-process `MockRelay`). A loopback relay URL is VALID

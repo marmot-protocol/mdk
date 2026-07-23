@@ -1551,6 +1551,11 @@ impl<S: StorageProvider> Engine<S> {
         Ok(self.storage.get_group(group_id)?)
     }
 
+    /// Profile selected for newly emitted KeyPackages and newly created groups.
+    pub fn new_protocol_profile(&self) -> ProtocolProfile {
+        self.new_protocol_profile
+    }
+
     /// Return the stored outbound welcome for `id` along with its group.
     ///
     /// Wrapped welcomes are persisted at wrap time as `Sent` raw-transport

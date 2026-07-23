@@ -1,12 +1,14 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MarmotAppEvent as MarmotInnerEvent,
 };
+use cgka_traits::group::ProtocolProfile;
 
 use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group};
 use crate::{
@@ -256,12 +258,23 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> AppGroupEncryptedMediaComponent {
+        let profile = self
+            .runtime
+            .group_record(group_id)
+            .map(|group| group.protocol_profile)
+            .unwrap_or(ProtocolProfile::Legacy);
+        let component_id = match profile {
+            ProtocolProfile::Legacy => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            ProtocolProfile::Current => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        };
         self.runtime
-            .app_component(group_id, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)
+            .app_component(group_id, component_id)
             .ok()
             .flatten()
-            .map(|bytes| AppGroupEncryptedMediaComponent::from_bytes(&bytes))
-            .unwrap_or_else(AppGroupEncryptedMediaComponent::disabled)
+            .map(|bytes| AppGroupEncryptedMediaComponent::from_bytes(component_id, &bytes))
+            .unwrap_or_else(|| {
+                AppGroupEncryptedMediaComponent::disabled_for_profile(profile.into())
+            })
     }
 
     pub(crate) fn image_for_group(&self, group_id: &GroupId) -> AppGroupImageInput {

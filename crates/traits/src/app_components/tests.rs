@@ -116,6 +116,98 @@ fn encrypted_media_policy_round_trips_ordered_endpoints() {
 }
 
 #[test]
+fn encrypted_media_v2_policy_has_independent_golden_bytes() {
+    const EXPECTED: &[u8] = &[
+        0x12, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74, 0x65, 0x64, 0x2d, 0x6d, 0x65, 0x64, 0x69,
+        0x61, 0x2d, 0x76, 0x32, // "encrypted-media-v2"
+        0x0b, 0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2d, 0x76,
+        0x31, // ["blossom-v1"]
+        0x27, 0x0a, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2d, 0x76, 0x31, 0x1b, 0x68, 0x74,
+        0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x62, 0x6c, 0x6f, 0x73, 0x73, 0x6f, 0x6d, 0x2e, 0x70,
+        0x72, 0x69, 0x6d, 0x61, 0x6c, 0x2e, 0x6e, 0x65, 0x74,
+        0x2f, // [{"blossom-v1", "https://blossom.primal.net/"}]
+    ];
+    let policy =
+        EncryptedMediaPolicyV2::blossom_default(["https://blossom.primal.net".to_owned()]).unwrap();
+
+    assert_eq!(encode_encrypted_media_policy_v2(&policy).unwrap(), EXPECTED);
+    assert_eq!(decode_encrypted_media_policy_v2(EXPECTED).unwrap(), policy);
+    assert!(decode_encrypted_media_policy_v1(EXPECTED).is_err());
+    assert!(
+        decode_encrypted_media_policy_v2(
+            &encode_encrypted_media_policy_v1(
+                &EncryptedMediaPolicyV1::blossom_default(
+                    ["https://blossom.primal.net".to_owned()],
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn encrypted_media_v2_endpoint_validity_is_not_destination_policy() {
+    for raw in [
+        "http://10.0.0.1/media",
+        "https://127.0.0.1/",
+        "http://localhost:3000/",
+    ] {
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url_v2(raw),
+            Ok(raw.to_owned())
+        );
+    }
+    for raw in [
+        "ftp://media.example/",
+        "https://user@media.example/",
+        "https://media.example/?token=x",
+        "https://media.example/#fragment",
+    ] {
+        assert!(
+            validate_and_normalize_blob_endpoint_url_v2(raw).is_err(),
+            "{raw} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn encrypted_media_v2_decode_rejects_noncanonical_and_duplicate_state() {
+    let mut allowed = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+    let mut endpoints = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+    encode_var_bytes(b"https://blossom.primal.net/", &mut endpoints);
+    let duplicate = encode_component_vectors(&[
+        ENCRYPTED_MEDIA_FORMAT_V2.as_bytes(),
+        allowed.as_slice(),
+        endpoints.as_slice(),
+    ]);
+    assert_eq!(
+        decode_encrypted_media_policy_v2(&duplicate),
+        Err("encrypted media policy has a duplicate allowed locator kind".into())
+    );
+
+    let mut allowed = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut allowed);
+    let mut endpoints = Vec::new();
+    encode_var_bytes(BLOSSOM_LOCATOR_KIND_V1.as_bytes(), &mut endpoints);
+    encode_var_bytes(b"https://blossom.primal.net", &mut endpoints);
+    let noncanonical = encode_component_vectors(&[
+        ENCRYPTED_MEDIA_FORMAT_V2.as_bytes(),
+        allowed.as_slice(),
+        endpoints.as_slice(),
+    ]);
+    assert_eq!(
+        decode_encrypted_media_policy_v2(&noncanonical),
+        Err("encrypted media endpoint base URL is not normalized".into())
+    );
+}
+
+#[test]
 fn encrypted_media_policy_decode_rejects_oversized_top_level_vectors() {
     let mut oversized_allowed = Vec::new();
     encode_var_bytes(ENCRYPTED_MEDIA_FORMAT_V1.as_bytes(), &mut oversized_allowed);

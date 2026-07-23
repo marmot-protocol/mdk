@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use super::DEFAULT_BLOSSOM_SERVER_URL;
 use super::blossom::{blossom_blob_url, fetch_blossom_blob, upload_blossom_blob};
-use super::crypto::canonical_media_type;
+use super::canonical_media_type;
 use crate::AppError;
 
 const GROUP_IMAGE_VERSION: &str = "marmot-group-image-v1";

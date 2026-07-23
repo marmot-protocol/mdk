@@ -373,7 +373,7 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
         nonce_hex: "bbbbbbbbbbbbbbbbbbbbbbbb".into(),
         file_name: "note.txt".into(),
         media_type: "text/plain".into(),
-        version: "encrypted-media-v1".into(),
+        version: marmot_uniffi::EncryptedMediaVersionFfi::V1,
         source_epoch: 0,
         dim: None,
         thumbhash: None,

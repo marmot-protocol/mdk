@@ -26,6 +26,8 @@ pub use cgka_traits::app_components::{
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_COMPONENT, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
     NOSTR_ROUTING_COMPONENT_ID,
@@ -143,9 +145,9 @@ pub use ids::{
 pub use marmot_forensics::AuditDataMode;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
-    MediaAttachmentReference, MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest,
-    MediaUploadAttachmentResult, MediaUploadRequest, MediaUploadResult,
-    media_attachment_from_imeta_tag,
+    EncryptedMediaVersion, MediaAttachmentReference, MediaDownloadResult, MediaLocator,
+    MediaUploadAttachmentRequest, MediaUploadAttachmentResult, MediaUploadRequest,
+    MediaUploadResult, media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use notifications::{
@@ -3146,7 +3148,11 @@ impl MarmotApp {
         let mut components = default_group_components();
         components.insert(NOSTR_ROUTING_COMPONENT_ID);
         components.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
-        components.insert(GROUP_ENCRYPTED_MEDIA_COMPONENT_ID);
+        // Existing legacy groups continue to require V1, while fresh
+        // current-profile groups require V2. Advertising both is support, not
+        // negotiation: each group's required component id selects exactly one.
+        components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
+        components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
         components.into_iter().collect()
     }
 

@@ -77,6 +77,7 @@ mod tests {
                 component_id: 0x8008,
                 component: "marmot.group.encrypted-media.v1".into(),
                 required: true,
+                version: Some(EncryptedMediaVersionFfi::V1),
                 media_format: "encrypted-media-v1".into(),
                 allowed_locator_kinds: vec!["blossom-v1".into()],
                 default_blob_endpoints: vec![AppBlobEndpointFfi {

@@ -16,8 +16,10 @@ use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, default_group_components, encode_components_list, encode_nostr_routing_v1,
+    EncryptedMediaPolicyV2, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    default_group_components, encode_components_list, encode_encrypted_media_policy_v2,
+    encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -936,14 +938,26 @@ fn current_proof_rejects_missing_support_advertisement() {
 #[tokio::test]
 async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
+    let current_components = default_group_components()
+        .into_iter()
+        .chain([GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID])
+        .collect::<Vec<_>>();
     let mut alice = EngineBuilder::new(storage.clone())
         .identity(pad32(b"alice-current-group"))
         .account_identity_proof_signer(proof_signer(b"alice-current-group"))
+        .supported_app_components(current_components.clone())
         .protocol_profile(ProtocolProfile::Current)
         .peeler(Box::new(MockPeeler::default()))
         .build()
         .unwrap();
-    let mut bob = build_current_client(b"bob-current-group");
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"bob-current-group"))
+        .account_identity_proof_signer(proof_signer(b"bob-current-group"))
+        .supported_app_components(current_components)
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
     let mut legacy_carol = build_client(b"carol-legacy-group", FeatureRegistry::new());
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -953,7 +967,16 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
             description: "strict profile".into(),
             members: vec![bob_kp],
             required_features: vec![],
-            app_components: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                data: encode_encrypted_media_policy_v2(
+                    &EncryptedMediaPolicyV2::blossom_default([
+                        "https://blossom.primal.net".to_owned()
+                    ])
+                    .unwrap(),
+                )
+                .unwrap(),
+            }],
             initial_admins: vec![],
         })
         .await
@@ -972,6 +995,18 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
             .required_capabilities
             .app_components
             .contains(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+    );
+    assert!(
+        group
+            .required_capabilities
+            .app_components
+            .contains(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID)
+    );
+    assert!(
+        alice
+            .app_component(&group_id, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID)
+            .unwrap()
+            .is_some()
     );
     assert!(
         !group

@@ -1,5 +1,5 @@
 use cgka_traits::app_components::{
-    BLOSSOM_LOCATOR_KIND_V1, BlobStoreEndpointV1, ENCRYPTED_MEDIA_FORMAT_V1,
+    BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
 };
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -17,13 +17,13 @@ mod host_safety;
 
 use blossom::{blossom_content_hash_from_url, upload_blossom_blob};
 use crypto::{
-    derive_media_file_key, media_aad, media_hash_from_reference, media_nonce_from_reference,
-    validate_sha256_hex,
+    canonical_media_type_v1, canonical_media_type_v2, derive_media_file_key, media_aad,
+    media_hash_from_reference, media_nonce_from_reference, validate_sha256_hex,
 };
 use host_safety::validate_locator;
 
 pub(crate) use blossom::{blossom_blob_url, fetch_blossom_blob};
-pub(crate) use crypto::canonical_media_type;
+pub(crate) use crypto::canonical_media_type_v1 as canonical_media_type;
 pub(crate) use group_image::{fetch_group_image, upload_group_image};
 pub(crate) use host_safety::is_loopback_http_endpoint;
 
@@ -42,7 +42,33 @@ pub const DEFAULT_BLOSSOM_SERVER_URLS: &[&str] = &[
 /// Primary built-in Blossom endpoint used by single-endpoint APIs such as
 /// encrypted group-image upload.
 pub const DEFAULT_BLOSSOM_SERVER_URL: &str = DEFAULT_BLOSSOM_SERVER_URLS[0];
+/// Frozen legacy format label. New code chooses a version from group state.
 pub const ENCRYPTED_MEDIA_VERSION: &str = ENCRYPTED_MEDIA_FORMAT_V1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncryptedMediaVersion {
+    V1,
+    V2,
+}
+
+impl EncryptedMediaVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => ENCRYPTED_MEDIA_FORMAT_V1,
+            Self::V2 => ENCRYPTED_MEDIA_FORMAT_V2,
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AppError> {
+        match value {
+            ENCRYPTED_MEDIA_FORMAT_V1 => Ok(Self::V1),
+            ENCRYPTED_MEDIA_FORMAT_V2 => Ok(Self::V2),
+            _ => Err(AppError::InvalidAppMessagePayload(
+                "media version is not supported".into(),
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaLocator {
@@ -83,6 +109,7 @@ impl MediaAttachmentReference {
     /// documentation, IPv6-transition, and multicast hosts are rejected
     /// regardless of its value.
     pub(crate) fn validate(&self, allow_loopback_http: bool) -> Result<(), AppError> {
+        let version = EncryptedMediaVersion::parse(&self.version)?;
         validate_sha256_hex(&self.ciphertext_sha256, "media ciphertext_sha256")?;
         validate_sha256_hex(&self.plaintext_sha256, "media plaintext_sha256")?;
         let expected_ciphertext_sha256 = self.ciphertext_sha256.to_ascii_lowercase();
@@ -99,14 +126,14 @@ impl MediaAttachmentReference {
             ));
         }
         for locator in &self.locators {
-            validate_locator(locator, allow_loopback_http)?;
+            validate_locator(locator, version, allow_loopback_http)?;
             // The blossom content-hash binding is Blossom-specific integrity, like
             // the host-safety check in `validate_locator`: a `blossom-v1` locator
             // URL MUST carry the ciphertext hash so the fetched blob is the one
             // this reference commits to. A non-Blossom locator is never fetched by
             // this client and carries no such URL convention, so it is subject only
             // to the structural checks above and stays merely unfetchable.
-            if locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
+            if version == EncryptedMediaVersion::V1 && locator.kind == BLOSSOM_LOCATOR_KIND_V1 {
                 let locator_hash =
                     blossom_content_hash_from_url(&locator.value).ok_or_else(|| {
                         AppError::InvalidAppMessagePayload(
@@ -120,16 +147,35 @@ impl MediaAttachmentReference {
                 }
             }
         }
-        if self.file_name.trim().is_empty() {
-            return Err(AppError::InvalidAppMessagePayload(
-                "media file name cannot be empty".into(),
-            ));
+        match version {
+            EncryptedMediaVersion::V1 if self.file_name.trim().is_empty() => {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "media file name cannot be empty".into(),
+                ));
+            }
+            EncryptedMediaVersion::V2
+                if self.file_name.is_empty()
+                    || self.file_name.len() > 255
+                    || self.file_name.contains('\0') =>
+            {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "media file name must be 1..255 UTF-8 bytes and contain no NUL".into(),
+                ));
+            }
+            _ => {}
         }
-        canonical_media_type(&self.media_type)?;
-        if self.version != ENCRYPTED_MEDIA_VERSION {
-            return Err(AppError::InvalidAppMessagePayload(format!(
-                "media version must be {ENCRYPTED_MEDIA_VERSION}"
-            )));
+        match version {
+            EncryptedMediaVersion::V1 => {
+                canonical_media_type_v1(&self.media_type)?;
+            }
+            EncryptedMediaVersion::V2 => {
+                let canonical = canonical_media_type_v2(&self.media_type)?;
+                if canonical != self.media_type {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "media type is not canonical for encrypted-media-v2".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -144,10 +190,17 @@ impl MediaAttachmentReference {
     /// default (see `locator_kind_allowed`).
     pub(crate) fn validate_outbound(
         &self,
+        expected_version: EncryptedMediaVersion,
         allowed_locator_kinds: &[String],
         allow_loopback_http: bool,
     ) -> Result<(), AppError> {
         self.validate(allow_loopback_http)?;
+        if self.version != expected_version.as_str() {
+            return Err(AppError::InvalidEncryptedMedia(format!(
+                "group requires {} references",
+                expected_version.as_str()
+            )));
+        }
         for locator in &self.locators {
             if !locator_kind_allowed(&locator.kind, allowed_locator_kinds) {
                 return Err(AppError::InvalidEncryptedMedia(
@@ -201,7 +254,7 @@ pub struct MediaUploadRequest {
     pub caption: Option<String>,
     pub send: bool,
     /// Optional explicit Blossom endpoint for local testing. When absent, the
-    /// group's `marmot.group.encrypted-media.v1` default endpoints are used.
+    /// the group's versioned encrypted-media default endpoints are used.
     pub blossom_server: Option<String>,
 }
 
@@ -225,14 +278,20 @@ pub struct MediaDownloadResult {
     pub size_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MediaOperationPolicy<'a> {
+    pub(crate) version: EncryptedMediaVersion,
+    pub(crate) default_endpoints: &'a [crate::AppBlobEndpoint],
+    pub(crate) allowed_locator_kinds: &'a [String],
+    pub(crate) allow_loopback_http: bool,
+}
+
 pub(crate) async fn upload_encrypted_media(
     request: MediaUploadRequest,
     source_epoch: u64,
     media_secret: &[u8],
     signer: &dyn NostrSigner,
-    default_endpoints: &[BlobStoreEndpointV1],
-    allowed_locator_kinds: &[String],
-    allow_loopback_http: bool,
+    policy: MediaOperationPolicy<'_>,
 ) -> Result<MediaUploadResult, AppError> {
     if request.attachments.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
@@ -241,7 +300,8 @@ pub(crate) async fn upload_encrypted_media(
     }
     let upload_servers = match request.blossom_server {
         Some(server) => vec![server],
-        None => default_endpoints
+        None => policy
+            .default_endpoints
             .iter()
             .map(|endpoint| endpoint.base_url.clone())
             .collect::<Vec<_>>(),
@@ -260,8 +320,7 @@ pub(crate) async fn upload_encrypted_media(
                 media_secret,
                 signer,
                 &upload_servers,
-                allowed_locator_kinds,
-                allow_loopback_http,
+                policy,
             )
             .await?,
         );
@@ -278,27 +337,34 @@ async fn upload_encrypted_media_attachment(
     media_secret: &[u8],
     signer: &dyn NostrSigner,
     upload_servers: &[String],
-    allowed_locator_kinds: &[String],
-    allow_loopback_http: bool,
+    policy: MediaOperationPolicy<'_>,
 ) -> Result<MediaUploadAttachmentResult, AppError> {
     if request.plaintext.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "media plaintext cannot be empty".into(),
         ));
     }
-    let file_name = request.file_name.trim().to_owned();
-    if file_name.is_empty() {
-        return Err(AppError::InvalidEncryptedMedia(
-            "media file name cannot be empty".into(),
-        ));
-    }
-    let media_type = canonical_media_type(&request.media_type)?;
+    let file_name = match policy.version {
+        EncryptedMediaVersion::V1 => request.file_name.trim().to_owned(),
+        EncryptedMediaVersion::V2 => request.file_name,
+    };
+    validate_outbound_file_name(&file_name, policy.version)?;
+    let media_type = match policy.version {
+        EncryptedMediaVersion::V1 => canonical_media_type_v1(&request.media_type)?,
+        EncryptedMediaVersion::V2 => canonical_media_type_v2(&request.media_type)?,
+    };
     let plaintext_hash: [u8; 32] = Sha256::digest(&request.plaintext).into();
     let plaintext_sha256 = hex::encode(plaintext_hash);
     let mut nonce = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce);
-    let file_key = derive_media_file_key(media_secret, &plaintext_hash, &media_type, &file_name)?;
-    let aad = media_aad(&plaintext_hash, &media_type, &file_name);
+    let file_key = derive_media_file_key(
+        media_secret,
+        policy.version,
+        &plaintext_hash,
+        &media_type,
+        &file_name,
+    )?;
+    let aad = media_aad(policy.version, &plaintext_hash, &media_type, &file_name);
     let cipher = ChaCha20Poly1305::new_from_slice(&file_key)
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid media key length".into()))?;
     let encrypted = cipher
@@ -316,7 +382,7 @@ async fn upload_encrypted_media_attachment(
         &encrypted,
         &ciphertext_sha256,
         signer,
-        allow_loopback_http,
+        policy.allow_loopback_http,
     )
     .await?;
     let reference = MediaAttachmentReference {
@@ -329,7 +395,7 @@ async fn upload_encrypted_media_attachment(
         nonce_hex: hex::encode(nonce),
         file_name,
         media_type,
-        version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+        version: policy.version.as_str().to_owned(),
         source_epoch,
         dim: request.dim,
         thumbhash: request.thumbhash,
@@ -338,7 +404,11 @@ async fn upload_encrypted_media_attachment(
     // it against the group's ACTUAL `allowed_locator_kinds` so an upload to a
     // group whose policy does not allow `blossom-v1` fails here rather than
     // emitting a reference its own receivers would reject.
-    reference.validate_outbound(allowed_locator_kinds, allow_loopback_http)?;
+    reference.validate_outbound(
+        policy.version,
+        policy.allowed_locator_kinds,
+        policy.allow_loopback_http,
+    )?;
     Ok(MediaUploadAttachmentResult {
         encrypted_size_bytes: encrypted.len() as u64,
         reference,
@@ -394,7 +464,7 @@ fn upload_error_summary(err: &AppError) -> String {
 pub(crate) async fn download_encrypted_media(
     reference: MediaAttachmentReference,
     media_secret: &[u8],
-    fallback_endpoints: &[BlobStoreEndpointV1],
+    fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     allow_loopback_blob_endpoints: bool,
 ) -> Result<MediaDownloadResult, AppError> {
@@ -402,6 +472,7 @@ pub(crate) async fn download_encrypted_media(
     // is judged at fetch time below, where it degrades to an unfetchable outcome
     // rather than a hard "corrupt reference" error.
     reference.validate(allow_loopback_blob_endpoints)?;
+    let version = EncryptedMediaVersion::parse(&reference.version)?;
     let encrypted = fetch_encrypted_media_blob(
         &reference,
         fallback_endpoints,
@@ -415,15 +486,19 @@ pub(crate) async fn download_encrypted_media(
         ));
     }
     let plaintext_hash = media_hash_from_reference(&reference)?;
-    let media_type = canonical_media_type(&reference.media_type)?;
+    let media_type = match version {
+        EncryptedMediaVersion::V1 => canonical_media_type_v1(&reference.media_type)?,
+        EncryptedMediaVersion::V2 => canonical_media_type_v2(&reference.media_type)?,
+    };
     let nonce = media_nonce_from_reference(&reference)?;
     let file_key = derive_media_file_key(
         media_secret,
+        version,
         &plaintext_hash,
         &media_type,
         &reference.file_name,
     )?;
-    let aad = media_aad(&plaintext_hash, &media_type, &reference.file_name);
+    let aad = media_aad(version, &plaintext_hash, &media_type, &reference.file_name);
     let cipher = ChaCha20Poly1305::new_from_slice(&file_key)
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid media key length".into()))?;
     let plaintext = cipher
@@ -455,7 +530,7 @@ fn encrypted_media_hash_matches(encrypted: &[u8], expected_hash: &str) -> bool {
 
 async fn fetch_encrypted_media_blob(
     reference: &MediaAttachmentReference,
-    fallback_endpoints: &[BlobStoreEndpointV1],
+    fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     allow_loopback_blob_endpoints: bool,
 ) -> Result<Vec<u8>, AppError> {
@@ -510,7 +585,7 @@ async fn fetch_encrypted_media_blob(
 
 fn encrypted_media_fetch_candidates(
     reference: &MediaAttachmentReference,
-    fallback_endpoints: &[BlobStoreEndpointV1],
+    fallback_endpoints: &[crate::AppBlobEndpoint],
 ) -> Vec<String> {
     let mut candidates = reference
         .locators
@@ -562,9 +637,9 @@ pub fn media_attachment_from_imeta_tag(
         Ok(())
     };
     for field in tag.iter().skip(1) {
-        if field.starts_with("blurhash ") {
+        if field == "blurhash" || field.starts_with("blurhash ") {
             return Err(AppError::InvalidAppMessagePayload(
-                "encrypted-media-v1 uses thumbhash, not blurhash".into(),
+                "encrypted media uses thumbhash, not blurhash".into(),
             ));
         }
         if let Some(rest) = field.strip_prefix("locator ") {
@@ -580,15 +655,27 @@ pub fn media_attachment_from_imeta_tag(
             continue;
         }
         let Some((key, value)) = field.split_once(' ') else {
+            if matches!(
+                field.as_str(),
+                "locator"
+                    | "v"
+                    | "ciphertext_sha256"
+                    | "plaintext_sha256"
+                    | "nonce"
+                    | "m"
+                    | "filename"
+                    | "dim"
+                    | "thumbhash"
+            ) {
+                return Err(AppError::InvalidAppMessagePayload(format!(
+                    "media field {field} is missing its value"
+                )));
+            }
             continue;
         };
         match key {
             "v" => {
-                if value != ENCRYPTED_MEDIA_VERSION {
-                    return Err(AppError::InvalidAppMessagePayload(format!(
-                        "media version must be {ENCRYPTED_MEDIA_VERSION}"
-                    )));
-                }
+                EncryptedMediaVersion::parse(value)?;
                 set_once(&mut version, value, "version")?;
             }
             "ciphertext_sha256" => set_once(&mut ciphertext_sha256, value, "ciphertext_sha256")?,
@@ -603,7 +690,7 @@ pub fn media_attachment_from_imeta_tag(
     }
     let required = |name: &'static str, value: Option<String>| {
         value
-            .filter(|value| !value.trim().is_empty())
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| AppError::InvalidAppMessagePayload(format!("media tag missing {name}")))
     };
     let reference = MediaAttachmentReference {
@@ -622,22 +709,12 @@ pub fn media_attachment_from_imeta_tag(
     Ok(reference)
 }
 
-/// Whether every `imeta` tag in `tags` is a structurally valid media reference.
-/// This is an ingest-time check only: locator-kind policy is NOT consulted here,
-/// because an out-of-policy or client-unsupported locator makes only that
-/// locator unfetchable and MUST NOT drop the containing message.
+/// Whether `tags` contains at least one structurally valid media reference.
+/// Invalid references are attachment-local and do not suppress valid siblings.
 pub(crate) fn media_imeta_tags_are_valid(tags: &[Vec<String>], allow_loopback_http: bool) -> bool {
-    let mut found = false;
-    for tag in tags
-        .iter()
+    tags.iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
-    {
-        found = true;
-        if media_attachment_from_imeta_tag(tag, None, allow_loopback_http).is_err() {
-            return false;
-        }
-    }
-    found
+        .any(|tag| media_attachment_from_imeta_tag(tag, None, allow_loopback_http).is_ok())
 }
 
 /// Whether `kind` is allowed by the group's `allowed_locator_kinds`. When the
@@ -651,6 +728,28 @@ fn locator_kind_allowed(kind: &str, allowed_locator_kinds: &[String]) -> bool {
         kind == BLOSSOM_LOCATOR_KIND_V1
     } else {
         allowed_locator_kinds.iter().any(|allowed| allowed == kind)
+    }
+}
+
+fn validate_outbound_file_name(
+    file_name: &str,
+    version: EncryptedMediaVersion,
+) -> Result<(), AppError> {
+    let valid = match version {
+        EncryptedMediaVersion::V1 => !file_name.trim().is_empty(),
+        EncryptedMediaVersion::V2 => {
+            !file_name.is_empty() && file_name.len() <= 255 && !file_name.contains('\0')
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::InvalidEncryptedMedia(match version {
+            EncryptedMediaVersion::V1 => "media file name cannot be empty".into(),
+            EncryptedMediaVersion::V2 => {
+                "media file name must be 1..255 UTF-8 bytes and contain no NUL".into()
+            }
+        }))
     }
 }
 

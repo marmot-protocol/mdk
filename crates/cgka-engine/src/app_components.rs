@@ -6,9 +6,10 @@ use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
     AppComponentId, AppComponentSet, GROUP_ADMIN_POLICY_COMPONENT_ID,
     GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, SAFE_AAD_COMPONENT_ID,
-    decode_components_list, decode_encrypted_media_policy_v1, decode_group_avatar_url_v1,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, SAFE_AAD_COMPONENT_ID, decode_components_list,
+    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
     decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
 };
 use cgka_traits::engine::CommitOrderingPriority;
@@ -540,6 +541,16 @@ fn validate_current_profile_group_context(
         ))
     })?;
     let required_components = required_app_components_of_extensions(extensions, context)?;
+    if required_components.contains(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID)
+        || dictionary
+            .dictionary()
+            .contains(&GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID)
+    {
+        return Err(EngineError::Other(format!(
+            "invalid current-profile {context}: frozen encrypted-media V1 component \
+             {GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID:#06x} is not permitted"
+        )));
+    }
     for mandatory in CURRENT_PROFILE_REQUIRED_APP_COMPONENTS {
         if !required_components.contains(mandatory) {
             return Err(EngineError::Other(format!(
@@ -626,7 +637,8 @@ fn is_known_group_component(component_id: AppComponentId) -> bool {
             | GROUP_MESSAGE_RETENTION_COMPONENT_ID
             | AGENT_TEXT_STREAM_QUIC_COMPONENT_ID
             | GROUP_AVATAR_URL_COMPONENT_ID
-            | GROUP_ENCRYPTED_MEDIA_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
     )
 }
 
@@ -1025,7 +1037,12 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(&component.data),
         GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
         AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
-        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(&component.data),
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+            validate_encrypted_media_policy_v1(&component.data)
+        }
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+            validate_encrypted_media_policy_v2(&component.data)
+        }
         _ => Ok(()),
     }
 }
@@ -1052,7 +1069,12 @@ pub(crate) fn validate_app_component_update(
         GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(&component.data),
         GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
         AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
-        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(&component.data),
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+            validate_encrypted_media_policy_v1(&component.data)
+        }
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+            validate_encrypted_media_policy_v2(&component.data)
+        }
         _ => Ok(()),
     }
 }
@@ -1240,10 +1262,16 @@ fn validate_agent_text_stream_policy(bytes: &[u8]) -> Result<(), EngineError> {
         .map_err(|e| EngineError::Serialize(format!("invalid agent text stream component: {e}")))
 }
 
-fn validate_encrypted_media_policy(bytes: &[u8]) -> Result<(), EngineError> {
+fn validate_encrypted_media_policy_v1(bytes: &[u8]) -> Result<(), EngineError> {
     decode_encrypted_media_policy_v1(bytes)
         .map(|_| ())
-        .map_err(|e| EngineError::Serialize(format!("invalid encrypted media component: {e}")))
+        .map_err(|e| EngineError::Serialize(format!("invalid encrypted media V1 component: {e}")))
+}
+
+fn validate_encrypted_media_policy_v2(bytes: &[u8]) -> Result<(), EngineError> {
+    decode_encrypted_media_policy_v2(bytes)
+        .map(|_| ())
+        .map_err(|e| EngineError::Serialize(format!("invalid encrypted media V2 component: {e}")))
 }
 
 fn decode_var_bytes(
@@ -1644,5 +1672,65 @@ mod tests {
 
         validate_current_profile_group_context(&extensions, "test")
             .expect("unknown optional component state is opaque");
+    }
+
+    #[test]
+    fn current_profile_rejects_frozen_encrypted_media_v1() {
+        let extensions = current_profile_extensions(
+            [
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            ],
+            true,
+            false,
+            &[ExtensionType::AppDataDictionary],
+            &[ProposalType::AppDataUpdate],
+        );
+        let error = validate_current_profile_group_context(&extensions, "test").unwrap_err();
+        assert!(
+            error.to_string().contains("encrypted-media V1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn encrypted_media_component_ids_do_not_reinterpret_each_others_bytes() {
+        let v1 = cgka_traits::app_components::EncryptedMediaPolicyV1::blossom_default(
+            ["https://blossom.primal.net".to_owned()],
+            false,
+        )
+        .unwrap();
+        let v1 = cgka_traits::app_components::encode_encrypted_media_policy_v1(&v1).unwrap();
+        let v2 = cgka_traits::app_components::EncryptedMediaPolicyV2::blossom_default([
+            "https://blossom.primal.net".to_owned(),
+        ])
+        .unwrap();
+        let v2 = cgka_traits::app_components::encode_encrypted_media_policy_v2(&v2).unwrap();
+
+        validate_initial_app_component(&AppComponentData {
+            component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            data: v1.clone(),
+        })
+        .unwrap();
+        validate_initial_app_component(&AppComponentData {
+            component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            data: v2.clone(),
+        })
+        .unwrap();
+        assert!(
+            validate_initial_app_component(&AppComponentData {
+                component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                data: v2,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_initial_app_component(&AppComponentData {
+                component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                data: v1,
+            })
+            .is_err()
+        );
     }
 }

@@ -72,6 +72,10 @@ where
         Ok(self.session.group_record(group_id)?)
     }
 
+    pub fn new_protocol_profile(&self) -> cgka_traits::group::ProtocolProfile {
+        self.session.new_protocol_profile()
+    }
+
     pub fn live_group_ids(&self) -> AccountResult<Vec<GroupId>> {
         Ok(self.session.live_group_ids()?)
     }

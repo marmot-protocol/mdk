@@ -1,13 +1,35 @@
 //! Media locator, attachment, upload/download, and media-record FFI conversions.
 
-use std::collections::HashMap;
-
 use marmot_app::{
-    AppMessageRecord, MediaAttachmentReference, MediaDownloadResult, MediaLocator,
-    MediaUploadAttachmentRequest, MediaUploadRequest, MediaUploadResult,
+    AppMessageRecord, EncryptedMediaVersion, MediaAttachmentReference, MediaDownloadResult,
+    MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest, MediaUploadResult,
 };
 
 use super::account::SendSummaryFfi;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum EncryptedMediaVersionFfi {
+    V1,
+    V2,
+}
+
+impl From<EncryptedMediaVersion> for EncryptedMediaVersionFfi {
+    fn from(value: EncryptedMediaVersion) -> Self {
+        match value {
+            EncryptedMediaVersion::V1 => Self::V1,
+            EncryptedMediaVersion::V2 => Self::V2,
+        }
+    }
+}
+
+impl From<EncryptedMediaVersionFfi> for EncryptedMediaVersion {
+    fn from(value: EncryptedMediaVersionFfi) -> Self {
+        match value {
+            EncryptedMediaVersionFfi::V1 => Self::V1,
+            EncryptedMediaVersionFfi::V2 => Self::V2,
+        }
+    }
+}
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MediaLocatorFfi {
@@ -41,7 +63,7 @@ pub struct MediaAttachmentReferenceFfi {
     pub nonce_hex: String,
     pub file_name: String,
     pub media_type: String,
-    pub version: String,
+    pub version: EncryptedMediaVersionFfi,
     pub source_epoch: u64,
     pub dim: Option<String>,
     pub thumbhash: Option<String>,
@@ -56,7 +78,9 @@ impl From<MediaAttachmentReference> for MediaAttachmentReferenceFfi {
             nonce_hex: value.nonce_hex,
             file_name: value.file_name,
             media_type: value.media_type,
-            version: value.version,
+            version: EncryptedMediaVersion::parse(&value.version)
+                .expect("validated media reference carries a supported version")
+                .into(),
             source_epoch: value.source_epoch,
             dim: value.dim,
             thumbhash: value.thumbhash,
@@ -73,7 +97,9 @@ impl From<MediaAttachmentReferenceFfi> for MediaAttachmentReference {
             nonce_hex: value.nonce_hex,
             file_name: value.file_name,
             media_type: value.media_type,
-            version: value.version,
+            version: EncryptedMediaVersion::from(value.version)
+                .as_str()
+                .to_owned(),
             source_epoch: value.source_epoch,
             dim: value.dim,
             thumbhash: value.thumbhash,
@@ -254,42 +280,7 @@ fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
 ) -> Option<MediaAttachmentReference> {
-    let mut locators = Vec::new();
-    let mut fields = HashMap::new();
-    for field in tag.iter().skip(1) {
-        if field.starts_with("blurhash ") {
-            return None;
-        }
-        if let Some(rest) = field.strip_prefix("locator ") {
-            let (kind, value) = rest.split_once(' ')?;
-            locators.push(MediaLocator {
-                kind: kind.to_owned(),
-                value: value.to_owned(),
-            });
-            continue;
-        }
-        if let Some((key, value)) = field.split_once(' ') {
-            fields.insert(key.to_owned(), value.to_owned());
-        }
-    }
-    let required = |key: &str| {
-        fields
-            .get(key)
-            .cloned()
-            .filter(|value| !value.trim().is_empty())
-    };
-    Some(MediaAttachmentReference {
-        locators,
-        ciphertext_sha256: required("ciphertext_sha256")?,
-        plaintext_sha256: required("plaintext_sha256")?,
-        nonce_hex: required("nonce")?,
-        file_name: required("filename")?,
-        media_type: required("m")?,
-        version: required("v")?,
-        source_epoch: source_epoch.unwrap_or_default(),
-        dim: fields.get("dim").cloned(),
-        thumbhash: fields.get("thumbhash").cloned(),
-    })
+    marmot_app::media_attachment_from_imeta_tag(tag, source_epoch, false).ok()
 }
 
 #[cfg(test)]
@@ -380,8 +371,21 @@ mod tests {
         assert_eq!(references[0].file_name, "diagram.png");
         assert_eq!(references[0].source_epoch, 7);
         assert_eq!(references[0].dim.as_deref(), Some("800x600"));
-        assert_eq!(references[0].version, "encrypted-media-v1");
+        assert_eq!(references[0].version, EncryptedMediaVersionFfi::V1);
         assert_eq!(references[0].locators.len(), 1);
+    }
+
+    #[test]
+    fn timeline_media_references_ffi_surfaces_v2_explicitly() {
+        let mut tag = imeta_tag(0x11, "image/png", "diagram.png", &[]);
+        tag[1] = "v encrypted-media-v2".to_owned();
+        tag[2] = "locator blossom-v1 http://10.0.0.1/blob".to_owned();
+
+        let references = timeline_media_references_ffi(&Some(imeta_metadata(&[tag])), Some(9));
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].version, EncryptedMediaVersionFfi::V2);
+        assert_eq!(references[0].source_epoch, 9);
     }
 
     #[test]
@@ -480,7 +484,7 @@ mod tests {
             nonce_hex: hex::encode([0x46; 12]),
             file_name: "brief.pdf".to_owned(),
             media_type: "application/pdf".to_owned(),
-            version: "encrypted-media-v1".to_owned(),
+            version: EncryptedMediaVersionFfi::V2,
             source_epoch: 42,
             dim: None,
             thumbhash: None,
@@ -493,6 +497,7 @@ mod tests {
         assert_eq!(round_trip.locators[0].kind, "blossom-v1");
         assert_eq!(round_trip.media_type, "application/pdf");
         assert_eq!(round_trip.file_name, "brief.pdf");
+        assert_eq!(round_trip.version, EncryptedMediaVersionFfi::V2);
         assert_eq!(round_trip.source_epoch, 42);
     }
 }
