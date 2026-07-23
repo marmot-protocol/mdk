@@ -282,6 +282,7 @@ fn registry() -> FeatureRegistry {
 
 fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -293,6 +294,7 @@ fn build(id: &[u8]) -> Engine<SqliteAccountStorage> {
 fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -358,6 +360,7 @@ fn build_with_routing(id: &[u8]) -> Engine<SqliteAccountStorage> {
     let mut components: Vec<_> = default_group_components().into_iter().collect();
     components.push(NOSTR_ROUTING_COMPONENT_ID);
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())
@@ -610,6 +613,7 @@ fn build_with_storage_and_peeler(
     peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry())

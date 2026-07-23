@@ -172,6 +172,7 @@ fn registry_selfremove_required_and_component_optional() -> FeatureRegistry {
 
 fn build_client(id: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
@@ -185,6 +186,7 @@ fn build_engine_with_components(
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .supported_app_components(components)
@@ -199,6 +201,7 @@ fn build_engine_with_registry_and_components(
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
@@ -215,6 +218,7 @@ fn build_engine_on_storage_with_registry_and_components(
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)
@@ -1041,6 +1045,7 @@ fn build_concrete_with_storage(
 ) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry)

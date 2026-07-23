@@ -67,6 +67,7 @@ pub struct SessionConfig {
     feature_registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
     protocol_profile: ProtocolProfile,
+    allow_legacy_compatibility_profile: bool,
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
@@ -87,7 +88,8 @@ impl SessionConfig {
             account_identity_proof_signer: None,
             feature_registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
-            protocol_profile: ProtocolProfile::Legacy,
+            protocol_profile: ProtocolProfile::Current,
+            allow_legacy_compatibility_profile: false,
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
             recorder: None,
@@ -123,9 +125,21 @@ impl SessionConfig {
     }
 
     /// Select the profile emitted by fresh KeyPackages and newly created
-    /// groups. Existing groups keep their persisted profile.
+    /// groups. Defaults to current. Existing groups keep their persisted
+    /// profile. Passing legacy is rejected by [`AccountDeviceSession::open`];
+    /// only the explicitly named compatibility-fixture seam can open it.
     pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
         self.protocol_profile = protocol_profile;
+        self.allow_legacy_compatibility_profile = false;
+        self
+    }
+
+    /// Open a legacy-profile session only to build compatibility fixtures.
+    /// Production account sessions must use the current default.
+    #[doc(hidden)]
+    pub fn legacy_compatibility_profile(mut self) -> Self {
+        self.protocol_profile = ProtocolProfile::Legacy;
+        self.allow_legacy_compatibility_profile = true;
         self
     }
 
@@ -209,6 +223,14 @@ pub struct IngestEffects {
 
 impl AccountDeviceSession {
     pub fn open(config: SessionConfig) -> SessionResult<Self> {
+        if config.protocol_profile == ProtocolProfile::Legacy
+            && !config.allow_legacy_compatibility_profile
+        {
+            return Err(EngineError::Other(
+                "strict cutover forbids opening a legacy-profile session".into(),
+            )
+            .into());
+        }
         tracing::debug!(
             target: TRACE_TARGET,
             method = "open",
@@ -226,12 +248,26 @@ impl AccountDeviceSession {
             )?)
             .feature_registry(config.feature_registry)
             .supported_app_components(config.supported_app_components.ids)
-            .protocol_profile(config.protocol_profile)
-            .peeler(config.peeler);
+            .protocol_profile(config.protocol_profile);
+        if config.allow_legacy_compatibility_profile {
+            builder = builder.legacy_compatibility_profile();
+        }
+        let mut builder = builder.peeler(config.peeler);
         if let Some(recorder) = config.recorder {
             builder = builder.recorder(recorder);
         }
         let mut engine = builder.build()?;
+        if config.protocol_profile == ProtocolProfile::Current {
+            let retirement = engine.retire_non_current_key_packages()?;
+            tracing::info!(
+                target: TRACE_TARGET,
+                method = "open",
+                legacy_key_packages_retired = retirement.legacy_retired,
+                invalid_key_packages_retired = retirement.invalid_retired,
+                current_key_packages_retained = retirement.current_retained,
+                "completed strict-cutover local key package retirement"
+            );
+        }
         engine.hydrate_stable_groups_from_storage()?;
         engine.set_convergence_policy(config.convergence_policy);
         engine.audit_recorder_health();

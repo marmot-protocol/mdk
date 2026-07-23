@@ -267,6 +267,7 @@ fn build_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorag
 fn build_epoch_gate_client(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -281,6 +282,7 @@ fn build_client_with_storage(
     storage: SqliteAccountStorage,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -295,6 +297,7 @@ fn build_client_with_max_past_epochs(
     max_past_epochs: usize,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -3661,6 +3664,7 @@ async fn rebuilt_engine_emits_canonical_app_message_after_convergence() {
         .expect("commit is stored");
 
     let mut restarted = EngineBuilder::new(carol_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(selfremove_registry())
@@ -3763,6 +3767,7 @@ async fn rebuilt_engine_emits_losing_branch_app_invalidation_after_convergence()
     }
 
     let mut restarted = EngineBuilder::new(carol_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(selfremove_registry())
@@ -5386,6 +5391,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
     );
 
     let mut restarted = EngineBuilder::new(carol_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(selfremove_registry())
@@ -5599,6 +5605,7 @@ async fn convergence_emits_run_state_and_decision_with_run_id_context() {
     let recorder = JsonlRecorder::open(&path, "test-engine-conv".to_string()).unwrap();
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut alice = EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
         .feature_registry(selfremove_registry())
@@ -5680,6 +5687,7 @@ async fn ingest_app_and_read_audit(
     )
     .unwrap();
     let mut bob = EngineBuilder::new(bob_storage)
+        .legacy_compatibility_profile()
         .identity(pad32(b"bob"))
         .account_identity_proof_signer(proof_signer(b"bob"))
         .feature_registry(selfremove_registry())

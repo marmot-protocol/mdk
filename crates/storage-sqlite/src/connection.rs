@@ -1,6 +1,8 @@
 use crate::openmls_storage::SqliteOpenMlsStorage;
 use crate::{SqliteResultExt, migrations};
-use cgka_traits::storage::{StorageError, StorageProvider, StorageResult};
+use cgka_traits::storage::{
+    KeyPackageBundleStorage, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+};
 use cgka_traits::types::Backend;
 use std::fmt;
 use std::path::Path;
@@ -640,6 +642,16 @@ impl StorageProvider for SqliteAccountStorage {
 
     fn backend(&self) -> Backend {
         Backend::Sqlite
+    }
+}
+
+impl KeyPackageBundleStorage for SqliteAccountStorage {
+    fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        self.openmls.stored_key_package_bundles()
+    }
+
+    fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
+        self.openmls.delete_stored_key_package_bundle(storage_key)
     }
 }
 

@@ -29,9 +29,10 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, LeaveRequest, LeaveRequestStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
+    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -225,6 +226,7 @@ fn build(id: &[u8]) -> impl CgkaEngine {
 
 fn build_with_peeler(id: &[u8], peeler: Box<dyn TransportPeeler>) -> impl CgkaEngine {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())
@@ -239,6 +241,7 @@ fn build_with_peeler_and_storage(
     storage: SqliteAccountStorage,
 ) -> impl CgkaEngine {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())
@@ -252,6 +255,7 @@ fn build_engine_with_storage(
     storage: SqliteAccountStorage,
 ) -> cgka_engine::Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())
@@ -962,6 +966,16 @@ impl AccountDeviceSignerStorage for FaultStorage {
     }
 }
 
+impl KeyPackageBundleStorage for FaultStorage {
+    fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        self.inner.stored_key_package_bundles()
+    }
+
+    fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
+        self.inner.delete_stored_key_package_bundle(storage_key)
+    }
+}
+
 impl StorageProvider for FaultStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 
@@ -996,6 +1010,7 @@ fn build_fault_engine(
     let inner = SqliteAccountStorage::in_memory().unwrap();
     let handle = inner.clone();
     let engine = EngineBuilder::new(FaultStorage { inner, fault })
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(registry_with_reactions())

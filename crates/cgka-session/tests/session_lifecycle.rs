@@ -13,12 +13,13 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::KeyPackageBundleStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use std::sync::Arc;
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 fn deterministic_nostr_keys(name: &[u8]) -> nostr::Keys {
     use sha2::{Digest, Sha256};
@@ -148,6 +149,7 @@ fn config(
         keys.public_key().to_bytes().to_vec(),
         Box::new(MockPeeler),
     )
+    .legacy_compatibility_profile()
     .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
     .feature_registry(FeatureRegistry::new())
 }
@@ -163,6 +165,54 @@ fn selfremove_registry() -> FeatureRegistry {
         },
     );
     registry
+}
+
+#[tokio::test]
+async fn default_session_cutover_retires_legacy_key_packages_on_every_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("cutover.sqlite");
+    let key = SqlCipherKey::new("strict cutover key").unwrap();
+    let identity = b"strict-cutover";
+
+    let mut legacy = AccountDeviceSession::open(config(&database_path, &key, identity)).unwrap();
+    legacy.fresh_key_package().await.unwrap();
+    legacy.fresh_key_package().await.unwrap();
+    drop(legacy);
+
+    let keys = deterministic_nostr_keys(identity);
+    let current_config = || {
+        SessionConfig::new(
+            &database_path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            keys.public_key().to_bytes().to_vec(),
+            Box::new(MockPeeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: keys.clone(),
+        }))
+    };
+
+    let current = AccountDeviceSession::open(current_config()).unwrap();
+    assert_eq!(current.new_protocol_profile(), ProtocolProfile::Current);
+    drop(current);
+
+    let storage = SqliteAccountStorage::open_encrypted(
+        &database_path,
+        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
+    )
+    .unwrap();
+    assert!(storage.stored_key_package_bundles().unwrap().is_empty());
+    drop(storage);
+
+    let reopened = AccountDeviceSession::open(current_config()).unwrap();
+    assert_eq!(reopened.new_protocol_profile(), ProtocolProfile::Current);
+    drop(reopened);
+    let storage = SqliteAccountStorage::open_encrypted(
+        &database_path,
+        &SqlCipherKey::new(key.as_secret_str()).unwrap(),
+    )
+    .unwrap();
+    assert!(storage.stored_key_package_bundles().unwrap().is_empty());
 }
 
 fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {

@@ -26,6 +26,53 @@ use crate::key_package_records::{
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
 
+#[tokio::test]
+async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let label = "cutover-crash";
+    let record_path = app.key_package_record_path(label);
+    write_json(
+        &record_path,
+        &KeyPackageRecord {
+            account_label: label.into(),
+            account_id_hex: "00".repeat(32),
+            key_package_id: "legacy-slot".into(),
+            key_package_ref_hex: String::new(),
+            key_package_event_id: String::new(),
+            published_at: 1,
+            key_package_hex: "00".into(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        app.retire_cached_non_current_key_package(label).await,
+        "invalid/non-current cache must enter the strict cutover path"
+    );
+    assert!(!record_path.exists());
+    assert!(app.key_package_cutover_replacement_pending(label));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(app.key_package_cutover_replacement_pending_path(label))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "cutover intent must be owner-only");
+    }
+
+    drop(app);
+    let reopened = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    assert!(
+        reopened.key_package_cutover_replacement_pending(label),
+        "a crash before current replacement must leave durable retry intent"
+    );
+    reopened.clear_key_package_cutover_replacement_pending(label);
+    assert!(!reopened.key_package_cutover_replacement_pending(label));
+}
+
 #[derive(Clone, Debug)]
 struct TestExternalAccountSigner {
     keys: nostr::Keys,

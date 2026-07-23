@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use cgka_engine::key_package::is_last_resort_key_package;
+use cgka_engine::key_package::{is_last_resort_key_package, key_package_metadata};
 use cgka_session::PublishWork;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
@@ -207,15 +207,29 @@ impl AppClient {
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
         match self.app.latest_key_package(&self.state.label) {
-            Ok(key_package) if is_last_resort_key_package(&key_package).unwrap_or(false) => {
-                self.app
-                    .publish_cached_key_package(&self.state.label, key_package)
-                    .await
+            Ok(key_package) => {
+                let reusable_current = match key_package_metadata(&key_package) {
+                    Ok(metadata) if metadata.protocol_profile == ProtocolProfile::Current => {
+                        is_last_resort_key_package(&key_package).unwrap_or(false)
+                    }
+                    // Strict cutover replaces legacy or malformed cached
+                    // packages instead of republishing them.
+                    Ok(_) | Err(_) => false,
+                };
+                if reusable_current {
+                    self.app
+                        .publish_cached_key_package(&self.state.label, key_package)
+                        .await
+                } else {
+                    Ok(self.runtime.publish_fresh_key_package().await?)
+                }
             }
-            Ok(_) => Ok(self.runtime.publish_fresh_key_package().await?),
-            Err(AppError::MissingKeyPackage(_)) => {
-                Ok(self.runtime.publish_fresh_key_package().await?)
-            }
+            Err(
+                AppError::MissingKeyPackage(_)
+                | AppError::InvalidKeyPackageEvent(_)
+                | AppError::Hex(_)
+                | AppError::Json(_),
+            ) => Ok(self.runtime.publish_fresh_key_package().await?),
             Err(err) => Err(err),
         }
     }

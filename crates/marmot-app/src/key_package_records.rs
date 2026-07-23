@@ -101,7 +101,10 @@ fn latest_key_package_from_records(
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
         }
-        latest = Some(key_package_from_record(record)?);
+        let fetched = key_package_from_record(record)?;
+        if fetched.key_package.protocol_profile == ProtocolProfile::Current {
+            latest = Some(fetched);
+        }
     }
     latest.ok_or_else(|| AppError::MissingKeyPackage(account_id_hex.to_owned()))
 }
@@ -171,6 +174,11 @@ fn validated_cached_key_package_with_ref(
     )?;
     let metadata = key_package_metadata(&decoded)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    if metadata.protocol_profile != ProtocolProfile::Current {
+        return Err(AppError::InvalidKeyPackageEvent(
+            "strict cutover rejects legacy KeyPackages for new joins".into(),
+        ));
+    }
     if metadata.credential_identity_hex != account_id_hex {
         return Err(AppError::InvalidKeyPackageEvent(
             "cached KeyPackage credential identity does not match directory account".into(),

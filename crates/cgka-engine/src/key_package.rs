@@ -13,8 +13,8 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    KeyPackage as MlsKeyPackage, KeyPackageVerifyError, MlsMessageBodyIn, MlsMessageIn,
-    MlsMessageOut, ProtocolVersion,
+    KeyPackage as MlsKeyPackage, KeyPackageBundle, KeyPackageVerifyError, MlsMessageBodyIn,
+    MlsMessageIn, MlsMessageOut, ProtocolVersion,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
@@ -30,6 +30,13 @@ pub struct KeyPackageMetadata {
     pub mls_extensions: Vec<u16>,
     pub mls_proposals: Vec<u16>,
     pub app_components: Vec<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyPackageRetirementReport {
+    pub legacy_retired: usize,
+    pub invalid_retired: usize,
+    pub current_retained: usize,
 }
 
 /// Parse and validate a transported KeyPackage enough for transport-directory
@@ -101,6 +108,48 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Permanently retire every locally persisted KeyPackage bundle that is not
+    /// usable by the current protocol profile.
+    ///
+    /// This runs synchronously during strict-cutover session open, before any
+    /// Welcome can be processed. Enumeration and deletion occur in one storage
+    /// transaction, making restart behavior idempotent. Corrupt or
+    /// unclassifiable bundles are deleted as well: retaining private join
+    /// capability is only safe when the bundle is positively identified as
+    /// current-profile.
+    pub fn retire_non_current_key_packages(
+        &mut self,
+    ) -> Result<KeyPackageRetirementReport, EngineError> {
+        self.storage.with_transaction(|storage| {
+            let mut report = KeyPackageRetirementReport::default();
+            for stored in storage.stored_key_package_bundles()? {
+                let bundle = match serde_json::from_slice::<KeyPackageBundle>(&stored.value) {
+                    Ok(bundle) => bundle,
+                    Err(_) => {
+                        storage.delete_stored_key_package_bundle(&stored.storage_key)?;
+                        report.invalid_retired += 1;
+                        continue;
+                    }
+                };
+                match crate::account_identity_proof::validate_leaf_account_identity_proof(
+                    bundle.key_package().leaf_node(),
+                    bundle.key_package().ciphersuite(),
+                ) {
+                    Ok(ProtocolProfile::Current) => report.current_retained += 1,
+                    Ok(ProtocolProfile::Legacy) => {
+                        storage.delete_stored_key_package_bundle(&stored.storage_key)?;
+                        report.legacy_retired += 1;
+                    }
+                    Err(_) => {
+                        storage.delete_stored_key_package_bundle(&stored.storage_key)?;
+                        report.invalid_retired += 1;
+                    }
+                }
+            }
+            Ok::<_, EngineError>(report)
+        })
+    }
+
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);

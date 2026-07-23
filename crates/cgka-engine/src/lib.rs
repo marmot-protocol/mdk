@@ -69,7 +69,7 @@ pub use engine_metrics::{
     EngineMetrics, EngineMetricsSnapshot, HistogramBucket, HistogramSnapshot,
 };
 pub use feature_registry::FeatureRegistry;
-pub use key_package::{KeyPackageMetadata, key_package_metadata};
+pub use key_package::{KeyPackageMetadata, KeyPackageRetirementReport, key_package_metadata};
 pub use wire_format::{
     DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, WIRE_FORMAT_POLICY_REVIEW_REQUIRED,
     default_join_config, join_config,

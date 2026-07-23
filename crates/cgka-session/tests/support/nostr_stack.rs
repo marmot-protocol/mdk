@@ -158,6 +158,7 @@ impl NostrStackHarness {
                 keys.public_key().to_bytes().to_vec(),
                 Box::new(NostrMlsPeeler::new().with_welcome_signer(keys.clone())),
             )
+            .legacy_compatibility_profile()
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
                 keys: keys.clone(),
             }))

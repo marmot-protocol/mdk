@@ -74,6 +74,7 @@ impl TransportPeeler for StubPeeler {
 fn engine_can_be_built_and_boxed_as_trait_object() {
     let identity = valid_identity(b"self-identity");
     let engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(identity.clone())
         .account_identity_proof_signer(proof_signer(b"self-identity"))
         .peeler(Box::new(StubPeeler))
@@ -90,6 +91,7 @@ fn engine_can_be_built_and_boxed_as_trait_object() {
 #[test]
 fn builder_rejects_missing_identity() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .peeler(Box::new(StubPeeler))
         .build();
     assert!(matches!(res, Err(EngineError::Other(_))));
@@ -98,6 +100,7 @@ fn builder_rejects_missing_identity() {
 #[test]
 fn builder_rejects_missing_peeler() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(b"id".to_vec())
         .build();
     assert!(matches!(res, Err(EngineError::Other(_))));
@@ -108,6 +111,7 @@ fn builder_rejects_non_mandatory_ciphersuite() {
     // spec/foundation/mls-protocol.md:11-15 — only
     // MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (0x0001) is permitted.
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(valid_identity(b"self-identity"))
         .account_identity_proof_signer(proof_signer(b"self-identity"))
         .peeler(Box::new(StubPeeler))
@@ -125,6 +129,7 @@ fn builder_rejects_non_mandatory_ciphersuite() {
 #[test]
 fn builder_accepts_mandatory_ciphersuite_explicitly() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(valid_identity(b"self-identity"))
         .account_identity_proof_signer(proof_signer(b"self-identity"))
         .peeler(Box::new(StubPeeler))
@@ -136,6 +141,7 @@ fn builder_accepts_mandatory_ciphersuite_explicitly() {
 #[tokio::test]
 async fn empty_engine_methods_return_typed_results() {
     let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(valid_identity(b"id"))
         .account_identity_proof_signer(proof_signer(b"id"))
         .peeler(Box::new(StubPeeler))

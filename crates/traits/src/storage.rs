@@ -238,6 +238,27 @@ pub trait AccountDeviceSignerStorage {
     ) -> StorageResult<Option<AccountDeviceSignerBinding>>;
 }
 
+// ── KeyPackageBundleStorage ────────────────────────────────────────────────
+
+/// Account-device-local enumeration of persisted OpenMLS KeyPackage bundles.
+///
+/// OpenMLS exposes point lookup and deletion by KeyPackage reference, but no
+/// enumeration API. A strict protocol-profile cutover must nevertheless find
+/// and retire every legacy bundle, including unpublished bundles for which the
+/// application has no public-event cache entry. Storage therefore exposes the
+/// serialized OpenMLS entities as opaque bytes; the engine owns their schema,
+/// profile classification, and deletion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredKeyPackageBundle {
+    pub storage_key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+pub trait KeyPackageBundleStorage {
+    fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>>;
+    fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()>;
+}
+
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
 /// The single storage type parameter carried by the engine.
@@ -255,6 +276,7 @@ pub trait StorageProvider:
     + ConvergencePolicyStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
+    + KeyPackageBundleStorage
     + Send
     + Sync
 {

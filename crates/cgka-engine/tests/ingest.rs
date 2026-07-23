@@ -399,6 +399,7 @@ fn build_client_with_storage_and_peeler(
     peeler: Box<dyn TransportPeeler>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -433,6 +434,7 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
     let mut supported = default_group_components();
     supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
     let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
         .feature_registry(selfremove_registry())

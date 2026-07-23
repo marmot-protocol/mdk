@@ -123,6 +123,7 @@ impl TransportPeeler for MockPeeler {
 async fn snapshot_names_do_not_embed_plaintext_group_id() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut alice = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
         .feature_registry(FeatureRegistry::new())
@@ -131,6 +132,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
         .unwrap();
 
     let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(b"bob"))
         .account_identity_proof_signer(proof_signer(b"bob"))
         .feature_registry(FeatureRegistry::new())
@@ -156,6 +158,7 @@ async fn snapshot_names_do_not_embed_plaintext_group_id() {
 
     // Force a few snapshots: invite, app message, update_group_data.
     let mut carol = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .feature_registry(FeatureRegistry::new())

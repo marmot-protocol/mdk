@@ -892,6 +892,13 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
                     let before = EpochId(mls_group.epoch().as_u64());
+                    if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
+                        &group_id,
+                        staged.add_proposals().next().is_some(),
+                    ) {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(error);
+                    }
                     if let Err(err) = crate::app_components::require_admin_for_staged_commit(
                         &mls_group,
                         &group_id,
@@ -1226,6 +1233,13 @@ impl<S: StorageProvider> Engine<S> {
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ProposalMessage(queued) => {
+                    if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
+                        &group_id,
+                        matches!(queued.proposal(), Proposal::Add(_)),
+                    ) {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(error);
+                    }
                     // Ask the auto-committer policy whether we should commit
                     // this proposal. OpenMLS does not auto-enqueue processed
                     // proposals, so store it before attempting to commit the
@@ -1261,6 +1275,12 @@ impl<S: StorageProvider> Engine<S> {
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                    if let Err(error) =
+                        self.strict_cutover_rejects_legacy_group_addition(&group_id, true)
+                    {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(error);
+                    }
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     Ok(IngestOutcome::Processed)
                 }

@@ -208,6 +208,7 @@ const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection
 const SELF_MEMBERSHIP_BACKFILL_MARKER: &str = "self-membership-backfill-v1";
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
+const KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT: usize = 1_024;
 const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
@@ -1095,6 +1096,59 @@ impl MarmotApp {
             epoch_stall: Default::default(),
             epoch_backfill_pending: false,
         };
+        client
+            .app
+            .retire_cached_non_current_key_package(&client.state.label)
+            .await;
+        client
+            .app
+            .retire_relay_non_current_key_packages(&client.state.label)
+            .await;
+        if client
+            .app
+            .key_package_cutover_replacement_pending(&client.state.label)
+        {
+            let cached_current = client
+                .app
+                .latest_key_package(&client.state.label)
+                .ok()
+                .and_then(|key_package| key_package_metadata(&key_package).ok())
+                .is_some_and(|metadata| {
+                    metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+                });
+            if cached_current {
+                client
+                    .app
+                    .clear_key_package_cutover_replacement_pending(&client.state.label);
+            } else {
+                match client.runtime.publish_fresh_key_package().await {
+                    Ok(_) => tracing::info!(
+                        target: "marmot_app::key_packages",
+                        method = "client_with_relay_plane",
+                        "published current key package replacement after strict cutover"
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "client_with_relay_plane",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "deferred current key package replacement after strict cutover"
+                    ),
+                }
+                if client
+                    .app
+                    .latest_key_package(&client.state.label)
+                    .ok()
+                    .and_then(|key_package| key_package_metadata(&key_package).ok())
+                    .is_some_and(|metadata| {
+                        metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+                    })
+                {
+                    client
+                        .app
+                        .clear_key_package_cutover_replacement_pending(&client.state.label);
+                }
+            }
+        }
         if client.reconcile_live_engine_groups()? {
             // Persist the repaired roster before any fallible network refresh,
             // so another restart cannot lose the group again.
@@ -2109,10 +2163,288 @@ impl MarmotApp {
             return Err(AppError::MissingKeyPackage(label.to_owned()));
         }
         let record: KeyPackageRecord = read_json(path)?;
-        key_package_from_hex_with_optional_source(
+        let key_package = key_package_from_hex_with_optional_source(
             &record.key_package_hex,
             &record.key_package_event_id,
-        )
+        )?;
+        let metadata = key_package_metadata(&key_package)
+            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+        Ok(key_package.with_protocol_profile(metadata.protocol_profile))
+    }
+
+    /// Best-effort public-event cleanup after the session has already
+    /// transactionally removed the matching non-current private bundle.
+    ///
+    /// A failed relay deletion deliberately leaves the cache record in place:
+    /// the current replacement then reuses the same replaceable-event `d`
+    /// slot, superseding the legacy event wherever the deletion was missed.
+    /// If replacement publication also fails, the next account open retries
+    /// from the unchanged cache.
+    async fn retire_cached_non_current_key_package(&self, label: &str) -> bool {
+        let path = self.key_package_record_path(label);
+        let record = match read_json::<KeyPackageRecord>(&path) {
+            Ok(record) => record,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_cached_non_current_key_package",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not classify cached key package after strict cutover"
+                );
+                if !self.mark_key_package_cutover_replacement_pending(label) {
+                    return false;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(remove_error) => tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "retire_cached_non_current_key_package",
+                        error_kind = AppError::from(remove_error).privacy_safe_kind(),
+                        "could not remove invalid key package cache"
+                    ),
+                }
+                return true;
+            }
+        };
+        let is_current = hex::decode(&record.key_package_hex)
+            .ok()
+            .map(KeyPackage::new)
+            .and_then(|key_package| key_package_metadata(&key_package).ok())
+            .is_some_and(|metadata| {
+                metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            });
+        if is_current {
+            return false;
+        }
+        if !self.mark_key_package_cutover_replacement_pending(label) {
+            return false;
+        }
+
+        if record.key_package_event_id.is_empty() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_cached_non_current_key_package",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not remove unpublished non-current key package cache"
+                ),
+            }
+            return true;
+        }
+
+        match self
+            .delete_key_package_event(label, &record.key_package_event_id, Vec::new())
+            .await
+        {
+            Ok(accepted) => tracing::info!(
+                target: "marmot_app::key_packages",
+                method = "retire_cached_non_current_key_package",
+                relay_accept_count = accepted,
+                "retired cached non-current key package event"
+            ),
+            Err(error) => tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "retire_cached_non_current_key_package",
+                error_kind = error.privacy_safe_kind(),
+                "could not delete cached non-current key package event; current replacement will supersede its slot"
+            ),
+        }
+        true
+    }
+
+    /// Scan the account's authoritative KeyPackage relays and best-effort
+    /// delete every still-discoverable legacy event. This runs on each account
+    /// open, so a crash or partial relay outage simply leaves work for the next
+    /// restart. Local private bundles have already been retired synchronously.
+    async fn retire_relay_non_current_key_packages(&self, label: &str) -> bool {
+        if self.key_package_cutover_scan_complete(label)
+            && !self.key_package_cutover_replacement_pending(label)
+        {
+            return false;
+        }
+        let account = match self.account_home().account(label) {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_relay_non_current_key_packages",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not resolve account for relay key package retirement"
+                );
+                return false;
+            }
+        };
+        let relay_lists =
+            match self.account_relay_list_status_for_account_id(&account.account_id_hex) {
+                Ok(relay_lists) => relay_lists,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "retire_relay_non_current_key_packages",
+                        error_kind = error.privacy_safe_kind(),
+                        "could not resolve relays for key package retirement"
+                    );
+                    return false;
+                }
+            };
+        let source_relays = relay_lists
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        if source_relays.is_empty() {
+            return false;
+        }
+        let records = match self
+            .fetch_key_package_events_for_account_id_with_limit(
+                &account.account_id_hex,
+                &source_relays,
+                KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT,
+            )
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_relay_non_current_key_packages",
+                    error_kind = error.privacy_safe_kind(),
+                    "deferred relay key package retirement scan"
+                );
+                return false;
+            }
+        };
+
+        let mut non_current_event_count = 0usize;
+        let mut accepted_delete_count = 0usize;
+        let mut delete_failure_count = 0usize;
+        for record in records {
+            let event_id = record.event.id.clone();
+            let endpoints = record.endpoints.clone();
+            let profile = key_package_from_record(record)
+                .ok()
+                .map(|fetched| fetched.key_package.protocol_profile);
+            if profile == Some(cgka_traits::group::ProtocolProfile::Current) {
+                continue;
+            }
+            if !self.mark_key_package_cutover_replacement_pending(label) {
+                delete_failure_count += 1;
+                continue;
+            }
+            non_current_event_count += 1;
+            match self
+                .delete_key_package_event(label, &event_id, endpoints)
+                .await
+            {
+                Ok(accepted) => accepted_delete_count += accepted,
+                Err(_) => delete_failure_count += 1,
+            }
+        }
+        if delete_failure_count == 0 {
+            self.mark_key_package_cutover_scan_complete(label);
+        }
+        if non_current_event_count > 0 {
+            tracing::info!(
+                target: "marmot_app::key_packages",
+                method = "retire_relay_non_current_key_packages",
+                non_current_event_count,
+                accepted_delete_count,
+                delete_failure_count,
+                "completed relay key package retirement scan"
+            );
+        }
+        non_current_event_count > 0
+    }
+
+    fn key_package_cutover_replacement_pending_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.strict-cutover-replacement-pending"))
+    }
+
+    fn key_package_cutover_scan_complete_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.strict-cutover-relay-scan-complete"))
+    }
+
+    fn key_package_cutover_replacement_pending(&self, label: &str) -> bool {
+        self.key_package_cutover_replacement_pending_path(label)
+            .exists()
+    }
+
+    fn mark_key_package_cutover_replacement_pending(&self, label: &str) -> bool {
+        let path = self.key_package_cutover_replacement_pending_path(label);
+        let result = path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cutover marker has no parent directory",
+                )
+            })
+            .and_then(fs_private::create_dir_all_private)
+            .and_then(|()| fs_private::write_private(&path, b"pending\n"));
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "mark_key_package_cutover_replacement_pending",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not persist key package cutover replacement intent"
+                );
+                false
+            }
+        }
+    }
+
+    fn clear_key_package_cutover_replacement_pending(&self, label: &str) {
+        let path = self.key_package_cutover_replacement_pending_path(label);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "clear_key_package_cutover_replacement_pending",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not clear completed key package replacement intent"
+            ),
+        }
+    }
+
+    fn key_package_cutover_scan_complete(&self, label: &str) -> bool {
+        self.key_package_cutover_scan_complete_path(label).exists()
+    }
+
+    fn mark_key_package_cutover_scan_complete(&self, label: &str) {
+        let path = self.key_package_cutover_scan_complete_path(label);
+        let result = path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cutover marker has no parent directory",
+                )
+            })
+            .and_then(fs_private::create_dir_all_private)
+            .and_then(|()| fs_private::write_private(&path, b"complete\n"));
+        if let Err(error) = result {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "mark_key_package_cutover_scan_complete",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not persist completed key package relay scan"
+            );
+        }
     }
 
     pub fn local_key_package_records(
@@ -3369,6 +3701,11 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
     ) -> Result<(), KeyPackagePublishError> {
         let metadata = key_package_metadata(&publication.key_package)
             .map_err(|e| KeyPackagePublishError::unexposed(e.to_string()))?;
+        if metadata.protocol_profile != cgka_traits::group::ProtocolProfile::Current {
+            return Err(KeyPackagePublishError::unexposed(
+                "strict cutover forbids publishing a legacy KeyPackage",
+            ));
+        }
         let account_id_hex = hex::encode(publication.account_id.as_slice());
         if metadata.credential_identity_hex != account_id_hex {
             return Err(KeyPackagePublishError::unexposed(

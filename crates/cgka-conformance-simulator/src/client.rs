@@ -178,7 +178,7 @@ fn build_harness_engine(
     audit_capture: &AuditCapture,
 ) -> Engine<SqliteAccountStorage> {
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
-    EngineBuilder::new(storage.clone())
+    let mut builder = EngineBuilder::new(storage.clone())
         .identity(identity.to_vec())
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: signer.clone(),
@@ -187,9 +187,11 @@ fn build_harness_engine(
         .feature_registry(registry.clone())
         .supported_app_components(harness_supported_app_components())
         .peeler(Box::new(peeler))
-        .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())))
-        .build()
-        .expect("engine builds")
+        .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
+    if protocol_profile == ProtocolProfile::Legacy {
+        builder = builder.legacy_compatibility_profile();
+    }
+    builder.build().expect("engine builds")
 }
 
 fn deterministic_nostr_keys(seed: &[u8]) -> nostr::Keys {

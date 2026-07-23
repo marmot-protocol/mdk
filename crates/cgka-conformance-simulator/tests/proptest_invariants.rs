@@ -1361,6 +1361,7 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
         let restarted_identity = restarted_keys.public_key().to_bytes().to_vec();
         let restarted_storage = clients[2].storage().clone();
         let mut restarted = EngineBuilder::new(restarted_storage.clone())
+            .legacy_compatibility_profile()
             .identity(restarted_identity.clone())
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
                 keys: restarted_keys,

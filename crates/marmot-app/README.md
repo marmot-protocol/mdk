@@ -26,8 +26,15 @@ published to (and fetched from) the account's NIP-65 relays; there is no dedicat
 can check whether those lists are already present before writing local account state. The same status API can fetch
 those relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for deterministic
 CLI/TUI development. KeyPackage publication keeps a stable replaceable d-tag for the account and tracks the decoded
-KeyPackage ref separately; normal publish reuses the cached valid last-resort package, while explicit rotate or lifetime
-policy rejection creates a new package under the same slot.
+KeyPackage ref separately; normal publish reuses only a cached current-profile last-resort package, while explicit
+rotate, a legacy cache entry, or lifetime-policy rejection creates a new current-profile package under the same slot.
+
+Account open performs the strict profile cutover before transport processing: the encrypted session transactionally
+retires every locally stored legacy KeyPackage private bundle, then the app best-effort deletes cached and
+relay-discoverable legacy kind `30443` events. A private owner-only retry marker is written before relay cleanup, so a
+crash or relay failure cannot restore legacy join capability or lose the obligation to publish a current replacement.
+Legacy Welcomes are terminally rejected. Already-joined legacy groups remain usable by their existing members,
+including their Media V1 state, but membership additions and re-additions are refused.
 
 The user directory is keyed by Nostr pubkey. Account setup and the daemon can refresh a local account's contact-list
 event, pre-cache direct follows, and cache profile metadata for those likely contacts. Runtime startup builds chunked

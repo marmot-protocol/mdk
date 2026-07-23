@@ -105,6 +105,17 @@ impl<S: StorageProvider> Engine<S> {
         // agent-text-stream-quic-v1.md): a client MUST NOT invite a member whose
         // KeyPackage does not advertise every required role capability.
         let existing = self.storage.get_group(&group_id)?;
+        if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && existing.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "LegacyProfile",
+                    to: "Invite",
+                    reason: "strict cutover forbids adding members to legacy groups",
+                },
+            ));
+        }
         let mut required = existing.required_capabilities.clone();
         merge_capabilities(
             &mut required,

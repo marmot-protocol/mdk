@@ -129,6 +129,7 @@ fn build_client(
     identity: &[u8],
 ) -> cgka_engine::Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(FeatureRegistry::new())
@@ -158,6 +159,7 @@ fn build_selfremove_client(
     identity: &[u8],
 ) -> cgka_engine::Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(selfremove_registry())

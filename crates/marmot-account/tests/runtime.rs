@@ -192,6 +192,7 @@ fn session_with_registry(
             pad32(identity),
             Box::new(MockPeeler),
         )
+        .legacy_compatibility_profile()
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
         .feature_registry(registry),
     )
