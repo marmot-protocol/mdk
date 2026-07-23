@@ -1244,6 +1244,28 @@ impl<S: StorageProvider> Engine<S> {
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     Ok(IngestOutcome::Processed)
                 }
+                ProcessedMessageContent::OwnPendingCommit
+                | ProcessedMessageContent::OwnPrivateMessage => {
+                    // This normally returns through the durable sent-content
+                    // marker before OpenMLS processing. Keep the library-level
+                    // classification as a safe fallback, but do not merge the
+                    // pending commit: MDK applies local commits only through
+                    // its explicit publish-before-apply confirmation path.
+                    self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    self.seen_message_ids.insert(msg.id.clone());
+                    Ok(IngestOutcome::Stale {
+                        reason: StaleReason::OwnEcho,
+                    })
+                }
+                ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                    // `process_commit_with_app_data_updates` must resolve this
+                    // before returning. Retain the message for diagnosis and
+                    // retry rather than accepting a partially processed commit.
+                    self.update_stored_message_state(&msg.id, MessageState::Retryable)?;
+                    Err(EngineError::Backend(
+                        "commit retained unresolved app-data updates".into(),
+                    ))
+                }
             };
         }
     }

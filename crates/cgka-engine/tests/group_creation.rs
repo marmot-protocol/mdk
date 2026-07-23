@@ -29,14 +29,16 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{MemberId, MessageId};
+use openmls::component::ComponentType;
 use openmls::prelude::{
     BasicCredential, Capabilities, CredentialWithKey, ExtensionType, Extensions,
-    KeyPackage as MlsKeyPackage, Lifetime, MlsMessageOut,
+    KeyPackage as MlsKeyPackage, Lifetime, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
+    ProtocolVersion,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::types::Ciphersuite;
 use storage_sqlite::SqliteAccountStorage;
-use tls_codec::Serialize as _;
+use tls_codec::{Deserialize as _, Serialize as _};
 
 mod support;
 use support::proof_signer;
@@ -127,7 +129,9 @@ fn key_package_with_account_identity_proof_and_lifetime(
             Some(&[ciphersuite]),
             Some(&[
                 ExtensionType::Unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE),
-                ExtensionType::LastResort,
+                // Draft-10 encodes the last-resort marker as component 0x0004
+                // inside the KeyPackage app_data_dictionary.
+                ExtensionType::AppDataDictionary,
             ]),
             None,
             None,
@@ -795,11 +799,37 @@ async fn fresh_key_package_roundtrips_bytes() {
 }
 
 #[tokio::test]
-async fn fresh_key_package_is_mls_last_resort() {
+async fn fresh_key_package_uses_draft10_last_resort_component() {
     let mut alice = build_client(b"a", selfremove_registry());
     let kp = alice.fresh_key_package().await.unwrap();
 
     assert!(is_last_resort_key_package(&kp).unwrap());
+
+    let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+    let key_package = match message.extract() {
+        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+        other => panic!("expected KeyPackage, got {other:?}"),
+    }
+    .validate(
+        &openmls_rust_crypto::RustCrypto::default(),
+        ProtocolVersion::Mls10,
+    )
+    .unwrap();
+    assert!(
+        !key_package.extensions().contains(ExtensionType::LastResort),
+        "new KeyPackages must not use the legacy last_resort extension"
+    );
+    let dictionary = key_package
+        .extensions()
+        .app_data_dictionary()
+        .expect("draft-10 last-resort marker requires app_data_dictionary");
+    assert_eq!(
+        dictionary
+            .dictionary()
+            .get(&ComponentType::LastResortKeyPackage.into()),
+        Some(&[][..]),
+        "draft-10 last-resort component 0x0004 must carry empty data"
+    );
 }
 
 #[tokio::test]

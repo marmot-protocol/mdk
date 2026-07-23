@@ -198,7 +198,7 @@ fn validate_key_package(
 
 fn key_package_verify_error(err: KeyPackageVerifyError) -> EngineError {
     match err {
-        KeyPackageVerifyError::InvalidLifetime | KeyPackageVerifyError::MissingLifetime => {
+        KeyPackageVerifyError::LifetimeError(_) | KeyPackageVerifyError::MissingLifetime => {
             EngineError::InvalidKeyPackageLifetime {
                 not_before: None,
                 not_after: None,
