@@ -2,6 +2,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
+use cgka_engine::app_components::{
+    CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS, CURRENT_PROFILE_REQUIRED_APP_COMPONENTS,
+    CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS,
+    CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS, CURRENT_PROFILE_REQUIRED_PROPOSALS,
+};
 use serde_json::Value;
 
 #[test]
@@ -131,6 +136,42 @@ fn current_profile_vector_pins_the_adopted_required_set() {
     assert_eq!(profile.required_app_components, ["0x8003", "0x8009"]);
     assert_eq!(profile.required_group_context_state_components, ["0x8003"]);
     assert_eq!(profile.leaf_only_app_components, ["0x8009"]);
+
+    assert_eq!(
+        parse_registry_values(&profile.required_group_context_extensions),
+        CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS
+    );
+    assert_eq!(
+        parse_registry_values(&profile.required_proposals),
+        CURRENT_PROFILE_REQUIRED_PROPOSALS
+    );
+    assert_eq!(
+        parse_registry_values(&profile.required_app_components),
+        CURRENT_PROFILE_REQUIRED_APP_COMPONENTS
+    );
+    assert_eq!(
+        parse_registry_values(&profile.required_group_context_state_components),
+        CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS
+    );
+    assert_eq!(
+        parse_registry_values(&profile.leaf_only_app_components),
+        CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS
+    );
+}
+
+fn parse_registry_values(values: &[String]) -> Vec<u16> {
+    values
+        .iter()
+        .map(|value| {
+            u16::from_str_radix(
+                value
+                    .strip_prefix("0x")
+                    .expect("registry value has 0x prefix"),
+                16,
+            )
+            .expect("registry value fits in u16")
+        })
+        .collect()
 }
 
 /// The byte fixtures are portable cross-implementation vectors, so they MUST

@@ -55,6 +55,19 @@ still agree after the world gets messy.
 
 See [`tests/AGENTS.md`](tests/AGENTS.md) for the test file map.
 
+## Promoting state-bearing app components
+
+`upgrade_group_capabilities` only promotes state-bearing app components whose
+optional state already exists in the GroupContext. Use two published commits:
+
+1. send `SendIntent::UpdateAppComponents` to install the optional component
+   state, then confirm that commit was published;
+2. call `upgrade_group_capabilities`, then publish and confirm its promotion
+   commit.
+
+The upgrade fails closed without staging a commit when required state is
+missing. MDK does not currently expose an atomic require-and-populate API.
+
 ## Reading order for a new contributor
 
 1. Target architecture: `../../docs/marmot-architecture/overview/target-architecture.md`

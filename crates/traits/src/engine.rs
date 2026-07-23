@@ -705,6 +705,13 @@ pub trait CgkaEngine: Send + Sync {
     /// Upgrade the group to require every currently-upgradeable capability.
     /// Produces a `SendResult::GroupEvolution` whose commit updates
     /// `RequiredCapabilities`.
+    ///
+    /// A state-bearing app component must already have optional GroupContext
+    /// state before this method can promote it to required. Install and publish
+    /// that state first with [`SendIntent::UpdateAppComponents`], then call this
+    /// method and publish its second commit. Promotion fails closed without
+    /// staging a commit when the component state is absent; there is currently
+    /// no atomic require-and-populate API.
     async fn upgrade_group_capabilities(
         &mut self,
         group_id: &GroupId,

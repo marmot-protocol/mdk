@@ -24,6 +24,22 @@ use openmls::prelude::{
 use openmls::treesync::Node;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Registry-level contract enforced for every current-profile group state.
+///
+/// These values are public so portable conformance vectors can cross-check
+/// their implementation-neutral hexadecimal contract against the exact set the
+/// engine validator consumes.
+pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS: [u16; 1] = [0x0006];
+pub const CURRENT_PROFILE_REQUIRED_PROPOSALS: [u16; 1] = [0x0008];
+pub const CURRENT_PROFILE_REQUIRED_APP_COMPONENTS: [AppComponentId; 2] = [
+    GROUP_ADMIN_POLICY_COMPONENT_ID,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+];
+pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS: [AppComponentId; 1] =
+    [GROUP_ADMIN_POLICY_COMPONENT_ID];
+pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
+    [ACCOUNT_IDENTITY_PROOF_COMPONENT_ID];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InitialComponentState {
     pub(crate) name: String,
@@ -493,17 +509,25 @@ fn validate_current_profile_group_context(
             "invalid current-profile {context}: missing required_capabilities"
         ))
     })?;
-    if !required
-        .extension_types()
-        .contains(&ExtensionType::AppDataDictionary)
+    if !CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS
+        .iter()
+        .all(|extension_type| {
+            required
+                .extension_types()
+                .contains(&ExtensionType::from(*extension_type))
+        })
     {
         return Err(EngineError::Other(format!(
             "invalid current-profile {context}: app_data_dictionary is not a required extension"
         )));
     }
-    if !required
-        .proposal_types()
-        .contains(&ProposalType::AppDataUpdate)
+    if !CURRENT_PROFILE_REQUIRED_PROPOSALS
+        .iter()
+        .all(|proposal_type| {
+            required
+                .proposal_types()
+                .contains(&ProposalType::from(*proposal_type))
+        })
     {
         return Err(EngineError::Other(format!(
             "invalid current-profile {context}: app_data_update is not a required proposal"
@@ -516,10 +540,7 @@ fn validate_current_profile_group_context(
         ))
     })?;
     let required_components = required_app_components_of_extensions(extensions, context)?;
-    for mandatory in [
-        GROUP_ADMIN_POLICY_COMPONENT_ID,
-        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
-    ] {
+    for mandatory in CURRENT_PROFILE_REQUIRED_APP_COMPONENTS {
         if !required_components.contains(mandatory) {
             return Err(EngineError::Other(format!(
                 "invalid current-profile {context}: missing mandatory component requirement \
@@ -527,13 +548,20 @@ fn validate_current_profile_group_context(
             )));
         }
     }
-    if dictionary
-        .dictionary()
-        .contains(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
-    {
-        return Err(EngineError::Other(format!(
-            "invalid current-profile {context}: leaf-only account proof appears in GroupContext"
-        )));
+    for component_id in CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS {
+        if dictionary.dictionary().contains(&component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: leaf-only account proof appears in GroupContext"
+            )));
+        }
+    }
+    for component_id in CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS {
+        if !dictionary.dictionary().contains(&component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: required component {component_id:#06x} \
+                 has no GroupContext state"
+            )));
+        }
     }
 
     for entry in dictionary.dictionary().entries() {
@@ -546,7 +574,7 @@ fn validate_current_profile_group_context(
         }
     }
     for component_id in &required_components.ids {
-        if *component_id == ACCOUNT_IDENTITY_PROOF_COMPONENT_ID {
+        if CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(component_id) {
             continue;
         }
         if !is_known_group_component(*component_id) {
@@ -602,15 +630,20 @@ fn is_known_group_component(component_id: AppComponentId) -> bool {
     )
 }
 
-fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafNode>, EngineError> {
+pub(crate) fn ratchet_tree_nodes(
+    tree: openmls::treesync::RatchetTree,
+) -> Result<Vec<Option<Node>>, EngineError> {
     // RatchetTree intentionally keeps its node vector private. Its stable
     // serde representation exposes the same public Node enum that MDK already
-    // uses for cold-path proof validation.
+    // uses for cold-path proof and capability validation.
     let value = serde_json::to_value(tree)
         .map_err(|error| EngineError::Backend(format!("export ratchet tree: {error}")))?;
-    let nodes: Vec<Option<Node>> = serde_json::from_value(value)
-        .map_err(|error| EngineError::Backend(format!("decode ratchet tree: {error}")))?;
-    Ok(nodes
+    serde_json::from_value(value)
+        .map_err(|error| EngineError::Backend(format!("decode ratchet tree: {error}")))
+}
+
+fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafNode>, EngineError> {
+    Ok(ratchet_tree_nodes(tree)?
         .into_iter()
         .filter_map(|node| match node {
             Some(Node::LeafNode(leaf)) => Some(*leaf),
@@ -622,12 +655,8 @@ fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafN
 fn indexed_ratchet_tree_leaves(
     tree: openmls::treesync::RatchetTree,
 ) -> Result<BTreeMap<u32, LeafNode>, EngineError> {
-    let value = serde_json::to_value(tree)
-        .map_err(|error| EngineError::Backend(format!("export ratchet tree: {error}")))?;
-    let nodes: Vec<Option<Node>> = serde_json::from_value(value)
-        .map_err(|error| EngineError::Backend(format!("decode ratchet tree: {error}")))?;
     let mut leaves = BTreeMap::new();
-    for (node_index, node) in nodes.into_iter().enumerate() {
+    for (node_index, node) in ratchet_tree_nodes(tree)?.into_iter().enumerate() {
         if let Some(Node::LeafNode(leaf)) = node {
             let leaf_index = u32::try_from(node_index / 2)
                 .map_err(|_| EngineError::Backend("ratchet tree index overflow".into()))?;

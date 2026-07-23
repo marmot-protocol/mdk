@@ -998,11 +998,7 @@ pub(crate) fn validate_member_credentials_and_account_proofs(
 ) -> Result<ProtocolProfile, EngineError> {
     validate_member_credentials(group)?;
     let protocol_profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
-    let tree = group.export_ratchet_tree();
-    let value = serde_json::to_value(tree)
-        .map_err(|e| EngineError::Backend(format!("export ratchet tree: {e}")))?;
-    let nodes: Vec<Option<Node>> = serde_json::from_value(value)
-        .map_err(|e| EngineError::Backend(format!("decode exported ratchet tree: {e}")))?;
+    let nodes = crate::app_components::ratchet_tree_nodes(group.export_ratchet_tree())?;
     for node in nodes {
         if let Some(Node::LeafNode(leaf)) = node {
             let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
