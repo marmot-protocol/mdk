@@ -539,22 +539,11 @@ impl AppClient {
                     gossip_message_ids.insert(message.message_id_hex.clone());
                     continue;
                 }
-                if message.kind == MARMOT_APP_EVENT_KIND_CHAT
+                let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
                     && media_imeta_tags_are_valid(
                         &message.tags,
                         self.app.allow_loopback_blob_endpoints(),
-                    )
-                    && self
-                        .remember_current_encrypted_media_secret(&message.group_id)
-                        .is_err()
-                {
-                    tracing::warn!(
-                        target: "marmot_app::media",
-                        method = "ingest_delivery",
-                        error_code = "encrypted_media_secret_cache_skipped",
-                        "failed to cache encrypted media source epoch secret",
                     );
-                }
                 self.app.remember_directory_message_sender(&message)?;
                 // Evaluated against the signed MLS group state while the
                 // delete's epoch context is live, then persisted with the
@@ -581,6 +570,23 @@ impl AppClient {
                     &message_projection,
                     message.received_at,
                 )?;
+                // Persist the reference first. A source epoch whose previous
+                // final reference was retired may be re-used by a later message;
+                // the durable reference is what authorizes restoring its secret.
+                // Doing this before the next delivery also preserves the source
+                // epoch when the same sync batch advances the group afterwards.
+                if retains_encrypted_media
+                    && self
+                        .remember_current_encrypted_media_secret(&message.group_id)
+                        .is_err()
+                {
+                    tracing::warn!(
+                        target: "marmot_app::media",
+                        method = "ingest_delivery",
+                        error_code = "encrypted_media_secret_cache_skipped",
+                        "failed to cache encrypted media source epoch secret",
+                    );
+                }
                 summary.projection_updates.push(projection_update);
                 self.prune_plaintext_retention_for_group(&message.group_id)?;
             }

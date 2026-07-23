@@ -1,5 +1,6 @@
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, bool_i64, connection::retry_on_busy, tags_from_json,
+    SqliteAccountStorage, SqliteResultExt, bool_i64, connection::retry_on_busy,
+    encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx, tags_from_json,
     unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -544,9 +545,12 @@ impl SqliteAccountStorage {
     /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
     /// app events, timeline rows, agent-stream start projection rows, cached
     /// encrypted-media epoch secrets, and group push-token rows keyed by
-    /// `group_id_hex`. `seen_events` and protocol/MLS tables are intentionally
-    /// left intact so old relay deliveries stay suppressed while a future fresh
-    /// group message can re-create the app projection.
+    /// `group_id_hex`. A metadata-only media-secret retirement barrier remains
+    /// because protocol/MLS state is intentionally retained; without it that
+    /// state could immediately rederive wiped key bytes. `seen_events` and
+    /// protocol/MLS tables are left intact so old relay deliveries stay
+    /// suppressed while a future fresh group message can re-create the app
+    /// projection.
     pub fn delete_local_group_data(&self, group_id_hex: &str) -> StorageResult<bool> {
         if group_id_hex.trim().is_empty() {
             return Err(StorageError::Backend(
@@ -556,7 +560,7 @@ impl SqliteAccountStorage {
 
         self.connection.with_transaction(|| -> StorageResult<bool> {
             let conn = self.lock()?;
-            let mut deleted = 0usize;
+            let mut deleted = retire_all_encrypted_media_secrets_for_group_tx(&conn, group_id_hex)?;
             for table in [
                 "app_events",
                 "message_timeline",
@@ -567,6 +571,7 @@ impl SqliteAccountStorage {
                 "group_push_tokens",
                 "group_push_token_tombstones",
                 "chat_notification_settings",
+                "encrypted_media_epoch_secret_references",
                 "encrypted_media_epoch_secrets",
                 "account_groups",
             ] {
@@ -742,6 +747,14 @@ impl SqliteAccountStorage {
                 (Err(err), Err(_)) => Err(err),
             }
         })?;
+        if outcome.pruned_media_epoch_secrets > 0 {
+            tracing::debug!(
+                target: "storage_sqlite::retention",
+                method = "secure_prune_app_events_before",
+                pruned_media_epoch_secrets = outcome.pruned_media_epoch_secrets,
+                "retired encrypted-media epoch secrets after final retained references expired"
+            );
+        }
         if outcome.pruned_messages > 0 {
             let conn = self.lock()?;
             if let Err(error) = checkpoint_wal_truncate_after_secure_prune(&conn) {

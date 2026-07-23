@@ -63,7 +63,11 @@ pub const NOSTR_ROUTING_COMPONENT_ID: AppComponentId = 0x8004;
 pub const GROUP_MESSAGE_RETENTION_COMPONENT_ID: AppComponentId = 0x8005;
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT_ID: AppComponentId = 0x8006;
 pub const GROUP_AVATAR_URL_COMPONENT_ID: AppComponentId = 0x8007;
+/// Frozen encrypted-media v1 component id. Kept under its original public name
+/// for compatibility; current-profile Media V2 uses [`GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID`].
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId = 0x8008;
+/// Current encrypted-media v2 component id.
+pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
 /// Lookup key for the encrypted-media secret in the
 /// [`crate::group_context::GroupContextSnapshot`] secrets map. This is an
 /// internal cache key, NOT the MLS exporter label/context: the secret is derived
@@ -79,7 +83,9 @@ pub const GROUP_MESSAGE_RETENTION_COMPONENT: &str = "marmot.group.message-retent
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT: &str = "marmot.group.agent-text-stream.quic.v1";
 pub const GROUP_AVATAR_URL_COMPONENT: &str = "marmot.group.avatar-url.v1";
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = "marmot.group.encrypted-media.v1";
+pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT: &str = "marmot.group.encrypted-media.v2";
 pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
+pub const ENCRYPTED_MEDIA_FORMAT_V2: &str = "encrypted-media-v2";
 pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";
 
 /// Maximum encoded length of a group avatar URL, in bytes.

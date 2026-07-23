@@ -1365,9 +1365,10 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     store
         .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
-    store
-        .record_app_event(&app_event("msg-aa", "aa", 10))
-        .unwrap();
+    let mut group_a_message = app_event("msg-aa", "aa", 10);
+    group_a_message.source_epoch = Some(7);
+    group_a_message.tags = vec![vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()]];
+    store.record_app_event(&group_a_message).unwrap();
     store
         .record_app_event(&agent_stream_start_event(
             "stream-aa",
@@ -1385,6 +1386,16 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     store
         .remember_encrypted_media_epoch_secret("bb", 0x8008, 7, &[4, 5, 6])
         .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO encrypted_media_epoch_secret_retirement_watermarks (
+                 group_id_hex, retired_through_epoch, retired_at_unix_seconds
+             ) VALUES ('aa', 6, 10)",
+            [],
+        )
+        .unwrap();
     insert_group_push_token(&store, "aa", "member-aa");
     insert_group_push_token(&store, "bb", "member-bb");
     // Tombstones on a distinct leaf so they don't collide with the live rows
@@ -1400,6 +1411,14 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     insert_protocol_group_marker(&store, &[0xaa]);
 
     assert!(store.delete_local_group_data("aa").unwrap());
+    store
+        .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
+        .unwrap();
+    assert_eq!(
+        store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+        None,
+        "local group deletion must prevent retained MLS state from rehydrating wiped secrets"
+    );
 
     for table in [
         "account_groups",
@@ -1411,10 +1430,20 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "chat_list_rows",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "encrypted_media_epoch_secret_references",
         "encrypted_media_epoch_secrets",
     ] {
         assert_eq!(group_row_count(&store, table, "aa"), 0, "{table}");
     }
+    assert_eq!(
+        group_row_count(
+            &store,
+            "encrypted_media_epoch_secret_retirement_watermarks",
+            "aa",
+        ),
+        1,
+        "the retirement barrier outlives the local group projection"
+    );
     for table in [
         "account_groups",
         "account_group_app_components",

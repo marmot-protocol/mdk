@@ -54,6 +54,8 @@ mod migration_0026_message_drafts;
 mod migration_0027_app_event_moderation_grant;
 #[path = "migrations/0028_ingress_dedup.rs"]
 mod migration_0028_ingress_dedup;
+#[path = "migrations/0029_encrypted_media_secret_references.rs"]
+mod migration_0029_encrypted_media_secret_references;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -205,6 +207,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 28,
         name: "0028_ingress_dedup",
         apply: migration_0028_ingress_dedup::apply,
+    },
+    Migration {
+        version: 29,
+        name: "0029_encrypted_media_secret_references",
+        apply: migration_0029_encrypted_media_secret_references::apply,
     },
 ];
 
@@ -409,6 +416,63 @@ mod tests {
     fn initial_schema_migration_is_recorded() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(applied_migrations(&store), expected_migrations());
+    }
+
+    #[test]
+    fn media_secret_reference_migration_backfills_known_rows_conservatively() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        run(&mut connection, &MIGRATIONS[..28]).unwrap();
+        let media_tags =
+            serde_json::to_string(&[vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()]])
+                .unwrap();
+        connection
+            .execute(
+                "INSERT INTO app_events (
+                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch,
+                     direction, sender, plaintext, kind, tags_json, recorded_at, received_at
+                 ) VALUES ('aa', 'media', 'source-media', 7, 'received', 'sender', '', 9, ?1, 10, 10)",
+                params![media_tags],
+            )
+            .unwrap();
+        for (epoch, secret) in [(7_i64, vec![1_u8, 2, 3]), (8, vec![4_u8, 5, 6])] {
+            connection
+                .execute(
+                    "INSERT INTO encrypted_media_epoch_secrets (
+                         group_id_hex, component_id, source_epoch, secret,
+                         created_at_unix_seconds
+                     ) VALUES ('aa', 32776, ?1, ?2, 10)",
+                    params![epoch, secret],
+                )
+                .unwrap();
+        }
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        let references: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM encrypted_media_epoch_secret_references
+                 WHERE group_id_hex = 'aa' AND message_id_hex = 'media'
+                   AND component_id = 32776 AND source_epoch = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(references, 1);
+        let managed = connection
+            .prepare(
+                "SELECT source_epoch, retention_managed
+                 FROM encrypted_media_epoch_secrets
+                 ORDER BY source_epoch",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(managed, vec![(7, 1), (8, 0)]);
     }
 
     #[test]

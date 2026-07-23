@@ -4250,6 +4250,106 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
 }
 
 #[tokio::test]
+async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_advances() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let blossom = mock_blossom().await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("retired media epoch", &["bob"])
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+    alice.update_message_retention(&group_id, 2).await.unwrap();
+    bob.sync().await.unwrap();
+
+    let expired = alice
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "expired.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    plaintext: b"expired media".to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: true,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let expired_reference = expired.attachments[0].reference.clone();
+    let expired_source_epoch = expired_reference.source_epoch;
+    bob.sync().await.unwrap();
+
+    sleep(Duration::from_secs(3)).await;
+    let pruned = bob
+        .secure_delete_expired_plaintext_for_group(&group_id)
+        .unwrap();
+    assert!(pruned.pruned_messages > 0);
+    assert!(
+        bob.download_media(&group_id, expired_reference.clone())
+            .await
+            .is_err(),
+        "a retired source epoch must not be re-derived from live MLS state"
+    );
+    drop(bob);
+    let mut bob = app.client("bob").await.unwrap();
+    assert!(
+        bob.download_media(&group_id, expired_reference)
+            .await
+            .is_err(),
+        "a retired source epoch must stay unavailable after restart"
+    );
+
+    let retained_plaintext = b"retained after epoch retirement".to_vec();
+    let retained = alice
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "retained.txt".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    plaintext: retained_plaintext.clone(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: true,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let retained_reference = retained.attachments[0].reference.clone();
+    assert_eq!(
+        retained_reference.source_epoch, expired_source_epoch,
+        "the retained message must reuse the retired epoch for this regression"
+    );
+    alice
+        .update_group_profile(&group_id, Some("advanced after media"), None)
+        .await
+        .unwrap();
+
+    bob.sync().await.unwrap();
+    let download = bob
+        .download_media(&group_id, retained_reference)
+        .await
+        .expect("retained media must preserve its source-epoch secret across the next commit");
+    assert_eq!(download.plaintext, retained_plaintext);
+}
+
+#[tokio::test]
 async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
