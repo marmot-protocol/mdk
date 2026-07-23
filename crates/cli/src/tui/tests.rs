@@ -348,6 +348,529 @@ fn slash_command_parser_handles_account_onboarding_commands() {
 }
 
 #[test]
+fn slash_command_parser_handles_logout() {
+    // `/logout` acts on the currently selected account and takes no arguments, so
+    // a stray argument is a parse error rather than a silently ignored token.
+    assert_eq!(parse_slash_command("/logout"), Ok(SlashCommand::Logout));
+    assert!(parse_slash_command("/logout npub1bob").is_err());
+}
+
+#[test]
+fn logout_local_signing_account_arms_typed_token_popup() {
+    // A local-signing logout is irreversible (the signing key is destroyed with
+    // the local data), so `/logout` arms a typed-token confirmation for the
+    // selected account rather than a one-key confirm. The body must state
+    // honestly that the wipe is permanent, deletes the signing key, and cannot be
+    // undone, and must instruct the user to type the token — a destructive
+    // action's description is never softened.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+
+    match &app.popup {
+        Some(Popup::Text {
+            purpose:
+                TextPurpose::ConfirmLogout {
+                    account_id: target,
+                    npub,
+                },
+            title,
+            body,
+            input,
+        }) => {
+            assert_eq!(target, &account_id, "popup targets the selected account");
+            assert_eq!(npub, "npub1alice");
+            assert_eq!(title, "Log Out");
+            assert!(input.value().is_empty(), "the token field starts empty");
+            let text = body.join(" ");
+            assert!(
+                text.contains("permanently"),
+                "wording must be honest about permanence: {text:?}"
+            );
+            assert!(
+                text.contains("signing key"),
+                "a local-signing account is told its key is deleted: {text:?}"
+            );
+            assert!(
+                text.contains("device"),
+                "wording must scope the wipe to this device: {text:?}"
+            );
+            assert!(
+                text.contains(&format!("Type {LOGOUT_CONFIRMATION_TOKEN}")),
+                "the body instructs the user to type the token: {text:?}"
+            );
+        }
+        other => panic!("expected a typed-token logout popup, got {other:?}"),
+    }
+}
+
+#[test]
+fn logout_confirm_body_omits_signing_key_line_for_public_only_accounts() {
+    // A public-only account has no signing key to erase, so the honest wording
+    // must not claim one is deleted; it warns about the unrecoverable local data
+    // instead.
+    let account_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.accounts[0].local_signing = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+
+    match &app.popup {
+        Some(Popup::Confirm { body, .. }) => {
+            let text = body.join(" ");
+            assert!(
+                !text.contains("signing key"),
+                "public-only account has no signing key to mention: {text:?}"
+            );
+            assert!(
+                text.contains("recover"),
+                "public-only wording still warns the local data is unrecoverable: {text:?}"
+            );
+        }
+        other => panic!("expected a logout confirm popup, got {other:?}"),
+    }
+}
+
+#[test]
+fn logout_popup_shows_the_npub_even_with_a_display_name() {
+    // The npub is the unambiguous identifier for which account is about to be
+    // destroyed. A display name must not hide it: the body shows the npub for
+    // both account types even when a display name is set.
+    for local_signing in [true, false] {
+        let account_id = "aa".repeat(32);
+        let mut app = test_tui_app(test_unused_client(), &account_id);
+        app.accounts[0].display_name = Some("Alice".to_owned());
+        app.accounts[0].local_signing = local_signing;
+
+        app.run_slash_command(SlashCommand::Logout)
+            .expect("/logout arms the popup");
+
+        let body = match &app.popup {
+            Some(Popup::Text { body, .. } | Popup::Confirm { body, .. }) => body.join(" "),
+            other => panic!("expected a logout popup, got {other:?}"),
+        };
+        assert!(
+            body.contains("Alice"),
+            "the display name still labels the account: {body:?}"
+        );
+        assert!(
+            body.contains("npub1alice"),
+            "the npub is shown regardless of the display name: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn logout_popup_sanitizes_a_hostile_display_name() {
+    // A hostile display name (ANSI/control/format characters) must be
+    // terminal-safe in the logout popup body specifically: the dangerous bytes
+    // are stripped, the visible text survives, and the npub still identifies the
+    // account.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.accounts[0].display_name = Some("Al\u{1b}\u{7}ice\u{202e}".to_owned());
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+
+    let body = match &app.popup {
+        Some(Popup::Text { body, .. }) => body.join(" "),
+        other => panic!("expected a typed-token logout popup, got {other:?}"),
+    };
+    assert!(
+        !body.contains('\u{1b}'),
+        "the ANSI escape is stripped: {body:?}"
+    );
+    assert!(
+        !body.contains('\u{7}'),
+        "the BEL control byte is stripped: {body:?}"
+    );
+    assert!(
+        !body.contains('\u{202e}'),
+        "the BiDi override is stripped: {body:?}"
+    );
+    assert!(
+        body.contains("Alice"),
+        "the visible display-name text survives sanitization: {body:?}"
+    );
+    assert!(
+        body.contains("npub1alice"),
+        "the npub identifies the account: {body:?}"
+    );
+}
+
+#[test]
+fn logout_slash_command_without_a_selected_account_reports_instead_of_arming() {
+    // With no account loaded there is nothing to log out; the command reports on
+    // the status line rather than opening a popup with an empty target.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.accounts.clear();
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout with no account is not an error");
+
+    assert!(app.popup.is_none(), "no popup without an account to target");
+    assert_eq!(app.status, "no account selected");
+}
+
+#[cfg(unix)]
+#[test]
+fn typing_the_logout_token_runs_wn_logout_and_refreshes() {
+    // The whole point of the typed-token confirm: typing the token and pressing
+    // Enter runs the real `wn logout <pubkey>` for the selected account, then
+    // reloads accounts so the TUI lands on a remaining account rather than the
+    // removed one.
+    let removed = "aa".repeat(32);
+    let remaining = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(
+        dir.path(),
+        r#"{"ok":true,"result":{"accounts":[{"account_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","npub":"npub1bob","local_signing":true}]}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &removed);
+    // No daemon so the refresh does not spawn subscription subprocesses; the flow
+    // under test is the command dispatch and account reload.
+    app.daemon.running = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    type_logout_token(&mut app);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on the exact token confirms logout");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line == format!("--json logout {removed}")),
+        "confirming runs `wn logout <selected-account>`; recorded: {recorded:?}"
+    );
+    assert!(app.popup.is_none(), "the popup closes after submit");
+    assert_eq!(
+        app.accounts.len(),
+        1,
+        "accounts reloaded after the wipe: {:?}",
+        app.accounts
+    );
+    assert_eq!(
+        app.accounts[0].account_id, remaining,
+        "the TUI lands on the remaining account, not the removed one"
+    );
+    assert!(
+        app.status.starts_with("logged out"),
+        "status: {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_subprocess_failure_surfaces_on_status_without_clobbering_accounts() {
+    // A failed `wn logout` must be non-destructive to the TUI's view: the error
+    // surfaces on the status line, the popup closes, and the account list is left
+    // intact (the account still appears) rather than being cleared as if the wipe
+    // had succeeded.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(
+        dir.path(),
+        r#"{"ok":false,"error":{"message":"keychain locked"}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    type_logout_token(&mut app);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on the exact token confirms logout");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line == format!("--json logout {account_id}")),
+        "the wipe was attempted; recorded: {recorded:?}"
+    );
+    assert!(
+        app.popup.is_none(),
+        "the popup closes even when the wipe fails"
+    );
+    assert!(
+        app.status.starts_with("error:"),
+        "the failure surfaces on the status line: {}",
+        app.status
+    );
+    assert_eq!(
+        app.accounts.len(),
+        1,
+        "a failed wipe does not clobber the account list"
+    );
+    assert_eq!(
+        app.accounts[0].account_id, account_id,
+        "the account still appears after a failed wipe"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn canceling_the_typed_token_logout_with_esc_runs_nothing() {
+    // Esc cancels the typed-token confirm with no side effect — even after part
+    // of the token was typed: no `wn` process is spawned and the account list is
+    // unchanged.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    for character in "log".chars() {
+        app.handle_key(char_key(character))
+            .expect("partial token typed");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("Esc cancels the typed-token popup");
+
+    assert!(app.popup.is_none(), "Esc dismisses the typed-token popup");
+    assert!(!args_file.exists(), "canceling never spawns a `wn` process");
+    assert_eq!(app.accounts.len(), 1, "the account list is untouched");
+    assert_eq!(app.accounts[0].account_id, account_id);
+}
+
+#[cfg(unix)]
+#[test]
+fn public_only_logout_confirms_with_y_enter_and_runs_wn_logout() {
+    // A public-only account is re-addable, so it keeps the lighter y/Enter
+    // confirm (medium-tier friction is proportional there): `y` runs the real
+    // `wn logout <pubkey>`.
+    let account_id = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.accounts[0].local_signing = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    assert!(
+        matches!(app.popup, Some(Popup::Confirm { .. })),
+        "a public-only account keeps the y/Enter confirm"
+    );
+    app.handle_key(char_key('y')).expect("y confirms logout");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line == format!("--json logout {account_id}")),
+        "y runs `wn logout <account>`; recorded: {recorded:?}"
+    );
+    assert!(app.popup.is_none(), "the confirm closes after submit");
+}
+
+#[cfg(unix)]
+#[test]
+fn canceling_public_only_logout_with_n_or_esc_runs_nothing() {
+    // The public-only confirm keeps its two cancel keys: both `n` and `Esc`
+    // dismiss it with no `wn` process spawned and the account list unchanged.
+    let account_id = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.accounts[0].local_signing = false;
+
+    for cancel in [
+        char_key('n'),
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    ] {
+        app.run_slash_command(SlashCommand::Logout)
+            .expect("/logout arms the popup");
+        app.handle_key(cancel).expect("cancel key handled");
+        assert!(app.popup.is_none(), "cancel dismisses the confirm");
+    }
+
+    assert!(!args_file.exists(), "canceling never spawns a `wn` process");
+    assert_eq!(app.accounts.len(), 1, "the account list is untouched");
+    assert_eq!(app.accounts[0].account_id, account_id);
+}
+
+#[test]
+fn logout_popup_captures_keys_without_leaking_to_the_composer() {
+    // The typed-token popup is modal: characters land in its own token field and
+    // never reach the composer draft hidden behind it.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Composer;
+    app.input.set_value("draft");
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    app.handle_key(char_key('x')).expect("stray key handled");
+
+    match &app.popup {
+        Some(Popup::Text { input, .. }) => {
+            assert_eq!(
+                input.value(),
+                "x",
+                "the key lands in the popup's own token field"
+            );
+        }
+        other => panic!("expected the typed-token popup to stay open, got {other:?}"),
+    }
+    assert_eq!(
+        app.input.value(),
+        "draft",
+        "the key does not leak into the composer behind the popup"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn logging_out_the_last_account_returns_to_the_login_menu_and_clears_state() {
+    // When the removed account was the only one, the TUI must not be left pointed
+    // at nothing: it clears chat/subscription state and drops to the login menu.
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, _args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    }];
+    app.chat_subscription = Some(test_chat_subscription(&account_id, false));
+    app.notification_subscription = Some(test_notification_subscription(&account_id));
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    type_logout_token(&mut app);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on the exact token confirms logout");
+
+    assert!(app.accounts.is_empty(), "the last account is gone");
+    assert!(app.chats.is_empty(), "chats cleared");
+    assert!(
+        app.chat_subscription.is_none(),
+        "chat subscription torn down"
+    );
+    assert!(
+        app.notification_subscription.is_none(),
+        "notification subscription torn down"
+    );
+    assert_eq!(
+        app.screen,
+        Screen::Login(LoginMode::Menu),
+        "the TUI drops back to the login menu"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn double_enter_after_slash_logout_does_not_wipe_a_local_signing_account() {
+    // The fixed footgun: `/logout` submitted from the composer used to arm a
+    // y/Enter confirm, so Enter-then-Enter (slash submit, then confirm accept)
+    // instantly ran the destructive wipe — the identity-destroying action was
+    // uniquely reachable by two Enters. For a local-signing account the second
+    // Enter must be a no-op that keeps the popup open and spawns no `wn` process.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Composer;
+    app.input.set_value("/logout");
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("first Enter submits /logout and arms the popup");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("second Enter is handled");
+
+    assert!(
+        app.popup.is_some(),
+        "the logout popup stays open after the second Enter"
+    );
+    assert!(
+        !args_file.exists(),
+        "Enter-then-Enter never spawns a `wn` process"
+    );
+    assert_eq!(app.accounts.len(), 1, "the account is untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_token_mismatch_is_a_noop_that_keeps_the_popup_open() {
+    // A local-signing logout requires typing the exact token `logout`. Anything
+    // else — a near miss included — keeps the popup open and spawns no `wn`
+    // process, so a fat-fingered confirmation never destroys the identity.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    for character in "logoutt".chars() {
+        app.handle_key(char_key(character))
+            .expect("typing the wrong token");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on a mismatched token is handled");
+
+    assert!(
+        app.popup.is_some(),
+        "a mismatched token keeps the popup open"
+    );
+    assert!(
+        !args_file.exists(),
+        "a mismatched token spawns no `wn` process"
+    );
+    assert_eq!(app.accounts.len(), 1, "the account is untouched");
+}
+
+#[test]
 fn slash_command_parser_handles_daemon_commands() {
     assert_eq!(
         parse_slash_command("/daemon status"),
@@ -1596,6 +2119,15 @@ fn move_index_clamps_at_list_edges() {
 
 fn char_key(character: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+}
+
+/// Type the exact logout confirmation token into an open typed-token popup,
+/// keyed off the shared constant so the tests track its value.
+fn type_logout_token(app: &mut TuiApp) {
+    for character in LOGOUT_CONFIRMATION_TOKEN.chars() {
+        app.handle_key(char_key(character))
+            .expect("typing the logout token");
+    }
 }
 
 #[test]
@@ -4998,6 +5530,7 @@ fn popup_key_text_entry_submits_purpose_and_cancels() {
             group_id: "g1".to_owned(),
         },
         title: "Rename Group".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     };
     for character in "ops".chars() {
@@ -5019,6 +5552,7 @@ fn popup_key_text_entry_submits_purpose_and_cancels() {
             group_id: "g1".to_owned(),
         },
         title: "Add Member".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     };
     // An empty submit is a no-op; Esc cancels with no side effect.
@@ -5038,8 +5572,54 @@ fn popup_key_text_entry_submits_purpose_and_cancels() {
             group_id: "g1".to_owned(),
         },
         title: "Add Member".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     };
+    assert_eq!(popup_key(&mut cancel, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
+fn popup_key_confirm_logout_requires_the_exact_token() {
+    // The typed-token confirm submits only when the input is exactly the token.
+    // Both an empty submit (the double-Enter case) and any mismatch are no-ops
+    // that keep the popup open; Esc always cancels. This is the reducer-level
+    // guard behind the local-signing logout.
+    let logout = || Popup::Text {
+        purpose: TextPurpose::ConfirmLogout {
+            account_id: "aa".repeat(32),
+            npub: "npub1alice".to_owned(),
+        },
+        title: "Log Out".to_owned(),
+        body: vec!["Log out npub1alice?".to_owned()],
+        input: Input::default(),
+    };
+
+    // Empty submit: no-op, popup stays open.
+    let mut empty = logout();
+    assert_eq!(popup_key(&mut empty, KeyCode::Enter), PopupAction::None);
+
+    // A near-miss token: no-op, popup stays open.
+    let mut mismatch = logout();
+    for character in "logoutt".chars() {
+        popup_key(&mut mismatch, KeyCode::Char(character));
+    }
+    assert_eq!(popup_key(&mut mismatch, KeyCode::Enter), PopupAction::None);
+
+    // The exact token submits the wipe.
+    let mut exact = logout();
+    for character in LOGOUT_CONFIRMATION_TOKEN.chars() {
+        popup_key(&mut exact, KeyCode::Char(character));
+    }
+    assert_eq!(
+        popup_key(&mut exact, KeyCode::Enter),
+        PopupAction::Submit(PopupSubmit::Logout {
+            account_id: "aa".repeat(32),
+            npub: "npub1alice".to_owned(),
+        })
+    );
+
+    // Esc cancels regardless of typed content.
+    let mut cancel = logout();
     assert_eq!(popup_key(&mut cancel, KeyCode::Esc), PopupAction::Dismiss);
 }
 
@@ -7144,6 +7724,7 @@ fn handle_paste_into_a_text_popup_lands_in_its_input_not_the_composer() {
             group_id: "g1".to_owned(),
         },
         title: "Add Member".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     });
 
@@ -7667,6 +8248,18 @@ fn help_card_documents_the_new_screens() {
     assert!(help.contains("p profile"), "help mentions profile");
     assert!(help.contains("h relays"), "help mentions relay health");
     assert!(help.contains("/users"), "help mentions the /users command");
+}
+
+#[test]
+fn logout_is_discoverable_in_help_and_suggestions() {
+    let help = help_card_lines().join("\n");
+    assert!(help.contains("/logout"), "help card lists /logout");
+    assert!(
+        slash_command_suggestions("/logout")
+            .iter()
+            .any(|suggestion| suggestion.usage == "/logout"),
+        "slash suggestions offer /logout"
+    );
 }
 
 #[cfg(unix)]

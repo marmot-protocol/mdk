@@ -646,6 +646,7 @@ Composer slash commands:
 /account <npub-or-hex>
 /create-identity
 /login <nsec-or-npub>
+/logout
 /daemon status
 /daemon start
 /daemon stop
@@ -680,6 +681,16 @@ Composer slash commands:
 ```
 
 `/stream` uses `quic://quic-broker.ipf.dev:4450` when no candidate is supplied.
+
+`/logout` acts on the currently selected account and is always confirmed first. `wn logout` is destructive: it
+permanently removes that account's local data (messages, group membership, and MLS state) from this device, and for a
+local-signing account it deletes the signing key too, so the confirmation says so plainly, never softens the wording,
+and always shows the account npub so it is unambiguous which account is destroyed. A local-signing logout is
+irreversible, so its confirmation requires typing the literal word `logout` and pressing `Enter`; an empty or
+mismatched entry keeps the popup open (so the wipe is never reachable by a stray Enter-then-Enter) and `Esc` cancels. A
+public-only account is re-addable, so it keeps the lighter `y`/`Enter` confirm (`n` or `Esc` cancels). On confirmation
+the account list reloads; if the removed account was the last one, the TUI returns to the login menu rather than
+pointing at a removed account.
 
 `/login <nsec>` redacts the secret in the composer and pipes it to the child `wn` process over stdin instead of argv.
 `/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the

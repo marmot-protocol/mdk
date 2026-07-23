@@ -868,6 +868,21 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Log out (permanently remove) an account via `wn logout <pubkey>`, then
+    /// reload accounts and chats. `wn logout` is destructive: it removes the
+    /// account's local data and signing key from this device. Because the
+    /// selected account is usually its own target, it is gone from `account list`
+    /// afterward, so this reuses the `/refresh` helper to reload accounts + chats
+    /// and drop back to the login menu when the last account is removed — never
+    /// leaving the TUI pointed at a removed account or a stale subscription (the
+    /// account-switch and empty-account clearing both live in that refresh path).
+    pub(crate) fn logout_account(&mut self, account_id: &str, npub: &str) -> TuiResult<()> {
+        self.client.run_json(None, &["logout", account_id])?;
+        self.refresh_or_return_to_login()?;
+        self.status = format!("logged out {}", shorten(&terminal_safe_text(npub), 18));
+        Ok(())
+    }
+
     /// Open the pending-invites list picker (`groups invites`). An empty result
     /// shows an info card rather than an empty picker.
     pub(crate) fn open_invites(&mut self) -> TuiResult<()> {

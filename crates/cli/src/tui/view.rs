@@ -960,7 +960,10 @@ impl TuiApp {
         frame.render_widget(Clear, rect);
         let mut lines: Vec<Line<'static>> = Vec::new();
         match popup {
-            Popup::Text { input, .. } => lines.push(input_cursor_line("> ", input)),
+            Popup::Text { body, input, .. } => {
+                lines.extend(body.iter().map(|line| Line::from(terminal_safe_text(line))));
+                lines.push(input_cursor_line("> ", input));
+            }
             Popup::Confirm { body, .. } | Popup::Card { body, .. } => {
                 lines.extend(body.iter().map(|line| Line::from(terminal_safe_text(line))))
             }

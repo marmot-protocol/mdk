@@ -95,6 +95,17 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- TUI: `/logout` removes the currently selected account. `wn logout` is destructive — it permanently erases the
+  account's local data (messages, group membership, and MLS state) from this device and, for a local-signing account,
+  deletes its signing key too — so the confirmation scales to the consequence. A local-signing logout is irreversible,
+  so it requires typing the literal word `logout` and pressing `Enter`; an empty or mismatched entry keeps the popup
+  open (so the wipe is never reachable by a stray Enter-then-Enter) and `Esc` cancels. A public-only account is
+  re-addable and keeps the lighter `y`/`Enter` confirm (`n` or `Esc` cancels). The confirmation body states the
+  consequences plainly, never softens the wording, tailors the irreversibility line to the account type (a public-only
+  account has no key to erase), and always shows the account npub so it is unambiguous which account is destroyed. On
+  confirmation the command runs, the account list reloads, and the TUI lands on a remaining account or drops back to the
+  login menu when the last account is removed — never left pointing at a removed account or a stale subscription. Listed
+  in the in-app help card and slash-command suggestions. No JSON response shapes changed.
 - TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
   loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
   decode, delivering the result over an `mpsc` channel drained on tick) and drawn via `ratatui-image` as cell-exact

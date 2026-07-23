@@ -283,10 +283,14 @@ pub(crate) enum Screen {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Popup {
     /// Text entry. `Enter` submits when non-empty, `Esc` cancels. Reuses the
-    /// composer's `Input` so cursor editing and masking behave identically.
+    /// composer's `Input` so cursor editing and masking behave identically. The
+    /// optional `body` renders explanatory lines above the input (empty for the
+    /// plain prompts); a typed-token confirmation uses it to carry the honest
+    /// consequence wording plus the instruction on what to type.
     Text {
         purpose: TextPurpose,
         title: String,
+        body: Vec<String>,
         input: Input,
     },
     /// Confirm. `y`/`Enter` confirms, `n`/`Esc` cancels.
@@ -332,17 +336,72 @@ pub(crate) enum TextPurpose {
     NewChatWithUser {
         pubkey: String,
     },
+    /// Typed-token confirmation for logging out (permanently removing) a
+    /// local-signing account. Unlike the free-form purposes, this does not
+    /// capture arbitrary input: the user must type the literal
+    /// [`LOGOUT_CONFIRMATION_TOKEN`] to submit the irreversible wipe (the
+    /// signing key is destroyed with the local data). `account_id` is the
+    /// `wn logout` target; `npub` identifies it in the post-logout status once
+    /// the account row is gone.
+    ConfirmLogout {
+        account_id: String,
+        npub: String,
+    },
+}
+
+/// The literal word a user must type to confirm the irreversible logout of a
+/// local-signing account (see [`TextPurpose::ConfirmLogout`]). Defined once so
+/// the reducer's exact-match check, the popup's instruction line, and the tests
+/// all share a single source of truth.
+pub(crate) const LOGOUT_CONFIRMATION_TOKEN: &str = "logout";
+
+impl TextPurpose {
+    /// The literal token that must be typed before `Enter` submits a typed-token
+    /// confirmation. Free-form entry purposes return `None` (any non-empty value
+    /// submits); a confirmation purpose returns the exact word the user must
+    /// type, so the reducer submits only on an exact match and treats an empty or
+    /// mismatched value as a no-op that keeps the popup open.
+    fn confirmation_token(&self) -> Option<&'static str> {
+        match self {
+            TextPurpose::ConfirmLogout { .. } => Some(LOGOUT_CONFIRMATION_TOKEN),
+            TextPurpose::RenameGroup { .. }
+            | TextPurpose::AddMemberByPubkey { .. }
+            | TextPurpose::EditProfileField { .. }
+            | TextPurpose::FollowByPubkey
+            | TextPurpose::NewChatWithUser { .. } => None,
+        }
+    }
 }
 
 /// What a confirm popup does on `y`/`Enter`. 5b adds unfollow and
 /// add-found-user-to-the-current-chat here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConfirmPurpose {
-    RemoveMember { group_id: String, pubkey: String },
-    PromoteMember { group_id: String, pubkey: String },
-    LeaveGroup { group_id: String },
-    Unfollow { pubkey: String },
-    AddUserToChat { group_id: String, pubkey: String },
+    RemoveMember {
+        group_id: String,
+        pubkey: String,
+    },
+    PromoteMember {
+        group_id: String,
+        pubkey: String,
+    },
+    LeaveGroup {
+        group_id: String,
+    },
+    Unfollow {
+        pubkey: String,
+    },
+    AddUserToChat {
+        group_id: String,
+        pubkey: String,
+    },
+    /// Log out (permanently remove) an account. `account_id` is the `wn logout`
+    /// target; `npub` identifies it in the post-logout status once the account
+    /// row is gone.
+    Logout {
+        account_id: String,
+        npub: String,
+    },
 }
 
 /// An editable own-profile field. Each maps to exactly one `profile update`
@@ -436,6 +495,7 @@ pub(crate) enum PopupSubmit {
     Unfollow { pubkey: String },
     NewChat { name: String, pubkey: String },
     AddUserToChat { group_id: String, pubkey: String },
+    Logout { account_id: String, npub: String },
 }
 
 impl Popup {
@@ -490,10 +550,18 @@ pub(crate) fn popup_key(popup: &mut Popup, key: KeyCode) -> PopupAction {
         Popup::Text { purpose, input, .. } => match key {
             KeyCode::Enter => {
                 let value = input.value().trim().to_owned();
-                if value.is_empty() {
-                    PopupAction::None
-                } else {
+                let ready = match purpose.confirmation_token() {
+                    // Typed-token confirmation: submit only on an exact match.
+                    // Empty (the double-Enter case) or any mismatch is a no-op
+                    // that keeps the popup open.
+                    Some(token) => value == token,
+                    // Free-form entry: submit any non-empty value.
+                    None => !value.is_empty(),
+                };
+                if ready {
                     PopupAction::Submit(text_purpose_submit(purpose, value))
+                } else {
+                    PopupAction::None
                 }
             }
             KeyCode::Esc => PopupAction::Dismiss,
@@ -575,6 +643,12 @@ fn text_purpose_submit(purpose: &TextPurpose, value: String) -> PopupSubmit {
             name: value,
             pubkey: pubkey.clone(),
         },
+        // The typed token was already matched by the reducer; it is a fixed
+        // confirmation word, not user data, so it is discarded here.
+        TextPurpose::ConfirmLogout { account_id, npub } => PopupSubmit::Logout {
+            account_id: account_id.clone(),
+            npub: npub.clone(),
+        },
     }
 }
 
@@ -597,6 +671,10 @@ fn confirm_purpose_submit(purpose: &ConfirmPurpose) -> PopupSubmit {
         ConfirmPurpose::AddUserToChat { group_id, pubkey } => PopupSubmit::AddUserToChat {
             group_id: group_id.clone(),
             pubkey: pubkey.clone(),
+        },
+        ConfirmPurpose::Logout { account_id, npub } => PopupSubmit::Logout {
+            account_id: account_id.clone(),
+            npub: npub.clone(),
         },
     }
 }
@@ -651,7 +729,7 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "Popups capture every key; Esc or the shown key closes them.",
         "",
         "/refresh   /diagnostics   /account <npub-or-hex>   /create-identity",
-        "/login <nsec-or-npub>   /daemon status|start|stop   /users [query]",
+        "/login <nsec-or-npub>   /logout   /daemon status|start|stop   /users [query]",
         "/chat new|rename|describe|archive|unarchive|archived",
         "/members add|remove|list   /react [emoji]   /unreact   /delete   /reply <text>   /retry <id>",
         "/keys fetch|rotate   /profile name <display-name>   /quit",
@@ -1592,6 +1670,10 @@ pub(crate) enum SlashCommand {
     AccountCreate,
     AccountAddPublic(String),
     AccountImportSecret(String),
+    /// Log out the currently selected account. Always routed through a confirm
+    /// popup because `wn logout` permanently removes the account's local data and
+    /// signing key from this device.
+    Logout,
     DaemonStatus,
     DaemonStart,
     DaemonStop,
@@ -1697,6 +1779,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/login <nsec-or-npub>",
         description: "import or add an identity",
+    },
+    SlashCommandSuggestion {
+        usage: "/logout",
+        description: "remove the selected account from this device",
     },
     SlashCommandSuggestion {
         usage: "/daemon status",

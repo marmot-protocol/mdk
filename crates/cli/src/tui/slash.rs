@@ -42,6 +42,13 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
             [] => Err("/login expects one nsec or npub".to_owned()),
             _ => Err("/login expects exactly one nsec or npub".to_owned()),
         },
+        "logout" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Logout)
+            } else {
+                Err("/logout acts on the selected account and takes no arguments".to_owned())
+            }
+        }
         "account" => parse_account_command(rest),
         "daemon" => parse_daemon_command(rest),
         "chat" => parse_chat_command(rest),

@@ -897,6 +897,10 @@ impl TuiApp {
             SlashCommand::AccountImportSecret(secret) => {
                 self.create_or_import_account(Some(secret), "logged in identity")
             }
+            SlashCommand::Logout => {
+                self.open_logout_popup();
+                Ok(())
+            }
             SlashCommand::DaemonStatus => {
                 self.refresh_daemon_status()?;
                 self.status = daemon_status_sentence(&self.daemon);
@@ -1129,6 +1133,7 @@ impl TuiApp {
                 self.reveal_chat_from_search();
                 Ok(())
             }
+            PopupSubmit::Logout { account_id, npub } => self.logout_account(&account_id, &npub),
         }
     }
 
@@ -1190,6 +1195,7 @@ impl TuiApp {
                     group_id: view.group_id.clone(),
                 },
                 title: "Add Member".to_owned(),
+                body: Vec::new(),
                 input: Input::default(),
             });
         }
@@ -1204,6 +1210,7 @@ impl TuiApp {
                     group_id: view.group_id.clone(),
                 },
                 title: "Rename Group".to_owned(),
+                body: Vec::new(),
                 input,
             });
         }
@@ -1282,6 +1289,66 @@ impl TuiApp {
                 },
             },
         );
+    }
+
+    /// Arm the logout popup for the currently selected account, scaling the guard
+    /// to the consequence. `wn logout` is a destructive wipe
+    /// (`AccountHome::remove_account`): it erases the account's local data from
+    /// this device, and for a local-signing account it also deletes the signing
+    /// key. That irreversible case is gated behind a typed-token confirmation —
+    /// the user must type `logout` — so the TUI's only identity-destroying action
+    /// is never reachable by a stray Enter-then-Enter. A public-only account is
+    /// re-addable, so it keeps the lighter `y`/`Enter` confirm. Both bodies state
+    /// plainly what is erased and never soften the wording.
+    fn open_logout_popup(&mut self) {
+        let Some(account) = self.selected_account_row() else {
+            self.status = "no account selected".to_owned();
+            return;
+        };
+        let label = shorten(&terminal_safe_text(&account_display_label(account)), 24);
+        let account_id = account.account_id.clone();
+        let npub = account.npub.clone();
+        let local_signing = account.local_signing;
+        // The npub is the unambiguous identifier for which account is about to be
+        // destroyed. Always surface it: when a display name labels the account the
+        // first line would otherwise hide the npub, so add an explicit line; with
+        // no display name the label already is the npub.
+        let mut body = vec![format!("Log out {label}?")];
+        if account.display_name.is_some() {
+            body.push(format!("npub {}", shorten(&npub, 24)));
+        }
+        body.push(
+            "This permanently erases this account's local data — messages, group membership, \
+             and MLS state — from this device."
+                .to_owned(),
+        );
+        if local_signing {
+            body.push(
+                "Its signing key is deleted too. Unless your nsec is backed up elsewhere, this \
+                 cannot be undone."
+                    .to_owned(),
+            );
+            body.push(format!(
+                "Type {LOGOUT_CONFIRMATION_TOKEN} to confirm; Esc cancels."
+            ));
+            self.popup = Some(Popup::Text {
+                purpose: TextPurpose::ConfirmLogout { account_id, npub },
+                title: "Log Out".to_owned(),
+                body,
+                input: Input::default(),
+            });
+        } else {
+            body.push(
+                "Local data cannot be recovered; the account would have to be added again from \
+                 scratch."
+                    .to_owned(),
+            );
+            self.popup = Some(Popup::Confirm {
+                purpose: ConfirmPurpose::Logout { account_id, npub },
+                title: "Log Out".to_owned(),
+                body,
+            });
+        }
     }
 
     /// Drop any Phase 5b full-view state and return to the main view. Shared by
@@ -1397,6 +1464,7 @@ impl TuiApp {
         self.popup = Some(Popup::Text {
             purpose: TextPurpose::NewChatWithUser { pubkey },
             title: "New Chat".to_owned(),
+            body: Vec::new(),
             input,
         });
     }
@@ -1447,6 +1515,7 @@ impl TuiApp {
                 self.popup = Some(Popup::Text {
                     purpose: TextPurpose::FollowByPubkey,
                     title: "Follow User".to_owned(),
+                    body: Vec::new(),
                     input: Input::default(),
                 });
             }
@@ -1474,6 +1543,7 @@ impl TuiApp {
         self.popup = Some(Popup::Text {
             purpose: TextPurpose::EditProfileField { field },
             title: format!("Edit {}", field.label()),
+            body: Vec::new(),
             input,
         });
     }
