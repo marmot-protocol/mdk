@@ -305,6 +305,14 @@ impl<S: StorageProvider> Engine<S> {
                                 StaleReason::PeelFailed,
                             );
                         }
+                        Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
+                            return self.terminal_peel_rejection_stale(
+                                &raw_msg_id,
+                                &msg.id,
+                                "wrong_recipient_snapshot_fallback",
+                                StaleReason::NotForThisClient,
+                            );
+                        }
                         Err(e) => return Err(e),
                     };
                     if let Some(recovery) = recovered {
@@ -404,6 +412,14 @@ impl<S: StorageProvider> Engine<S> {
                                 &msg.id,
                                 "malformed_payload_snapshot_fallback",
                                 StaleReason::PeelFailed,
+                            );
+                        }
+                        Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
+                            return self.terminal_peel_rejection_stale(
+                                &raw_msg_id,
+                                &msg.id,
+                                "wrong_recipient_snapshot_fallback",
+                                StaleReason::NotForThisClient,
                             );
                         }
                         Err(e) => return Err(e),

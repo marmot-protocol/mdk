@@ -65,7 +65,34 @@ enum BoundaryRejection {
     InvalidSignature,
     WrongRecipient,
 }
-struct BoundaryRejectionPeeler(BoundaryRejection);
+#[derive(Clone, Copy)]
+enum InitialPeelFailure {
+    DecryptFailed,
+    StaleEpoch,
+}
+#[derive(Clone, Copy)]
+enum BoundaryRejectionPath {
+    Direct,
+    SnapshotFallback {
+        live_epoch: u64,
+        initial_failure: InitialPeelFailure,
+    },
+}
+struct BoundaryRejectionPeeler {
+    rejection: BoundaryRejection,
+    path: BoundaryRejectionPath,
+}
+
+const BOUNDARY_REJECTION_PAYLOAD: &[u8] = b"typed-boundary-rejection-payload";
+
+impl BoundaryRejection {
+    fn peeler_error(self) -> PeelerError {
+        match self {
+            Self::InvalidSignature => PeelerError::InvalidSignature,
+            Self::WrongRecipient => PeelerError::WrongRecipient,
+        }
+    }
+}
 
 impl FailOncePeeler {
     fn new() -> Self {
@@ -273,13 +300,27 @@ impl TransportPeeler for MalformedShortPayloadPeeler {
 impl TransportPeeler for BoundaryRejectionPeeler {
     async fn peel_group_message(
         &self,
-        _msg: &TransportMessage,
-        _ctx: &GroupContextSnapshot,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
-        Err(match self.0 {
-            BoundaryRejection::InvalidSignature => PeelerError::InvalidSignature,
-            BoundaryRejection::WrongRecipient => PeelerError::WrongRecipient,
-        })
+        if msg.payload != BOUNDARY_REJECTION_PAYLOAD {
+            return MockPeeler.peel_group_message(msg, ctx).await;
+        }
+
+        match self.path {
+            BoundaryRejectionPath::Direct => Err(self.rejection.peeler_error()),
+            BoundaryRejectionPath::SnapshotFallback {
+                live_epoch,
+                initial_failure,
+            } if ctx.epoch().0 >= live_epoch => Err(match initial_failure {
+                InitialPeelFailure::DecryptFailed => PeelerError::DecryptFailed,
+                InitialPeelFailure::StaleEpoch => PeelerError::StaleEpoch {
+                    message_epoch: EpochId(live_epoch.saturating_sub(1)),
+                    context_epoch: ctx.epoch(),
+                },
+            }),
+            BoundaryRejectionPath::SnapshotFallback { .. } => Err(self.rejection.peeler_error()),
+        }
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
@@ -833,7 +874,10 @@ async fn assert_typed_terminal_transport_rejection(
     let mut alice = build_client(b"alice-terminal-rejection");
     let mut bob = build_client_with_peeler(
         b"bob-terminal-rejection",
-        Box::new(BoundaryRejectionPeeler(rejection)),
+        Box::new(BoundaryRejectionPeeler {
+            rejection,
+            path: BoundaryRejectionPath::Direct,
+        }),
     );
     let bob_kp = bob.fresh_key_package().await.unwrap();
 
@@ -860,7 +904,7 @@ async fn assert_typed_terminal_transport_rejection(
 
     let rejected = TransportMessage {
         id: hash_id(b"terminal transport rejection"),
-        payload: vec![0; STRUCTURAL_MIN_PAYLOAD_LEN],
+        payload: BOUNDARY_REJECTION_PAYLOAD.to_vec(),
         timestamp: Timestamp(0),
         causal_deps: vec![],
         source: TransportSource("mock".into()),
@@ -891,6 +935,106 @@ async fn assert_typed_terminal_transport_rejection(
     ));
 }
 
+async fn assert_snapshot_fallback_terminal_transport_rejection(
+    rejection: BoundaryRejection,
+    initial_failure: InitialPeelFailure,
+    expected_reason: StaleReason,
+) {
+    let mut alice = build_client(b"alice-snapshot-boundary-rejection");
+    let live_epoch = 2u64;
+    let mut bob = build_client_with_peeler(
+        b"bob-snapshot-boundary-rejection",
+        Box::new(BoundaryRejectionPeeler {
+            rejection,
+            path: BoundaryRejectionPath::SnapshotFallback {
+                live_epoch,
+                initial_failure,
+            },
+        }),
+    );
+    let mut carol = build_client(b"carol-snapshot-boundary-rejection");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected group create, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = match alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            alice.confirm_published(pending).await.unwrap();
+            TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..msg
+            }
+        }
+        other => panic!("expected invite commit, got {other:?}"),
+    };
+    bob.buffer_openmls_convergence_message(&group_id, invite, 1_000)
+        .expect("invite commit buffered");
+    bob.converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("invite commit applies and retains the pre-commit anchor");
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(live_epoch));
+
+    let rejected = TransportMessage {
+        id: hash_id(b"snapshot fallback terminal transport rejection"),
+        payload: BOUNDARY_REJECTION_PAYLOAD.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(rejected.clone())
+        .await
+        .expect("snapshot-fallback boundary rejection is terminal, not a drain failure");
+    assert_eq!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: expected_reason
+        }
+    );
+
+    let duplicate = bob
+        .ingest(rejected)
+        .await
+        .expect("redelivery short-circuits after snapshot-fallback rejection");
+    assert_eq!(
+        duplicate,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    );
+}
+
 #[tokio::test]
 async fn invalid_transport_signature_is_typed_terminal_input() {
     assert_typed_terminal_transport_rejection(
@@ -904,6 +1048,26 @@ async fn invalid_transport_signature_is_typed_terminal_input() {
 async fn wrong_transport_recipient_is_typed_terminal_input() {
     assert_typed_terminal_transport_rejection(
         BoundaryRejection::WrongRecipient,
+        StaleReason::NotForThisClient,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn invalid_transport_signature_after_decrypt_failed_fallback_is_terminal() {
+    assert_snapshot_fallback_terminal_transport_rejection(
+        BoundaryRejection::InvalidSignature,
+        InitialPeelFailure::DecryptFailed,
+        StaleReason::PeelFailed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_transport_recipient_after_stale_epoch_fallback_is_terminal() {
+    assert_snapshot_fallback_terminal_transport_rejection(
+        BoundaryRejection::WrongRecipient,
+        InitialPeelFailure::StaleEpoch,
         StaleReason::NotForThisClient,
     )
     .await;
