@@ -41,9 +41,18 @@
         "pending": "create"
       },
       {
-        "type": "confirm_pending",
-        "client": "alice",
-        "pending": "create"
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "send_app_message",
+        "sender": "bob",
+        "payload": "bob:first-current-message"
       },
       {
         "type": "deliver_all"
@@ -51,6 +60,7 @@
       {
         "type": "tick",
         "clients": [
+          "alice",
           "bob"
         ]
       },
@@ -65,18 +75,13 @@
   },
   "expected_outcomes": [
     {
-      "type": "pending_resolution",
-      "step_index": 1,
-      "client": "alice",
-      "pending": "create",
-      "resolution": "confirmed"
-    },
-    {
       "type": "client_state",
       "client": "alice",
       "epoch": 1,
       "member_count": 2,
-      "received_payloads": []
+      "received_payloads": [
+        "bob:first-current-message"
+      ]
     },
     {
       "type": "client_state",

@@ -180,6 +180,9 @@ pub enum PublishWork {
         welcomes: Vec<TransportMessage>,
         pending: PendingStateRef,
     },
+    FoundingGroupCreated {
+        welcomes: Vec<TransportMessage>,
+    },
     AutoPublish {
         msg: TransportMessage,
         pending: PendingStateRef,
@@ -710,6 +713,9 @@ impl AccountDeviceSession {
                 SendResult::GroupCreated { welcomes, pending } => effects
                     .publish
                     .push(PublishWork::GroupCreated { welcomes, pending }),
+                SendResult::FoundingGroupCreated { welcomes } => effects
+                    .publish
+                    .push(PublishWork::FoundingGroupCreated { welcomes }),
                 SendResult::Queued {
                     group_id,
                     intent_id,
@@ -764,7 +770,9 @@ fn send_result_kind(result: &SendResult) -> &'static str {
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",
         SendResult::GroupEvolution { .. } => "group_evolution",
-        SendResult::GroupCreated { .. } => "group_created",
+        SendResult::GroupCreated { .. } | SendResult::FoundingGroupCreated { .. } => {
+            "group_created"
+        }
     }
 }
 

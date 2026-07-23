@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use cgka_engine::key_package::is_last_resort_key_package;
+use cgka_session::PublishWork;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
@@ -17,6 +18,7 @@ use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
+use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, SecretBytes};
 use marmot_forensics::AuditEventContext;
 
@@ -260,9 +262,9 @@ impl AppClient {
             Some(member_refs.len() as u64),
         );
 
-        let (group_id, effects) = self
+        let prepared = self
             .runtime
-            .create_group_with_audit_context(
+            .prepare_create_group_with_audit_context(
                 CreateGroupRequest {
                     name: name.to_owned(),
                     description: String::new(),
@@ -274,6 +276,21 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
+        let group_id = prepared.group_id;
+        // Current-profile founding creation is already canonical before
+        // transport delivery. Persist every exact Welcome obligation before
+        // the first external side effect, so a crash between recipients
+        // cannot lose the still-undelivered work or induce a second group.
+        let founding_welcome_intents =
+            self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects)?;
+        let effects = self
+            .runtime
+            .publish_prepared_session_effects_with_audit_context(
+                prepared.effects,
+                audit_context.clone(),
+            )
+            .await?;
+        self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects)?;
         fail_if_publish_failed(&effects)?;
         self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
@@ -2084,6 +2101,67 @@ impl AppClient {
                     recipient_hex,
                     recorded_at,
                 });
+        }
+        Ok(())
+    }
+
+    /// Record current-profile founding Welcome delivery intent before any
+    /// transport publish. Returns the message ids so successful deliveries can
+    /// be cleared after the account runtime reports their acknowledgements.
+    fn record_founding_welcome_delivery_intents(
+        &mut self,
+        group_id: &GroupId,
+        effects: &cgka_session::SessionEffects,
+    ) -> Result<Vec<String>, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let recorded_at = unix_now_seconds();
+        let storage = self.app.account_storage(&self.state.label)?;
+        let mut message_ids = Vec::new();
+        for work in &effects.publish {
+            let PublishWork::FoundingGroupCreated { welcomes } = work else {
+                continue;
+            };
+            for welcome in welcomes {
+                let TransportEnvelope::Welcome { recipient } = &welcome.envelope else {
+                    return Err(AppError::Publish(
+                        "founding delivery artifact was not a Welcome".into(),
+                    ));
+                };
+                let message_id_hex = hex::encode(welcome.id.as_slice());
+                storage.record_pending_welcome_delivery(
+                    &message_id_hex,
+                    &group_id_hex,
+                    &hex::encode(recipient.as_slice()),
+                    recorded_at,
+                )?;
+                message_ids.push(message_id_hex);
+            }
+        }
+        Ok(message_ids)
+    }
+
+    /// Clear only intent rows whose exact Welcome met its acknowledgement
+    /// policy. Failed or unattempted rows stay durable for re-delivery.
+    fn clear_delivered_founding_welcome_intents(
+        &mut self,
+        message_ids: &[String],
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        for message_id_hex in message_ids {
+            let delivered = effects.reports.iter().any(|report| {
+                hex::encode(report.message_id.as_slice()) == *message_id_hex
+                    && report.met_required_acks()
+            }) && !effects
+                .welcome_failures
+                .iter()
+                .any(|failure| hex::encode(failure.message_id.as_slice()) == *message_id_hex);
+            if delivered {
+                storage.clear_pending_welcome_delivery(message_id_hex)?;
+            }
         }
         Ok(())
     }

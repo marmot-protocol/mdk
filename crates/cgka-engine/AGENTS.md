@@ -160,10 +160,12 @@ These are the load-bearing departures from the original plan. Each is also docum
    mechanical churn with zero functional value. Site: `crates/traits/src/storage.rs` (`StorageProvider` aggregate with
    `type Mls` / `fn mls_storage`).
 
-2. **`SendResult::GroupCreated { welcomes, pending }` is its own variant.** `GroupEvolution` carries a
-   `msg: TransportMessage` that has no consumer at create-time (every other initial member arrives via welcome with
-   post-commit state). Splitting the variant also eliminates a welcome-before-commit `AlreadyAtEpoch` bounce at
-   creation. Site: `crates/traits/src/engine.rs::SendResult`.
+2. **Founding creation never invents a group-message publication.** Current-profile creation returns
+   `SendResult::FoundingGroupCreated { welcomes }`: the epoch-0 group and optional founding Add are already canonical,
+   and each Welcome is an independent delivery obligation. The temporary explicit-legacy path retains
+   `SendResult::GroupCreated { welcomes, pending }`. Neither variant carries a `msg: TransportMessage`, because every
+   initial invitee arrives through a Welcome containing the post-Add state. Site:
+   `crates/traits/src/engine.rs::SendResult`.
 
 3. **`CreateGroupRequest::initial_admins: Vec<MemberId>`.** Bootstraps multi-admin groups so admins can subsequently
    self-remove (MIP-03 §149's "not the last admin" constraint). Creator is implicitly an admin; `initial_admins` adds
@@ -301,11 +303,13 @@ Admin-policy and routing-component updates are deliberately out of scope. Tests 
 
 ### Done — Task 4.13 publish-before-apply (2026-04-25)
 
-`do_create_group` / `do_send_invite` / `do_upgrade_group_capabilities` / auto-commit stage their commits and defer merge
-until `CgkaEngine::confirm_published`. `CgkaEngine::publish_failed` discards via `MlsGroup::clear_pending_commit` +
-Marmot re-derive from the still-unmerged group. The Marmot record holds _projected post-merge_ `members` so `members()`
-and `feature_status` reflect the pending group evolution during `PendingPublish`. See `tests/publish_lifecycle.rs` and
-`tests/invite_leave.rs` for the contract.
+`do_send_invite` / `do_upgrade_group_capabilities` / auto-commit stage their commits and defer merge until
+`CgkaEngine::confirm_published`. `CgkaEngine::publish_failed` discards via `MlsGroup::clear_pending_commit` + Marmot
+re-derive from the still-unmerged group. Current-profile `do_create_group` is the founding exception: it atomically
+makes epoch 0 and the optional founding Add canonical locally, publishes no ordinary group commit, and persists each
+Welcome as independent retryable work. The temporary explicit-legacy create path retains the older pending behavior.
+For pending evolutions, the Marmot record holds _projected post-merge_ `members` so `members()` and `feature_status`
+reflect the pending change. See `tests/publish_lifecycle.rs`, `tests/group_creation.rs`, and `tests/invite_leave.rs`.
 
 OpenMLS 0.8.1 surface used: `MlsGroup::pending_commit() -> Option<&StagedCommit>` (`mod.rs:353`),
 `StagedCommit::export_secret` (`staged_commit.rs:778`, identical signature to `MlsGroup::export_secret`),

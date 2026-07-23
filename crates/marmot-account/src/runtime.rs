@@ -262,13 +262,40 @@ where
         context: AuditEventContext,
     ) -> AccountResult<(GroupId, AccountDeviceEffects)> {
         let CreateGroupEffects { group_id, effects } = self
-            .session
-            .create_group_with_audit_context(request, context.clone())
+            .prepare_create_group_with_audit_context(request, context.clone())
             .await?;
         let effects = self
-            .publish_session_effects_with_audit_context(effects, Some(context))
+            .publish_prepared_session_effects_with_audit_context(effects, context)
             .await?;
         Ok((group_id, effects))
+    }
+
+    /// Prepare group creation without performing transport side effects.
+    ///
+    /// The application runtime uses this seam to durably record every
+    /// current-profile founding Welcome obligation before the first publish
+    /// attempt. Callers must subsequently pass the returned effects to
+    /// [`Self::publish_prepared_session_effects_with_audit_context`].
+    pub async fn prepare_create_group_with_audit_context(
+        &mut self,
+        request: CreateGroupRequest,
+        context: AuditEventContext,
+    ) -> AccountResult<CreateGroupEffects> {
+        Ok(self
+            .session
+            .create_group_with_audit_context(request, context)
+            .await?)
+    }
+
+    /// Publish effects returned by
+    /// [`Self::prepare_create_group_with_audit_context`].
+    pub async fn publish_prepared_session_effects_with_audit_context(
+        &mut self,
+        effects: SessionEffects,
+        context: AuditEventContext,
+    ) -> AccountResult<AccountDeviceEffects> {
+        self.publish_session_effects_with_audit_context(effects, Some(context))
+            .await
     }
 
     pub async fn send(&mut self, intent: SendIntent) -> AccountResult<AccountDeviceEffects> {
@@ -366,6 +393,10 @@ where
                         context.clone(),
                     )
                     .await?;
+                }
+                PublishWork::FoundingGroupCreated { welcomes } => {
+                    self.publish_founding_group_created(welcomes, &mut output, context.clone())
+                        .await?;
                 }
                 PublishWork::GroupEvolution {
                     msg,
@@ -551,9 +582,9 @@ where
                     failure.group_id = group_id.clone();
                 }
             }
-            // Only a confirmed create leaves welcomes worth re-delivering; a
-            // rolled-back create discards the whole evolution, welcomes
-            // included.
+            // Only a confirmed legacy create leaves welcomes worth
+            // re-delivering; a rolled-back create discards the whole
+            // evolution, welcomes included.
             output.welcome_failures.extend(welcome_failures);
         } else {
             let effects = self.session.publish_failed(pending).await?;
@@ -561,6 +592,36 @@ where
                 .pending
                 .push(PendingResolution::RolledBack { pending });
             output.absorb_session_effects(effects, queue);
+        }
+        Ok(())
+    }
+
+    async fn publish_founding_group_created(
+        &mut self,
+        welcomes: Vec<TransportMessage>,
+        output: &mut AccountDeviceEffects,
+        context: Option<AuditEventContext>,
+    ) -> AccountResult<()> {
+        let group_id = output.events.iter().find_map(|event| match event {
+            GroupEvent::GroupCreated { group_id } => Some(group_id.clone()),
+            _ => None,
+        });
+        for welcome in welcomes {
+            let recipient = welcome_recipient(&welcome);
+            let welcome_id = welcome.id.clone();
+            let failures_before = output.failures.len();
+            let status = self.publish_one(welcome, output, context.clone()).await?;
+            if !status.met_required_acks
+                && let Some(recipient) = recipient
+            {
+                output.welcome_failures.push(self.welcome_delivery_failure(
+                    welcome_id,
+                    recipient,
+                    group_id.clone(),
+                    output,
+                    failures_before,
+                ));
+            }
         }
         Ok(())
     }

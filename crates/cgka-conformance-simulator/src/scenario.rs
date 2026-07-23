@@ -364,9 +364,16 @@ async fn run_scenario_report_inner(
                     required_features_from_names(required_features, step_index)?;
                 let creator = client_mut(&mut clients, creator, step_index)?;
                 let (_group_id, pending_ref) = creator
-                    .create_group_with_admins(name, key_packages, required_features, initial_admins)
+                    .create_group_with_admins_maybe_pending(
+                        name,
+                        key_packages,
+                        required_features,
+                        initial_admins,
+                    )
                     .await;
-                insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+                if let Some(pending_ref) = pending_ref {
+                    insert_pending(&mut pending_refs, pending, pending_ref, step_index)?;
+                }
             }
             ScenarioStep::InviteMembers {
                 inviter,

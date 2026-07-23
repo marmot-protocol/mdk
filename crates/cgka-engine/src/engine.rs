@@ -609,7 +609,9 @@ impl<S: StorageProvider> Engine<S> {
             }
             SendResult::Proposal { msg } => Some((msg, MessageArtifactKind::Proposal)),
             SendResult::GroupEvolution { msg, .. } => Some((msg, MessageArtifactKind::Commit)),
-            SendResult::GroupCreated { .. } | SendResult::Queued { .. } => None,
+            SendResult::GroupCreated { .. }
+            | SendResult::FoundingGroupCreated { .. }
+            | SendResult::Queued { .. } => None,
         };
         if let Some((msg, artifact_kind)) = main {
             let self_id = self.identity.self_id();
@@ -643,7 +645,8 @@ impl<S: StorageProvider> Engine<S> {
 
         let welcomes = match result {
             SendResult::GroupEvolution { welcomes, .. }
-            | SendResult::GroupCreated { welcomes, .. } => welcomes.as_slice(),
+            | SendResult::GroupCreated { welcomes, .. }
+            | SendResult::FoundingGroupCreated { welcomes } => welcomes.as_slice(),
             _ => [].as_slice(),
         };
         for welcome in welcomes {

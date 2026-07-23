@@ -273,7 +273,9 @@ impl<S: StorageProvider> Engine<S> {
                     self.queued_intent_by_pending
                         .insert(*pending, (record.group_id.clone(), record.id.clone()));
                 }
-                SendResult::GroupCreated { .. } | SendResult::Queued { .. } => {}
+                SendResult::GroupCreated { .. }
+                | SendResult::FoundingGroupCreated { .. }
+                | SendResult::Queued { .. } => {}
             }
             drained.push(result);
             if pauses_for_pending_publish {

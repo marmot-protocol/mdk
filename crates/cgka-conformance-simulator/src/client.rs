@@ -387,6 +387,43 @@ impl HarnessClient {
         required_features: Vec<cgka_traits::capabilities::Feature>,
         initial_admins: Vec<MemberId>,
     ) -> Result<(GroupId, PendingStateRef), EngineError> {
+        let (group_id, pending) = self
+            .try_create_group_with_admins_maybe_pending(
+                name,
+                invitees,
+                required_features,
+                initial_admins,
+            )
+            .await?;
+        pending.map(|pending| (group_id, pending)).ok_or_else(|| {
+            EngineError::Other("current founding creation has no pending state".into())
+        })
+    }
+
+    pub async fn create_group_with_admins_maybe_pending(
+        &mut self,
+        name: &str,
+        invitees: Vec<KeyPackage>,
+        required_features: Vec<cgka_traits::capabilities::Feature>,
+        initial_admins: Vec<MemberId>,
+    ) -> (GroupId, Option<PendingStateRef>) {
+        self.try_create_group_with_admins_maybe_pending(
+            name,
+            invitees,
+            required_features,
+            initial_admins,
+        )
+        .await
+        .expect("create_group")
+    }
+
+    async fn try_create_group_with_admins_maybe_pending(
+        &mut self,
+        name: &str,
+        invitees: Vec<KeyPackage>,
+        required_features: Vec<cgka_traits::capabilities::Feature>,
+        initial_admins: Vec<MemberId>,
+    ) -> Result<(GroupId, Option<PendingStateRef>), EngineError> {
         let res = self
             .engine
             .create_group(CreateGroupRequest {
@@ -399,10 +436,11 @@ impl HarnessClient {
             })
             .await?;
         let (gid, pending, welcomes) = match res {
-            (gid, SendResult::GroupCreated { pending, welcomes }) => (gid, pending, welcomes),
+            (gid, SendResult::GroupCreated { pending, welcomes }) => (gid, Some(pending), welcomes),
+            (gid, SendResult::FoundingGroupCreated { welcomes }) => (gid, None, welcomes),
             (_, other) => {
                 return Err(EngineError::Other(format!(
-                    "expected GroupCreated, got {other:?}"
+                    "expected group creation result, got {other:?}"
                 )));
             }
         };
@@ -410,6 +448,9 @@ impl HarnessClient {
             self.bus.send(self.bus_id, w);
         }
         self.default_group = Some(gid.clone());
+        if pending.is_none() {
+            self.capture_engine_events();
+        }
         Ok((gid, pending))
     }
 
@@ -822,6 +863,12 @@ impl HarnessClient {
                     self.bus.send(self.bus_id, welcome);
                 }
                 self.engine.confirm_published(pending).await?;
+                self.capture_engine_events();
+            }
+            SendResult::FoundingGroupCreated { welcomes } => {
+                for welcome in welcomes {
+                    self.bus.send(self.bus_id, welcome);
+                }
                 self.capture_engine_events();
             }
             SendResult::Queued { .. } => {}

@@ -132,7 +132,9 @@ pub(crate) fn send_result_kind_str(result: &SendResult) -> &'static str {
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",
         SendResult::GroupEvolution { .. } => "group_evolution",
-        SendResult::GroupCreated { .. } => "group_created",
+        SendResult::GroupCreated { .. } | SendResult::FoundingGroupCreated { .. } => {
+            "group_created"
+        }
     }
 }
 
@@ -531,7 +533,8 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
                     .map(|w| outbound(w, MessageArtifactKind::Welcome)),
             );
         }
-        SendResult::GroupCreated { welcomes, .. } => {
+        SendResult::GroupCreated { welcomes, .. }
+        | SendResult::FoundingGroupCreated { welcomes } => {
             messages.extend(
                 welcomes
                     .iter()

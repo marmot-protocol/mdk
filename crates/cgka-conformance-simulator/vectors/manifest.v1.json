@@ -75,7 +75,8 @@
         "required app_data_update proposal 0x0008",
         "mandatory admin-policy component 0x8003",
         "mandatory LeafNode-only account-proof component 0x8009",
-        "creation and Welcome join under the current profile"
+        "canonical founding creation without ordinary commit publication",
+        "Welcome join and invitee first application message under the current profile"
       ],
       "next": "Keep registry ids synchronized with the adopted application profile."
     },

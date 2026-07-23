@@ -496,8 +496,10 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let mut id_material = payload.ciphertext.clone();
+        id_material.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&id_material),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -956,15 +958,14 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         })
         .await
         .unwrap();
-    let (welcome, pending) = match result {
-        SendResult::GroupCreated {
-            mut welcomes,
-            pending,
-        } => (welcomes.remove(0), pending),
-        other => panic!("expected GroupCreated, got {other:?}"),
+    let welcome = match result {
+        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    alice.confirm_published(pending).await.unwrap();
+    let welcome_id = welcome.id.clone();
     let group = alice.group_record(&group_id).unwrap();
+    assert_eq!(group.epoch, cgka_traits::types::EpochId(1));
+    assert_eq!(group.members.len(), 2);
     assert_eq!(group.protocol_profile, ProtocolProfile::Current);
     assert!(
         group
@@ -978,11 +979,27 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
             .extensions
             .contains(&ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)
     );
+    let duplicate_welcome = welcome.clone();
     let joined = bob.join_welcome(welcome).await.unwrap();
     assert_eq!(
         bob.group_record(&joined).unwrap().protocol_profile,
         ProtocolProfile::Current
     );
+    let duplicate_error = bob
+        .join_welcome(duplicate_welcome)
+        .await
+        .expect_err("a duplicate founding Welcome must not mutate joined state");
+    assert!(matches!(
+        duplicate_error,
+        EngineError::WelcomeAlreadyProcessed
+    ));
+    assert_eq!(bob.epoch(&joined).unwrap(), cgka_traits::types::EpochId(1));
+    assert_eq!(bob.members(&joined).unwrap().len(), 2);
+    assert!(matches!(
+        alice.drain_events().as_slice(),
+        [cgka_traits::engine::GroupEvent::GroupCreated { group_id: created }]
+            if created == &group_id
+    ));
 
     let legacy_kp = legacy_carol.fresh_key_package().await.unwrap();
     let error = alice
@@ -1003,10 +1020,52 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         .build()
         .unwrap();
     reopened.hydrate_stable_groups_from_storage().unwrap();
-    assert_eq!(
-        reopened.group_record(&group_id).unwrap().protocol_profile,
-        ProtocolProfile::Current
-    );
+    let reopened_group = reopened.group_record(&group_id).unwrap();
+    assert_eq!(reopened_group.protocol_profile, ProtocolProfile::Current);
+    assert_eq!(reopened_group.epoch, cgka_traits::types::EpochId(1));
+    assert_eq!(reopened_group.members.len(), 2);
+    let (stored_group, stored_welcome) = reopened.stored_sent_welcome(&welcome_id).unwrap();
+    assert_eq!(stored_group, group_id);
+    assert_eq!(stored_welcome.id, welcome_id);
+}
+
+#[tokio::test]
+async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
+    let mut alice = build_current_client(b"alice-current-solo");
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "solo".into(),
+            description: "canonical immediately".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        SendResult::FoundingGroupCreated { ref welcomes } if welcomes.is_empty()
+    ));
+    let group = alice.group_record(&group_id).unwrap();
+    assert_eq!(group.epoch, cgka_traits::types::EpochId(0));
+    assert_eq!(group.members.len(), 1);
+    assert!(matches!(
+        alice.drain_events().as_slice(),
+        [cgka_traits::engine::GroupEvent::GroupCreated { group_id: created }]
+            if created == &group_id
+    ));
+
+    let sent = alice
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id,
+            payload: app_payload_for(&alice, "usable immediately"),
+        })
+        .await
+        .expect("canonical solo group accepts work without confirm_published");
+    assert!(matches!(sent, SendResult::ApplicationMessage { .. }));
 }
 
 #[tokio::test]
@@ -1090,11 +1149,10 @@ async fn group_commit_cannot_change_or_mix_the_protocol_profile() {
         })
         .await
         .unwrap();
-    let pending = match result {
-        SendResult::GroupCreated { pending, .. } => pending,
-        other => panic!("expected GroupCreated, got {other:?}"),
-    };
-    current.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        result,
+        SendResult::FoundingGroupCreated { ref welcomes } if welcomes.is_empty()
+    ));
     let drop_current_proof = AppComponentData {
         component_id: cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
         data: encode_components_list(&default_group_components()),

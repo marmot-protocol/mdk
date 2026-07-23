@@ -1012,11 +1012,10 @@ async fn inbound_commit_cannot_unrequire_current_admin_policy() {
         })
         .await
         .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    alice.confirm_published(pending).await.unwrap();
     bob.join_welcome(welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
@@ -1149,11 +1148,10 @@ async fn unrelated_update_and_invite_preserve_opaque_app_component_for_all_membe
         })
         .await
         .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    alice.confirm_published(pending).await.unwrap();
     bob.join_welcome(welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
@@ -1283,11 +1281,10 @@ async fn inbound_commit_atomically_unrequires_and_removes_optional_component() {
         })
         .await
         .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
+    let welcomes = match create {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
-    alice.confirm_published(pending).await.unwrap();
     bob.join_welcome(welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
