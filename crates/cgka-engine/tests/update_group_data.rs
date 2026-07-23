@@ -999,7 +999,7 @@ async fn admin_policy_update_listing_non_member_is_rejected() {
 // ── Partial update ──────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn unrelated_update_preserves_opaque_app_component_for_all_members() {
+async fn unrelated_update_and_invite_preserve_opaque_app_component_for_all_members() {
     const OPAQUE_COMPONENT_ID: u16 = 0xF301;
     const OPAQUE_BYTES: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
 
@@ -1060,6 +1060,49 @@ async fn unrelated_update_preserves_opaque_app_component_for_all_members() {
         bob.app_component(&gid, OPAQUE_COMPONENT_ID).unwrap(),
         Some(OPAQUE_BYTES.to_vec())
     );
+
+    // Exercise the distinct Add/Welcome transition after the unrelated
+    // profile update. The existing members and the new member must all retain
+    // the exact opaque bytes.
+    let mut carol = build_with_opaque_component(b"carol", OPAQUE_COMPONENT_ID);
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, pending, mut welcomes) = match invite {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => (msg, pending, welcomes),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    })
+    .await
+    .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    carol
+        .join_welcome(welcomes.remove(0))
+        .await
+        .expect("new member joins from the invite Welcome");
+
+    for (name, engine) in [("alice", &alice), ("bob", &bob), ("carol", &carol)] {
+        assert_eq!(
+            engine.app_component(&gid, OPAQUE_COMPONENT_ID).unwrap(),
+            Some(OPAQUE_BYTES.to_vec()),
+            "{name} must retain the opaque component through Add/Welcome"
+        );
+    }
 }
 
 #[tokio::test]

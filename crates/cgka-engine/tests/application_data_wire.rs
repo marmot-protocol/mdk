@@ -1,8 +1,10 @@
-//! Wire-contract tests for the MLS application-data carriers Marmot uses.
+//! OpenMLS integration-contract tests for the MLS application-data carriers
+//! Marmot uses.
 //!
-//! These tests deliberately sit at the MDK integration boundary. They pin the
-//! OpenMLS fork behavior that current-profile KeyPackages, LeafNodes,
-//! GroupContexts, and AppDataUpdate proposals rely on.
+//! These direct codec tests pin the fork behavior that MDK's engine paths rely
+//! on. Engine-boundary coverage for KeyPackage application data lives in
+//! `group_creation.rs`; state-transition preservation coverage lives in
+//! `update_group_data.rs`.
 
 use openmls::component::ComponentData;
 use openmls::extensions::{
@@ -57,19 +59,26 @@ fn application_data_dictionary_roundtrips_in_every_extension_carrier_mdk_uses() 
 }
 
 #[test]
-fn application_data_dictionary_roundtrip_is_canonical_and_preserves_opaque_bytes() {
-    let entries = vec![
+fn application_data_dictionary_serializes_canonically_and_preserves_opaque_bytes() {
+    let mut dictionary = AppDataDictionary::new();
+    // Insert in descending component-id order. Canonical serialization must
+    // still order the wire entries by component id.
+    dictionary.insert(OPAQUE_COMPONENT_ID, OPAQUE_COMPONENT_BYTES.to_vec());
+    dictionary.insert(0x0001, vec![0x01]);
+    let encoded = dictionary.tls_serialize_detached().unwrap();
+    let expected = vec![
         ComponentData::from_parts(0x0001, vec![0x01].into()),
         ComponentData::from_parts(OPAQUE_COMPONENT_ID, OPAQUE_COMPONENT_BYTES.to_vec().into()),
-    ];
-    let encoded = entries.tls_serialize_detached().unwrap();
-    let dictionary = AppDataDictionary::tls_deserialize_exact(encoded.clone()).unwrap();
+    ]
+    .tls_serialize_detached()
+    .unwrap();
+    assert_eq!(encoded, expected);
 
+    let dictionary = AppDataDictionary::tls_deserialize_exact(encoded).unwrap();
     assert_eq!(
         dictionary.get(&OPAQUE_COMPONENT_ID),
         Some(OPAQUE_COMPONENT_BYTES)
     );
-    assert_eq!(dictionary.tls_serialize_detached().unwrap(), encoded);
 }
 
 #[test]
@@ -135,8 +144,11 @@ fn app_data_update_proposals_roundtrip_and_reject_malformed_operations() {
     assert_eq!(decoded.component_id(), OPAQUE_COMPONENT_ID);
     assert_eq!(decoded.operation(), &AppDataUpdateOperation::Remove);
 
-    let mut unknown_operation = update_bytes.clone();
-    unknown_operation[2] = 0xff;
+    // AppDataUpdateProposal starts with the explicit u16 component id followed
+    // by the operation discriminant. Construct that frame directly instead of
+    // mutating a positional byte in an otherwise-valid proposal.
+    let mut unknown_operation = OPAQUE_COMPONENT_ID.to_be_bytes().to_vec();
+    unknown_operation.push(0xff);
     assert!(AppDataUpdateProposal::tls_deserialize_exact(unknown_operation).is_err());
 
     let mut truncated = update_bytes;

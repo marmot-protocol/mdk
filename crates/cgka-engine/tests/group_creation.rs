@@ -933,11 +933,21 @@ async fn fresh_key_package_uses_draft10_last_resort_component() {
     );
 }
 
-#[test]
-fn malformed_last_resort_component_is_rejected_at_mdk_boundary() {
+#[tokio::test]
+async fn create_group_rejects_malformed_last_resort_component() {
+    let mut alice = build_client(b"alice", selfremove_registry());
     let key_package = key_package_with_malformed_last_resort_component(b"malformed-last-resort");
-    let error = is_last_resort_key_package(&key_package)
-        .expect_err("non-empty last-resort component data must be rejected");
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "malformed-last-resort".into(),
+            description: String::new(),
+            members: vec![key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("create_group must reject non-empty last-resort component data");
     assert!(
         matches!(&error, EngineError::Backend(message) if message.contains("MalformedLastResortComponent")),
         "unexpected error: {error:?}"
