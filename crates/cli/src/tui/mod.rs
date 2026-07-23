@@ -57,6 +57,13 @@ const MEDIA_IMAGE_ROWS: u16 = 8;
 /// images) would spike process/thread pressure. The remainder stay untracked
 /// and are slotted on later ticks as running downloads complete.
 const MEDIA_MAX_IN_FLIGHT: usize = 3;
+/// How many decoded images stay retained in memory for the full-size viewer on
+/// pixel-capable terminals. Each retained copy is decode-capped (at most
+/// ~11.8 MB RGBA), so four bound the viewer's worst-case footprint at ~47 MB
+/// while comfortably covering the freshest arrivals (`MEDIA_MAX_IN_FLIGHT`
+/// admits three at a time). Opening an evicted image's viewer falls back to
+/// the cell-exact halfblock popup.
+const MEDIA_VIEWER_RETAINED_IMAGES: usize = 4;
 const TUI_LIVE_STREAM_PREVIEW_LIMIT: usize = 128;
 /// Cap on the notification-key dedup set. Dedup only needs to cover the recent
 /// event window (the runtime feed emits duplicates close together), so the set

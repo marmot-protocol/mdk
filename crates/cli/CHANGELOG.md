@@ -109,6 +109,20 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: inline images are no longer pixelated, and `o` now shows the actual image on pixel-capable terminals. Inline
+  previews stay cell-exact half-blocks but downscale through a proper resampling filter (Lanczos3) instead of
+  `ratatui-image`'s nearest-neighbor default, so the 8-row preview reads as a legible thumbnail. On a terminal whose
+  startup capability query reported a real pixel protocol, the `o` full-size viewer draws the image with that native
+  protocol (inside an iTerm2 session the misdetected kitty answer is overridden to iTerm2's own inline-image
+  protocol); every popup close now forces a full terminal clear and repaint so a terminal-side image can never linger
+  after dismissal. Decoded images are capped to a 2100x1400 fit box at decode time — a general memory bound on every
+  decode, so neither the inline preview nor any retained copy ever holds an unbounded camera-photo pixel buffer.
+  Separately, viewer pixels are retained in memory only: at most four viewer copies are kept (oldest evicted first,
+  worst case ~47 MB), so the decrypted download artifact is still removed right after decode and nothing is written
+  back to disk. The Lanczos3 downscale runs synchronously on the render thread and is cached per target size, so
+  scrolling never re-resizes; changing the terminal width does re-resize every visible image on that one frame, an
+  accepted cost of the sharper preview. Halfblock-only terminals, and evicted images, keep the cell-exact viewer popup.
+
 - TUI: `a` on a user-search result now picks which chat the found user is added to. It opens a group picker over the
   loaded chats list (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), one row per chat in the list's
   order with the open chat preselected when one is loaded; `Enter` then opens the same confirm popup that guards the

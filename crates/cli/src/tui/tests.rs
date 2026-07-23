@@ -2306,6 +2306,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         streaming: None,
         status: String::new(),
         popup: None,
+        pending_full_repaint: false,
         group_detail: None,
         user_search: None,
         profile_view: None,
@@ -4384,6 +4385,27 @@ fn media_ready_image_with_picker(picker: ratatui_image::picker::Picker, hash: &s
     media
 }
 
+/// As `media_ready_image_with_picker`, but with a source large enough (in
+/// halfblock cells, font 10x20) that `Resize::Fit` must downscale it *differently*
+/// for the small inline block than for the full-size popup. A small source fits
+/// without upscaling and renders at one natural size in both, which would mask
+/// both a reused-protocol re-resize (item 1) and whether the popup card itself
+/// drew anything (item 2). 700x560 is ~70x28 cells: taller than the 8-row inline
+/// block and the ~21-row popup, so both downscale it and the popup image fills its
+/// card with glyphs.
+fn media_ready_large_varied_image(picker: ratatui_image::picker::Picker, hash: &str) -> MediaState {
+    let mut media = MediaState::with_test_picker(picker);
+    let mut buffer = image::RgbImage::new(700, 560);
+    for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(x % 256) as u8, y.wrapping_mul(3) as u8, 200]);
+    }
+    media.apply_for_test(MediaLoad::Decoded {
+        hash: hash.to_owned(),
+        image: Box::new(image::DynamicImage::ImageRgb8(buffer)),
+    });
+    media
+}
+
 /// Each terminal row of a full frame render, top to bottom, as a string. Unlike
 /// `rendered_buffer` (which flattens the whole grid) this keeps row boundaries so
 /// a test can assert *where* content lands — e.g. that an image block never draws
@@ -4759,6 +4781,501 @@ fn inline_images_render_cell_exact_not_a_pixel_protocol() {
 }
 
 #[test]
+fn media_images_downscale_with_a_smoothing_filter_not_nearest() {
+    // The one `Resize` both media render sites (inline timeline block and the
+    // image-viewer popup) pass to `StatefulImage`. `Resize::Fit(None)` falls back
+    // to `FilterType::Nearest`, which downscales by sparse sampling — on a photo
+    // shrunk to a thumbnail that reads as pixelated noise (the field report).
+    // The seam must request a proper resampling filter instead.
+    let resize = media_image_resize();
+    assert!(
+        matches!(
+            resize,
+            ratatui_image::Resize::Fit(Some(ratatui_image::FilterType::Lanczos3))
+        ),
+        "media images must aspect-fit with Lanczos3 smoothing, got {resize:?}"
+    );
+}
+
+#[test]
+fn oversized_decodes_are_capped_to_the_screen_bound_preserving_aspect() {
+    // A decoded image is kept in memory for the rest of the session (the inline
+    // protocol retains it, and pixel-capable terminals retain a viewer copy), so
+    // an unbounded camera photo would cost its full pixel area forever. Anything
+    // beyond the largest plausible terminal display area is downscaled at decode
+    // time; smaller images pass through untouched.
+    let huge = image::DynamicImage::new_rgb8(4200, 2800);
+    let capped = cap_decoded_image(huge);
+    assert_eq!(
+        (capped.width(), capped.height()),
+        (2100, 1400),
+        "a 3:2 photo larger than the cap lands exactly on the cap box"
+    );
+
+    let portrait = image::DynamicImage::new_rgb8(1400, 4200);
+    let capped = cap_decoded_image(portrait);
+    assert!(
+        capped.width() <= 2100 && capped.height() <= 1400,
+        "portrait images fit inside the cap box too, got {}x{}",
+        capped.width(),
+        capped.height()
+    );
+    assert_eq!(
+        (capped.width() as f64 / capped.height() as f64 * 3.0).round(),
+        1.0,
+        "the 1:3 portrait aspect survives the cap"
+    );
+
+    let small = image::DynamicImage::new_rgb8(800, 600);
+    let untouched = cap_decoded_image(small);
+    assert_eq!(
+        (untouched.width(), untouched.height()),
+        (800, 600),
+        "images already inside the cap are never resized (Fit would upscale)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn media_worker_delivers_oversized_images_already_capped() {
+    // The cap must run on the worker thread (off the 50ms event loop) before the
+    // decoded image is delivered, so no oversized pixel buffer ever crosses the
+    // channel or reaches the reducer.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
+    let output_path = dir.path().join("deadbeef");
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    // Wider than the cap box but with a small pixel area, so the unoptimized
+    // test-build decode+resize stays well inside the worker harness timeout.
+    image::DynamicImage::new_rgb8(2150, 200)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("encode png");
+    std::fs::write(&output_path, encoded.into_inner()).expect("seed decrypted file");
+
+    let result = run_media_worker(&wn, output_path);
+
+    match result {
+        MediaLoad::Decoded { image, .. } => {
+            assert!(
+                image.width() <= 2100 && image.height() <= 1400,
+                "the worker caps before delivery, got {}x{}",
+                image.width(),
+                image.height()
+            );
+        }
+        _ => panic!("a valid image decodes"),
+    }
+}
+
+#[test]
+fn pixel_capable_terminal_builds_a_native_viewer_protocol_on_demand() {
+    // On a terminal whose startup query reported a pixel protocol, the inline
+    // timeline stays cell-exact halfblocks (the adopt chokepoint), but the
+    // full-size viewer popup can draw the real image: the queried pixel
+    // capability is remembered, decoded pixels are retained in memory, and a
+    // native-protocol instance is built on demand when the viewer opens.
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    let mut media = media_ready_image_with_picker(picker, "cafebabe");
+
+    assert!(
+        media.build_viewer_protocol("cafebabe"),
+        "a pixel-capable terminal builds a native viewer protocol"
+    );
+    let protocol = media
+        .viewer_protocol_mut("cafebabe")
+        .expect("the built viewer protocol is drawable");
+    assert!(
+        matches!(
+            protocol.protocol_type(),
+            ratatui_image::protocol::StatefulProtocolType::Kitty(_)
+        ),
+        "the viewer draws the terminal's native pixel protocol, not halfblocks"
+    );
+}
+
+#[test]
+fn halfblock_only_terminal_builds_a_dedicated_halfblock_viewer_protocol() {
+    // Terminals whose query reported no pixel protocol still get a *dedicated*
+    // popup protocol — a fresh cell-exact halfblock instance built from the
+    // retained pixels — rather than reusing the shared inline protocol. It is a
+    // distinct instance, so drawing it at popup size never re-resizes the inline
+    // block's protocol.
+    let mut media = media_with_ready_image("cafebabe");
+    assert!(
+        media.build_viewer_protocol("cafebabe"),
+        "a halfblock-only terminal builds its own dedicated popup protocol"
+    );
+    let protocol = media
+        .viewer_protocol_mut("cafebabe")
+        .expect("the dedicated halfblock viewer protocol is drawable");
+    assert!(
+        matches!(
+            protocol.protocol_type(),
+            ratatui_image::protocol::StatefulProtocolType::Halfblocks(_)
+        ),
+        "the dedicated fallback popup protocol stays cell-exact halfblocks"
+    );
+}
+
+#[test]
+fn iterm2_session_viewer_protocol_is_iterm2_even_when_queried_as_kitty() {
+    // iTerm2 answers the startup capability query kitty-style and is misdetected
+    // as Kitty — the original reason inline rendering forces halfblocks. iTerm2's
+    // kitty-graphics support is not the real thing, so inside an iTerm2 session
+    // the viewer must use iTerm2's own inline-image protocol.
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    let mut media = MediaState::with_test_picker_in_iterm2_session(picker);
+    media.apply_for_test(MediaLoad::Decoded {
+        hash: "cafebabe".to_owned(),
+        image: Box::new(image::DynamicImage::new_rgb8(40, 40)),
+    });
+
+    assert!(media.build_viewer_protocol("cafebabe"));
+    let protocol = media
+        .viewer_protocol_mut("cafebabe")
+        .expect("viewer protocol built");
+    assert!(
+        matches!(
+            protocol.protocol_type(),
+            ratatui_image::protocol::StatefulProtocolType::ITerm2(_)
+        ),
+        "an iTerm2 session viewer draws OSC 1337, not misdetected kitty graphics"
+    );
+}
+
+#[test]
+fn viewer_retention_evicts_oldest_and_falls_back_to_the_halfblock_popup() {
+    // Retained viewer pixels are bounded: decoding one image past the cap
+    // evicts the oldest. The evicted image's viewer degrades honestly — no
+    // native protocol, so the popup draws the shared halfblock protocol — while
+    // the newest images keep their crisp native viewer. Re-decoding a hash must
+    // refresh in place, not double-count it toward the cap.
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    let mut media = MediaState::with_test_picker(picker);
+    let decode = |media: &mut MediaState, hash: &str| {
+        media.apply_for_test(MediaLoad::Decoded {
+            hash: hash.to_owned(),
+            image: Box::new(image::DynamicImage::new_rgb8(4, 4)),
+        });
+    };
+
+    for hash in ["h1", "h2", "h3", "h4"] {
+        decode(&mut media, hash);
+    }
+    decode(&mut media, "h2"); // refresh, not a new retention slot
+    assert!(
+        media.build_viewer_protocol("h1"),
+        "a duplicate decode must not evict anything"
+    );
+
+    decode(&mut media, "h5"); // one past the cap of 4: h1 is evicted
+    assert!(
+        !media.build_viewer_protocol("h1"),
+        "the oldest image is evicted and its viewer falls back to halfblocks"
+    );
+    assert!(media.is_ready("h1"), "the inline halfblock render survives");
+    for hash in ["h2", "h3", "h4", "h5"] {
+        assert!(
+            media.build_viewer_protocol(hash),
+            "{hash} stays retained for the native viewer"
+        );
+    }
+}
+
+/// A pixel-capable (iTerm2 session, kitty-misdetected) media state with one
+/// decoded, ready image, mirroring `media_with_ready_image` for the viewer path.
+fn iterm2_media_with_ready_image(hash: &str) -> MediaState {
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    let mut media = MediaState::with_test_picker_in_iterm2_session(picker);
+    media.apply_for_test(MediaLoad::Decoded {
+        hash: hash.to_owned(),
+        image: Box::new(image::DynamicImage::new_rgb8(40, 40)),
+    });
+    media
+}
+
+#[test]
+fn o_opens_a_native_pixel_viewer_on_a_pixel_capable_terminal() {
+    // On a terminal with a real pixel protocol, `o` shows the actual image: the
+    // viewer popup draws a native-protocol instance (here iTerm2's OSC 1337
+    // inline image) instead of the low-resolution halfblock cells. The inline
+    // timeline behind it stays cell-exact (pinned elsewhere).
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+    app.media = iterm2_media_with_ready_image("cafebabe");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+        .expect("open viewer");
+
+    assert!(
+        matches!(app.popup, Some(Popup::Image { .. })),
+        "o opens the image viewer popup"
+    );
+    assert!(
+        app.media.viewer_protocol_mut("cafebabe").is_some(),
+        "opening the viewer builds the native protocol on demand"
+    );
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        rendered.contains("1337"),
+        "the viewer popup draws the terminal's native pixel protocol"
+    );
+}
+
+#[test]
+fn o_falls_back_to_the_halfblock_viewer_without_a_pixel_protocol() {
+    // Halfblock-only terminal: `o` opens the viewer popup, which draws its own
+    // dedicated cell-exact halfblock protocol — never a pixel escape.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+    app.media = media_with_ready_image("cafebabe");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+        .expect("open viewer");
+
+    assert!(
+        matches!(app.popup, Some(Popup::Image { .. })),
+        "o opens the image viewer popup"
+    );
+    assert!(
+        app.media.viewer_protocol_mut("cafebabe").is_some(),
+        "the popup builds its own dedicated halfblock protocol, not the inline one"
+    );
+    let rendered = rendered_buffer(&mut app);
+    assert!(
+        !rendered.contains("1337"),
+        "the fallback viewer never emits a pixel escape"
+    );
+    assert!(
+        rendered.contains('▀') || rendered.contains('▄'),
+        "the fallback viewer draws cell-exact halfblocks"
+    );
+}
+
+#[test]
+fn o_on_an_evicted_image_renders_the_halfblock_fallback_on_a_pixel_terminal() {
+    // review finding 6, driven end to end: on a pixel-capable terminal, opening
+    // `o` on an image whose retained viewer pixels were evicted (older than the
+    // retention cap) must still open the viewer and render — degrading honestly to
+    // the cell-exact halfblock protocol, never a pixel escape and never a blank
+    // card. The evicted image's pixels survive only inside the inline protocol, so
+    // that is what the popup draws as a last resort.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("h1")];
+    app.timeline = vec![row];
+
+    // Pixel-capable terminal (kitty). Decode h1 first as a large varied image so
+    // its inline halfblock protocol fills the popup card with glyphs; then four
+    // more decodes push h1 out of the bounded viewer-pixel retention (cap 4,
+    // oldest evicted first).
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    app.media = media_ready_large_varied_image(picker, "h1");
+    for hash in ["h2", "h3", "h4", "h5"] {
+        app.media.apply_for_test(MediaLoad::Decoded {
+            hash: hash.to_owned(),
+            image: Box::new(image::DynamicImage::new_rgb8(4, 4)),
+        });
+    }
+    assert!(
+        app.media.is_ready("h1"),
+        "h1's inline render survives eviction"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+        .expect("open viewer");
+    assert!(
+        matches!(app.popup, Some(Popup::Image { .. })),
+        "o opens the viewer even for an evicted image"
+    );
+    assert!(
+        app.media.viewer_protocol_mut("h1").is_none(),
+        "the evicted image has no dedicated protocol — its pixels were evicted"
+    );
+
+    // On a 100x30 frame the popup card spans rows 3..27; its image area is rows
+    // 4..24. The inline preview behind it lives in the top ~9 rows, and the
+    // popup's `Clear` wipes everything under the card. So a halfblock glyph in the
+    // popup's interior band (rows 12..20) can only come from the popup drawing the
+    // image itself — not from the inline preview bleeding through the margins.
+    let rows = rendered_rows(&mut app);
+    let popup_interior = rows[12..=20].join("");
+    assert!(
+        popup_interior.contains('▀') || popup_interior.contains('▄'),
+        "the evicted fallback draws the cell-exact halfblock image inside the popup card:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        !rows.join("").contains("1337"),
+        "the evicted fallback never emits a pixel escape, even on a pixel terminal"
+    );
+}
+
+#[test]
+fn the_fallback_viewer_popup_does_not_re_resize_the_shared_inline_protocol() {
+    // The inline timeline draws `protocols[hash]` sized to its small reserved
+    // block. The viewer popup must draw its OWN dedicated protocol, never that
+    // shared inline one: reusing it would resize the inline protocol from its
+    // block size up to the ~80% popup area every frame, and the next inline frame
+    // would resize it straight back — two full Lanczos3 passes of a large source
+    // per frame, continuous jank while the popup is open.
+    //
+    // Observe it honestly through the protocol's own encode signal: after the
+    // inline block has encoded at its block size, opening and rendering the popup
+    // must not trigger a fresh resize/encode of the inline protocol.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+    // Halfblock-only terminal: the popup fallback used to reuse the inline
+    // protocol here, so this is the case that thrashed. The source is large so it
+    // is downscaled to different sizes for the 8-row inline block and the ~21-row
+    // popup — a reused protocol would actually re-encode between them.
+    app.media =
+        media_ready_large_varied_image(ratatui_image::picker::Picker::halfblocks(), "cafebabe");
+
+    // First frame: the inline block encodes the shared protocol at its block size.
+    // Drain that encode result so a later `Some` means a *new* encode was forced.
+    let _ = rendered_buffer(&mut app);
+    let _ = app
+        .media
+        .protocol_mut("cafebabe")
+        .expect("the inline protocol exists after the first frame")
+        .last_encoding_result();
+
+    // Open the viewer popup and render it over the still-visible timeline.
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+        .expect("open viewer");
+    assert!(
+        matches!(app.popup, Some(Popup::Image { .. })),
+        "o opens the viewer popup"
+    );
+    let _ = rendered_buffer(&mut app);
+
+    assert!(
+        app.media
+            .protocol_mut("cafebabe")
+            .expect("the inline protocol still exists")
+            .last_encoding_result()
+            .is_none(),
+        "the open viewer popup must not re-resize the shared inline protocol"
+    );
+}
+
+#[test]
+fn closing_the_image_viewer_forces_a_full_repaint_and_drops_the_native_protocol() {
+    // A pixel-protocol image lives terminal-side, out of reach of ratatui's
+    // cell diff (iTerm2 in particular does not self-erase when its cells are
+    // overwritten), so dismissing the viewer must schedule a full terminal
+    // clear+repaint — `run()` consumes this flag before the next draw — and
+    // drop the on-demand native protocol.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+    app.media = iterm2_media_with_ready_image("cafebabe");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+        .expect("open viewer");
+    assert!(
+        !app.pending_full_repaint,
+        "opening the viewer needs no full repaint"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .expect("dismiss viewer");
+
+    assert!(app.popup.is_none(), "any key dismisses the viewer");
+    assert!(
+        app.pending_full_repaint,
+        "closing the viewer schedules the full clear+repaint"
+    );
+    assert!(
+        app.media.viewer_protocol_mut("cafebabe").is_none(),
+        "closing the viewer drops the native protocol"
+    );
+}
+
+#[test]
+fn every_popup_close_arm_forces_a_full_repaint() {
+    // All popup teardown funnels through the three non-`None` arms of
+    // `handle_popup_key` (dismiss, submit, open-next). The full repaint is
+    // uniform across them — a modal close is rare and a full repaint cheap, so
+    // no arm needs to know whether the popup it tears down drew a pixel image.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+
+    // Dismiss: Esc on the help card.
+    app.popup = Some(Popup::help());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("dismiss help");
+    assert!(app.popup.is_none());
+    assert!(app.pending_full_repaint, "dismiss forces a full repaint");
+
+    // Submit: Enter on a confirm popup (the CLI call fails onto the status
+    // line; the popup still closes).
+    app.pending_full_repaint = false;
+    app.popup = Some(Popup::confirm_add_user_to_chat("gid", "chat", "pk", "user"));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("submit confirm");
+    assert!(app.popup.is_none());
+    assert!(app.pending_full_repaint, "submit forces a full repaint");
+
+    // Open-next: Enter on the add-user group picker replaces it with the
+    // confirm popup; the picker it tears down gets the same uniform treatment.
+    app.pending_full_repaint = false;
+    app.popup = Some(Popup::add_user_group_picker(
+        "pk".to_owned(),
+        "user".to_owned(),
+        vec![PickerItem {
+            id: "gid".to_owned(),
+            label: "chat".to_owned(),
+        }],
+        0,
+    ));
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("advance picker");
+    assert!(
+        matches!(app.popup, Some(Popup::Confirm { .. })),
+        "the picker advances to the confirm popup"
+    );
+    assert!(
+        app.pending_full_repaint,
+        "replacing a popup forces a full repaint too"
+    );
+}
+
+#[test]
 fn startup_media_sweep_removes_leftover_cache_files_but_keeps_the_dir() {
     // Decrypted-media artifacts are deleted right after decode, so any file still
     // in the cache dir is litter left by a crashed session — decrypted plaintext
@@ -4928,6 +5445,51 @@ fn media_worker_removes_the_decrypted_file_after_a_failed_decode() {
     assert!(
         !output_path.exists(),
         "the worker removes the decrypted artifact after a failed decode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn viewer_retention_keeps_pixels_in_memory_only_never_on_disk() {
+    // The decrypted download artifact is removed right after decode (the
+    // security fix); the viewer's retained pixels must not undo that by
+    // parking plaintext back on disk. Drive the real worker end-to-end into a
+    // pixel-capable media state, build the native viewer protocol, and verify
+    // the cache directory holds nothing — the viewer draws from memory alone.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
+    let cache_dir = dir.path().join("media-cache");
+    std::fs::create_dir_all(&cache_dir).expect("cache dir");
+    let output_path = cache_dir.join("deadbeef");
+    seed_decodable_image(&output_path);
+
+    let result = run_media_worker(&wn, output_path.clone());
+
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    let mut media = MediaState::with_test_picker(picker);
+    media.apply_for_test(result);
+    assert!(
+        media.is_ready("deadbeef"),
+        "the image decoded and folded in"
+    );
+    assert!(
+        media.build_viewer_protocol("deadbeef"),
+        "the native viewer builds from retained in-memory pixels"
+    );
+
+    assert!(
+        !output_path.exists(),
+        "the decrypted artifact is still removed after decode"
+    );
+    let leftover: Vec<_> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "viewer retention writes nothing to disk; found {leftover:?}"
     );
 }
 

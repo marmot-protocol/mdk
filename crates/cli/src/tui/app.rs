@@ -71,6 +71,14 @@ pub(crate) struct TuiApp {
     /// The one open modal, or none. While set it captures every key (routed at
     /// the top of `handle_key`) and overlays whatever screen is showing.
     pub(crate) popup: Option<Popup>,
+    /// Set when a popup is torn down; `run()` consumes it and clears the whole
+    /// terminal before the next draw. Ratatui otherwise erases a closed popup
+    /// by diffing cells, which cannot reach a pixel-protocol image stored
+    /// terminal-side (iTerm2 does not self-erase when its cells are
+    /// overwritten), so the viewer popup needs the full clear — and it is
+    /// applied uniformly to every popup close, which is rare and cheap, so no
+    /// close path has to know what the popup drew.
+    pub(crate) pending_full_repaint: bool,
     /// Group-detail screen state, loaded on entry and dropped on exit. Present
     /// only while `screen == Screen::GroupDetail`.
     pub(crate) group_detail: Option<GroupDetailView>,
@@ -124,6 +132,7 @@ impl TuiApp {
             streaming: None,
             status: "loading accounts".to_owned(),
             popup: None,
+            pending_full_repaint: false,
             group_detail: None,
             user_search: None,
             profile_view: None,
@@ -158,6 +167,13 @@ impl TuiApp {
             while self.running {
                 dirty |= self.tick();
                 if dirty {
+                    // A closed popup may have drawn a pixel-protocol image that
+                    // lives terminal-side, beyond the cell diff's reach; the
+                    // scheduled full clear wipes it and the draw below repaints
+                    // every cell.
+                    if std::mem::take(&mut self.pending_full_repaint) {
+                        terminal.clear()?;
+                    }
                     terminal.draw(|frame| self.render(frame))?;
                     dirty = false;
                 }
@@ -624,6 +640,11 @@ impl TuiApp {
         });
         match ready {
             Some((name, hash)) => {
+                // Build the native pixel-protocol viewer where the terminal has
+                // one and the pixels are still retained; on `false` the popup
+                // falls back to drawing the shared cell-exact halfblock
+                // protocol, so the viewer opens either way.
+                self.media.build_viewer_protocol(&hash);
                 self.popup = Some(Popup::Image {
                     title: format!("Image: {name}"),
                     hash,
@@ -1092,10 +1113,13 @@ impl TuiApp {
         };
         match popup_key(popup, key.code) {
             PopupAction::None => {}
-            PopupAction::Dismiss => self.popup = None,
+            PopupAction::Dismiss => self.close_popup(),
             // A multi-step flow: the reducer resolved the next popup (the group
             // picker's Enter opens the add-user confirm). No CLI call yet.
-            PopupAction::Open(next) => self.popup = Some(next),
+            PopupAction::Open(next) => {
+                self.close_popup();
+                self.popup = Some(next);
+            }
             PopupAction::Submit(submit) => {
                 // The invites picker stays open across actions so one
                 // accept/decline does not lose the user's place: capture the
@@ -1110,7 +1134,7 @@ impl TuiApp {
                     }) => Some(*selected),
                     _ => None,
                 };
-                self.popup = None;
+                self.close_popup();
                 if let Err(err) = self.run_popup_submit(submit) {
                     self.status = format!("error: {err}");
                 }
@@ -1122,6 +1146,16 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    /// Tear down the open popup: drop the viewer's on-demand native protocol
+    /// (a no-op for non-image popups) and schedule the full clear+repaint that
+    /// `run()` applies before the next draw. Every popup close funnels through
+    /// here so a terminal-side pixel image can never outlive its popup.
+    fn close_popup(&mut self) {
+        self.popup = None;
+        self.media.drop_viewer_protocol();
+        self.pending_full_repaint = true;
     }
 
     fn run_popup_submit(&mut self, submit: PopupSubmit) -> TuiResult<()> {

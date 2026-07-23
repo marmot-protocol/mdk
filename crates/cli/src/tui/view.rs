@@ -2,8 +2,6 @@
 
 use super::*;
 
-use ratatui_image::StatefulImage;
-
 pub(crate) fn daemon_status_sentence(daemon: &DaemonView) -> String {
     if !daemon.running {
         return "daemon not running".to_owned();
@@ -534,8 +532,14 @@ impl TuiApp {
     }
 
     /// Render the full-size image viewer popup: a centered card with a cyan
-    /// border, the decoded image aspect-fit inside, and a dismiss hint. Falls
-    /// back to a text card if the protocol is somehow gone.
+    /// border, the decoded image aspect-fit inside, and a dismiss hint. The popup
+    /// draws its own dedicated protocol (`viewer_protocol_mut`) — native on a
+    /// pixel-capable terminal, a fresh cell-exact halfblock instance on a
+    /// halfblock-only one — so it never re-resizes the shared inline protocol the
+    /// timeline draws. Only when that image's retained pixels were evicted (an
+    /// image older than the retention window) is there no dedicated instance; the
+    /// popup then draws the shared inline protocol as a last resort, since the
+    /// evicted pixels survive only there. If neither exists the card stays empty.
     fn render_image_popup(&mut self, frame: &mut Frame, title: &str, hash: &str) {
         let rect = centered_rect(80, 80, frame.area());
         frame.render_widget(Clear, rect);
@@ -558,8 +562,14 @@ impl TuiApp {
             height: 1,
             ..inner
         };
-        if let Some(protocol) = self.media.protocol_mut(hash) {
-            frame.render_stateful_widget(StatefulImage::new(), image_area, protocol);
+        if let Some(protocol) = self.media.viewer_protocol_mut(hash) {
+            // The popup's own dedicated instance (native or halfblock): drawing
+            // it at popup size never disturbs the shared inline protocol.
+            frame.render_stateful_widget(media_image_widget(), image_area, protocol);
+        } else if let Some(protocol) = self.media.protocol_mut(hash) {
+            // Evicted image only: its pixels survive solely inside the inline
+            // protocol, so the popup draws that as a last resort.
+            frame.render_stateful_widget(media_image_widget(), image_area, protocol);
         }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -930,7 +940,7 @@ impl TuiApp {
         // gave it the space; `StatefulImage` aspect-fits within the rect.
         for (hash, rect) in image_draws {
             if let Some(protocol) = self.media.protocol_mut(&hash) {
-                frame.render_stateful_widget(StatefulImage::new(), rect, protocol);
+                frame.render_stateful_widget(media_image_widget(), rect, protocol);
             }
         }
     }

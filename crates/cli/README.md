@@ -589,17 +589,23 @@ Main view controls:
   `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
   text as the guard requires. `o` opens the selected message's downloaded image full-size in a dismiss-on-any-key
   viewer (see "Inbound media" below).
-- Inbound media: an image attachment renders inline in the message pane as cell-exact half-block glyphs (`▀` colored
-  cells) on any image-capable terminal. The rendering is deliberately cell-exact rather than a native pixel image
+- Inbound media: an image attachment renders inline in the message pane as a filtered half-block preview — cell-exact
+  `▀` colored cells, downscaled with a proper resampling filter (Lanczos3) so the small preview stays legible — on any
+  image-capable terminal. The inline rendering is deliberately cell-exact rather than a native pixel image
   (iTerm2/Kitty/Sixel): half-blocks are ordinary colored cells bounded strictly to the reserved block, so an image can
   never overdraw a neighboring message or leave a terminal-side artifact behind when you scroll. Each image is
   downloaded and decoded in the background — never blocking the event loop — and its placeholder walks `[img name]` ->
   `[downloading name...]` -> `[loading name...]` -> the inline image, or `[name failed: err]` on error. A terminal
   with no image capability keeps the `[img name]` placeholder (and non-image attachments always show `[file name]`).
-  The `o` full-size viewer uses the same cell-exact rendering. Each image is decrypted to a private
-  `tui-media-cache/` directory under the TUI home, decoded into memory, and the decrypted file is then removed right
-  away — the viewer draws the in-memory image, so nothing reads the file again and no decrypted media is left at rest.
-  Any files a prior crashed session left behind are swept from that directory at startup.
+  The `o` full-size viewer shows the actual image with the terminal's native pixel protocol when the startup
+  capability query found one (in an iTerm2 session it uses iTerm2's own inline-image protocol), and closing the
+  viewer — like closing any popup — forces a full terminal repaint so nothing lingers on screen. Viewer pixels are
+  kept in a small in-memory pool (the most recent images, oldest evicted first); on terminals without a pixel
+  protocol, or for an evicted image, the viewer falls back to the same cell-exact half-block rendering. Each image is
+  decrypted to a private `tui-media-cache/` directory under the TUI home, decoded into memory, and the decrypted file
+  is then removed right away — inline preview and full-size viewer both draw from memory, so nothing reads the file
+  again and no decrypted media is left at rest. Any files a prior crashed session left behind are swept from that
+  directory at startup.
 - Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
   character, `Ctrl-U` clears the whole composer (a readline kill-line that empties it whatever it holds — armed prefill
   or hand-typed draft), and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard
