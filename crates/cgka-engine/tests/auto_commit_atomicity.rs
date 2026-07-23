@@ -1,6 +1,6 @@
 //! Auto-commit staging atomicity (mdk#333).
 //!
-//! `stage_auto_commit_for_queued_proposal` projects the post-merge group
+//! `stage_auto_commit_for_queued_proposals` projects the post-merge group
 //! record (epoch N+1, leaver dropped) as part of staging. If any fallible
 //! staging step fails after durable state has advanced, the record must not
 //! be left torn — epoch/membership disagreeing with the MLS group and the
@@ -540,24 +540,17 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     );
 
     // The group stays fully usable: the state machine rewound to Stable, the
-    // staged OpenMLS commit was cleared, AND the stored SelfRemove proposal
-    // was removed from the proposal store (left behind, OpenMLS 0.8.1 panics
-    // when this remove_members filters it against the Remove for bob's
-    // leaf). A fresh commit stages, confirms, and lands. (The failed attempt
-    // consumed bob's scheduled auto-commit — schedule removal precedes
-    // replay by design — so the admin completes the removal explicitly.)
-    let evolution = alice
-        .send(SendIntent::RemoveMembers {
-            group_id: group_id.clone(),
-            members: vec![bob_member_id.clone()],
-        })
+    // staged OpenMLS commit was cleared, and every proposal-store insertion was
+    // removed. The durable SelfRemove row re-arms the same batch, which stages,
+    // confirms, and lands on the next convergence pass.
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    alice.advance_convergence(&group_id).await.unwrap();
+    let mut retried = alice.drain_auto_publish();
+    assert_eq!(retried.len(), 1, "failed batch must re-arm exactly once");
+    alice
+        .confirm_published(retried.remove(0).pending)
         .await
         .unwrap();
-    let pending = match evolution {
-        SendResult::GroupEvolution { pending, .. } => pending,
-        other => panic!("expected GroupEvolution, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
     let record = handle.get_group(&group_id).unwrap();
     assert_eq!(record.epoch, EpochId(2));
     assert_eq!(record.members.len(), 2);

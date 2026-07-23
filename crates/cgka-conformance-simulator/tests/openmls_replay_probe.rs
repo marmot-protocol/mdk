@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cgka_conformance_simulator::canonicalization::{
     CanonicalizationError, CanonicalizationInput, CanonicalizationPolicy, CanonicalizationResult,
@@ -180,6 +180,131 @@ async fn openmls_probe_replays_consumed_proposal_without_mutating_live_state() {
         "carol should still process the real proposal and commit after probe: {carol_outcomes:?}"
     );
     assert_eq!(carol.epoch().0, 2);
+}
+
+#[tokio::test]
+async fn openmls_probe_exposes_deterministic_multi_selfremove_batch() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice-batch"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob-batch"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol-batch"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut dave = ClientBuilder::new(pad32(b"dave-batch"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let dave_kp = dave.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group(
+            "openmls-multi-selfremove-batch",
+            vec![bob_kp, carol_kp, dave_kp],
+            vec![],
+        )
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+    dave.tick().await;
+
+    let bob_proposal = bob.leave_capture().await;
+    let carol_proposal = carol.leave_capture().await;
+    let bob_proposal = openmls_projection_message(&dave, &bob_proposal).await;
+    let carol_proposal = openmls_projection_message(&dave, &carol_proposal).await;
+    let bob_digest = project_mls_message(&bob_proposal.payload)
+        .expect("bob proposal projects")
+        .message_digest;
+    let carol_digest = project_mls_message(&carol_proposal.payload)
+        .expect("carol proposal projects")
+        .message_digest;
+
+    // Deliver the higher digest first. Arrival order is deliberately the
+    // opposite of the canonical local-commit order.
+    if bob_digest < carol_digest {
+        assert!(bus.reorder_queued(&[1, 0]));
+    }
+    bus.deliver_all();
+    let alice_outcomes = alice.tick().await;
+    assert!(
+        alice_outcomes.iter().all(Result::is_ok),
+        "alice should batch both SelfRemove proposals: {alice_outcomes:?}"
+    );
+
+    let commit_msg = queued_commit_messages(&dave, &bus)
+        .await
+        .into_iter()
+        .next()
+        .expect("alice auto-published one batched commit");
+    assert_projected_kind(&commit_msg, OpenMlsContentKind::Commit, 1);
+
+    let observations = replay_openmls_messages(
+        dave.storage(),
+        &group_id,
+        &[bob_proposal.clone(), carol_proposal.clone(), commit_msg],
+    )
+    .expect("batched SelfRemove replay succeeds");
+
+    let digest_by_message_id = BTreeMap::from([
+        (hex::encode(bob_proposal.id.as_slice()), bob_digest),
+        (hex::encode(carol_proposal.id.as_slice()), carol_digest),
+    ]);
+    let mut digest_by_proposal_ref = BTreeMap::new();
+    let mut consumed_refs = None;
+    for observation in observations {
+        match observation {
+            OpenMlsReplayObservation::ProposalStored {
+                message_id,
+                proposal_ref,
+                ..
+            } => {
+                let digest = digest_by_message_id
+                    .get(&message_id)
+                    .copied()
+                    .expect("proposal observation names one frozen input");
+                digest_by_proposal_ref.insert(proposal_ref, digest);
+            }
+            OpenMlsReplayObservation::CommitStaged {
+                consumed_proposal_refs,
+                ..
+            } => consumed_refs = Some(consumed_proposal_refs),
+            _ => {}
+        }
+    }
+
+    let consumed_digests: Vec<_> = consumed_refs
+        .expect("batch commit staged during replay")
+        .iter()
+        .map(|proposal_ref| {
+            digest_by_proposal_ref
+                .get(proposal_ref)
+                .copied()
+                .expect("consumed reference maps to a frozen proposal digest")
+        })
+        .collect();
+    let mut expected_digests = vec![bob_digest, carol_digest];
+    expected_digests.sort();
+    assert_eq!(
+        consumed_digests, expected_digests,
+        "selected batch must expose both proposal digests in canonical order"
+    );
+    assert_eq!(alice.epoch().0, 2);
+    assert_eq!(alice.members().len(), 2);
+
+    bus.deliver_all();
+    let dave_outcomes = dave.tick().await;
+    assert!(
+        dave_outcomes.iter().all(Result::is_ok),
+        "observer should apply the batched commit: {dave_outcomes:?}"
+    );
+    assert_eq!(dave.epoch().0, 2, "final epoch must be deterministic");
+    assert_eq!(dave.members().len(), 2);
 }
 
 #[tokio::test]

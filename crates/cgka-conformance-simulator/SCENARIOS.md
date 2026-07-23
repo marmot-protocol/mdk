@@ -197,6 +197,15 @@ These are real simulator scenarios that are still tied to Rust harness details.
 - Expected: Alice, Bob, and Carol reach epoch 2, and Bob is removed from the active group.
 - Reason: the direct harness asserts the auto-commit path and member state.
 
+### `openmls_probe_exposes_deterministic_multi_selfremove_batch`
+
+- Setup: Alice creates a four-member group. Bob and Carol publish SelfRemove proposals, with the higher proposal digest
+  deliberately delivered first; Dave retains the proposal and commit bytes as an observer.
+- Expected: Alice emits one SelfRemove-only commit whose consumed proposal references map to both proposal digests in
+  ascending digest order. Alice and Dave finish at epoch 2 with both leavers absent.
+- Reason: the OpenMLS replay probe exposes the selected batch and its canonical proposal-digest ordering instead of
+  asserting only the final member count.
+
 ### `deliberate_fork_via_harness`
 
 - Setup: Alice and Bob concurrently invite different new members while a partition hides each branch.

@@ -9,7 +9,7 @@ use super::{content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::fork_recovery::ForkResolution;
 use crate::group_lifecycle::{self};
-use crate::identity::{member_id_at_leaf, member_id_of_sender};
+use crate::identity::member_id_of_sender;
 use crate::openmls_projection::{
     OpenMlsContentKind, process_commit_with_app_data_updates, project_mls_message,
     retained_anchor_epoch_from_snapshot_name,
@@ -27,6 +27,7 @@ use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use openmls::framing::Sender;
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::prelude::{
@@ -1301,7 +1302,13 @@ impl<S: StorageProvider> Engine<S> {
                 .scheduled_self_remove_auto_commits
                 .values()
                 .filter(|scheduled| &scheduled.group_id == group_id)
-                .min_by_key(|scheduled| scheduled.due_at_ms)
+                .min_by(|left, right| {
+                    left.due_at_ms.cmp(&right.due_at_ms).then_with(|| {
+                        left.proposal_id
+                            .as_slice()
+                            .cmp(right.proposal_id.as_slice())
+                    })
+                })
                 .cloned()
             else {
                 return Ok(false);
@@ -1311,12 +1318,51 @@ impl<S: StorageProvider> Engine<S> {
                 return Ok(false);
             }
 
-            self.scheduled_self_remove_auto_commits
-                .remove(&schedule.proposal_id);
-            match self
-                .replay_scheduled_self_remove_auto_commit(schedule)
-                .await?
-            {
+            // Freeze every proposal already scheduled for this group/epoch when
+            // the first jitter expires. Later arrivals belong to a later pass;
+            // due time, map iteration order, and local identity never choose the
+            // contents of this batch.
+            let mut batch: Vec<_> = self
+                .scheduled_self_remove_auto_commits
+                .values()
+                .filter(|scheduled| {
+                    scheduled.group_id == schedule.group_id
+                        && scheduled.source_epoch == schedule.source_epoch
+                })
+                .cloned()
+                .collect();
+            batch.sort_by(|left, right| {
+                left.proposal_id
+                    .as_slice()
+                    .cmp(right.proposal_id.as_slice())
+            });
+            for scheduled in &batch {
+                self.scheduled_self_remove_auto_commits
+                    .remove(&scheduled.proposal_id);
+            }
+
+            let replay = self
+                .replay_scheduled_self_remove_auto_commit_batch(
+                    schedule.group_id.clone(),
+                    schedule.source_epoch,
+                    batch,
+                )
+                .await;
+            let replay = match replay {
+                Ok(replay) => replay,
+                Err(error) => {
+                    // Staging guards have unwound partial OpenMLS state. Re-arm
+                    // from durable proposal rows so a transient failure does not
+                    // strand the frozen batch until process restart.
+                    let _ = self.restore_self_remove_auto_commit_schedules_for_group(
+                        &schedule.group_id,
+                        schedule.source_epoch,
+                        now_ms,
+                    );
+                    return Err(error);
+                }
+            };
+            match replay {
                 ScheduledAutoCommitReplay::Staged => {
                     self.drop_self_remove_auto_commit_schedules_for_group(group_id);
                     return Ok(true);
@@ -1326,58 +1372,25 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    async fn replay_scheduled_self_remove_auto_commit(
+    async fn replay_scheduled_self_remove_auto_commit_batch(
         &mut self,
-        schedule: ScheduledSelfRemoveAutoCommit,
+        group_id: GroupId,
+        source_epoch: EpochId,
+        schedules: Vec<ScheduledSelfRemoveAutoCommit>,
     ) -> Result<ScheduledAutoCommitReplay, EngineError> {
-        let group = match self.storage.get_group(&schedule.group_id) {
+        let group = match self.storage.get_group(&group_id) {
             Ok(group) => group,
             Err(StorageError::NotFound) => return Ok(ScheduledAutoCommitReplay::NotApplicable),
             Err(err) => return Err(EngineError::Storage(err)),
         };
-        if group.epoch != schedule.source_epoch {
+        if group.epoch != source_epoch {
             return Ok(ScheduledAutoCommitReplay::NotApplicable);
         }
 
-        let record = match self.storage.get_message(&schedule.proposal_id) {
-            Ok(record) => record,
-            Err(StorageError::NotFound) => return Ok(ScheduledAutoCommitReplay::NotApplicable),
-            Err(err) => return Err(EngineError::Storage(err)),
-        };
-        if !matches!(
-            record.state,
-            MessageState::Created | MessageState::Retryable
-        ) {
-            return Ok(ScheduledAutoCommitReplay::NotApplicable);
-        }
-
-        let Ok(stored_payload) = StoredMessagePayload::decode(&record.payload) else {
-            return Ok(ScheduledAutoCommitReplay::NotApplicable);
-        };
-        let Some(message) = stored_payload.as_openmls_wire() else {
-            return Ok(ScheduledAutoCommitReplay::NotApplicable);
-        };
-        let Ok(projection) = project_mls_message(&message.payload) else {
-            return Ok(ScheduledAutoCommitReplay::NotApplicable);
-        };
-        if projection.kind != OpenMlsContentKind::Proposal
-            || projection.source_epoch != Some(schedule.source_epoch.0)
-        {
-            return Ok(ScheduledAutoCommitReplay::NotApplicable);
-        }
-
-        let msg_in = MlsMessageIn::tls_deserialize_exact(message.payload.as_slice())
-            .map_err(|e| EngineError::Serialize(format!("message deserialize: {e:?}")))?;
-        let proto: ProtocolMessage = match msg_in.extract() {
-            MlsMessageBodyIn::PrivateMessage(p) => p.into(),
-            MlsMessageBodyIn::PublicMessage(p) => p.into(),
-            _ => return Ok(ScheduledAutoCommitReplay::NotApplicable),
-        };
-
-        let (mut mls_group, queued) = {
+        let (mut mls_group, replayed) = {
             let provider =
                 EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-            let mls_gid = openmls::group::GroupId::from_slice(schedule.group_id.as_slice());
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
             let mut mls_group = MlsGroup::load(
                 <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
                     &provider,
@@ -1385,28 +1398,101 @@ impl<S: StorageProvider> Engine<S> {
                 &mls_gid,
             )
             .map_err(|e| EngineError::Backend(format!("load auto-commit replay: {e:?}")))?
-            .ok_or_else(|| EngineError::UnknownGroup(schedule.group_id.clone()))?;
-            if EpochId(mls_group.epoch().as_u64()) != schedule.source_epoch {
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+            if EpochId(mls_group.epoch().as_u64()) != source_epoch {
                 return Ok(ScheduledAutoCommitReplay::NotApplicable);
             }
 
-            let processed = match mls_group.process_message(&provider, proto) {
-                Ok(processed) => processed,
-                Err(_) => return Ok(ScheduledAutoCommitReplay::NotApplicable),
-            };
-            let queued = match processed.into_content() {
-                ProcessedMessageContent::ProposalMessage(queued)
-                    if matches!(queued.proposal(), Proposal::SelfRemove) =>
-                {
-                    queued
+            let mut replayed = Vec::new();
+            for schedule in schedules {
+                let record = match self.storage.get_message(&schedule.proposal_id) {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound) => continue,
+                    Err(err) => return Err(EngineError::Storage(err)),
+                };
+                if !matches!(
+                    record.state,
+                    MessageState::Created | MessageState::Retryable
+                ) {
+                    continue;
                 }
-                _ => return Ok(ScheduledAutoCommitReplay::NotApplicable),
-            };
-            (mls_group, queued)
+                let Ok(stored_payload) = StoredMessagePayload::decode(&record.payload) else {
+                    continue;
+                };
+                let Some(message) = stored_payload.as_openmls_wire() else {
+                    continue;
+                };
+                let Ok(projection) = project_mls_message(&message.payload) else {
+                    continue;
+                };
+                if projection.kind != OpenMlsContentKind::Proposal
+                    || projection.source_epoch != Some(source_epoch.0)
+                {
+                    continue;
+                }
+                let Ok(msg_in) = MlsMessageIn::tls_deserialize_exact(message.payload.as_slice())
+                else {
+                    continue;
+                };
+                let proto: ProtocolMessage = match msg_in.extract() {
+                    MlsMessageBodyIn::PrivateMessage(private) => private.into(),
+                    MlsMessageBodyIn::PublicMessage(public) => public.into(),
+                    _ => continue,
+                };
+                let Ok(processed) = mls_group.process_message(&provider, proto) else {
+                    continue;
+                };
+                let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content()
+                else {
+                    continue;
+                };
+                if !matches!(queued.proposal(), Proposal::SelfRemove) {
+                    continue;
+                }
+                let digest: [u8; 32] = Sha256::digest(&message.payload).into();
+                replayed.push((digest, queued));
+            }
+            (mls_group, replayed)
         };
 
+        // Re-check authorization against the same candidate-parent state used
+        // to stage the batch, then deterministically retain the lowest proposal
+        // digest for each leaving leaf. Finally order the selected proposals by
+        // that digest before they enter OpenMLS's insertion-ordered store.
+        let mut eligible = Vec::new();
+        for (digest, queued) in replayed {
+            let decision_report = crate::auto_committer::decide_with_reason(&mls_group, &queued);
+            let decision_str = match &decision_report.decision {
+                crate::auto_committer::AutoCommitDecision::Commit => "commit",
+                crate::auto_committer::AutoCommitDecision::Observe => "observe",
+            };
+            self.audit_group(
+                &group_id,
+                marmot_forensics::AuditEventKind::AutoCommitDecision {
+                    proposal_kind: crate::audit_helpers::proposal_kind_str(queued.proposal())
+                        .to_string(),
+                    decision: decision_str.to_string(),
+                    reason: Some(decision_report.reason.to_string()),
+                },
+            );
+            if !matches!(
+                decision_report.decision,
+                crate::auto_committer::AutoCommitDecision::Commit
+            ) {
+                continue;
+            }
+            let Sender::Member(leaver) = queued.sender() else {
+                continue;
+            };
+            eligible.push((*leaver, digest, *queued));
+        }
+        let selected = crate::auto_committer::select_self_remove_batch(eligible);
+        if selected.is_empty() {
+            return Ok(ScheduledAutoCommitReplay::NotApplicable);
+        }
+
         if self
-            .stage_auto_commit_for_queued_proposal(&schedule.group_id, &mut mls_group, queued)
+            .stage_auto_commit_for_queued_proposals(&group_id, &mut mls_group, selected)
             .await?
         {
             Ok(ScheduledAutoCommitReplay::Staged)
@@ -1415,79 +1501,86 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    async fn stage_auto_commit_for_queued_proposal(
+    async fn stage_auto_commit_for_queued_proposals(
         &mut self,
         group_id: &GroupId,
         mls_group: &mut MlsGroup,
-        queued: Box<QueuedProposal>,
+        queued_proposals: Vec<QueuedProposal>,
     ) -> Result<bool, EngineError> {
-        let decision_report = crate::auto_committer::decide_with_reason(mls_group, &queued);
-        let decision_str = match &decision_report.decision {
-            crate::auto_committer::AutoCommitDecision::Commit => "commit",
-            crate::auto_committer::AutoCommitDecision::Observe => "observe",
-        };
-        self.audit_group(
-            group_id,
-            marmot_forensics::AuditEventKind::AutoCommitDecision {
-                proposal_kind: crate::audit_helpers::proposal_kind_str(queued.proposal())
-                    .to_string(),
-                decision: decision_str.to_string(),
-                reason: Some(decision_report.reason.to_string()),
-            },
-        );
-        if !matches!(
-            decision_report.decision,
-            crate::auto_committer::AutoCommitDecision::Commit
-        ) {
+        if queued_proposals.is_empty()
+            || queued_proposals
+                .iter()
+                .any(|queued| !matches!(queued.proposal(), Proposal::SelfRemove))
+        {
             return Ok(false);
         }
-
-        let auto_removed: Vec<MemberId> = match queued.proposal() {
-            Proposal::Remove(r) => member_id_at_leaf(mls_group, r.removed())
-                .into_iter()
-                .collect(),
-            Proposal::SelfRemove => member_id_of_sender(queued.sender(), mls_group)
-                .into_iter()
-                .collect(),
-            _ => Vec::new(),
-        };
-        let auto_is_self_remove = matches!(queued.proposal(), Proposal::SelfRemove);
-        let auto_proposer = member_id_of_sender(queued.sender(), mls_group);
-        let auto_proposal_kind =
-            crate::audit_helpers::proposal_kind_str(queued.proposal()).to_string();
 
         let is_stable = self
             .epoch_manager
             .state(group_id)
-            .is_none_or(|s| s.is_stable());
+            .is_none_or(|state| state.is_stable());
         if !is_stable {
             self.audit_group(
                 group_id,
                 marmot_forensics::AuditEventKind::AutoCommitDecision {
-                    proposal_kind: auto_proposal_kind,
+                    proposal_kind: "self_remove".to_string(),
                     decision: "observe".to_string(),
                     reason: Some("group_not_stable".to_string()),
                 },
             );
-            self.schedule_pending_convergence_group(group_id);
+            self.restore_self_remove_auto_commit_schedules_for_group(
+                group_id,
+                EpochId(mls_group.epoch().as_u64()),
+                self.convergence_now_ms(),
+            )?;
+            return Ok(false);
+        }
+
+        // `commit_to_pending_proposals` consumes the whole insertion-ordered
+        // live store. Keep SelfRemove batches closed: unrelated work remains in
+        // durable message records and must never be mixed into this commit.
+        if mls_group.has_pending_proposals() {
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::AutoCommitDecision {
+                    proposal_kind: "self_remove".to_string(),
+                    decision: "observe".to_string(),
+                    reason: Some("unrelated_pending_proposals".to_string()),
+                },
+            );
+            self.restore_self_remove_auto_commit_schedules_for_group(
+                group_id,
+                EpochId(mls_group.epoch().as_u64()),
+                self.convergence_now_ms(),
+            )?;
+            return Ok(false);
+        }
+
+        let auto_removed: Vec<MemberId> = queued_proposals
+            .iter()
+            .filter_map(|queued| member_id_of_sender(queued.sender(), mls_group))
+            .collect();
+        if auto_removed.len() != queued_proposals.len() {
             return Ok(false);
         }
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let stored_proposal_ref = queued.proposal_reference_ref().clone();
-        mls_group
-            .store_pending_proposal(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                    &provider,
-                ),
-                *queued,
-            )
-            .map_err(|e| EngineError::Backend(format!("store_pending: {e:?}")))?;
-
-        let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let mut pending_commit_guard =
             PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
-        pending_commit_guard.set_stored_proposal_ref(stored_proposal_ref);
+        for queued in queued_proposals {
+            let stored_proposal_ref = queued.proposal_reference_ref().clone();
+            mls_group
+                .store_pending_proposal(
+                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                        &provider,
+                    ),
+                    queued,
+                )
+                .map_err(|e| EngineError::Backend(format!("store_pending: {e:?}")))?;
+            pending_commit_guard.set_stored_proposal_ref(stored_proposal_ref);
+        }
+
+        let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
         let recovery_snapshot =
             self.fork_recovery
                 .create_snapshot(&self.storage, group_id, pre_commit_epoch)?;
@@ -1499,9 +1592,33 @@ impl<S: StorageProvider> Engine<S> {
             "pre_auto_commit",
         );
         let pre_commit_ctx = group_lifecycle::build_group_context_snapshot(mls_group, &provider)?;
-        let (commit_out, _welcome_opt, _gi) = mls_group
+        let (commit_out, _welcome_opt, _group_info) = mls_group
             .commit_to_pending_proposals(&provider, &self.identity.signer)
             .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
+
+        // Re-check the complete resulting transition before exposing pending
+        // state: committer/leaver separation, active-admin depletion,
+        // admin/leaf coupling, and app-component integrity are one atomic gate.
+        let staged_commit = mls_group
+            .pending_commit()
+            .ok_or_else(|| EngineError::Backend("auto-commit produced no pending commit".into()))?;
+        crate::app_components::require_admin_for_staged_commit(
+            mls_group,
+            group_id,
+            Some(self.identity.self_id()),
+            staged_commit,
+        )?;
+        crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+            mls_group,
+            group_id,
+            staged_commit,
+        )?;
+        crate::app_components::validate_app_component_integrity_for_staged_commit(
+            mls_group,
+            group_id,
+            staged_commit,
+        )?;
+
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -1523,6 +1640,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             pre_commit_epoch,
         )?;
+        pending_commit_guard.set_stored_commit_id(wrapped.id.clone());
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
         let commit_priority = mls_group
@@ -1567,7 +1685,7 @@ impl<S: StorageProvider> Engine<S> {
             if self.epoch_manager.rollback_publish(pending_ref).is_err() {
                 tracing::warn!(
                     target: "cgka_engine::message_processor",
-                    method = "stage_auto_commit_for_queued_proposal",
+                    method = "stage_auto_commit_for_queued_proposals",
                     "state-machine rollback failed after group record projection failure"
                 );
             }
@@ -1598,23 +1716,10 @@ impl<S: StorageProvider> Engine<S> {
             recovery_snapshot,
         );
         let auto_changes = auto_removed
-            .iter()
-            .cloned()
-            .map(|member| {
-                let (change, actor) = if auto_is_self_remove {
-                    (
-                        GroupStateChange::MemberLeft {
-                            member: member.clone(),
-                        },
-                        Some(member),
-                    )
-                } else {
-                    (
-                        GroupStateChange::MemberRemoved { member },
-                        auto_proposer.clone(),
-                    )
-                };
-                crate::engine::PendingGroupStateChange { actor, change }
+            .into_iter()
+            .map(|member| crate::engine::PendingGroupStateChange {
+                actor: Some(member.clone()),
+                change: GroupStateChange::MemberLeft { member },
             })
             .collect();
         self.pending_state_changes.insert(pending_ref, auto_changes);

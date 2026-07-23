@@ -356,6 +356,41 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Rebuild the in-memory jitter edge from durable current-epoch proposal
+    /// rows. The proposal bytes and source epoch are the source of truth; the
+    /// eventual replay performs full MLS, SelfRemove, and authorization checks.
+    /// A staged removal commit projects the group record to the next epoch, so
+    /// its already-consumed source-epoch proposals are excluded after restart.
+    pub(crate) fn restore_self_remove_auto_commit_schedules_for_group(
+        &mut self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+        now_ms: u64,
+    ) -> Result<(), EngineError> {
+        let records = self.storage.list_messages(group_id, source_epoch)?;
+        for record in records {
+            if record.epoch != source_epoch
+                || !matches!(
+                    record.state,
+                    MessageState::Created | MessageState::Retryable
+                )
+            {
+                continue;
+            }
+            let Some((_message, projection)) = decode_openmls_wire_projection(&record.payload)
+            else {
+                continue;
+            };
+            if projection.kind != OpenMlsContentKind::Proposal
+                || projection.source_epoch != Some(source_epoch.0)
+            {
+                continue;
+            }
+            self.schedule_self_remove_auto_commit(group_id, &record.id, source_epoch, now_ms)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn drop_self_remove_auto_commit_schedules_for_group(&mut self, group_id: &GroupId) {
         self.scheduled_self_remove_auto_commits
             .retain(|_, scheduled| &scheduled.group_id != group_id);

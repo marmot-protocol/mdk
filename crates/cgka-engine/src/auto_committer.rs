@@ -20,13 +20,16 @@
 //! the application calls `publish_failed` with the pending ref and the engine
 //! clears the staged commit.
 
+use std::collections::BTreeMap;
+
 use openmls::framing::Sender;
 use openmls::group::MlsGroup;
 use openmls::prelude::{LeafNodeIndex, Proposal, QueuedProposal};
 
 /// Decision returned by the policy.
 pub(crate) enum AutoCommitDecision {
-    /// This client should commit the named proposal.
+    /// This client should include the eligible proposal in the next frozen
+    /// SelfRemove batch.
     Commit,
     /// We are not allowed to commit this proposal.
     Observe,
@@ -159,7 +162,63 @@ fn pubkey_at_leaf_index(
     PubkeyResult::Ok(out)
 }
 
+/// Resolve a frozen set of eligible SelfRemove candidates without consulting
+/// arrival order or local identity. At most one proposal may represent each
+/// leaving leaf; the lower SHA-256 proposal digest wins that slot. Selected
+/// proposals are returned in digest order so OpenMLS insertion order is stable.
+pub(crate) fn select_self_remove_batch<T>(
+    candidates: impl IntoIterator<Item = (LeafNodeIndex, [u8; 32], T)>,
+) -> Vec<T> {
+    let mut selected_by_leaver: BTreeMap<LeafNodeIndex, ([u8; 32], T)> = BTreeMap::new();
+    for (leaver, digest, candidate) in candidates {
+        let replace = selected_by_leaver
+            .get(&leaver)
+            .is_none_or(|(selected_digest, _)| digest < *selected_digest);
+        if replace {
+            selected_by_leaver.insert(leaver, (digest, candidate));
+        }
+    }
+
+    let mut selected: Vec<_> = selected_by_leaver.into_values().collect();
+    selected.sort_by_key(|(digest, _)| *digest);
+    selected
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
 // The commit-staging work happens in `message_processor::ingest_group_message`
 // directly so the freshly processed proposal can be stored and committed on
 // the same OpenMLS group instance. Applying the staged commit still waits for
 // `confirm_published`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_remove_batch_selection_is_permutation_invariant() {
+        let candidates = [
+            (LeafNodeIndex::new(1), [9; 32], "bob-high"),
+            (LeafNodeIndex::new(2), [4; 32], "carol"),
+            (LeafNodeIndex::new(1), [2; 32], "bob-low"),
+        ];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+
+        for permutation in permutations {
+            let input = permutation.map(|index| candidates[index]);
+            assert_eq!(
+                select_self_remove_batch(input),
+                vec!["bob-low", "carol"],
+                "arrival order {permutation:?} changed the selected batch"
+            );
+        }
+    }
+}

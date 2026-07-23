@@ -142,10 +142,12 @@ pub struct Engine<S: StorageProvider> {
     /// further outbound group traffic while a leave request is outstanding.
     pub(crate) leaving_groups: HashSet<GroupId>,
 
-    /// Delayed SelfRemove auto-commit attempts keyed by the standalone
-    /// proposal's content-derived message id. These are re-checked against live
-    /// storage before staging so unrelated commits can invalidate them without
-    /// producing a commit storm.
+    /// Delayed SelfRemove auto-commit candidates keyed by the standalone
+    /// proposal's content-derived message id. The first due candidate freezes
+    /// all currently eligible proposals for the same group/epoch into one
+    /// deterministic batch; every candidate is re-checked against live storage
+    /// before staging so unrelated commits can invalidate it without producing
+    /// a commit storm.
     pub(crate) scheduled_self_remove_auto_commits:
         HashMap<MessageId, ScheduledSelfRemoveAutoCommit>,
 
@@ -935,6 +937,13 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.audit_group_context(group_id, "hydrate_stable_group");
+
+        self.restore_self_remove_auto_commit_schedules_for_group(
+            group_id,
+            group.epoch,
+            self.convergence_now_ms(),
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         // Startup must recreate the in-memory scheduling edge for durable
         // convergence work. Otherwise queued user sends and stored branch

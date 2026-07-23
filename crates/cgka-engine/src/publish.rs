@@ -277,13 +277,50 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
+        let retry_self_remove_batch = mls_group.pending_commit().is_some_and(|commit| {
+            let mut proposals = commit.queued_proposals().peekable();
+            proposals.peek().is_some()
+                && proposals.all(|proposal| {
+                    matches!(proposal.proposal(), openmls::prelude::Proposal::SelfRemove)
+                })
+        });
+        let failed_self_remove_commit = retry_self_remove_batch
+            .then(|| self.peek_pending_commit_for_recovery(pending))
+            .flatten();
+        let retry_proposal_refs = if retry_self_remove_batch {
+            mls_group
+                .pending_commit()
+                .into_iter()
+                .flat_map(|commit| commit.queued_proposals())
+                .map(|proposal| proposal.proposal_reference_ref().clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if mls_group.pending_commit().is_some() {
             self.storage.with_transaction(|storage| {
                 let tx_provider =
                     EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                 mls_group
                     .clear_pending_commit(tx_provider.storage())
-                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
+                    .map_err(|error| EngineError::Backend(format!("clear_pending: {error:?}")))?;
+                for proposal_ref in &retry_proposal_refs {
+                    match mls_group.remove_pending_proposal(tx_provider.storage(), proposal_ref) {
+                        Ok(()) | Err(openmls::group::RemoveProposalError::ProposalNotFound) => {}
+                        Err(error) => {
+                            return Err(EngineError::Backend(format!(
+                                "remove retry proposal: {error:?}"
+                            )));
+                        }
+                    }
+                }
+                if let Some(commit_id) = failed_self_remove_commit.as_ref() {
+                    match storage.update_message_state(commit_id, MessageState::Failed) {
+                        Ok(()) | Err(cgka_traits::storage::StorageError::NotFound) => {}
+                        Err(error) => return Err(EngineError::Storage(error)),
+                    }
+                }
+                Ok(())
             })?;
         }
 
@@ -332,6 +369,13 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.pending_state_changes.remove(&pending);
+        if retry_self_remove_batch {
+            self.restore_self_remove_auto_commit_schedules_for_group(
+                &group_id,
+                prior_epoch,
+                self.convergence_now_ms(),
+            )?;
+        }
         if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {
             self.schedule_pending_convergence_group(&queued_group_id);
         }

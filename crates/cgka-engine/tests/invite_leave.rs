@@ -13,15 +13,16 @@ use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, OutboundIntentStorage,
-    StorageProvider,
+    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, MessageStorage,
+    OutboundIntentStorage, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
-use cgka_traits::types::{GroupId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
@@ -1895,6 +1896,206 @@ async fn selfremove_full_flow_with_auto_commit() {
 }
 
 #[tokio::test]
+async fn selfremove_auto_commit_batches_all_eligible_leavers() {
+    let (mut alice, alice_storage) = build_with_storage(b"alice-batch");
+    let mut bob = build_client(b"bob-batch");
+    let mut carol = build_client(b"carol-batch");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "selfremove-batch".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    let bob_leave = match bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        other => panic!("expected bob SelfRemove proposal, got {other:?}"),
+    };
+    let carol_leave = match carol
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        other => panic!("expected carol SelfRemove proposal, got {other:?}"),
+    };
+
+    for proposal in [carol_leave, bob_leave] {
+        let outcome = alice
+            .ingest(TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..proposal
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, IngestOutcome::Processed));
+    }
+
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    assert_eq!(
+        alice.drain_auto_publish().len(),
+        1,
+        "one eligible frozen batch must produce one commit"
+    );
+    let projected_members = alice.members(&group_id).unwrap();
+    assert_eq!(
+        projected_members.len(),
+        1,
+        "the staged batch must project both leavers out; got {projected_members:?}"
+    );
+    assert_eq!(projected_members[0].id, alice.self_id());
+
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load alice group")
+        .expect("alice group present");
+    let staged = mls_group
+        .pending_commit()
+        .expect("alice staged a SelfRemove batch commit");
+    let queued: Vec<_> = staged.queued_proposals().collect();
+    assert_eq!(queued.len(), 2, "the commit must reference both proposals");
+    assert!(
+        queued
+            .iter()
+            .all(|queued| matches!(queued.proposal(), Proposal::SelfRemove)),
+        "the batch commit must contain only SelfRemove proposals"
+    );
+}
+
+#[tokio::test]
+async fn selfremove_batch_schedule_survives_engine_rebuild() {
+    let (mut alice, alice_storage) = build_with_storage(b"alice-batch-restart");
+    let mut bob = build_client(b"bob-batch-restart");
+    let mut carol = build_client(b"carol-batch-restart");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "selfremove-batch-restart".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome_for_bob, welcome_for_carol) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            (welcomes.remove(0), welcomes.remove(0))
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+    carol.join_welcome(welcome_for_carol).await.unwrap();
+
+    let bob_leave = match bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        other => panic!("expected bob SelfRemove proposal, got {other:?}"),
+    };
+    let carol_leave = match carol
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::Proposal { msg } => msg,
+        other => panic!("expected carol SelfRemove proposal, got {other:?}"),
+    };
+    for proposal in [bob_leave, carol_leave] {
+        alice
+            .ingest(TransportMessage {
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+                ..proposal
+            })
+            .await
+            .unwrap();
+    }
+    assert!(alice.drain_auto_publish().is_empty());
+
+    drop(alice);
+    let mut alice = build_client_on_storage(b"alice-batch-restart", alice_storage.clone());
+    alice.hydrate_stable_groups_from_storage().unwrap();
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+
+    assert_eq!(
+        alice.drain_auto_publish().len(),
+        1,
+        "restart must restore one durable batch schedule"
+    );
+    let projected_members = alice.members(&group_id).unwrap();
+    assert_eq!(
+        projected_members.len(),
+        1,
+        "restored batch must still remove both leavers; got {projected_members:?}"
+    );
+    assert_eq!(projected_members[0].id, alice.self_id());
+
+    // Crash again after the batch has been staged but before its pending handle
+    // is resolved. The durable projected epoch prevents hydration from
+    // scheduling either source-epoch proposal again, so no duplicate commit is
+    // prepared on the reopened engine.
+    drop(alice);
+    let mut alice = build_client_on_storage(b"alice-batch-restart", alice_storage);
+    alice.hydrate_stable_groups_from_storage().unwrap();
+    assert!(alice.drain_auto_publish().is_empty());
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    assert!(
+        alice.drain_auto_publish().is_empty(),
+        "restart with a staged batch must not produce a duplicate commit"
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(alice.members(&group_id).unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn selfremove_leaving_gate_survives_engine_rebuild() {
     let mut alice = build_client(b"alice");
     let (mut bob, bob_storage) = build_with_storage(b"bob");
@@ -2232,7 +2433,7 @@ async fn leave_requires_stable_epoch_state() {
 
 #[tokio::test]
 async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
-    let mut alice = build_client(b"alice");
+    let (mut alice, alice_storage) = build_with_storage(b"alice");
     let mut bob = build_client(b"bob");
     let mut carol = build_client(b"carol");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -2290,12 +2491,43 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
     alice.publish_failed(auto.remove(0).pending).await.unwrap();
 
     assert_eq!(alice.epoch(&group_id).unwrap().0, 1);
+    let proposal_states: Vec<_> = alice_storage
+        .list_messages(&group_id, EpochId(1))
+        .unwrap()
+        .into_iter()
+        .map(|record| record.state)
+        .collect();
+    assert!(
+        proposal_states
+            .iter()
+            .any(|state| matches!(state, MessageState::Created | MessageState::Retryable)),
+        "publish_failed must leave durable proposal rows retryable; got {proposal_states:?}"
+    );
     let members = alice.members(&group_id).unwrap();
     assert_eq!(members.len(), 3, "publish_failed should restore bob");
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, alice_storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mls_group.pending_proposals().count(),
+        0,
+        "publish_failed must restore an empty live proposal store"
+    );
     let events = alice.drain_events();
     assert!(
         !emits_departure_of(&events, &bob.self_id()),
         "failed auto-publish must not emit a departure; got {events:?}"
+    );
+
+    advance_selfremove_auto_commit(&mut alice, &group_id).await;
+    assert_eq!(
+        alice.drain_auto_publish().len(),
+        1,
+        "durable SelfRemove proposals must be retried after publish failure"
     );
 }
 
