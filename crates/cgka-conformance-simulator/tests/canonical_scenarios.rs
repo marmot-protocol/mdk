@@ -2053,3 +2053,121 @@ async fn harness_captures_and_asserts_convergence_decision() {
         "carol should observe the committer-decided convergence decision: {failures:#?}"
     );
 }
+
+#[tokio::test]
+async fn failed_invite_staging_does_not_poison_fork_detection_via_harness() {
+    // Harness mirror of the cgka-engine regression test
+    // `failed_invite_staging_does_not_poison_fork_detection`: a send-path
+    // staging failure must leave no phantom "we committed from this epoch"
+    // bookkeeping behind. Historically it did, and once the client advanced
+    // past that epoch via a PEER's commit (settled through convergence, so
+    // no fork-recovery incumbent of its own exists), a legitimate sibling
+    // commit for the poisoned epoch failed closed with ForkedEpoch and stuck
+    // the group in Recovering.
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"phantom-alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"phantom-bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"phantom-carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut dave = ClientBuilder::new(pad32(b"phantom-dave"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut erin = ClientBuilder::new(pad32(b"phantom-erin"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    // Bob and Dave are admins: each later commits an invite from epoch 1.
+    let bob_kp = bob.fresh_key_package().await;
+    let dave_kp = dave.fresh_key_package().await;
+    let (_group_id, pending) = alice
+        .create_group_with_admins(
+            "phantom-committed-from",
+            vec![bob_kp, dave_kp],
+            vec![],
+            vec![bob.member_id(), dave.member_id()],
+        )
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    dave.tick().await;
+    assert_eq!(alice.epoch().0, 1);
+    assert_eq!(bob.epoch().0, 1);
+    assert_eq!(dave.epoch().0, 1);
+
+    // Alice's invite fails DURING commit staging: the duplicate-Bob
+    // KeyPackage carries Bob's existing leaf signature key, which OpenMLS
+    // rejects inside add_members — after capability validation, before the
+    // pending-publish state transition. Nothing reaches the bus.
+    let duplicate_bob_kp = bob.fresh_key_package().await;
+    let failed = alice.try_invite(vec![duplicate_bob_kp]).await;
+    assert!(
+        failed.is_err(),
+        "duplicate-member invite must fail during staging"
+    );
+
+    // Partition Dave away so he stays at epoch 1 and never sees Bob's
+    // commit. Bob invites Carol; Alice advances to epoch 2 purely by
+    // settling Bob's commit through convergence (peer-driven advance — no
+    // own commit, no fork-recovery incumbent at epoch 1).
+    bus.set_partition(Some(vec![alice.bus_id, bob.bus_id, carol.bus_id]));
+    let carol_kp = carol.fresh_key_package().await;
+    let bob_pending = bob.invite(vec![carol_kp]).await;
+    bob.confirm(bob_pending).await;
+    bus.deliver_all();
+    carol.tick().await;
+    let alice_outcomes = alice.tick().await;
+    assert_eq!(
+        alice.epoch().0,
+        2,
+        "alice must settle bob's commit via convergence: {alice_outcomes:?}"
+    );
+
+    // Heal the partition. Dave — still at epoch 1 — commits a sibling
+    // invite from the epoch Alice's failed staging attempt touched.
+    bus.set_partition(None);
+    let erin_kp = erin.fresh_key_package().await;
+    let dave_pending = dave.invite(vec![erin_kp]).await;
+    dave.confirm(dave_pending).await;
+    bus.deliver_all();
+
+    // Alice must classify the sibling (stale losing branch, or a
+    // deterministic reorg onto the winning branch) — never fail closed with
+    // ForkedEpoch, which left the group stuck in Recovering.
+    let alice_outcomes = alice.tick().await;
+    let alice_forked = alice_outcomes
+        .iter()
+        .any(|o| matches!(o, Err(cgka_traits::EngineError::ForkedEpoch { .. })));
+    assert!(
+        !alice_forked,
+        "sibling commit after failed staging must not fail closed: {alice_outcomes:?}"
+    );
+    assert_eq!(alice.epoch().0, 2);
+
+    // Whichever branch won deterministically, alice holds exactly one of
+    // the two invitees and the group remains operational.
+    let members = alice.members();
+    let has_carol = members.iter().any(|m| m.id == carol.member_id());
+    let has_erin = members.iter().any(|m| m.id == erin.member_id());
+    assert_ne!(
+        has_carol, has_erin,
+        "exactly one branch must win: {members:?}"
+    );
+    // Usability probe: a fresh valid invite from Alice must stage normally.
+    // A group stuck in Recovering rejects the send outright.
+    let mut frank = ClientBuilder::new(pad32(b"phantom-frank"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let frank_kp = frank.fresh_key_package().await;
+    let probe_pending = alice
+        .try_invite(vec![frank_kp])
+        .await
+        .expect("group must remain usable after failed staging + sibling commit");
+    alice.confirm(probe_pending).await;
+    assert_eq!(alice.epoch().0, 3);
+}

@@ -158,8 +158,9 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
             "pre_upgrade_commit",
         );
-        self.epoch_manager
-            .record_committed_from(group_id, pre_commit_epoch);
+        // `committed_from` is recorded atomically by `begin_pending` after
+        // staging succeeds — never here, where a staging failure would leave
+        // a phantom entry behind (see do_send_invite).
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 

@@ -927,3 +927,256 @@ async fn stale_commit_without_own_commit_is_classified_as_already_at_epoch_not_f
         }
     ));
 }
+
+#[tokio::test]
+async fn failed_invite_staging_does_not_poison_fork_detection() {
+    // Regression: `do_send_invite` used to record `committed_from` BEFORE
+    // staging the commit. When staging failed, the cleanup guard cleared the
+    // OpenMLS pending commit but nothing pruned the phantom "we committed
+    // from this epoch" entry. Once Alice later advanced past that epoch via a
+    // PEER's commit (settled through convergence — so no fork-recovery
+    // incumbent of her own exists), a legitimate same-epoch sibling commit
+    // was mis-routed: the phantom blocked convergence entry, the WrongEpoch
+    // fork branch found no recovery snapshot, and ingest failed closed with
+    // ForkedEpoch, sticking the group in Recovering. `committed_from` is now
+    // recorded only inside `begin_pending`, atomically with the transition.
+    let (mut alice, _alice_storage) = build_client_with_storage(b"phantom-alice");
+    let mut bob = build_client(b"phantom-bob");
+    let mut carol = build_client(b"phantom-carol");
+    let (mut dave, dave_storage) = build_client_with_storage(b"phantom-dave");
+    let dave_id = MemberId::new(pad32(b"phantom-dave"));
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp, dave_kp],
+            required_features: vec![],
+            app_components: vec![],
+            // Bob must be an admin so his sibling-epoch invite below passes
+            // the MIP-03 committer guard.
+            initial_admins: vec![MemberId::new(pad32(b"phantom-bob"))],
+        })
+        .await
+        .unwrap();
+    let (bob_welcome, dave_welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            let dave_welcome = welcomes.remove(1);
+            (welcomes.remove(0), dave_welcome)
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+    dave.join_welcome(dave_welcome).await.unwrap();
+
+    // Dave produces (but never publishes/applies) a sibling commit from the
+    // current epoch — the legitimate same-epoch race Alice must classify
+    // later.
+    let dave_sibling_commit = raw_self_update_commit(&dave_storage, &dave_id, &group_id);
+
+    // Alice's invite fails DURING staging: the duplicate-Bob KeyPackage is
+    // signed with Bob's existing leaf signature key, which OpenMLS rejects
+    // inside `add_members` — after capability validation, before
+    // `begin_pending`.
+    let duplicate_bob_kp = bob.fresh_key_package().await.unwrap();
+    let failed = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![duplicate_bob_kp],
+        })
+        .await;
+    assert!(
+        failed.is_err(),
+        "duplicate-member invite must fail during staging"
+    );
+
+    // Bob commits from the same epoch (invites Carol). Alice advances by
+    // settling Bob's commit through convergence — a peer-driven advance, so
+    // she has no fork-recovery incumbent of her own for the source epoch.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, pending) = match invite {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    bob.confirm_published(pending).await.unwrap();
+    let routed_bob_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..bob_commit
+    };
+    alice
+        .buffer_openmls_convergence_message(&group_id, routed_bob_commit, 1_000)
+        .expect("bob commit buffered");
+    alice
+        .converge_stored_openmls_messages(&group_id, 3_000)
+        .expect("bob commit settles");
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+
+    // Dave's sibling commit for the now-past epoch arrives. Alice never
+    // published a commit from that epoch, so ingest must classify it (stale
+    // losing branch, or a reorg onto the winning branch) — NOT take the
+    // fork-recovery path, which with the phantom entry and no tracked
+    // snapshot failed closed with ForkedEpoch and left the group stuck in
+    // Recovering.
+    alice
+        .ingest(dave_sibling_commit)
+        .await
+        .expect("sibling commit after failed staging must not fail closed");
+
+    // The group is still operational: a fresh (valid) invite from Alice is
+    // accepted — staged immediately or queued behind unresolved convergence
+    // input. In Recovering it would error instead (`begin_pending` rejects
+    // non-Stable states).
+    let mut erin = build_client(b"phantom-erin");
+    let erin_kp = erin.fresh_key_package().await.unwrap();
+    let recovery_probe = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![erin_kp],
+        })
+        .await
+        .expect("group must remain usable after failed staging + sibling commit");
+    assert!(matches!(
+        recovery_probe,
+        SendResult::GroupEvolution { .. } | SendResult::Queued { .. }
+    ));
+}
+
+#[tokio::test]
+async fn publish_failed_rollback_does_not_poison_fork_detection() {
+    // Companion regression to `failed_invite_staging_does_not_poison_fork_
+    // detection`, for the POST-staging failure: staging succeeds, so
+    // `begin_pending` records `committed_from`, and then the publish fails.
+    // `rollback_publish` used to clear the staged commit and drop its
+    // recovery snapshot but leave the provisional `committed_from` entry
+    // behind. Once Alice later advanced past that epoch via a peer's commit,
+    // a legitimate late same-epoch sibling hit the phantom entry, found no
+    // recovery snapshot, and failed closed with ForkedEpoch. Rollback now
+    // removes the provisional entry it recorded.
+    let (mut alice, _alice_storage) = build_client_with_storage(b"rollback-alice");
+    let mut bob = build_client(b"rollback-bob");
+    let mut carol = build_client(b"rollback-carol");
+    let (mut dave, dave_storage) = build_client_with_storage(b"rollback-dave");
+    let dave_id = MemberId::new(pad32(b"rollback-dave"));
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let dave_kp = dave.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "".into(),
+            description: "".into(),
+            members: vec![bob_kp, dave_kp],
+            required_features: vec![],
+            app_components: vec![],
+            // Bob must be an admin so his sibling-epoch invite below passes
+            // the MIP-03 committer guard.
+            initial_admins: vec![MemberId::new(pad32(b"rollback-bob"))],
+        })
+        .await
+        .unwrap();
+    let (bob_welcome, dave_welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            let dave_welcome = welcomes.remove(1);
+            (welcomes.remove(0), dave_welcome)
+        }
+        _ => unreachable!(),
+    };
+    bob.join_welcome(bob_welcome).await.unwrap();
+    dave.join_welcome(dave_welcome).await.unwrap();
+
+    // Dave produces (but never publishes/applies) a sibling commit from the
+    // current epoch — the legitimate same-epoch race Alice must classify
+    // later.
+    let dave_sibling_commit = raw_self_update_commit(&dave_storage, &dave_id, &group_id);
+
+    // Alice's invite stages successfully — `begin_pending` records the
+    // provisional `committed_from` entry — and then the publish fails.
+    let mut frank = build_client(b"rollback-frank");
+    let frank_kp = frank.fresh_key_package().await.unwrap();
+    let staged = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![frank_kp],
+        })
+        .await
+        .unwrap();
+    let pending = match staged {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        _ => unreachable!(),
+    };
+    alice.publish_failed(pending).await.unwrap();
+
+    // Bob commits from the same epoch (invites Carol). Alice advances by
+    // settling Bob's commit through convergence — a peer-driven advance, so
+    // she has no fork-recovery incumbent of her own for the source epoch.
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, pending) = match invite {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        _ => unreachable!(),
+    };
+    bob.confirm_published(pending).await.unwrap();
+    let routed_bob_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..bob_commit
+    };
+    alice
+        .buffer_openmls_convergence_message(&group_id, routed_bob_commit, 1_000)
+        .expect("bob commit buffered");
+    alice
+        .converge_stored_openmls_messages(&group_id, 3_000)
+        .expect("bob commit settles");
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(2));
+
+    // Dave's sibling commit for the now-past epoch arrives. Alice's rolled-
+    // back commit reached no one, so ingest must classify it — NOT take the
+    // fork-recovery path and fail closed with ForkedEpoch.
+    alice
+        .ingest(dave_sibling_commit)
+        .await
+        .expect("sibling commit after rolled-back publish must not fail closed");
+
+    // The group is still operational: a fresh (valid) invite from Alice is
+    // accepted — staged immediately or queued behind unresolved convergence
+    // input. In Recovering it would error instead (`begin_pending` rejects
+    // non-Stable states).
+    let mut erin = build_client(b"rollback-erin");
+    let erin_kp = erin.fresh_key_package().await.unwrap();
+    let recovery_probe = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![erin_kp],
+        })
+        .await
+        .expect("group must remain usable after rolled-back publish + sibling commit");
+    assert!(matches!(
+        recovery_probe,
+        SendResult::GroupEvolution { .. } | SendResult::Queued { .. }
+    ));
+}

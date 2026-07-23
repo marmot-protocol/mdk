@@ -35,6 +35,14 @@ struct PendingMeta {
     /// rows, which are emitted on a later publish-confirm call after the
     /// engine's ambient context has cleared.
     audit_context: Option<AuditEventContext>,
+    /// Whether `begin_pending` newly inserted `prior_epoch` into
+    /// `committed_from` for this pending. A group holds at most one live
+    /// pending, so a fresh insert is owned solely by it and must be removed
+    /// again on `rollback_publish` — otherwise the phantom entry poisons
+    /// fork detection for later same-epoch siblings. `false` means the epoch
+    /// was already owned (e.g. by a previously confirmed commit after a
+    /// fork rollback), and rollback must leave that incumbent in place.
+    owns_committed_from: bool,
 }
 
 /// Discriminator the engine uses when emitting the post-confirm event.
@@ -137,7 +145,8 @@ impl EpochManager {
         let new_state = prev.begin_pending(new_epoch, pending, pending_ref)?;
 
         // The transition succeeded — commit every mutation together.
-        self.committed_from
+        let owns_committed_from = self
+            .committed_from
             .entry(group_id.clone())
             .or_default()
             .insert(pre_commit_epoch);
@@ -149,6 +158,7 @@ impl EpochManager {
                 prior_epoch: pre_commit_epoch,
                 kind,
                 audit_context,
+                owns_committed_from,
             },
         );
         Ok(())
@@ -216,8 +226,10 @@ impl EpochManager {
     /// the OpenMLS `clear_pending_commit` + any Marmot/cache rewinds — this
     /// only handles the state-machine bookkeeping.
     ///
-    /// Atomic in the state map: a failed `rollback_pending` leaves both
-    /// `pending` and `states` untouched.
+    /// Atomic in the state map: a failed `rollback_pending` leaves
+    /// `pending`, `states`, and `committed_from` untouched. On success the
+    /// provisional `committed_from` entry inserted by this pending's
+    /// `begin_pending` is removed (a pre-existing incumbent survives).
     ///
     /// Returns `(group_id, prior_epoch)` so the caller can target the
     /// matching MLS group.
@@ -239,17 +251,21 @@ impl EpochManager {
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let stable = prev.rollback_pending(prior_epoch)?;
         self.pending.remove(&pending);
+        // Drop the provisional `committed_from` ownership recorded by
+        // `begin_pending` — the commit never reached anyone, so a later
+        // same-epoch sibling is a benign race, not a fork. Only the entry
+        // this pending itself inserted is removed; a pre-existing confirmed
+        // incumbent stays.
+        if meta.owns_committed_from
+            && let Some(epochs) = self.committed_from.get_mut(&group_id)
+        {
+            epochs.remove(&prior_epoch);
+            if epochs.is_empty() {
+                self.committed_from.remove(&group_id);
+            }
+        }
         self.states.insert(group_id.clone(), stable);
         Ok((group_id, prior_epoch))
-    }
-
-    /// Record a committed-from epoch outside the begin_pending path (used
-    /// by the auto-committer, which doesn't go through PendingPublish).
-    pub(crate) fn record_committed_from(&mut self, group_id: &GroupId, epoch: EpochId) {
-        self.committed_from
-            .entry(group_id.clone())
-            .or_default()
-            .insert(epoch);
     }
 
     pub(crate) fn prune_committed_from_before(
@@ -384,5 +400,87 @@ mod tests {
         assert_eq!(em.epoch(&group_id), Some(EpochId(8)));
         assert_eq!(em.group_for_pending(pending_ref), Some(group_id.clone()));
         assert!(em.we_committed_from(&group_id, EpochId(7)));
+    }
+
+    /// `rollback_publish` must remove the provisional `committed_from` entry
+    /// its `begin_pending` inserted — the commit reached no one, so a later
+    /// same-epoch sibling is a benign race, not a fork.
+    #[test]
+    fn rollback_publish_removes_provisional_committed_from() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(7));
+
+        let pending_ref = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            pending_ref,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("begin_pending from Stable succeeds");
+        assert!(em.we_committed_from(&group_id, EpochId(7)));
+
+        let (rolled_group, prior) = em
+            .rollback_publish(pending_ref)
+            .expect("rollback_publish succeeds");
+        assert_eq!(rolled_group, group_id);
+        assert_eq!(prior, EpochId(7));
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(7)));
+        assert!(
+            !em.we_committed_from(&group_id, EpochId(7)),
+            "rolled-back pending must not leave a phantom committed_from entry"
+        );
+    }
+
+    /// A `committed_from` epoch already owned by an earlier confirmed commit
+    /// must survive a later rollback of a pending staged from the same epoch
+    /// (reachable via fork-recovery rewinding to that epoch).
+    #[test]
+    fn rollback_publish_preserves_confirmed_committed_from_incumbent() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+
+        // Confirmed commit from epoch 7 → committed_from owns 7 legitimately.
+        em.set_stable(group_id.clone(), EpochId(7));
+        let first = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            first,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("first begin_pending succeeds");
+        em.confirm_publish(first).expect("confirm_publish succeeds");
+        assert!(em.we_committed_from(&group_id, EpochId(7)));
+
+        // Fork recovery rewinds the group to epoch 7; a second commit is
+        // staged from the same epoch and then rolled back.
+        em.set_stable(group_id.clone(), EpochId(7));
+        let second = em.next_pending_ref();
+        em.begin_pending(
+            group_id.clone(),
+            EpochId(7),
+            EpochId(8),
+            handle(),
+            second,
+            PendingKind::GroupEvolution,
+            None,
+        )
+        .expect("second begin_pending succeeds");
+        em.rollback_publish(second)
+            .expect("rollback_publish succeeds");
+
+        assert!(
+            em.we_committed_from(&group_id, EpochId(7)),
+            "rollback must not clear the confirmed incumbent's committed_from entry"
+        );
     }
 }

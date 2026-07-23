@@ -204,6 +204,17 @@ These are real simulator scenarios that are still tied to Rust harness details.
   set.
 - Reason: the test inspects recovery observations and exact branch ordering keys.
 
+### `failed_invite_staging_does_not_poison_fork_detection_via_harness`
+
+- Setup: Alice's invite fails during commit staging (duplicate-member KeyPackage). Alice then advances to epoch 2 by
+  settling Bob's commit through convergence, and a partitioned Dave later delivers a sibling commit from the same
+  source epoch.
+- Expected: the sibling commit is adjudicated deterministically (stale losing branch or reorg onto the winner) — never
+  a fail-closed `ForkedEpoch` — and Alice's group stays usable for a follow-up invite.
+- Reason: regression guard for the phantom `committed_from` bookkeeping bug (fixed by recording it only inside
+  `begin_pending`); mirrors the cgka-engine test `failed_invite_staging_does_not_poison_fork_detection` at the
+  multi-client bus level.
+
 ### `convergence-e2e-group-events/v1`
 
 - Setup: Alice creates a four-member group. Alice and Bob race invite commits and each branch has an app payload. Carol
