@@ -9,7 +9,8 @@ ids, relay order, relay timestamps, and local arrival order are not consensus in
 
 The transport layer may buffer, retry, and fetch from relays. The CGKA engine receives peeled messages and decides which
 protocol artifacts become canonical. Any ordering supplied by the transport adapter is advisory. The engine may use it
-as input order for buffering, but branch selection depends on MLS replay, retained anchors, and the negotiated policy.
+as input order for buffering, but branch selection depends on MLS replay, retained anchors, and the pinned protocol
+policy.
 
 The handoff is:
 
@@ -28,19 +29,19 @@ canonicalize(engine_state, pending_messages, outbound_intents, policy, clock)
 ```
 
 Implementations may call this operation after each ingest, after a sync batch, after relay input becomes idle, or on
-demand. The result MUST be the same for the same inputs, retained anchor, policy, engine version, and lifecycle clock
-state.
+demand. The result MUST be the same for the same inputs, retained anchor, pinned protocol policy, engine version, and
+lifecycle clock state.
 
 ## Core Invariant
 
-Two honest engines with the same retained anchor, the same pending set, the same negotiated policy, and the same engine
-version MUST produce the same canonical branch and the same protocol message dispositions.
+Two honest engines with the same retained anchor, the same pending set, the same pinned protocol policy, and the same
+engine version MUST produce the same canonical branch and the same protocol message dispositions.
 
 ```text
 same anchor
 + same retained candidate states
 + same pending messages
-+ same policy
++ same pinned protocol policy
 + same engine version
 = same CanonicalizationResult
 ```
@@ -85,9 +86,10 @@ Statuses:
 Convergence-relevant input includes commits, proposals, and app messages that can affect branch witness scores. Pure
 duplicate messages do not reset the quiescence timer.
 
-`settlement_quiescence_ms` MUST be tunable. Groups SHOULD publish a recommended value. Clients MAY choose a longer local
-value, but MUST NOT choose a value below a group-required minimum. A value that is too high can pin clients in
-`Syncing`; a value that is too low can cause avoidable forks. Conformance tests SHOULD model both failure modes.
+Under v1, `settlement_quiescence_ms` is the protocol-pinned `1000` ms. It is not group-negotiated or a local production
+preference. Dev/test builds MAY expose an explicit override for deterministic harnesses, but production clients MUST
+use the pinned value. A future change requires a new app component behind a required capability so every participant
+uses the same policy version.
 
 The branch selection function itself MUST NOT depend on wall-clock time. Time only gates when the engine is willing to
 publish outbound work.
@@ -184,26 +186,23 @@ The engine MUST queue outbound intents while convergence is not `Settled`.
 
 ## Policy
 
-The convergence policy is a group policy. Unsupported policy is a capability mismatch.
+The adopted v1 convergence policy is pinned by the protocol:
 
 ```text
-ConvergencePolicy {
+convergence_policy = {
   max_rewind_commits: 5,
-  app_message_past_epoch_limit: FromMlsConfiguration,
-  settlement_quiescence_ms,
-  witness_quorum,
-  max_witness_override_depth,
+  app_payload_past_epoch_limit: 5,
+  settlement_quiescence_ms: 1000,
+  witness_quorum_senders_per_epoch: 2,
+  witness_quorum_epochs: 1,
+  max_witness_override_depth: 1,
 }
 ```
 
-`max_rewind_commits` defaults to 5 and is normative for v0 groups unless the group negotiates another value.
-
-Engines MUST persist the negotiated policy per group. After restart, the engine MUST load the stored group policy before
-computing retained anchors, pruning snapshots, selecting candidate branches, or deciding whether a stale commit is
-inside the rewind horizon. A local default is only a fallback for groups that do not yet have a stored policy.
-
-Until MLS app components carry this policy, v0 engines use the local default policy and store explicit policy bytes when
-a group has negotiated or otherwise configured an override.
+These values are protocol constants, not per-group state or local production preferences. Engines MUST NOT negotiate,
+persist, or accept alternate values under v1. A future policy change requires a new app component behind a required
+capability. The canonical definition lives in the adopted Marmot
+[`protocol-core/convergence.md`](https://github.com/marmot-protocol/marmot/blob/master/protocol-core/convergence.md).
 
 The same value bounds retained anchor snapshots. At current tip `T`, the oldest retained anchor is:
 
@@ -214,30 +213,12 @@ oldest_retained_anchor = T - max_rewind_commits
 Engines MUST retain snapshots for the current tip and every epoch at or after that anchor. Engines MUST prune older
 retained anchors as soon as a successful canonicalization pass reaches `Settled` and advances the current tip.
 
-`app_message_past_epoch_limit` MUST follow the MLS configuration used by the engine for decrypting past-epoch
-application messages. App messages outside that limit are discarded or reported as expired. The engine MUST NOT invent a
-separate app-message rewind horizon.
+`app_payload_past_epoch_limit` MUST also configure the MLS past-epoch decryption window. App messages outside that
+limit are discarded or reported as expired. The engine MUST NOT invent a separate app-message rewind horizon.
 
-`witness_quorum` SHOULD be derived from active group size. The exact function is part of group policy:
-
-```text
-DerivedWitnessQuorum {
-  min_senders_per_epoch,
-  max_senders_per_epoch,
-  sender_fraction_bps,
-  required_epochs,
-}
-
-witness_quorum_senders_per_epoch =
-  clamp(
-    ceil(active_members_at_epoch * sender_fraction_bps / 10000),
-    min_senders_per_epoch,
-    max_senders_per_epoch
-  )
-```
-
-The derived sender count is evaluated per epoch against that epoch's active membership. This keeps the rule
-deterministic across membership changes.
+Witness quorum is met when at least `witness_quorum_senders_per_epoch` distinct senders produced valid app messages on
+at least `witness_quorum_epochs` branch epochs. The bounded witness boost adds at most
+`max_witness_override_depth` to effective commit depth.
 
 ## Candidate-State Graph
 
@@ -276,7 +257,9 @@ Branch scoring follows [`distributed-convergence.md`](./distributed-convergence.
 2. Witness quorum beats no quorum.
 3. Higher raw commit depth.
 4. Higher app-witness score.
-5. Lower tip commit digest.
+5. Lower tip commit priority (`Privileged` before `Ordinary`).
+6. Lower authenticated tip committer account id.
+7. Lower tip commit digest.
 
 ## Proposals
 
@@ -427,7 +410,6 @@ The engine MUST persist enough state to reproduce canonicalization after a resta
 
 Required storage:
 
-- negotiated convergence policy and engine version, stored per group and loaded before convergence after restart,
 - finalized anchor and anchor epoch,
 - retained Marmot and OpenMLS epoch snapshots from the current tip back through `max_rewind_commits`,
 - canonical commit sequence from the anchor to the selected tip,
@@ -444,10 +426,15 @@ Required storage:
 - last successful canonicalization result,
 - last convergence-relevant input time for sync quiescence.
 
-Storage MAY discard candidate states, pending messages, retained anchors, and app payloads outside their negotiated
-retention horizons. Once discarded, those artifacts cannot cause rollback or app-message acceptance. Invalidated message
-records SHOULD remain durable audit/debug records even when they are no longer replayable. Applications MAY surface
-invalidated app messages according to local UX policy.
+The current v1 implementation does not persist convergence-policy constants or an engine version per group: the policy
+is protocol-pinned, and the on-disk schema is versioned through storage migrations. If a future policy revision needs
+on-disk compatibility detection, it MUST introduce an explicit policy-version stamp and migration before engines accept
+that revision.
+
+Storage MAY discard candidate states, pending messages, retained anchors, and app payloads outside their pinned
+retention horizons. Once discarded, those artifacts cannot cause rollback or app-message acceptance. Invalidated
+message records SHOULD remain durable audit/debug records even when they are no longer replayable. Applications MAY
+surface invalidated app messages according to local UX policy.
 
 When storage discards a retained anchor, later commits that require that anchor fall into one of two outcomes:
 `MissingRetainedAnchor` if the commit is still inside the configured rewind window but the snapshot is absent, or

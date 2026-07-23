@@ -80,7 +80,7 @@ Late commits are handled by their source epoch:
   as invalidated.
 
 This rule is the local storage boundary for the forward-secrecy tradeoff. A client cannot be forced to replay commits
-older than the group policy says it will retain.
+older than the pinned protocol policy says it will retain.
 
 ## Convergence Status
 
@@ -137,7 +137,12 @@ Branches are compared in this order:
 2. Witness quorum beats no quorum.
 3. Higher `valid_commit_depth`.
 4. Higher `app_witness_score`.
-5. Lower tip commit digest.
+5. Prefer a `Privileged` tip commit over an `Ordinary` one.
+6. Lower authenticated tip committer account id.
+7. Lower tip commit digest.
+
+The conformance scenario
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 4 and 5.
 
 ```mermaid
 flowchart TD
@@ -145,7 +150,7 @@ flowchart TD
     B --> C["Drop branches outside rewind horizon"]
     C --> D["Count distinct app witnesses per epoch"]
     D --> E["Apply bounded quorum boost"]
-    E --> F["Tie-break by raw depth, witness score, digest"]
+    E --> F["Tie-break by raw depth, witness score, priority, committer, digest"]
     F --> G["Materialize selected branch"]
     F --> H["Mark losing-branch messages invalidated"]
 ```
@@ -156,51 +161,51 @@ with message volume.
 
 ## Policy
 
-The convergence policy should be group-negotiated. Working defaults:
+The adopted v1 convergence policy is pinned by the protocol:
 
 ```text
 convergence_policy = {
   max_rewind_commits: 5,
-  witness_quorum_senders_per_epoch: <group policy>,
-  witness_quorum_epochs: <group policy>,
-  max_witness_override_depth: <group policy>,   // MUST be <= max_rewind_commits
+  app_payload_past_epoch_limit: 5,
+  settlement_quiescence_ms: 1000,
+  witness_quorum_senders_per_epoch: 2,
+  witness_quorum_epochs: 1,
+  max_witness_override_depth: 1,
 }
 ```
 
-`max_witness_override_depth` MUST NOT exceed `max_rewind_commits` (the worked example below uses `2` against the default
-`5`). The engine enforces this bound — `ConvergencePolicy::validate` rejects an out-of-bound policy when it is set or
-decoded — so the witness-quorum boost can never push a branch past the rollback horizon.
-
-`max_rewind_commits` also bounds snapshot retention, so the forward-secrecy cost is explicit. The engine persists the
-per-group policy and uses that stored value after restart. Once MLS app components are available, the policy should live
-there. Until then, Marmot can carry it in a group context extension and treat an unsupported policy as a capability
-mismatch.
+These are protocol constants, not group state or local preferences. `max_witness_override_depth` remains bounded by
+`max_rewind_commits`, so the witness-quorum boost can never push a branch past the rollback horizon.
+`max_rewind_commits` also bounds snapshot retention, making the forward-secrecy cost explicit. A future policy change
+requires a new app component behind a required capability; v1 clients MUST NOT negotiate or accept alternate values.
+The canonical definition lives in the adopted Marmot
+[`protocol-core/convergence.md`](https://github.com/marmot-protocol/marmot/blob/master/protocol-core/convergence.md).
 
 ## Examples
 
 ### Equal-depth fork
 
 Two branches both have depth 2. One branch has app witnesses from more distinct members. The witnessed branch wins
-before digest tie-break.
+before priority, committer, and digest tie-breaks.
 
 ### Withheld private branch
 
-The live branch has 3 commits and witness quorum across 2 epochs. A private branch later publishes 5 commits from the
-same fork. If `max_witness_override_depth = 2`, the live branch receives a bounded boost and wins the tie:
+The live branch has 3 commits and witness quorum. A private branch later publishes 4 commits from the same fork. Under
+the pinned v1 `max_witness_override_depth = 1`, the live branch receives a bounded boost and wins the tie:
 
 ```text
-live:     depth 3 + quorum boost 2 = effective 5
-private:  depth 5 + quorum boost 0 = effective 5
+live:     depth 3 + quorum boost 1 = effective 4
+private:  depth 4 + quorum boost 0 = effective 4
 winner:   live branch, because quorum beats no quorum
 ```
 
 ### Longer valid branch
 
-The live branch has 3 commits plus quorum boost 2. A competing branch has 6 valid commits. The longer branch wins:
+The live branch has 3 commits plus quorum boost 1. A competing branch has 5 valid commits. The longer branch wins:
 
 ```text
-live:      effective 5
-competing: effective 6
+live:      effective 4
+competing: effective 5
 winner:    competing branch
 ```
 
@@ -248,9 +253,9 @@ Tamarin is a good fit for the security-adjacent part of this model if we keep th
 
 The initial scaffold lives in
 [`formal/tamarin/distributed_convergence_v0.spthy`](../../formal/tamarin/distributed_convergence_v0.spthy). It models
-the selector boundary only: two honest clients, the same valid candidate set, the same negotiated policy, and
-deterministic branch selection. Scores are represented as bounded symbolic classes so the model can prove the comparison
-order without modeling MLS internals.
+the selector boundary only: two honest clients, the same valid candidate set, a projection of the pinned policy containing
+only the selector-relevant rewind and quorum fields, and deterministic branch selection. Scores are represented as bounded
+symbolic classes so the model can prove the comparison order without modeling MLS internals.
 
 Model first:
 

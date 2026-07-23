@@ -55,13 +55,13 @@ The engine emits:
 
 ## Core Invariant
 
-Two honest engines with the same retained anchor, pending message set, negotiated policy, engine version, and lifecycle
-clock inputs MUST select the same canonical branch and produce the same protocol dispositions.
+Two honest engines with the same retained anchor, pending message set, pinned protocol policy, engine version, and
+lifecycle clock inputs MUST select the same canonical branch and produce the same protocol dispositions.
 
 ```text
 same retained anchor
 + same pending messages
-+ same negotiated policy
++ same pinned protocol policy
 + same engine version
 + same lifecycle clock inputs
 = same canonical branch and dispositions
@@ -194,8 +194,8 @@ pause later queued work until `confirm_published` or `publish_failed` resolves t
 
 ## Commit Convergence
 
-Commits are the consensus log. All honest engines that see the same valid commit set and policy MUST process commits in
-the same canonical order.
+Commits are the consensus log. All honest engines that see the same valid commit set under the same pinned protocol
+policy MUST process commits in the same canonical order.
 
 The engine builds a bounded candidate-state graph from retained MLS snapshots. Production engines MUST derive candidate
 edges by replaying MLS bytes against retained snapshots. They MUST NOT trust transport-provided parent metadata.
@@ -246,7 +246,7 @@ Branch selection uses these values:
 - `app_witness_score`: the sum of distinct app-message senders counted per branch epoch, capped by that epoch's sender
   quorum.
 - `witness_quorum_met`: true when the branch has enough distinct app-message senders in enough branch epochs under the
-  group policy.
+  pinned protocol policy.
 - `effective_commit_depth`: `raw_commit_depth` plus the bounded witness boost when `witness_quorum_met` is true.
 
 Witnesses are evidence that group members used a branch after it was created. They do not create epochs, apply commits,
@@ -258,12 +258,17 @@ Branches are compared in this order:
 2. Witness quorum beats no quorum.
 3. Higher raw commit depth.
 4. Higher app-witness score.
-5. Lower tip commit digest.
+5. Lower tip commit priority (`Privileged` before `Ordinary`).
+6. Lower authenticated tip committer account id.
+7. Lower tip commit digest.
+
+The conformance scenario
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 4 and 5.
 
 Application witnesses are valid application messages that decrypt against a candidate state. Witness score counts
 distinct senders per epoch. One sender cannot increase score by sending many messages in the same epoch.
 
-The group policy defines the quorum. A typical policy uses:
+The pinned protocol policy defines the quorum through:
 
 ```text
 witness_quorum_senders_per_epoch
@@ -282,7 +287,7 @@ epoch_witness_score =
 A branch meets witness quorum when at least `witness_quorum_senders_per_epoch` distinct senders witnessed at least
 `witness_quorum_epochs` branch epochs.
 
-When a branch meets witness quorum, the selector MAY add a bounded boost:
+When a branch meets witness quorum, the selector adds the pinned bounded boost:
 
 ```text
 effective_commit_depth =
@@ -290,42 +295,42 @@ effective_commit_depth =
   + (witness_quorum_met ? max_witness_override_depth : 0)
 ```
 
-This boost is capped. If `max_witness_override_depth = 2`, witness quorum can make a branch compare as up to two commits
-deeper. It cannot compare as three or more commits deeper, no matter how many app messages exist.
+This boost is capped. Under the pinned v1 policy, `max_witness_override_depth = 1`, so witness quorum can make a branch
+compare as one commit deeper. It cannot compare as two or more commits deeper, no matter how many app messages exist.
 
-Example with `max_witness_override_depth = 2`:
+Example with the pinned v1 policy:
 
 ```text
 live branch:
   raw_commit_depth = 3
   witness_quorum_met = true
-  effective_commit_depth = 5
+  effective_commit_depth = 4
+
+private branch:
+  raw_commit_depth = 4
+  witness_quorum_met = false
+  effective_commit_depth = 4
+
+winner: live branch, because effective depth ties and witness quorum beats no quorum
+```
+
+The witnessed branch wins because the group had broad app-message evidence on that branch, and the competing branch is
+only one commit deeper.
+
+Another example with the pinned v1 policy:
+
+```text
+live branch:
+  raw_commit_depth = 3
+  witness_quorum_met = true
+  effective_commit_depth = 4
 
 private branch:
   raw_commit_depth = 5
   witness_quorum_met = false
   effective_commit_depth = 5
 
-winner: live branch, because effective depth ties and witness quorum beats no quorum
-```
-
-The witnessed branch wins because the group had broad app-message evidence on that branch, and the competing branch is
-only two commits deeper.
-
-Another example with the same policy:
-
-```text
-live branch:
-  raw_commit_depth = 3
-  witness_quorum_met = true
-  effective_commit_depth = 5
-
-private branch:
-  raw_commit_depth = 6
-  witness_quorum_met = false
-  effective_commit_depth = 6
-
-winner: private branch, because it is more than two valid commits deeper
+winner: private branch, because it is more than one valid commit deeper
 ```
 
 The cap keeps app-message evidence secondary to the commit log. Witness quorum can protect the branch most members were
@@ -371,19 +376,21 @@ The engine MUST NOT emit an invalidated message as a normal received message.
 
 ## Policy
 
-Convergence policy is group policy. Engines MUST persist the negotiated policy per group and load it before convergence
-after restart.
+The adopted v1 convergence policy is pinned by the protocol:
 
-The policy contains:
+```text
+max_rewind_commits = 5
+app_payload_past_epoch_limit = 5
+settlement_quiescence_ms = 1000
+witness_quorum_senders_per_epoch = 2
+witness_quorum_epochs = 1
+max_witness_override_depth = 1
+```
 
-- `max_rewind_commits`, default 5 for v0 groups.
-- app-message past-epoch limit, derived from the MLS configuration.
-- stable quiescence duration.
-- witness quorum parameters.
-- `max_witness_override_depth`.
-
-Unsupported policy is a capability mismatch. A local default is only a fallback for groups that do not yet have a stored
-policy.
+These are protocol constants, not group state or local preferences. A future policy change requires a new app component
+behind a required capability; clients MUST NOT negotiate or accept alternate values under v1. The canonical definition
+lives in the adopted Marmot
+[`protocol-core/convergence.md`](https://github.com/marmot-protocol/marmot/blob/master/protocol-core/convergence.md).
 
 The branch selection function MUST NOT depend on wall-clock time. Local monotonic time only gates sync stability and
 outbound publication.
@@ -396,7 +403,6 @@ Required storage:
 
 - group metadata and current epoch,
 - OpenMLS state,
-- negotiated convergence policy and engine version,
 - retained Marmot and OpenMLS snapshots from current tip back through `max_rewind_commits`,
 - durable message records for retained commits, proposals, app messages, and welcomes, with typed stored payloads
   distinguishing raw transport bytes from peeled OpenMLS wire bytes,
@@ -408,11 +414,15 @@ Required storage:
 - queued outbound intents,
 - last convergence-relevant input time.
 
+The current storage does not persist convergence-policy constants or an engine version per group. V1 constants are
+protocol-pinned, and the on-disk schema is versioned through storage migrations. A future policy revision that needs
+on-disk compatibility detection requires an explicit policy-version stamp and migration.
+
 Snapshot and rollback MUST be atomic across Marmot metadata and OpenMLS state. A rollback that restores only one side is
 invalid.
 
-Storage MAY discard artifacts outside negotiated retention horizons. Once discarded, those artifacts cannot cause
-rollback or app-message acceptance.
+Storage MAY discard artifacts outside the pinned protocol retention horizons. Once discarded, those artifacts cannot
+cause rollback or app-message acceptance.
 
 ## Errors And Dispositions
 

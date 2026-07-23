@@ -166,6 +166,10 @@ fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
         validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
         Err("encrypted media endpoint URL must not point at a non-routable address".into())
     );
+    assert_eq!(
+        validate_and_normalize_blob_endpoint_url("https://[2001:2::1]", false),
+        Err("encrypted media endpoint URL must not point at a non-routable address".into())
+    );
     for raw in ["https://localhost./", "https://sub.localhost./"] {
         assert_eq!(
             validate_and_normalize_blob_endpoint_url(raw, false),
@@ -386,6 +390,23 @@ fn group_avatar_url_rejects_documentation_ipv6_ranges() {
     assert!(validate_and_normalize_group_avatar_url("https://[3ffe::1]/a.png").is_ok());
     assert!(validate_and_normalize_group_avatar_url("https://[3fff:1000::1]/a.png").is_ok());
     assert!(validate_and_normalize_group_avatar_url("https://[2606:4700::1]/a.png").is_ok());
+}
+
+#[test]
+fn group_avatar_url_rejects_iana_special_purpose_ipv6_pool() {
+    for raw in [
+        "https://[2001:1::1]/a.png",
+        "https://[2001:2::1]/a.png",
+        "https://[2001:4:112::1]/a.png",
+        "https://[2001:20::1]/a.png",
+        "https://[2001:1ff:ffff::1]/a.png",
+    ] {
+        assert!(
+            validate_and_normalize_group_avatar_url(raw).is_err(),
+            "{raw} should be rejected"
+        );
+    }
+    assert!(validate_and_normalize_group_avatar_url("https://[2001:200::1]/a.png").is_ok());
 }
 
 #[test]

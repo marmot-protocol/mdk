@@ -327,12 +327,35 @@ impl DaemonClient {
 }
 
 pub(crate) async fn write_daemon_output(stream: &mut UnixStream, output: &CliOutput) {
+    let _ = write_daemon_output_within(stream, output, DAEMON_RESPONSE_WRITE_TIMEOUT).await;
+}
+
+/// Write, flush, and close one daemon response within one deadline.
+///
+/// `false` is connection-fatal: the future may have been dropped after a
+/// partial frame was written, so callers must drop the stream and never retry
+/// or write another frame on it.
+pub(crate) async fn write_daemon_output_within<W>(
+    stream: &mut W,
+    output: &CliOutput,
+    timeout_after: Duration,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     let Ok(mut response) = serde_json::to_vec(output) else {
-        return;
+        return false;
     };
     response.push(b'\n');
-    let _ = stream.write_all(&response).await;
-    let _ = stream.shutdown().await;
+    matches!(
+        tokio::time::timeout(timeout_after, async {
+            stream.write_all(&response).await?;
+            stream.flush().await?;
+            stream.shutdown().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 pub(crate) async fn read_daemon_request(
@@ -389,11 +412,34 @@ pub(crate) async fn write_stream_response(
     stream: &mut UnixStream,
     response: &DaemonStreamResponse,
 ) -> bool {
+    write_stream_response_within(stream, response, DAEMON_RESPONSE_WRITE_TIMEOUT).await
+}
+
+/// Write and flush one streaming response within one deadline.
+///
+/// `false` is connection-fatal: the future may have been dropped after a
+/// partial frame was written, so callers must drop the stream and never retry
+/// or write another frame on it.
+pub(crate) async fn write_stream_response_within<W>(
+    stream: &mut W,
+    response: &DaemonStreamResponse,
+    timeout_after: Duration,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     let Ok(mut bytes) = serde_json::to_vec(response) else {
         return false;
     };
     bytes.push(b'\n');
-    stream.write_all(&bytes).await.is_ok()
+    matches!(
+        tokio::time::timeout(timeout_after, async {
+            stream.write_all(&bytes).await?;
+            stream.flush().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 pub(crate) async fn write_stream_end(stream: &mut UnixStream) -> bool {

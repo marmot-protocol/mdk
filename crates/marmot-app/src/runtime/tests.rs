@@ -19,12 +19,16 @@ fn message_subscription_seen_ids_are_bounded_to_recent_ids() {
 }
 
 #[test]
-fn message_subscription_seen_ids_do_not_store_empty_ids() {
+fn live_message_subscription_emits_each_empty_id_without_storing_it() {
     let mut seen = MessageSubscriptionSeenIds::with_limit(1);
 
-    assert!(seen.insert(String::new()));
-    assert!(seen.insert(String::new()));
+    // Both live updates must be emitted; the first empty id must not poison
+    // dedupe state for the second. `subscribe_messages` routes its live and
+    // recovery paths through this same decision.
+    assert!(seen.should_emit(String::new()));
+    assert!(seen.should_emit(String::new()));
     assert_eq!(seen.len(), 0);
+    assert!(!seen.contains(""));
 }
 
 #[test]

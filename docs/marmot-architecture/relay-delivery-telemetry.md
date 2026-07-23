@@ -17,8 +17,8 @@ Completeness is unsolvable in the strong sense, and no ordering or consensus mec
 The convergence model already accepts this. It does not try to *achieve* completeness; it makes gaps **detectable** (a
 commit whose parent is unknown is deferred, not applied) and **bounds the damage** of a missing message (`max_rewind_commits`
 plus witness quorum). What remains is the one place where the design still substitutes a heuristic for completeness: the
-decision to stop waiting and settle. Today that decision is `settlement_quiescence_ms`, a group-negotiated constant. We
-do not have a principled basis for its value.
+decision to stop waiting and settle. Today that decision is the protocol-pinned
+`settlement_quiescence_ms = 1000`. We need evidence to validate that value and to inform any future protocol revision.
 
 This note specifies what to measure to set it, and how the measurement maps onto the convergence machine.
 
@@ -117,21 +117,22 @@ timing land via the raw per-relay event/EOSE stream (phase 2; see [Instrumentati
 
 ## Choosing the static value
 
-`settlement_quiescence_ms` is a single group-negotiated constant. It is **not** computed per client and it does **not**
-adapt at runtime. The point of this telemetry is the opposite of auto-tuning: it lets an operator choose the right
-constant from real data, once, and set it in group policy. The procedure is offline:
+`settlement_quiescence_ms` is a single protocol-pinned constant. It is **not** computed per client, negotiated per
+group, or adapted at runtime. The point of this telemetry is the opposite of auto-tuning: it lets protocol maintainers
+validate the current value from real data and evaluate a future policy revision. The procedure is offline:
 
 - **Gather.** Collect `cross_relay_spread` (and, for the initial-sync side, the EOSE / first-event timing) across the
   real relay population and real groups, aggregated into the histograms this telemetry already produces.
 - **Read the distribution.** Pick a candidate operating point — for example a high percentile of the steady-state spread
   plus margin. The loss function is asymmetric: too low costs extra post-settle reorgs (observable as
   `observed_reorg_rate`), too high costs liveness. Move the candidate until the reorg rate is acceptable.
-- **Set the constant.** Encode the chosen value in the negotiated convergence policy. Every member processing an epoch
-  uses the same policy bytes; this is not a local preference.
+- **Propose a protocol revision.** If the evidence justifies a different value, specify it through a new app component
+  behind a required capability. Every participant processing an epoch must use the same policy version; this is not a
+  per-group or local preference.
 
-The existing policy already treats `settlement_quiescence_ms` as a floor a client MAY exceed, but only as a deliberate
-static configuration choice — never derived from a client's own live measurements. The measurement-to-value step is a
-human decision fed by dashboards, not a runtime controller.
+V1 clients use the exact pinned value in production. Dev/test-only overrides exist to make harnesses deterministic, but
+must not ship as production policy. The measurement-to-value step is a human protocol-design decision fed by
+dashboards, not a runtime controller.
 
 ## Validation: post-settle reorg rate
 
@@ -261,8 +262,9 @@ the engine against settle outcomes and is out of scope for the adapter.
    convergence apply site and exposes them via `Engine::engine_metrics()`
    ([`crates/cgka-engine/src/engine_metrics.rs`](../../crates/cgka-engine/src/engine_metrics.rs)); see
    [Validation: post-settle reorg rate](#validation-post-settle-reorg-rate).
-4. **Set the static value from data.** Aggregate (1) and (3) over real relays and groups, read the distributions, and
-   choose the negotiated `settlement_quiescence_ms`. An offline operator/analysis step, not a runtime controller.
+4. **Validate the static value from data.** Aggregate (1) and (3) over real relays and groups, read the distributions,
+   and decide whether the pinned `settlement_quiescence_ms` needs a capability-gated protocol revision. An offline
+   protocol-design step, not a runtime controller.
 5. **Set reconciliation (NIP-77).** Fetch-completeness backstop for backdated late commits.
 
 Each phase is independently useful and independently shippable, and (1) de-risks the rest by telling us what our relay

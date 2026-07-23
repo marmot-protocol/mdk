@@ -101,9 +101,16 @@ pub fn is_public_ipv6(addr: Ipv6Addr) -> bool {
     if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 {
         return false;
     }
-    // Reject IPv6 transition mechanisms that can route to an embedded IPv4
-    // endpoint through host-local tunnel configuration, bypassing IPv4 checks.
-    if first == 0x2002 || (first == 0x2001 && second == 0x0000) {
+    // Reject the IANA IPv6 special-purpose pool 2001::/23. Individual
+    // allocations include transition, benchmarking, anycast, and identifier
+    // ranges; they are not general public dial targets. The adjacent
+    // 2001:200::/23 RIR allocation remains eligible.
+    if first == 0x2001 && second <= 0x01ff {
+        return false;
+    }
+    // Reject 6to4, which can route to an embedded IPv4 endpoint through
+    // host-local tunnel configuration and bypass IPv4 checks.
+    if first == 0x2002 {
         return false;
     }
     if first == 0x2001 && second == 0x0db8 {
