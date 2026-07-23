@@ -24,6 +24,9 @@ use cgka_traits::app_components::{
     default_group_components, encode_component_vectors, encode_components_list,
     encode_group_avatar_url_v1, encode_nostr_routing_v1,
 };
+use cgka_traits::app_event::{
+    AppMessageRetentionDecision, MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent,
+};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
@@ -1620,6 +1623,146 @@ async fn convergence_emits_attributed_message_retention_change_events() {
         )),
         "convergence apply must emit an attributed MessageRetentionChanged for alice, got: {events:?}",
     );
+}
+
+#[tokio::test]
+async fn delayed_app_messages_pin_retention_from_their_source_epoch() {
+    let (mut alice, mut bob, gid) = create_pair().await;
+    let alice_pubkey = hex::encode(alice.self_id().as_slice());
+
+    let before_enable_payload = MarmotAppEvent::new(
+        alice_pubkey.clone(),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "before retention",
+    )
+    .encode()
+    .unwrap();
+    let before_enable_event_id = MarmotAppEvent::decode(&before_enable_payload).unwrap().id;
+    let before_enable = match alice
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload: before_enable_payload,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage {
+            msg,
+            group_id,
+            app_event_id,
+            source_epoch,
+            retention,
+        } => {
+            assert_eq!(group_id, gid);
+            assert_eq!(app_event_id, before_enable_event_id);
+            assert_eq!(source_epoch, cgka_traits::EpochId(1));
+            assert_eq!(
+                retention,
+                AppMessageRetentionDecision::new(1_700_000_000, 0)
+            );
+            route_to_group(&msg, &gid)
+        }
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+
+    let enable = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (enable_commit, enable_pending) = match enable {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(enable_pending).await.unwrap();
+    bob.ingest(route_to_group(&enable_commit, &gid))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    bob.drain_events();
+
+    bob.ingest(before_enable).await.unwrap();
+    assert!(bob.drain_events().iter().any(|event| matches!(
+        event,
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            retention: Some(decision),
+            ..
+        } if *decision == AppMessageRetentionDecision::new(1_700_000_000, 0)
+    )));
+
+    let before_disable_payload = MarmotAppEvent::new(
+        alice_pubkey,
+        1_700_000_100,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "before disable",
+    )
+    .encode()
+    .unwrap();
+    let before_disable_event_id = MarmotAppEvent::decode(&before_disable_payload).unwrap().id;
+    let before_disable = match alice
+        .send(SendIntent::AppMessage {
+            group_id: gid.clone(),
+            payload: before_disable_payload,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage {
+            msg,
+            group_id,
+            app_event_id,
+            source_epoch,
+            retention,
+        } => {
+            assert_eq!(group_id, gid);
+            assert_eq!(app_event_id, before_disable_event_id);
+            assert_eq!(source_epoch, cgka_traits::EpochId(2));
+            assert_eq!(
+                retention,
+                AppMessageRetentionDecision::new(1_700_000_100, 60)
+            );
+            route_to_group(&msg, &gid)
+        }
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+
+    let disable = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 0u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (disable_commit, disable_pending) = match disable {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(disable_pending).await.unwrap();
+    bob.ingest(route_to_group(&disable_commit, &gid))
+        .await
+        .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+    bob.drain_events();
+
+    bob.ingest(before_disable).await.unwrap();
+    assert!(bob.drain_events().iter().any(|event| matches!(
+        event,
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            retention: Some(decision),
+            ..
+        } if *decision == AppMessageRetentionDecision::new(1_700_000_100, 60)
+    )));
 }
 
 // ── Concurrent-rename supersession (issue #363) ─────────────────────────────

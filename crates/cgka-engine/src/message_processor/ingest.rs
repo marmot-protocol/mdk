@@ -18,6 +18,7 @@ use crate::openmls_projection::{
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::snapshot_guard::SnapshotRollbackGuard;
+use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::{
     AutoPublish, CommitOrderingKey, CommitOrderingPriority, GroupEvent, GroupStateChange,
     GroupStateInvalidationReason,
@@ -40,6 +41,7 @@ use tls_codec::{Deserialize as _, Serialize as _};
 struct PastPeelRecovery {
     peeled: cgka_traits::ingest::PeeledMessage,
     source_epoch: EpochId,
+    message_retention_seconds: Option<u64>,
     snapshot_name: String,
     attempt_count: u64,
 }
@@ -289,6 +291,7 @@ impl<S: StorageProvider> Engine<S> {
                     },
                 );
             }
+            let mut recovered_source_retention = None;
             let peeled = match peel_result {
                 Ok(p) => p,
                 Err(PeelerError::DecryptFailed) => {
@@ -319,6 +322,8 @@ impl<S: StorageProvider> Engine<S> {
                         Err(e) => return Err(e),
                     };
                     if let Some(recovery) = recovered {
+                        recovered_source_retention =
+                            Some((recovery.source_epoch, recovery.message_retention_seconds));
                         self.audit_group(
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -416,6 +421,8 @@ impl<S: StorageProvider> Engine<S> {
                         Err(e) => return Err(e),
                     };
                     if let Some(recovery) = recovered {
+                        recovered_source_retention =
+                            Some((recovery.source_epoch, recovery.message_retention_seconds));
                         self.audit_group(
                             &group_id,
                             marmot_forensics::AuditEventKind::PeelerOutcome {
@@ -898,25 +905,49 @@ impl<S: StorageProvider> Engine<S> {
                         });
                     };
                     let payload = bytes.into_bytes();
-                    if crate::app_payload::validate_app_payload_for_sender(&payload, &sender)
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            target: "cgka_engine::message_processor",
-                            method = "ingest_group_message",
-                            "dropping application message with invalid Marmot app event",
-                        );
-                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                        // Peeled successfully but terminally rejected: retire
-                        // the raw deferred row (mdk#339).
-                        self.mark_raw_transport_message_failed_if_awaiting_retry(
-                            &raw_msg_id,
-                            "invalid_app_payload",
-                        )?;
-                        return Ok(IngestOutcome::Stale {
-                            reason: StaleReason::PeelFailed,
-                        });
-                    }
+                    let app_event = match crate::app_payload::validate_app_payload_for_sender(
+                        &payload, &sender,
+                    ) {
+                        Ok(event) => event,
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "cgka_engine::message_processor",
+                                method = "ingest_group_message",
+                                "dropping application message with invalid Marmot app event",
+                            );
+                            self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                            // Peeled successfully but terminally rejected: retire
+                            // the raw deferred row (mdk#339).
+                            self.mark_raw_transport_message_failed_if_awaiting_retry(
+                                &raw_msg_id,
+                                "invalid_app_payload",
+                            )?;
+                            return Ok(IngestOutcome::Stale {
+                                reason: StaleReason::PeelFailed,
+                            });
+                        }
+                    };
+                    let retention_seconds = if msg_epoch == current_epoch {
+                        Some(
+                            crate::app_components::message_retention_seconds_of_group(&mls_group)?
+                                .unwrap_or(0),
+                        )
+                    } else {
+                        let recovered =
+                            recovered_source_retention.and_then(|(snapshot_epoch, seconds)| {
+                                (snapshot_epoch == msg_epoch).then_some(seconds.unwrap_or(0))
+                            });
+                        match recovered {
+                            Some(seconds) => Some(seconds),
+                            None => self
+                                .message_retention_seconds_for_retained_source_epoch(
+                                    &group_id,
+                                    msg_epoch,
+                                    current_epoch,
+                                )?
+                                .map(|seconds| seconds.unwrap_or(0)),
+                        }
+                    };
                     // Full-data forensic mode: surface the decrypted app content
                     // and authenticated author. Strictly gated — obfuscated mode
                     // never decodes or logs plaintext/author identities.
@@ -934,6 +965,9 @@ impl<S: StorageProvider> Engine<S> {
                         sender,
                         epoch: msg_epoch,
                         payload,
+                        retention: retention_seconds.map(|seconds| {
+                            AppMessageRetentionDecision::new(app_event.created_at, seconds)
+                        }),
                     });
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     // In-memory fast path mirrors the durable record, keyed on
@@ -2047,14 +2081,15 @@ impl<S: StorageProvider> Engine<S> {
             // state.
             let guard =
                 SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_snapshot)?;
-            let ctx = match self.context_from_group_snapshot(group_id, &snapshot_name) {
-                Ok(ctx) => ctx,
-                Err(err) => {
-                    // Drop on `guard` rolls back to live + releases.
-                    guard.commit()?;
-                    return Err(err);
-                }
-            };
+            let (ctx, message_retention_seconds) =
+                match self.context_from_group_snapshot(group_id, &snapshot_name) {
+                    Ok(context) => context,
+                    Err(err) => {
+                        // Drop on `guard` rolls back to live + releases.
+                        guard.commit()?;
+                        return Err(err);
+                    }
+                };
             let peeled = self.peeler.peel_group_message(msg, &ctx).await;
             guard.commit()?;
             match peeled {
@@ -2062,6 +2097,7 @@ impl<S: StorageProvider> Engine<S> {
                     return Ok(Some(PastPeelRecovery {
                         peeled,
                         source_epoch,
+                        message_retention_seconds,
                         snapshot_name,
                         attempt_count,
                     }));
@@ -2084,6 +2120,71 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(false)
+    }
+
+    /// Resolve retention from the exact retained MLS state for a delayed
+    /// application message. The outer `Option` distinguishes a recovered
+    /// source decision from an unavailable historical policy; the inner
+    /// `Option` is the component's disabled/absent state.
+    fn message_retention_seconds_for_retained_source_epoch(
+        &self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+        current_epoch: EpochId,
+    ) -> Result<Option<Option<u64>>, EngineError> {
+        let snapshot_name = self
+            .storage
+            .list_group_snapshots(group_id)?
+            .into_iter()
+            .find(|name| {
+                retained_anchor_epoch_from_snapshot_name(name.as_str()) == Some(source_epoch.0)
+            });
+        let Some(snapshot_name) = snapshot_name else {
+            return Ok(None);
+        };
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-retention-restore/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(source_epoch.0.to_be_bytes());
+        hasher.update(current_epoch.0.to_be_bytes());
+        let restore_name = format!(
+            "retention-restore-{}-{}",
+            current_epoch.0,
+            hex::encode(&hasher.finalize()[..8])
+        );
+        let guard = SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_name)?;
+        let resolved = match self
+            .storage
+            .rollback_group_to_snapshot(group_id, &snapshot_name)
+        {
+            Ok(()) => {
+                let provider =
+                    EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+                let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+                let historical_group = MlsGroup::load(
+                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                        &provider,
+                    ),
+                    &mls_gid,
+                )
+                .map_err(|error| {
+                    EngineError::Backend(format!("load retention source snapshot: {error:?}"))
+                })?
+                .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+                if historical_group.epoch().as_u64() != source_epoch.0 {
+                    None
+                } else {
+                    Some(crate::app_components::message_retention_seconds_of_group(
+                        &historical_group,
+                    )?)
+                }
+            }
+            Err(StorageError::SnapshotMissing(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        guard.commit()?;
+        Ok(resolved)
     }
 
     pub(crate) fn available_past_peel_snapshots(
@@ -2109,7 +2210,13 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         group_id: &GroupId,
         snapshot_name: &str,
-    ) -> Result<cgka_traits::group_context::GroupContextSnapshot, EngineError> {
+    ) -> Result<
+        (
+            cgka_traits::group_context::GroupContextSnapshot,
+            Option<u64>,
+        ),
+        EngineError,
+    > {
         self.storage
             .rollback_group_to_snapshot(group_id, snapshot_name)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -2120,7 +2227,12 @@ impl<S: StorageProvider> Engine<S> {
         )
         .map_err(|e| EngineError::Backend(format!("load snapshot group: {e:?}")))?
         .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        group_lifecycle::build_group_context_snapshot(&mls_group, &provider)
+        let message_retention_seconds =
+            crate::app_components::message_retention_seconds_of_group(&mls_group)?;
+        Ok((
+            group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?,
+            message_retention_seconds,
+        ))
     }
 }
 

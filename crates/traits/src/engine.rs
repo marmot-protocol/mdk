@@ -18,6 +18,7 @@
 //! breaking the contract.
 
 use crate::app_components::{AppComponentData, AppComponentId};
+use crate::app_event::AppMessageRetentionDecision;
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
@@ -157,7 +158,17 @@ pub enum SendIntent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
     /// Pure application message — publish once, no state advance.
-    ApplicationMessage { msg: TransportMessage },
+    ApplicationMessage {
+        msg: TransportMessage,
+        group_id: GroupId,
+        /// Inner [`MarmotAppEvent::id`](crate::app_event::MarmotAppEvent)
+        /// from the encrypted application payload.
+        app_event_id: String,
+        /// Exact MLS epoch whose state encrypted this message.
+        source_epoch: EpochId,
+        /// Retention decision resolved from that same encryption state.
+        retention: AppMessageRetentionDecision,
+    },
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input. The intent
     /// will be regenerated from the canonical state when the group becomes
@@ -372,6 +383,11 @@ pub enum GroupEvent {
         sender: MemberId,
         epoch: EpochId,
         payload: Vec<u8>,
+        /// Retention policy resolved from the authenticated MLS source epoch.
+        /// `None` is a safe legacy/recovery result when that historical policy
+        /// is not recoverable; callers must not substitute the live policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retention: Option<AppMessageRetentionDecision>,
     },
     AppMessageInvalidated {
         group_id: GroupId,

@@ -591,7 +591,7 @@ impl HarnessClient {
             .await
             .expect("send app");
         match res {
-            SendResult::ApplicationMessage { msg } => {
+            SendResult::ApplicationMessage { msg, .. } => {
                 let routed = route(msg, &gid);
                 self.bus.send(self.bus_id, routed.clone());
                 routed
@@ -615,7 +615,7 @@ impl HarnessClient {
             })
             .await
             .expect("send app");
-        if let SendResult::ApplicationMessage { msg } = res {
+        if let SendResult::ApplicationMessage { msg, .. } = res {
             self.bus.send(self.bus_id, route(msg, &gid));
         } else {
             panic!("expected ApplicationMessage");
@@ -833,7 +833,7 @@ impl HarnessClient {
     async fn publish_send_result(&mut self, result: SendResult) -> Result<(), EngineError> {
         let gid = self.default_group.clone();
         match result {
-            SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
+            SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
                 let routed = if let Some(gid) = &gid {
                     route(msg, gid)
                 } else {

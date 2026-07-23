@@ -35,6 +35,7 @@ pub use cgka_traits::app_components::{
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
 };
+pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
@@ -594,6 +595,10 @@ pub struct ReceivedMessage {
     pub sender_display_name: Option<String>,
     pub group_id: GroupId,
     pub source_epoch: u64,
+    /// Retention decision pinned from this message's authenticated MLS source
+    /// epoch. `None` means the historical policy was not recoverable and is
+    /// intentionally retained rather than evaluated against live group state.
+    pub retention: Option<AppMessageRetentionDecision>,
     /// Displayed text for the inner app event (its `content`).
     pub plaintext: String,
     /// Nostr `kind` of the inner Marmot app event.
@@ -651,6 +656,10 @@ pub struct AppMessageRecord {
     pub tags: Vec<Vec<String>>,
     #[serde(default)]
     pub source_epoch: Option<u64>,
+    /// Durable source-epoch retention decision. Legacy rows are `None` and are
+    /// never destructively interpreted using the current group component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<AppMessageRetentionDecision>,
     /// Sender-authenticated inner app-event timestamp. Synthesized rows without
     /// an inner event use their local observation time.
     pub recorded_at: u64,
@@ -780,6 +789,7 @@ pub(crate) struct AppMessageProjection {
     pub(crate) kind: u64,
     pub(crate) tags: Vec<Vec<String>>,
     pub(crate) source_epoch: Option<u64>,
+    pub(crate) retention: Option<AppMessageRetentionDecision>,
     pub(crate) recorded_at: Option<u64>,
     /// Transport id of the originating commit for a synthesized kind-1210 group
     /// system row, so the row can be invalidated by origin commit if that commit
@@ -2768,7 +2778,10 @@ impl MarmotApp {
     ) -> Result<AppProjectionUpdate, AppError> {
         let storage_update = self
             .account_storage(label)?
-            .record_app_event(&stored_app_event_from_projection(message, received_at))?;
+            .record_app_event_with_retention(
+                &stored_app_event_from_projection(message, received_at),
+                message.retention,
+            )?;
         self.app_projection_update(label, storage_update)
     }
 
@@ -2784,10 +2797,32 @@ impl MarmotApp {
         let now = unix_now_seconds();
         let storage_update = self
             .account_storage(label)?
-            .record_app_event_refreshing_moderation_grant(&stored_app_event_from_projection(
-                message, now,
-            ))?;
+            .record_app_event_refreshing_moderation_grant_with_retention(
+                &stored_app_event_from_projection(message, now),
+                message.retention,
+            )?;
         self.app_projection_update(label, storage_update)
+    }
+
+    pub(crate) fn finalize_account_app_event_source_retention(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        source_message_id_hex: Option<&str>,
+        source_epoch: u64,
+        retention: AppMessageRetentionDecision,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        self.account_storage(label)?
+            .finalize_app_event_source_retention(
+                group_id_hex,
+                message_id_hex,
+                source_message_id_hex,
+                source_epoch,
+                retention,
+            )?
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
     }
 
     pub(crate) fn invalidate_timeline_source_message(
@@ -2894,15 +2929,15 @@ impl MarmotApp {
         })
     }
 
-    pub(crate) fn secure_prune_account_app_events_before(
+    pub(crate) fn secure_prune_expired_account_app_events(
         &self,
         label: &str,
         group_id_hex: &str,
-        cutoff_recorded_at: u64,
+        now: u64,
     ) -> Result<SecureDeleteExpiredResult, AppError> {
         Ok(self
             .account_storage(label)?
-            .secure_prune_app_events_before(group_id_hex, cutoff_recorded_at)?
+            .secure_prune_expired_app_events(group_id_hex, now)?
             .into())
     }
 

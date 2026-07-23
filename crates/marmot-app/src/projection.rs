@@ -576,6 +576,7 @@ impl LegacyAccountProjectionDb {
                 source_epoch: row
                     .get::<_, Option<i64>>(7)?
                     .and_then(|value| value.try_into().ok()),
+                retention: None,
                 recorded_at: recorded_at.try_into().unwrap_or_default(),
                 received_at: received_at.try_into().unwrap_or_default(),
                 // Frozen legacy migration reader (the old `messages` table): its

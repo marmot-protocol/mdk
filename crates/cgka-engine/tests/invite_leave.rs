@@ -697,7 +697,7 @@ async fn post_eviction_app_message(
         .await
         .unwrap();
     let msg = match sent {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     TransportMessage {

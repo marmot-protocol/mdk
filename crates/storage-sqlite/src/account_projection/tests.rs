@@ -1,8 +1,9 @@
 use super::*;
 use crate::{SqlCipherKey, SqliteStorageOptions, StoredAppEvent};
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_TAG,
+    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+    QUOTE_REF_TAG, STREAM_TAG,
 };
 
 /// Test twin of the app layer's transport-cursor future-skew policy (five
@@ -12,6 +13,204 @@ const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
 fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
     false
+}
+
+#[test]
+fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retention.sqlite");
+    let key = SqlCipherKey::new("source epoch retention test key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+
+    let mut due = app_event("due", "aa", 10);
+    due.source_epoch = Some(4);
+    store
+        .record_app_event_with_retention(
+            &due,
+            Some(AppMessageRetentionDecision::new(due.recorded_at, 5)),
+        )
+        .unwrap();
+
+    // A relay echo or restart replay cannot rewrite either the source epoch or
+    // the already-pinned deadline.
+    let mut duplicate = due.clone();
+    duplicate.source_epoch = Some(99);
+    store
+        .record_app_event_with_retention(
+            &duplicate,
+            Some(AppMessageRetentionDecision::new(duplicate.recorded_at, 500)),
+        )
+        .unwrap();
+
+    let later = app_event("later", "aa", 12);
+    store
+        .record_app_event_with_retention(
+            &later,
+            Some(AppMessageRetentionDecision::new(later.recorded_at, 4)),
+        )
+        .unwrap();
+    let disabled = app_event("disabled", "aa", 1);
+    store
+        .record_app_event_with_retention(
+            &disabled,
+            Some(AppMessageRetentionDecision::new(disabled.recorded_at, 0)),
+        )
+        .unwrap();
+    let overflow = app_event("overflow", "aa", 1);
+    store
+        .record_app_event_with_retention(
+            &overflow,
+            Some(AppMessageRetentionDecision::new(u64::MAX, 1)),
+        )
+        .unwrap();
+    store
+        .record_app_event(&app_event("legacy", "aa", 1))
+        .unwrap();
+    store
+        .record_app_event_with_retention(
+            &app_event("other-group", "bb", 1),
+            Some(AppMessageRetentionDecision::new(1, 1)),
+        )
+        .unwrap();
+
+    drop(store);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let records = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            limit: None,
+        })
+        .unwrap();
+    let due_record = records
+        .iter()
+        .find(|record| record.message_id_hex == "due")
+        .unwrap();
+    assert_eq!(due_record.source_epoch, Some(4));
+    assert_eq!(
+        due_record.retention,
+        Some(AppMessageRetentionDecision::new(10, 5))
+    );
+    assert_eq!(
+        records
+            .iter()
+            .find(|record| record.message_id_hex == "legacy")
+            .unwrap()
+            .retention,
+        None
+    );
+
+    let outcome = store.secure_prune_expired_app_events("aa", 15).unwrap();
+    assert_eq!(outcome.pruned_messages, 1);
+    let surviving_ids = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: None,
+            limit: None,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|record| record.message_id_hex)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!surviving_ids.contains("due"));
+    assert!(surviving_ids.contains("later"));
+    assert!(surviving_ids.contains("disabled"));
+    assert!(surviving_ids.contains("overflow"));
+    assert!(surviving_ids.contains("legacy"));
+    assert!(surviving_ids.contains("other-group"));
+
+    assert_eq!(
+        store
+            .secure_prune_expired_app_events("aa", 16)
+            .unwrap()
+            .pruned_messages,
+        1
+    );
+}
+
+#[test]
+fn optimistic_local_retention_is_finalized_once_from_matching_source_epoch() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let optimistic = app_event("local", "aa", 10);
+    store.record_app_event(&optimistic).unwrap();
+
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "local",
+                Some("transport-id"),
+                4,
+                AppMessageRetentionDecision::new(12, 5),
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "local",
+                Some("different-id"),
+                99,
+                AppMessageRetentionDecision::new(10, 500),
+            )
+            .unwrap()
+            .is_none(),
+        "a duplicate publication cannot reinterpret a finalized decision"
+    );
+
+    let mut pinned_epoch = app_event("pinned-epoch", "aa", 20);
+    pinned_epoch.source_epoch = Some(7);
+    store.record_app_event(&pinned_epoch).unwrap();
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "pinned-epoch",
+                None,
+                8,
+                AppMessageRetentionDecision::new(20, 30),
+            )
+            .unwrap()
+            .is_none(),
+        "retention from a different epoch must not attach to an existing row"
+    );
+    assert!(
+        store
+            .finalize_app_event_source_retention(
+                "aa",
+                "pinned-epoch",
+                None,
+                7,
+                AppMessageRetentionDecision::new(20, 30),
+            )
+            .unwrap()
+            .is_some()
+    );
+
+    let records = store
+        .app_messages(StoredAppMessageQuery {
+            group_id_hex: Some("aa".to_owned()),
+            limit: None,
+        })
+        .unwrap();
+    let local = records
+        .iter()
+        .find(|record| record.message_id_hex == "local")
+        .unwrap();
+    assert_eq!(local.source_epoch, Some(4));
+    assert_eq!(
+        local.retention,
+        Some(AppMessageRetentionDecision::new(12, 5))
+    );
+    let pinned = records
+        .iter()
+        .find(|record| record.message_id_hex == "pinned-epoch")
+        .unwrap();
+    assert_eq!(pinned.source_epoch, Some(7));
+    assert_eq!(
+        pinned.retention,
+        Some(AppMessageRetentionDecision::new(20, 30))
+    );
 }
 
 fn group(id: &str, name: &str) -> StoredAccountGroup {

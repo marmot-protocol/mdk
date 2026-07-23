@@ -31,10 +31,13 @@ impl AppClient {
         sender: &str,
         event: &MarmotInnerEvent,
         source_message_id_hex: Option<String>,
-        source_epoch: Option<u64>,
+        source_state: Option<(u64, crate::AppMessageRetentionDecision)>,
         advance_read_marker: bool,
     ) -> Result<crate::AppProjectionUpdate, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
+        let (source_epoch, retention) = source_state
+            .map(|(epoch, retention)| (Some(epoch), Some(retention)))
+            .unwrap_or((None, None));
         // Stamped on the sender's own store too, so a moderation delete of
         // another member's message survives local reprojection instead of
         // resurrecting the target.
@@ -50,6 +53,7 @@ impl AppClient {
             kind: event.kind,
             tags: event.tags.clone(),
             source_epoch,
+            retention,
             recorded_at: Some(event.created_at),
             // Only synthesized kind-1210 system rows carry an origin commit;
             // ordinary sent app events do not.
@@ -209,6 +213,28 @@ impl AppClient {
             .unwrap_or_else(AppGroupMessageRetentionComponent::disabled)
     }
 
+    pub(crate) fn finalize_published_app_message_source_retention(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        let mut updates = Vec::new();
+        for published in &effects.published_app_messages {
+            let group_id_hex = hex::encode(published.group_id.as_slice());
+            let source_message_id_hex = hex::encode(published.message_id.as_slice());
+            if let Some(update) = self.app.finalize_account_app_event_source_retention(
+                &self.state.label,
+                &group_id_hex,
+                &published.app_event_id,
+                Some(source_message_id_hex.as_str()),
+                published.source_epoch.0,
+                published.retention,
+            )? {
+                updates.push(update);
+            }
+        }
+        Ok(updates)
+    }
+
     pub(crate) fn prune_plaintext_retention_for_group(
         &self,
         group_id: &GroupId,
@@ -221,15 +247,10 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<SecureDeleteExpiredResult, AppError> {
-        let retention = self.message_retention_for_group(group_id);
-        if retention.disappearing_message_secs == 0 {
-            return Ok(SecureDeleteExpiredResult::default());
-        }
-        let cutoff = unix_now_seconds().saturating_sub(retention.disappearing_message_secs);
-        self.app.secure_prune_account_app_events_before(
+        self.app.secure_prune_expired_account_app_events(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
-            cutoff,
+            unix_now_seconds(),
         )
     }
 
@@ -419,6 +440,7 @@ fn build_group_system_projection(
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         tags: material.tags,
         source_epoch: Some(epoch),
+        retention: None,
         recorded_at: Some(recorded_at),
         moderation_grant: false,
         // Non-unique link to the origin commit so a losing-branch rollback can

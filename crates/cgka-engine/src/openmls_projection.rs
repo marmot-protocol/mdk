@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::group::Member;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
@@ -253,6 +254,7 @@ pub enum OpenMlsReplayObservation {
         source_epoch: u64,
         sender: Vec<u8>,
         payload: Vec<u8>,
+        retention: AppMessageRetentionDecision,
         decrypted_payload_ref: String,
     },
     Ignored {
@@ -2310,15 +2312,29 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 // retryable until the tip passes it — indistinguishable from
                 // a legitimate future message at this point, and it converts
                 // to terminal as the tip advances.
-                let validated_sender = sender_id.as_ref().filter(|sender| {
-                    crate::app_payload::validate_app_payload_for_sender(&payload, sender).is_ok()
+                let validated = sender_id.as_ref().and_then(|sender| {
+                    crate::app_payload::validate_app_payload_for_sender(&payload, sender)
+                        .ok()
+                        .map(|event| (sender, event))
                 });
-                if let Some(sender) = validated_sender {
+                if let Some((sender, app_event)) = validated {
+                    let retention_seconds =
+                        crate::app_components::message_retention_seconds_of_group(&mls_group)
+                            .map_err(|error| {
+                                OpenMlsProjectionError::Replay(format!(
+                                    "decode source-epoch message retention: {error}"
+                                ))
+                            })?
+                            .unwrap_or(0);
                     observations.push(OpenMlsReplayObservation::ApplicationProcessed {
                         message_id,
                         source_epoch,
                         sender: sender.as_slice().to_vec(),
                         payload: payload.clone(),
+                        retention: AppMessageRetentionDecision::new(
+                            app_event.created_at,
+                            retention_seconds,
+                        ),
                         decrypted_payload_ref: format!(
                             "sha256:{}",
                             hex::encode(message_digest(payload.as_slice()))

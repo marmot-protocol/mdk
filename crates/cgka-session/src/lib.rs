@@ -166,6 +166,10 @@ pub enum PublishWork {
     ApplicationMessage {
         msg: TransportMessage,
         queued_intent: Option<QueuedIntentRef>,
+        group_id: GroupId,
+        app_event_id: String,
+        source_epoch: EpochId,
+        retention: cgka_traits::app_event::AppMessageRetentionDecision,
     },
     Proposal {
         msg: TransportMessage,
@@ -681,7 +685,13 @@ impl AccountDeviceSession {
         };
         for result in results {
             match result {
-                SendResult::ApplicationMessage { msg } => {
+                SendResult::ApplicationMessage {
+                    msg,
+                    group_id,
+                    app_event_id,
+                    source_epoch,
+                    retention,
+                } => {
                     let queued_intent = self
                         .engine
                         .take_regenerated_queued_intent_for_message(&msg.id)
@@ -689,9 +699,14 @@ impl AccountDeviceSession {
                             group_id,
                             intent_id,
                         });
-                    effects
-                        .publish
-                        .push(PublishWork::ApplicationMessage { msg, queued_intent });
+                    effects.publish.push(PublishWork::ApplicationMessage {
+                        msg,
+                        queued_intent,
+                        group_id,
+                        app_event_id,
+                        source_epoch,
+                        retention,
+                    });
                 }
                 SendResult::Proposal { msg } => {
                     let queued_intent = self

@@ -676,7 +676,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -767,7 +767,7 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -852,7 +852,7 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1058,7 +1058,7 @@ async fn malformed_via_snapshot_fallback_is_stale_and_does_not_wedge_ingest() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1111,7 +1111,7 @@ async fn ingest_own_created_message_returns_own_echo() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => unreachable!(),
     };
 
@@ -1173,7 +1173,7 @@ async fn buffered_legacy_own_echo_retires_raw_retry_row() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     let own_content_id = content_id(&own_message);
@@ -1296,7 +1296,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
             .await
             .unwrap()
         {
-            SendResult::ApplicationMessage { msg } => msg,
+            SendResult::ApplicationMessage { msg, .. } => msg,
             _ => unreachable!(),
         };
     }
@@ -1455,7 +1455,7 @@ async fn send_app_message_round_trips_to_another_client() {
         .unwrap();
 
     let msg = match send_res {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => panic!("expected ApplicationMessage"),
     };
 
@@ -1519,7 +1519,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1617,7 +1617,7 @@ async fn buffered_retryable_peer_message_is_retired_terminal_after_replay() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1758,7 +1758,7 @@ async fn rewrapped_mls_message_with_new_transport_id_is_a_duplicate() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => unreachable!(),
     };
 
@@ -1831,7 +1831,7 @@ async fn distinct_mls_messages_are_not_collapsed_by_content_dedup() {
             .await
             .unwrap()
         {
-            SendResult::ApplicationMessage { msg } => msg,
+            SendResult::ApplicationMessage { msg, .. } => msg,
             _ => unreachable!(),
         };
         let routed = TransportMessage {
