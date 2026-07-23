@@ -120,7 +120,7 @@ pub(crate) async fn start_stream_watch(
         account_home.clone(),
     ) {
         Ok(app) => app,
-        Err(err) => return daemon_error(json, "stream_watch_failed", err.to_string()),
+        Err(err) => return crate::command_output_result(json, Err(err)),
     };
     let (report, handle) =
         match spawn_stream_watch(cli, account_home, app, runtime.clone(), stream_manager) {

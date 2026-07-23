@@ -137,7 +137,7 @@ Branches are compared in this order:
 2. Witness quorum beats no quorum.
 3. Higher `valid_commit_depth`.
 4. Higher `app_witness_score`.
-5. Lower tip commit priority (`Privileged` before `Ordinary`).
+5. Prefer a `Privileged` tip commit over an `Ordinary` one.
 6. Lower authenticated tip committer account id.
 7. Lower tip commit digest.
 
@@ -253,9 +253,9 @@ Tamarin is a good fit for the security-adjacent part of this model if we keep th
 
 The initial scaffold lives in
 [`formal/tamarin/distributed_convergence_v0.spthy`](../../formal/tamarin/distributed_convergence_v0.spthy). It models
-the selector boundary only: two honest clients, the same valid candidate set, the same pinned policy, and
-deterministic branch selection. Scores are represented as bounded symbolic classes so the model can prove the comparison
-order without modeling MLS internals.
+the selector boundary only: two honest clients, the same valid candidate set, a projection of the pinned policy containing
+only the selector-relevant rewind and quorum fields, and deterministic branch selection. Scores are represented as bounded
+symbolic classes so the model can prove the comparison order without modeling MLS internals.
 
 Model first:
 
