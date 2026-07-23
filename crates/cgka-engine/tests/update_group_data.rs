@@ -320,6 +320,19 @@ fn build_with_routing(id: &[u8]) -> Engine<SqliteAccountStorage> {
         .unwrap()
 }
 
+fn build_with_opaque_component(id: &[u8], component_id: u16) -> Engine<SqliteAccountStorage> {
+    let mut components: Vec<_> = default_group_components().into_iter().collect();
+    components.push(component_id);
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(registry())
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
 /// #740 rotation regression: after a Nostr routing-component update commit is
 /// applied, the engine's `transport_group_id_index` must self-heal so inbound
 /// messages addressed to the NEW `nostr_group_id` still resolve to the group.
@@ -984,6 +997,70 @@ async fn admin_policy_update_listing_non_member_is_rejected() {
 }
 
 // ── Partial update ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn unrelated_update_preserves_opaque_app_component_for_all_members() {
+    const OPAQUE_COMPONENT_ID: u16 = 0xF301;
+    const OPAQUE_BYTES: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
+
+    let mut alice = build_with_opaque_component(b"alice", OPAQUE_COMPONENT_ID);
+    let mut bob = build_with_opaque_component(b"bob", OPAQUE_COMPONENT_ID);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "orig description".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: OPAQUE_COMPONENT_ID,
+                data: OPAQUE_BYTES.to_vec(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let result = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("renamed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match result {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    })
+    .await
+    .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
+
+    assert_eq!(
+        alice.app_component(&gid, OPAQUE_COMPONENT_ID).unwrap(),
+        Some(OPAQUE_BYTES.to_vec())
+    );
+    assert_eq!(
+        bob.app_component(&gid, OPAQUE_COMPONENT_ID).unwrap(),
+        Some(OPAQUE_BYTES.to_vec())
+    );
+}
 
 #[tokio::test]
 async fn update_group_data_with_only_name_preserves_description() {

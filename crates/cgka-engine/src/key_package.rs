@@ -61,7 +61,8 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
 }
 
 /// Parse and validate a transported KeyPackage and report whether it carries
-/// the MLS last-resort extension.
+/// either the current last-resort application-data component or the legacy
+/// last-resort extension.
 pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> {
     let msg = MlsMessageIn::tls_deserialize_exact(kp.bytes())
         .map_err(|e| EngineError::Serialize(format!("key_package deserialize: {e:?}")))?;
@@ -124,8 +125,9 @@ impl<S: StorageProvider> Engine<S> {
     /// KeyPackage it must call this to prune the orphaned private bundle;
     /// otherwise retries against a failing publisher accumulate unused private
     /// key material indefinitely (mdk#160). The KeyPackages produced
-    /// here carry the last-resort extension, so OpenMLS never deletes them on
-    /// the welcome path — cleanup is entirely the caller's responsibility.
+    /// here carry the last-resort application-data component, so OpenMLS never
+    /// deletes them on the welcome path — cleanup is entirely the caller's
+    /// responsibility.
     ///
     /// Deleting a KeyPackage that is not present in storage is a no-op (the
     /// underlying `DELETE` matches zero rows), so this is safe to call
