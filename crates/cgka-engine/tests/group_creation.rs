@@ -15,9 +15,9 @@ use cgka_engine::key_package::{is_last_resort_key_package, key_package_metadata}
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
-    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    default_group_components, encode_components_list, encode_nostr_routing_v1,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, default_group_components, encode_components_list, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -151,6 +151,42 @@ fn key_package_with_account_identity_proof_and_lifetime(
     cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
 }
 
+fn key_package_with_account_identity_proof_for_ciphersuite(
+    identity_seed: &[u8],
+    ciphersuite: Ciphersuite,
+) -> cgka_traits::engine::KeyPackage {
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential_with_key = CredentialWithKey {
+        credential: BasicCredential::new(credential_identity.clone()).into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_extension = account_identity_proof_extension(
+        &credential_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        proof_signer(identity_seed).as_ref(),
+    )
+    .unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[ExtensionType::Unknown(
+                ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+            )]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
 fn mixed_profile_key_package(identity_seed: &[u8]) -> cgka_traits::engine::KeyPackage {
     let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
     let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
@@ -201,6 +237,89 @@ fn mixed_profile_key_package(identity_seed: &[u8]) -> cgka_traits::engine::KeyPa
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
     cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
+#[derive(Clone, Copy)]
+enum CurrentProofFault {
+    WrongLength,
+    TamperedSignature,
+    CredentialMismatch,
+    LeafKeyMismatch,
+    MissingSupportAdvertisement,
+}
+
+fn current_profile_key_package_with_fault(
+    identity_seed: &[u8],
+    fault: CurrentProofFault,
+) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential_with_key = CredentialWithKey {
+        credential: BasicCredential::new(credential_identity).into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_identity_seed = if matches!(fault, CurrentProofFault::CredentialMismatch) {
+        b"different-proof-identity".as_slice()
+    } else {
+        identity_seed
+    };
+    let proof_leaf_key = if matches!(fault, CurrentProofFault::LeafKeyMismatch) {
+        vec![0x5a; signer.to_public_vec().len()]
+    } else {
+        signer.to_public_vec()
+    };
+    let mut proof = account_identity_proof_component(
+        &pad32(proof_identity_seed),
+        &proof_leaf_key,
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        1_700_000_000,
+        proof_signer(proof_identity_seed).as_ref(),
+    )
+    .unwrap();
+    match fault {
+        CurrentProofFault::WrongLength => {
+            proof.pop();
+        }
+        CurrentProofFault::TamperedSignature => proof[40] ^= 1,
+        CurrentProofFault::CredentialMismatch
+        | CurrentProofFault::LeafKeyMismatch
+        | CurrentProofFault::MissingSupportAdvertisement => {}
+    }
+
+    let advertised = if matches!(fault, CurrentProofFault::MissingSupportAdvertisement) {
+        [APP_COMPONENTS_COMPONENT_ID].into_iter().collect()
+    } else {
+        [
+            APP_COMPONENTS_COMPONENT_ID,
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        ]
+        .into_iter()
+        .collect()
+    };
+    let mut dictionary = AppDataDictionary::new();
+    dictionary.insert(
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&advertised),
+    );
+    dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof);
+    let extension = Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary));
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[ExtensionType::AppDataDictionary]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(extension).unwrap())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+        .with_protocol_profile(ProtocolProfile::Current)
 }
 
 fn key_package_with_malformed_last_resort_component(
@@ -695,6 +814,31 @@ async fn directory_key_package_helpers_validate_against_own_ciphersuite() {
 }
 
 #[tokio::test]
+async fn invite_path_validates_proof_against_key_package_ciphersuite() {
+    let mut alice = build_client(b"alice-own-suite", selfremove_registry());
+    let alternate_suite = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
+    let kp =
+        key_package_with_account_identity_proof_for_ciphersuite(b"bob-own-suite", alternate_suite);
+
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "own-suite-proof".into(),
+            description: "".into(),
+            members: vec![kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("the engine does not negotiate the alternate ciphersuite yet");
+
+    assert!(
+        !matches!(error, EngineError::InvalidAccountIdentityProof(_)),
+        "the valid proof must be checked against the KeyPackage suite before later suite negotiation rejects it: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn current_key_package_uses_only_the_0x8009_proof_component() {
     let mut alice = build_current_client(b"alice-current");
     let kp = alice.fresh_key_package().await.unwrap();
@@ -750,6 +894,41 @@ fn mixed_profile_key_package_is_rejected() {
     let error = key_package_metadata(&key_package)
         .expect_err("a KeyPackage carrying both proof profiles must be rejected");
     assert!(matches!(error, EngineError::InvalidAccountIdentityProof(_)));
+}
+
+fn assert_invalid_current_proof(fault: CurrentProofFault) {
+    let key_package = current_profile_key_package_with_fault(b"invalid-current-proof", fault);
+    let error =
+        key_package_metadata(&key_package).expect_err("invalid current proof must be rejected");
+    assert!(
+        matches!(error, EngineError::InvalidAccountIdentityProof(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn current_proof_rejects_non_104_byte_component() {
+    assert_invalid_current_proof(CurrentProofFault::WrongLength);
+}
+
+#[test]
+fn current_proof_rejects_tampered_signature() {
+    assert_invalid_current_proof(CurrentProofFault::TamperedSignature);
+}
+
+#[test]
+fn current_proof_rejects_signer_credential_mismatch() {
+    assert_invalid_current_proof(CurrentProofFault::CredentialMismatch);
+}
+
+#[test]
+fn current_proof_rejects_leaf_key_mismatch() {
+    assert_invalid_current_proof(CurrentProofFault::LeafKeyMismatch);
+}
+
+#[test]
+fn current_proof_rejects_missing_support_advertisement() {
+    assert_invalid_current_proof(CurrentProofFault::MissingSupportAdvertisement);
 }
 
 #[tokio::test]

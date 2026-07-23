@@ -191,7 +191,7 @@ impl<S: StorageProvider> Engine<S> {
         crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
         let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             key_package.leaf_node(),
-            self.ciphersuite,
+            key_package.ciphersuite(),
         )?;
         ensure_key_package_profile(kp, protocol_profile)?;
         Ok(key_package)
