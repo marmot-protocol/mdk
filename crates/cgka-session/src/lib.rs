@@ -156,9 +156,11 @@ impl SessionEffects {
 pub enum PublishWork {
     ApplicationMessage {
         msg: TransportMessage,
+        queued_intent: Option<QueuedIntentRef>,
     },
     Proposal {
         msg: TransportMessage,
+        queued_intent: Option<QueuedIntentRef>,
     },
     GroupEvolution {
         msg: TransportMessage,
@@ -268,6 +270,10 @@ impl AccountDeviceSession {
 
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
         Ok(self.engine.group_record(group_id)?)
+    }
+
+    pub fn live_group_ids(&self) -> SessionResult<Vec<GroupId>> {
+        Ok(self.engine.live_group_ids()?)
     }
 
     /// The stored outbound welcome for `id` along with its group, for
@@ -514,6 +520,20 @@ impl AccountDeviceSession {
         Ok(self.engine.has_pending_convergence_inputs(group_id)?)
     }
 
+    pub fn confirm_regenerated_queued_intent(
+        &mut self,
+        intent: &QueuedIntentRef,
+    ) -> SessionResult<()> {
+        Ok(self
+            .engine
+            .confirm_regenerated_queued_intent(&intent.intent_id)?)
+    }
+
+    pub fn retry_regenerated_queued_intent(&mut self, intent: &QueuedIntentRef) {
+        self.engine
+            .retry_regenerated_queued_intent(&intent.group_id);
+    }
+
     pub async fn confirm_published(
         &mut self,
         pending: PendingStateRef,
@@ -644,10 +664,30 @@ impl AccountDeviceSession {
         };
         for result in results {
             match result {
-                SendResult::ApplicationMessage { msg } => effects
-                    .publish
-                    .push(PublishWork::ApplicationMessage { msg }),
-                SendResult::Proposal { msg } => effects.publish.push(PublishWork::Proposal { msg }),
+                SendResult::ApplicationMessage { msg } => {
+                    let queued_intent = self
+                        .engine
+                        .take_regenerated_queued_intent_for_message(&msg.id)
+                        .map(|(group_id, intent_id)| QueuedIntentRef {
+                            group_id,
+                            intent_id,
+                        });
+                    effects
+                        .publish
+                        .push(PublishWork::ApplicationMessage { msg, queued_intent });
+                }
+                SendResult::Proposal { msg } => {
+                    let queued_intent = self
+                        .engine
+                        .take_regenerated_queued_intent_for_message(&msg.id)
+                        .map(|(group_id, intent_id)| QueuedIntentRef {
+                            group_id,
+                            intent_id,
+                        });
+                    effects
+                        .publish
+                        .push(PublishWork::Proposal { msg, queued_intent });
+                }
                 SendResult::GroupEvolution {
                     msg,
                     welcomes,
@@ -676,7 +716,10 @@ impl AccountDeviceSession {
             });
         }
         for msg in self.engine.drain_auto_proposals() {
-            effects.publish.push(PublishWork::Proposal { msg });
+            effects.publish.push(PublishWork::Proposal {
+                msg,
+                queued_intent: None,
+            });
         }
         effects
             .pending_convergence

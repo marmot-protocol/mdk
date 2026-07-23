@@ -282,12 +282,10 @@ pub fn validate_and_normalize_blob_endpoint_url(
         .ok_or("encrypted media endpoint URL must include a host")?;
     match url.scheme() {
         "https" => match host {
-            Host::Domain(domain) => {
-                let lowered = domain.to_ascii_lowercase();
-                if lowered == "localhost" || lowered.ends_with(".localhost") {
-                    return Err("encrypted media https endpoint must not point at localhost".into());
-                }
+            Host::Domain(_) if is_loopback_host(host.clone()) => {
+                return Err("encrypted media https endpoint must not point at localhost".into());
             }
+            Host::Domain(_) => {}
             Host::Ipv4(addr) => reject_non_routable_ipv4(addr).map_err(|_| {
                 "encrypted media endpoint URL must not point at a non-routable address".to_owned()
             })?,

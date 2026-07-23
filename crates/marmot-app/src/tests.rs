@@ -900,6 +900,7 @@ fn received_message_sender_is_admitted_to_directory_cache() {
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         recorded_at: 0,
+        received_at: 0,
     })
     .unwrap();
 
@@ -1114,6 +1115,33 @@ fn local_account_directory_refresh_still_promotes_follows() {
         .find(|batch| batch.authors.contains(&account.account_id_hex))
         .expect("local account should be watched");
     assert!(local_batch.kinds.contains(&KIND_NOSTR_CONTACT_LIST));
+}
+
+#[test]
+fn empty_follow_fetch_preserves_cached_edges() {
+    let account_id = format!("{:064x}", 6);
+    let followed = format!("{:064x}", 7);
+    let cached = UserDirectoryRecord {
+        account_id_hex: account_id.clone(),
+        npub: npub_for_account_id_lossy(&account_id),
+        local_account: None,
+        profile: None,
+        follows: vec![followed.clone()],
+        follow_source_relays: vec!["wss://cached.example".to_owned()],
+        relay_lists: AccountRelayListStatus::empty(),
+        key_package: None,
+    };
+
+    let selected = directory::cached_or_unknown_follow_list(
+        Some(cached),
+        &[TransportEndpoint("wss://queried.example".to_owned())],
+    );
+
+    assert_eq!(selected.follows, vec![followed]);
+    assert_eq!(
+        selected.source_relays,
+        vec!["wss://cached.example".to_owned()]
+    );
 }
 
 #[test]
@@ -1415,6 +1443,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
         kind: crate::notifications::MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         tags: vec![vec!["v".to_owned(), "marmot-push-v1".to_owned()]],
         recorded_at: 1,
+        received_at: 1,
     };
 
     // Transitive list response: the owner's own-signed record, relayed by another
@@ -1991,6 +2020,7 @@ fn received_event_decodes_when_id_and_sender_match() {
     let event = build(AppMessageIntent::Chat {
         content: "hi".to_owned(),
     });
+    let inner_created_at = event.created_at;
     let bytes = event.encode().unwrap();
     let group_id = GroupId::new(vec![0x01]);
     let message = groups::decode_received_event(
@@ -2001,13 +2031,15 @@ fn received_event_decodes_when_id_and_sender_match() {
         0,
         "msg1",
         1_700_000_000,
+        Some(42),
         false,
     )
     .expect("valid event is accepted");
     assert_eq!(message.plaintext, "hi");
     assert_eq!(message.kind, MARMOT_APP_EVENT_KIND_CHAT);
     assert_eq!(message.sender, SENDER_HEX);
-    assert_eq!(message.recorded_at, 1_700_000_000);
+    assert_eq!(message.recorded_at, inner_created_at);
+    assert_eq!(message.received_at, 1_700_000_000);
 }
 
 #[test]
@@ -2039,9 +2071,10 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
     });
     let bytes = event.encode().unwrap();
     let group_id = GroupId::new(vec![0x01]);
-    let message =
-        groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, false)
-            .expect("an out-of-policy media locator must not drop the message");
+    let message = groups::decode_received_event(
+        &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+    )
+    .expect("an out-of-policy media locator must not drop the message");
     assert_eq!(message.plaintext, "delayed media");
     assert!(
         message
@@ -2095,8 +2128,10 @@ fn received_media_message_with_malformed_reference_is_rejected() {
     let bytes = event.encode().unwrap();
     let group_id = GroupId::new(vec![0x01]);
     assert!(
-        groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, false)
-            .is_none(),
+        groups::decode_received_event(
+            &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+        )
+        .is_none(),
         "a structurally malformed media reference must drop the message",
     );
 }
@@ -2112,8 +2147,10 @@ fn received_event_with_tampered_id_is_rejected() {
     let bytes = serde_json::to_vec(&event).unwrap();
     let group_id = GroupId::new(vec![0x01]);
     assert!(
-        groups::decode_received_event(&bytes, SENDER_HEX, None, &group_id, 0, "msg1", 0, false)
-            .is_none()
+        groups::decode_received_event(
+            &bytes, SENDER_HEX, None, &group_id, 0, "msg1", 0, None, false,
+        )
+        .is_none()
     );
 }
 
@@ -2127,8 +2164,18 @@ fn received_event_with_wrong_sender_is_rejected() {
     let other_sender = "bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66";
     // The inner pubkey is SENDER_HEX, but MLS authenticated `other_sender`.
     assert!(
-        groups::decode_received_event(&bytes, other_sender, None, &group_id, 0, "msg1", 0, false)
-            .is_none()
+        groups::decode_received_event(
+            &bytes,
+            other_sender,
+            None,
+            &group_id,
+            0,
+            "msg1",
+            0,
+            None,
+            false,
+        )
+        .is_none()
     );
 }
 
@@ -2301,7 +2348,7 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
     })
     .unwrap();
     let media_hash = "ef".repeat(32);
-    app.record_account_app_event(
+    app.record_account_app_event_at(
         "alice",
         &AppMessageProjection {
             message_id_hex: "old-aa".to_owned(),
@@ -2321,8 +2368,14 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
             origin_commit_id: None,
             moderation_grant: false,
         },
+        100,
     )
     .unwrap();
+    let stored = app.messages("alice").unwrap();
+    assert_eq!(stored[0].recorded_at, 10);
+    assert_eq!(stored[0].received_at, 100);
+    // Retention follows the authenticated recorded_at even though this device
+    // observed the message well after the cutoff.
     assert!(
         app.chat_list_row("alice", "aa")
             .unwrap()

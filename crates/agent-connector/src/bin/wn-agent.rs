@@ -48,15 +48,21 @@ struct ServeArgs {
     relay: Vec<String>,
     #[arg(
         long,
-        help = "Accept all welcome invites without consulting the allowlist"
+        help = "Dev/test only: accept invites from any authenticated welcomer; requires --debug-controls"
     )]
-    allow_any: bool,
+    dev_allow_any_invites: bool,
     #[arg(
         long,
         value_name = "PATH",
-        help = "Require this local control-plane bearer token file for every request"
+        help = "Require this full-control local bearer token file for every request"
     )]
     auth_token_file: Option<PathBuf>,
+    #[arg(
+        long = "media-allowed-root",
+        value_name = "PATH",
+        help = "Allow outbound media reads beneath this directory; may be repeated (default: deny all)"
+    )]
+    media_allowed_roots: Vec<PathBuf>,
     #[arg(
         long,
         value_name = "OCTAL",
@@ -120,9 +126,9 @@ struct BootstrapArgs {
         help = "Reuse this local signing account instead of selecting by label"
     )]
     account_id_hex: Option<String>,
-    #[arg(long, value_name = "TOKEN", help = "Control-plane auth token")]
+    #[arg(long, value_name = "TOKEN", help = "Full-control bearer token")]
     auth_token: Option<String>,
-    #[arg(long, value_name = "PATH", help = "Control-plane auth token file")]
+    #[arg(long, value_name = "PATH", help = "Full-control bearer token file")]
     auth_token_file: Option<PathBuf>,
     #[arg(
         long,
@@ -219,13 +225,19 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         socket_dir_mode,
         socket_mode,
         relays: args.relay,
-        allow_any: args.allow_any,
+        dev_allow_any_invites: args.dev_allow_any_invites,
         debug_controls: args.debug_controls,
         auth_token,
+        media_allowed_roots: args.media_allowed_roots,
         max_connections: args.max_connections,
         allow_insecure_local_broker: args.insecure_local_broker,
         allow_loopback_relays: args.allow_loopback_relays,
     };
+    if config.dev_allow_any_invites && config.debug_controls {
+        eprintln!(
+            "wn-agent: WARNING dev allow-any invite policy enabled; authenticated welcomers bypass the allowlist"
+        );
+    }
     match serve_socket(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

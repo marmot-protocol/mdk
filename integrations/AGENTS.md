@@ -12,7 +12,7 @@ systems to Marmot through `wn-agent`.
 - `openclaw/marmot` - OpenClaw channel plugin.
 - `opencode/marmot` - `wn-opencode` OpenCode harness binary.
 
-The shared boundary is the `marmot.agent-control.v1` NDJSON protocol over a
+The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
 local Unix socket. `wn-agent` owns Marmot account state, MLS state, Nostr
 transport, relay interaction, QUIC preview records, durable encrypted sends,
 deletes, invite policy, and local storage.

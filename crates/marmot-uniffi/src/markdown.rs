@@ -2,13 +2,17 @@
 //!
 //! The parser crate owns the real AST. These records/enums keep the generated
 //! Swift/Kotlin surface stable and host-friendly.
+//!
+//! Destination classifications are renderer-policy input, not authorization.
+//! Hosts must inspect them before navigating to a link or fetching an image;
+//! the original untrusted destination is intentionally preserved.
 
 use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN;
 use marmot_markdown::{
     Alignment as MdAlignment, AutolinkKind as MdAutolinkKind, Block as MdBlock,
     CodeBlockKind as MdCodeBlockKind, Document as MdDocument, Inline as MdInline,
-    ListItem as MdListItem, ListKind as MdListKind, NostrEntity as MdNostrEntity,
-    NostrHrp as MdNostrHrp, TableCell as MdTableCell,
+    LinkDestinationKind as MdLinkDestinationKind, ListItem as MdListItem, ListKind as MdListKind,
+    NostrEntity as MdNostrEntity, NostrHrp as MdNostrHrp, TableCell as MdTableCell,
 };
 
 const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
@@ -117,15 +121,18 @@ pub enum MarkdownInlineFfi {
         dest: String,
         title: Option<String>,
         children: Vec<MarkdownInlineFfi>,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Image {
         dest: String,
         title: Option<String>,
         alt: Vec<MarkdownInlineFfi>,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Autolink {
         url: String,
         kind: MarkdownAutolinkKindFfi,
+        classification: MarkdownLinkDestinationKindFfi,
     },
     Math {
         content: String,
@@ -142,6 +149,18 @@ pub enum MarkdownInlineFfi {
 pub enum MarkdownAutolinkKindFfi {
     Uri,
     Email,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MarkdownLinkDestinationKindFfi {
+    Web,
+    Contact,
+    App,
+    Nostr,
+    Relative,
+    Unknown,
+    Dangerous,
+    Sensitive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -378,19 +397,32 @@ fn markdown_inline_from_md(value: &MdInline, depth: usize) -> MarkdownInlineFfi 
             dest,
             title,
             children,
+            classification,
         } => MarkdownInlineFfi::Link {
             dest: dest.clone(),
             title: title.clone(),
             children: markdown_inlines_from_md(children, depth + 1),
+            classification: (*classification).into(),
         },
-        MdInline::Image { dest, title, alt } => MarkdownInlineFfi::Image {
+        MdInline::Image {
+            dest,
+            title,
+            alt,
+            classification,
+        } => MarkdownInlineFfi::Image {
             dest: dest.clone(),
             title: title.clone(),
             alt: markdown_inlines_from_md(alt, depth + 1),
+            classification: (*classification).into(),
         },
-        MdInline::Autolink { url, kind } => MarkdownInlineFfi::Autolink {
+        MdInline::Autolink {
+            url,
+            kind,
+            classification,
+        } => MarkdownInlineFfi::Autolink {
             url: url.clone(),
             kind: (*kind).into(),
+            classification: (*classification).into(),
         },
         MdInline::Math(content) => MarkdownInlineFfi::Math {
             content: content.clone(),
@@ -409,6 +441,21 @@ impl From<MdAutolinkKind> for MarkdownAutolinkKindFfi {
         match value {
             MdAutolinkKind::Uri => Self::Uri,
             MdAutolinkKind::Email => Self::Email,
+        }
+    }
+}
+
+impl From<MdLinkDestinationKind> for MarkdownLinkDestinationKindFfi {
+    fn from(value: MdLinkDestinationKind) -> Self {
+        match value {
+            MdLinkDestinationKind::Web => Self::Web,
+            MdLinkDestinationKind::Contact => Self::Contact,
+            MdLinkDestinationKind::App => Self::App,
+            MdLinkDestinationKind::Nostr => Self::Nostr,
+            MdLinkDestinationKind::Relative => Self::Relative,
+            MdLinkDestinationKind::Unknown => Self::Unknown,
+            MdLinkDestinationKind::Dangerous => Self::Dangerous,
+            MdLinkDestinationKind::Sensitive => Self::Sensitive,
         }
     }
 }
@@ -488,7 +535,36 @@ mod tests {
         ));
         assert!(matches!(
             inlines[4],
-            MarkdownInlineFfi::Link { ref dest, .. } if dest == "https://example.com"
+            MarkdownInlineFfi::Link {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Web,
+                ..
+            } if dest == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn bridges_explicit_destination_classification_without_dropping_targets() {
+        let document =
+            parse_markdown_document("[verify](javascript:alert(1)) ![key](nostr:ncryptsec1qqqqqq)");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Link {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Dangerous,
+                ..
+            } if dest == "javascript:alert(1)"
+        ));
+        assert!(matches!(
+            inlines[2],
+            MarkdownInlineFfi::Image {
+                ref dest,
+                classification: MarkdownLinkDestinationKindFfi::Sensitive,
+                ..
+            } if dest == "nostr:ncryptsec1qqqqqq"
         ));
     }
 
@@ -527,7 +603,27 @@ mod tests {
         };
         assert!(matches!(
             inlines[1],
-            MarkdownInlineFfi::Autolink { ref url, .. } if url == "marmot://profile/npub1abc"
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                classification: MarkdownLinkDestinationKindFfi::App,
+                ..
+            } if url == "marmot://profile/npub1abc"
+        ));
+    }
+
+    #[test]
+    fn bridges_dangerous_autolink_classification_without_dropping_url() {
+        let document = parse_markdown_document("<javascript:alert(1)>");
+        let MarkdownBlockFfi::Paragraph { inlines } = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(
+            inlines[0],
+            MarkdownInlineFfi::Autolink {
+                ref url,
+                classification: MarkdownLinkDestinationKindFfi::Dangerous,
+                ..
+            } if url == "javascript:alert(1)"
         ));
     }
 

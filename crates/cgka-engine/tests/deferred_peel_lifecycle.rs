@@ -472,17 +472,17 @@ async fn deferred_peel_terminal_after_attempt_budget() {
 
 /// A flood of undecryptable group-routed input (fresh transport id per
 /// re-wrap is attacker-controllable) must not grow the durable store past
-/// the per-group cap; overflow is dropped unpersisted and deduplicated.
+/// the per-group cap. Overflow remains retryable by same-id redelivery once
+/// the retained backlog drains.
 #[tokio::test]
 async fn peel_deferred_rows_capped_per_group_under_flood() {
-    let (mut alice, mut carol, carol_storage, _carol_peeler, group_id, _commit2, _commit3) =
+    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, commit3) =
         carol_behind_two_epochs().await;
 
     // One real epoch-3 app message, re-wrapped under distinct transport ids —
     // exactly the re-wrap flood a malicious peer can produce for free.
     let template = send_app(&mut alice, &group_id, "flood payload").await;
-    let flood = MAX_PEEL_DEFERRED_ROWS_PER_GROUP + 5;
-    let mut overflow_ids = Vec::new();
+    let flood = MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
     for i in 0..flood {
         let wrapped = TransportMessage {
             id: MessageId::new(format!("flood-{i}").into_bytes()),
@@ -498,10 +498,19 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
             ),
             "flood message {i} classified unexpectedly: {outcome:?}"
         );
-        if i >= MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
-            overflow_ids.push(wrapped.id.clone());
-        }
     }
+
+    let legitimate_template = send_app(&mut alice, &group_id, "cap overflow legitimate").await;
+    let overflow = TransportMessage {
+        id: MessageId::new(b"cap-overflow-legitimate".to_vec()),
+        ..legitimate_template.clone()
+    };
+    assert!(matches!(
+        carol.ingest(overflow.clone()).await.unwrap(),
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
 
     let retained = carol_storage
         .list_messages(&group_id, EpochId(0))
@@ -513,23 +522,39 @@ async fn peel_deferred_rows_capped_per_group_under_flood() {
         retained, MAX_PEEL_DEFERRED_ROWS_PER_GROUP,
         "durable PeelDeferred rows must be capped per group"
     );
-    for id in &overflow_ids {
-        assert!(
-            matches!(carol_storage.get_message(id), Err(StorageError::NotFound)),
-            "overflow input must not be persisted"
-        );
-    }
+    assert!(
+        matches!(
+            carol_storage.get_message(&overflow.id),
+            Err(StorageError::NotFound)
+        ),
+        "overflow input must not be persisted"
+    );
 
-    // Overflow ids were remembered in-process: redelivery dedups cheaply.
-    let overflow_replay = TransportMessage {
-        id: overflow_ids[0].clone(),
-        ..template.clone()
-    };
+    // While the cap remains full, same-id redelivery re-attempts the peel and
+    // is cap-dropped again; it is not poisoned as terminal AlreadySeen.
+    let attempts_before_redelivery = carol_peeler.attempts_for(&overflow.id);
     assert!(matches!(
-        carol.ingest(overflow_replay).await.unwrap(),
+        carol.ingest(overflow.clone()).await.unwrap(),
         IngestOutcome::Stale {
-            reason: StaleReason::AlreadySeen
+            reason: StaleReason::PeelFailed
         }
+    ));
+    assert_eq!(
+        carol_peeler.attempts_for(&overflow.id),
+        attempts_before_redelivery + 1
+    );
+
+    // Catch up to the sender epoch and drain the retained backlog. The exact
+    // same overflow id can then be redelivered and processed successfully.
+    carol.ingest(commit2).await.unwrap();
+    carol.ingest(commit3).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert!(matches!(
+        carol.ingest(overflow).await.unwrap(),
+        IngestOutcome::Processed
     ));
 }
 

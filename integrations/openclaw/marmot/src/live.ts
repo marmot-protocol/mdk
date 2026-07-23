@@ -39,7 +39,9 @@ export class MarmotLivePreview {
   private beginPromise: Promise<void> | null = null;
   private closed = false;
   private streamIdHex: string | null = null;
+  private streamCapability: string | null = null;
   private startMessageIdHex: string | null = null;
+  private readonly beginRequestId = randomUUID();
   private transcript: AgentTextStreamTranscript | null = null;
   private readonly finalizeIdempotencyKey = randomUUID();
   private readonly appendOnly = new AppendOnlyText();
@@ -99,9 +101,11 @@ export class MarmotLivePreview {
       {
         parentMessageIdHex: this.options.parentMessageIdHex,
         quicCandidates: this.options.quicCandidates,
+        requestId: this.beginRequestId,
       },
     );
     this.streamIdHex = response.stream_id_hex;
+    this.streamCapability = response.stream_capability;
     this.startMessageIdHex = response.start_message_id_hex;
     this.transcript = new AgentTextStreamTranscript(
       Buffer.from(response.stream_id_hex, "hex"),
@@ -140,7 +144,7 @@ export class MarmotLivePreview {
     // Commit local transcript/append state only after the remote append
     // succeeds, so a failed append can be retried with the same text without
     // diverging from wn-agent's transcript.
-    await this.client.streamAppend(this.streamIdHex!, suffix);
+    await this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix);
     this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(fullText);
   }
@@ -154,7 +158,7 @@ export class MarmotLivePreview {
       return;
     }
     const next = `${this.appendOnly.current}${suffix}`;
-    await this.client.streamAppend(this.streamIdHex!, suffix);
+    await this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix);
     this.transcript!.appendText(suffix, this.chunkBytes);
     this.appendOnly.suffixFor(next);
   }
@@ -167,7 +171,7 @@ export class MarmotLivePreview {
     }
     await this.ensureBegun();
     this.ensureOpen();
-    await this.client.streamStatus(this.streamIdHex!, text);
+    await this.client.streamStatus(this.streamIdHex!, this.streamCapability!, text);
     this.transcript!.appendStatus(text, this.chunkBytes);
   }
 
@@ -179,7 +183,7 @@ export class MarmotLivePreview {
     }
     await this.ensureBegun();
     this.ensureOpen();
-    await this.client.streamProgress(this.streamIdHex!, progressText);
+    await this.client.streamProgress(this.streamIdHex!, this.streamCapability!, progressText);
     this.transcript!.appendProgress(progressText, this.chunkBytes);
   }
 
@@ -198,7 +202,7 @@ export class MarmotLivePreview {
     }
     const suffix = finalText.slice(current.length);
     if (suffix.length > 0) {
-      await this.client.streamAppend(this.streamIdHex!, suffix);
+      await this.client.streamAppend(this.streamIdHex!, this.streamCapability!, suffix);
       this.transcript!.appendText(suffix, this.chunkBytes);
       this.appendOnly.suffixFor(finalText);
     }
@@ -207,6 +211,7 @@ export class MarmotLivePreview {
       try {
         response = await this.client.streamFinalize(
           this.streamIdHex!,
+          this.streamCapability!,
           finalText,
           this.transcript!.hashHex,
           this.transcript!.chunkCount,
@@ -256,6 +261,6 @@ export class MarmotLivePreview {
     if (!this.begun || !this.streamIdHex) {
       return;
     }
-    await this.client.streamCancel(this.streamIdHex, reason ?? null);
+    await this.client.streamCancel(this.streamIdHex, this.streamCapability!, reason ?? null);
   }
 }

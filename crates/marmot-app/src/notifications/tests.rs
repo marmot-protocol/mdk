@@ -284,6 +284,12 @@ fn token_fingerprint_is_redacted_and_stable() {
     );
 }
 
+#[test]
+fn token_fingerprint_validation_rejects_uppercase_hex() {
+    assert!(validate_fingerprint("sha256:0123456789abcdef01234567").is_ok());
+    assert!(validate_fingerprint("sha256:0123456789ABCDEF01234567").is_err());
+}
+
 fn timeline_target(kind: u64, plaintext: &str) -> TimelineMessageTarget {
     TimelineMessageTarget {
         sender: "bb".repeat(32),
@@ -306,6 +312,7 @@ fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
         kind: MARMOT_APP_EVENT_KIND_REACTION,
         tags: vec![vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]],
         recorded_at: 0,
+        received_at: 0,
     }
 }
 
@@ -321,6 +328,7 @@ fn received_chat(plaintext: &str, tags: Vec<Vec<String>>) -> ReceivedMessage {
         kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
         tags,
         recorded_at: 0,
+        received_at: 0,
     }
 }
 

@@ -64,8 +64,8 @@ fn committer_decided_convergence_accepts_with_a_reproducible_vector() {
     assert_eq!(vector.scenario_name, "test-committer-convergence/v1");
     // observer + two committers + two invitees.
     assert_eq!(vector.scenario.clients.len(), 5);
-    // A single ConvergenceDecision expectation.
-    assert_eq!(vector.expected_outcomes.len(), 1);
+    // Three step-level resolution outcomes + ConvergenceDecision.
+    assert_eq!(vector.expected_outcomes.len(), 4);
 }
 
 #[test]
@@ -77,5 +77,5 @@ fn witness_decided_convergence_accepts_with_a_reproducible_vector() {
 
     assert_eq!(vector.scenario_name, "test-witness-convergence/v1");
     assert_eq!(vector.scenario.clients.len(), 5);
-    assert_eq!(vector.expected_outcomes.len(), 1);
+    assert_eq!(vector.expected_outcomes.len(), 4);
 }

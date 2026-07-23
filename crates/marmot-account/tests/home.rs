@@ -161,6 +161,21 @@ fn account_home_rejects_windows_drive_relative_labels() {
 }
 
 #[test]
+fn account_home_rejects_control_characters_in_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let secret_hex = nostr::Keys::generate().secret_key().to_secret_hex();
+
+    for label in ["evil\nlabel", "evil\rlabel", "evil\u{1b}[2Klabel"] {
+        assert!(matches!(
+            home.import_account(label, &secret_hex),
+            Err(AccountHomeError::InvalidAccountLabel(rejected)) if rejected == label
+        ));
+        assert!(!dir.path().join("accounts").join(label).exists());
+    }
+}
+
+#[test]
 fn account_home_can_derive_identity_before_importing_secret() {
     let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
 

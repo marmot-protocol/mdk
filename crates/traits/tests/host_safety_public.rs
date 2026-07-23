@@ -79,6 +79,8 @@ fn shared_host_safety_classifies_canonical_ipv6_ranges() {
     assert!(is_public_ipv6("2606:4700::1".parse().unwrap()));
     assert!(is_public_ipv6("::ffff:93.184.216.34".parse().unwrap()));
     assert!(is_public_ip(IpAddr::V6("2606:4700::1".parse().unwrap())));
+    assert!(is_public_ipv6("3ffe::1".parse().unwrap()));
+    assert!(is_public_ipv6("3fff:1000::1".parse().unwrap()));
 
     for raw in [
         "::1",              // loopback

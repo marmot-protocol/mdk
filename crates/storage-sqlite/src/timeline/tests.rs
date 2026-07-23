@@ -100,6 +100,116 @@ fn moderated_delete(id: &str, sender: &str, target: &str, at: u64) -> StoredAppE
     event
 }
 
+#[test]
+fn oversized_timeline_id_sets_are_chunked() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let ids = (0..=SQLITE_BIND_PARAMETER_CHUNK)
+        .map(|index| format!("message-{index:04}"))
+        .collect::<Vec<_>>();
+    store
+        .record_app_event(&chat(&ids[0], "alice", 20, "first chunk"))
+        .unwrap();
+    store
+        .record_app_event(&chat(
+            &ids[SQLITE_BIND_PARAMETER_CHUNK],
+            "alice",
+            10,
+            "second chunk",
+        ))
+        .unwrap();
+    store
+        .record_app_event(&reply(
+            "reply",
+            "bob",
+            &ids[SQLITE_BIND_PARAMETER_CHUNK],
+            30,
+            "answer",
+        ))
+        .unwrap();
+
+    let conn = store.lock().unwrap();
+    assert_eq!(
+        reply_message_ids_for_targets_tx(&conn, &"11".repeat(32), &ids).unwrap(),
+        BTreeSet::from(["reply".to_owned()])
+    );
+    let records =
+        timeline_records_by_ids_tx(&conn, &"11".repeat(32), ids.iter().cloned().collect()).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.message_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec![ids[SQLITE_BIND_PARAMETER_CHUNK].as_str(), ids[0].as_str()]
+    );
+}
+
+#[test]
+fn oversized_reply_preview_target_sets_are_chunked() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+    let ids = (0..=SQLITE_BIND_PARAMETER_CHUNK)
+        .map(|index| format!("preview-{index:04}"))
+        .collect::<Vec<_>>();
+    store
+        .record_app_event(&chat(&ids[0], "alice", 10, "first"))
+        .unwrap();
+    store
+        .record_app_event(&chat(
+            &ids[SQLITE_BIND_PARAMETER_CHUNK],
+            "alice",
+            20,
+            "last",
+        ))
+        .unwrap();
+    let targets = ids
+        .into_iter()
+        .map(|message_id| (group_id.clone(), message_id))
+        .collect();
+
+    let previews = load_reply_previews(&store.lock().unwrap(), targets).unwrap();
+    assert_eq!(previews.len(), 2);
+}
+
+#[test]
+fn timeline_rebuild_tolerates_one_corrupt_source_tag_blob() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let group_id = "11".repeat(32);
+    store
+        .record_app_event(&chat("corrupt", "alice", 10, "first"))
+        .unwrap();
+    store
+        .record_app_event(&chat("healthy", "bob", 20, "second"))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE app_events SET tags_json = 'not-json'
+             WHERE group_id_hex = ?1 AND message_id_hex = 'corrupt'",
+            params![&group_id],
+        )
+        .unwrap();
+
+    store
+        .rebuild_message_timeline_for_group(&group_id)
+        .expect("a malformed tag blob must not poison the group rebuild");
+    let page = store
+        .message_timeline(TimelineMessageQuery {
+            group_id_hex: Some(group_id),
+            ..TimelineMessageQuery::default()
+        })
+        .unwrap();
+    assert_eq!(page.messages.len(), 2);
+    assert!(
+        page.messages
+            .iter()
+            .find(|message| message.message_id_hex == "corrupt")
+            .unwrap()
+            .tags
+            .is_empty()
+    );
+}
+
 fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> StoredAppEvent {
     StoredAppEvent {
         group_id_hex: "11".repeat(32),
@@ -1077,6 +1187,44 @@ fn timeline_search_matches_plaintext_case_insensitively() {
 }
 
 #[test]
+fn timeline_search_treats_like_metacharacters_literally() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for (message_id, plaintext) in [
+        ("percent", "50% complete"),
+        ("percent-wildcard", "500 complete"),
+        ("underscore", "a_b"),
+        ("underscore-wildcard", "axb"),
+        ("backslash", r"path\name"),
+        ("backslash-absent", "pathname"),
+    ] {
+        store
+            .record_app_event(&chat(message_id, "alice", 1, plaintext))
+            .unwrap();
+    }
+
+    for (search, expected_id) in [
+        ("50%", "percent"),
+        ("a_b", "underscore"),
+        (r"path\name", "backslash"),
+    ] {
+        let page = store
+            .message_timeline(TimelineMessageQuery {
+                group_id_hex: Some("11".repeat(32)),
+                search: Some(search.to_owned()),
+                ..TimelineMessageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.message_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec![expected_id]
+        );
+    }
+}
+
+#[test]
 fn sender_own_invalidated_message_stays_as_tombstone() {
     // Issue #111: a sender's own message invalidated by convergence (losing
     // branch) must not silently disappear; it stays with a status instead.
@@ -1294,7 +1442,9 @@ fn parent_invalidation_keeps_parent_as_tombstone_and_reply_preview() {
         .iter()
         .find(|m| m.message_id_hex == "reply")
         .expect("reply kept");
-    assert!(reply.reply_preview.is_some());
+    let preview = reply.reply_preview.as_ref().expect("reply preview");
+    assert_eq!(preview.invalidation_status.as_deref(), Some("LosingBranch"));
+    assert_eq!(preview.plaintext, "the original");
 }
 
 #[test]

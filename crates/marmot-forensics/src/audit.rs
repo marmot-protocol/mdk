@@ -1364,7 +1364,11 @@ fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditE
                 value.pubkeys_hex.clear();
             }
         }
-        AuditEventKind::ConvergenceDecision { candidates, .. } => {
+        AuditEventKind::ConvergenceDecision {
+            candidates,
+            rule_trace,
+            ..
+        } => {
             for candidate in candidates {
                 candidate.tip_committer_pubkey_hex = None;
                 if let Some(score) = candidate.score.as_mut() {
@@ -1374,6 +1378,11 @@ fn scrub_full_data_fields(kind: &mut AuditEventKind, context: &mut Option<AuditE
                     witness.sender_pubkey_hex = None;
                 }
             }
+            // Rule inputs/results are intentionally free-form JSON, so the
+            // sink cannot prove that arbitrary future producer fields contain
+            // no full identities. Keep the typed, scrubbed candidate summary
+            // and omit the untyped trace in shareable obfuscated logs.
+            rule_trace.clear();
         }
         _ => {}
     }

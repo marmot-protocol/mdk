@@ -86,6 +86,12 @@ pub(crate) fn u64_to_i64(value: u64) -> StorageResult<i64> {
     })
 }
 
+/// Convert SQLite's signed `INTEGER` to `u64`, rejecting negative values.
+pub(crate) fn i64_to_u64(value: i64) -> StorageResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| StorageError::Serialization(format!("value does not fit in u64: {value}")))
+}
+
 /// Convert an optional `u64` to SQLite's signed `INTEGER`, preserving `None`.
 pub(crate) fn optional_u64_to_i64(value: Option<u64>) -> StorageResult<Option<i64>> {
     value.map(u64_to_i64).transpose()

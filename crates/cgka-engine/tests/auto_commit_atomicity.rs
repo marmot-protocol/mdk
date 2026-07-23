@@ -20,7 +20,7 @@ use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
-use cgka_traits::error::PeelerError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
@@ -214,6 +214,12 @@ impl MessageStorage for FaultStorage {
     ) -> StorageResult<Vec<MessageRecord>> {
         self.inner.list_messages(group_id, at_or_after_epoch)
     }
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.put_ingress_dedup_marker(id)
+    }
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
+        self.inner.has_ingress_dedup_marker(id)
+    }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.create_group_snapshot(group_id, name)
     }
@@ -377,6 +383,69 @@ fn build_selfremove_client(identity: &[u8]) -> cgka_engine::Engine<SqliteAccount
         .expect("build engine")
 }
 
+/// A backend failure after OpenMLS consumes the joining KeyPackage must roll
+/// the complete Welcome attempt back. The identical transport object remains
+/// retryable and no terminal ingress marker may escape the failed attempt.
+#[tokio::test]
+async fn welcome_record_failure_restores_key_package_for_retry() {
+    let mut alice = build_selfremove_client(b"alice-welcome-atomic");
+    let fault = PutGroupFault::default();
+    let (mut bob, bob_storage) =
+        build_fault_selfremove_client(b"bob-welcome-atomic", fault.clone());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome atomicity".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcome) = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    fault.arm(1);
+    let failed = bob
+        .join_welcome(welcome.clone())
+        .await
+        .expect_err("injected group-record write must fail the join");
+    assert!(
+        matches!(failed, EngineError::Storage(StorageError::Busy(_))),
+        "storage fault must stay retryable, got {failed:?}"
+    );
+    assert!(
+        !bob_storage.has_ingress_dedup_marker(&welcome.id).unwrap(),
+        "failed attempt must not leave a terminal transport marker"
+    );
+    assert!(
+        matches!(
+            bob_storage.get_group(&group_id),
+            Err(StorageError::NotFound)
+        ),
+        "failed attempt must not leave a discoverable group"
+    );
+
+    let joined = bob
+        .join_welcome(welcome.clone())
+        .await
+        .expect("the identical Welcome must succeed after the transient fault");
+    assert_eq!(joined, group_id);
+    assert!(
+        bob_storage.has_ingress_dedup_marker(&welcome.id).unwrap(),
+        "successful attempt must commit its transport marker"
+    );
+}
+
 /// A `put_group` failure during auto-commit staging must leave no torn group
 /// record (mdk#333): the record stays at the pre-stage epoch with all members,
 /// no orphaned pending publish or leaked snapshot survives, and the group
@@ -493,4 +562,69 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     assert_eq!(record.epoch, EpochId(2));
     assert_eq!(record.members.len(), 2);
     assert!(!record.members.iter().any(|m| m.id == bob_member_id));
+}
+
+/// A profile projection failure occurs after the MLS commit is staged. It must
+/// rewind the pending state and clear the staged commit rather than leaving a
+/// projected record that no caller can confirm or roll back (mdk#824).
+#[tokio::test]
+async fn update_group_data_record_write_failure_leaves_group_stable() {
+    let fault = PutGroupFault::default();
+    let (mut alice, handle) = build_fault_selfremove_client(b"alice-ugd", fault.clone());
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "preserve me".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let snapshot_baseline = handle.list_group_snapshots(&group_id).unwrap().len();
+
+    fault.arm(1);
+    let failed = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("failed rename".into()),
+            description: None,
+        })
+        .await;
+    assert!(failed.is_err(), "injected projection failure must surface");
+
+    let record = handle.get_group(&group_id).unwrap();
+    assert_eq!(record.name, "original");
+    assert_eq!(record.description, "preserve me");
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(0));
+    assert_eq!(
+        handle.list_group_snapshots(&group_id).unwrap().len(),
+        snapshot_baseline,
+        "failed staging must release its recovery snapshot"
+    );
+
+    let retry = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("successful rename".into()),
+            description: None,
+        })
+        .await
+        .expect("group must remain usable after compensation");
+    let pending = match retry {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let record = handle.get_group(&group_id).unwrap();
+    assert_eq!(record.name, "successful rename");
+    assert_eq!(record.description, "preserve me");
 }

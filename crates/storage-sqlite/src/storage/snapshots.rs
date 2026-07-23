@@ -106,6 +106,122 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_rollback_joins_outer_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let anchor_group = sample_group(gid(1), 0, 1);
+        let anchor_message = sample_message(mid(1), anchor_group.id.clone(), 0);
+        let anchor_queued = sample_queued_intent(mid(10), anchor_group.id.clone());
+        store.put_group(&anchor_group).unwrap();
+        store.put_message(&anchor_message).unwrap();
+        store.put_queued_outbound_intent(&anchor_queued).unwrap();
+        store
+            .create_group_snapshot(&anchor_group.id, "historical-anchor")
+            .unwrap();
+
+        let live_group = sample_group(gid(1), 1, 2);
+        let live_message = sample_message(mid(2), live_group.id.clone(), 1);
+        let live_queued = sample_queued_intent(mid(11), live_group.id.clone());
+        store.put_group(&live_group).unwrap();
+        store.put_message(&live_message).unwrap();
+        store.put_queued_outbound_intent(&live_queued).unwrap();
+
+        let result: cgka_traits::storage::StorageResult<()> = store.with_transaction(|storage| {
+            storage.rollback_group_to_snapshot(&live_group.id, "historical-anchor")?;
+            // Simulate restoring only part of the live record set before a
+            // process/error boundary interrupts the operation.
+            storage.put_message(&live_message)?;
+            Err(cgka_traits::storage::StorageError::Backend(
+                "injected after partial live restore".into(),
+            ))
+        });
+        assert!(result.is_err());
+
+        assert_eq!(store.get_group(&live_group.id).unwrap(), live_group);
+        assert_eq!(
+            store.list_messages(&live_group.id, EpochId(0)).unwrap(),
+            vec![anchor_message, live_message]
+        );
+        assert_eq!(
+            store.list_queued_outbound_intents(&live_group.id).unwrap(),
+            vec![anchor_queued, live_queued]
+        );
+    }
+
+    #[test]
+    fn snapshot_create_joins_outer_transaction() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 0, 1);
+        store.put_group(&group).unwrap();
+
+        let result: cgka_traits::storage::StorageResult<()> = store.with_transaction(|storage| {
+            storage.create_group_snapshot(&group.id, "nested")?;
+            Err(StorageError::Backend("force rollback".to_owned()))
+        });
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Backend(message)) if message == "force rollback"
+        ));
+        assert!(store.list_group_snapshots(&group.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_create_and_rollback_retry_writer_contention() {
+        use crate::{SqlCipherKey, SqliteStorageOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot-contention.sqlite");
+        let key = SqlCipherKey::new("snapshot contention key").unwrap();
+        let options = SqliteStorageOptions {
+            busy_timeout_ms: 50,
+            ..SqliteStorageOptions::default()
+        };
+        let store = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+            .unwrap();
+        let original = sample_group(gid(1), 0, 1);
+        store.put_group(&original).unwrap();
+
+        let spawn_blocker = || {
+            let blocker_path = path.clone();
+            let blocker_options = options.clone();
+            let blocker_key = SqlCipherKey::new("snapshot contention key").unwrap();
+            let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                    &blocker_path,
+                    &blocker_key,
+                    blocker_options,
+                )
+                .unwrap();
+                let conn = blocker.lock().unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                lock_acquired_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                conn.execute_batch("COMMIT").unwrap();
+            });
+            lock_acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            handle
+        };
+
+        let blocker = spawn_blocker();
+        store
+            .create_group_snapshot(&original.id, "contended")
+            .expect("snapshot capture retries after transient contention");
+        blocker.join().unwrap();
+
+        let changed = sample_group(gid(1), 1, 1);
+        store.put_group(&changed).unwrap();
+        let blocker = spawn_blocker();
+        store
+            .rollback_group_to_snapshot(&original.id, "contended")
+            .expect("snapshot rollback retries after transient contention");
+        blocker.join().unwrap();
+        assert_eq!(store.get_group(&original.id).unwrap(), original);
+    }
+
+    #[test]
     fn snapshot_listing_and_release_are_group_scoped() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g1 = sample_group(gid(1), 0, 0);

@@ -285,8 +285,7 @@ impl AgentTextStreamRecordV1 {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, AgentTextStreamRecordError> {
-        self.validate()?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.encoded_len()?);
         out.push(AGENT_TEXT_STREAM_RECORD_VERSION);
         encode_quic_varint(self.stream_id.len() as u64, &mut out);
         out.extend_from_slice(&self.stream_id);
@@ -296,6 +295,19 @@ impl AgentTextStreamRecordV1 {
         encode_quic_varint(self.plaintext_frame.len() as u64, &mut out);
         out.extend_from_slice(&self.plaintext_frame);
         Ok(out)
+    }
+
+    /// Return the exact encoded record length without allocating or
+    /// serializing the payload.
+    pub fn encoded_len(&self) -> Result<usize, AgentTextStreamRecordError> {
+        self.validate()?;
+        Ok(1 + quic_varint_encoded_len(self.stream_id.len() as u64)
+            + self.stream_id.len()
+            + 8
+            + 1
+            + 1
+            + quic_varint_encoded_len(self.plaintext_frame.len() as u64)
+            + self.plaintext_frame.len())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, AgentTextStreamRecordError> {
@@ -340,11 +352,9 @@ impl AgentTextStreamRecordV1 {
                 self.stream_id.len(),
             ));
         }
-        if !is_known_record_type(self.record_type) {
-            return Err(AgentTextStreamRecordError::UnknownRecordType(
-                self.record_type,
-            ));
-        }
+        // Unknown record types are valid framing. Receivers ignore semantics
+        // they do not understand so newer advisory records do not tear down an
+        // otherwise valid preview stream.
         // The frame field carries ciphertext on the wire, so the struct bound
         // is the `ciphertext<0..2^16-1>` field bound. The tighter plaintext
         // policy cap (`max_plaintext_frame_len`, app-profile max 65519) is
@@ -372,6 +382,9 @@ pub enum AgentTextStreamRecordError {
     EmptyStreamId,
     #[error("agent text stream id is too long: {0}")]
     StreamIdTooLong(usize),
+    /// Retained for source compatibility with callers that matched the former
+    /// strict decoder; v1 framing now accepts unknown types for forward
+    /// compatibility and does not emit this variant.
     #[error("unknown agent text stream record type: {0:#04x}")]
     UnknownRecordType(u8),
     #[error("agent text stream plaintext frame is too large: {0}")]
@@ -471,6 +484,18 @@ fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn quic_varint_encoded_len(value: u64) -> usize {
+    if value < 64 {
+        1
+    } else if value < 16_384 {
+        2
+    } else if value < 1_073_741_824 {
+        4
+    } else {
+        8
+    }
+}
+
 /// Hash `len(bytes) || bytes` where `len(...)` is the Marmot binary profile's
 /// QUIC variable-length integer — the same length encoding the QUIC record and
 /// key-context use, per the transcript-hash construction in the spec (a
@@ -480,18 +505,6 @@ fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     encode_quic_varint(bytes.len() as u64, &mut prefix);
     hasher.update(&prefix);
     hasher.update(bytes);
-}
-
-fn is_known_record_type(record_type: u8) -> bool {
-    matches!(
-        record_type,
-        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
-            | AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA
-            | AGENT_TEXT_STREAM_RECORD_STATUS
-            | AGENT_TEXT_STREAM_RECORD_CHECKPOINT
-            | AGENT_TEXT_STREAM_RECORD_ABORT
-            | AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE
-    )
 }
 
 fn take_exact<'a>(
@@ -713,11 +726,27 @@ mod tests {
         let record = AgentTextStreamRecordV1::text_delta(vec![0x11; 32], 7, "hello");
 
         let encoded = record.encode().unwrap();
+        assert_eq!(record.encoded_len().unwrap(), encoded.len());
         assert_eq!(encoded[0], AGENT_TEXT_STREAM_RECORD_VERSION);
         assert_eq!(encoded[1], 32);
 
         let decoded = AgentTextStreamRecordV1::decode(&encoded).unwrap();
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn record_encoded_len_tracks_each_quic_varint_width() {
+        for frame_len in [0, 63, 64, 16_383, 16_384, u16::MAX as usize] {
+            let record = AgentTextStreamRecordV1::text_delta(
+                vec![0x11; AGENT_TEXT_STREAM_MAX_STREAM_ID_LEN],
+                7,
+                vec![0x22; frame_len],
+            );
+            assert_eq!(
+                record.encoded_len().unwrap(),
+                record.encode().unwrap().len()
+            );
+        }
     }
 
     #[test]
@@ -740,9 +769,10 @@ mod tests {
             record_type: 0xff,
             ..AgentTextStreamRecordV1::text_delta(vec![0x11; 32], 1, "x")
         };
+        let encoded_unknown = unknown_type.encode().unwrap();
         assert_eq!(
-            unknown_type.encode(),
-            Err(AgentTextStreamRecordError::UnknownRecordType(0xff))
+            AgentTextStreamRecordV1::decode(&encoded_unknown).unwrap(),
+            unknown_type
         );
 
         let empty_stream = AgentTextStreamRecordV1::text_delta(Vec::new(), 1, "x");

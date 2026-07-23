@@ -25,6 +25,21 @@ use crate::{
 };
 
 impl AccountManager {
+    /// Refresh other account workers after an irreversible mutation without
+    /// changing the mutation's result. Once the command worker has confirmed
+    /// a publish, a read-side catch-up fault cannot roll it back; surfacing
+    /// that fault would tell the host to retry work already visible to peers.
+    async fn catch_up_after_committed_mutation(&self, method: &'static str) {
+        if let Err(error) = self.catch_up_accounts().await {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = method,
+                error_kind = error.privacy_safe_kind(),
+                "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
+            );
+        }
+    }
+
     pub async fn create_group(
         &self,
         account_ref: &str,
@@ -44,7 +59,7 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let group_id = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("create_group").await;
         self.schedule_audit_log_tracker_update("create_group");
         Ok(group_id)
     }
@@ -248,7 +263,14 @@ impl AccountManager {
                 catch_up_started_at.elapsed(),
                 catch_up.is_ok(),
             );
-            catch_up?;
+            if let Err(error) = catch_up {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "invite_members",
+                    error_kind = error.privacy_safe_kind(),
+                    "committed mutation succeeded but post-mutation catch-up failed; state will refresh on the next cycle"
+                );
+            }
 
             self.schedule_audit_log_tracker_update("invite_members");
             Ok(summary)
@@ -279,7 +301,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("remove_members")
+            .await;
         self.schedule_audit_log_tracker_update("remove_members");
         Ok(summary)
     }
@@ -299,7 +322,7 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("leave_group").await;
         self.schedule_audit_log_tracker_update("leave_group");
         Ok(summary)
     }
@@ -371,7 +394,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let result = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("decline_group_invite")
+            .await;
         self.schedule_audit_log_tracker_update("decline_group_invite");
         Ok(result)
     }
@@ -435,7 +459,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_group_image")
+            .await;
         Ok(summary)
     }
 
@@ -473,7 +498,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_message_retention")
+            .await;
         self.schedule_audit_log_tracker_update("update_message_retention");
         Ok(summary)
     }
@@ -495,7 +521,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("replace_encrypted_media_blob_endpoints")
+            .await;
         self.schedule_audit_log_tracker_update("replace_encrypted_media_blob_endpoints");
         Ok(summary)
     }
@@ -521,7 +548,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_group_avatar_url")
+            .await;
         self.schedule_audit_log_tracker_update("update_group_avatar_url");
         Ok(summary)
     }
@@ -545,7 +573,8 @@ impl AccountManager {
                 .await
                 .map_err(|_| AppError::TransportClosed)?;
             let summary = account_worker_response(response).await?;
-            self.catch_up_accounts().await?;
+            self.catch_up_after_committed_mutation("promote_admin")
+                .await;
             self.schedule_audit_log_tracker_update("promote_admin");
             Ok(summary)
         }
@@ -575,7 +604,7 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("demote_admin").await;
         self.schedule_audit_log_tracker_update("demote_admin");
         Ok(summary)
     }
@@ -595,7 +624,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("self_demote_admin")
+            .await;
         self.schedule_audit_log_tracker_update("self_demote_admin");
         Ok(summary)
     }
@@ -619,7 +649,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("update_group_profile")
+            .await;
         self.schedule_audit_log_tracker_update("update_group_profile");
         Ok(summary)
     }
@@ -934,7 +965,8 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let summary = account_worker_response(response).await?;
-        self.catch_up_accounts().await?;
+        self.catch_up_after_committed_mutation("retry_group_convergence")
+            .await;
         self.schedule_audit_log_tracker_update("retry_group_convergence");
         Ok(summary)
     }

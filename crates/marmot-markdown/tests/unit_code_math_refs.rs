@@ -92,6 +92,18 @@ fn fenced_info_string_trimmed() {
 }
 
 #[test]
+fn fenced_info_string_strips_control_characters() {
+    for control in ['\u{0007}', '\u{001b}', '\u{007f}', '\u{0085}', '\u{009f}'] {
+        let input = format!("```rust{control}payload\ncode\n```");
+        assert_eq!(
+            parse_blocks(&input),
+            vec![fenced("rustpayload", "code\n")],
+            "control character {control:?} must not reach code-block metadata"
+        );
+    }
+}
+
+#[test]
 fn fenced_close_must_be_at_least_as_long() {
     // Opening `~~~~` (4) cannot be closed by `~~~` (3).
     let input = "~~~~\n~~~\nfoo\n~~~~";
@@ -200,4 +212,10 @@ fn refdef_first_label_wins_on_duplicate() {
 fn refdef_invalid_destination_falls_through_to_paragraph() {
     // No destination after `]:` — not a valid ref-def, becomes paragraph.
     assert_eq!(parse_blocks("[foo]:"), vec![paragraph("[foo]:")]);
+}
+
+#[test]
+fn refdef_label_over_999_bytes_falls_through_to_paragraph() {
+    let input = format!("[{}]: /url", "x".repeat(1000));
+    assert_eq!(parse_blocks(&input), vec![paragraph(&input)]);
 }

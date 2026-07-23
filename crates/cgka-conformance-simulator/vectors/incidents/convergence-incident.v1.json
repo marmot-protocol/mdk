@@ -96,6 +96,27 @@
   },
   "expected_outcomes": [
     {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 7,
+      "client": "alice",
+      "pending": "invite-a",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "bob",
+      "pending": "invite-b",
+      "resolution": "confirmed"
+    },
+    {
       "type": "convergence_decision",
       "client": "carol",
       "selected_tip_epoch": 2,

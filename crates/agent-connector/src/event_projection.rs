@@ -47,11 +47,12 @@ fn message_mentions_account(tags: &[Vec<String>], plaintext: &str, account_id_he
     // the account hex in the body, or the visible bech32 (`npub`) forms parsed
     // by marmot-markdown (`nostr:npub1…` and bare `@npub1…`).
     // `nprofile` mentions still rely on the p-tag above.
-    if plaintext_has_nostr_hex_ref(plaintext, account_id_hex) {
+    let scan_input = mention_plaintext_scan_input(plaintext);
+    if plaintext_has_nostr_hex_ref(scan_input, account_id_hex) {
         return true;
     }
     marmot_app::npub_for_account_id(account_id_hex)
-        .is_ok_and(|npub| plaintext_has_visible_npub_ref(plaintext, &npub))
+        .is_ok_and(|npub| plaintext_scan_has_visible_npub_ref(scan_input, &npub))
 }
 
 /// Whether `plaintext` contains a `nostr:<hex>` token that is not glued to
@@ -68,7 +69,7 @@ fn plaintext_has_nostr_hex_ref(plaintext: &str, reference: &str) -> bool {
 const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize =
     cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
 
-/// Whether `plaintext` contains a visible npub mention token for the account.
+/// Scan `plaintext` for a visible npub mention token for the account.
 ///
 /// This deliberately avoids `marmot_markdown::parse`: the parser has
 /// super-linear behavior on hostile emphasis/bracket input, and this caller is
@@ -77,10 +78,6 @@ const MAX_MENTION_PLAINTEXT_SCAN_BYTES: usize =
 /// recognizes (`@npub1…`, `nostr:npub1…`, and bare `npub1…`), so a bounded
 /// token-boundary scan is enough and keeps replay/live drain work predictable
 /// (mdk#663).
-fn plaintext_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
-    plaintext_scan_has_visible_npub_ref(mention_plaintext_scan_input(plaintext), npub)
-}
-
 fn plaintext_scan_has_visible_npub_ref(plaintext: &str, npub: &str) -> bool {
     let bytes = plaintext.as_bytes();
     let npub_bytes = npub.as_bytes();

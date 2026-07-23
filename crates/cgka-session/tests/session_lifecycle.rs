@@ -285,7 +285,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         vec![GroupEvent::GroupJoined {
             group_id: created.group_id.clone(),
             via_welcome: welcome_id,
-            welcomer: None,
+            welcomer: Some(alice.self_id()),
         }]
     );
 
@@ -297,7 +297,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
         .await
         .unwrap();
     let app_msg = match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => route(msg.clone(), &created.group_id),
+        PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected application publish work, got {other:?}"),
     };
 
@@ -356,7 +356,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
         .await
         .unwrap();
     let app_msg = match &sent.publish[0] {
-        PublishWork::ApplicationMessage { msg } => route(msg.clone(), &created.group_id),
+        PublishWork::ApplicationMessage { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected application publish work, got {other:?}"),
     };
 
@@ -416,7 +416,7 @@ async fn session_ingest_schedules_auto_publish_work() {
         .await
         .unwrap();
     let proposal = match &leave.publish[0] {
-        PublishWork::Proposal { msg } => route(msg.clone(), &created.group_id),
+        PublishWork::Proposal { msg, .. } => route(msg.clone(), &created.group_id),
         other => panic!("expected proposal publish work, got {other:?}"),
     };
 
@@ -625,6 +625,7 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         .unwrap();
     assert_eq!(queued.queued.len(), 1);
     assert!(queued.publish.is_empty());
+    let queued_intent = queued.queued[0].clone();
 
     carol.set_convergence_policy(CanonicalizationPolicy {
         settlement_quiescence_ms: 0,
@@ -634,11 +635,16 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
 
     assert_eq!(carol.epoch(&created.group_id).unwrap(), EpochId(2));
     assert!(
-        advanced
-            .publish
-            .iter()
-            .any(|work| matches!(work, PublishWork::ApplicationMessage { .. })),
-        "expected queued application message to be regenerated, got {:?}",
+        advanced.publish.iter().any(|work| {
+            matches!(
+                work,
+                PublishWork::ApplicationMessage {
+                    queued_intent: Some(regenerated),
+                    ..
+                } if regenerated == &queued_intent
+            )
+        }),
+        "expected queued application message to retain its durable intent handle, got {:?}",
         advanced.publish
     );
     assert!(advanced.queued.is_empty());

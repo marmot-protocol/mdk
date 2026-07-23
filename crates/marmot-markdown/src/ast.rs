@@ -87,15 +87,24 @@ pub enum Inline {
         dest: String,
         title: Option<String>,
         children: Vec<Inline>,
+        /// Renderer-facing classification. The original destination is
+        /// preserved; clients decide whether it should be actionable.
+        classification: LinkDestinationKind,
     },
     Image {
         dest: String,
         title: Option<String>,
         alt: Vec<Inline>,
+        /// Renderer-facing classification. Clients decide whether fetching
+        /// this untrusted destination is appropriate.
+        classification: LinkDestinationKind,
     },
     Autolink {
         url: String,
         kind: AutolinkKind,
+        /// Renderer-facing classification. The original URL is preserved;
+        /// clients decide whether it should be actionable.
+        classification: LinkDestinationKind,
     },
     Math(String),
     NostrMention(NostrEntity),
@@ -106,6 +115,22 @@ pub enum Inline {
 pub enum AutolinkKind {
     Uri,
     Email,
+}
+
+/// Security-relevant classification of an untrusted Markdown destination.
+///
+/// This classification does not authorize navigation or fetching. Renderers
+/// apply their own policy and can still display every original destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkDestinationKind {
+    Web,
+    Contact,
+    App,
+    Nostr,
+    Relative,
+    Unknown,
+    Dangerous,
+    Sensitive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

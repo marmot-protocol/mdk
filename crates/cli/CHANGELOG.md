@@ -9,6 +9,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- WN Agent control clients and the connector now speak the incompatible `marmot.agent-control.v2` protocol.
+  `stream_begin` returns a random per-stream bearer capability that every later stream operation must present; exact
+  request-id retries return the original begin receipt, and stream-id collisions no longer replace active sessions.
+- WN Agent documentation and command help now state that a configured control token replaces peer-UID authorization
+  and grants the full API for every hosted account. Separate trust domains require separate connector instances.
 - TUI: adopted a chat-first shell. A screen model replaces the fixed four-pane dashboard: a login/account-select
   screen (create identity, nsec login, or pick from several accounts) opens when there is no single obvious account,
   and the main view is the chat list plus the message timeline plus the composer, with the reclaimed space going to
@@ -27,6 +32,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- Markdown autolinks now carry a renderer-facing destination classification across Rust and MarmotKit surfaces. The
+  original destination is preserved, while web, contact, app, public Nostr, relative, unknown, dangerous, and
+  sensitive targets are distinguished for client policy.
+- Explicit Markdown links and images now carry the same destination classification, including reference-style links,
+  so clients can independently decide whether to navigate to or fetch an untrusted target.
 - `wn tui` gained optional `--discovery-relays` and `--default-account-relays` flags (comma-separated, matching
   `wn daemon start`). They are forwarded to the `daemon start` child and to `create-identity`/`login` account setup
   so a first run with no relay configuration can supply relays without dead-ending. Flag passthrough only; no JSON
@@ -50,6 +60,26 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn-agent` now denies path-based media sends by default and accepts only regular, non-symlink files beneath explicit
+  repeatable `--media-allowed-root` directories. Bundled Hermes and OpenClaw launchers stage short-lived copies in a
+  dedicated approved directory and clean them up after each send.
+- `wn-agent` replaced the ambiguous `--allow-any` invite bypass with `--dev-allow-any-invites`, requires
+  `--debug-controls` alongside it, warns when the policy is active, and still rejects welcomes that lack an
+  MLS-authenticated author.
+- `wn-agent` now applies a 15-second whole-operation deadline to the initial unauthenticated control frame and to
+  request-scoped QUIC candidate DNS lookup, preventing silent or slow peers from pinning connection permits forever.
+- Every `wn-agent` control response and inbound-subscription event write now has the same 15-second whole-frame
+  deadline, including socket flush, so a non-reading client cannot retain a connection permit indefinitely.
+- `wnd` now caps long-lived subscriptions at 64 within its 256-connection global ceiling, preserving one-shot status,
+  shutdown, and command capacity. Quota rejection is reported as the typed `server_busy` protocol error instead of an
+  empty response that could be mistaken for a stopped daemon.
+- `wn-agent` now caps `SubscribeInbound` streams at 16 within its 64-connection global ceiling, and both quota
+  boundaries return a typed `server_busy` response so subscriptions cannot starve durable one-shot operations.
+- Public Nostr relay connections now require `wss://`; `ws://` is limited to loopback development relays behind
+  `WN_ALLOW_LOOPBACK_RELAYS`.
+- Received-message chronology and retention now use the MLS-authenticated inner app-event timestamp instead of the
+  replayable outer Nostr event timestamp. Runtime, daemon JSON, and MarmotKit surfaces expose that send time alongside
+  the device-local observation time.
 - WN Agent, Hermes, and OpenClaw now carry the triggering prompt message id on agent text-stream start events through
   the protocol `parent` tag, preserving the durable reply chain after timeline reloads.
 - Encrypted media uploads now fail over, in order, across a default list of Blossom endpoints that accept opaque

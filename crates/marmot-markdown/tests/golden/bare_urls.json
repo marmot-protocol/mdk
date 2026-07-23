@@ -45,7 +45,8 @@
                     {
                       "Autolink": {
                         "url": "https://example.com/path?q=1",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "Web"
                       }
                     }
                   ]
@@ -65,7 +66,8 @@
                     {
                       "Autolink": {
                         "url": "http://example.com",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "Web"
                       }
                     }
                   ]
@@ -85,7 +87,8 @@
                     {
                       "Autolink": {
                         "url": "mailto:foo@bar.com",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "Contact"
                       }
                     }
                   ]
@@ -105,7 +108,8 @@
                     {
                       "Autolink": {
                         "url": "tel:+15551234567",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "Contact"
                       }
                     }
                   ]
@@ -125,7 +129,8 @@
                     {
                       "Autolink": {
                         "url": "marmot://profile/npub1abc",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "App"
                       }
                     }
                   ]
@@ -145,7 +150,8 @@
                     {
                       "Autolink": {
                         "url": "whitenoise://group/abc",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "App"
                       }
                     }
                   ]
@@ -165,7 +171,8 @@
                     {
                       "Autolink": {
                         "url": "whitenoise-staging://group/abc",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "App"
                       }
                     }
                   ]
@@ -186,7 +193,8 @@
           {
             "Autolink": {
               "url": "https://example.com",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Web"
             }
           },
           {
@@ -204,7 +212,8 @@
           {
             "Autolink": {
               "url": "https://example.com",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Web"
             }
           },
           {
@@ -222,7 +231,8 @@
           {
             "Autolink": {
               "url": "https://example.com",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Web"
             }
           },
           {
@@ -240,7 +250,8 @@
           {
             "Autolink": {
               "url": "https://en.wikipedia.org/wiki/Foo_(bar)",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Web"
             }
           },
           {
@@ -258,7 +269,8 @@
           {
             "Autolink": {
               "url": "https://example.com",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Web"
             }
           },
           {
@@ -340,7 +352,8 @@
               {
                 "Autolink": {
                   "url": "https://example.com",
-                  "kind": "Uri"
+                  "kind": "Uri",
+                  "classification": "Web"
                 }
               }
             ]
@@ -353,7 +366,8 @@
               {
                 "Autolink": {
                   "url": "https://example.com",
-                  "kind": "Uri"
+                  "kind": "Uri",
+                  "classification": "Web"
                 }
               }
             ]
@@ -393,7 +407,8 @@
                     {
                       "Autolink": {
                         "url": "https://example.com",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "Web"
                       }
                     },
                     {
@@ -416,7 +431,8 @@
                     {
                       "Autolink": {
                         "url": "mailto:help@example.com",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "Contact"
                       }
                     }
                   ]
@@ -436,7 +452,8 @@
                     {
                       "Autolink": {
                         "url": "marmot://thread/xyz",
-                        "kind": "Uri"
+                        "kind": "Uri",
+                        "classification": "App"
                       }
                     }
                   ]
@@ -469,7 +486,8 @@
                 {
                   "Autolink": {
                     "url": "https://example.com",
-                    "kind": "Uri"
+                    "kind": "Uri",
+                    "classification": "Web"
                   }
                 },
                 {
@@ -490,7 +508,8 @@
           {
             "Autolink": {
               "url": "ftp://example.com/file",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Unknown"
             }
           },
           {

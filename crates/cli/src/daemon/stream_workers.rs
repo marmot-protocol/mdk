@@ -194,9 +194,13 @@ pub(crate) fn new_stream_watch_start(
         .map(crate::commands::stream::normalize_hex)
         .transpose()
         .map_err(|err| err.to_string())?;
+    let account = cli
+        .account
+        .clone()
+        .ok_or_else(|| "background stream watch requires --account".to_owned())?;
     let started_at = unix_now();
     Ok(marmot_app::AgentStreamWatchStart {
-        account: cli.account.clone(),
+        account: Some(account),
         group_id,
         stream_id,
         started_at,
@@ -654,6 +658,10 @@ pub(crate) async fn finish_stream_compose(
         Err(err) => return daemon_error(cli.json, "stream_compose_failed", err.to_string()),
     };
     if report.text.is_empty() {
+        // `Finish` consumes the compose task. A malformed terminal report
+        // cannot be retried, so remove its dead session instead of leaving a
+        // permanently closed sender in the registry.
+        workers.remove(&key);
         return daemon_error(
             cli.json,
             "stream_compose_failed",
@@ -661,6 +669,7 @@ pub(crate) async fn finish_stream_compose(
         );
     }
     if report.transcript_hash.is_none() {
+        workers.remove(&key);
         return daemon_error(
             cli.json,
             "stream_compose_failed",

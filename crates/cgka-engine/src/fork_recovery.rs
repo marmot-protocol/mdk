@@ -435,6 +435,14 @@ mod tests {
             unused()
         }
 
+        fn put_ingress_dedup_marker(&self, _id: &MessageId) -> StorageResult<()> {
+            unused()
+        }
+
+        fn has_ingress_dedup_marker(&self, _id: &MessageId) -> StorageResult<bool> {
+            unused()
+        }
+
         fn create_group_snapshot(&self, _group_id: &GroupId, _name: &str) -> StorageResult<()> {
             unused()
         }

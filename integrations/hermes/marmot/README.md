@@ -4,6 +4,11 @@ This directory is a Hermes platform plugin for the local `wn-agent` connector.
 Hermes runs the agent and tools. `wn-agent` owns the Marmot account, MLS state,
 Nostr transport, final encrypted sends, and QUIC live-preview stream records.
 
+For live previews, the plugin retries `stream_begin` with one stable v2 request
+id and retains the returned stream capability in memory for subsequent append,
+status, finalize, and cancel calls. The capability is a bearer secret and must
+not be logged or persisted.
+
 For a real Hermes install, install it by copying or symlinking this directory to:
 
 ```sh
@@ -224,8 +229,9 @@ Hermes in the first agent-stream start message. Run logs in another terminal whi
 just hermes-phone-test-logs
 ```
 
-For this manual test the container starts `wn-agent` with `MARMOT_AGENT_ALLOW_ANY=1`, so the first phone invite can land
-without knowing the phone account id ahead of time. Use an explicit allowlist for a real deployment.
+For this manual test the container starts `wn-agent` with `MARMOT_AGENT_DEV_ALLOW_ANY_INVITES=1` and
+`MARMOT_AGENT_DEBUG_CONTROLS=1`, so the first invite from an authenticated phone can land without knowing the phone
+account id ahead of time. Use an explicit allowlist and omit both development options for a real deployment.
 
 In the phone-test container, `MARMOT_PROFILE_NAME_ONBOARDING=1` makes the Marmot Hermes adapter ask on the first
 encrypted chat message whether to publish a public Nostr profile name for the agent account. Reply with the name to
@@ -302,6 +308,11 @@ export MARMOT_AGENT_AUTH_TOKEN_FILE="$HOME/.marmot-agents/hermes/control.token"
 `MARMOT_AGENT_AUTH_TOKEN_FILE` for shell and service-manager setups so the token
 does not appear in process environments by default.
 
+This is a full-control connector credential: it is not limited to the selected
+Hermes account or group. Any holder can subscribe to all plaintext and operate
+every account in that connector home. Do not share the connector/token with an
+untrusted plugin or tenant; give that boundary its own `wn-agent` instance.
+
 ### Group activation (multi-party groups)
 
 By default the adapter only runs an agent turn in a multi-party group when the
@@ -321,8 +332,12 @@ does not touch an allowlist managed directly on `wn-agent`.
 
 Inbound attachments are downloaded through `wn-agent`, re-staged under
 `$MARMOT_HOME/dev/inbound-media` (override with `MARMOT_INBOUND_MEDIA_DIR`),
-and the wn-agent temp file is removed. Outbound local-path sends must stay
-within `MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory).
+and the wn-agent temp file is removed. Outbound source paths must stay within
+`MARMOT_MEDIA_LOCAL_ROOTS` (defaults to the inbound media directory). Hermes
+then stages a private copy under `MARMOT_OUTBOUND_MEDIA_DIR` (defaults to
+`$MARMOT_HOME/dev/outbound-media`), sends only that path, and removes it after
+the connector responds. `wn-agent` must independently allow that exact staging
+directory with `--media-allowed-root`; without one, path sends fail closed.
 
 ## Behavior
 

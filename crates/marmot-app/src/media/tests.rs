@@ -5,7 +5,9 @@ use std::thread;
 
 use url::Url;
 
-use super::blossom::{MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body};
+use super::blossom::{
+    MAX_BLOSSOM_DESCRIPTOR_BYTES, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, read_limited_blossom_body,
+};
 use super::host_safety::validate_blossom_fetch_url;
 
 fn valid_imeta_tag() -> Vec<String> {
@@ -26,6 +28,14 @@ fn valid_imeta_tag() -> Vec<String> {
 
 fn valid_hash() -> String {
     "11".repeat(32)
+}
+
+#[test]
+fn encrypted_media_integrity_accepts_uppercase_hex() {
+    let encrypted = b"encrypted media bytes";
+    let uppercase_hash = hex::encode(Sha256::digest(encrypted)).to_ascii_uppercase();
+
+    assert!(encrypted_media_hash_matches(encrypted, &uppercase_hash));
 }
 
 fn tag_with_locator(locator: String) -> Vec<String> {
@@ -193,6 +203,26 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
     assert!(
         !locator.value.starts_with(&failing),
         "upload must not use the failed server locator"
+    );
+}
+
+#[tokio::test]
+async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_BLOSSOM_DESCRIPTOR_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let encrypted = b"encrypted bytes";
+    let encrypted_hash = hex::encode(Sha256::digest(encrypted));
+
+    let error = upload_blossom_blob(&server, encrypted, &encrypted_hash, &signing_keys(), true)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: upload descriptor exceeds size limit"
     );
 }
 
@@ -526,6 +556,25 @@ fn blossom_reference() -> MediaAttachmentReference {
         value: format!("https://media.example/{}.bin", "11".repeat(32)),
     }];
     reference
+}
+
+#[test]
+fn media_fetch_candidates_deduplicate_non_adjacent_fallback_urls() {
+    let mut reference = blossom_reference();
+    let duplicate_url = reference.locators[0].value.clone();
+    reference.locators.push(MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: format!("https://other.example/{}.bin", reference.ciphertext_sha256),
+    });
+    let fallback = [BlobStoreEndpointV1 {
+        locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        base_url: "https://media.example".to_owned(),
+    }];
+
+    let candidates = encrypted_media_fetch_candidates(&reference, &fallback);
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0], duplicate_url);
 }
 
 #[test]

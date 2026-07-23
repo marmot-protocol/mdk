@@ -40,11 +40,12 @@ incident becomes a vector only if the simulator reproduces the recorded outcome
     (topic/name/avatar/retention) and **membership** forks (member add/remove,
     admin grant/revoke — all collapse to one `Membership` kind, so a real
     add-vs-promote race is one shape, not `MixedCommitKinds`). Rule-3 tier-b
-    winner attribution (the invalidated message's publisher is the loser) runs
+    winner attribution (the invalidated commit's actor is the loser) runs
     **only for group-data forks** — the membership fork is winner-agnostic, and
-    real observer-recorded exports cannot join a publisher's `account_ref` (the
-    observing engine) to a committer's `actor_member_ref` (an MLS member id), so
-    the join is structurally impossible on real data.
+    joins `fork_resolution.invalidated_msg_id` to the matching
+    `group_state_changed.origin_commit_id`, then uses that row's
+    `actor_member_ref` as the loser. This keeps attribution wholly in the MLS
+    member-ref namespace.
 - **Module:** `src/convergence.rs`
   - **Role:** `recover_convergence` turns a convergence-selected export into a
     `RecoveredConvergence` (the decisive rule + a `ConvergenceDecisionKind`), or a
@@ -168,6 +169,7 @@ Gate designs evaluated against real exports and deliberately **rejected**:
   enter VCS.
 - Real exports are the manual pre-PR verification set:
   `cargo run -p incident-replay -- <export.json | export.ndjson>`.
+  The CLI rejects inputs larger than 64 MiB before JSON/NDJSON parsing.
 
 ## Verification
 

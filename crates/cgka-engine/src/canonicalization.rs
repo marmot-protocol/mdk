@@ -639,6 +639,13 @@ fn attach_app_witnesses(
                 .iter_mut()
                 .find(|candidate| candidate.id == *branch_id)
             {
+                // Shared-history traffic is not evidence that a branch was
+                // actually used. Only messages from branch epochs strictly
+                // after the divergence point can witness this candidate
+                // (convergence-v1, #964).
+                if *epoch <= candidate.fork_epoch {
+                    continue;
+                }
                 // Witness counting evaluates the retained app-payload window with
                 // the CANDIDATE's tip_epoch as the reference tip, not the global
                 // canonical tip (retained-history.md "App-payload retention" and
@@ -705,6 +712,14 @@ fn handle_proposal(
             .push(dropped(message, DroppedMessageReason::BeyondAnchor));
     } else if selected_consumed_proposal_ids.contains(&message.message_id) {
         result.accepted_proposals.push(message.message_id.clone());
+    } else if result.selected_tip.unwrap_or(input.state.current_tip_epoch) > message.source_epoch {
+        // An unconsumed proposal cannot cross an epoch boundary. Once the
+        // canonical tip advances past its source epoch it is terminal and must
+        // not be prepended to every later candidate replay (#963).
+        result.dropped_messages.push(dropped(
+            message,
+            DroppedMessageReason::InvalidAgainstCandidateState,
+        ));
     } else if materialized_branch_ids.contains(branch_id)
         && !selected_branch_path.contains(branch_id)
         && result.selected_branch_id.is_some()
@@ -725,15 +740,30 @@ fn handle_app_message(
     decrypted_payload_ref: Option<String>,
     already_delivered: bool,
 ) {
-    // A message applied on a prior pass is re-admitted only so it can witness its
-    // branch again (see `attach_app_witnesses`). It must never be re-delivered or
-    // re-invalidated, so it takes no delivery disposition — it resolves as
-    // already-seen (which keeps the pass out of `Resolving`).
+    // A message applied on a prior pass is re-admitted so it can witness its
+    // branch again (see `attach_app_witnesses`). It must never be re-delivered,
+    // but a later reorg still has to withdraw it when its branch loses (#965).
     if already_delivered {
-        result.already_seen.push(AlreadySeen {
-            message_id: message.message_id.clone(),
-            kind: message.kind_name(),
-        });
+        let selected_still_decrypts = result
+            .selected_branch_id
+            .as_ref()
+            .is_some_and(|selected| decrypts_on_branches.contains(selected));
+        if result.selected_branch_id.is_some()
+            && !selected_still_decrypts
+            && !decrypts_on_branches.is_empty()
+        {
+            result.invalidated_app_messages.push(invalidated_app(
+                message,
+                epoch,
+                InvalidatedAppMessageReason::LosingBranch,
+                decrypted_payload_ref,
+            ));
+        } else {
+            result.already_seen.push(AlreadySeen {
+                message_id: message.message_id.clone(),
+                kind: message.kind_name(),
+            });
+        }
         return;
     }
     if epoch < input.state.retained_anchor_epoch {
@@ -925,6 +955,23 @@ impl CanonicalizationResult {
 #[cfg(test)]
 mod witness_window_tests {
     use super::*;
+
+    #[test]
+    fn v1_default_policy_constants_are_pinned() {
+        assert_eq!(
+            CanonicalizationPolicy::default(),
+            CanonicalizationPolicy {
+                convergence: ConvergencePolicy {
+                    max_rewind_commits: 5,
+                    witness_quorum_senders_per_epoch: 2,
+                    witness_quorum_epochs: 1,
+                    max_witness_override_depth: 1,
+                },
+                app_message_past_epoch_limit: 5,
+                settlement_quiescence_ms: 1_000,
+            }
+        );
+    }
 
     #[test]
     fn app_message_expired_is_relative_to_the_passed_reference_tip() {

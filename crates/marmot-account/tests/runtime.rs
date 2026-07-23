@@ -1229,7 +1229,7 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
         .await
         .unwrap();
     let proposal = match &leave.publish[0] {
-        PublishWork::Proposal { msg } => msg.clone(),
+        PublishWork::Proposal { msg, .. } => msg.clone(),
         other => panic!("expected proposal publish work, got {other:?}"),
     };
 

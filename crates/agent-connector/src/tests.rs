@@ -5,8 +5,8 @@ use agent_control::{
     AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_RECORD_STATUS, AGENT_TEXT_STREAM_RECORD_TEXT_DELTA,
-    AgentTextStreamTranscriptV1,
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
@@ -44,18 +44,147 @@ use marmot_app::AppMessageRecord;
 
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[tokio::test]
+async fn control_operation_timeout_bounds_a_stalled_whole_operation() {
+    let started = tokio::time::Instant::now();
+    let error = crate::with_control_operation_timeout_after(
+        "test_stalled_operation",
+        Duration::from_millis(10),
+        std::future::pending::<()>(),
+    )
+    .await
+    .expect_err("a stalled operation must time out");
+
+    assert!(matches!(
+        error,
+        crate::ConnectorError::OperationTimedOut("test_stalled_operation")
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn control_frame_write_timeout_includes_flush() {
+    struct FlushStallingWriter;
+
+    impl tokio::io::AsyncWrite for FlushStallingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    let response = AgentControlEnvelope::new(None, AgentControlResponse::Ack);
+    let error = crate::connection::write_control_frame_with_timeout(
+        &mut FlushStallingWriter,
+        &response,
+        Duration::from_millis(10),
+    )
+    .await
+    .expect_err("a stalled flush must time out");
+
+    assert!(matches!(
+        error,
+        crate::ConnectorError::OperationTimedOut("control_frame_write")
+    ));
+}
+
+#[test]
+fn inbound_subscription_quota_preserves_one_shot_capacity() {
+    let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let subscription = AgentControlRequest::SubscribeInbound {
+        account_id_hex: None,
+        group_id_hex: None,
+    };
+
+    let first = crate::connection::try_acquire_inbound_subscription(&subscription, &limiter)
+        .expect("first subscription should be admitted")
+        .expect("subscription should hold a permit");
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(&subscription, &limiter).is_err(),
+        "a second subscription must hit the dedicated cap"
+    );
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(
+            &AgentControlRequest::AccountList,
+            &limiter,
+        )
+        .expect("one-shot requests bypass the subscription cap")
+        .is_none()
+    );
+
+    drop(first);
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(&subscription, &limiter)
+            .expect("released subscription capacity should be reusable")
+            .is_some()
+    );
+}
+
+#[test]
+fn poisoned_connector_store_mutex_recovers_inner_state() {
+    let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
+    let panic_mutex = std::sync::Arc::clone(&mutex);
+
+    let panic_result = std::thread::spawn(move || {
+        let mut values = panic_mutex.lock().expect("initial lock should succeed");
+        values.push(2);
+        panic!("poison test mutex");
+    })
+    .join();
+    assert!(panic_result.is_err());
+
+    crate::lock_recover(&mutex).push(3);
+    assert_eq!(*crate::lock_recover(&mutex), vec![1, 2, 3]);
+}
+
+#[test]
+fn profile_name_validation_rejects_non_whitespace_control_characters() {
+    use crate::validation::validate_profile_name;
+
+    assert_eq!(
+        validate_profile_name("  Alice\nAgent  ".to_owned()).unwrap(),
+        "Alice Agent"
+    );
+    for name in ["Alice\u{1b}[2J", "Alice\0Agent", "Alice\u{7}Agent"] {
+        assert!(matches!(
+            validate_profile_name(name.to_owned()),
+            Err(crate::ConnectorError::InvalidProfileName(
+                "control_characters"
+            ))
+        ));
+    }
+}
+
 fn test_config(
     home: &Path,
     socket: impl Into<std::path::PathBuf>,
     relays: Vec<String>,
-    allow_any: bool,
+    dev_allow_any_invites: bool,
     debug_controls: bool,
 ) -> AgentConnectorConfig {
     let mut config = AgentConnectorConfig::new(home);
     config.socket = socket.into();
     config.relays = relays;
-    config.allow_any = allow_any;
+    config.dev_allow_any_invites = dev_allow_any_invites;
     config.debug_controls = debug_controls;
+    config.media_allowed_roots = Vec::new();
     // The white-box suite drives streams at loopback brokers and connects to an
     // in-process `MockRelay` at loopback; production defaults keep both off (see
     // `allow_insecure_local_broker` / `allow_loopback_relays`).
@@ -80,6 +209,7 @@ fn received_message(
         kind,
         tags,
         recorded_at: 42,
+        received_at: 84,
     }
 }
 
@@ -367,6 +497,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx: idle_tx,
             cancel_tx: idle_cancel_tx,
@@ -386,6 +517,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![2]),
             stream_id: vec![0xbb],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx: active_tx,
             cancel_tx: active_cancel_tx,
@@ -440,6 +572,7 @@ async fn stream_session_sweep_spares_finalized_session_despite_idle() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx,
             cancel_tx,
@@ -520,6 +653,59 @@ async fn connector_socket_bind_applies_configured_group_modes() {
         !fs_private::socket_staging_dir(&socket).exists(),
         "staging dir should be removed after bind"
     );
+}
+
+#[tokio::test]
+async fn connector_socket_bind_preserves_preexisting_custom_parent_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_parent = dir.path().join("s");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let socket = shared_parent.join("a");
+
+    let listener = bind_connector_socket_with_mode(&socket, 0o700, 0o600).unwrap();
+
+    assert!(listener.local_addr().is_ok());
+    assert_eq!(
+        shared_parent.metadata().unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_bind_rejects_symlinked_parent_without_chmodding_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("dev");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&target, &link).unwrap();
+
+    let error = bind_connector_socket_with_mode(&link.join("wn-agent.sock"), 0o700, 0o600)
+        .expect_err("symlinked socket parent must be rejected");
+
+    assert_eq!(error.code(), "io_error");
+    assert_eq!(
+        target.metadata().unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!target.join("wn-agent.sock").exists());
+}
+
+#[tokio::test]
+async fn connector_socket_bind_rejects_unconfigured_group_writable_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_parent = dir.path().join("shared");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    let error = bind_connector_socket_with_mode(&shared_parent.join("wn-agent.sock"), 0o700, 0o600)
+        .expect_err("unexpected group write access must be rejected");
+
+    assert_eq!(error.code(), "io_error");
+    assert!(!shared_parent.join("wn-agent.sock").exists());
 }
 
 #[tokio::test]
@@ -633,8 +819,8 @@ async fn connector_socket_caps_concurrent_connections() {
     assert_eq!(response.id.as_deref(), Some("req-held"));
     assert_eq!(response.payload, AgentControlResponse::Ack);
 
-    // A second concurrent connection is over the cap: the connector closes
-    // it at accept time without serving a response.
+    // A second concurrent connection is over the global cap and receives a
+    // typed busy response rather than an ambiguous empty close.
     let refused = UnixStream::connect(&socket).await.unwrap();
     let (refused_read, mut refused_write) = tokio::io::split(refused);
     let mut refused_read = BufReader::new(refused_read);
@@ -642,16 +828,17 @@ async fn connector_socket_caps_concurrent_connections() {
         Some("req-refused".to_owned()),
         AgentControlRequest::AccountList,
     );
-    // The write may race the server-side close; only the read matters.
     let _ = write_frame(&mut refused_write, &request).await;
-    let refused_result: Result<Option<AgentControlEnvelope<AgentControlResponse>>, _> =
+    let refused_response: AgentControlEnvelope<AgentControlResponse> =
         timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut refused_read))
             .await
-            .unwrap();
-    assert!(
-        matches!(refused_result, Ok(None) | Err(_)),
-        "over-cap connection must be closed without a response"
-    );
+            .expect("busy response should not time out")
+            .expect("busy response should be a valid frame")
+            .expect("busy response should not be empty");
+    assert!(matches!(
+        refused_response.payload,
+        AgentControlResponse::Error { ref code, .. } if code == "server_busy"
+    ));
 
     // Dropping the held connection frees the permit for a new connection.
     drop(held_read);
@@ -1260,6 +1447,7 @@ async fn stream_session_store_resolves_non_canonical_stream_id() {
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa, 0xbb],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx,
             cancel_tx,
@@ -1285,6 +1473,109 @@ async fn stream_session_store_resolves_non_canonical_stream_id() {
         "session should be gone after removal via the non-canonical id"
     );
     handle.abort();
+}
+
+#[tokio::test]
+async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
+    use crate::stream_session::{StreamBeginReceipt, StreamBeginReservation, StreamSessionStore};
+
+    let store = StreamSessionStore::default();
+    let first_stream_id = hex::encode([0x11; 32]);
+    let second_stream_id = hex::encode([0x22; 32]);
+
+    let first_guard = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("first request must lead its reservation"),
+    };
+
+    let mut follower = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Wait(completion) => completion,
+        _ => panic!("same-request retry must wait for the leader"),
+    };
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-a".to_owned(),
+            "different-fingerprint".to_owned(),
+            Some(first_stream_id.clone()),
+        ),
+        Err(crate::ConnectorError::StreamBeginRequestConflict)
+    ));
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-b".to_owned(),
+            "fingerprint-b".to_owned(),
+            Some(first_stream_id.clone()),
+        ),
+        Err(crate::ConnectorError::StreamIdInUse)
+    ));
+
+    // A distinct request and stream id becomes a leader immediately while A
+    // is still in flight. Its DNS/runtime work can therefore run concurrently.
+    let second_guard = match store
+        .reserve_stream_begin(
+            "request-b".to_owned(),
+            "fingerprint-b".to_owned(),
+            Some(second_stream_id),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("unrelated request must not wait behind request A"),
+    };
+    drop(second_guard);
+
+    // Cancelling/failing the leader releases its stream id and wakes followers
+    // so one can retry as the new leader.
+    drop(first_guard);
+    timeout(Duration::from_secs(1), follower.changed())
+        .await
+        .expect("cancelled leader must wake followers")
+        .expect("reservation watch remains valid through wakeup");
+
+    let retry_guard = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("retry must lead after the cancelled reservation is released"),
+    };
+    let receipt = StreamBeginReceipt {
+        fingerprint: "fingerprint-a".to_owned(),
+        stream_id_hex: first_stream_id,
+        stream_capability: hex::encode([0x33; 32]),
+        start_message_id_hex: hex::encode([0x44; 32]),
+        quic_candidates: vec!["quic://broker.example:443".to_owned()],
+        policy_max_plaintext_frame_len: Some(1024),
+    };
+    retry_guard.complete(receipt.clone());
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            None,
+        ),
+        Ok(StreamBeginReservation::Completed(completed))
+            if completed.stream_id_hex == receipt.stream_id_hex
+                && completed.stream_capability == receipt.stream_capability
+    ));
 }
 
 #[tokio::test]
@@ -1315,6 +1606,7 @@ async fn stream_session_sweep_does_not_force_abort_when_cancel_already_queued() 
             account_label: "agent".to_owned(),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
+            stream_capability: [0x77; 32],
             start_message_id_hex: "00".to_owned(),
             tx,
             cancel_tx,
@@ -1465,7 +1757,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
 }
 
 #[tokio::test]
-async fn connector_policy_allow_any_accepts_unlisted_welcomer() {
+async fn connector_policy_dev_allow_any_accepts_unlisted_authenticated_welcomer() {
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -1493,7 +1785,7 @@ async fn connector_policy_allow_any_accepts_unlisted_welcomer() {
         socket.clone(),
         vec![relay_url],
         true,
-        false,
+        true,
     )));
     assert!(matches!(
         send_control_request(&socket, "req-ready", AgentControlRequest::AccountList)
@@ -1520,6 +1812,33 @@ async fn connector_policy_allow_any_accepts_unlisted_welcomer() {
     human_runtime.shutdown().await;
     server.abort();
     let _ = server.await;
+}
+
+#[test]
+fn dev_allow_any_invites_still_requires_an_authenticated_welcomer() {
+    assert!(crate::invite_policy::invite_policy_allows(
+        true, true, false
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        true, false, false
+    ));
+}
+
+#[test]
+fn dev_allow_any_invites_requires_debug_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        true,
+        false,
+    );
+    config.debug_controls = false;
+
+    let error = crate::validation::validate_control_plane_config(&config)
+        .expect_err("dev allow-any must require debug controls");
+    assert_eq!(error.code(), "unsafe_control_plane_config");
 }
 
 #[tokio::test]
@@ -1918,7 +2237,52 @@ async fn connector_socket_composes_and_finalizes_stream() {
     .unwrap();
     let listener = bind_connector_socket(&socket).unwrap();
 
+    let missing_begin_id = connector
+        .stream_begin_response(
+            None,
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            Some(stream_id_hex.clone()),
+            Some(parent_message_id_hex.clone()),
+            vec!["quic://127.0.0.1:9".to_owned()],
+        )
+        .await;
+    assert!(matches!(
+        missing_begin_id,
+        Err(crate::ConnectorError::InvalidStreamBeginRequestId)
+    ));
+
+    let begin_request = AgentControlRequest::StreamBegin {
+        account_id_hex: agent.account.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        stream_id_hex: Some(stream_id_hex.clone()),
+        parent_message_id_hex: Some(parent_message_id_hex.clone()),
+        quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+    };
     let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin",
+        begin_request.clone(),
+    )
+    .await;
+    let first_begun_payload = begun.payload.clone();
+
+    let retried_begin = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin",
+        begin_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        retried_begin.payload, first_begun_payload,
+        "an identical begin retry must return the original capability and receipt"
+    );
+
+    let conflicting_retry = serve_control_request_once(
         &connector,
         &listener,
         &socket,
@@ -1927,13 +2291,32 @@ async fn connector_socket_composes_and_finalizes_stream() {
             account_id_hex: agent.account.account_id_hex.clone(),
             group_id_hex: group_id_hex.clone(),
             stream_id_hex: Some(stream_id_hex.clone()),
-            parent_message_id_hex: Some(parent_message_id_hex.clone()),
+            parent_message_id_hex: None,
             quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
         },
     )
     .await;
+    let AgentControlResponse::Error { code, .. } = conflicting_retry.payload else {
+        panic!("expected conflicting stream-begin retry error");
+    };
+    assert_eq!(code, "stream_begin_request_conflict");
+
+    let colliding_begin = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin-collision",
+        begin_request,
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = colliding_begin.payload else {
+        panic!("expected stream-id collision error");
+    };
+    assert_eq!(code, "stream_id_in_use");
+
     let AgentControlResponse::StreamBegun {
         stream_id_hex: begun_stream_id_hex,
+        stream_capability,
         start_message_id_hex,
         quic_candidates,
         ..
@@ -1942,6 +2325,9 @@ async fn connector_socket_composes_and_finalizes_stream() {
         panic!("expected stream begun response");
     };
     assert_eq!(begun_stream_id_hex, stream_id_hex);
+    assert_eq!(stream_capability.len(), 64);
+    assert_eq!(hex::decode(&stream_capability).unwrap().len(), 32);
+    assert_eq!(stream_capability, stream_capability.to_ascii_lowercase());
     assert_eq!(quic_candidates, vec!["quic://127.0.0.1:9"]);
     let stored = connector
         .runtime
@@ -1957,6 +2343,14 @@ async fn connector_socket_composes_and_finalizes_stream() {
         .iter()
         .find(|message| message.message_id_hex == start_message_id_hex)
         .expect("stream start must be in the local app projection");
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|message| message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START)
+            .count(),
+        1,
+        "begin retries and collisions must not publish another start event"
+    );
     assert_eq!(start.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
     assert_eq!(
         start
@@ -1975,6 +2369,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         "req-stream-append",
         AgentControlRequest::StreamAppend {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             append_text: "hello stream".to_owned(),
         },
     )
@@ -1988,6 +2383,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         "req-stream-status",
         AgentControlRequest::StreamStatus {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             status: "thinking".to_owned(),
         },
     )
@@ -2009,6 +2405,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
         "req-stream-finalize",
         AgentControlRequest::StreamFinalize {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability,
             final_text: "hello stream".to_owned(),
             transcript_hash_hex,
             chunk_count: 2,
@@ -2086,6 +2483,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
     )
     .await;
     let AgentControlResponse::StreamBegun {
+        stream_capability,
         start_message_id_hex,
         ..
     } = begun.payload
@@ -2100,6 +2498,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-append",
         AgentControlRequest::StreamAppend {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             append_text: "hello stream".to_owned(),
         },
     )
@@ -2120,6 +2519,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-finalize-mismatch",
         AgentControlRequest::StreamFinalize {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             final_text: "hello stream".to_owned(),
             transcript_hash_hex: first_hash,
             chunk_count: 7,
@@ -2141,6 +2541,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-append-again",
         AgentControlRequest::StreamAppend {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             append_text: " again".to_owned(),
         },
     )
@@ -2163,6 +2564,7 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
         "req-retry-finalize",
         AgentControlRequest::StreamFinalize {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability,
             final_text: "hello stream again".to_owned(),
             transcript_hash_hex: corrected_hash,
             chunk_count: 2,
@@ -2246,10 +2648,12 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         },
     )
     .await;
-    assert!(matches!(
-        begun.payload,
-        AgentControlResponse::StreamBegun { .. }
-    ));
+    let AgentControlResponse::StreamBegun {
+        stream_capability, ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
 
     // Reconstruct the exact state left after a validated finalize whose durable
     // publish then failed: the compose task has exited (abort it here to prove
@@ -2277,6 +2681,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let mismatch = connector
         .stream_finalize_response(
             &stream_id_hex,
+            &stream_capability,
             "different final".to_owned(),
             &hex::encode(transcript_hash),
             1,
@@ -2298,6 +2703,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let finalized = connector
         .stream_finalize_response(
             &stream_id_hex,
+            &stream_capability,
             "frozen final".to_owned(),
             &hex::encode(transcript_hash),
             1,
@@ -2324,6 +2730,7 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
     let retried_after_success = connector
         .stream_finalize_response(
             &stream_id_hex,
+            &stream_capability,
             "frozen final".to_owned(),
             &hex::encode(transcript_hash),
             1,
@@ -2339,6 +2746,22 @@ async fn connector_finalize_retries_durable_finish_without_compose_task() {
         panic!("expected stream finalized response");
     };
     assert_eq!(retried_ids, message_ids_hex);
+
+    let wrong_capability = hex::encode([0x99; 32]);
+    let wrong_capability_retry = connector
+        .stream_finalize_response(
+            &stream_id_hex,
+            &wrong_capability,
+            "frozen final".to_owned(),
+            &hex::encode(transcript_hash),
+            1,
+            Some("frozen-finalize".to_owned()),
+        )
+        .await;
+    assert!(
+        wrong_capability_retry.is_err(),
+        "a finalized idempotency receipt must remain bound to its capability"
+    );
 }
 
 #[tokio::test]
@@ -2394,10 +2817,30 @@ async fn connector_socket_cancels_stream_session() {
         },
     )
     .await;
-    assert!(matches!(
-        begun.payload,
-        AgentControlResponse::StreamBegun { .. }
-    ));
+    let AgentControlResponse::StreamBegun {
+        stream_capability, ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+
+    let wrong_capability = hex::encode([0x99; 32]);
+    let denied_cancel = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-cancel-denied",
+        AgentControlRequest::StreamCancel {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: wrong_capability,
+            reason: Some("unauthorized".to_owned()),
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = denied_cancel.payload else {
+        panic!("expected denied cancel error");
+    };
+    assert_eq!(code, "stream_capability_denied");
 
     let status = serve_control_request_once(
         &connector,
@@ -2406,6 +2849,7 @@ async fn connector_socket_cancels_stream_session() {
         "req-stream-status",
         AgentControlRequest::StreamStatus {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             status: "thinking".to_owned(),
         },
     )
@@ -2419,6 +2863,7 @@ async fn connector_socket_cancels_stream_session() {
         "req-stream-cancel",
         AgentControlRequest::StreamCancel {
             stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
             reason: Some("gateway_replaced_text".to_owned()),
         },
     )
@@ -2432,6 +2877,7 @@ async fn connector_socket_cancels_stream_session() {
         "req-stream-append-after-cancel",
         AgentControlRequest::StreamAppend {
             stream_id_hex,
+            stream_capability,
             append_text: "late".to_owned(),
         },
     )
@@ -2439,7 +2885,7 @@ async fn connector_socket_cancels_stream_session() {
     let AgentControlResponse::Error { code, .. } = append_after_cancel.payload else {
         panic!("expected append-after-cancel error");
     };
-    assert_eq!(code, "stream_error");
+    assert_eq!(code, "stream_capability_denied");
 }
 
 async fn connect_with_retry(socket: &Path) -> UnixStream {
@@ -2886,6 +3332,18 @@ fn inbound_message_event_detects_inline_nostr_mention() {
 }
 
 #[test]
+fn inbound_message_event_does_not_scan_for_hex_mentions_past_the_cap() {
+    let account = "aa".repeat(32);
+    let mut text = "x".repeat(AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize);
+    text.push_str(&format!(" nostr:{account}"));
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "nostr:<hex> mentions past the bounded scan window must be ignored"
+    );
+}
+
+#[test]
 fn inbound_message_event_detects_npub_bech32_mention() {
     // A p-tag-less mention whose inline text is the bech32 `nostr:npub1…` form
     // (what marmot-markdown renders) must still be detected.
@@ -3317,7 +3775,7 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
     } = connector
         .send_final_response(
             &agent.account.account_id_hex,
-            &group_id_hex,
+            &group_id_hex.to_uppercase(),
             "idempotent reply".to_owned(),
             None,
             Some(key.clone()),
@@ -3347,7 +3805,7 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
     };
     assert_eq!(
         second_ids, first_ids,
-        "a repeated idempotency key must return the original message ids"
+        "a repeated idempotency key must return the original ids across equivalent hex casing"
     );
 
     // Observable proof there was no second underlying send: exactly one copy of
@@ -3398,6 +3856,29 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
         store.get("k2", &fingerprint),
         None,
         "an unrelated key stays absent"
+    );
+}
+
+#[test]
+fn send_idempotency_persist_preserves_existing_socket_directory_mode() {
+    use crate::stream_session::SendIdempotencyStore;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dev = dir.path().join("dev");
+    std::fs::create_dir(&dev).unwrap();
+    std::fs::set_permissions(&dev, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "key".to_owned(),
+        "fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+
+    assert_eq!(
+        std::fs::metadata(dev).unwrap().permissions().mode() & 0o777,
+        0o750
     );
 }
 

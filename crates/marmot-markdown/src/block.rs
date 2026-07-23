@@ -15,6 +15,10 @@ use crate::ast::{Alignment, Block, CodeBlockKind, Inline, ListItem, ListKind, Ta
 use crate::scanner;
 
 pub(crate) const MAX_CONTAINER_DEPTH: usize = 96;
+/// Hard cap on GFM table width. Once width is bounded, padding ragged rows is
+/// linear in the input row count instead of permitting an input-sized width
+/// multiplied by an input-sized row count.
+const MAX_TABLE_COLUMNS: usize = 128;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // populated in Phase 3 (link reference definitions)
@@ -851,6 +855,9 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
     while j < b.len() && b[j] != b']' {
         if b[j] == b'\\' && j + 1 < b.len() {
             j += 2;
+            if j - label_start > 999 {
+                return None;
+            }
             continue;
         }
         if b[j] == b'\n' {
@@ -859,6 +866,9 @@ fn parse_one_ref_def(s: &str) -> Option<(String, LinkRef, usize)> {
             // — treat newlines as label content.
         }
         j += 1;
+        if j - label_start > 999 {
+            return None;
+        }
     }
     if j >= b.len() || b[j] != b']' {
         return None;
@@ -930,7 +940,7 @@ pub(crate) fn parse_link_destination(b: &[u8], i: usize) -> Option<(String, usiz
         let mut j = start;
         let mut out_bytes: Vec<u8> = Vec::new();
         while j < b.len() && b[j] != b'>' {
-            if b[j] == b'<' || b[j] == b'\n' {
+            if b[j] == b'<' || b[j] < 0x20 || b[j] == 0x7f {
                 return None;
             }
             if b[j] == b'\\' && j + 1 < b.len() && scanner::is_ascii_punct(b[j + 1]) {
@@ -1005,7 +1015,11 @@ pub(crate) fn parse_link_title(b: &[u8], i: usize) -> Option<(String, usize)> {
             continue;
         }
         if c == close {
-            return Some((String::from_utf8(out_bytes).ok()?, j + 1));
+            let title = String::from_utf8(out_bytes).ok()?;
+            if title.chars().any(char::is_control) {
+                return None;
+            }
+            return Some((title, j + 1));
         }
         // Disallow unescaped opening quote of same family inside parens form.
         if open == b'(' && c == b'(' {
@@ -1262,7 +1276,11 @@ fn parse_fence_open(bytes: &[u8]) -> Option<(u8, usize, String)> {
         return None;
     }
     let trimmed = trim_ascii_ws(info_bytes);
-    let info = std::str::from_utf8(trimmed).ok()?.to_string();
+    let info = std::str::from_utf8(trimmed)
+        .ok()?
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
     Some((ch, i, info))
 }
 
@@ -1361,7 +1379,7 @@ fn parse_table_delim_row(line: &str) -> Option<Vec<Alignment>> {
         return None;
     }
     let cells = split_table_row(line);
-    if cells.is_empty() {
+    if cells.is_empty() || cells.len() > MAX_TABLE_COLUMNS {
         return None;
     }
     let mut alignments = Vec::with_capacity(cells.len());

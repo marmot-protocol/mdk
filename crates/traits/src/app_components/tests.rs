@@ -36,6 +36,15 @@ fn component_list_rejects_duplicate_or_trailing_bytes() {
 }
 
 #[test]
+fn component_list_rejects_non_canonical_id_order() {
+    let descending = vec![4, 0x80, 0x02, 0x80, 0x01];
+    assert_eq!(
+        decode_components_list(&descending),
+        Err("component list is not sorted".into())
+    );
+}
+
+#[test]
 fn quic_varint_decoder_rejects_non_canonical_lengths() {
     assert_eq!(
         decode_quic_varint(&[0x40, 0x3f]),
@@ -62,6 +71,15 @@ fn nostr_routing_round_trips_canonical_state() {
         vec!["wss://relay-a.example", "wss://relay-b.example"]
     );
     assert_eq!(decoded.nostr_group_id, [0x42; 32]);
+}
+
+#[test]
+fn nostr_routing_keeps_plaintext_relays_structurally_representable() {
+    let routing = NostrRoutingV1::new([0x42; 32], vec!["ws://relay.example".into()]).unwrap();
+    assert_eq!(
+        decode_nostr_routing_v1(&encode_nostr_routing_v1(&routing).unwrap()).unwrap(),
+        routing
+    );
 }
 
 #[test]
@@ -148,6 +166,12 @@ fn encrypted_media_policy_rejects_non_https_except_loopback_dev_http() {
         validate_and_normalize_blob_endpoint_url("https://10.0.0.1", false),
         Err("encrypted media endpoint URL must not point at a non-routable address".into())
     );
+    for raw in ["https://localhost./", "https://sub.localhost./"] {
+        assert_eq!(
+            validate_and_normalize_blob_endpoint_url(raw, false),
+            Err("encrypted media https endpoint must not point at localhost".into())
+        );
+    }
 }
 
 /// Regression for #374: the spec's invalidity list (group-encrypted-media-v1.md)
@@ -350,14 +374,17 @@ fn group_avatar_url_rejects_documentation_ipv6_ranges() {
         "https://[2001:db8::1]/a.png",
         "https://[2001:db8:abcd:12::1]/a.png",
         "https://[3fff::1]/a.png",
-        "https://[3fff:ffff::1]/a.png",
+        "https://[3fff:0fff::1]/a.png",
     ] {
         assert!(
             validate_and_normalize_group_avatar_url(raw).is_err(),
             "{raw} should be rejected"
         );
     }
-    // A globally-routable IPv6 address is still accepted.
+    // Addresses immediately outside 3fff::/20 and other global-unicast IPv6
+    // addresses remain accepted.
+    assert!(validate_and_normalize_group_avatar_url("https://[3ffe::1]/a.png").is_ok());
+    assert!(validate_and_normalize_group_avatar_url("https://[3fff:1000::1]/a.png").is_ok());
     assert!(validate_and_normalize_group_avatar_url("https://[2606:4700::1]/a.png").is_ok());
 }
 
@@ -455,6 +482,8 @@ fn group_avatar_url_rejects_localhost_and_non_routable_hosts() {
     for raw in [
         "https://localhost/a.png",
         "https://app.localhost/a.png",
+        "https://localhost./a.png",
+        "https://app.localhost./a.png",
         "https://127.0.0.1/a.png",
         "https://10.0.0.5/a.png",
         "https://192.168.1.2/a.png",

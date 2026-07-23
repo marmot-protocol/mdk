@@ -254,6 +254,33 @@ describe("startMarmotInbound", () => {
     });
   });
 
+  it("surfaces a disappearing-message timer change", async () => {
+    const surfaced: { text: string }[] = [];
+    const api: InboundPluginApi = {
+      config: { channels: { marmot: { profileNameOnboarding: false } } },
+      logger: noopLogger,
+    };
+    const stop = startMarmotInbound(api, () => {}, {
+      clientFactory: () =>
+        inboundStubClient([
+          {
+            type: "group_state_changed",
+            account_id_hex: HEX32("aa"),
+            group_id_hex: HEX32("cc"),
+            change: "disappearing_timer_changed",
+          },
+        ]),
+      surfaceAmbientEvent: (event) => {
+        surfaced.push(event);
+      },
+    });
+
+    await waitFor(() => surfaced.length > 0);
+    stop();
+
+    expect(surfaced[0]?.text).toBe("The disappearing-message timer was changed.");
+  });
+
   it("surfaces a membership change without any member detail", async () => {
     const surfaced: { text: string }[] = [];
     const api: InboundPluginApi = {

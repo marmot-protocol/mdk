@@ -104,10 +104,12 @@ This repository now has the main engine candidate:
 - `crates/marmot-markdown` — CommonMark and Nostr-aware display parser for app message rendering.
 - `crates/marmot-forensics` — opt-in JSONL forensic audit schema and recorder traits.
 - `crates/marmot-uniffi` — UniFFI bindings and build scripts for Swift/Kotlin app runtimes.
-- `crates/agent-control` — `marmot.agent-control.v1` DTOs and newline-delimited JSON framing for agent integrations.
+- `crates/agent-control` — `marmot.agent-control.v2` DTOs and newline-delimited JSON framing for agent integrations.
 - `crates/agent-stream-compose` — reusable live-preview stream composition over the QUIC broker publisher.
 - `crates/agent-connector` — local `wn-agent` connector daemon bridging agent control, account runtime, and stream
-  composition; Hermes and OpenClaw plugins talk to it over a Unix socket.
+  composition; Hermes and OpenClaw plugins talk to it over a Unix socket. Version 2 stream sessions use random
+  per-stream bearer capabilities, reject active stream-id collisions, and replay the original begin receipt for an
+  identical request-id retry.
 - `integrations/hermes/marmot` and `integrations/openclaw/marmot` — thin control-plane-only agent plugins.
 - `formal/tamarin` — formal models for the convergence selector, delivery-order robustness, lifecycle cases, and
   proof/test mapping.

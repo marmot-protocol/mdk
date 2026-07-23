@@ -105,29 +105,38 @@ impl RelaySafetyPolicy {
     }
 }
 
-/// Reject a relay endpoint whose LITERAL host is loopback or any other
-/// non-public IP, unless the dev/test loopback opt-in is set (which admits
-/// loopback only — private/link-local/CGNAT literals stay rejected). Relay
+/// Require TLS for every public relay. Plaintext `ws://` is admitted only for
+/// an explicitly enabled loopback host; private/link-local/CGNAT and public
+/// plaintext endpoints stay rejected even with the dev flag. Relay
 /// endpoints arrive from signed routing components and relay-list events, so a
 /// poisoned record must not steer the relay pool at internal services (SSRF;
-/// see `docs/marmot-architecture/overview/dial-safety.md`). A DOMAIN host is
-/// accepted here: nostr-sdk owns DNS resolution and the WebSocket, so
+/// see `docs/marmot-architecture/overview/dial-safety.md`). A `wss://` DOMAIN
+/// host is accepted here: nostr-sdk owns DNS resolution and the WebSocket, so
 /// resolve-time validation cannot be pinned at this layer — an accepted LOW
 /// residual, per the dial-safety note. Error strings stay URL-free.
 fn reject_unsafe_relay_host(url: &RelayUrl, allow_loopback: bool) -> Result<(), String> {
     let parsed = Url::parse(url.as_str()).map_err(|_| "invalid relay endpoint".to_owned())?;
-    match parsed.host() {
-        Some(Host::Ipv4(addr)) => reject_non_public_ip(IpAddr::V4(addr), allow_loopback)
+    let host = parsed
+        .host()
+        .ok_or_else(|| "relay endpoint is missing a host".to_owned())?;
+    if parsed.scheme() == "ws" {
+        return if allow_loopback && is_loopback_host(host) {
+            Ok(())
+        } else {
+            Err("plaintext relay endpoints are allowed only for loopback in dev mode".to_owned())
+        };
+    }
+    match host {
+        Host::Ipv4(addr) => reject_non_public_ip(IpAddr::V4(addr), allow_loopback)
             .map_err(|_| "relay endpoint host is not a public address".to_owned()),
-        Some(Host::Ipv6(addr)) => reject_non_public_ip(IpAddr::V6(addr), allow_loopback)
+        Host::Ipv6(addr) => reject_non_public_ip(IpAddr::V6(addr), allow_loopback)
             .map_err(|_| "relay endpoint host is not a public address".to_owned()),
-        Some(Host::Domain(domain)) => {
+        Host::Domain(domain) => {
             if is_loopback_host(Host::Domain(domain)) && !allow_loopback {
                 return Err("relay endpoint host must not be localhost".to_owned());
             }
             Ok(())
         }
-        None => Err("relay endpoint is missing a host".to_owned()),
     }
 }
 
@@ -175,6 +184,23 @@ mod tests {
                 .sanitize_endpoints(endpoints(&["wss://relay.example"]), "test")
                 .expect("public relay accepted");
             assert_eq!(sanitized.len(), 1);
+        }
+    }
+
+    #[test]
+    fn rejects_public_plaintext_relays_even_with_dev_opt_in() {
+        for policy in [
+            RelaySafetyPolicy::default(),
+            RelaySafetyPolicy::with_allow_loopback(true),
+        ] {
+            for url in ["ws://relay.example", "ws://8.8.8.8"] {
+                assert!(
+                    policy
+                        .sanitize_endpoints(endpoints(&[url]), "test")
+                        .is_err(),
+                    "{url} must require TLS"
+                );
+            }
         }
     }
 

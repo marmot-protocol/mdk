@@ -6,6 +6,7 @@ use cgka_traits::app_components::{is_loopback_candidate_host, reject_non_public_
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::error::ConnectorError;
+use crate::with_control_operation_timeout;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedQuicCandidate {
@@ -60,14 +61,17 @@ pub(crate) async fn resolve_quic_candidate_addr(
     candidate: &ParsedQuicCandidate,
     allow_local_endpoint: bool,
 ) -> Result<SocketAddr, ConnectorError> {
-    let mut addrs = tokio::net::lookup_host(&candidate.authority)
-        .await
-        .map_err(|err| {
-            ConnectorError::Stream(format!(
-                "failed to resolve QUIC candidate {}: {err}",
-                candidate.original
-            ))
-        })?;
+    let mut addrs = with_control_operation_timeout(
+        "quic_candidate_dns_lookup",
+        tokio::net::lookup_host(&candidate.authority),
+    )
+    .await?
+    .map_err(|err| {
+        ConnectorError::Stream(format!(
+            "failed to resolve QUIC candidate {}: {err}",
+            candidate.original
+        ))
+    })?;
     let addr = addrs.next().ok_or_else(|| {
         ConnectorError::Stream(format!("invalid QUIC candidate: {}", candidate.original))
     })?;

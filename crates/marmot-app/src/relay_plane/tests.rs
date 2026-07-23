@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use cgka_traits::transport::{TransportEnvelope, TransportMessage, TransportSource};
@@ -206,6 +206,24 @@ impl DirectoryRelayFetcher for RecordingDirectoryFetcher {
     }
 }
 
+#[derive(Default)]
+struct PanicOnceDirectoryFetcher {
+    panicked: AtomicBool,
+}
+
+#[async_trait]
+impl DirectoryRelayFetcher for PanicOnceDirectoryFetcher {
+    async fn fetch_directory_events(
+        &self,
+        _request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        if !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("injected directory fetch panic");
+        }
+        Ok(Vec::new())
+    }
+}
+
 fn relay_plane_with_directory_fetcher(
     relay: Arc<dyn NostrRelayClient>,
     directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
@@ -240,6 +258,19 @@ async fn relay_plane_rejects_invalid_relay_endpoints_before_subscribing() {
 
     assert!(err.to_string().contains("invalid relay endpoint"));
     assert!(relay.subscriptions.lock().unwrap().is_empty());
+}
+
+#[test]
+fn notification_trigger_endpoints_use_the_relay_safety_policy() {
+    let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let err = plane
+        .sanitize_relay_endpoints(
+            vec![TransportEndpoint("wss://169.254.169.254".into())],
+            "notification trigger publish",
+        )
+        .expect_err("peer-controlled link-local relay hint must be rejected");
+
+    assert!(err.contains("host is not a public address"));
 }
 
 #[tokio::test]
@@ -584,6 +615,34 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
     assert_eq!(
         relay_plane.relay_health().await.directory_coalesced_waiters,
         1
+    );
+}
+
+#[tokio::test]
+async fn directory_fetch_panic_clears_inflight_entry_for_retry() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let directory_fetcher = Arc::new(PanicOnceDirectoryFetcher::default());
+    let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher);
+    let endpoints = vec![TransportEndpoint("wss://relay.example".into())];
+    let queries = vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12)];
+
+    let error = relay_plane
+        .fetch_directory_events(endpoints.clone(), queries.clone())
+        .await
+        .expect_err("the injected panic should become a fetch error");
+    assert_eq!(error, "directory fetch task failed");
+    assert_eq!(
+        relay_plane.relay_health().await.directory_inflight_fetches,
+        0,
+        "the panicked owner must release its coalescing key"
+    );
+
+    assert_eq!(
+        relay_plane
+            .fetch_directory_events(endpoints, queries)
+            .await
+            .expect("an identical fetch should retry after the panic"),
+        Vec::new()
     );
 }
 

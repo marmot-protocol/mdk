@@ -51,6 +51,9 @@ optional_env:
   - name: MARMOT_INBOUND_MEDIA_DIR
     description: "Directory where inbound media is re-staged before agent tools read it; defaults to $MARMOT_HOME/dev/inbound-media"
     password: false
+  - name: MARMOT_OUTBOUND_MEDIA_DIR
+    description: "Connector-approved directory for short-lived outbound media staging; defaults to $MARMOT_HOME/dev/outbound-media"
+    password: false
   - name: MARMOT_PROFILE_NAME_ONBOARDING
     description: "Enable the one-time public Nostr profile-name consent flow (true/false)"
     password: false

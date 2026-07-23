@@ -100,7 +100,10 @@ pub struct TimelineMessageRecord {
     pub plaintext: String,
     pub kind: u64,
     pub tags: Vec<Vec<String>>,
+    /// Authenticated inner app-event time for app messages; local observation
+    /// time for synthesized rows that have no inner timestamp.
     pub timeline_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreview>,
@@ -129,6 +132,9 @@ pub struct TimelineReplyPreview {
     pub media: Option<Value>,
     pub agent_text_stream: Option<Value>,
     pub deleted: bool,
+    /// Set when convergence invalidated the previewed message. Content remains
+    /// available so the application can choose whether to show or hide it.
+    pub invalidation_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1824,32 +1830,33 @@ fn reply_message_ids_for_targets_tx(
     tx: &Connection,
     group_id_hex: &str,
     target_message_ids: &[String],
-) -> StorageResult<Vec<String>> {
+) -> StorageResult<BTreeSet<String>> {
     if target_message_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeSet::new());
     }
-    let placeholders = std::iter::repeat_n("?", target_message_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT message_id_hex
-         FROM message_timeline
-         WHERE group_id_hex = ?
-           AND reply_to_message_id_hex IN ({placeholders})"
-    );
-    let mut values = Vec::<rusqlite::types::Value>::with_capacity(target_message_ids.len() + 1);
-    values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-    values.extend(
-        target_message_ids
-            .iter()
-            .cloned()
-            .map(rusqlite::types::Value::Text),
-    );
-    let mut stmt = tx.prepare(&sql).storage()?;
-    stmt.query_map(params_from_iter(values.iter()), |row| row.get(0))
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()
+    let mut message_ids = BTreeSet::new();
+    for chunk in target_message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id_hex
+             FROM message_timeline
+             WHERE group_id_hex = ?
+               AND reply_to_message_id_hex IN ({placeholders})"
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+        values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        values.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_ids = stmt
+            .query_map(params_from_iter(values.iter()), |row| row.get(0))
+            .storage()?
+            .collect::<Result<Vec<String>, _>>()
+            .storage()?;
+        message_ids.extend(chunk_ids);
+    }
+    Ok(message_ids)
 }
 
 fn reaction_target_message_id_tx(
@@ -1894,27 +1901,34 @@ fn timeline_records_by_ids_tx(
     if message_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat_n("?", message_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
+    let message_ids = message_ids.into_iter().collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT message_id_hex, source_message_id_hex, source_epoch, direction, group_id_hex, sender,
                 plaintext, kind, tags_json, timeline_at, received_at,
                 reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
                 deleted, deleted_by_message_id_hex, invalidation_status
-         FROM message_timeline
-         WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})
-         {TIMELINE_ORDER_BY_ASC}"
-    );
-    let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
-    params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-    params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
-    let mut stmt = tx.prepare(&sql).storage()?;
-    let mut messages = stmt
-        .query_map(params_from_iter(params.iter()), timeline_record_from_row)
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
+             FROM message_timeline
+             WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
+        );
+        let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+        params.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
+        params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+        let mut stmt = tx.prepare(&sql).storage()?;
+        let chunk_messages = stmt
+            .query_map(params_from_iter(params.iter()), timeline_record_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        messages.extend(chunk_messages);
+    }
+    messages.sort_by(|left, right| {
+        (left.timeline_at, &left.message_id_hex).cmp(&(right.timeline_at, &right.message_id_hex))
+    });
     attach_reply_previews(tx, &mut messages)?;
     Ok(messages)
 }
@@ -1976,8 +1990,11 @@ fn timeline_query_sql(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
-        clauses.push("plaintext LIKE ? COLLATE NOCASE".to_owned());
-        params.push(rusqlite::types::Value::Text(format!("%{search}%")));
+        clauses.push("plaintext LIKE ? ESCAPE '\\' COLLATE NOCASE".to_owned());
+        params.push(rusqlite::types::Value::Text(format!(
+            "%{}%",
+            escape_like_literal(search)
+        )));
     }
     match pagination.direction {
         CursorDirection::Before => {
@@ -2031,6 +2048,17 @@ fn timeline_query_sql(
         ),
         params,
     ))
+}
+
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn project_group_events(events: Vec<RawAppEvent>) -> (Vec<TimelineRow>, Vec<StreamStartRow>) {
@@ -2314,9 +2342,10 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         sender: row.get(5)?,
         plaintext: row.get(6)?,
         kind: row.get::<_, i64>(7)?.try_into().unwrap_or_default(),
-        tags: tags_from_json(row.get::<_, String>(8)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(err))
-        })?,
+        // Timeline rows are a rebuildable projection. Degrade a corrupt source
+        // tag blob to no tags so one damaged row cannot poison every rebuild
+        // for the group; this matches the tolerant unread/search read paths.
+        tags: tags_from_json(row.get::<_, String>(8)?).unwrap_or_default(),
         recorded_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
         invalidated: row.get::<_, i64>(11)? != 0,
@@ -2419,28 +2448,31 @@ fn load_reply_previews(
     for (group_id_hex, mut message_ids) in targets_by_group {
         message_ids.sort();
         message_ids.dedup();
-        let placeholders = std::iter::repeat_n("?", message_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch
-             FROM message_timeline
-             WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
-        );
-        let mut params = Vec::<rusqlite::types::Value>::with_capacity(message_ids.len() + 1);
-        params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
-        params.extend(message_ids.into_iter().map(rusqlite::types::Value::Text));
-        let mut stmt = conn.prepare(&sql).storage()?;
-        let group_previews = stmt
-            .query_map(params_from_iter(params.iter()), reply_preview_from_row)
-            .storage()?
-            .collect::<Result<Vec<_>, _>>()
-            .storage()?;
-        for preview in group_previews {
-            previews.insert(
-                (group_id_hex.clone(), preview.message_id_hex.clone()),
-                preview,
+        for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT message_id_hex, sender, plaintext, kind, media_json, agent_stream_json, deleted, source_epoch,
+                        invalidation_status
+                 FROM message_timeline
+                 WHERE group_id_hex = ? AND message_id_hex IN ({placeholders})"
             );
+            let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
+            params.push(rusqlite::types::Value::Text(group_id_hex.clone()));
+            params.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
+            let mut stmt = conn.prepare(&sql).storage()?;
+            let group_previews = stmt
+                .query_map(params_from_iter(params.iter()), reply_preview_from_row)
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            for preview in group_previews {
+                previews.insert(
+                    (group_id_hex.clone(), preview.message_id_hex.clone()),
+                    preview,
+                );
+            }
         }
     }
     Ok(previews)
@@ -2468,6 +2500,7 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
         source_epoch: row
             .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),
+        invalidation_status: row.get(8)?,
     })
 }
 

@@ -247,6 +247,10 @@ def configure_gateway_config(
 
     platform_entries = _ensure_mapping(config, "platforms")
     platform_entry = _ensure_mapping(platform_entries, platform)
+    # Persist platform activation in gateway config. The installer cannot
+    # assume an externally managed Hermes process inherits MARMOT_HOME or
+    # MARMOT_AGENT_SOCKET from its shell environment.
+    platform_entry["enabled"] = True
     extra = _ensure_mapping(platform_entry, "extra")
     if agent_home is not None:
         extra["home"] = str(agent_home)

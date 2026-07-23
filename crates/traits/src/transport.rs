@@ -26,6 +26,8 @@ pub struct TransportSource(pub String);
 pub struct TransportMessage {
     pub id: MessageId,
     pub payload: Vec<u8>,
+    /// Transport-supplied timestamp used only as an ordering/cursor hint. It
+    /// is not an authenticated application-message timestamp.
     pub timestamp: Timestamp,
     pub causal_deps: Vec<MessageId>,
     pub source: TransportSource,

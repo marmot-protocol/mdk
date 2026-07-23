@@ -28,6 +28,18 @@ pub enum ConnectorError {
     Stream(String),
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
+    #[error("connector operation timed out: {0}")]
+    OperationTimedOut(&'static str),
+    #[error("outbound media path denied: {0}")]
+    MediaPathDenied(&'static str),
+    #[error("stream id is already reserved")]
+    StreamIdInUse,
+    #[error("stream capability denied")]
+    StreamCapabilityDenied,
+    #[error("stream begin request id is invalid")]
+    InvalidStreamBeginRequestId,
+    #[error("stream begin request id was reused with different inputs")]
+    StreamBeginRequestConflict,
 }
 
 impl ConnectorError {
@@ -44,6 +56,12 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidProfileName(_) => "invalid_profile_name",
+            Self::OperationTimedOut(_) => "operation_timed_out",
+            Self::MediaPathDenied(_) => "media_path_denied",
+            Self::StreamIdInUse => "stream_id_in_use",
+            Self::StreamCapabilityDenied => "stream_capability_denied",
+            Self::InvalidStreamBeginRequestId => "invalid_stream_begin_request_id",
+            Self::StreamBeginRequestConflict => "stream_begin_request_conflict",
         }
     }
 
@@ -56,6 +74,14 @@ impl ConnectorError {
             Self::Json(_) | Self::Control(_) => "invalid control request",
             Self::Stream(_) => "agent stream request failed",
             Self::InvalidProfileName(_) => "invalid profile name",
+            Self::OperationTimedOut(_) => "connector operation timed out",
+            Self::MediaPathDenied(_) => "media path is not allowed",
+            Self::StreamIdInUse => "stream id is already in use",
+            Self::StreamCapabilityDenied => "stream capability is not authorized",
+            Self::InvalidStreamBeginRequestId => "stream begin request id is invalid",
+            Self::StreamBeginRequestConflict => {
+                "stream begin request id was reused with different inputs"
+            }
             Self::Io(_) => "connector I/O failed",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",
         }

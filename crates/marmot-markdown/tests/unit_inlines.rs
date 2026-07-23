@@ -105,6 +105,16 @@ fn code_span_unmatched_opening_run_is_not_rescanned() {
 }
 
 #[test]
+fn distinct_unclosed_code_span_runs_do_not_rescan_the_suffix() {
+    let mut input = String::new();
+    for run_len in (1..=512).rev() {
+        input.push_str(&"`".repeat(run_len));
+        input.push('x');
+    }
+    assert_eq!(parse_inlines(&input), vec![t(&input)]);
+}
+
+#[test]
 fn code_span_no_escapes_inside() {
     assert_eq!(parse_inlines("`\\n`"), vec![code("\\n")]);
 }
@@ -208,7 +218,7 @@ fn entity_decimal_numeric() {
 
 #[test]
 fn entity_decimal_numeric_allows_leading_zeroes() {
-    assert_eq!(parse_inlines("&#0000000065;"), vec![t("A")]);
+    assert_eq!(parse_inlines("&#0000065;"), vec![t("A")]);
 }
 
 #[test]
@@ -218,7 +228,13 @@ fn entity_hex_numeric_lower() {
 
 #[test]
 fn entity_hex_numeric_allows_leading_zeroes() {
-    assert_eq!(parse_inlines("&#x0000000041;"), vec![t("A")]);
+    assert_eq!(parse_inlines("&#x000041;"), vec![t("A")]);
+}
+
+#[test]
+fn entity_numeric_rejects_overlong_digit_runs() {
+    assert_eq!(parse_inlines("&#00000065;"), vec![t("&#00000065;")]);
+    assert_eq!(parse_inlines("&#x0000041;"), vec![t("&#x0000041;")]);
 }
 
 #[test]
@@ -229,6 +245,19 @@ fn entity_hex_numeric_upper() {
 #[test]
 fn entity_zero_becomes_replacement_char() {
     assert_eq!(parse_inlines("&#0;"), vec![t("\u{FFFD}")]);
+}
+
+#[test]
+fn entity_numeric_control_characters_become_replacement_chars() {
+    for entity in ["&#7;", "&#27;", "&#127;", "&#x80;", "&#x9f;"] {
+        assert_eq!(parse_inlines(entity), vec![t("\u{FFFD}")], "{entity}");
+    }
+}
+
+#[test]
+fn entity_numeric_text_whitespace_remains_allowed() {
+    assert_eq!(parse_inlines("a&#9;b"), vec![t("a\tb")]);
+    assert_eq!(parse_inlines("a&#10;b"), vec![t("a\nb")]);
 }
 
 #[test]

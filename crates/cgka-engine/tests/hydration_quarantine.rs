@@ -350,6 +350,12 @@ impl MessageStorage for FlakyGroupRecordStorage {
     ) -> StorageResult<Vec<MessageRecord>> {
         self.inner.list_messages(group_id, at_or_after_epoch)
     }
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.put_ingress_dedup_marker(id)
+    }
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
+        self.inner.has_ingress_dedup_marker(id)
+    }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.create_group_snapshot(group_id, name)
     }
@@ -1121,6 +1127,110 @@ async fn hydration_persists_validation_marker_and_unchanged_group_reopens() {
         storage.validated_tree_marker(&group).expect("read marker"),
         Some(marker),
         "marker for an unchanged group must be stable across opens"
+    );
+}
+
+// mdk#969: a crash after the retained-anchor probe durably rewinds the live
+// group leaves its pre-probe snapshot behind. Hydration must restore that
+// snapshot before it reads either the Marmot record or the OpenMLS group.
+#[tokio::test]
+async fn hydration_recovers_interrupted_retained_anchor_probe() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    let mut historical_group = live_group.clone();
+    historical_group.name = "historical anchor".into();
+    historical_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&historical_group)
+        .expect("plant historical group record");
+    storage
+        .create_group_snapshot(&group_id, "test-historical-anchor")
+        .expect("capture historical anchor");
+
+    storage.put_group(&live_group).expect("restore live record");
+    storage
+        .create_group_snapshot(&group_id, "openmls-retained-probe-test-crash")
+        .expect("capture pre-probe live state");
+    storage
+        .rollback_group_to_snapshot(&group_id, "test-historical-anchor")
+        .expect("simulate committed probe rewind");
+    drop(initial);
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("rewound group"),
+        historical_group,
+        "fixture must start in the crash-stranded historical state"
+    );
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydrate recovers orphaned probe");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-probe live state"
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).expect("hydrated epoch"),
+        live_group.epoch
+    );
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-retained-probe-")),
+        "recovered probe snapshot must be released"
+    );
+}
+
+// mdk#968: the apply snapshot is released transactionally with a completed
+// branch apply. If one survives a crash, hydration must restore the captured
+// pre-apply live state rather than accepting a partially rewound projection.
+#[tokio::test]
+async fn hydration_recovers_interrupted_convergence_apply() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    let live_group = storage.get_group(&group_id).expect("live group");
+
+    storage
+        .create_group_snapshot(&group_id, "openmls-apply-test-crash")
+        .expect("capture pre-apply live state");
+    let mut partial_group = live_group.clone();
+    partial_group.name = "partial historical apply".into();
+    partial_group.epoch = EpochId(live_group.epoch.0.saturating_sub(1));
+    storage
+        .put_group(&partial_group)
+        .expect("simulate partial rewind");
+    drop(initial);
+
+    let mut reopened = build_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("hydrate recovers interrupted apply");
+
+    assert_eq!(
+        storage.get_group(&group_id).expect("recovered group"),
+        live_group,
+        "hydrate must restore the pre-apply live state"
+    );
+    assert_eq!(
+        reopened.epoch(&group_id).expect("hydrated epoch"),
+        live_group.epoch
+    );
+    assert!(
+        !storage
+            .list_group_snapshots(&group_id)
+            .expect("list snapshots")
+            .iter()
+            .any(|name| name.starts_with("openmls-apply-")),
+        "recovered apply snapshot must be released"
     );
 }
 

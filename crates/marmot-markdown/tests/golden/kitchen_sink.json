@@ -75,7 +75,8 @@
                 {
                   "Text": "link"
                 }
-              ]
+              ],
+              "classification": "Web"
             }
           },
           {
@@ -102,7 +103,8 @@
                 {
                   "Text": "reference link"
                 }
-              ]
+              ],
+              "classification": "Relative"
             }
           },
           {
@@ -116,7 +118,8 @@
                 {
                   "Text": "alt text"
                 }
-              ]
+              ],
+              "classification": "Relative"
             }
           },
           {
@@ -129,7 +132,8 @@
           {
             "Autolink": {
               "url": "https://nostr.com",
-              "kind": "Uri"
+              "kind": "Uri",
+              "classification": "Web"
             }
           },
           {
@@ -138,7 +142,8 @@
           {
             "Autolink": {
               "url": "a@b.co",
-              "kind": "Email"
+              "kind": "Email",
+              "classification": "Contact"
             }
           },
           {

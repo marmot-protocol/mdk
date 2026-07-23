@@ -28,7 +28,7 @@ MESSAGE_ID_HEX = "33" * 32
 SENDER_ACCOUNT_ID_HEX = "44" * 32
 INBOUND_TEXT = "ping from marmot"
 DETERMINISTIC_RESPONSE = f"marmot-e2e-ok: {INBOUND_TEXT}"
-PROTOCOL = "marmot.agent-control.v1"
+PROTOCOL = "marmot.agent-control.v2"
 
 
 async def read_json_line(reader: asyncio.StreamReader) -> dict[str, Any]:

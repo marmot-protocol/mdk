@@ -13,6 +13,7 @@ use crate::{AppError, unix_now_seconds};
 const BLOSSOM_UPLOAD_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
 const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 const MAX_BLOSSOM_ERROR_BODY_BYTES: u64 = 1024;
+pub(crate) const MAX_BLOSSOM_DESCRIPTOR_BYTES: u64 = 16 * 1024;
 const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -48,9 +49,10 @@ pub(crate) async fn upload_blossom_blob(
     if !response.status().is_success() {
         return Err(blossom_upload_status_error(response).await);
     }
-    let descriptor = response
-        .json::<BlossomBlobDescriptor>()
+    let descriptor_body = read_limited_blossom_body(response, MAX_BLOSSOM_DESCRIPTOR_BYTES)
         .await
+        .map_err(|_| AppError::BlobStore("upload descriptor exceeds size limit".into()))?;
+    let descriptor = serde_json::from_slice::<BlossomBlobDescriptor>(&descriptor_body)
         .map_err(|_| AppError::BlobStore("upload returned an invalid descriptor".into()))?;
     if let Some(sha256) = descriptor.sha256.as_deref()
         && sha256.to_ascii_lowercase() != encrypted_hash_hex

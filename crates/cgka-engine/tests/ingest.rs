@@ -550,6 +550,98 @@ async fn ingest_duplicate_message_id_returns_already_seen() {
 }
 
 #[tokio::test]
+async fn malformed_peeled_welcome_is_terminal_and_restart_deduplicated() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut engine = build_client_with_storage(storage.clone(), b"malformed-welcome");
+    let message_id = MessageId::new(vec![0x67; 32]);
+    let msg = TransportMessage {
+        id: message_id.clone(),
+        payload: b"not an MLS welcome".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("test".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: engine.self_id(),
+        },
+    };
+
+    let outcome = engine
+        .ingest(msg.clone())
+        .await
+        .expect("malformed welcome is a per-message stale outcome");
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+    assert!(storage.has_ingress_dedup_marker(&message_id).unwrap());
+    drop(engine);
+
+    let mut reopened = build_client_with_storage(storage, b"malformed-welcome");
+    let replay = reopened
+        .ingest(msg)
+        .await
+        .expect("poisoned welcome must not hard-error after restart");
+    assert!(matches!(
+        replay,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+}
+
+#[tokio::test]
+async fn rewrapped_identical_welcome_uses_content_dedup() {
+    let mut alice = build_client(b"alice-welcome-content-dedup");
+    let mut bob = build_client(b"bob-welcome-content-dedup");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (_group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "content dedup".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected group create, got {other:?}"),
+    };
+
+    assert!(matches!(
+        bob.ingest(welcome.clone()).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    bob.drain_events();
+
+    let rewrapped = TransportMessage {
+        id: MessageId::new(vec![0x68; 32]),
+        ..welcome
+    };
+    let outcome = bob.ingest(rewrapped).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+    assert!(
+        bob.drain_events().is_empty(),
+        "content-duplicate welcome must not emit a second join"
+    );
+}
+
+#[tokio::test]
 async fn peel_deferred_message_retries_instead_of_short_circuiting() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client_with_peeler(b"bob", Box::new(FailOncePeeler::new()));
@@ -692,6 +784,89 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
         ),
         "expected the message behind the garbage to still deliver, got {events:?}"
     );
+}
+
+#[tokio::test]
+async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest() {
+    let mut alice = build_client(b"alice-post-peel");
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = build_client_with_storage(storage.clone(), b"bob-post-peel");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected group create, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    // The pass-through test peeler represents a valid authenticated wrapper;
+    // only the carried MLS bytes are malformed. This must be a per-message
+    // terminal disposition, not an engine error that aborts the relay drain.
+    let garbage = TransportMessage {
+        id: hash_id(b"authenticated wrapper with malformed MLS bytes"),
+        payload: b"not an MLS message".to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let garbage_content_id = content_id(&garbage);
+    let outcome = bob
+        .ingest(garbage)
+        .await
+        .expect("malformed post-peel MLS bytes must not abort ingest");
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::PeelFailed
+        }
+    ));
+    assert_eq!(
+        storage.get_message(&garbage_content_id).unwrap().state,
+        MessageState::Failed,
+        "the content-derived poison row must be durable and terminal"
+    );
+
+    let msg = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"after post-peel garbage"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        other => panic!("expected app message, got {other:?}"),
+    };
+    assert!(matches!(
+        bob.ingest(msg).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert!(bob.drain_events().iter().any(
+        |event| matches!(event, GroupEvent::MessageReceived { payload, .. } if app_content(payload) == b"after post-peel garbage")
+    ));
 }
 
 #[tokio::test]

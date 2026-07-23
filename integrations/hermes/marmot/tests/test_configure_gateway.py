@@ -44,6 +44,7 @@ class ConfigureGatewayTests(unittest.TestCase):
             config = self.module.load_config(config_path)
 
         self.assertNotIn("streaming", config)
+        self.assertTrue(config["platforms"]["marmot"]["enabled"])
         extra = config["platforms"]["marmot"]["extra"]
         self.assertEqual(extra["home"], str(home / "marmot-agent"))
         self.assertEqual(

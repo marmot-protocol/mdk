@@ -146,6 +146,12 @@ pub(crate) fn validate_control_plane_config(
         ));
     }
 
+    if config.dev_allow_any_invites && !config.debug_controls {
+        return Err(ConnectorError::UnsafeControlPlaneConfig(
+            "dev allow-any invites requires debug controls",
+        ));
+    }
+
     if config.auth_token.is_none()
         && (config.socket_dir_mode != AGENT_SOCKET_DIR_MODE
             || config.socket_mode != AGENT_SOCKET_MODE)
@@ -198,6 +204,9 @@ pub(crate) fn validate_profile_name(value: String) -> Result<String, ConnectorEr
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if value.is_empty() {
         return Err(ConnectorError::InvalidProfileName("empty"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ConnectorError::InvalidProfileName("control_characters"));
     }
     if value.chars().count() > MAX_PROFILE_NAME_CHARS {
         return Err(ConnectorError::InvalidProfileName("too_long"));

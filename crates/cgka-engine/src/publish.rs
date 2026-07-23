@@ -66,6 +66,7 @@ impl<S: StorageProvider> Engine<S> {
         // publish-confirm call), so re-attach it explicitly.
         let audit_context = self.epoch_manager.audit_context_for_pending(pending);
         let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
+        let queued_intent = self.queued_intent_by_pending.get(&pending).cloned();
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
@@ -159,6 +160,9 @@ impl<S: StorageProvider> Engine<S> {
                         own_commit_stamp.take(),
                     )?;
                 }
+                if let Some((_, intent_id)) = queued_intent.as_ref() {
+                    storage.delete_queued_outbound_intent(intent_id)?;
+                }
                 Ok(())
             })?;
 
@@ -176,6 +180,7 @@ impl<S: StorageProvider> Engine<S> {
         // backend) plus best-effort cleanup. Kind discriminates create (always
         // `GroupCreated`) from evolution (always `EpochChanged`).
         let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
+        self.queued_intent_by_pending.remove(&pending);
         self.audit_with_context(
             Some(&group_id),
             audit_context.clone(),
@@ -327,6 +332,9 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.pending_state_changes.remove(&pending);
+        if let Some((queued_group_id, _)) = self.queued_intent_by_pending.remove(&pending) {
+            self.schedule_pending_convergence_group(&queued_group_id);
+        }
         self.forget_pending_commit_for_recovery(pending)?;
         self.replay_buffered_messages(&group_id).await?;
         Ok(())

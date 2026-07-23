@@ -181,7 +181,7 @@ impl BrokerState {
         // only.
         let retain_backlog = !self.replay_ttl.is_zero();
         let record_bytes = if retain_backlog {
-            let record_bytes = record.encode()?.len();
+            let record_bytes = record.encoded_len()?;
             if record_bytes > self.max_backlog_bytes {
                 return Err(QuicBrokerError::BacklogRecordTooLarge {
                     record_bytes,

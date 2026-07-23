@@ -368,7 +368,7 @@ pub(crate) fn value_matches_group_and_account(
         .get("account")
         .or_else(|| value.get("account_id"))
         .and_then(serde_json::Value::as_str)
-        .is_none_or(|event_account| event_account == account_id)
+        .is_some_and(|event_account| event_account == account_id)
 }
 
 pub(crate) fn mark_stream_response_seen(
@@ -404,7 +404,6 @@ pub(crate) fn runtime_message_json(
     account_id_hex: &str,
     account_label: &str,
 ) -> serde_json::Value {
-    let now = unix_now();
     let is_own_sender = message.sender == account_id_hex || message.sender == account_label;
     let from_display_name = if is_own_sender {
         None
@@ -422,7 +421,7 @@ pub(crate) fn runtime_message_json(
         "kind": message.kind,
         "tags": message.tags,
         "recorded_at": message.recorded_at,
-        "received_at": now,
+        "received_at": message.received_at,
     });
     if let Some(agent_text_stream) =
         crate::agent_text_stream_payload_value(message.kind, &message.tags, &message.plaintext)

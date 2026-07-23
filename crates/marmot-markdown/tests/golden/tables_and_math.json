@@ -148,7 +148,8 @@
                       {
                         "Text": "y"
                       }
-                    ]
+                    ],
+                    "classification": "Relative"
                   }
                 }
               ]

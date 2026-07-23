@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const AGENT_CONTROL_PROTOCOL_V1: &str = "marmot.agent-control.v1";
+pub const AGENT_CONTROL_PROTOCOL_V2: &str = "marmot.agent-control.v2";
 pub const MAX_AGENT_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const AGENT_CONTROL_STREAM_STATUS_STARTED: &str = "started";
 
@@ -37,7 +37,7 @@ pub struct AgentControlEnvelope<T> {
 impl<T> AgentControlEnvelope<T> {
     pub fn new(id: Option<String>, payload: T) -> Self {
         Self {
-            marmot_agent_control: AGENT_CONTROL_PROTOCOL_V1.to_owned(),
+            marmot_agent_control: AGENT_CONTROL_PROTOCOL_V2.to_owned(),
             id,
             auth_token: None,
             payload,
@@ -54,7 +54,7 @@ impl<T> AgentControlEnvelope<T> {
     }
 
     pub fn validate_protocol(&self) -> Result<(), AgentControlError> {
-        if self.marmot_agent_control == AGENT_CONTROL_PROTOCOL_V1 {
+        if self.marmot_agent_control == AGENT_CONTROL_PROTOCOL_V2 {
             Ok(())
         } else {
             Err(AgentControlError::WrongProtocol(
@@ -98,14 +98,17 @@ pub enum AgentControlRequest {
     },
     StreamAppend {
         stream_id_hex: String,
+        stream_capability: String,
         append_text: String,
     },
     StreamStatus {
         stream_id_hex: String,
+        stream_capability: String,
         status: String,
     },
     StreamProgress {
         stream_id_hex: String,
+        stream_capability: String,
         text: String,
     },
     /// Finalize an active preview stream into the durable final message.
@@ -116,6 +119,7 @@ pub enum AgentControlRequest {
     /// and/or re-issue `StreamFinalize`, or cancel the stream.
     StreamFinalize {
         stream_id_hex: String,
+        stream_capability: String,
         final_text: String,
         transcript_hash_hex: String,
         chunk_count: u64,
@@ -127,6 +131,7 @@ pub enum AgentControlRequest {
     },
     StreamCancel {
         stream_id_hex: String,
+        stream_capability: String,
         reason: Option<String>,
     },
     AccountList,
@@ -300,6 +305,9 @@ pub enum AgentControlResponse {
     },
     StreamBegun {
         stream_id_hex: String,
+        /// Random 256-bit bearer capability required for every subsequent
+        /// operation on this stream. Never log or persist this value.
+        stream_capability: String,
         start_message_id_hex: String,
         quic_candidates: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,7 +382,8 @@ pub enum AgentControlEvent {
         sender_account_id_hex: String,
     },
     /// A durable, MLS-authenticated change to group state was observed (a member
-    /// add/remove/leave, an admin grant/revoke, or a group rename/avatar change).
+    /// add/remove/leave, an admin grant/revoke, a group rename/avatar change,
+    /// or a disappearing-message timer change).
     /// Privacy: the subject member's pubkey is never surfaced — only a coarse
     /// `change` kind plus, for a rename, the new group display name in `detail`.
     GroupStateChanged {
@@ -382,7 +391,8 @@ pub enum AgentControlEvent {
         group_id_hex: String,
         /// Coarse change kind: `"member_added"`, `"member_removed"`,
         /// `"member_left"`, `"admin_added"`, `"admin_removed"`,
-        /// `"group_renamed"`, or `"group_avatar_changed"`.
+        /// `"group_renamed"`, `"group_avatar_changed"`, or
+        /// `"disappearing_timer_changed"`.
         change: String,
         /// The new group display name for `group_renamed`; `None` otherwise.
         /// Never carries a member pubkey.
@@ -514,6 +524,7 @@ mod tests {
             AgentControlRequest::StreamAppend {
                 stream_id_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_owned(),
+                stream_capability: "11".repeat(32),
                 append_text: "lo".to_owned(),
             },
         );
@@ -521,10 +532,11 @@ mod tests {
         let encoded = encode_frame(&frame).unwrap();
         assert!(encoded.ends_with(b"\n"));
         let json: Value = serde_json::from_slice(&encoded[..encoded.len() - 1]).unwrap();
-        assert_eq!(json["marmot_agent_control"], "marmot.agent-control.v1");
+        assert_eq!(json["marmot_agent_control"], "marmot.agent-control.v2");
         assert_eq!(json["id"], "req-1");
         assert_eq!(json["type"], "stream_append");
         assert_eq!(json["append_text"], "lo");
+        assert_eq!(json["stream_capability"], "11".repeat(32));
         assert!(json.get("text").is_none());
         assert!(json.get("replace_text").is_none());
 
@@ -580,8 +592,8 @@ mod tests {
 
     #[test]
     fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
-        // Additive, v1-compatible field: omitted from the wire when None so an
-        // old peer's frame stays byte-identical; present and round-tripping when
+        // Optional field: omitted from the wire when None; present and
+        // round-tripping when
         // a client supplies it for dedup.
         let without = AgentControlRequest::SendFinal {
             account_id_hex: "aa".repeat(32),
@@ -615,6 +627,7 @@ mod tests {
         // when the key is absent, while newer clients can opt into dedup.
         let without = AgentControlRequest::StreamFinalize {
             stream_id_hex: "55".repeat(32),
+            stream_capability: "66".repeat(32),
             final_text: "done".to_owned(),
             transcript_hash_hex: "ab".repeat(32),
             chunk_count: 1,
@@ -628,6 +641,7 @@ mod tests {
 
         let with = AgentControlRequest::StreamFinalize {
             stream_id_hex: "55".repeat(32),
+            stream_capability: "66".repeat(32),
             final_text: "done".to_owned(),
             transcript_hash_hex: "ab".repeat(32),
             chunk_count: 1,
@@ -643,6 +657,7 @@ mod tests {
     fn stream_begun_response_carries_policy_plaintext_cap_when_present() {
         let begun = AgentControlResponse::StreamBegun {
             stream_id_hex: "aa".repeat(32),
+            stream_capability: "cc".repeat(32),
             start_message_id_hex: "bb".repeat(32),
             quic_candidates: vec!["quic://127.0.0.1:4433".to_owned()],
             policy_max_plaintext_frame_len: Some(4),
@@ -768,6 +783,7 @@ mod tests {
                     stream_id_hex:
                         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                             .to_owned(),
+                    stream_capability: capability(),
                     append_text,
                 },
             )
@@ -845,6 +861,7 @@ mod tests {
             (
                 AgentControlRequest::StreamAppend {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     append_text: "hel".to_owned(),
                 },
                 "stream_append",
@@ -852,6 +869,7 @@ mod tests {
             (
                 AgentControlRequest::StreamStatus {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     status: "thinking".to_owned(),
                 },
                 "stream_status",
@@ -859,6 +877,7 @@ mod tests {
             (
                 AgentControlRequest::StreamProgress {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     text: "{\"v\":1,\"status\":\"started\"}".to_owned(),
                 },
                 "stream_progress",
@@ -866,6 +885,7 @@ mod tests {
             (
                 AgentControlRequest::StreamFinalize {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     final_text: "hello".to_owned(),
                     transcript_hash_hex: hash(),
                     chunk_count: 1,
@@ -876,6 +896,7 @@ mod tests {
             (
                 AgentControlRequest::StreamCancel {
                     stream_id_hex: stream(),
+                    stream_capability: capability(),
                     reason: Some("gateway_replaced_text".to_owned()),
                 },
                 "stream_cancel",
@@ -1043,6 +1064,10 @@ mod tests {
 
     fn stream() -> String {
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned()
+    }
+
+    fn capability() -> String {
+        "6666666666666666666666666666666666666666666666666666666666666666".to_owned()
     }
 
     fn message() -> String {

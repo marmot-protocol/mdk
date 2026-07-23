@@ -1,13 +1,13 @@
-use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::{
-    SqliteResultExt, bool_i64, optional_u64_to_i64, u64_to_i64, unix_now_ms, usize_to_i64,
+    SqliteResultExt, bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64,
+    unix_now_ms, usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 const SHARED_BUSY_TIMEOUT_MS: u64 = 5_000;
 
@@ -63,7 +63,8 @@ impl SqliteSharedStorage {
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| StorageError::Backend(err.to_string()))?;
+            fs_private::create_dir_all_private(parent)
+                .map_err(|err| StorageError::Backend(err.to_string()))?;
         }
         // The shared cache is unencrypted, so file-level 0600 (including
         // sidecars) is the only thing keeping it from other local users.
@@ -83,6 +84,12 @@ impl SqliteSharedStorage {
         conn.pragma_update(None, "trusted_schema", false)
             .storage()?;
         conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;",
+        )
+        .storage()?;
+        conn.execute_batch(
             r#"
 CREATE TABLE IF NOT EXISTS directory_users (
     account_id_hex TEXT PRIMARY KEY NOT NULL,
@@ -96,37 +103,6 @@ CREATE TABLE IF NOT EXISTS directory_users (
 );
 CREATE TABLE IF NOT EXISTS directory_user_follows (
     account_id_hex TEXT NOT NULL REFERENCES directory_users(account_id_hex) ON DELETE CASCADE,
-    follow_account_id_hex TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    event_id_hex TEXT,
-    event_created_at INTEGER,
-    PRIMARY KEY (account_id_hex, follow_account_id_hex)
-);
-CREATE TABLE IF NOT EXISTS directory_events (
-    event_id_hex TEXT PRIMARY KEY NOT NULL,
-    author_account_id_hex TEXT NOT NULL,
-    kind INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS directory_key_packages (
-    account_id_hex TEXT PRIMARY KEY NOT NULL REFERENCES directory_users(account_id_hex) ON DELETE CASCADE,
-    key_package_ref_hex TEXT,
-    key_package_event_id_hex TEXT,
-    key_package_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS directory_search_graph_users (
-    account_id_hex TEXT PRIMARY KEY NOT NULL,
-    npub TEXT NOT NULL,
-    profile_json TEXT,
-    relay_lists_json TEXT,
-    key_package_json TEXT,
-    event_id_hex TEXT,
-    event_kind INTEGER,
-    event_created_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
-    account_id_hex TEXT NOT NULL,
     follow_account_id_hex TEXT NOT NULL,
     position INTEGER NOT NULL,
     event_id_hex TEXT,
@@ -194,10 +170,13 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         &self,
         record: &PublicDirectoryUserRecord,
     ) -> StorageResult<()> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().storage()?;
-        tx.execute(
-            "INSERT INTO directory_users (
+        retry_on_busy(|| {
+            let mut conn = self.lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .storage()?;
+            tx.execute(
+                "INSERT INTO directory_users (
                 account_id_hex, npub, profile_json, relay_lists_json, key_package_json,
                 event_id_hex, event_kind, event_created_at
              )
@@ -210,49 +189,50 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
                 event_id_hex = excluded.event_id_hex,
                 event_kind = excluded.event_kind,
                 event_created_at = excluded.event_created_at",
-            params![
-                &record.account_id_hex,
-                &record.npub,
-                &record.profile_json,
-                &record.relay_lists_json,
-                &record.key_package_json,
-                &record.event_id_hex,
-                optional_u64_to_i64(record.event_kind)?,
-                optional_u64_to_i64(record.event_created_at)?,
-            ],
-        )
-        .storage()?;
-        tx.execute(
-            "DELETE FROM directory_user_follows WHERE account_id_hex = ?1",
-            params![&record.account_id_hex],
-        )
-        .storage()?;
-        for (position, follow) in record.follows.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO directory_user_follows (
-                    account_id_hex, follow_account_id_hex, position, event_id_hex, event_created_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     &record.account_id_hex,
-                    follow,
-                    usize_to_i64(position)?,
+                    &record.npub,
+                    &record.profile_json,
+                    &record.relay_lists_json,
+                    &record.key_package_json,
                     &record.event_id_hex,
+                    optional_u64_to_i64(record.event_kind)?,
                     optional_u64_to_i64(record.event_created_at)?,
                 ],
             )
             .storage()?;
-        }
-        tx.commit().storage()
+            tx.execute(
+                "DELETE FROM directory_user_follows WHERE account_id_hex = ?1",
+                params![&record.account_id_hex],
+            )
+            .storage()?;
+            for (position, follow) in record.follows.iter().enumerate() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO directory_user_follows (
+                    account_id_hex, follow_account_id_hex, position, event_id_hex, event_created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        &record.account_id_hex,
+                        follow,
+                        usize_to_i64(position)?,
+                        &record.event_id_hex,
+                        optional_u64_to_i64(record.event_created_at)?,
+                    ],
+                )
+                .storage()?;
+            }
+            tx.commit().storage()
+        })
     }
 
     pub fn public_directory_user(
         &self,
         account_id_hex: &str,
     ) -> StorageResult<Option<PublicDirectoryUserRecord>> {
-        let conn = self.lock();
-        let Some(mut record) = self
-            .conn_ref(&conn)
+        let mut conn = self.lock();
+        let tx = conn.transaction().storage()?;
+        let Some(mut record) = tx
             .query_row(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
                         key_package_json, event_id_hex, event_kind, event_created_at
@@ -276,10 +256,10 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             .optional()
             .storage()?
         else {
+            tx.commit().storage()?;
             return Ok(None);
         };
-        let mut stmt = self
-            .conn_ref(&conn)
+        let mut stmt = tx
             .prepare(
                 "SELECT follow_account_id_hex FROM directory_user_follows
                  WHERE account_id_hex = ?1
@@ -291,6 +271,8 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
+        drop(stmt);
+        tx.commit().storage()?;
         Ok(Some(record))
     }
 
@@ -312,12 +294,12 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         // loads the whole cache. Ordering preserved (users by account_id_hex;
         // each user's follows by position then follow id).
         let cap = i64::try_from(max).unwrap_or(i64::MAX);
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction().storage()?;
         let mut follows_by_account: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         {
-            let mut stmt = self
-                .conn_ref(&conn)
+            let mut stmt = tx
                 .prepare(
                     "SELECT account_id_hex, follow_account_id_hex FROM directory_user_follows
                      WHERE account_id_hex IN (
@@ -340,8 +322,7 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
                     .push(follow);
             }
         }
-        let mut stmt = self
-            .conn_ref(&conn)
+        let mut stmt = tx
             .prepare(
                 "SELECT account_id_hex, npub, profile_json, relay_lists_json,
                         key_package_json, event_id_hex, event_kind, event_created_at
@@ -367,6 +348,8 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
+        drop(stmt);
+        tx.commit().storage()?;
         if records.len() >= max {
             // no silent caps: surface (aggregate count only, privacy-safe) that
             // the listing was truncated so an operator can tell the bound bit.
@@ -411,9 +394,10 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
         &self,
         settings: &StoredRelayTelemetrySettings,
     ) -> StorageResult<()> {
-        self.lock()
-            .execute(
-                "INSERT INTO relay_telemetry_settings (
+        retry_on_busy(|| {
+            self.lock()
+                .execute(
+                    "INSERT INTO relay_telemetry_settings (
                     id, export_enabled, export_interval_seconds, updated_at_ms
                  )
                  VALUES (1, ?1, ?2, ?3)
@@ -421,14 +405,15 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
                     export_enabled = excluded.export_enabled,
                     export_interval_seconds = excluded.export_interval_seconds,
                     updated_at_ms = excluded.updated_at_ms",
-                params![
-                    bool_i64(settings.export_enabled),
-                    u64_to_i64(settings.export_interval_seconds)?,
-                    unix_now_ms(),
-                ],
-            )
-            .storage()?;
-        Ok(())
+                    params![
+                        bool_i64(settings.export_enabled),
+                        u64_to_i64(settings.export_interval_seconds)?,
+                        unix_now_ms(),
+                    ],
+                )
+                .storage()?;
+            Ok(())
+        })
     }
 
     pub fn telemetry_install_id(&self) -> StorageResult<Option<String>> {
@@ -445,17 +430,19 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     }
 
     pub fn set_telemetry_install_id(&self, install_id: &str) -> StorageResult<()> {
-        self.lock()
-            .execute(
-                "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
+        retry_on_busy(|| {
+            self.lock()
+                .execute(
+                    "INSERT INTO telemetry_install (id, install_id, updated_at_ms)
                  VALUES (1, ?1, ?2)
                  ON CONFLICT(id) DO UPDATE SET
                     install_id = excluded.install_id,
                     updated_at_ms = excluded.updated_at_ms",
-                params![install_id, unix_now_ms()],
-            )
-            .storage()?;
-        Ok(())
+                    params![install_id, unix_now_ms()],
+                )
+                .storage()?;
+            Ok(())
+        })
     }
 
     pub fn audit_log_settings(&self) -> StorageResult<StoredAuditLogSettings> {
@@ -477,9 +464,10 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     }
 
     pub fn set_audit_log_settings(&self, settings: &StoredAuditLogSettings) -> StorageResult<()> {
-        self.lock()
-            .execute(
-                "INSERT INTO audit_log_settings (
+        retry_on_busy(|| {
+            self.lock()
+                .execute(
+                    "INSERT INTO audit_log_settings (
                     id, enabled, data_mode, updated_at_ms
                  )
                  VALUES (1, ?1, ?2, ?3)
@@ -487,21 +475,21 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
                     enabled = excluded.enabled,
                     data_mode = excluded.data_mode,
                     updated_at_ms = excluded.updated_at_ms",
-                params![
-                    bool_i64(settings.enabled),
-                    settings.data_mode,
-                    unix_now_ms()
-                ],
-            )
-            .storage()?;
-        Ok(())
+                    params![
+                        bool_i64(settings.enabled),
+                        settings.data_mode,
+                        unix_now_ms()
+                    ],
+                )
+                .storage()?;
+            Ok(())
+        })
     }
 
     #[cfg(test)]
     fn table_columns(&self, table: &str) -> Vec<String> {
         let conn = self.lock();
-        let mut stmt = self
-            .conn_ref(&conn)
+        let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1))
@@ -516,25 +504,20 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn conn_ref<'a>(
-        &self,
-        conn: &'a MutexGuard<'_, rusqlite::Connection>,
-    ) -> &'a rusqlite::Connection {
-        conn
-    }
-
     fn ensure_relay_telemetry_settings(&self) -> StorageResult<()> {
-        self.lock()
-            .execute(
-                "INSERT INTO relay_telemetry_settings (
+        retry_on_busy(|| {
+            self.lock()
+                .execute(
+                    "INSERT INTO relay_telemetry_settings (
                     id, export_enabled, export_interval_seconds, updated_at_ms
                  )
                  VALUES (1, 0, 60, ?1)
                  ON CONFLICT(id) DO NOTHING",
-                params![unix_now_ms()],
-            )
-            .storage()?;
-        Ok(())
+                    params![unix_now_ms()],
+                )
+                .storage()?;
+            Ok(())
+        })
     }
 
     fn clear_legacy_relay_telemetry_endpoint(conn: &rusqlite::Connection) -> StorageResult<()> {
@@ -558,17 +541,19 @@ CREATE TABLE IF NOT EXISTS directory_search_graph_follows (
     }
 
     fn ensure_audit_log_settings(&self) -> StorageResult<()> {
-        self.lock()
-            .execute(
-                "INSERT INTO audit_log_settings (
+        retry_on_busy(|| {
+            self.lock()
+                .execute(
+                    "INSERT INTO audit_log_settings (
                     id, enabled, updated_at_ms
                  )
                  VALUES (1, 0, ?1)
                  ON CONFLICT(id) DO NOTHING",
-                params![unix_now_ms()],
-            )
-            .storage()?;
-        Ok(())
+                    params![unix_now_ms()],
+                )
+                .storage()?;
+            Ok(())
+        })
     }
 }
 
@@ -590,6 +575,14 @@ mod tests {
         assert!(!user_columns.contains(&"local_account_json".to_owned()));
         assert!(!user_columns.contains(&"private_discovery_reason".to_owned()));
         assert!(!user_columns.contains(&"local_fetch_timestamp".to_owned()));
+        for dead_table in [
+            "directory_events",
+            "directory_key_packages",
+            "directory_search_graph_users",
+            "directory_search_graph_follows",
+        ] {
+            assert!(storage.table_columns(dead_table).is_empty(), "{dead_table}");
+        }
     }
 
     #[test]
@@ -601,6 +594,7 @@ mod tests {
         let path = dir.path().join("shared").join("directory.sqlite");
         drop(SqliteSharedStorage::open(&path).unwrap());
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(mode(&path), 0o600);
 
         // A pre-existing permissive cache (from builds that created it at the
@@ -608,6 +602,27 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(SqliteSharedStorage::open(&path).unwrap());
         assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn shared_cache_uses_account_database_durability_pragmas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.sqlite");
+        let storage = SqliteSharedStorage::open(&path).unwrap();
+        let conn = storage.lock();
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        let temp_store: i64 = conn
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 1);
+        assert_eq!(temp_store, 2);
     }
 
     #[test]
@@ -634,6 +649,47 @@ mod tests {
                 .unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn public_directory_user_reads_user_and_follows_in_one_transaction() {
+        let source = include_str!("shared.rs");
+        let body = source
+            .split("pub fn public_directory_user(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn public_directory_users(")
+            .next()
+            .unwrap();
+
+        assert!(body.contains("transaction()"));
+        assert!(body.contains("tx.commit()"));
+    }
+
+    #[test]
+    fn duplicate_public_directory_follows_do_not_abort_the_record_upsert() {
+        let storage = SqliteSharedStorage::in_memory().unwrap();
+        let follow = "cc".repeat(32);
+        let record = PublicDirectoryUserRecord {
+            account_id_hex: "aa".repeat(32),
+            npub: "npub1example".to_owned(),
+            profile_json: Some(r#"{"name":"Alice"}"#.to_owned()),
+            relay_lists_json: "{}".to_owned(),
+            key_package_json: None,
+            event_id_hex: Some("bb".repeat(32)),
+            event_kind: Some(3),
+            event_created_at: Some(1_700_000_000),
+            follows: vec![follow.clone(), follow.clone()],
+        };
+
+        storage.put_public_directory_user(&record).unwrap();
+
+        let stored = storage
+            .public_directory_user(&record.account_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.npub, record.npub);
+        assert_eq!(stored.follows, vec![follow]);
     }
 
     // #761: the batched listing is defensively bounded. The uncapped path still
@@ -672,6 +728,21 @@ mod tests {
                 .iter()
                 .all(|user| user.follows == vec!["ff".repeat(32)])
         );
+    }
+
+    #[test]
+    fn public_directory_users_read_users_and_follows_in_one_transaction() {
+        let source = include_str!("shared.rs");
+        let body = source
+            .split("fn public_directory_users_capped(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn relay_telemetry_settings(")
+            .next()
+            .unwrap();
+
+        assert!(body.contains("transaction()"));
+        assert!(body.contains("tx.commit()"));
     }
 
     #[test]

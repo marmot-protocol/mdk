@@ -216,6 +216,16 @@ impl MarmotRelayPlane {
         }
     }
 
+    pub(crate) fn sanitize_relay_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Result<Vec<TransportEndpoint>, String> {
+        self.inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, context)
+    }
+
     pub fn subscription_rebuild_since(
         &self,
         last_transport_timestamp: Option<u64>,
@@ -419,7 +429,7 @@ impl MarmotRelayPlane {
             .iter()
             .map(|endpoint| {
                 RelayUrl::parse(endpoint.as_str())
-                    .map_err(|err| format!("directory subscription: invalid relay endpoint: {err}"))
+                    .map_err(|_| "directory subscription: invalid relay endpoint".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
         for relay_url in &relay_urls {
@@ -427,14 +437,14 @@ impl MarmotRelayPlane {
                 .client()
                 .add_relay(relay_url.clone())
                 .await
-                .map_err(|err| format!("directory subscription add relay: {err}"))?;
+                .map_err(|_| "directory subscription add relay failed".to_owned())?;
             timeout(
                 DIRECTORY_RELAY_CONNECT_WAIT,
                 sdk_relay_client.client().connect_relay(relay_url.clone()),
             )
             .await
             .map_err(|_| "directory subscription connect relay timed out".to_owned())?
-            .map_err(|err| format!("directory subscription connect relay: {err}"))?;
+            .map_err(|_| "directory subscription connect relay failed".to_owned())?;
         }
 
         let desired_ids = plan

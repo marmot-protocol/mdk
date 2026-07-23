@@ -296,12 +296,16 @@ fn is_known_profile_field(field: &str) -> bool {
 const MAX_PROFILE_FIELD_CHARS: usize = 4096;
 
 fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
-    value
+    let value = value
         .get(field)
         .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(MAX_PROFILE_FIELD_CHARS).collect())
+        .map(str::trim)?;
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_PROFILE_FIELD_CHARS)
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
 }
 
 pub(crate) fn source_relays_from_record(record: &RelayEventRecord) -> Vec<String> {
@@ -516,5 +520,24 @@ pub(crate) fn latest_fresh_profiles_from_records(
     DirectorySelection {
         value: latest_profiles_from_records(records),
         rejected_future,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_string_fields_strip_control_characters() {
+        let content = serde_json::json!({
+            "name": "  alice\u{1b}[2J\nadmin\u{7}  ",
+            "about": "\u{0}\u{1b}",
+        });
+
+        assert_eq!(
+            string_field(&content, "name").as_deref(),
+            Some("alice[2Jadmin")
+        );
+        assert_eq!(string_field(&content, "about"), None);
     }
 }

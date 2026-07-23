@@ -89,6 +89,16 @@ pub(crate) struct DeferredPeelGroupState {
     attempts: std::collections::HashMap<MessageId, DeferredPeelAttempts>,
 }
 
+impl DeferredPeelGroupState {
+    fn has_capacity(&self) -> bool {
+        self.deferred_rows < MAX_PEEL_DEFERRED_ROWS_PER_GROUP
+    }
+
+    fn note_row_persisted(&mut self) {
+        self.deferred_rows += 1;
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct DeferredPeelAttempts {
     attempts: u32,
@@ -102,6 +112,9 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         msg: TransportMessage,
     ) -> Result<IngestOutcome, EngineError> {
+        // Clear a marker left by cancellation/panic in an earlier ingest; only
+        // the current call may suppress its own seen-cache insertion.
+        self.retryable_unpersisted_ingest_id = None;
         // Durable dedup / own-echo check. Storage is authoritative so a
         // restarted engine can classify replayed transport messages the same
         // way as a hot process.
@@ -139,7 +152,12 @@ impl<S: StorageProvider> Engine<S> {
             }
         };
 
-        if !matches!(outcome, IngestOutcome::Buffered { .. })
+        let retryable_unpersisted = self
+            .retryable_unpersisted_ingest_id
+            .take()
+            .is_some_and(|id| id == msg.id);
+        if !retryable_unpersisted
+            && !matches!(outcome, IngestOutcome::Buffered { .. })
             && self.should_remember_ingested_message(&msg.id)?
         {
             self.seen_message_ids.insert(msg.id.clone());
@@ -245,8 +263,18 @@ impl<S: StorageProvider> Engine<S> {
                 break;
             }
             let result = self.do_send_ready(record.intent.clone()).await?;
-            self.storage.delete_queued_outbound_intent(&record.id)?;
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
+            match &result {
+                SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
+                    self.queued_intent_by_message
+                        .insert(msg.id.clone(), (record.group_id.clone(), record.id.clone()));
+                }
+                SendResult::GroupEvolution { pending, .. } => {
+                    self.queued_intent_by_pending
+                        .insert(*pending, (record.group_id.clone(), record.id.clone()));
+                }
+                SendResult::GroupCreated { .. } | SendResult::Queued { .. } => {}
+            }
             drained.push(result);
             if pauses_for_pending_publish {
                 break;
@@ -278,6 +306,25 @@ impl<S: StorageProvider> Engine<S> {
 
     pub(crate) fn schedule_pending_convergence_group(&mut self, group_id: &GroupId) {
         self.pending_convergence_groups.insert(group_id.clone());
+    }
+
+    pub fn take_regenerated_queued_intent_for_message(
+        &mut self,
+        message_id: &MessageId,
+    ) -> Option<(GroupId, MessageId)> {
+        self.queued_intent_by_message.remove(message_id)
+    }
+
+    pub fn confirm_regenerated_queued_intent(
+        &mut self,
+        intent_id: &MessageId,
+    ) -> Result<(), EngineError> {
+        self.storage.delete_queued_outbound_intent(intent_id)?;
+        Ok(())
+    }
+
+    pub fn retry_regenerated_queued_intent(&mut self, group_id: &GroupId) {
+        self.schedule_pending_convergence_group(group_id);
     }
 
     pub(crate) fn schedule_self_remove_auto_commit(
@@ -701,11 +748,11 @@ impl<S: StorageProvider> Engine<S> {
         Ok(out)
     }
 
-    /// Reserve capacity for one new `PeelDeferred` row, lazily counting the
-    /// group's retained rows on first use this session. Returns `false` when
-    /// the per-group flood cap is reached — the caller drops the message
-    /// unpersisted (mdk#339).
-    pub(crate) fn reserve_peel_deferred_slot(
+    /// Check capacity for one new `PeelDeferred` row, lazily counting the
+    /// group's retained rows on first use this session. This deliberately does
+    /// not consume a slot: the caller records the row only after its durable
+    /// write succeeds, so a storage error cannot leak in-memory capacity.
+    pub(crate) fn has_peel_deferred_capacity(
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, EngineError> {
@@ -725,11 +772,14 @@ impl<S: StorageProvider> Engine<S> {
             state.counted = true;
         }
         let state = self.deferred_peel.entry(group_id.clone()).or_default();
-        if state.deferred_rows >= MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
-            return Ok(false);
-        }
-        state.deferred_rows += 1;
-        Ok(true)
+        Ok(state.has_capacity())
+    }
+
+    pub(crate) fn note_peel_deferred_row_persisted(&mut self, group_id: &GroupId) {
+        self.deferred_peel
+            .entry(group_id.clone())
+            .or_default()
+            .note_row_persisted();
     }
 
     /// Bookkeeping for a row leaving `PeelDeferred` (applied, reclassified,
@@ -1020,5 +1070,27 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::Leave { group_id }
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. } => group_id,
+    }
+}
+
+#[cfg(test)]
+mod deferred_peel_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn capacity_check_does_not_consume_slot_before_persist() {
+        let mut state = DeferredPeelGroupState {
+            counted: true,
+            ..Default::default()
+        };
+
+        assert!(state.has_capacity());
+        assert_eq!(
+            state.deferred_rows, 0,
+            "a failed write must consume no slot"
+        );
+
+        state.note_row_persisted();
+        assert_eq!(state.deferred_rows, 1);
     }
 }

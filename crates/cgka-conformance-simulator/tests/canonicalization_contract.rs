@@ -224,6 +224,32 @@ fn same_pending_set_in_different_orders_yields_same_result() {
 }
 
 #[test]
+fn shared_history_messages_do_not_witness_a_post_fork_branch() {
+    let branches = vec![
+        branch("live", 10, 11, 0xff),
+        branch("withheld", 10, 12, 0x00),
+    ];
+    let result = canonicalize(input(
+        vec![
+            // These messages decrypt on both descendants but belong to the
+            // shared trunk. They must not give either branch quorum.
+            app_message("trunk-a", "alice", 10, &["live", "withheld"], None),
+            app_message("trunk-b", "bob", 10, &["live", "withheld"], None),
+            // Actual post-fork use gives only the live branch quorum. Its
+            // effective depth ties the deeper withheld branch, then the
+            // quorum rule selects live. Before #964 the trunk messages also
+            // gave withheld a boost, so it won at effective depth three.
+            app_message("live-a", "alice", 11, &["live"], None),
+            app_message("live-b", "bob", 11, &["live"], None),
+        ],
+        branches,
+    ));
+
+    assert_eq!(result.selected_branch_id.as_deref(), Some("live"));
+    assert_eq!(result.selected_tip, Some(11));
+}
+
+#[test]
 fn commit_edges_materialize_candidate_branches_before_selection() {
     let result = canonicalize(input(
         vec![
@@ -371,6 +397,11 @@ fn proposals_are_accepted_only_when_consumed_by_canonical_commits() {
             },
             DroppedMessage {
                 message_id: "losing-proposal".into(),
+                kind: MessageKind::Proposal,
+                reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            },
+            DroppedMessage {
+                message_id: "pending-proposal".into(),
                 kind: MessageKind::Proposal,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
             },

@@ -172,6 +172,7 @@ fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empt
     for record_type in [
         AGENT_TEXT_STREAM_RECORD_ABORT,
         AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
+        0xff,
     ] {
         assert_eq!(stream_record_text(&record(record_type, "ignored")), "");
     }

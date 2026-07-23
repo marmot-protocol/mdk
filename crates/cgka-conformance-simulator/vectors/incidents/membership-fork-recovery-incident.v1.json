@@ -100,6 +100,27 @@
   },
   "expected_outcomes": [
     {
+      "type": "pending_resolution",
+      "step_index": 1,
+      "client": "alice",
+      "pending": "create",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "alice",
+      "pending": "w",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 9,
+      "client": "bob",
+      "pending": "l",
+      "resolution": "confirmed"
+    },
+    {
       "type": "recovery_summary",
       "count": 1,
       "source_epoch": 1,

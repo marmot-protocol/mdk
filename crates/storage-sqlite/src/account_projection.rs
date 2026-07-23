@@ -4,7 +4,7 @@ use crate::{
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
-    Connection, OptionalExtension, params, params_from_iter,
+    Connection, OptionalExtension, TransactionBehavior, params, params_from_iter,
     types::{Type, Value},
 };
 use serde::{Deserialize, Serialize};
@@ -709,32 +709,39 @@ impl SqliteAccountStorage {
         // transaction that toggles the pragma, so setting it inside the
         // transaction (the previous shape) silently weakened the prune on
         // connections opened with `secure_delete: false`.
-        let original_secure_delete = {
-            let conn = self.lock()?;
+        let outcome = retry_on_busy(|| {
+            // Keep the connection mutex for the entire save/set/prune/restore
+            // sequence. `secure_delete` is connection-global, so releasing it
+            // between those steps lets concurrent prunes save each other's
+            // temporary ON value and restore the wrong configuration.
+            let mut conn = self.lock()?;
             let original = conn
                 .query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
                 .storage()?;
             conn.execute_batch("PRAGMA secure_delete = ON;").storage()?;
-            original
-        };
-        let prune_outcome = self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            crate::timeline::secure_prune_app_events_before_tx(
-                &conn,
-                group_id_hex,
-                cutoff_recorded_at,
-            )
-        });
-        let restore = self.lock().and_then(|conn| {
-            conn.execute_batch(&format!("PRAGMA secure_delete = {original_secure_delete};"))
+            let prune_outcome = (|| {
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .storage()?;
+                let outcome = crate::timeline::secure_prune_app_events_before_tx(
+                    &tx,
+                    group_id_hex,
+                    cutoff_recorded_at,
+                )?;
+                tx.commit().storage()?;
+                Ok(outcome)
+            })();
+            let restore = conn
+                .execute_batch(&format!("PRAGMA secure_delete = {original};"))
                 .storage()
-        });
-        let outcome = match (prune_outcome, restore) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), Ok(())) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-            (Err(err), Err(_)) => Err(err),
-        }?;
+                .map(|_| ());
+            match (prune_outcome, restore) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Err(err), Ok(())) => Err(err),
+                (Ok(_), Err(err)) => Err(err),
+                (Err(err), Err(_)) => Err(err),
+            }
+        })?;
         if outcome.pruned_messages > 0 {
             let conn = self.lock()?;
             if let Err(error) = checkpoint_wal_truncate_after_secure_prune(&conn) {
@@ -1066,26 +1073,27 @@ impl SqliteAccountStorage {
     /// the record was applied. Callers verify `owner_sig` and group membership
     /// before calling.
     pub fn apply_group_push_token(&self, token: &AccountGroupPushToken) -> StorageResult<bool> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let incoming = (token.owner_ts, token.record_digest.as_str());
-        let key = PushTokenKey {
-            group_id_hex: &token.group_id_hex,
-            member_id_hex: &token.member_id_hex,
-            leaf_index: token.leaf_index,
-            platform: token.platform,
-            server_pubkey_hex: &token.server_pubkey_hex,
-        };
-        let tombstone = read_push_tombstone_stamp(&tx, key)?;
-        let live = read_push_token_stamp(&tx, key)?;
-        let strictly_newer = |stored: &Option<(i64, String)>| {
-            push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
-        };
-        if !strictly_newer(&tombstone) || !strictly_newer(&live) {
-            return Ok(false);
-        }
-        tx.execute(
-            "INSERT INTO group_push_tokens (
+        retry_on_busy(|| {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction().storage()?;
+            let incoming = (token.owner_ts, token.record_digest.as_str());
+            let key = PushTokenKey {
+                group_id_hex: &token.group_id_hex,
+                member_id_hex: &token.member_id_hex,
+                leaf_index: token.leaf_index,
+                platform: token.platform,
+                server_pubkey_hex: &token.server_pubkey_hex,
+            };
+            let tombstone = read_push_tombstone_stamp(&tx, key)?;
+            let live = read_push_token_stamp(&tx, key)?;
+            let strictly_newer = |stored: &Option<(i64, String)>| {
+                push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
+            };
+            if !strictly_newer(&tombstone) || !strictly_newer(&live) {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO group_push_tokens (
                     group_id_hex, member_id_hex, leaf_index, platform, token_fingerprint,
                     server_pubkey_hex, relay_hint, encrypted_token, owner_ts, owner_sig,
                     record_digest, updated_at_ms
@@ -1100,25 +1108,26 @@ impl SqliteAccountStorage {
                     owner_sig = excluded.owner_sig,
                     record_digest = excluded.record_digest,
                     updated_at_ms = excluded.updated_at_ms",
-            params![
-                &token.group_id_hex,
-                &token.member_id_hex,
-                u32_to_i64(token.leaf_index),
-                i64::from(token.platform),
-                &token.token_fingerprint,
-                &token.server_pubkey_hex,
-                &token.relay_hint,
-                &token.encrypted_token,
-                token.owner_ts,
-                &token.owner_sig,
-                &token.record_digest,
-                token.updated_at_ms,
-            ],
-        )
-        .storage()?;
-        delete_push_tombstone(&tx, key)?;
-        tx.commit().storage()?;
-        Ok(true)
+                params![
+                    &token.group_id_hex,
+                    &token.member_id_hex,
+                    u32_to_i64(token.leaf_index),
+                    i64::from(token.platform),
+                    &token.token_fingerprint,
+                    &token.server_pubkey_hex,
+                    &token.relay_hint,
+                    &token.encrypted_token,
+                    token.owner_ts,
+                    &token.owner_sig,
+                    &token.record_digest,
+                    token.updated_at_ms,
+                ],
+            )
+            .storage()?;
+            delete_push_tombstone(&tx, key)?;
+            tx.commit().storage()?;
+            Ok(true)
+        })
     }
 
     /// Apply an owner-verified removal: when its `(owner_ts, record_digest)` stamp
@@ -1137,27 +1146,28 @@ impl SqliteAccountStorage {
         record_digest: &str,
         created_at_ms: i64,
     ) -> StorageResult<bool> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction().storage()?;
-        let incoming = (owner_ts, record_digest);
-        let key = PushTokenKey {
-            group_id_hex,
-            member_id_hex,
-            leaf_index,
-            platform,
-            server_pubkey_hex,
-        };
-        let tombstone = read_push_tombstone_stamp(&tx, key)?;
-        let live = read_push_token_stamp(&tx, key)?;
-        let strictly_newer = |stored: &Option<(i64, String)>| {
-            push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
-        };
-        if !strictly_newer(&tombstone) || !strictly_newer(&live) {
-            return Ok(false);
-        }
-        delete_push_token(&tx, key)?;
-        tx.execute(
-            "INSERT INTO group_push_token_tombstones (
+        retry_on_busy(|| {
+            let mut conn = self.lock()?;
+            let tx = conn.transaction().storage()?;
+            let incoming = (owner_ts, record_digest);
+            let key = PushTokenKey {
+                group_id_hex,
+                member_id_hex,
+                leaf_index,
+                platform,
+                server_pubkey_hex,
+            };
+            let tombstone = read_push_tombstone_stamp(&tx, key)?;
+            let live = read_push_token_stamp(&tx, key)?;
+            let strictly_newer = |stored: &Option<(i64, String)>| {
+                push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
+            };
+            if !strictly_newer(&tombstone) || !strictly_newer(&live) {
+                return Ok(false);
+            }
+            delete_push_token(&tx, key)?;
+            tx.execute(
+                "INSERT INTO group_push_token_tombstones (
                     group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex,
                     owner_ts, record_digest, created_at_ms
                  )
@@ -1167,20 +1177,21 @@ impl SqliteAccountStorage {
                     owner_ts = excluded.owner_ts,
                     record_digest = excluded.record_digest,
                     created_at_ms = excluded.created_at_ms",
-            params![
-                group_id_hex,
-                member_id_hex,
-                u32_to_i64(leaf_index),
-                i64::from(platform),
-                server_pubkey_hex,
-                owner_ts,
-                record_digest,
-                created_at_ms,
-            ],
-        )
-        .storage()?;
-        tx.commit().storage()?;
-        Ok(true)
+                params![
+                    group_id_hex,
+                    member_id_hex,
+                    u32_to_i64(leaf_index),
+                    i64::from(platform),
+                    server_pubkey_hex,
+                    owner_ts,
+                    record_digest,
+                    created_at_ms,
+                ],
+            )
+            .storage()?;
+            tx.commit().storage()?;
+            Ok(true)
+        })
     }
 
     pub fn group_push_tokens(

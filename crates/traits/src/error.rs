@@ -103,6 +103,15 @@ pub enum EngineError {
     #[error("serialization failure: {0}")]
     Serialize(String),
 
+    /// The transport envelope decrypted successfully, but the carried MLS
+    /// Welcome could not be validated or staged. This is terminal for that
+    /// inbound object, not a backend outage worth retrying.
+    #[error("invalid welcome")]
+    InvalidWelcome,
+
+    #[error("welcome already processed")]
+    WelcomeAlreadyProcessed,
+
     /// Last-resort bucket. Prefer adding a typed variant.
     #[error("backend failure: {0}")]
     Backend(String),

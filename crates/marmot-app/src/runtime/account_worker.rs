@@ -577,7 +577,15 @@ async fn run_app_runtime_account_worker(
                     None => return,
                 }
             }
-            result = client.next_event() => {
+            received = client.receive_next_delivery() => {
+                // Only the transport wait participates in `select!`. Once a
+                // delivery has been claimed, finish ingest + incidental
+                // publish + projection as one uncancelled worker operation;
+                // commands remain queued until that durable sequence lands.
+                let result = match received {
+                    Ok(delivery) => client.ingest_received_delivery(delivery).await,
+                    Err(err) => Err(err),
+                };
                 match result {
                     Ok(summary) => {
                         reconnect_backoff.reset();

@@ -1,7 +1,7 @@
 ---
 title: "Nostr Account Transport Notes"
 created: 2026-05-11
-updated: 2026-06-07
+updated: 2026-07-22
 tags: [marmot, overview, nostr, transport, accounts]
 status: working-note
 ---
@@ -106,7 +106,7 @@ Relay lists in the wild contain bad data. Local clients need a safety policy bef
 The policy should be explicit and testable:
 
 - require valid relay URLs;
-- prefer `wss://` by default;
+- require `wss://` for public relays; admit `ws://` only for loopback behind the explicit dev/test flag;
 - reject malformed URLs;
 - reject duplicate relay URLs after normalization rules are applied;
 - cap relay counts;

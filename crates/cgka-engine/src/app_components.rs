@@ -239,7 +239,7 @@ fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 
 /// storage provider now wraps `merge_staged_commit` in a backend transaction.
 pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     mls_group: &MlsGroup,
-    group_id: &GroupId,
+    _group_id: &GroupId,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
     // Resulting admins come from the staged (provisional) app_data_dictionary, so
@@ -311,9 +311,10 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
         .iter()
         .any(|admin| !accounts.contains(admin))
     {
-        return Err(EngineError::Other(format!(
-            "admin-policy update is invalid: an admin key has no member leaf in the resulting epoch (group {group_id:?})"
-        )));
+        return Err(EngineError::Other(
+            "admin-policy update is invalid: an admin key has no member leaf in the resulting epoch"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -344,15 +345,15 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
 ///    validators before the commit was staged.
 pub(crate) fn validate_app_component_integrity_for_staged_commit(
     mls_group: &MlsGroup,
-    group_id: &GroupId,
+    _group_id: &GroupId,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
     let current = mls_group.extensions().app_data_dictionary();
     let resulting = staged.group_context().extensions().app_data_dictionary();
     if current.is_some() && resulting.is_none() {
-        return Err(EngineError::Other(format!(
-            "commit is invalid: resulting GroupContext drops the app_data_dictionary (group {group_id:?})"
-        )));
+        return Err(EngineError::Other(
+            "commit is invalid: resulting GroupContext drops the app_data_dictionary".into(),
+        ));
     }
     let current = current.map(|ext| ext.dictionary());
     let resulting = resulting.map(|ext| ext.dictionary());
@@ -365,7 +366,7 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
         if currently_present && !still_present {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext drops required app component \
-                 {component_id:#06x} (group {group_id:?})"
+                 {component_id:#06x}"
             )));
         }
     }
@@ -402,7 +403,7 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
         if !update_backed {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext changes app component \
-                 {component_id:#06x} outside an AppDataUpdate proposal (group {group_id:?})"
+                 {component_id:#06x} outside an AppDataUpdate proposal"
             )));
         }
     }
@@ -457,15 +458,13 @@ pub(crate) fn member_account_pubkeys(mls_group: &MlsGroup) -> BTreeSet<[u8; 32]>
 pub(crate) fn reject_admins_without_member_accounts(
     admins: &[[u8; 32]],
     member_accounts: &BTreeSet<[u8; 32]>,
-    group_id: &GroupId,
+    _group_id: &GroupId,
 ) -> Result<(), EngineError> {
     if admins.is_empty() {
         return Ok(());
     }
     if admins.iter().any(|admin| !member_accounts.contains(admin)) {
-        return Err(EngineError::Other(format!(
-            "admin key has no member leaf (group {group_id:?})"
-        )));
+        return Err(EngineError::Other("admin key has no member leaf".into()));
     }
     Ok(())
 }
@@ -1014,5 +1013,18 @@ mod tests {
         assert_eq!(decode_message_retention(&42u64.to_be_bytes()).unwrap(), 42);
         assert_eq!(decode_message_retention(&0u64.to_be_bytes()).unwrap(), 0);
         assert!(decode_message_retention(&[0u8; 7]).is_err());
+    }
+
+    #[test]
+    fn admin_policy_validation_error_does_not_display_group_id() {
+        let secret_group_id = GroupId::new(vec![0xA5; 32]);
+        let error = reject_admins_without_member_accounts(
+            &[[0x11; 32]],
+            &BTreeSet::new(),
+            &secret_group_id,
+        )
+        .unwrap_err();
+
+        assert!(!error.to_string().contains(&hex::encode([0xA5; 32])));
     }
 }

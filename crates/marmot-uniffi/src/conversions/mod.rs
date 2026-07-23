@@ -25,6 +25,10 @@ mod push;
 mod relay;
 mod timeline;
 
+pub(super) fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 pub use account::*;
 pub use agent_stream::*;
 pub use audit::*;
@@ -49,6 +53,11 @@ mod tests {
         TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn count_conversion_saturates_instead_of_wrapping() {
+        assert_eq!(super::saturating_u32(usize::MAX), u32::MAX);
+    }
 
     fn group(admins: Vec<&str>) -> AppGroupRecordFfi {
         AppGroupRecordFfi {
@@ -201,6 +210,7 @@ mod tests {
                 media: None,
                 agent_text_stream: None,
                 deleted: false,
+                invalidation_status: Some("LosingBranch".to_owned()),
             }),
             media: Some(serde_json::json!({
                 "imeta": [["imeta", "url https://blob.example/file"]]

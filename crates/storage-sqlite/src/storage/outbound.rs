@@ -14,25 +14,30 @@ impl OutboundIntentStorage for SqliteAccountStorage {
         // to retry on transient lock contention from a concurrent writer.
         let serialized = serialize(record)?;
         let created_at = created_at_to_i64(record.created_at_ms)?;
-        retry_on_busy(|| {
-            self.lock()?
-                .execute(
-                    "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
+        let write = || {
+            let conn = self.lock()?;
+            conn.execute(
+                "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(id) DO UPDATE SET
                     group_id = excluded.group_id,
                     created_at_ms = excluded.created_at_ms,
                     record = excluded.record",
-                    params![
-                        record.id.as_slice(),
-                        record.group_id.as_slice(),
-                        created_at,
-                        serialized,
-                    ],
-                )
-                .storage()?;
+                params![
+                    record.id.as_slice(),
+                    record.group_id.as_slice(),
+                    created_at,
+                    serialized,
+                ],
+            )
+            .storage()?;
             Ok(())
-        })
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            retry_on_busy(write)
+        }
     }
 
     fn list_queued_outbound_intents(
@@ -59,14 +64,19 @@ impl OutboundIntentStorage for SqliteAccountStorage {
         // #484: delete is also on the queued send path (the intent is removed
         // once it is published), and is a single autocommit statement, so the
         // whole statement is safe to retry on transient lock contention.
-        let changed = retry_on_busy(|| {
+        let delete = || {
             self.lock()?
                 .execute(
                     "DELETE FROM cgka_queued_outbound WHERE id = ?1",
                     params![id.as_slice()],
                 )
                 .storage()
-        })?;
+        };
+        let changed = if self.connection.is_current_thread_transaction_owner() {
+            delete()?
+        } else {
+            retry_on_busy(delete)?
+        };
         if changed == 0 {
             return Err(StorageError::NotFound);
         }
@@ -110,6 +120,32 @@ mod tests {
             .into_iter()
             .map(|queued| queued.id)
             .collect();
+        assert_eq!(ids, vec![mid(1)]);
+    }
+
+    #[test]
+    fn queued_outbound_writes_reuse_outer_engine_transaction() {
+        use cgka_traits::storage::{StorageError, StorageProvider};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store
+            .put_queued_outbound_intent(&sample_queued_intent(mid(1), gid(1)))
+            .unwrap();
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.delete_queued_outbound_intent(&mid(1))?;
+            storage.put_queued_outbound_intent(&sample_queued_intent(mid(2), gid(1)))?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+
+        assert!(result.is_err());
+        let ids = store
+            .list_queued_outbound_intents(&gid(1))
+            .unwrap()
+            .into_iter()
+            .map(|intent| intent.id)
+            .collect::<Vec<_>>();
         assert_eq!(ids, vec![mid(1)]);
     }
 

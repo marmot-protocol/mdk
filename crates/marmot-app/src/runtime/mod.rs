@@ -112,6 +112,7 @@ pub struct AccountManager {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     workers: Arc<Mutex<HashMap<String, ManagedAccountWorker>>>,
+    tearing_down: Arc<StdMutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -457,8 +458,17 @@ impl RuntimeLifecycle {
 
         let started_at = Instant::now();
         let drained = timeout(wait, async {
-            while self.active_account_opens() != 0 {
-                self.inner.account_opens_drained.notified().await;
+            loop {
+                // `notify_waiters` does not retain a permit. Register the
+                // waiter before observing the counter so the final account
+                // open cannot finish in between the check and registration.
+                let notified = self.inner.account_opens_drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.active_account_opens() == 0 {
+                    break;
+                }
+                notified.await;
             }
         })
         .await
@@ -2266,8 +2276,7 @@ impl MarmotAppRuntime {
             )
             .await
         {
-            Ok(Some(profile)) => Ok(Some(profile)),
-            Ok(None) => Ok(cached),
+            Ok(fetched) => Ok(newest_user_profile(cached, fetched)),
             Err(error) => {
                 tracing::debug!(
                     target: "marmot_app::runtime",
@@ -2600,7 +2609,27 @@ impl AccountManager {
             events,
             shared,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            tearing_down: Arc::new(StdMutex::new(HashSet::new())),
         }
+    }
+
+    fn set_account_tearing_down(&self, account_id_hex: &str, tearing_down: bool) {
+        let mut accounts = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tearing_down {
+            accounts.insert(account_id_hex.to_owned());
+        } else {
+            accounts.remove(account_id_hex);
+        }
+    }
+
+    fn account_is_tearing_down(&self, account_id_hex: &str) -> bool {
+        self.tearing_down
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(account_id_hex)
     }
 
     pub fn managed_accounts(&self) -> Result<Vec<ManagedAccount>, AppError> {
@@ -2638,21 +2667,24 @@ impl AccountManager {
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
-        let mut workers = self.workers.lock().await;
-        let worker = workers.remove(&account.account_id_hex);
-        if let Some(worker) = worker {
-            worker.shutdown().await;
+        self.set_account_tearing_down(&account.account_id_hex, true);
+        let result = async {
+            let worker = self.workers.lock().await.remove(&account.account_id_hex);
+            if let Some(worker) = worker {
+                worker.shutdown().await;
+            }
+            // Evict every in-memory handle and warm flag for this label BEFORE
+            // the account directory is deleted. Otherwise the cached account
+            // storage connection (and directory cache) keeps pointing at the
+            // unlinked inode and a later re-import silently splits writes
+            // across a stale handle.
+            self.app.drop_account_caches(&account.label);
+            self.app.account_home().remove_account(&account.label)?;
+            Ok(())
         }
-        // Hold the worker map lock until storage is updated so reconcile()
-        // cannot recreate this account's worker mid-removal.
-        //
-        // Evict every in-memory handle and warm flag for this label BEFORE the
-        // account directory is deleted. Otherwise the cached account-storage
-        // connection (and directory cache) keeps pointing at the unlinked inode
-        // and a later re-import silently splits writes across a stale handle.
-        self.app.drop_account_caches(&account.label);
-        self.app.account_home().remove_account(&account.label)?;
-        Ok(())
+        .await;
+        self.set_account_tearing_down(&account.account_id_hex, false);
+        result
     }
 
     /// Non-destructive deactivation of an account on this device: persist a
@@ -2675,18 +2707,21 @@ impl AccountManager {
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
-        // Hold the worker-map lock across the signed-out marker write,
-        // shutdown, and cache eviction so reconcile() cannot recreate this
-        // account's worker mid-teardown.
-        let mut workers = self.workers.lock().await;
-        self.app
-            .account_home()
-            .set_account_signed_out(&account.label, true)?;
-        if let Some(worker) = workers.remove(&account.account_id_hex) {
-            worker.shutdown().await;
+        self.set_account_tearing_down(&account.account_id_hex, true);
+        let result = async {
+            self.app
+                .account_home()
+                .set_account_signed_out(&account.label, true)?;
+            let worker = self.workers.lock().await.remove(&account.account_id_hex);
+            if let Some(worker) = worker {
+                worker.shutdown().await;
+            }
+            self.app.drop_account_caches(&account.label);
+            Ok(())
         }
-        self.app.drop_account_caches(&account.label);
-        Ok(())
+        .await;
+        self.set_account_tearing_down(&account.account_id_hex, false);
+        result
     }
 
     /// Explicitly re-activate a reversibly signed-out local account.
@@ -2722,10 +2757,11 @@ impl AccountManager {
                 .accounts()?
                 .into_iter()
                 .filter(|account| {
-                    account.is_active_local_signing()
-                        || (account.external_signing
-                            && !account.signed_out
-                            && self.app.has_external_signer(&account.account_id_hex))
+                    !self.account_is_tearing_down(&account.account_id_hex)
+                        && (account.is_active_local_signing()
+                            || (account.external_signing
+                                && !account.signed_out
+                                && self.app.has_external_signer(&account.account_id_hex)))
                 })
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
@@ -2762,7 +2798,9 @@ impl AccountManager {
             {
                 let mut workers = self.workers.lock().await;
                 for account in pending {
-                    if workers.contains_key(&account.account_id_hex) {
+                    if workers.contains_key(&account.account_id_hex)
+                        || self.account_is_tearing_down(&account.account_id_hex)
+                    {
                         continue;
                     }
                     let (ready_tx, ready_rx) = oneshot::channel();
@@ -3656,6 +3694,17 @@ fn collect_notification_update_from_event(
 fn stamp_published_profile_created_at(profile: &mut UserProfileMetadata, now: u64) {
     if profile.created_at == 0 {
         profile.created_at = now;
+    }
+}
+
+fn newest_user_profile(
+    cached: Option<UserProfileMetadata>,
+    fetched: Option<UserProfileMetadata>,
+) -> Option<UserProfileMetadata> {
+    match (cached, fetched) {
+        (Some(cached), Some(fetched)) if cached.created_at >= fetched.created_at => Some(cached),
+        (_, Some(fetched)) => Some(fetched),
+        (cached, None) => cached,
     }
 }
 

@@ -599,11 +599,12 @@ pub struct ReceivedMessage {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<Vec<String>>,
-    /// Source-event timestamp (seconds since epoch) for the MLS-delivered
-    /// message. Clients should sort the timeline by this value so chronology
-    /// reflects send time, not delivery time. Zero means the timestamp was
-    /// unavailable at decode time.
+    /// Sender-authenticated inner app-event timestamp (seconds since epoch).
+    /// Clients should sort the timeline by this value so chronology reflects
+    /// send time, not delivery time. It is intentionally not clamped.
     pub recorded_at: u64,
+    /// Local wall-clock time when this device observed the delivery.
+    pub received_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -649,7 +650,10 @@ pub struct AppMessageRecord {
     pub tags: Vec<Vec<String>>,
     #[serde(default)]
     pub source_epoch: Option<u64>,
+    /// Sender-authenticated inner app-event timestamp. Synthesized rows without
+    /// an inner event use their local observation time.
     pub recorded_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     /// Local `app_events` insert order (rowid). The final LOCAL tiebreak of the
     /// raw-event replay cursor used by lag-recovery watermark/suppression (#630);
@@ -1077,7 +1081,7 @@ impl MarmotApp {
             lifecycle.ensure_running()?;
         }
         open.runtime.sync_transport_groups(rebuild_since).await?;
-        let client = AppClient {
+        let mut client = AppClient {
             app: self.clone(),
             runtime: open.runtime,
             adapter: open.adapter,
@@ -1090,6 +1094,19 @@ impl MarmotApp {
             epoch_stall: Default::default(),
             epoch_backfill_pending: false,
         };
+        if client.reconcile_live_engine_groups()? {
+            // Persist the repaired roster before any fallible network refresh,
+            // so another restart cannot lose the group again.
+            client.app.save_state(&client.state)?;
+            if let Err(error) = client.sync_runtime_groups().await {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "runtime_client",
+                    error_kind = error.privacy_safe_kind(),
+                    "reconciled engine groups but deferred their subscription refresh"
+                );
+            }
+        }
         // One-time upgrade backfill: derive `self_membership` for pre-0018 rows
         // from current engine state so groups the local account already left /
         // was removed from stop inflating `account_unread_total()`. Gated by a
@@ -2741,10 +2758,18 @@ impl MarmotApp {
         label: &str,
         message: &AppMessageProjection,
     ) -> Result<AppProjectionUpdate, AppError> {
-        let now = unix_now_seconds();
+        self.record_account_app_event_at(label, message, unix_now_seconds())
+    }
+
+    pub(crate) fn record_account_app_event_at(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+        received_at: u64,
+    ) -> Result<AppProjectionUpdate, AppError> {
         let storage_update = self
             .account_storage(label)?
-            .record_app_event(&stored_app_event_from_projection(message, now))?;
+            .record_app_event(&stored_app_event_from_projection(message, received_at))?;
         self.app_projection_update(label, storage_update)
     }
 

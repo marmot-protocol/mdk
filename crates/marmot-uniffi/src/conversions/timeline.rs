@@ -98,6 +98,9 @@ pub struct TimelineReplyPreviewFfi {
     pub media: Vec<MediaAttachmentReferenceFfi>,
     pub agent_text_stream_json: Option<String>,
     pub deleted: bool,
+    /// Convergence invalidation reason for the previewed message. The content
+    /// fields are intentionally preserved so the application controls display.
+    pub invalidation_status: Option<String>,
 }
 
 impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
@@ -114,6 +117,7 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
             media,
             agent_text_stream_json: value.agent_text_stream.map(|stream| stream.to_string()),
             deleted: value.deleted,
+            invalidation_status: value.invalidation_status,
         }
     }
 }
@@ -171,7 +175,10 @@ pub struct TimelineMessageRecordFfi {
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
     pub tags: Vec<MessageTagFfi>,
+    /// Authenticated inner app-event time, or observation time for synthesized
+    /// rows without an inner timestamp.
     pub timeline_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
     pub reply_to_message_id_hex: Option<String>,
     pub reply_preview: Option<TimelineReplyPreviewFfi>,
@@ -527,6 +534,7 @@ mod tests {
             media: Some(imeta_metadata(&[imeta_tag(0x22, "video/mp4", "clip.mp4")])),
             agent_text_stream: None,
             deleted: false,
+            invalidation_status: Some("LosingBranch".to_owned()),
         };
         let record: TimelineMessageRecordFfi =
             record_with_media(Some(7), None, Some(preview)).into();
@@ -535,5 +543,6 @@ mod tests {
         assert_eq!(reply.media.len(), 1);
         assert_eq!(reply.media[0].file_name, "clip.mp4");
         assert_eq!(reply.media[0].source_epoch, 3);
+        assert_eq!(reply.invalidation_status.as_deref(), Some("LosingBranch"));
     }
 }

@@ -476,6 +476,16 @@ systemd_quote() {
     printf '"%s"' "$value"
 }
 
+activate_systemd_user_service() {
+    local unit="$1"
+    if systemctl --user is-active --quiet "$unit"; then
+        run systemctl --user enable "$unit" || return 1
+        run systemctl --user restart "$unit" || return 1
+    else
+        run systemctl --user enable --now "$unit" || return 1
+    fi
+}
+
 install_linux_wn_agent_service() {
     local service_dir service program relay
     service_dir="$HOME/.config/systemd/user"
@@ -484,7 +494,7 @@ install_linux_wn_agent_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now $MARMOT_AGENT_SERVICE_NAME.service"
+        log "would restart $MARMOT_AGENT_SERVICE_NAME.service when active; otherwise enable --now"
         return 0
     fi
 
@@ -513,7 +523,7 @@ install_linux_wn_agent_service() {
     chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
-    run systemctl --user enable --now "$MARMOT_AGENT_SERVICE_NAME.service" || return 1
+    activate_systemd_user_service "$MARMOT_AGENT_SERVICE_NAME.service" || return 1
     log "installed and started systemd user service: $MARMOT_AGENT_SERVICE_NAME.service"
 }
 
@@ -525,7 +535,7 @@ install_linux_opencode_service() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "would install systemd user unit $service"
-        log "would run: systemctl --user enable --now wn-opencode.service"
+        log "would restart wn-opencode.service when active; otherwise enable --now"
         log "env: WN_OPENCODE_TIMEOUT_SECS=$WN_OPENCODE_TIMEOUT_SECS WN_OPENCODE_IDLE_TIMEOUT_SECS=$WN_OPENCODE_IDLE_TIMEOUT_SECS"
         return 0
     fi
@@ -562,7 +572,7 @@ install_linux_opencode_service() {
     chmod 600 "$service" || return 1
 
     run systemctl --user daemon-reload || return 1
-    run systemctl --user enable --now wn-opencode.service || return 1
+    activate_systemd_user_service wn-opencode.service || return 1
     log "installed and started systemd user service: wn-opencode.service"
 }
 

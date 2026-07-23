@@ -217,7 +217,7 @@ impl MarmotApp {
         let Some(profile) = profiles.get(&account_id_hex).cloned() else {
             return Ok(None);
         };
-        self.remember_directory_profile(&account_id_hex, &profile)?;
+        self.remember_directory_profile_if_newer(&account_id_hex, &profile)?;
         Ok(Some(profile))
     }
 
@@ -488,21 +488,13 @@ impl MarmotApp {
         if let Some(follow_list) = selection.value {
             return Ok(follow_list);
         }
-        if selection.rejected_future
-            && let Some(entry) = self.directory_entry_for_account_id(account_id_hex)?
-        {
-            return Ok(FetchedFollowList {
-                follows: entry.follows,
-                source_relays: entry.follow_source_relays,
-            });
-        }
-        Ok(FetchedFollowList {
-            follows: Vec::new(),
-            source_relays: source_relays
-                .iter()
-                .map(|endpoint| endpoint.0.clone())
-                .collect(),
-        })
+        // No event on this relay set means "unknown", not "the account
+        // follows nobody". Preserve any cached edges whether the candidates
+        // were absent or rejected as future-dated.
+        Ok(cached_or_unknown_follow_list(
+            self.directory_entry_for_account_id(account_id_hex)?,
+            source_relays,
+        ))
     }
 
     pub async fn fetch_current_follow_list_for_account_id(
@@ -545,7 +537,7 @@ impl MarmotApp {
             self.remember_directory_user(account_id)?;
         }
         for (account_id, profile) in &profiles {
-            self.remember_directory_profile(account_id, profile)?;
+            self.remember_directory_profile_if_newer(account_id, profile)?;
         }
         Ok(profiles.len())
     }
@@ -1201,5 +1193,24 @@ impl MarmotApp {
                 label: account.label,
                 local_signing: account.local_signing,
             })
+    }
+}
+
+pub(crate) fn cached_or_unknown_follow_list(
+    cached: Option<UserDirectoryRecord>,
+    source_relays: &[TransportEndpoint],
+) -> FetchedFollowList {
+    if let Some(entry) = cached {
+        return FetchedFollowList {
+            follows: entry.follows,
+            source_relays: entry.follow_source_relays,
+        };
+    }
+    FetchedFollowList {
+        follows: Vec::new(),
+        source_relays: source_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect(),
     }
 }

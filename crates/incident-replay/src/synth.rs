@@ -104,6 +104,24 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         },
         expected_trace: None,
         expected_outcomes: vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: winner.to_owned(),
+                pending: "create".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 7,
+                client: winner.to_owned(),
+                pending: "w".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 8,
+                client: loser.to_owned(),
+                pending: "l".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
             // Rule 4: assert the full recovery summary, not just the winner.
             TraceExpectation::RecoverySummary {
                 count: 1,
@@ -202,6 +220,24 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         },
         expected_trace: None,
         expected_outcomes: vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: winner.to_owned(),
+                pending: "create".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 8,
+                client: winner.to_owned(),
+                pending: "w".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 9,
+                client: loser.to_owned(),
+                pending: "l".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
             // Rule 4: assert the full recovery summary, not just the winner.
             TraceExpectation::RecoverySummary {
                 count: 1,
@@ -318,7 +354,27 @@ fn convergence_fixture(
             steps,
         },
         expected_trace: None,
-        expected_outcomes: vec![expected],
+        expected_outcomes: vec![
+            TraceExpectation::PendingResolution {
+                step_index: 1,
+                client: COMMITTER_A.to_owned(),
+                pending: "create".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 7,
+                client: COMMITTER_A.to_owned(),
+                pending: "invite-a".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            TraceExpectation::PendingResolution {
+                step_index: 8,
+                client: COMMITTER_B.to_owned(),
+                pending: "invite-b".to_owned(),
+                resolution: "confirmed".to_owned(),
+            },
+            expected,
+        ],
     }
 }
 

@@ -7,35 +7,42 @@ use crate::{
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::{MessageStorage, StorageError, StorageResult};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+
+const INGRESS_DEDUP_MARKER_CAPACITY: i64 = 4_096;
 
 impl MessageStorage for SqliteAccountStorage {
     fn put_message(&self, record: &MessageRecord) -> StorageResult<()> {
-        // Single autocommit statement: safe to retry the whole statement on
-        // transient lock contention (issue #484).
         let serialized = serialize(record)?;
         let epoch = epoch_to_i64(record.epoch)?;
-        retry_on_busy(|| {
-            self.lock()?
-                .execute(
-                    "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
+        let write = || {
+            let conn = self.lock()?;
+            conn.execute(
+                "INSERT INTO cgka_messages (id, group_id, epoch, state, record)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                     group_id = excluded.group_id,
                     epoch = excluded.epoch,
                     state = excluded.state,
                     record = excluded.record",
-                    params![
-                        record.id.as_slice(),
-                        record.group_id.as_slice(),
-                        epoch,
-                        message_state_to_i64(record.state),
-                        serialized,
-                    ],
-                )
-                .storage()?;
+                params![
+                    record.id.as_slice(),
+                    record.group_id.as_slice(),
+                    epoch,
+                    message_state_to_i64(record.state),
+                    serialized,
+                ],
+            )
+            .storage()?;
             Ok(())
-        })
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            // Single autocommit statement: safe to retry as a complete unit on
+            // transient lock contention (issue #484).
+            retry_on_busy(write)
+        }
     }
 
     fn get_message(&self, id: &MessageId) -> StorageResult<MessageRecord> {
@@ -68,7 +75,9 @@ impl MessageStorage for SqliteAccountStorage {
             // and idempotent.
             retry_on_busy(|| {
                 let mut conn = self.lock()?;
-                let tx = conn.transaction().storage()?;
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .storage()?;
                 update_message_state_on_connection(&tx, id, new_state)?;
                 tx.commit().storage()?;
                 Ok(())
@@ -98,6 +107,39 @@ impl MessageStorage for SqliteAccountStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         records.iter().map(|record| deserialize(record)).collect()
+    }
+
+    fn put_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<()> {
+        retry_on_busy(|| {
+            self.connection.with_transaction(|| {
+                let conn = self.lock()?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO cgka_ingress_dedup (id) VALUES (?1)",
+                    params![id.as_slice()],
+                )
+                .storage()?;
+                conn.execute(
+                    "DELETE FROM cgka_ingress_dedup
+                     WHERE insert_order NOT IN (
+                        SELECT insert_order FROM cgka_ingress_dedup
+                        ORDER BY insert_order DESC LIMIT ?1
+                     )",
+                    params![INGRESS_DEDUP_MARKER_CAPACITY],
+                )
+                .storage()?;
+                Ok(())
+            })
+        })
+    }
+
+    fn has_ingress_dedup_marker(&self, id: &MessageId) -> StorageResult<bool> {
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cgka_ingress_dedup WHERE id = ?1)",
+                params![id.as_slice()],
+                |row| row.get(0),
+            )
+            .storage()
     }
 
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
@@ -190,6 +232,16 @@ mod tests {
     }
 
     #[test]
+    fn ingress_dedup_markers_are_group_independent_and_idempotent() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let id = mid(42);
+        assert!(!store.has_ingress_dedup_marker(&id).unwrap());
+        store.put_ingress_dedup_marker(&id).unwrap();
+        store.put_ingress_dedup_marker(&id).unwrap();
+        assert!(store.has_ingress_dedup_marker(&id).unwrap());
+    }
+
+    #[test]
     fn update_message_state_keeps_read_modify_write_in_one_transaction() {
         let source = include_str!("messages.rs");
         let body = source
@@ -197,7 +249,7 @@ mod tests {
             .nth(1)
             .expect("update_message_state body");
 
-        assert!(body.contains("transaction()"));
+        assert!(body.contains("transaction_with_behavior(TransactionBehavior::Immediate)"));
         assert!(!body.contains("self.get_message(id)"));
     }
 
@@ -223,6 +275,26 @@ mod tests {
             store.get_message(&message.id).unwrap().state,
             MessageState::Processed
         );
+    }
+
+    #[test]
+    fn put_message_reuses_outer_engine_transaction() {
+        use cgka_traits::storage::{StorageError, StorageProvider};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let message = sample_message(mid(1), gid(1), 0);
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage.put_message(&message)?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+
+        assert!(result.is_err());
+        assert!(matches!(
+            store.get_message(&message.id),
+            Err(StorageError::NotFound)
+        ));
     }
 
     #[test]

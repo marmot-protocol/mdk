@@ -1,4 +1,4 @@
-use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
+use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -59,17 +59,26 @@ impl SqliteAccountStorage {
                  ORDER BY recorded_at ASC, message_id_hex ASC",
             )
             .storage()?;
-        stmt.query_map([], |row| {
-            Ok(PendingWelcomeDeliveryRecord {
-                message_id_hex: row.get(0)?,
-                group_id_hex: row.get(1)?,
-                recipient_hex: row.get(2)?,
-                recorded_at: row.get::<_, i64>(3)? as u64,
+        let records = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)?))
             })
-        })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        records
+            .into_iter()
+            .map(
+                |(message_id_hex, group_id_hex, recipient_hex, recorded_at)| {
+                    Ok(PendingWelcomeDeliveryRecord {
+                        message_id_hex,
+                        group_id_hex,
+                        recipient_hex,
+                        recorded_at: i64_to_u64(recorded_at)?,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Clear the pending welcome delivery for `message_id_hex`, if any.
@@ -167,5 +176,26 @@ mod tests {
             .map(|record| record.message_id_hex)
             .collect();
         assert_eq!(order, vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+    }
+
+    #[test]
+    fn list_rejects_negative_recorded_at() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO app_pending_welcome_delivery
+                 (message_id_hex, group_id_hex, recipient_hex, recorded_at)
+                 VALUES ('aa', 'bb', 'cc', -1)",
+                [],
+            )
+            .unwrap();
+
+        let error = store.list_pending_welcome_deliveries().unwrap_err();
+        assert!(matches!(
+            error,
+            cgka_traits::storage::StorageError::Serialization(_)
+        ));
     }
 }

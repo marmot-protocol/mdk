@@ -409,8 +409,7 @@ pub(crate) async fn download_encrypted_media(
         allow_loopback_blob_endpoints,
     )
     .await?;
-    let actual_encrypted_hash = hex::encode(Sha256::digest(&encrypted));
-    if actual_encrypted_hash != reference.ciphertext_sha256 {
+    if !encrypted_media_hash_matches(&encrypted, &reference.ciphertext_sha256) {
         return Err(AppError::InvalidEncryptedMedia(
             "encrypted blob hash does not match media reference".into(),
         ));
@@ -450,6 +449,10 @@ pub(crate) async fn download_encrypted_media(
     })
 }
 
+fn encrypted_media_hash_matches(encrypted: &[u8], expected_hash: &str) -> bool {
+    hex::encode(Sha256::digest(encrypted)).eq_ignore_ascii_case(expected_hash)
+}
+
 async fn fetch_encrypted_media_blob(
     reference: &MediaAttachmentReference,
     fallback_endpoints: &[BlobStoreEndpointV1],
@@ -466,19 +469,7 @@ async fn fetch_encrypted_media_blob(
             "media reference has no supported locators".into(),
         ));
     }
-    let mut candidates = reference
-        .locators
-        .iter()
-        .filter(|locator| locator.kind == BLOSSOM_LOCATOR_KIND_V1)
-        .map(|locator| locator.value.clone())
-        .collect::<Vec<_>>();
-    candidates.extend(
-        fallback_endpoints
-            .iter()
-            .filter(|endpoint| endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1)
-            .map(|endpoint| blossom_blob_url(&endpoint.base_url, &reference.ciphertext_sha256)),
-    );
-    candidates.dedup();
+    let mut candidates = encrypted_media_fetch_candidates(reference, fallback_endpoints);
     if !allow_loopback_blob_endpoints {
         // A loopback-HTTP candidate is valid component state but unusable in a
         // production build: skip it rather than GETting the local host. The
@@ -515,6 +506,27 @@ async fn fetch_encrypted_media_blob(
         }
     }
     Err(last_error.unwrap_or_else(|| AppError::BlobStore("download failed".into())))
+}
+
+fn encrypted_media_fetch_candidates(
+    reference: &MediaAttachmentReference,
+    fallback_endpoints: &[BlobStoreEndpointV1],
+) -> Vec<String> {
+    let mut candidates = reference
+        .locators
+        .iter()
+        .filter(|locator| locator.kind == BLOSSOM_LOCATOR_KIND_V1)
+        .map(|locator| locator.value.clone())
+        .collect::<Vec<_>>();
+    candidates.extend(
+        fallback_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.locator_kind == BLOSSOM_LOCATOR_KIND_V1)
+            .map(|endpoint| blossom_blob_url(&endpoint.base_url, &reference.ciphertext_sha256)),
+    );
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    candidates
 }
 
 pub fn media_attachment_from_imeta_tag(

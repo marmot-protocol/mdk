@@ -146,6 +146,12 @@ impl AppClient {
                 .collect::<Vec<_>>();
             let endpoints =
                 self.notification_trigger_target_relays(&server_pubkey_hex, &records)?;
+            let endpoints = self
+                .relay_plane
+                .sanitize_relay_endpoints(endpoints, "notification trigger publish")
+                .map_err(|err| {
+                    AppError::Transport(cgka_traits::TransportAdapterError::Publish(err))
+                })?;
             if endpoints.is_empty() {
                 // No relay hint and no published kind-10050 inbox list for this
                 // server: it is unreachable, so skip it as the genuine last

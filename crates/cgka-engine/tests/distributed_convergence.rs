@@ -3485,7 +3485,7 @@ async fn engine_ingest_buffers_future_epoch_app_message_as_convergence_witness()
 /// `app_payload` unit tests (empty `MemberId` rejected outright) and the
 /// emit-side backstop in `emit_application_replay_events`.
 #[tokio::test]
-async fn convergence_app_message_with_unresolvable_sender_emits_no_event_and_lands_terminal() {
+async fn terminal_undecryptable_app_emits_invalidation_without_message_received() {
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
     let (mut carol, carol_storage) = build_client(b"carol");
@@ -3559,11 +3559,28 @@ async fn convergence_app_message_with_unresolvable_sender_emits_no_event_and_lan
             .contains(&content_hex(&forged_msg)),
         "forged-attribution app message must not be accepted"
     );
+    assert!(result.invalidated_app_messages.iter().any(|invalidated| {
+        invalidated.message_id == content_hex(&forged_msg)
+            && invalidated.reason == InvalidatedAppMessageReason::UndecryptableInCanonicalState
+    }));
     // Message epoch (2) is at the settled tip (2): the failed validation is
     // terminal, not retryable — the message cannot re-enter convergence.
     assert_message_state(&carol_storage, &forged_msg, MessageState::EpochInvalidated);
 
     let events = carol.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::AppMessageInvalidated {
+                group_id: event_group,
+                message_id,
+                epoch: EpochId(2),
+                reason: AppMessageInvalidationReason::UndecryptableInCanonicalState,
+                ..
+            } if *event_group == group_id && *message_id == content_id(&forged_msg)
+        )),
+        "terminal at-tip decrypt miss must emit AppMessageInvalidated, got {events:?}"
+    );
     for event in &events {
         if let GroupEvent::MessageReceived {
             sender, payload, ..
@@ -3849,6 +3866,129 @@ async fn engine_emits_only_canonical_branch_app_messages_after_convergence() {
             } if *event_group == group_id
                 && *message_id == content_id(&app_messages[losing_index])
                 && *epoch == EpochId(2)
+        )
+    }));
+}
+
+/// mdk#965: an app message delivered from the initially-selected branch must
+/// be withdrawn if a later-arriving competing commit wins a reorg.
+#[tokio::test]
+async fn late_reorg_invalidates_an_already_delivered_losing_branch_message() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "already-delivered-reorg".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.drain_events();
+
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    let (bob_commit, bob_pending) = evolution(bob_invite);
+    let commits = [route(alice_commit, &group_id), route(bob_commit, &group_id)];
+    alice.confirm_published(alice_pending).await.unwrap();
+    bob.confirm_published(bob_pending).await.unwrap();
+    let apps = [
+        send_app(&mut alice, &group_id, b"late reorg alice".to_vec()).await,
+        send_app(&mut bob, &group_id, b"late reorg bob".to_vec()).await,
+    ];
+    let winning_index = commit_tiebreak_winner_index(&alice.self_id(), &bob.self_id());
+    let losing_index = 1 - winning_index;
+
+    // Settle and deliver the branch that will lose once the deterministic
+    // winner arrives late.
+    carol
+        .buffer_openmls_convergence_message(&group_id, commits[losing_index].clone(), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, apps[losing_index].clone(), 1_000)
+        .unwrap();
+    let first = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        first.accepted_app_messages,
+        vec![content_hex(&apps[losing_index])]
+    );
+    assert!(carol.drain_events().iter().any(|event| {
+        matches!(
+            event,
+            GroupEvent::MessageReceived { payload, .. }
+                if app_content(payload)
+                    == if losing_index == 0 {
+                        b"late reorg alice".as_slice()
+                    } else {
+                        b"late reorg bob".as_slice()
+                    }
+        )
+    }));
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, commits[winning_index].clone(), 2_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, apps[winning_index].clone(), 2_000)
+        .unwrap();
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 2_000_000)
+        .unwrap();
+
+    assert!(second.invalidated_app_messages.iter().any(|invalidated| {
+        invalidated.message_id == content_hex(&apps[losing_index])
+            && invalidated.reason == InvalidatedAppMessageReason::LosingBranch
+    }));
+    assert_message_state(
+        &carol_storage,
+        &apps[losing_index],
+        MessageState::EpochInvalidated,
+    );
+    let losing_id = content_id(&apps[losing_index]);
+    assert!(carol.drain_events().iter().any(|event| {
+        matches!(
+            event,
+            GroupEvent::AppMessageInvalidated {
+                message_id,
+                reason: AppMessageInvalidationReason::LosingBranch,
+                ..
+            } if *message_id == losing_id
         )
     }));
 }
@@ -4162,6 +4302,113 @@ async fn engine_ingest_retains_proposal_until_canonical_commit_consumes_it() {
     );
 }
 
+/// mdk#963: an unconsumed proposal is scoped to its source epoch. It must not
+/// be replayed before every later candidate commit, where OpenMLS rejects it as
+/// WrongEpoch and prunes every candidate path.
+#[tokio::test]
+async fn stale_unconsumed_proposal_does_not_poison_later_candidate_paths() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "stale-proposal-replay".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let stale_proposal = route(
+        proposal(
+            bob.send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        ),
+        &group_id,
+    );
+
+    // Alice never sees Bob's proposal, so this epoch-1 commit cannot consume
+    // it. Carol observes both through stored convergence.
+    let first_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (first_commit, first_pending) = evolution(first_invite);
+    alice.confirm_published(first_pending).await.unwrap();
+    let first_commit = route(first_commit, &group_id);
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, stale_proposal.clone(), 1_000)
+        .unwrap();
+    carol
+        .buffer_openmls_convergence_message(&group_id, first_commit.clone(), 1_000)
+        .unwrap();
+    let first = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(first.accepted_commits, vec![content_hex(&first_commit)]);
+    assert!(first.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == content_hex(&stale_proposal)
+            && dropped.kind == MessageKind::Proposal
+            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    }));
+    assert_message_state(
+        &carol_storage,
+        &stale_proposal,
+        MessageState::EpochInvalidated,
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+
+    // A later epoch-2 commit must materialize normally. Before the fix the
+    // stale epoch-1 proposal was prepended and every replay failed WrongEpoch.
+    let second_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (second_commit, second_pending) = evolution(second_invite);
+    alice.confirm_published(second_pending).await.unwrap();
+    let second_commit = route(second_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, second_commit.clone(), 2_000)
+        .unwrap();
+    let second = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .unwrap();
+
+    assert_eq!(second.accepted_commits, vec![content_hex(&second_commit)]);
+    assert_message_state(&carol_storage, &second_commit, MessageState::Processed);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}
+
 #[tokio::test]
 async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     let (mut alice, _alice_storage) = build_client(b"alice");
@@ -4213,6 +4460,65 @@ async fn engine_duplicate_convergence_input_does_not_reset_quiescence() {
     let result = carol
         .converge_stored_openmls_messages(&group_id, 2_000)
         .expect("duplicate should not pin syncing");
+
+    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&carol_storage, &commit, MessageState::Processed);
+}
+
+#[tokio::test]
+async fn malformed_convergence_input_does_not_reset_quiescence() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-convergence-malformed".into(),
+            description: "".into(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david.fresh_key_package().await.unwrap()],
+        })
+        .await
+        .unwrap();
+    let (commit, _pending) = evolution(invite);
+    let commit = route(commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, commit.clone(), 1_000)
+        .expect("valid commit buffered");
+
+    let mut malformed = commit.clone();
+    malformed.payload = b"not an OpenMLS message".to_vec();
+    carol
+        .buffer_openmls_convergence_message(&group_id, malformed, 1_900)
+        .expect_err("malformed input must fail before touching quiescence");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 2_000)
+        .expect("malformed input should not pin syncing");
 
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
@@ -4272,7 +4578,10 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
         .await
         .unwrap();
 
-    assert!(matches!(queued, SendResult::Queued { .. }));
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected Queued, got {other:?}"),
+    };
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
     assert_message_state(&carol_storage, &commit, MessageState::Created);
     assert_eq!(
@@ -4314,6 +4623,15 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "regeneration keeps the intent until transport acceptance"
+    );
+    carol.confirm_queued_outbound_intent(&intent_id).unwrap();
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
@@ -4431,6 +4749,87 @@ async fn far_future_convergence_input_beyond_ceiling_does_not_gate_sends() {
     // The forged row is NOT dropped — it stays retained so it would gate again
     // (correctly) once the tip advances into `[anchor, ceiling]`.
     assert_message_state(&carol_storage, &far_future_msg, MessageState::Created);
+}
+
+/// mdk#962: a commit that parses structurally but fails OpenMLS validation
+/// against every reachable parent is terminal convergence input. Before the
+/// fix the replay bridge returned no candidate and no disposition, leaving the
+/// stored row `Created` and permanently gating every subsequent send.
+#[tokio::test]
+async fn never_validating_commit_is_terminal_and_does_not_gate_sends() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, _carol_storage) = build_client(b"carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "never-validating-commit".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![alice.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (mut invalid_commit, _pending) = evolution(invite);
+    invalid_commit = route(invalid_commit, &group_id);
+    let last = invalid_commit
+        .payload
+        .last_mut()
+        .expect("commit wire payload is non-empty");
+    *last ^= 0x01;
+    assert_eq!(
+        project_mls_message(&invalid_commit.payload)
+            .expect("signature-corrupted commit remains structurally projectable")
+            .source_epoch,
+        Some(1)
+    );
+
+    bob.buffer_openmls_convergence_message(&group_id, invalid_commit.clone(), 1_000)
+        .expect("invalid commit buffered");
+    let result = bob
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("invalid commit classified");
+
+    assert!(result.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == content_hex(&invalid_commit)
+            && dropped.kind == MessageKind::Commit
+            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    }));
+    assert_message_state(
+        &bob_storage,
+        &invalid_commit,
+        MessageState::EpochInvalidated,
+    );
+    assert!(!bob.has_pending_convergence_inputs(&group_id).unwrap());
+
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, b"send after invalid commit"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(sent, SendResult::ApplicationMessage { .. }));
 }
 
 /// mdk#736 (related hardening): a `Created`/`Retryable` convergence row that
@@ -4961,10 +5360,14 @@ async fn engine_queues_group_evolution_until_convergence_is_settled() {
         .unwrap();
 
     assert_eq!(drained.len(), 1);
-    let queued_commit = match &drained[0] {
-        SendResult::GroupEvolution { msg, welcomes, .. } => {
+    let (queued_commit, queued_pending) = match &drained[0] {
+        SendResult::GroupEvolution {
+            msg,
+            welcomes,
+            pending,
+        } => {
             assert_eq!(welcomes.len(), 1);
-            route(msg.clone(), &group_id)
+            (route(msg.clone(), &group_id), *pending)
         }
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
@@ -4975,11 +5378,21 @@ async fn engine_queues_group_evolution_until_convergence_is_settled() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "regeneration alone must not delete the durable intent"
+    );
+    carol.confirm_published(queued_pending).await.unwrap();
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
             .unwrap()
-            .is_empty()
+            .is_empty(),
+        "confirming the externally visible evolution retires its intent"
     );
 }
 
@@ -5035,7 +5448,10 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
         })
         .await
         .unwrap();
-    assert!(matches!(queued, SendResult::Queued { .. }));
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected Queued, got {other:?}"),
+    };
 
     let policy = CanonicalizationPolicy {
         settlement_quiescence_ms: 0,
@@ -5059,6 +5475,17 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "standalone publish work remains queued until transport acceptance"
+    );
+    engine
+        .confirm_queued_outbound_intent(&intent_id)
+        .expect("simulated transport acceptance retires the intent");
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
@@ -5115,6 +5542,50 @@ async fn advance_convergence_retains_queued_intent_when_regeneration_fails() {
 }
 
 #[tokio::test]
+async fn restart_schedules_groups_with_durable_queued_intents() {
+    let (mut alice, alice_storage) = build_client(b"alice-restart-queued");
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "restart queued".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match create {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    alice_storage
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: MessageId::new(b"durable-restart-intent".to_vec()),
+            group_id: group_id.clone(),
+            intent: SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&alice, b"send after restart"),
+            },
+            created_at_ms: 1,
+        })
+        .unwrap();
+    drop(alice);
+
+    let mut restarted = build_client_with_storage(b"alice-restart-queued", alice_storage);
+    restarted
+        .hydrate_stable_groups_from_storage()
+        .expect("session-open hydration succeeds");
+    let scheduled = restarted.drain_pending_convergence_groups();
+    assert!(
+        scheduled.contains(&group_id),
+        "hydration must schedule durable queued work without new traffic; got {scheduled:?}"
+    );
+}
+
+#[tokio::test]
 async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolves() {
     let (mut alice, alice_storage) = build_client(b"alice");
     let (mut bob, _bob_storage) = build_client(b"bob");
@@ -5139,9 +5610,10 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
     alice.confirm_published(pending).await.unwrap();
 
     let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite_intent_id = MessageId::new(b"invite-carol".to_vec());
     alice_storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {
-            id: MessageId::new(b"invite-carol".to_vec()),
+            id: invite_intent_id,
             group_id: group_id.clone(),
             intent: SendIntent::Invite {
                 group_id: group_id.clone(),
@@ -5150,9 +5622,10 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             created_at_ms: 0,
         })
         .unwrap();
+    let app_intent_id = MessageId::new(b"later-app".to_vec());
     alice_storage
         .put_queued_outbound_intent(&QueuedOutboundIntent {
-            id: MessageId::new(b"later-app".to_vec()),
+            id: app_intent_id.clone(),
             group_id: group_id.clone(),
             intent: SendIntent::AppMessage {
                 group_id: group_id.clone(),
@@ -5173,7 +5646,7 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             .list_queued_outbound_intents(&group_id)
             .unwrap()
             .len(),
-        1
+        2
     );
 
     let paused = alice.advance_convergence(&group_id).await.unwrap();
@@ -5186,19 +5659,42 @@ async fn queued_group_evolution_pauses_later_queued_intents_until_publish_resolv
             .list_queued_outbound_intents(&group_id)
             .unwrap()
             .len(),
-        1
+        2
     );
 
     alice.publish_failed(pending_invite).await.unwrap();
     let drained_after_failure = alice.advance_convergence(&group_id).await.unwrap();
     assert_eq!(drained_after_failure.len(), 1);
-    assert!(
-        matches!(
-            drained_after_failure[0],
-            SendResult::ApplicationMessage { .. }
-        ),
-        "expected later app intent after publish failure, got {drained_after_failure:?}"
+    let retry_pending = match drained_after_failure[0] {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        ref other => panic!("failed evolution must retry before later work, got {other:?}"),
+    };
+    assert_eq!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        2,
+        "publish failure must retain the evolution intent"
     );
+    alice.confirm_published(retry_pending).await.unwrap();
+    assert_eq!(
+        alice_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "evolution confirmation retires only that intent"
+    );
+
+    let later = alice.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        matches!(later.as_slice(), [SendResult::ApplicationMessage { .. }]),
+        "later app intent should run after evolution confirmation, got {later:?}"
+    );
+    alice
+        .confirm_queued_outbound_intent(&app_intent_id)
+        .unwrap();
     assert!(
         alice_storage
             .list_queued_outbound_intents(&group_id)
@@ -5259,7 +5755,10 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
         })
         .await
         .unwrap();
-    assert!(matches!(queued, SendResult::Queued { .. }));
+    let intent_id = match queued {
+        SendResult::Queued { intent_id, .. } => intent_id,
+        other => panic!("expected Queued, got {other:?}"),
+    };
     assert_eq!(
         carol_storage
             .list_queued_outbound_intents(&group_id)
@@ -5293,6 +5792,17 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
             .source_epoch,
         Some(2)
     );
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "restart regeneration keeps the intent until transport acceptance"
+    );
+    restarted
+        .confirm_queued_outbound_intent(&intent_id)
+        .unwrap();
     assert!(
         carol_storage
             .list_queued_outbound_intents(&group_id)

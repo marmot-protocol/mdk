@@ -99,10 +99,11 @@ impl AgentConnector {
         reply_to_message_id_hex: Option<String>,
         idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        let group_id_hex = normalize_hex(group_id_hex)?;
         if self.debug_controls {
             return self.debug_record_final_send_response(
                 account_id_hex,
-                group_id_hex,
+                &group_id_hex,
                 text,
                 reply_to_message_id_hex,
             );
@@ -114,7 +115,7 @@ impl AgentConnector {
         // return ids belonging to an unrelated send.
         let fingerprint = send_final_fingerprint(
             account_id_hex,
-            group_id_hex,
+            &group_id_hex,
             &text,
             reply_to_message_id_hex.as_deref(),
         );
@@ -129,7 +130,7 @@ impl AgentConnector {
         }
 
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let summary = if let Some(target_message_id) = reply_to_message_id_hex {
             self.runtime
                 .reply_to_message(&account.label, &group_id, &target_message_id, &text)
@@ -160,7 +161,8 @@ impl AgentConnector {
         target_message_id_hex: &str,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let target_message_id = normalize_hex(target_message_id_hex)?;
         let summary = self
             .runtime
@@ -181,7 +183,8 @@ impl AgentConnector {
         group_id_hex: &str,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let state = self
             .runtime
             .group_mls_state(&account.label, &group_id)
@@ -366,16 +369,10 @@ impl AgentConnector {
     /// message. The plaintext bytes are read from the connector host by path and
     /// never crossed the control plane; the content key stays in the runtime.
     ///
-    /// Trust boundary: the connector reads `attachment.path` verbatim and is the
-    /// generic glue serving every control-plane gateway (OpenClaw, Hermes), so it
-    /// cannot know which paths a given deployment considers safe. Confining the
-    /// path to an allowlisted media root is therefore the caller's responsibility
-    /// — e.g. the OpenClaw channel adapter validates the resolved local path with
-    /// `assertLocalMediaAllowed` before issuing `send_media`, mirroring the
-    /// inbound model where downloaded media is re-staged under an allowlisted
-    /// root. A gateway that forwards an unconstrained, tool-influenced path would
-    /// let a prompt-injected agent read an arbitrary connector-host file; that
-    /// must be prevented gateway-side, not here.
+    /// Every path must identify a regular, non-symlink file beneath a directory
+    /// handle opened from `media_allowed_roots` at connector startup. Gateways
+    /// should still validate their source policy and stage a private copy beneath
+    /// one of those roots; the connector independently enforces the final read.
     pub(crate) async fn send_media_response(
         &self,
         account_id_hex: &str,
@@ -384,10 +381,14 @@ impl AgentConnector {
         caption: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let mut upload_attachments = Vec::with_capacity(attachments.len());
         for attachment in attachments {
-            let plaintext = tokio::fs::read(&attachment.path).await?;
+            let plaintext = self
+                .media_allowed_roots
+                .read_regular_file(attachment.path.into())
+                .await?;
             upload_attachments.push(MediaUploadAttachmentRequest {
                 file_name: attachment.file_name,
                 media_type: attachment.media_type,
@@ -424,7 +425,8 @@ impl AgentConnector {
         media: AgentControlMediaRef,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
-        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let reference = media_ref_to_reference(media);
         let result = self
             .runtime

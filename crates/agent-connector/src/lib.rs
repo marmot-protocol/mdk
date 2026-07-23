@@ -8,6 +8,7 @@ mod error;
 mod event_projection;
 mod inbound;
 mod invite_policy;
+mod media_roots;
 mod media_temp;
 mod messaging;
 mod quic;
@@ -28,9 +29,10 @@ pub use bootstrap::{
 pub use error::ConnectorError;
 pub use socket::{bind_connector_socket, bind_connector_socket_with_mode, default_socket_path};
 
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_control::AgentControlEvent;
@@ -46,14 +48,28 @@ pub(crate) use marmot_app::AppMessageQuery;
 
 use crate::allowlist::AllowlistStore;
 use crate::event_projection::InboundCatchUpDriver;
+use crate::socket::bind_connector_socket_with_owned_home;
 use crate::stream_session::{DebugFinalSendStore, SendIdempotencyStore, StreamSessionStore};
 use crate::validation::{endpoint, validate_control_plane_config};
 
 pub(crate) const AGENT_SOCKET_DIR_MODE: u32 = 0o700;
 pub(crate) const AGENT_SOCKET_MODE: u32 = 0o600;
 pub(crate) const ALLOWLIST_DIR: &str = "agent-allowlist";
+
+/// Recover the protected value after a previous holder panicked instead of
+/// permanently bricking an in-memory connector store.
+pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub(crate) const STREAM_COMPOSE_CHANNEL_DEPTH: usize = 32;
 pub(crate) const STREAM_COMPOSE_CHUNK_BYTES: usize = 1024;
+/// Whole-operation deadline for control-socket I/O and request-scoped name
+/// resolution. A peer cannot reset it by trickling bytes or partial progress.
+pub(crate) const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CONTROL_BUSY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) const INBOUND_CATCH_UP_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const INVITE_POLICY_RETRY_BASE: Duration = Duration::from_secs(5);
@@ -78,8 +94,34 @@ pub(crate) const MAX_PROFILE_NAME_CHARS: usize = 80;
 /// control plane is local and authenticated, but the threat model includes a
 /// prompt-injected/compromised gateway; each connection holds a spawned task
 /// plus, for `SubscribeInbound`, runtime/debug subscriptions and a delivered
-/// cursor, so beyond the cap new connections are closed instead of accepted.
+/// cursor, so beyond the cap new connections receive `server_busy` and close.
 pub const MAX_CONTROL_CONNECTIONS: usize = 64;
+/// Long-lived inbound subscriptions are capped separately so one-shot sends,
+/// stream finalization, and policy operations retain connection capacity.
+pub(crate) const MAX_CONTROL_SUBSCRIPTIONS: usize = 16;
+
+pub(crate) async fn with_control_operation_timeout<T, F>(
+    operation: &'static str,
+    future: F,
+) -> Result<T, ConnectorError>
+where
+    F: Future<Output = T>,
+{
+    with_control_operation_timeout_after(operation, CONTROL_OPERATION_TIMEOUT, future).await
+}
+
+pub(crate) async fn with_control_operation_timeout_after<T, F>(
+    operation: &'static str,
+    timeout_after: Duration,
+    future: F,
+) -> Result<T, ConnectorError>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(timeout_after, future)
+        .await
+        .map_err(|_| ConnectorError::OperationTimedOut(operation))
+}
 
 #[derive(Clone, Debug)]
 pub struct AgentConnectorConfig {
@@ -88,9 +130,15 @@ pub struct AgentConnectorConfig {
     pub socket_dir_mode: u32,
     pub socket_mode: u32,
     pub relays: Vec<String>,
-    pub allow_any: bool,
+    /// Dev/test-only bypass for the welcomer allowlist. Requires
+    /// `debug_controls`; a pending invite still needs an authenticated MLS
+    /// welcomer identity.
+    pub dev_allow_any_invites: bool,
     pub debug_controls: bool,
     pub auth_token: Option<String>,
+    /// Roots from which control clients may request outbound plaintext media.
+    /// Empty is fail-closed: every path-based media send is denied.
+    pub media_allowed_roots: Vec<PathBuf>,
     /// Cap on concurrently served control connections; connections beyond it
     /// are closed at accept time. Must be nonzero.
     pub max_connections: usize,
@@ -122,9 +170,10 @@ impl AgentConnectorConfig {
             socket_dir_mode: AGENT_SOCKET_DIR_MODE,
             socket_mode: AGENT_SOCKET_MODE,
             relays: Vec::new(),
-            allow_any: false,
+            dev_allow_any_invites: false,
             debug_controls: false,
             auth_token: None,
+            media_allowed_roots: Vec::new(),
             max_connections: MAX_CONTROL_CONNECTIONS,
             allow_insecure_local_broker: false,
             allow_loopback_relays: false,
@@ -136,9 +185,10 @@ impl AgentConnectorConfig {
 pub struct AgentConnector {
     pub(crate) account_home: AccountHome,
     pub(crate) allowlists: AllowlistStore,
-    pub(crate) allow_any: bool,
+    pub(crate) dev_allow_any_invites: bool,
     pub(crate) debug_controls: bool,
     pub(crate) auth_token: Option<String>,
+    pub(crate) media_allowed_roots: media_roots::MediaAllowedRoots,
     pub(crate) allow_insecure_local_broker: bool,
     pub(crate) debug_events: broadcast::Sender<AgentControlEvent>,
     pub(crate) debug_final_sends: DebugFinalSendStore,
@@ -153,10 +203,13 @@ pub struct AgentConnector {
     /// Kept separate from `connection_errors` so expected backpressure does
     /// not muddy fault-rate diagnostics.
     connections_refused: Arc<AtomicU64>,
+    subscription_limiter: Arc<Semaphore>,
 }
 
 impl AgentConnector {
     pub fn open(config: AgentConnectorConfig) -> Result<Self, ConnectorError> {
+        let media_allowed_roots =
+            media_roots::MediaAllowedRoots::prepare(&config.media_allowed_roots)?;
         let account_home = AccountHome::open(&config.home);
         let relays = config.relays;
         let app = MarmotApp::with_relays_and_account_home_and_config(
@@ -173,9 +226,10 @@ impl AgentConnector {
         Ok(Self {
             account_home,
             allowlists,
-            allow_any: config.allow_any,
+            dev_allow_any_invites: config.dev_allow_any_invites,
             debug_controls: config.debug_controls,
             auth_token: config.auth_token,
+            media_allowed_roots,
             allow_insecure_local_broker: config.allow_insecure_local_broker,
             debug_events,
             debug_final_sends: DebugFinalSendStore::default(),
@@ -187,6 +241,7 @@ impl AgentConnector {
             relays,
             connection_errors: Arc::new(AtomicU64::new(0)),
             connections_refused: Arc::new(AtomicU64::new(0)),
+            subscription_limiter: Arc::new(Semaphore::new(MAX_CONTROL_SUBSCRIPTIONS)),
         })
     }
 
@@ -252,17 +307,25 @@ impl AgentConnector {
 
 pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
     validate_control_plane_config(&config)?;
-    let listener = bind_connector_socket_with_mode(
+    if config.dev_allow_any_invites {
+        tracing::warn!(
+            target: "agent_connector",
+            method = "serve_socket",
+            "DANGER: dev allow-any invite policy is enabled; authenticated welcomers bypass the allowlist"
+        );
+    }
+    let listener = bind_connector_socket_with_owned_home(
         &config.socket,
         config.socket_dir_mode,
         config.socket_mode,
+        Some(&config.home),
     )?;
     let max_connections = config.max_connections;
     let connector = AgentConnector::open(config)?;
     connector.start().await?;
     let connection_limiter = Arc::new(Semaphore::new(max_connections));
     loop {
-        let (stream, _peer_addr) = match listener.accept().await {
+        let (mut stream, _peer_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
                 let connection_error =
@@ -294,7 +357,19 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
                 error_code = "connection_limit_exceeded",
                 "refusing control connection beyond the concurrency cap"
             );
-            drop(stream);
+            let response = agent_control::AgentControlEnvelope::new(
+                None,
+                agent_control::AgentControlResponse::Error {
+                    code: "server_busy".to_owned(),
+                    message: "agent connector connection capacity is busy".to_owned(),
+                },
+            );
+            let _ = crate::connection::write_control_frame_with_timeout(
+                &mut stream,
+                &response,
+                CONTROL_BUSY_RESPONSE_TIMEOUT,
+            )
+            .await;
             continue;
         };
         let connector = connector.clone();

@@ -122,6 +122,11 @@ pub struct Engine<S: StorageProvider> {
     /// out of the cap is still classified by storage.
     pub(crate) seen_message_ids: BoundedIdSet<MessageId>,
 
+    /// One-shot marker for a cap-dropped, unpersisted ingest. The outer
+    /// `do_ingest` epilogue must not promote that retryable id into the
+    /// terminal `seen_message_ids` cache.
+    pub(crate) retryable_unpersisted_ingest_id: Option<MessageId>,
+
     /// MessageIds this engine has produced via `send` or `create_group` /
     /// `invite`. Backs `StaleReason::OwnEcho` when a message we produced
     /// bounces back via ingest before we filter it client-side.
@@ -149,6 +154,17 @@ pub struct Engine<S: StorageProvider> {
     /// SelfRemove auto-commit schedule) rather than returned as
     /// `IngestOutcome::Buffered`.
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+
+    /// Queued intents regenerated into standalone publish work. The session
+    /// consumes these associations when it builds `PublishWork`, then deletes
+    /// the durable intent only after the transport reports acceptance.
+    pub(crate) queued_intent_by_message: HashMap<MessageId, (GroupId, MessageId)>,
+
+    /// Queued group evolutions stay associated with their pending publish so
+    /// confirm can delete the durable intent in the same transaction as the
+    /// MLS merge. Publish failure drops only this in-memory association and
+    /// leaves the intent queued for retry.
+    pub(crate) queued_intent_by_pending: HashMap<PendingStateRef, (GroupId, MessageId)>,
 
     pub(crate) convergence_policy: crate::canonicalization::CanonicalizationPolicy,
     pub(crate) last_convergence_relevant_input_ms: HashMap<GroupId, u64>,
@@ -349,11 +365,14 @@ impl<S: StorageProvider> EngineBuilder<S> {
             auto_proposal_buf: VecDeque::new(),
             pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
+            retryable_unpersisted_ingest_id: None,
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),
             scheduled_self_remove_auto_commits: HashMap::new(),
             pending_convergence_groups: HashSet::new(),
+            queued_intent_by_message: HashMap::new(),
+            queued_intent_by_pending: HashMap::new(),
             convergence_policy: crate::canonicalization::CanonicalizationPolicy::default(),
             last_convergence_relevant_input_ms: HashMap::new(),
             convergence_clock_started_at: Instant::now(),
@@ -729,10 +748,34 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// Group ids that successfully hydrated into this live engine session.
+    /// Stored records quarantined during open are intentionally omitted: they
+    /// use the separate recovery surface and must not be projected as healthy.
+    pub fn live_group_ids(&self) -> Result<Vec<GroupId>, EngineError> {
+        Ok(self
+            .storage
+            .list_groups()?
+            .into_iter()
+            .filter(|group_id| self.epoch_manager.state(group_id).is_some())
+            .collect())
+    }
+
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,
     ) -> Result<EpochId, GroupHydrationQuarantineReason> {
+        // A retained-anchor convergence probe durably rewinds the group while
+        // it explores historical candidates. Process termination cannot run
+        // the in-process rollback guard, so restore its pre-probe live snapshot
+        // before loading any MLS or Marmot state.
+        crate::openmls_projection::recover_interrupted_retained_anchor_probe(
+            &self.storage,
+            group_id,
+        )
+        .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
             self.storage.mls_storage(),
@@ -892,6 +935,22 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.audit_group_context(group_id, "hydrate_stable_group");
+
+        // Startup must recreate the in-memory scheduling edge for durable
+        // convergence work. Otherwise queued user sends and stored branch
+        // inputs remain asleep after a process restart until unrelated traffic
+        // happens to touch the group.
+        let has_queued_intents = !self
+            .storage
+            .list_queued_outbound_intents(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .is_empty();
+        let has_convergence_inputs = self
+            .has_pending_convergence_inputs(group_id)
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        if has_queued_intents || has_convergence_inputs {
+            self.schedule_pending_convergence_group(group_id);
+        }
         Ok(group.epoch)
     }
 
@@ -989,15 +1048,15 @@ impl<S: StorageProvider> Engine<S> {
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every
     /// retained artifact in place.
     ///
-    /// Called when the local member is removed from a group (the inbound
-    /// removal-commit apply paths). It deletes the OpenMLS-owned rows for the
-    /// group — ratchet tree, group context, epoch/message secrets, resumption
-    /// PSKs, own-leaf index/nodes, group state/config, the proposal queue, and
-    /// the current-epoch encryption key pairs — via `MlsGroup::delete`. That is
-    /// enough to stop a later re-add Welcome from failing with
-    /// `GroupAlreadyExists` when OpenMLS stages the fresh join, and to keep
-    /// OpenMLS from stacking the re-join on stale epoch keypairs / message
-    /// secrets / own-leaf index (mdk#557).
+    /// Called inside the authenticated re-join transaction when a removed
+    /// local member receives a fresh Welcome. It deletes the OpenMLS-owned rows
+    /// for the group — ratchet tree, group context, epoch/message secrets,
+    /// resumption PSKs, own-leaf index/nodes, group state/config, the proposal
+    /// queue, and the current-epoch encryption key pairs — via
+    /// `MlsGroup::delete`. That is enough to stop the re-add Welcome from
+    /// failing with `GroupAlreadyExists` when OpenMLS stages the fresh join,
+    /// and to keep OpenMLS from stacking the re-join on stale epoch keypairs /
+    /// message secrets / own-leaf index (mdk#557).
     ///
     /// Crucially it does NOT delete the Marmot `cgka_groups` record, the retained
     /// anchor snapshots, the stored commit/message history, or the convergence
@@ -1015,13 +1074,14 @@ impl<S: StorageProvider> Engine<S> {
     /// group, and the bookkeeping is reset when the group is re-joined.
     ///
     /// No identifiers are logged (observability.md privacy rule).
-    pub(crate) fn clear_live_openmls_group(
-        &mut self,
+    pub(crate) fn clear_live_openmls_group_on_storage(
+        &self,
+        storage_provider: &S,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
         let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
             &self.crypto,
-            self.storage.mls_storage(),
+            storage_provider.mls_storage(),
         );
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
         let storage = <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
@@ -1638,6 +1698,14 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         let now_ms = self.convergence_now_ms();
         self.converge_and_drain_queued_outbound_intents(group_id, now_ms)
             .await
+    }
+
+    fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError> {
+        self.confirm_regenerated_queued_intent(intent_id)
+    }
+
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId) {
+        self.retry_regenerated_queued_intent(group_id);
     }
 
     async fn confirm_published(

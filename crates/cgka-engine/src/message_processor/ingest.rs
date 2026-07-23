@@ -48,6 +48,11 @@ enum ScheduledAutoCommitReplay {
     NotApplicable,
 }
 
+enum ForkProbeError {
+    InvalidCandidate,
+    Engine(EngineError),
+}
+
 impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn ingest_welcome(
         &mut self,
@@ -65,19 +70,28 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        // Reuse the existing join_welcome machinery. Map its error shapes
-        // to typed stale reasons where applicable.
+        // Reuse the existing join_welcome machinery. Any classifiable failure
+        // for this individual welcome is terminal input, not a failure of the
+        // transport drain: persist an account-scoped marker even when no group
+        // id could be recovered, then return a typed stale outcome. Storage and
+        // truly internal transition failures still propagate.
         match self.do_join_welcome(msg.clone()).await {
             Ok(gid) => {
                 self.persist_transport_message(msg, &gid, EpochId(0), MessageState::Processed)?;
                 Ok(IngestOutcome::Processed)
             }
-            Err(EngineError::Peeler(PeelerError::DecryptFailed)) => Ok(IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed,
-            }),
-            Err(EngineError::Peeler(PeelerError::Malformed(_))) => Ok(IngestOutcome::Stale {
-                reason: StaleReason::PeelFailed,
-            }),
+            Err(EngineError::WelcomeAlreadyProcessed) => {
+                self.storage.put_ingress_dedup_marker(&msg.id)?;
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::AlreadySeen,
+                })
+            }
+            Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
+                self.storage.put_ingress_dedup_marker(&msg.id)?;
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::PeelFailed,
+                })
+            }
             Err(other) => Err(other),
         }
     }
@@ -101,13 +115,16 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage.get_message(&msg.id),
                 Ok(record) if record.state == MessageState::PeelDeferred
             );
-            if already_retained || self.reserve_peel_deferred_slot(&group_id)? {
+            if already_retained || self.has_peel_deferred_capacity(&group_id)? {
                 self.persist_transport_message_for_existing_group(
                     msg,
                     &group_id,
                     EpochId(0),
                     MessageState::PeelDeferred,
                 )?;
+                if !already_retained {
+                    self.note_peel_deferred_row_persisted(&group_id);
+                }
                 self.audit_group(
                     &group_id,
                     crate::audit_helpers::message_state_changed_event(
@@ -306,8 +323,8 @@ impl<S: StorageProvider> Engine<S> {
                             self.storage.get_message(&msg.id),
                             Ok(record) if record.state == MessageState::PeelDeferred
                         );
-                        if !already_retained && !self.reserve_peel_deferred_slot(&group_id)? {
-                            self.seen_message_ids.insert(msg.id.clone());
+                        if !already_retained && !self.has_peel_deferred_capacity(&group_id)? {
+                            self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
                             if self.should_audit_peel_deferred_cap_rejection(&group_id) {
                                 self.audit_group(
                                     &group_id,
@@ -334,6 +351,9 @@ impl<S: StorageProvider> Engine<S> {
                             current_epoch,
                             MessageState::PeelDeferred,
                         )?;
+                        if !already_retained {
+                            self.note_peel_deferred_row_persisted(&group_id);
+                        }
                         self.audit_group(
                             &group_id,
                             crate::audit_helpers::message_state_changed_event(
@@ -501,8 +521,29 @@ impl<S: StorageProvider> Engine<S> {
 
             // Parse into ProtocolMessage. Grab its epoch before process_message
             // consumes it — we need it for the fork-detection branch below.
-            let msg_in = MlsMessageIn::tls_deserialize_exact(mls_bytes.as_slice())
-                .map_err(|e| EngineError::Serialize(format!("message deserialize: {e:?}")))?;
+            let msg_in = match MlsMessageIn::tls_deserialize_exact(mls_bytes.as_slice()) {
+                Ok(msg_in) => msg_in,
+                Err(_) => {
+                    // The transport envelope authenticated successfully, but
+                    // a member is still free to wrap arbitrary bytes. Treat a
+                    // structurally invalid MLS message as terminal hostile
+                    // input: returning `Err` here aborts the transport drain
+                    // and lets the same poison event redeliver forever.
+                    self.persist_openmls_wire_message(
+                        &openmls_msg,
+                        &group_id,
+                        current_epoch,
+                        MessageState::Failed,
+                    )?;
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(
+                        &raw_msg_id,
+                        "malformed_mls_message",
+                    )?;
+                    return Ok(IngestOutcome::Stale {
+                        reason: StaleReason::PeelFailed,
+                    });
+                }
+            };
             let body = msg_in.extract();
             let proto: ProtocolMessage = match body {
                 MlsMessageBodyIn::PrivateMessage(p) => p.into(),
@@ -684,13 +725,32 @@ impl<S: StorageProvider> Engine<S> {
                                 }
                             }
                         };
-                        let (candidate_priority, candidate_committer) = self
+                        let (candidate_priority, candidate_committer) = match self
                             .probe_commit_ordering_metadata_for_recovery(
                                 &group_id,
                                 msg_epoch,
                                 &snapshot_name,
                                 mls_bytes.as_slice(),
-                            )?;
+                            ) {
+                            Ok(metadata) => metadata,
+                            Err(ForkProbeError::InvalidCandidate) => {
+                                // The retained-anchor probe proved that this
+                                // authenticated fork candidate cannot be a
+                                // valid commit on its claimed parent. It can
+                                // never become valid on redelivery, so retire
+                                // both its content and raw-wrapper lifecycle
+                                // rows instead of aborting the drain.
+                                self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                                self.mark_raw_transport_message_failed_if_awaiting_retry(
+                                    &raw_msg_id,
+                                    "invalid_fork_candidate_probe",
+                                )?;
+                                return Ok(IngestOutcome::Stale {
+                                    reason: StaleReason::PeelFailed,
+                                });
+                            }
+                            Err(ForkProbeError::Engine(error)) => return Err(error),
+                        };
                         match self.resolve_fork_candidate(
                             &group_id,
                             msg_epoch,
@@ -1708,7 +1768,7 @@ impl<S: StorageProvider> Engine<S> {
         source_epoch: EpochId,
         recovery_snapshot_name: &str,
         mls_bytes: &[u8],
-    ) -> Result<(CommitOrderingPriority, MemberId), EngineError> {
+    ) -> Result<(CommitOrderingPriority, MemberId), ForkProbeError> {
         let mut hasher = Sha256::new();
         hasher.update(b"cgka-engine-fork-probe/v1");
         hasher.update(group_id.as_slice());
@@ -1720,9 +1780,11 @@ impl<S: StorageProvider> Engine<S> {
             source_epoch.0,
             hex::encode(&digest[..8])
         );
-        let guard = SnapshotRollbackGuard::create(&self.storage, group_id.clone(), probe_snapshot)?;
+        let guard = SnapshotRollbackGuard::create(&self.storage, group_id.clone(), probe_snapshot)
+            .map_err(|error| ForkProbeError::Engine(error.into()))?;
         self.storage
-            .rollback_group_to_snapshot(group_id, recovery_snapshot_name)?;
+            .rollback_group_to_snapshot(group_id, recovery_snapshot_name)
+            .map_err(|error| ForkProbeError::Engine(error.into()))?;
 
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -1730,25 +1792,22 @@ impl<S: StorageProvider> Engine<S> {
             <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
             &mls_gid,
         )
-        .map_err(|e| EngineError::Backend(format!("load fork probe: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        .map_err(|e| {
+            ForkProbeError::Engine(EngineError::Backend(format!("load fork probe: {e:?}")))
+        })?
+        .ok_or_else(|| ForkProbeError::Engine(EngineError::UnknownGroup(group_id.clone())))?;
 
         let msg_in = MlsMessageIn::tls_deserialize_exact(mls_bytes)
-            .map_err(|e| EngineError::Serialize(format!("fork probe deserialize: {e:?}")))?;
+            .map_err(|_| ForkProbeError::InvalidCandidate)?;
         let proto: ProtocolMessage = match msg_in.extract() {
             MlsMessageBodyIn::PrivateMessage(p) => p.into(),
             MlsMessageBodyIn::PublicMessage(p) => p.into(),
-            _ => {
-                return Err(EngineError::Serialize(
-                    "fork probe expected MLS protocol message".into(),
-                ));
-            }
+            _ => return Err(ForkProbeError::InvalidCandidate),
         };
         let processed = process_commit_with_app_data_updates(&mut probe_group, &provider, proto)
-            .map_err(|e| EngineError::Backend(format!("fork probe process_message: {e:?}")))?;
-        let sender = member_id_of_sender(processed.sender(), &probe_group).ok_or_else(|| {
-            EngineError::Backend("fork candidate commit has no authenticated member sender".into())
-        })?;
+            .map_err(|_| ForkProbeError::InvalidCandidate)?;
+        let sender = member_id_of_sender(processed.sender(), &probe_group)
+            .ok_or(ForkProbeError::InvalidCandidate)?;
         let priority = match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 crate::app_components::require_admin_for_staged_commit(
@@ -1756,16 +1815,15 @@ impl<S: StorageProvider> Engine<S> {
                     group_id,
                     Some(&sender),
                     staged.as_ref(),
-                )?;
+                )
+                .map_err(|_| ForkProbeError::InvalidCandidate)?;
                 crate::app_components::commit_ordering_priority_for_staged(staged.as_ref())
             }
-            _ => {
-                return Err(EngineError::Backend(
-                    "fork probe expected staged commit".into(),
-                ));
-            }
+            _ => return Err(ForkProbeError::InvalidCandidate),
         };
-        guard.commit()?;
+        guard
+            .commit()
+            .map_err(|error| ForkProbeError::Engine(error.into()))?;
         Ok((priority, sender))
     }
 

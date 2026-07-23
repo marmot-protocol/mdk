@@ -754,7 +754,7 @@ async fn publish_app_events(
             .await
             .unwrap();
         let message = match &sent.publish[0] {
-            PublishWork::ApplicationMessage { msg } => msg.clone(),
+            PublishWork::ApplicationMessage { msg, .. } => msg.clone(),
             other => panic!("expected application message publish work, got {other:?}"),
         };
         let report = stack

@@ -339,6 +339,8 @@ pub enum GroupEvent {
     GroupJoined {
         group_id: GroupId,
         via_welcome: MessageId,
+        /// MLS-authenticated Welcome author derived from the GroupInfo signer
+        /// leaf. Transport-wrapper authorship is not used for attribution.
         welcomer: Option<MemberId>,
     },
     MessageReceived {
@@ -595,6 +597,15 @@ pub trait CgkaEngine: Send + Sync {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Vec<SendResult>, EngineError>;
+
+    /// Retire a durable queued intent after its regenerated standalone
+    /// message or proposal was accepted by the transport. Group-evolution
+    /// intents are retired automatically by [`Self::confirm_published`].
+    fn confirm_queued_outbound_intent(&mut self, intent_id: &MessageId) -> Result<(), EngineError>;
+
+    /// Re-arm a group after a regenerated standalone queued publish reached no
+    /// endpoint. The durable intent remains intact until confirmation.
+    fn retry_queued_outbound_intent(&mut self, group_id: &GroupId);
 
     /// Confirm that a [`SendResult::GroupEvolution`] (or
     /// [`SendResult::GroupCreated`]) was successfully published to the

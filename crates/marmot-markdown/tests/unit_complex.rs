@@ -8,8 +8,8 @@
 //! sibling unit tests; nothing here introduces new spec interpretations.
 
 use marmot_markdown::{
-    Alignment, AutolinkKind, Block, CodeBlockKind, Inline, ListItem, ListKind, NostrEntity,
-    NostrHrp, TableCell, parse,
+    Alignment, AutolinkKind, Block, CodeBlockKind, Inline, LinkDestinationKind, ListItem, ListKind,
+    NostrEntity, NostrHrp, TableCell, classify_link_destination, parse,
 };
 
 mod common;
@@ -23,6 +23,7 @@ fn link(dest: &str, title: Option<&str>, children: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: title.map(|s| s.to_string()),
         children,
+        classification: classify_link_destination(dest),
     }
 }
 fn image(dest: &str, alt: Vec<Inline>) -> Inline {
@@ -30,6 +31,7 @@ fn image(dest: &str, alt: Vec<Inline>) -> Inline {
         dest: dest.to_string(),
         title: None,
         alt,
+        classification: classify_link_destination(dest),
     }
 }
 fn npub(b32: &str) -> Inline {
@@ -359,6 +361,7 @@ fn autolink_and_nostr_uri_share_paragraph() {
             Inline::Autolink {
                 url: "https://example.com".into(),
                 kind: AutolinkKind::Uri,
+                classification: LinkDestinationKind::Web,
             },
             t(" and "),
             nuri(NostrHrp::Npub, &npub_str()),

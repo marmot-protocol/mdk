@@ -823,9 +823,10 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     group_id: &GroupId,
     work: StoredOpenMlsCanonicalizationWork,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+    use crate::snapshot_guard::SnapshotRollbackGuard;
+
     let live_snapshot = retained_anchor_probe_snapshot_name(group_id, work.replay_start_epoch);
-    storage
-        .create_group_snapshot(group_id, &live_snapshot)
+    let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), live_snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
@@ -840,16 +841,42 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
         Err(e) => Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
     };
 
-    let rollback_result = storage
-        .rollback_group_to_snapshot(group_id, &live_snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")));
-    let release_result = storage
-        .release_group_snapshot(group_id, &live_snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")));
-
-    rollback_result?;
-    release_result?;
+    guard
+        .commit()
+        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     result
+}
+
+/// Recover the live state captured before a retained-anchor probe that was
+/// interrupted by process termination.
+///
+/// The probe snapshot is created before the durable rollback to the historical
+/// anchor. A surviving snapshot therefore always contains the newer live state
+/// that must win on the next open. More than one probe snapshot is not expected:
+/// convergence for a group is serialized and hydrate runs before new work. If
+/// storage contains several, fail closed instead of guessing which live state
+/// is newest.
+pub(crate) fn recover_interrupted_retained_anchor_probe<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<(), OpenMlsProjectionError> {
+    let probes = storage
+        .list_group_snapshots(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        .into_iter()
+        .filter(|name| name.starts_with(RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX))
+        .collect::<Vec<_>>();
+
+    let Some(snapshot) = probes.first() else {
+        return Ok(());
+    };
+    if probes.len() != 1 {
+        return Err(OpenMlsProjectionError::Snapshot(
+            "multiple interrupted retained-anchor probes".into(),
+        ));
+    }
+
+    rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 
 /// Whether the pass may reuse the candidates the BFS already materialized instead
@@ -994,6 +1021,12 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     }];
     let mut completed = Vec::new();
     let mut invalid_commit_drops = Vec::new();
+    // A structurally valid commit can still fail OpenMLS validation against
+    // every candidate parent state. Track those failed probes separately from
+    // commits that materialize on at least one branch: only the former are
+    // terminal once the BFS has exhausted every reachable parent (#962).
+    let mut replay_rejected_commit_ids = BTreeSet::new();
+    let mut materialized_commit_ids = BTreeSet::new();
     let mut seen_paths = BTreeSet::from([Vec::<[u8; 32]>::new()]);
 
     while !frontier.is_empty() {
@@ -1023,8 +1056,14 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                     own_commits,
                     &mut budget,
                 )? {
-                    CandidatePathProbeResult::Materialized(Some(candidate)) => candidate,
-                    CandidatePathProbeResult::Materialized(None) => continue,
+                    CandidatePathProbeResult::Materialized(Some(candidate)) => {
+                        materialized_commit_ids.insert(commit.message.id.to_string());
+                        candidate
+                    }
+                    CandidatePathProbeResult::Materialized(None) => {
+                        replay_rejected_commit_ids.insert(commit.message.id.to_string());
+                        continue;
+                    }
                     CandidatePathProbeResult::UnauthorizedCommit { message_id } => {
                         invalid_commit_drops.push(DroppedMessage {
                             message_id,
@@ -1059,6 +1098,14 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
         }
 
         frontier = next_frontier;
+    }
+
+    for message_id in replay_rejected_commit_ids.difference(&materialized_commit_ids) {
+        invalid_commit_drops.push(DroppedMessage {
+            message_id: message_id.clone(),
+            kind: MessageKind::Commit,
+            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+        });
     }
 
     let mut candidate_paths = Vec::with_capacity(completed.len());
@@ -1185,18 +1232,6 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
 
     let prepare_result = if has_new_commits && apply_start_epoch == current_epoch {
         retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
-    } else if apply_start_epoch < current_epoch {
-        let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
-        storage
-            .rollback_group_to_snapshot(group_id, &anchor_snapshot)
-            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))
-            .and_then(|()| {
-                restore_live_message_and_queue_records(
-                    storage,
-                    &live_message_records,
-                    &live_queued_outbound,
-                )
-            })
     } else {
         Ok(())
     };
@@ -1205,14 +1240,38 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
         return Err(err);
     }
 
-    let apply_result =
-        apply_openmls_canonicalization_result_inner(storage, group_id, result, &replay_messages);
+    // The historical rewind, restoration of the complete live input/queue set,
+    // selected-branch apply, and apply-snapshot release are one durable unit.
+    // SQLite snapshot rollback joins this outer transaction; a crash or error
+    // therefore returns to the pre-apply live state instead of committing an
+    // older message/queue image and rebuilding it row by row.
+    let apply_result = storage.with_transaction(|storage| {
+        if apply_start_epoch < current_epoch {
+            let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
+            storage
+                .rollback_group_to_snapshot(group_id, &anchor_snapshot)
+                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+            restore_live_message_and_queue_records(
+                storage,
+                &live_message_records,
+                &live_queued_outbound,
+            )?;
+        }
+
+        let observations = apply_openmls_canonicalization_result_inner(
+            storage,
+            group_id,
+            result,
+            &replay_messages,
+        )?;
+        storage
+            .release_group_snapshot(group_id, &snapshot)
+            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+        Ok(observations)
+    });
 
     match apply_result {
         Ok(observations) => {
-            storage
-                .release_group_snapshot(group_id, &snapshot)
-                .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
             if result.selected_tip.is_some() {
                 retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)?;
             }
@@ -1327,6 +1386,37 @@ fn rollback_and_release_group_snapshot<S: StorageProvider>(
         .release_group_snapshot(group_id, snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
     Ok(())
+}
+
+/// Restore a pre-apply live snapshot left by a process termination and release
+/// it before the group is hydrated.
+///
+/// A completed apply releases this snapshot in the same transaction as its
+/// state changes. Consequently any surviving snapshot identifies an
+/// interrupted apply. Restoring is also safe for snapshots left by older
+/// versions: the captured input records allow convergence to replay any branch
+/// work that had committed immediately before the crash.
+pub(crate) fn recover_interrupted_apply_snapshot<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<(), OpenMlsProjectionError> {
+    let snapshots = storage
+        .list_group_snapshots(group_id)
+        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+        .into_iter()
+        .filter(|name| name.starts_with(APPLY_SNAPSHOT_PREFIX))
+        .collect::<Vec<_>>();
+
+    let Some(snapshot) = snapshots.first() else {
+        return Ok(());
+    };
+    if snapshots.len() != 1 {
+        return Err(OpenMlsProjectionError::Snapshot(
+            "multiple interrupted convergence applies".into(),
+        ));
+    }
+
+    rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 
 fn restore_live_message_and_queue_records<S: StorageProvider>(
@@ -1622,34 +1712,81 @@ fn candidate_paths_with_pending_replay_messages(
     candidate_paths: &[OpenMlsCandidatePath],
     pending_messages: &[TransportMessage],
 ) -> Result<Vec<OpenMlsCandidatePath>, OpenMlsProjectionError> {
-    let mut proposals = Vec::new();
+    let mut proposals_by_epoch: BTreeMap<u64, Vec<TransportMessage>> = BTreeMap::new();
     let mut applications = Vec::new();
     for message in pending_messages {
-        match project_mls_message(&message.payload)?.kind {
-            OpenMlsContentKind::Proposal => proposals.push(message.clone()),
+        let projection = project_mls_message(&message.payload)?;
+        match projection.kind {
+            OpenMlsContentKind::Proposal => {
+                let source_epoch = projection.source_epoch.ok_or(
+                    OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
+                )?;
+                proposals_by_epoch
+                    .entry(source_epoch)
+                    .or_default()
+                    .push(message.clone());
+            }
             OpenMlsContentKind::Application => applications.push(message.clone()),
             OpenMlsContentKind::Commit
             | OpenMlsContentKind::Welcome
             | OpenMlsContentKind::Other => {}
         }
     }
+    for proposals in proposals_by_epoch.values_mut() {
+        proposals.sort_by(|a, b| a.id.as_slice().cmp(b.id.as_slice()));
+    }
 
-    Ok(candidate_paths
+    candidate_paths
         .iter()
-        .map(|path| {
-            let mut seen = BTreeSet::new();
-            let mut messages = Vec::new();
-            for message in proposals.iter().chain(&path.messages).chain(&applications) {
-                if seen.insert(hex::encode(message.id.as_slice())) {
-                    messages.push(message.clone());
+        .map(
+            |path| -> Result<OpenMlsCandidatePath, OpenMlsProjectionError> {
+                let mut seen = BTreeSet::new();
+                let mut messages = Vec::new();
+                let mut final_epoch = None;
+                for message in &path.messages {
+                    let projection = project_mls_message(&message.payload)?;
+                    if projection.kind == OpenMlsContentKind::Commit {
+                        let source_epoch = projection.source_epoch.ok_or(
+                            OpenMlsProjectionError::UnsupportedMessageKind(projection.kind),
+                        )?;
+                        if let Some(proposals) = proposals_by_epoch.get(&source_epoch) {
+                            for proposal in proposals {
+                                if seen.insert(hex::encode(proposal.id.as_slice())) {
+                                    messages.push(proposal.clone());
+                                }
+                            }
+                        }
+                        final_epoch = Some(source_epoch.saturating_add(1));
+                    }
+                    if seen.insert(hex::encode(message.id.as_slice())) {
+                        messages.push(message.clone());
+                    }
                 }
-            }
-            OpenMlsCandidatePath {
-                branch_id: path.branch_id.clone(),
-                messages,
-            }
-        })
-        .collect())
+                // Proposals created at the path tip are still live evidence even
+                // when no commit consumes them yet. Older proposals were either
+                // folded immediately before their epoch's commit or are stale;
+                // future proposals belong to a later path (#963).
+                if let Some(final_epoch) = final_epoch
+                    && let Some(proposals) = proposals_by_epoch.get(&final_epoch)
+                {
+                    for proposal in proposals {
+                        if seen.insert(hex::encode(proposal.id.as_slice())) {
+                            messages.push(proposal.clone());
+                        }
+                    }
+                }
+                for message in &applications {
+                    if seen.insert(hex::encode(message.id.as_slice())) {
+                        messages.push(message.clone());
+                    }
+                }
+                Ok(OpenMlsCandidatePath {
+                    branch_id: path.branch_id.clone(),
+                    messages,
+                })
+            },
+        )
+        .collect()
 }
 
 fn proposal_id_by_ref(candidates: &[OpenMlsMaterializedCandidate]) -> BTreeMap<String, String> {
@@ -2198,8 +2335,13 @@ fn retained_anchor_probe_snapshot_name(group_id: &GroupId, epoch: u64) -> String
     hasher.update(group_id.as_slice());
     hasher.update(epoch.to_be_bytes());
     let digest = hasher.finalize();
-    format!("openmls-retained-probe-{}", hex::encode(&digest[..8]))
+    format!(
+        "{RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX}{}",
+        hex::encode(&digest[..8])
+    )
 }
+
+const RETAINED_ANCHOR_PROBE_SNAPSHOT_PREFIX: &str = "openmls-retained-probe-";
 
 fn replay_snapshot_name(group_id: &GroupId, messages: &[TransportMessage]) -> String {
     let mut hasher = Sha256::new();
@@ -2227,8 +2369,10 @@ fn apply_snapshot_name(group_id: &GroupId, result: &CanonicalizationResult) -> S
         hasher.update(message_id.as_bytes());
     }
     let digest = hasher.finalize();
-    format!("openmls-apply-{}", hex::encode(&digest[..8]))
+    format!("{APPLY_SNAPSHOT_PREFIX}{}", hex::encode(&digest[..8]))
 }
+
+const APPLY_SNAPSHOT_PREFIX: &str = "openmls-apply-";
 
 fn tls_hex<T: TlsSerialize>(value: &T) -> Result<String, OpenMlsProjectionError> {
     value

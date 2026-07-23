@@ -195,7 +195,17 @@ impl DirectoryRelayPlane {
             let fetcher = self.fetcher.clone();
             let state = self.state.clone();
             tokio::spawn(async move {
-                let result = fetcher.fetch_directory_events(request).await;
+                // Keep ownership of the inflight entry in this supervisor.
+                // The child JoinHandle converts a fetcher panic into an error,
+                // so cleanup and waiter notification still run.
+                let result = match tokio::spawn(async move {
+                    fetcher.fetch_directory_events(request).await
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("directory fetch task failed".to_owned()),
+                };
                 let mut state = state.lock().await;
                 if result.is_ok() {
                     state.completed_fetches += 1;
@@ -324,22 +334,21 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .endpoints
             .iter()
             .map(|endpoint| {
-                RelayUrl::parse(endpoint.as_str())
-                    .map_err(|e| format!("invalid relay URL {}: {e}", endpoint.as_str()))
+                RelayUrl::parse(endpoint.as_str()).map_err(|_| "invalid relay URL".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
         for relay_url in &relay_urls {
             self.client
                 .add_relay(relay_url.clone())
                 .await
-                .map_err(|e| format!("add relay: {e}"))?;
+                .map_err(|_| "add relay failed".to_owned())?;
             timeout(
                 DIRECTORY_RELAY_CONNECT_WAIT,
                 self.client.connect_relay(relay_url.clone()),
             )
             .await
             .map_err(|_| "connect relay timed out".to_owned())?
-            .map_err(|e| format!("connect relay: {e}"))?;
+            .map_err(|_| "connect relay failed".to_owned())?;
         }
 
         let mut records = Vec::new();
@@ -360,10 +369,10 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
                 .client
                 .fetch_events_from(relay_urls.clone(), filter, DIRECTORY_RELAY_FETCH_WAIT)
                 .await
-                .map_err(|e| format!("fetch directory events: {e}"))?;
+                .map_err(|_| "fetch directory events failed".to_owned())?;
             for event in events {
                 let event = NostrTransportEvent::from_nostr_event(&event)
-                    .map_err(|e| format!("map directory event: {e}"))?;
+                    .map_err(|_| "map directory event failed".to_owned())?;
                 records.push(DirectoryRelayEventRecord {
                     endpoints: request.endpoints.clone(),
                     event,
@@ -371,5 +380,28 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             }
         }
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sdk_fetcher_errors_do_not_echo_invalid_relay_urls() {
+        let secret_url = "not-a-relay-with-secret-token";
+        let request = DirectoryFetchRequest::new(
+            vec![TransportEndpoint(secret_url.to_owned())],
+            vec![DirectoryEventQuery::new(0, vec!["11".repeat(32)], 1)],
+        )
+        .unwrap();
+
+        let error = NostrSdkDirectoryRelayFetcher::standalone()
+            .fetch_directory_events(request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "invalid relay URL");
+        assert!(!error.contains(secret_url));
     }
 }

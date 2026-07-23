@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::{SqliteAccountStorage, SqliteResultExt, unix_now_ms};
+use crate::{SqliteAccountStorage, SqliteResultExt, connection::retry_on_busy, unix_now_ms};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -107,9 +107,10 @@ impl fmt::Debug for StoredMessageDraftSummary {
 impl SqliteAccountStorage {
     /// List draft preview metadata newest-first without loading attachment BLOBs.
     pub fn message_drafts(&self) -> StorageResult<Vec<StoredMessageDraftSummary>> {
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
         let mut drafts = {
-            let mut statement = conn
+            let mut statement = tx
                 .prepare(
                     "SELECT group_id_hex, content, reply_to_message_id_hex,
                             created_at_ms, updated_at_ms
@@ -135,15 +136,19 @@ impl SqliteAccountStorage {
 
         for draft in &mut drafts {
             draft.media_attachments =
-                load_message_draft_attachment_summaries(&conn, &draft.group_id_hex)?;
+                load_message_draft_attachment_summaries(&tx, &draft.group_id_hex)?;
         }
+        tx.commit().storage()?;
         Ok(drafts)
     }
 
     /// Load one fully hydrated draft for a group.
     pub fn message_draft(&self, group_id_hex: &str) -> StorageResult<Option<StoredMessageDraft>> {
-        let conn = self.lock()?;
-        load_message_draft(&conn, group_id_hex)
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        let draft = load_message_draft(&tx, group_id_hex)?;
+        tx.commit().storage()?;
+        Ok(draft)
     }
 
     /// Transactionally validate the group and upsert a draft plus its ordered
@@ -155,8 +160,9 @@ impl SqliteAccountStorage {
         reply_to_message_id_hex: Option<&str>,
         media_attachments: &[StoredMessageDraftAttachment],
     ) -> StorageResult<StoredMessageDraft> {
+        validate_waveform_samples(media_attachments)?;
         let now_ms = unix_now_ms();
-        let saved = {
+        retry_on_busy(|| {
             let mut conn = self.lock()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -188,10 +194,8 @@ impl SqliteAccountStorage {
                 StorageError::Backend("saved message draft could not be reloaded".to_owned())
             })?;
             tx.commit().storage()?;
-            saved
-        };
-
-        Ok(saved)
+            Ok(saved)
+        })
     }
 
     /// Delete one draft and its cascading attachment rows.
@@ -204,6 +208,19 @@ impl SqliteAccountStorage {
             .storage()?;
         Ok(())
     }
+}
+
+fn validate_waveform_samples(attachments: &[StoredMessageDraftAttachment]) -> StorageResult<()> {
+    if attachments
+        .iter()
+        .flat_map(|attachment| &attachment.waveform_samples)
+        .any(|sample| !sample.is_finite())
+    {
+        return Err(StorageError::Serialization(
+            "message draft waveform samples must be finite".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn load_message_draft_attachment_summaries(
@@ -645,6 +662,30 @@ mod tests {
     }
 
     #[test]
+    fn message_draft_reads_use_one_snapshot_for_rows_and_attachments() {
+        let source = include_str!("message_drafts.rs");
+        let list_body = source
+            .split("pub fn message_drafts(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn message_draft(")
+            .next()
+            .unwrap();
+        let single_body = source
+            .split("pub fn message_draft(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn save_message_draft(")
+            .next()
+            .unwrap();
+
+        for body in [list_body, single_body] {
+            assert!(body.contains("transaction()"));
+            assert!(body.contains("tx.commit()"));
+        }
+    }
+
+    #[test]
     fn message_draft_attachment_reorder_preserves_existing_rows() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let group_id_hex = "22".repeat(16);
@@ -725,5 +766,95 @@ mod tests {
             storage.save_message_draft(&"33".repeat(16), "draft", None, &[]),
             Err(StorageError::NotFound)
         ));
+    }
+
+    #[test]
+    fn saving_draft_retries_concurrent_writer_contention() {
+        use crate::{SqlCipherKey, SqliteStorageOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("draft-contention.sqlite");
+        let key = SqlCipherKey::new("draft contention key").unwrap();
+        let options = SqliteStorageOptions {
+            busy_timeout_ms: 50,
+            ..SqliteStorageOptions::default()
+        };
+        let storage =
+            SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+                .unwrap();
+        let group_id_hex = "55".repeat(16);
+        storage
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    seen_events: vec![],
+                    last_transport_timestamp: None,
+                    groups: vec![group(&group_id_hex)],
+                },
+                100,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+
+        let blocker_path = path.clone();
+        let blocker_key = SqlCipherKey::new("draft contention key").unwrap();
+        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                &blocker_path,
+                &blocker_key,
+                options,
+            )
+            .unwrap();
+            let conn = blocker.lock().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            lock_acquired_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        lock_acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let saved = storage
+            .save_message_draft(&group_id_hex, "survives contention", None, &[])
+            .expect("draft save retries after transient contention");
+        blocker.join().unwrap();
+        assert_eq!(saved.content, "survives contention");
+    }
+
+    #[test]
+    fn saving_draft_rejects_non_finite_waveform_samples_before_writing() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let group_id_hex = "44".repeat(16);
+        storage
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    seen_events: vec![],
+                    last_transport_timestamp: None,
+                    groups: vec![group(&group_id_hex)],
+                },
+                100,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        let attachment = StoredMessageDraftAttachment {
+            id: "voice".to_owned(),
+            file_name: "voice.m4a".to_owned(),
+            media_type: "audio/mp4".to_owned(),
+            plaintext: vec![1, 2, 3],
+            dim: None,
+            thumbhash: None,
+            duration_seconds: Some(1.0),
+            waveform_samples: vec![0.25, f64::NAN],
+        };
+
+        let error = storage
+            .save_message_draft(&group_id_hex, "draft", None, &[attachment])
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::Serialization(_)));
+        assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
     }
 }

@@ -4,10 +4,38 @@ use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
 };
-use nostr_relay_builder::MockRelay;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+#[tokio::test]
+async fn run_server_validates_relays_before_creating_runtime_artifacts() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let home_path = home.path().to_path_buf();
+    let socket = default_socket_path(&home_path);
+    let pid_path = default_pid_path(&home_path);
+    let args = DaemonArgs {
+        home: Some(home_path),
+        data_dir: None,
+        logs_dir: None,
+        socket: None,
+        relay: None,
+        discovery_relays: vec!["not a relay URL".to_owned()],
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+
+    run_server(args)
+        .await
+        .expect_err("invalid relay configuration should fail startup");
+
+    assert!(!socket.exists(), "failed startup must not leave a socket");
+    assert!(
+        !pid_path.exists(),
+        "failed startup must not leave a pid file"
+    );
+}
 
 #[test]
 #[cfg(unix)]
@@ -61,13 +89,45 @@ fn daemon_pid_and_log_writers_create_private_files() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn daemon_socket_parent_rejects_symlink_without_chmodding_target() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("target");
+    let dev = home.path().join("dev");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&target, &dev).unwrap();
+
+    prepare_socket_dir(&dev, home.path()).expect_err("symlinked daemon parent must be rejected");
+
+    assert_eq!(
+        target.metadata().unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_socket_parent_rejects_group_writable_custom_directory() {
+    let home = tempfile::tempdir().expect("home");
+    let custom_root = tempfile::tempdir().expect("custom root");
+    let parent = custom_root.path().join("shared");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    prepare_socket_dir(&parent, home.path())
+        .expect_err("same-UID daemon must reject group-writable custom parent");
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn daemon_socket_is_owner_only_after_bind() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let relay = MockRelay::run().await.expect("start mock relay");
-    let relay_url = relay.url().await.to_string();
+    let relay_url = "wss://relay.example".to_owned();
     let args = DaemonArgs {
         home: Some(home.path().to_path_buf()),
         data_dir: None,
@@ -491,6 +551,56 @@ fn daemon_peer_authorization_rejects_mismatched_uid_value() {
     assert!(!daemon_peer_uid_authorized(other_uid, current_uid));
 }
 
+#[test]
+fn daemon_subscription_quota_reserves_capacity_for_one_shot_requests() {
+    let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let subscription = DaemonRequest::MessagesSubscribe {
+        cli: Box::new(daemon_test_cli(crate::Command::Whoami)),
+    };
+
+    let first = try_acquire_daemon_subscription(&subscription, &limiter)
+        .expect("first subscription should be admitted")
+        .expect("subscription should hold a permit");
+    assert!(
+        try_acquire_daemon_subscription(&subscription, &limiter).is_err(),
+        "a second subscription must hit the dedicated cap"
+    );
+    assert!(
+        try_acquire_daemon_subscription(&DaemonRequest::Status, &limiter)
+            .expect("one-shot requests bypass the subscription cap")
+            .is_none()
+    );
+
+    drop(first);
+    assert!(
+        try_acquire_daemon_subscription(&subscription, &limiter)
+            .expect("released subscription capacity should be reusable")
+            .is_some()
+    );
+}
+
+#[test]
+fn daemon_busy_frame_is_typed_for_one_shot_and_streaming_clients() {
+    let frame = daemon_server_busy_frame();
+
+    assert!(matches!(
+        decode_daemon_output(&frame),
+        Err(DaemonClientError::ServerBusy)
+    ));
+    let streaming: DaemonStreamResponse =
+        serde_json::from_slice(&frame).expect("busy frame should decode for stream clients");
+    let error = streaming.error.expect("busy frame should carry an error");
+    assert_eq!(error.code, DAEMON_SERVER_BUSY_CODE);
+    assert_eq!(error.message, DAEMON_SERVER_BUSY_MESSAGE);
+
+    let legacy: DaemonStreamResponse = serde_json::from_value(serde_json::json!({
+        "error": {"message": "legacy daemon error"},
+        "stream_end": false,
+    }))
+    .expect("new clients should accept pre-code daemon errors");
+    assert_eq!(legacy.error.expect("legacy error").code, "stream_error");
+}
+
 #[tokio::test]
 async fn daemon_request_reader_rejects_oversized_requests() {
     let (mut server, mut client) = UnixStream::pair().expect("unix stream pair");
@@ -579,8 +689,7 @@ async fn daemon_ping_is_not_blocked_by_stalled_request_reader() {
     // client's Ping/Status/Shutdown request.
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
-    let relay = MockRelay::run().await.expect("start mock relay");
-    let relay_url = relay.url().await.to_string();
+    let relay_url = "wss://relay.example".to_owned();
     let args = DaemonArgs {
         home: Some(home.path().to_path_buf()),
         data_dir: None,
@@ -803,6 +912,7 @@ fn runtime_message_json_marks_account_label_sender_as_me() {
         kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         recorded_at: 0,
+        received_at: 0,
     };
 
     let value = runtime_message_json(
@@ -865,6 +975,10 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
         chunk_count: 1,
         error: None,
     };
+    stub_compose_session_with_report(report)
+}
+
+fn stub_compose_session_with_report(report: StreamComposeReport) -> StreamComposeSession {
     let (tx, mut rx) = mpsc::channel::<StreamComposeCommand>(4);
     let (cancel_tx, _cancel_rx) = mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {
@@ -882,6 +996,74 @@ fn stub_compose_session(stream_id: &str) -> StreamComposeSession {
         cancel_tx,
         handle,
         finalized: None,
+    }
+}
+
+#[tokio::test]
+async fn finish_stream_compose_removes_session_for_invalid_terminal_report() {
+    let defaults = DaemonDefaults {
+        home: PathBuf::from("/tmp/wn-daemon-home"),
+        socket: PathBuf::from("/tmp/wn-daemon.sock"),
+        pid_path: PathBuf::from("/tmp/wn-daemon.pid"),
+        log_path: PathBuf::from("/tmp/wn-daemon.log"),
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let cli = daemon_test_cli(crate::Command::Sync);
+
+    for (stream_id, text, transcript_hash) in [
+        (
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "",
+            Some("aa".to_owned()),
+        ),
+        (
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "hello",
+            None,
+        ),
+    ] {
+        let state = Arc::new(Mutex::new(DaemonState {
+            pid: 0,
+            started_at: 0,
+            last_runtime_activity: None,
+        }));
+        let mut runtime_host = AppRuntimeHost::default();
+        let mut workers = StreamComposeWorkers::default();
+        let key = stream_compose_key(None, stream_id);
+        let report = StreamComposeReport {
+            account: None,
+            group_id: "abcd".to_owned(),
+            stream_id: stream_id.to_owned(),
+            start_message_id: "ef01".to_owned(),
+            candidate: "quic://127.0.0.1:9000".to_owned(),
+            status: "streaming".to_owned(),
+            text: text.to_owned(),
+            transcript_hash,
+            chunk_count: 1,
+            error: None,
+        };
+        workers.insert(key.clone(), stub_compose_session_with_report(report));
+
+        let output = finish_stream_compose(
+            &cli,
+            &defaults,
+            state,
+            DaemonEventHub::new(),
+            &mut runtime_host,
+            &mut workers,
+            stream_id,
+        )
+        .await;
+
+        assert_ne!(output.code, 0);
+        assert!(
+            workers.get(&key).is_none(),
+            "a consumed compose task with an invalid report must be removed"
+        );
     }
 }
 
@@ -989,6 +1171,7 @@ fn runtime_message_json_carries_named_peer_display_name() {
         kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         recorded_at: 0,
+        received_at: 0,
     };
 
     let value = runtime_message_json(
@@ -1011,11 +1194,10 @@ fn runtime_message_json_carries_named_peer_display_name() {
 
 #[test]
 fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
-    // Live payloads must echo the message's own source timestamp under
-    // `recorded_at` (so they match replay/snapshot payloads) while stamping
-    // `received_at` with the live delivery time.
+    // Live payloads preserve both timestamps assigned during authenticated
+    // ingest rather than replacing observation time during JSON rendering.
     let source_recorded_at = 1_700_000_000;
-    let before = unix_now();
+    let source_received_at = 1_700_000_123;
     let message = marmot_app::ReceivedMessage {
         message_id_hex: "03".to_owned(),
         source_message_id_hex: "source-03".to_owned(),
@@ -1027,6 +1209,7 @@ fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
         kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         recorded_at: source_recorded_at,
+        received_at: source_received_at,
     };
 
     let value = runtime_message_json(
@@ -1034,16 +1217,8 @@ fn runtime_message_json_keeps_source_recorded_at_and_live_received_at() {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "Alice Example",
     );
-    let after = unix_now();
-
     assert_eq!(value["recorded_at"], source_recorded_at);
-    let received_at = value["received_at"]
-        .as_u64()
-        .expect("received_at should be a unix timestamp");
-    assert!(
-        (before..=after).contains(&received_at),
-        "received_at {received_at} should be a live timestamp in [{before}, {after}]"
-    );
+    assert_eq!(value["received_at"], source_received_at);
     assert_ne!(
         value["recorded_at"], value["received_at"],
         "recorded_at must track source time, not the live received_at"
@@ -1343,7 +1518,7 @@ fn timeline_stream_plain_output_is_human_readable() {
 }
 
 #[test]
-fn message_subscription_filters_stream_updates_by_account_when_present() {
+fn message_subscription_filters_stream_updates_fail_closed_without_account() {
     let scoped_delta = DaemonStreamResponse::ok(serde_json::json!({
         "type": "agent_stream_delta",
         "agent_stream_delta": {
@@ -1373,9 +1548,27 @@ fn message_subscription_filters_stream_updates_by_account_when_present() {
         Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     ));
-    assert!(stream_response_matches_subscription(
+    assert!(!stream_response_matches_subscription(
         &accountless_preview,
         Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ));
+}
+
+#[test]
+fn background_stream_watch_requires_account_scope() {
+    let cli = daemon_test_cli(crate::Command::Stream {
+        command: crate::StreamCommand::Watch {
+            group: "aa".repeat(32),
+            stream_id: None,
+            server_cert_der_hex: None,
+            insecure_local: true,
+            background: true,
+        },
+    });
+
+    assert_eq!(
+        new_stream_watch_start(&cli).unwrap_err(),
+        "background stream watch requires --account"
+    );
 }

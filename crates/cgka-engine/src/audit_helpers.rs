@@ -579,6 +579,8 @@ pub(crate) fn engine_error_kind(err: &EngineError) -> &'static str {
         EngineError::Storage(_) => "storage",
         EngineError::Peeler(_) => "peeler",
         EngineError::Serialize(_) => "serialize",
+        EngineError::InvalidWelcome => "invalid_welcome",
+        EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::Backend(_) => "backend",
         EngineError::Other(_) => "other",
     }

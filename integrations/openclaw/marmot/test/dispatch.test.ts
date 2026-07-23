@@ -41,6 +41,7 @@ const buildCtxMock = vi.mocked(buildChannelInboundEventContext);
 const HEX32 = (b: string) => b.repeat(32);
 const STREAM_ID = HEX32("11");
 const START_ID = HEX32("22");
+const CAPABILITY = HEX32("33");
 // Rust-anchored hash for stream=0x11*32 start=0x22*32, appends "hel"/"lo"/" world".
 const INCREMENTAL_HASH = "412b9bd20aedf322174fab2b1dee909992044fa166391027f4b8fb730d5c5a81";
 
@@ -94,27 +95,28 @@ function stubClient(calls: Calls, opts: { isDirect?: boolean } = {}): MarmotSink
       return {
         type: "stream_begun",
         stream_id_hex: STREAM_ID,
+        stream_capability: CAPABILITY,
         start_message_id_hex: START_ID,
         quic_candidates: [],
       };
     },
-    async streamAppend(_id: string, text: string) {
+    async streamAppend(_id: string, _capability: string, text: string) {
       calls.append.push(text);
       return { type: "ack" };
     },
-    async streamStatus(_id: string, text: string) {
+    async streamStatus(_id: string, _capability: string, text: string) {
       calls.status.push(text);
       return { type: "ack" };
     },
-    async streamProgress(_id: string, text: string) {
+    async streamProgress(_id: string, _capability: string, text: string) {
       calls.progress.push(text);
       return { type: "ack" };
     },
-    async streamFinalize(_id: string, _final: string, hash: string, count: number) {
+    async streamFinalize(_id: string, _capability: string, _final: string, hash: string, count: number) {
       calls.finalize.push({ hash, count });
       return { type: "stream_finalized", stream_id_hex: STREAM_ID, message_ids_hex: [HEX32("ab")] };
     },
-    async streamCancel(_id: string, reason?: string | null) {
+    async streamCancel(_id: string, _capability: string, reason?: string | null) {
       calls.cancel.push(reason ?? "");
       return { type: "ack" };
     },

@@ -270,7 +270,12 @@ impl DirectoryCache {
                 account_id_hex: entry.account_id_hex.clone(),
                 npub: entry.npub.clone(),
                 profile: entry.profile.clone(),
-                follows: Some(entry.follows.clone()),
+                // An empty `directory_users` follow list often means this
+                // promotion path has not observed a contact list. Do not let
+                // that absence erase independently discovered search-graph
+                // edges; an explicit `Some([])` from the graph writer still
+                // records a known-empty contact list.
+                follows: (!entry.follows.is_empty()).then(|| entry.follows.clone()),
                 metadata_updated_at: entry.profile.as_ref().map(|profile| profile.created_at),
                 metadata_expires_at: None,
             },
@@ -366,8 +371,14 @@ impl DirectoryCache {
                 profile_json = excluded.profile_json,
                 metadata_updated_at = excluded.metadata_updated_at,
                 metadata_expires_at = excluded.metadata_expires_at,
-                follows_known = excluded.follows_known,
-                follows_updated_at = excluded.follows_updated_at,
+                follows_known = CASE
+                    WHEN ?9 THEN excluded.follows_known
+                    ELSE directory_search_graph_users.follows_known
+                END,
+                follows_updated_at = CASE
+                    WHEN ?9 THEN excluded.follows_updated_at
+                    ELSE directory_search_graph_users.follows_updated_at
+                END,
                 updated_at = excluded.updated_at",
             params![
                 &record.account_id_hex,
@@ -378,6 +389,7 @@ impl DirectoryCache {
                 i64::from(follows_known),
                 follows_updated_at,
                 now,
+                follows_known,
             ],
         )?;
         if let Some(follows) = &record.follows {
@@ -387,14 +399,9 @@ impl DirectoryCache {
                 &record.account_id_hex,
                 follows,
                 now,
-            )
-        } else {
-            conn.execute(
-                "DELETE FROM directory_search_graph_follows WHERE account_id_hex = ?1",
-                [&record.account_id_hex],
             )?;
-            Ok(())
         }
+        Ok(())
     }
 
     fn replace_follow_rows(
@@ -850,6 +857,27 @@ mod tests {
             Some("carol".to_owned())
         );
         assert_eq!(search_record.follows, vec![dave]);
+    }
+
+    #[test]
+    fn directory_user_promotion_preserves_search_graph_only_follows() {
+        let (_dir, cache) = test_cache();
+        let alice = account_id(1);
+        let bob = account_id(2);
+
+        cache
+            .remember_search_graph_follows(
+                &alice,
+                &npub_for_account_id_lossy(&alice),
+                std::slice::from_ref(&bob),
+            )
+            .unwrap();
+        cache
+            .put(&directory_record(alice.clone(), Vec::new()))
+            .unwrap();
+
+        let graph_record = cache.search_graph_record(&alice).unwrap().unwrap();
+        assert_eq!(graph_record.follows, vec![bob]);
     }
 
     #[test]

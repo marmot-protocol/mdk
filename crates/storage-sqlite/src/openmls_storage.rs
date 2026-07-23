@@ -40,6 +40,8 @@ pub(crate) fn mls_group_key(group_id: &MarmotGroupId) -> StorageResult<Vec<u8>> 
 
 #[derive(thiserror::Error, Debug)]
 pub enum SqliteOpenMlsStorageError {
+    #[error("storage failure: {0}")]
+    Storage(#[from] StorageError),
     #[error("sqlite failure: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("serialization failure: {0}")]
