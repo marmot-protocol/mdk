@@ -60,8 +60,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
-- Release builds now reject `WN_DEV_SETTLEMENT_QUIESCENCE_MS` instead of allowing it to override the protocol-pinned
-  convergence window. Debug builds retain the override for local development and integration tests.
+- Release builds now fail app startup with a clear error when `WN_DEV_SETTLEMENT_QUIESCENCE_MS` is set instead of
+  allowing it to override the protocol-pinned convergence window. Debug builds retain the override for local
+  development and integration tests.
 - `wnd` streaming subscription responses now have a 15-second whole-frame write deadline, including socket flush, so
   a client that stops reading cannot retain a connection permit indefinitely.
 - `wnd` one-shot responses now apply the same deadline across write, flush, and socket shutdown, preventing a

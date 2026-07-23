@@ -51,6 +51,10 @@ pub(crate) enum WnError {
     PublicAccountCannotSign,
     #[error("invalid secret store: {0}")]
     InvalidSecretStore(String),
+    #[error(
+        "WN_DEV_SETTLEMENT_QUIESCENCE_MS is only available in debug builds; unset it when running a release binary"
+    )]
+    DevSettlementOverrideInRelease,
     #[error("stream text is required")]
     EmptyStreamText,
     #[error("no brokered stream start found")]
@@ -447,6 +451,13 @@ pub(crate) fn wn_error_json(err: &WnError) -> Value {
             "code": "invalid_secret_store",
             "message": err.to_string(),
             "secret_store": store,
+        }),
+        WnError::DevSettlementOverrideInRelease => json!({
+            "code": "dev_settlement_override_in_release",
+            "message": err.to_string(),
+            "repair": {
+                "unset": "WN_DEV_SETTLEMENT_QUIESCENCE_MS",
+            },
         }),
     }
 }

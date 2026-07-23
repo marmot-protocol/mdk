@@ -163,11 +163,14 @@ async fn dispatch_hosted_runtime_command(
             Ok(account_home) => account_home,
             Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
         };
-    let app = crate::app_for(
+    let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
         account_home.clone(),
-    );
+    ) {
+        Ok(app) => app,
+        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
+    };
 
     let output = match cli.command.clone() {
         crate::Command::Group { command } => {
@@ -539,7 +542,7 @@ pub(crate) fn open_app_runtime(
     let secret_store = crate::resolve_secret_store(defaults.secret_store)?;
     let keychain_service = crate::resolve_keychain_service(defaults.keychain_service.clone());
     let account_home = crate::open_account_home(&defaults.home, secret_store, &keychain_service)?;
-    let app = crate::app_for(defaults.home.clone(), defaults.relay.clone(), account_home);
+    let app = crate::app_for(defaults.home.clone(), defaults.relay.clone(), account_home)?;
     Ok(app.runtime())
 }
 
@@ -688,11 +691,14 @@ pub(crate) async fn auto_watch_agent_stream_starts(
             Ok(account_home) => account_home,
             Err(_) => return,
         };
-    let app = crate::app_for(
+    let app = match crate::app_for(
         defaults.home.clone(),
         defaults.relay.clone(),
         account_home.clone(),
-    );
+    ) {
+        Ok(app) => app,
+        Err(_) => return,
+    };
     for message in &summary.messages {
         let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
         else {

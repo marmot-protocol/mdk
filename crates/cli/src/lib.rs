@@ -437,7 +437,7 @@ async fn execute_inner(cli: Cli) -> Result<CommandOutput, WnError> {
             .or_else(|| cli.daemon_discovery_relays.first().cloned())
             .or_else(|| cli.daemon_default_account_relays.first().cloned()),
         account_home.clone(),
-    );
+    )?;
     match command {
         Command::Debug { command } => {
             commands::debug::debug_command(&account_home, &app, command, account_flag)
@@ -990,7 +990,11 @@ pub(crate) fn relay_lists_json(status: AccountRelayListStatus) -> Value {
     })
 }
 
-fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> MarmotApp {
+fn app_for(
+    home: PathBuf,
+    relay: Option<String>,
+    account_home: AccountHome,
+) -> Result<MarmotApp, WnError> {
     // Loopback-HTTP blob endpoints are only acted on when explicitly enabled for
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
@@ -1002,15 +1006,15 @@ fn app_for(home: PathBuf, relay: Option<String>, account_home: AccountHome) -> M
     // convergence settlement window (e.g. `0` for instant settlement in
     // integration tests). Production installs leave it unset and use the pinned
     // default.
-    if let Some(ms) = wn_dev_settlement_quiescence_ms() {
+    if let Some(ms) = wn_dev_settlement_quiescence_ms()? {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
-    MarmotApp::with_relays_and_account_home_and_config(
+    Ok(MarmotApp::with_relays_and_account_home_and_config(
         home,
         relay.into_iter().collect(),
         account_home,
         config,
-    )
+    ))
 }
 
 fn wn_allow_loopback_blob_endpoints() -> bool {
@@ -1035,14 +1039,14 @@ fn wn_allow_loopback_relays() -> bool {
 fn resolve_dev_settlement_quiescence_ms(
     value: Option<&str>,
     dev_overrides_enabled: bool,
-) -> Option<u64> {
-    if !dev_overrides_enabled {
-        return None;
+) -> Result<Option<u64>, WnError> {
+    if value.is_some() && !dev_overrides_enabled {
+        return Err(WnError::DevSettlementOverrideInRelease);
     }
-    value.and_then(|value| value.trim().parse().ok())
+    Ok(value.and_then(|value| value.trim().parse().ok()))
 }
 
-fn wn_dev_settlement_quiescence_ms() -> Option<u64> {
+fn wn_dev_settlement_quiescence_ms() -> Result<Option<u64>, WnError> {
     let value = std::env::var("WN_DEV_SETTLEMENT_QUIESCENCE_MS").ok();
     resolve_dev_settlement_quiescence_ms(value.as_deref(), cfg!(debug_assertions))
 }
@@ -1283,23 +1287,36 @@ mod tests {
     #[test]
     fn dev_settlement_override_is_available_in_debug_builds() {
         assert_eq!(
-            resolve_dev_settlement_quiescence_ms(Some("0"), true),
+            resolve_dev_settlement_quiescence_ms(Some("0"), true).unwrap(),
             Some(0)
         );
     }
 
     #[test]
     fn dev_settlement_override_is_rejected_in_release_builds() {
-        assert_eq!(resolve_dev_settlement_quiescence_ms(Some("0"), false), None);
+        let error =
+            resolve_dev_settlement_quiescence_ms(Some("0"), false).expect_err("release rejection");
+        assert!(matches!(&error, WnError::DevSettlementOverrideInRelease));
+        assert_eq!(
+            super::wn_error_json(&error)["code"],
+            "dev_settlement_override_in_release"
+        );
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(None, false).unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn invalid_dev_settlement_override_remains_inactive_without_a_warning() {
+    fn invalid_or_missing_dev_settlement_override_remains_inactive_when_enabled() {
         assert_eq!(
-            resolve_dev_settlement_quiescence_ms(Some("not-a-duration"), false),
+            resolve_dev_settlement_quiescence_ms(Some("not-a-duration"), true).unwrap(),
             None
         );
-        assert_eq!(resolve_dev_settlement_quiescence_ms(None, false), None);
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(None, true).unwrap(),
+            None
+        );
     }
 
     fn test_cli(command: Command) -> Cli {
