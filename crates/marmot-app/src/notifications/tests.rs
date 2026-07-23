@@ -656,12 +656,8 @@ fn agent_activity_and_operation_kinds_are_notifiable() {
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     };
 
-    assert!(is_notifiable_message_kind(
-        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-    ));
-    assert!(is_notifiable_message_kind(
-        MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-    ));
+    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY).is_some());
+    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_OPERATION).is_some());
 }
 
 #[test]
@@ -671,38 +667,110 @@ fn state_change_kinds_remain_non_notifiable() {
         MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     };
 
-    assert!(!is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_DELETE));
-    assert!(!is_notifiable_message_kind(MARMOT_APP_EVENT_KIND_EDIT));
-    assert!(!is_notifiable_message_kind(
-        MARMOT_APP_EVENT_KIND_GROUP_SYSTEM
-    ));
-    assert!(!is_notifiable_message_kind(
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
-    ));
+    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_DELETE).is_none());
+    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_EDIT).is_none());
+    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_GROUP_SYSTEM).is_none());
+    assert!(notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_STREAM_START).is_none());
 }
 
 #[test]
 fn notification_traffic_class_is_deterministic_from_the_wire_kind() {
     use cgka_traits::app_event::{
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
+        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_REACTION,
     };
 
     assert_eq!(
         notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY),
-        NotificationTrafficClass::AgentActivity,
+        Some(NotificationTrafficClass::AgentActivity),
     );
     assert_eq!(
         notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_OPERATION),
-        NotificationTrafficClass::AgentActivity,
+        Some(NotificationTrafficClass::AgentActivity),
     );
     assert_eq!(
         notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_CHAT),
-        NotificationTrafficClass::Standard,
+        Some(NotificationTrafficClass::Standard),
     );
     assert_eq!(
         notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_REACTION),
-        NotificationTrafficClass::Standard,
+        Some(NotificationTrafficClass::Standard),
+    );
+    assert_eq!(
+        notification_traffic_for_kind(MARMOT_APP_EVENT_KIND_AGENT_STREAM_START),
+        None,
+    );
+    assert_eq!(notification_traffic_for_kind(u64::MAX), None);
+}
+
+#[test]
+fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
+    use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_label = "alice";
+    let account_id_hex = "aa".repeat(32);
+    let sender_id_hex = "bb".repeat(32);
+    let group_id_hex = "ee".repeat(32);
+    let message = RuntimeMessageReceived {
+        account_id_hex: account_id_hex.clone(),
+        account_label: account_label.to_owned(),
+        message: ReceivedMessage {
+            message_id_hex: "ff".repeat(32),
+            source_message_id_hex: "ff".repeat(32),
+            sender: sender_id_hex.clone(),
+            sender_display_name: Some("Agent".to_owned()),
+            group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
+            source_epoch: 1,
+            plaintext: r#"{"status":"running","text":"Searching relays"}"#.to_owned(),
+            kind: MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+            // Even a receiver p-tag must not make a non-chat kind a mention.
+            tags: vec![vec![PUBKEY_REF_TAG.to_owned(), account_id_hex.clone()]],
+            recorded_at: 0,
+            received_at: 0,
+        },
+    };
+    let mut resolver = NotificationResolver::default();
+    resolver.settings.insert(
+        account_label.to_owned(),
+        NotificationSettings {
+            account_ref: account_label.to_owned(),
+            account_id_hex: account_id_hex.clone(),
+            local_notifications_enabled: true,
+            native_push_enabled: true,
+        },
+    );
+    let conversation = (account_label.to_owned(), group_id_hex.clone());
+    resolver.groups.insert(conversation.clone(), None);
+    resolver.chat_muted.insert(conversation.clone(), false);
+    for account_id in [&account_id_hex, &sender_id_hex] {
+        resolver.users.insert(
+            account_id.clone(),
+            NotificationUser {
+                account_id_hex: account_id.clone(),
+                display_name: None,
+                picture_url: None,
+            },
+        );
+    }
+
+    let update = notification_update_from_message(&app, &mut resolver, &message)
+        .unwrap()
+        .expect("unmuted agent activity should produce a notification");
+    assert_eq!(
+        update.traffic_class,
+        NotificationTrafficClass::AgentActivity
+    );
+    assert_eq!(update.preview_text.as_deref(), Some("Searching relays"));
+    assert!(!update.is_mention);
+
+    resolver.chat_muted.insert(conversation, true);
+    assert_eq!(
+        notification_update_from_message(&app, &mut resolver, &message).unwrap(),
+        None,
+        "agent activity must respect the conversation mute"
     );
 }
 

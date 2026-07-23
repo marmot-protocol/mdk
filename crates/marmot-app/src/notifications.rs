@@ -1247,26 +1247,18 @@ pub(crate) fn notification_update_from_event_cached(
     }
 }
 
-/// Whether a received app-event kind should ever surface as a notification.
-/// Chat messages, reactions, and explicitly classified agent activity are
-/// eligible for notification. Deletes, edits, stream control, and group-system
-/// rows are state changes rather than new user-visible traffic.
-fn is_notifiable_message_kind(kind: u64) -> bool {
-    matches!(
-        kind,
-        MARMOT_APP_EVENT_KIND_CHAT
-            | MARMOT_APP_EVENT_KIND_REACTION
-            | MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY
-            | MARMOT_APP_EVENT_KIND_AGENT_OPERATION
-    )
-}
-
-fn notification_traffic_for_kind(kind: u64) -> NotificationTrafficClass {
+/// Classify every notification-eligible wire kind. Returning `None` for
+/// unknown kinds keeps notification eligibility and channel routing coupled:
+/// adding a kind cannot silently fall through to the audible standard channel.
+fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> {
     match kind {
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY | MARMOT_APP_EVENT_KIND_AGENT_OPERATION => {
-            NotificationTrafficClass::AgentActivity
+            Some(NotificationTrafficClass::AgentActivity)
         }
-        _ => NotificationTrafficClass::Standard,
+        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION => {
+            Some(NotificationTrafficClass::Standard)
+        }
+        _ => None,
     }
 }
 
@@ -1283,9 +1275,9 @@ fn notification_update_from_message(
     // alert. Deletes, edits, stream control events, and group-system rows never
     // produce notifications (e.g. deleting a message must not push a "Deleted
     // a message" alert).
-    if !is_notifiable_message_kind(event.message.kind) {
+    let Some(traffic_class) = notification_traffic_for_kind(event.message.kind) else {
         return Ok(None);
-    }
+    };
     let group_id_hex = hex::encode(event.message.group_id.as_slice());
     let group = match resolver.group(app, &event.account_label, &group_id_hex) {
         Ok(group) => group,
@@ -1335,7 +1327,7 @@ fn notification_update_from_message(
         ),
         conversation_key: conversation_key(&event.account_id_hex, &group_id_hex),
         trigger: NotificationTrigger::NewMessage,
-        traffic_class: notification_traffic_for_kind(event.message.kind),
+        traffic_class,
         account_ref: event.account_label.clone(),
         account_id_hex: event.account_id_hex.clone(),
         group_id_hex,
@@ -1460,7 +1452,9 @@ pub(crate) fn message_text_mentions_account(
 }
 
 /// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
-/// kinds and blank text never produce a preview.
+/// kinds and blank text never produce a preview. Structured agent kinds expose
+/// only approved text/status fields, so raw JSON and tool output never reach a
+/// notification payload.
 fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
     if is_push_gossip_kind(kind) || plaintext.trim().is_empty() {
         None
