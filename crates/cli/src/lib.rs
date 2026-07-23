@@ -1032,10 +1032,19 @@ fn wn_allow_loopback_relays() -> bool {
     )
 }
 
+fn resolve_dev_settlement_quiescence_ms(
+    value: Option<&str>,
+    dev_overrides_enabled: bool,
+) -> Option<u64> {
+    if !dev_overrides_enabled {
+        return None;
+    }
+    value.and_then(|value| value.trim().parse().ok())
+}
+
 fn wn_dev_settlement_quiescence_ms() -> Option<u64> {
-    std::env::var("WN_DEV_SETTLEMENT_QUIESCENCE_MS")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
+    let value = std::env::var("WN_DEV_SETTLEMENT_QUIESCENCE_MS").ok();
+    resolve_dev_settlement_quiescence_ms(value.as_deref(), cfg!(debug_assertions))
 }
 
 fn open_account_home(
@@ -1190,7 +1199,8 @@ mod tests {
     };
     use super::{
         Cli, Command, StreamCommand, WnError, daemon, daemon_socket_for_client,
-        default_home_from_env, npub_for_account_id, relay_endpoints, resolve_relay, run_from,
+        default_home_from_env, npub_for_account_id, relay_endpoints,
+        resolve_dev_settlement_quiescence_ms, resolve_relay, run_from,
     };
 
     use marmot_app::{
@@ -1268,6 +1278,28 @@ mod tests {
             .expect_err("invalid account ids must surface as a CLI error");
         let rendered = super::wn_error_json(&err);
         assert_eq!(rendered["code"], "invalid_public_key");
+    }
+
+    #[test]
+    fn dev_settlement_override_is_available_in_debug_builds() {
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(Some("0"), true),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn dev_settlement_override_is_rejected_in_release_builds() {
+        assert_eq!(resolve_dev_settlement_quiescence_ms(Some("0"), false), None);
+    }
+
+    #[test]
+    fn invalid_dev_settlement_override_remains_inactive_without_a_warning() {
+        assert_eq!(
+            resolve_dev_settlement_quiescence_ms(Some("not-a-duration"), false),
+            None
+        );
+        assert_eq!(resolve_dev_settlement_quiescence_ms(None, false), None);
     }
 
     fn test_cli(command: Command) -> Cli {

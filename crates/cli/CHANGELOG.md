@@ -60,6 +60,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Release builds now reject `WN_DEV_SETTLEMENT_QUIESCENCE_MS` instead of allowing it to override the protocol-pinned
+  convergence window. Debug builds retain the override for local development and integration tests.
 - `wn-agent` now denies path-based media sends by default and accepts only regular, non-symlink files beneath explicit
   repeatable `--media-allowed-root` directories. Bundled Hermes and OpenClaw launchers stage short-lived copies in a
   dedicated approved directory and clean them up after each send.
