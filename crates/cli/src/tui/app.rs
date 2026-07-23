@@ -138,6 +138,9 @@ impl TuiApp {
         // before the event loop starts reading stdin. Detection failure leaves
         // media placeholders in place (no image protocol).
         self.media.detect_capability();
+        // Sweep any decrypted-media artifacts a prior crashed session left in the
+        // cache dir before this session starts writing its own downloads.
+        self.sweep_media_cache();
         // Bracketed paste delivers a paste as one `Event::Paste(text)` instead of a
         // burst of key events, so a multi-line paste keeps its newlines instead of
         // firing Enter (send) on every line. Best-effort chrome: ignore failures
@@ -572,19 +575,33 @@ impl TuiApp {
         started
     }
 
+    /// The directory holding decrypted-media download artifacts, under the TUI
+    /// home when one is set (else a private temp dir).
+    fn media_cache_dir(&self) -> PathBuf {
+        self.client
+            .home
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("tui-media-cache")
+    }
+
     /// The per-hash cache path for a decrypted download, under the TUI home when
     /// one is set (else a private temp dir). Passed as `--output` so the CLI does
     /// not write the file's basename into the current directory. The directory is
     /// created restrictive-by-construction; the CLI writes the file privately.
     fn media_cache_path(&self, hash: &str) -> TuiResult<PathBuf> {
-        let cache_dir = self
-            .client
-            .home
-            .clone()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("tui-media-cache");
+        let cache_dir = self.media_cache_dir();
         fs_private::create_dir_all_private(&cache_dir)?;
         Ok(cache_dir.join(hash))
+    }
+
+    /// Sweep decrypted-media artifacts left by a prior (possibly crashed) session
+    /// at startup. Each artifact is removed right after decode, so anything still
+    /// on disk is decrypted plaintext with no reader; clearing it keeps decrypted
+    /// media from lingering at rest. Best-effort and non-recursive; see
+    /// `sweep_media_cache_dir`.
+    pub(crate) fn sweep_media_cache(&self) {
+        sweep_media_cache_dir(&self.media_cache_dir());
     }
 
     /// Open the selected message's downloaded image full-size, or explain on the

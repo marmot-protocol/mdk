@@ -210,6 +210,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   compiled with different defaults resolve them against different endpoints until the group image is re-set on a
   current build.
 
+### Security
+
+- TUI: inline media no longer leaves decrypted image files in the home directory. The decrypted download artifact is
+  removed immediately after it is decoded (on both the success and decode-failure paths) instead of accumulating under
+  `tui-media-cache/`, and any files a prior crashed session left behind are swept from that directory at startup. The
+  files had no reuse value — the viewer draws the in-memory image and a new session never reads them — so they were
+  decrypted plaintext at rest, outliving message deletion, with nothing to gain by keeping them.
+
 ## [0.9.3] - 2026-07-07
 
 ### Added

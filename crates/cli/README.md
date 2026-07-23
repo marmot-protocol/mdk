@@ -576,8 +576,10 @@ Main view controls:
   downloaded and decoded in the background — never blocking the event loop — and its placeholder walks `[img name]` ->
   `[downloading name...]` -> `[loading name...]` -> the inline image, or `[name failed: err]` on error. A terminal
   with no image capability keeps the `[img name]` placeholder (and non-image attachments always show `[file name]`).
-  The `o` full-size viewer uses the same cell-exact rendering. Downloaded files are cached under the TUI home in
-  `tui-media-cache/` (a private directory), so passing `--home` keeps the cache with the account data.
+  The `o` full-size viewer uses the same cell-exact rendering. Each image is decrypted to a private
+  `tui-media-cache/` directory under the TUI home, decoded into memory, and the decrypted file is then removed right
+  away — the viewer draws the in-memory image, so nothing reads the file again and no decrypted media is left at rest.
+  Any files a prior crashed session left behind are swept from that directory at startup.
 - Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
   character, `Ctrl-U` clears the whole composer (a readline kill-line that empties it whatever it holds — armed prefill
   or hand-typed draft), and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard

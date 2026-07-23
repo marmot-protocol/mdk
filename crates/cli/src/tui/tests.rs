@@ -4731,6 +4731,151 @@ fn inline_images_render_cell_exact_not_a_pixel_protocol() {
 }
 
 #[test]
+fn startup_media_sweep_removes_leftover_cache_files_but_keeps_the_dir() {
+    // Decrypted-media artifacts are deleted right after decode, so any file still
+    // in the cache dir is litter left by a crashed session — decrypted plaintext
+    // at rest. The startup sweep must clear those files while leaving the
+    // directory itself in place for this session's downloads.
+    let home = tempfile::tempdir().expect("tempdir");
+    let cache_dir = home.path().join("tui-media-cache");
+    std::fs::create_dir_all(&cache_dir).expect("seed cache dir");
+    for name in ["deadbeef", "cafebabe", "f00dface"] {
+        std::fs::write(cache_dir.join(name), b"decrypted-plaintext").expect("seed leftover");
+    }
+
+    let client = WnClient {
+        home: Some(home.path().to_path_buf()),
+        ..test_unused_client()
+    };
+    let app = test_tui_app(client, &"aa".repeat(32));
+    app.sweep_media_cache();
+
+    assert!(cache_dir.is_dir(), "the sweep keeps the cache directory");
+    let remaining: Vec<_> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "the sweep removes every leftover decrypted file; remaining: {remaining:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_media_sweep_unlinks_symlinks_without_following_them() {
+    // The sweep's security contract: a symlink inside the cache dir is removed
+    // as a link, and the file it points to — outside the directory — survives.
+    let home = tempfile::tempdir().expect("tempdir");
+    let cache_dir = home.path().join("tui-media-cache");
+    std::fs::create_dir_all(&cache_dir).expect("seed cache dir");
+    let sentinel = home.path().join("sentinel-outside-cache");
+    std::fs::write(&sentinel, b"must survive").expect("seed sentinel");
+    std::os::unix::fs::symlink(&sentinel, cache_dir.join("deadbeef")).expect("seed symlink");
+
+    let client = WnClient {
+        home: Some(home.path().to_path_buf()),
+        ..test_unused_client()
+    };
+    let app = test_tui_app(client, &"aa".repeat(32));
+    app.sweep_media_cache();
+
+    assert!(
+        cache_dir.join("deadbeef").symlink_metadata().is_err(),
+        "the sweep unlinks the symlink itself"
+    );
+    assert!(
+        sentinel.exists(),
+        "the sweep never follows a link out of the cache dir"
+    );
+}
+
+/// Drive the download worker to completion and return its terminal result,
+/// skipping the intermediate `Downloaded` ladder step. The worker removes the
+/// on-disk artifact before sending the terminal result, so once this returns the
+/// file state is settled and race-free to assert on.
+#[cfg(unix)]
+fn run_media_worker(exe: &std::path::Path, output_path: PathBuf) -> MediaLoad {
+    let (tx, rx) = mpsc::channel();
+    spawn_media_download(StdCommand::new(exe), output_path, "deadbeef".to_owned(), tx);
+    loop {
+        match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker result")
+        {
+            MediaLoad::Downloaded { .. } => continue,
+            terminal => return terminal,
+        }
+    }
+}
+
+/// A real, decodable PNG on disk, standing in for the CLI's decrypted write that
+/// the worker sees at `--output` after a successful `media download`.
+#[cfg(unix)]
+fn seed_decodable_image(path: &std::path::Path) {
+    let mut buffer = image::RgbImage::new(4, 4);
+    for (_, _, pixel) in buffer.enumerate_pixels_mut() {
+        *pixel = image::Rgb([10, 20, 30]);
+    }
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(buffer)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("encode png");
+    std::fs::write(path, encoded.into_inner()).expect("seed decrypted file");
+}
+
+#[cfg(unix)]
+#[test]
+fn media_worker_removes_the_decrypted_file_after_a_successful_decode() {
+    // The decrypted image is decoded into memory and never read from disk again,
+    // so the worker must remove the plaintext artifact once decode succeeds —
+    // decrypted media must not linger at rest.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
+    let output_path = dir.path().join("deadbeef");
+    seed_decodable_image(&output_path);
+    assert!(
+        output_path.exists(),
+        "the artifact exists before the worker runs"
+    );
+
+    let result = run_media_worker(&wn, output_path.clone());
+
+    assert!(
+        matches!(result, MediaLoad::Decoded { .. }),
+        "a valid image decodes"
+    );
+    assert!(
+        !output_path.exists(),
+        "the worker removes the decrypted artifact after a successful decode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn media_worker_removes_the_decrypted_file_after_a_failed_decode() {
+    // A download that succeeds but yields undecodable bytes still wrote decrypted
+    // plaintext to disk; the worker must remove it on the decode-failure path too,
+    // not only when decode succeeds.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
+    let output_path = dir.path().join("deadbeef");
+    std::fs::write(&output_path, b"decrypted-but-not-an-image").expect("seed decrypted file");
+
+    let result = run_media_worker(&wn, output_path.clone());
+
+    assert!(
+        matches!(result, MediaLoad::Failed { .. }),
+        "undecodable bytes fail to decode"
+    );
+    assert!(
+        !output_path.exists(),
+        "the worker removes the decrypted artifact after a failed decode"
+    );
+}
+
+#[test]
 fn timeline_row_lines_strip_terminal_control_sequences() {
     let mut row = timeline_row("m", 0);
     row.from_display_name = Some("Al\u{202e}ice".to_owned());

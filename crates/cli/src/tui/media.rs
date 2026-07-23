@@ -259,7 +259,13 @@ pub(crate) fn spawn_media_download(
             Ok(_) => {
                 // Advance to the decoding ladder step, then decode off-loop.
                 let _ = tx.send(MediaLoad::Downloaded { hash: hash.clone() });
-                match decode_image(&output_path) {
+                let decoded = decode_image(&output_path);
+                // Whether decode produced an in-memory image or an error, the file
+                // has no remaining reader; remove the decrypted plaintext artifact
+                // before signalling completion so it never lingers at rest.
+                // Best-effort: it may already be gone.
+                let _ = std::fs::remove_file(&output_path);
+                match decoded {
                     Ok(image) => {
                         let _ = tx.send(MediaLoad::Decoded {
                             hash,
@@ -272,6 +278,8 @@ pub(crate) fn spawn_media_download(
                 }
             }
             Err(err) => {
+                // A failed download may still have written a partial file (e.g.
+                // ENOSPC mid-write); the startup sweep clears it next session.
                 let _ = tx.send(MediaLoad::Failed {
                     hash,
                     error: shorten(&err.to_string(), 60),
@@ -279,6 +287,24 @@ pub(crate) fn spawn_media_download(
             }
         }
     });
+}
+
+/// Best-effort sweep of the flat media-cache directory: remove every entry it
+/// holds, keeping the directory itself. Decrypted-media artifacts are deleted
+/// right after decode, so anything still here is litter from a crashed session —
+/// decrypted plaintext at rest — swept at startup so it never lingers.
+///
+/// A missing directory and per-entry errors are ignored (the sweep is advisory).
+/// Only the directory's own entries are touched — the layout is flat, so no
+/// recursion is needed — and `remove_file` unlinks a symlink rather than
+/// following it, so nothing outside the directory is ever removed.
+pub(crate) fn sweep_media_cache_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let _ = std::fs::remove_file(entry.path());
+    }
 }
 
 /// Decode a downloaded file with `image`, guessing the format from content (the
