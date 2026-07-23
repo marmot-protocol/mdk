@@ -60,6 +60,12 @@ struct FailOncePeeler {
 /// as `Malformed` before any decryption attempt.
 const STRUCTURAL_MIN_PAYLOAD_LEN: usize = 28;
 struct MalformedShortPayloadPeeler;
+#[derive(Clone, Copy)]
+enum BoundaryRejection {
+    InvalidSignature,
+    WrongRecipient,
+}
+struct BoundaryRejectionPeeler(BoundaryRejection);
 
 impl FailOncePeeler {
     fn new() -> Self {
@@ -240,6 +246,40 @@ impl TransportPeeler for MalformedShortPayloadPeeler {
             ));
         }
         MockPeeler.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        MockPeeler.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        MockPeeler.wrap_welcome(payload, recipient).await
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for BoundaryRejectionPeeler {
+    async fn peel_group_message(
+        &self,
+        _msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Err(match self.0 {
+            BoundaryRejection::InvalidSignature => PeelerError::InvalidSignature,
+            BoundaryRejection::WrongRecipient => PeelerError::WrongRecipient,
+        })
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
@@ -784,6 +824,89 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
         ),
         "expected the message behind the garbage to still deliver, got {events:?}"
     );
+}
+
+async fn assert_typed_terminal_transport_rejection(
+    rejection: BoundaryRejection,
+    expected_reason: StaleReason,
+) {
+    let mut alice = build_client(b"alice-terminal-rejection");
+    let mut bob = build_client_with_peeler(
+        b"bob-terminal-rejection",
+        Box::new(BoundaryRejectionPeeler(rejection)),
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, bob_welcome) = match result {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected group create, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+
+    let rejected = TransportMessage {
+        id: hash_id(b"terminal transport rejection"),
+        payload: vec![0; STRUCTURAL_MIN_PAYLOAD_LEN],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+    let outcome = bob
+        .ingest(rejected.clone())
+        .await
+        .expect("boundary rejection is terminal input, not a drain failure");
+    assert_eq!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: expected_reason
+        }
+    );
+
+    let duplicate = bob
+        .ingest(rejected)
+        .await
+        .expect("redelivery short-circuits after terminal rejection");
+    assert!(matches!(
+        duplicate,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    ));
+}
+
+#[tokio::test]
+async fn invalid_transport_signature_is_typed_terminal_input() {
+    assert_typed_terminal_transport_rejection(
+        BoundaryRejection::InvalidSignature,
+        StaleReason::PeelFailed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wrong_transport_recipient_is_typed_terminal_input() {
+    assert_typed_terminal_transport_rejection(
+        BoundaryRejection::WrongRecipient,
+        StaleReason::NotForThisClient,
+    )
+    .await;
 }
 
 #[tokio::test]

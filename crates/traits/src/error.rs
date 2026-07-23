@@ -142,6 +142,18 @@ pub enum PeelerError {
     #[error("malformed transport payload: {0}")]
     Malformed(String),
 
+    /// A required outer transport signature or signed-event id failed
+    /// authentication. Kept distinct from malformed byte encoding so callers
+    /// can report the adopted `invalid_signature` category without parsing
+    /// error strings.
+    #[error("invalid transport signature")]
+    InvalidSignature,
+
+    /// The outer transport object names a routing id or recipient that does
+    /// not match the transport envelope presented to the engine.
+    #[error("transport input is addressed to another recipient")]
+    WrongRecipient,
+
     #[error("decrypt failed (likely stale or wrong-epoch exporter secret)")]
     DecryptFailed,
 

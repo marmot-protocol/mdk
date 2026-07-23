@@ -270,6 +270,18 @@ pub enum TransportAdapterError {
     #[error("account not active")]
     AccountNotActive(MemberId),
 
+    /// An inbound transport object failed its transport-specific syntax or
+    /// exact-shape validation. Carries no attacker-controlled detail so it is
+    /// safe to classify in runtime telemetry.
+    #[error("invalid inbound transport encoding")]
+    InvalidInboundEncoding,
+
+    /// An inbound signed transport object reported an id that did not match
+    /// its signed fields. Full signature verification remains at the peeler
+    /// boundary, before decryption.
+    #[error("invalid inbound transport signature")]
+    InvalidInboundSignature,
+
     #[error("publish target does not match message envelope: envelope={envelope}, target={target}")]
     PublishTargetMismatch { envelope: String, target: String },
 

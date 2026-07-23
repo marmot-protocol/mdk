@@ -244,6 +244,12 @@ impl<S: StorageProvider> Engine<S> {
                     Err(PeelerError::Malformed(_)) => {
                         marmot_forensics::PeelerOutcomeKind::Malformed
                     }
+                    Err(PeelerError::InvalidSignature) => {
+                        marmot_forensics::PeelerOutcomeKind::InvalidSignature
+                    }
+                    Err(PeelerError::WrongRecipient) => {
+                        marmot_forensics::PeelerOutcomeKind::WrongRecipient
+                    }
                     Err(_) => marmot_forensics::PeelerOutcomeKind::Other,
                 };
                 self.audit_group(
@@ -281,18 +287,22 @@ impl<S: StorageProvider> Engine<S> {
                     {
                         Ok(recovered) => recovered,
                         // Defense-in-depth for the public TransportPeeler
-                        // contract: a `Malformed` verdict raised only by the
-                        // snapshot fallback is terminal on this seam too — never
-                        // an aborted drain (mdk#707). Not reachable via the
-                        // production Nostr peeler (its Malformed detection is
-                        // deterministic in the message bytes, so the direct peel
-                        // catches it first); MissingContext / storage errors keep
-                        // propagating as genuine engine faults.
-                        Err(EngineError::Peeler(PeelerError::Malformed(_))) => {
-                            return self.malformed_terminal_stale(
+                        // contract: a malformed or invalid-signature verdict
+                        // raised only by the snapshot fallback is terminal on
+                        // this seam too — never an aborted drain (mdk#707). Not
+                        // reachable via the production Nostr peeler (both
+                        // checks are deterministic in the message bytes, so
+                        // the direct peel catches them first); MissingContext /
+                        // storage errors keep propagating as genuine engine
+                        // faults.
+                        Err(EngineError::Peeler(
+                            PeelerError::Malformed(_) | PeelerError::InvalidSignature,
+                        )) => {
+                            return self.terminal_peel_rejection_stale(
                                 &raw_msg_id,
                                 &msg.id,
                                 "malformed_payload_snapshot_fallback",
+                                StaleReason::PeelFailed,
                             );
                         }
                         Err(e) => return Err(e),
@@ -378,18 +388,22 @@ impl<S: StorageProvider> Engine<S> {
                     {
                         Ok(recovered) => recovered,
                         // Defense-in-depth for the public TransportPeeler
-                        // contract: a `Malformed` verdict raised only by the
-                        // snapshot fallback is terminal on this seam too — never
-                        // an aborted drain (mdk#707). Not reachable via the
-                        // production Nostr peeler (its Malformed detection is
-                        // deterministic in the message bytes, so the direct peel
-                        // catches it first); MissingContext / storage errors keep
-                        // propagating as genuine engine faults.
-                        Err(EngineError::Peeler(PeelerError::Malformed(_))) => {
-                            return self.malformed_terminal_stale(
+                        // contract: a malformed or invalid-signature verdict
+                        // raised only by the snapshot fallback is terminal on
+                        // this seam too — never an aborted drain (mdk#707). Not
+                        // reachable via the production Nostr peeler (both
+                        // checks are deterministic in the message bytes, so
+                        // the direct peel catches them first); MissingContext /
+                        // storage errors keep propagating as genuine engine
+                        // faults.
+                        Err(EngineError::Peeler(
+                            PeelerError::Malformed(_) | PeelerError::InvalidSignature,
+                        )) => {
+                            return self.terminal_peel_rejection_stale(
                                 &raw_msg_id,
                                 &msg.id,
                                 "malformed_payload_snapshot_fallback",
+                                StaleReason::PeelFailed,
                             );
                         }
                         Err(e) => return Err(e),
@@ -438,22 +452,37 @@ impl<S: StorageProvider> Engine<S> {
                         });
                     }
                 }
-                Err(PeelerError::Malformed(_)) => {
-                    // Structurally-invalid content is ordinary hostile input:
-                    // anyone can publish to the cleartext routing tag without
-                    // group membership, and no epoch context can ever peel it.
-                    // Terminal — propagating an error here would abort the
-                    // caller's whole transport drain on one garbage event,
-                    // starving every message queued behind it. Dropped
-                    // unpersisted for the same reason as the mdk#339 flood
-                    // cap: transport ids are attacker-controllable, so durable
-                    // rows keyed by them would grow without bound. Retire the
-                    // raw deferred row if this arrived via the retry
-                    // lifecycle; a no-op on the direct path.
-                    return self.malformed_terminal_stale(
+                Err(rejection @ (PeelerError::Malformed(_) | PeelerError::InvalidSignature)) => {
+                    // Structurally-invalid or unauthenticated content is
+                    // ordinary hostile input: anyone can publish to the
+                    // cleartext routing tag without group membership, and no
+                    // epoch context can ever make it valid. Terminal —
+                    // propagating an error here would abort the caller's whole
+                    // transport drain on one garbage event, starving every
+                    // message queued behind it. Dropped unpersisted for the
+                    // same reason as the mdk#339 flood cap: transport ids are
+                    // attacker-controllable, so durable rows keyed by them
+                    // would grow without bound. Retire the raw deferred row if
+                    // this arrived via the retry lifecycle; a no-op on the
+                    // direct path.
+                    let reason = if matches!(rejection, PeelerError::InvalidSignature) {
+                        "invalid_signature"
+                    } else {
+                        "malformed_payload"
+                    };
+                    return self.terminal_peel_rejection_stale(
                         &raw_msg_id,
                         &msg.id,
-                        "malformed_payload",
+                        reason,
+                        StaleReason::PeelFailed,
+                    );
+                }
+                Err(PeelerError::WrongRecipient) => {
+                    return self.terminal_peel_rejection_stale(
+                        &raw_msg_id,
+                        &msg.id,
+                        "wrong_recipient",
+                        StaleReason::NotForThisClient,
                     );
                 }
                 Err(e) => return Err(EngineError::Peeler(e)),
@@ -1714,22 +1743,24 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    /// Terminal disposition for a peel that resolved to `Malformed`: retire the
-    /// awaiting-retry raw transport row (a no-op on the direct path, where no
-    /// deferred row exists), mark the id seen so a redelivery short-circuits,
-    /// and classify the input `Stale { PeelFailed }`. Shared by the direct peel
-    /// and both snapshot-fallback seams so the terminal behavior has a single
+    /// Terminal disposition for malformed, unauthenticated, or misaddressed
+    /// transport input: retire the awaiting-retry raw transport row (a no-op on
+    /// the direct path, where no deferred row exists), mark the id seen so a
+    /// redelivery short-circuits, and classify the input with the supplied
+    /// typed stale reason. Shared by the direct peel and both
+    /// snapshot-fallback seams so the terminal behavior has a single
     /// definition — a guard living on one seam only is a bug (mdk#707).
-    fn malformed_terminal_stale(
+    fn terminal_peel_rejection_stale(
         &mut self,
         raw_msg_id: &MessageId,
         msg_id: &MessageId,
         reason: &'static str,
+        stale_reason: StaleReason,
     ) -> Result<IngestOutcome, EngineError> {
         self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
         self.seen_message_ids.insert(msg_id.clone());
         Ok(IngestOutcome::Stale {
-            reason: StaleReason::PeelFailed,
+            reason: stale_reason,
         })
     }
 

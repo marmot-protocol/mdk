@@ -1,5 +1,5 @@
 use cgka_traits::app_event::MarmotAppEventError;
-use cgka_traits::error::EngineError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::transport_adapter::TransportAdapterError;
 use cgka_traits::types::{EpochId, GroupId, MemberId};
 
@@ -58,6 +58,26 @@ fn transport_adapter_error_display_passes_reasons_through_verbatim() {
     assert_eq!(err.to_string(), "publish failed: connect relay failed");
     let err = TransportAdapterError::Subscription("add relay failed".to_owned());
     assert_eq!(err.to_string(), "subscription failed: add relay failed");
+}
+
+#[test]
+fn typed_inbound_rejection_display_is_fixed_and_privacy_safe() {
+    assert_eq!(
+        PeelerError::InvalidSignature.to_string(),
+        "invalid transport signature"
+    );
+    assert_eq!(
+        PeelerError::WrongRecipient.to_string(),
+        "transport input is addressed to another recipient"
+    );
+    assert_eq!(
+        TransportAdapterError::InvalidInboundEncoding.to_string(),
+        "invalid inbound transport encoding"
+    );
+    assert_eq!(
+        TransportAdapterError::InvalidInboundSignature.to_string(),
+        "invalid inbound transport signature"
+    );
 }
 
 #[test]

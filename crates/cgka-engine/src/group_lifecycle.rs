@@ -57,6 +57,8 @@ pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
         error,
         EngineError::Peeler(cgka_traits::error::PeelerError::DecryptFailed)
             | EngineError::Peeler(cgka_traits::error::PeelerError::Malformed(_))
+            | EngineError::Peeler(cgka_traits::error::PeelerError::InvalidSignature)
+            | EngineError::Peeler(cgka_traits::error::PeelerError::WrongRecipient)
             | EngineError::Serialize(_)
             | EngineError::InvalidWelcome
             | EngineError::InvalidCredentialIdentity(_)
