@@ -141,6 +141,9 @@ Branches are compared in this order:
 6. Lower authenticated tip committer account id.
 7. Lower tip commit digest.
 
+The conformance scenario
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 4 and 5.
+
 ```mermaid
 flowchart TD
     A["Message bag"] --> B["Build candidate states by MLS replay"]

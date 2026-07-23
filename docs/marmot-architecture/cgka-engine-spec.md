@@ -262,6 +262,9 @@ Branches are compared in this order:
 6. Lower authenticated tip committer account id.
 7. Lower tip commit digest.
 
+The conformance scenario
+`app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 4 and 5.
+
 Application witnesses are valid application messages that decrypt against a candidate state. Witness score counts
 distinct senders per epoch. One sender cannot increase score by sending many messages in the same epoch.
 
@@ -400,7 +403,6 @@ Required storage:
 
 - group metadata and current epoch,
 - OpenMLS state,
-- convergence policy version, pinned values, and engine version,
 - retained Marmot and OpenMLS snapshots from current tip back through `max_rewind_commits`,
 - durable message records for retained commits, proposals, app messages, and welcomes, with typed stored payloads
   distinguishing raw transport bytes from peeled OpenMLS wire bytes,
@@ -411,6 +413,10 @@ Required storage:
 - dedupe index,
 - queued outbound intents,
 - last convergence-relevant input time.
+
+The current storage does not persist convergence-policy constants or an engine version per group. V1 constants are
+protocol-pinned, and the on-disk schema is versioned through storage migrations. A future policy revision that needs
+on-disk compatibility detection requires an explicit policy-version stamp and migration.
 
 Snapshot and rollback MUST be atomic across Marmot metadata and OpenMLS state. A rollback that restores only one side is
 invalid.
