@@ -211,6 +211,24 @@ impl MediaAttachmentReference {
         Ok(())
     }
 
+    /// Build the exact authenticated `imeta` tag for this reference after
+    /// validating it against the target group's selected media version and
+    /// locator policy.
+    ///
+    /// Host-facing callers must use this checked builder instead of formatting
+    /// `imeta` fields themselves. In particular, the `version` carried by the
+    /// reference cannot be used to smuggle a V1 reference into a V2 group (or
+    /// vice versa).
+    pub fn build_imeta_tag(
+        &self,
+        expected_version: EncryptedMediaVersion,
+        allowed_locator_kinds: &[String],
+        allow_loopback_http: bool,
+    ) -> Result<Vec<String>, AppError> {
+        self.validate_outbound(expected_version, allowed_locator_kinds, allow_loopback_http)?;
+        Ok(self.imeta_tag())
+    }
+
     pub(crate) fn imeta_tag(&self) -> Vec<String> {
         let mut tag = vec!["imeta".to_owned(), format!("v {}", self.version)];
         tag.extend(
@@ -225,14 +243,13 @@ impl MediaAttachmentReference {
             format!("m {}", self.media_type),
             format!("filename {}", self.file_name),
         ]);
-        if let Some(dim) = self.dim.as_deref().filter(|value| !value.trim().is_empty()) {
+        // Optional wire fields are emitted whenever they are present. `Some("")`
+        // and `None` are distinct authenticated inputs; omitting a present-empty
+        // value would make build -> parse lossy.
+        if let Some(dim) = self.dim.as_deref() {
             tag.push(format!("dim {}", dim));
         }
-        if let Some(thumbhash) = self
-            .thumbhash
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
+        if let Some(thumbhash) = self.thumbhash.as_deref() {
             tag.push(format!("thumbhash {}", thumbhash));
         }
         tag

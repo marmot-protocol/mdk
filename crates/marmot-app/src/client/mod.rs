@@ -1410,6 +1410,26 @@ impl AppClient {
         Ok(summary)
     }
 
+    /// Build one outbound encrypted-media `imeta` tag using the target
+    /// group's actual profile-selected media version and locator policy.
+    ///
+    /// This is the checked bridge used by host apps for optimistic message
+    /// records. It deliberately performs no publish.
+    pub async fn build_media_imeta_tag(
+        &mut self,
+        group_id: &GroupId,
+        reference: &MediaAttachmentReference,
+    ) -> Result<Vec<String>, AppError> {
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        let policy = self.encrypted_media_policy_for_group(group_id)?;
+        reference.build_imeta_tag(
+            policy.version,
+            &policy.allowed_locator_kinds,
+            self.app.allow_loopback_blob_endpoints(),
+        )
+    }
+
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,

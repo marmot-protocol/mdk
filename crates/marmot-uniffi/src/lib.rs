@@ -42,6 +42,7 @@ pub use markdown::{
 
 uniffi::setup_scaffolding!();
 
+pub use commands::parse_media_imeta_tag;
 pub use conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AuditDataModeFfi,
     AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi,
@@ -53,12 +54,12 @@ pub use conversions::{
     MediaDownloadResultFfi, MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
     MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
     MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
-    MessageDraftSummaryFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
-    NotificationTrafficClassFfi, NotificationTriggerFfi, NotificationUpdateFfi,
-    NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi,
-    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
-    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    MessageDraftSummaryFfi, MessageTagFfi, NotificationCollectionStatusFfi,
+    NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
+    NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi,
+    PushRegistrationFfi, RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi,
+    RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi,
+    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi,

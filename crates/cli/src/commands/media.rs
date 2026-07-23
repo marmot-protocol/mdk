@@ -1,6 +1,5 @@
 //! `media` command namespace handlers and media-attachment helpers.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use cgka_traits::GroupId;
@@ -105,7 +104,11 @@ pub(crate) async fn media_command_with_runtime(
                     limit: None,
                 },
             )?;
-            let reference = media_attachment_for_hash(messages, &file_hash_hex)?;
+            let reference = media_attachment_for_hash(
+                messages,
+                &file_hash_hex,
+                app.allow_loopback_blob_endpoints(),
+            )?;
             let output_path = media_output_path(output, &reference.file_name);
             let download = runtime
                 .download_media(&account.account_id_hex, &group_id, reference.clone())
@@ -135,7 +138,7 @@ pub(crate) async fn media_command_with_runtime(
                     limit: None,
                 },
             )?;
-            let media = media_records_json(messages)?;
+            let media = media_records_json(messages, app.allow_loopback_blob_endpoints())?;
             Ok(CommandOutput {
                 plain: if media.is_empty() {
                     "no media".to_owned()
@@ -157,13 +160,17 @@ pub(crate) async fn media_command_with_runtime(
     }
 }
 
-fn media_records_json(messages: Vec<AppMessageRecord>) -> Result<Vec<Value>, WnError> {
+fn media_records_json(
+    messages: Vec<AppMessageRecord>,
+    allow_loopback_http: bool,
+) -> Result<Vec<Value>, WnError> {
     let mut records = Vec::new();
     for message in messages {
         let caption = (!message.plaintext.is_empty()).then(|| message.plaintext.clone());
-        for (attachment_index, reference) in media_attachments_from_message(&message)?
-            .into_iter()
-            .enumerate()
+        for (attachment_index, reference) in
+            media_attachments_from_message(&message, allow_loopback_http)?
+                .into_iter()
+                .enumerate()
         {
             records.push(json!({
                 "message_id": message.message_id_hex,
@@ -235,9 +242,10 @@ fn send_summary_json(summary: marmot_app::SendSummary) -> Value {
 fn media_attachment_for_hash(
     messages: Vec<AppMessageRecord>,
     file_hash_hex: &str,
+    allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, WnError> {
     for message in messages {
-        for reference in media_attachments_from_message(&message)? {
+        for reference in media_attachments_from_message(&message, allow_loopback_http)? {
             if reference.plaintext_sha256 == file_hash_hex {
                 return Ok(reference);
             }
@@ -248,59 +256,25 @@ fn media_attachment_for_hash(
 
 fn media_attachments_from_message(
     message: &AppMessageRecord,
+    allow_loopback_http: bool,
 ) -> Result<Vec<MediaAttachmentReference>, WnError> {
     message
         .tags
         .iter()
         .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        .map(|tag| media_attachment_from_imeta_tag(tag, message.source_epoch))
+        .map(|tag| media_attachment_from_imeta_tag(tag, message.source_epoch, allow_loopback_http))
         .collect()
 }
 
 fn media_attachment_from_imeta_tag(
     tag: &[String],
     source_epoch: Option<u64>,
+    allow_loopback_http: bool,
 ) -> Result<MediaAttachmentReference, WnError> {
-    let mut locators = Vec::new();
-    let mut fields = HashMap::new();
-    for field in tag.iter().skip(1) {
-        if field.starts_with("blurhash ") {
-            return Err(WnError::InvalidMediaAttachment("blurhash".to_owned()));
-        }
-        if let Some(rest) = field.strip_prefix("locator ") {
-            let (kind, value) = rest
-                .split_once(' ')
-                .ok_or_else(|| WnError::InvalidMediaAttachment("locator".to_owned()))?;
-            locators.push(MediaLocator {
-                kind: kind.to_owned(),
-                value: value.to_owned(),
-            });
-            continue;
-        }
-        if let Some((key, value)) = field.split_once(' ') {
-            fields.insert(key.to_owned(), value.to_owned());
-        }
-    }
-    let required = |key: &'static str| {
-        fields
-            .get(key)
-            .cloned()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(WnError::InvalidMediaAttachment(key.to_owned()))
-    };
-    Ok(MediaAttachmentReference {
-        locators,
-        ciphertext_sha256: required("ciphertext_sha256")?,
-        plaintext_sha256: required("plaintext_sha256")?,
-        nonce_hex: required("nonce")?,
-        file_name: required("filename")?,
-        media_type: required("m")?,
-        version: required("v")?,
-        source_epoch: source_epoch
-            .ok_or_else(|| WnError::InvalidMediaAttachment("source_epoch".to_owned()))?,
-        dim: fields.get("dim").cloned(),
-        thumbhash: fields.get("thumbhash").cloned(),
-    })
+    let source_epoch =
+        source_epoch.ok_or_else(|| WnError::InvalidMediaAttachment("source_epoch".to_owned()))?;
+    marmot_app::media_attachment_from_imeta_tag(tag, Some(source_epoch), allow_loopback_http)
+        .map_err(|error| WnError::InvalidMediaAttachment(error.to_string()))
 }
 
 fn normalize_sha256_hex(value: &str) -> Result<String, WnError> {

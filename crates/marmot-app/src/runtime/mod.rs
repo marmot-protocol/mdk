@@ -1806,6 +1806,20 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Build an authenticated `imeta` tag for an optimistic host-side record
+    /// without publishing it. The account worker derives the target group's
+    /// media profile and rejects a reference from the other media version.
+    pub async fn build_media_imeta_tag(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+    ) -> Result<Vec<String>, AppError> {
+        self.accounts
+            .build_media_imeta_tag(account_ref, group_id, reference)
+            .await
+    }
+
     pub async fn download_media(
         &self,
         account_ref: &str,
