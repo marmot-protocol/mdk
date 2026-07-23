@@ -54,13 +54,14 @@ pub use conversions::{
     MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
     MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
     MessageDraftSummaryFfi, NotificationCollectionStatusFfi, NotificationSettingsFfi,
-    NotificationTriggerFfi, NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi,
-    PushPlatformFfi, PushRegistrationFfi, RelayTelemetryResourceFfi,
-    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RuntimeProjectionUpdateFfi,
-    SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
-    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
-    TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
+    NotificationTrafficClassFfi, NotificationTriggerFfi, NotificationUpdateFfi,
+    NotificationUserFfi, NotificationWakeSourceFfi, PushPlatformFfi, PushRegistrationFfi,
+    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
+    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
+    TimelineUserReactionFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
