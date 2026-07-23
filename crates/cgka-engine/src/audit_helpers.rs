@@ -66,6 +66,7 @@ pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Stale { .. } => "stale",
+        IngestOutcome::Rejected { .. } => "rejected",
     }
 }
 
@@ -80,6 +81,12 @@ pub(crate) fn stale_reason_str(reason: &StaleReason) -> &'static str {
         StaleReason::SelfEvicted => "self_evicted",
         StaleReason::Quarantined => "quarantined",
     }
+}
+
+pub(crate) fn proposal_rejection_category_tag(
+    category: cgka_traits::ingest::ProposalRejectionCategory,
+) -> &'static str {
+    crate::proposal_authorization::proposal_rejection_category_tag(category)
 }
 
 pub(crate) fn ingest_outcome_epoch(outcome: &IngestOutcome) -> Option<u64> {
@@ -434,6 +441,9 @@ pub(crate) fn ingest_outcome_event(
         outcome_kind: ingest_outcome_kind_str(outcome).to_string(),
         stale_reason: match outcome {
             IngestOutcome::Stale { reason } => Some(stale_reason_str(reason).to_string()),
+            IngestOutcome::Rejected { category } => {
+                Some(proposal_rejection_category_tag(*category).to_string())
+            }
             _ => None,
         },
         epoch: ingest_outcome_epoch(outcome),

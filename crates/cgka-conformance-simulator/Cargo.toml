@@ -34,6 +34,7 @@ sha2.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+openmls_basic_credential.workspace = true
 # Byte-level conformance vectors for the agent text stream QUIC feature pin
 # the transport crates' key derivation, AAD, and broker control bytes.
 transport-quic-stream.workspace = true

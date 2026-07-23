@@ -391,6 +391,12 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::Quarantined
         }
     );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_authorization_failed",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed
+        }
+    );
 }
 
 #[test]

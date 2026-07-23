@@ -16,7 +16,9 @@ use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, Requ
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
+use cgka_traits::ingest::{
+    IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
+};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
 use cgka_traits::transport::{
@@ -483,11 +485,15 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
 
     assert!(matches!(
         alice.ingest(spoofed_proposal.clone()).await.unwrap(),
-        IngestOutcome::Processed
+        IngestOutcome::Rejected {
+            category: ProposalRejectionCategory::AuthorizationFailed
+        }
     ));
     assert!(matches!(
         carol.ingest(spoofed_proposal.clone()).await.unwrap(),
-        IngestOutcome::Processed
+        IngestOutcome::Rejected {
+            category: ProposalRejectionCategory::AuthorizationFailed
+        }
     ));
 
     let before_epoch = carol.epoch(&group_id).expect("carol has group");
@@ -505,10 +511,10 @@ async fn inbound_by_reference_update_rejects_account_identity_spoofing() {
         matches!(
             outcome,
             IngestOutcome::Stale {
-                reason: cgka_traits::ingest::StaleReason::PeelFailed
+                reason: StaleReason::PeelFailed
             }
         ),
-        "terminally invalid by-reference Update commits should not remain buffered, got {outcome:?}"
+        "terminally invalid same-epoch by-reference commits should not remain buffered, got {outcome:?}"
     );
     let result = carol
         .converge_stored_openmls_messages(&group_id, 1_000_000)

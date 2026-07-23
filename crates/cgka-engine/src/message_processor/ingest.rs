@@ -2,8 +2,9 @@
 //!
 //! Inbound messages are peeled, classified, stored, and either applied or
 //! buffered for convergence. Classifiable stale ingest cases return
-//! `Ok(IngestOutcome::Stale { .. })` with a typed `StaleReason`. `Err` is
-//! reserved for storage, peeler, serialization, and OpenMLS failures.
+//! `Ok(IngestOutcome::Stale { .. })`; terminal protocol admission failures
+//! return `Ok(IngestOutcome::Rejected { .. })`. `Err` is reserved for storage,
+//! peeler, serialization, and unclassified OpenMLS failures.
 
 use super::{content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
@@ -22,7 +23,7 @@ use cgka_traits::engine::{
     GroupStateInvalidationReason,
 };
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, StaleReason};
+use cgka_traits::ingest::{IngestOutcome, PeeledContent, ProposalRejectionCategory, StaleReason};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
@@ -54,6 +55,44 @@ enum ForkProbeError {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    fn terminalize_rejected_proposal(
+        &mut self,
+        group_id: &GroupId,
+        msg_id: &MessageId,
+        raw_msg_id: &MessageId,
+        category: ProposalRejectionCategory,
+    ) -> Result<IngestOutcome, EngineError> {
+        let reason = crate::proposal_authorization::proposal_rejection_category_tag(category);
+        self.audit_group(
+            group_id,
+            marmot_forensics::AuditEventKind::Rejection {
+                msg_id: hex::encode(msg_id.as_slice()),
+                reason: reason.to_string(),
+            },
+        );
+        self.update_stored_message_state(msg_id, MessageState::Failed)?;
+        self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
+        Ok(IngestOutcome::Rejected { category })
+    }
+
+    fn reject_staged_commit_proposals(
+        &mut self,
+        mls_group: &MlsGroup,
+        group_id: &GroupId,
+        msg_id: &MessageId,
+        raw_msg_id: &MessageId,
+        staged: &openmls::prelude::StagedCommit,
+    ) -> Result<Option<IngestOutcome>, EngineError> {
+        match crate::proposal_authorization::authorize_staged_commit_queued_proposals(
+            mls_group, group_id, staged,
+        ) {
+            crate::proposal_authorization::ProposalAuthorizationOutcome::Authorized => Ok(None),
+            crate::proposal_authorization::ProposalAuthorizationOutcome::Rejected(category) => Ok(
+                Some(self.terminalize_rejected_proposal(group_id, msg_id, raw_msg_id, category)?),
+            ),
+        }
+    }
+
     pub(crate) async fn ingest_welcome(
         &mut self,
         msg: &TransportMessage,
@@ -806,6 +845,19 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
                 Err(e) => {
+                    if let Some(category) =
+                        crate::proposal_authorization::classify_process_message_error(
+                            &e,
+                            msg_content_type,
+                        )
+                    {
+                        return self.terminalize_rejected_proposal(
+                            &group_id,
+                            &msg.id,
+                            &raw_msg_id,
+                            category,
+                        );
+                    }
                     self.update_stored_message_state(&msg.id, MessageState::Retryable)?;
                     return Err(EngineError::Backend(format!("process_message: {e:?}")));
                 }
@@ -888,6 +940,15 @@ impl<S: StorageProvider> Engine<S> {
                 }
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
                     let before = EpochId(mls_group.epoch().as_u64());
+                    if let Some(outcome) = self.reject_staged_commit_proposals(
+                        &mls_group,
+                        &group_id,
+                        &msg.id,
+                        &raw_msg_id,
+                        &staged,
+                    )? {
+                        return Ok(outcome);
+                    }
                     if let Err(err) = crate::app_components::require_admin_for_staged_commit(
                         &mls_group,
                         &group_id,
@@ -1206,6 +1267,25 @@ impl<S: StorageProvider> Engine<S> {
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ProposalMessage(queued) => {
+                    match crate::proposal_authorization::authorize_queued_proposal(
+                        &mls_group,
+                        &group_id,
+                        &queued,
+                        crate::proposal_authorization::ProposalAuthorizationContext::Standalone,
+                    ) {
+                        crate::proposal_authorization::ProposalAuthorizationOutcome::Rejected(
+                            category,
+                        ) => {
+                            return self.terminalize_rejected_proposal(
+                                &group_id,
+                                &msg.id,
+                                &raw_msg_id,
+                                category,
+                            );
+                        }
+                        crate::proposal_authorization::ProposalAuthorizationOutcome::Authorized => {
+                        }
+                    }
                     // Ask the auto-committer policy whether we should commit
                     // this proposal. OpenMLS does not auto-enqueue processed
                     // proposals, so store it before attempting to commit the
@@ -1421,6 +1501,29 @@ impl<S: StorageProvider> Engine<S> {
         mls_group: &mut MlsGroup,
         queued: Box<QueuedProposal>,
     ) -> Result<bool, EngineError> {
+        if let crate::proposal_authorization::ProposalAuthorizationOutcome::Rejected(category) =
+            crate::proposal_authorization::authorize_queued_proposal(
+                mls_group,
+                group_id,
+                queued.as_ref(),
+                crate::proposal_authorization::ProposalAuthorizationContext::Standalone,
+            )
+        {
+            let reason = crate::proposal_authorization::proposal_rejection_category_tag(category);
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::Rejection {
+                    msg_id: hex::encode(
+                        tls_codec::Serialize::tls_serialize_detached(
+                            queued.proposal_reference_ref(),
+                        )
+                        .unwrap_or_default(),
+                    ),
+                    reason: reason.to_string(),
+                },
+            );
+            return Ok(false);
+        }
         let decision_report = crate::auto_committer::decide_with_reason(mls_group, &queued);
         let decision_str = match &decision_report.decision {
             crate::auto_committer::AutoCommitDecision::Commit => "commit",
@@ -1836,6 +1939,14 @@ impl<S: StorageProvider> Engine<S> {
             .ok_or(ForkProbeError::InvalidCandidate)?;
         let priority = match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
+                if crate::proposal_authorization::authorize_staged_commit_queued_proposals(
+                    &probe_group,
+                    group_id,
+                    staged.as_ref(),
+                ) != crate::proposal_authorization::ProposalAuthorizationOutcome::Authorized
+                {
+                    return Err(ForkProbeError::InvalidCandidate);
+                }
                 crate::app_components::require_admin_for_staged_commit(
                     &probe_group,
                     group_id,
@@ -2030,6 +2141,8 @@ fn convergence_ingest_outcome(
     epoch: EpochId,
 ) -> IngestOutcome {
     let message_id = hex::encode(msg.id.as_slice());
+    let content_message_id =
+        hex::encode(crate::message_processor::content_dedup_id(&msg.payload).as_slice());
 
     // Was this exact message classified by the canonicalize pass? Map
     // the disposition to a typed outcome so callers can log by category
@@ -2041,7 +2154,7 @@ fn convergence_ingest_outcome(
         .iter()
         .chain(&result.accepted_proposals)
         .chain(&result.accepted_app_messages)
-        .any(|accepted| accepted == &message_id);
+        .any(|accepted| accepted == &message_id || accepted == &content_message_id);
     if accepted && result.convergence_status == crate::canonicalization::ConvergenceStatus::Settled
     {
         return IngestOutcome::Processed;
@@ -2050,7 +2163,7 @@ fn convergence_ingest_outcome(
     if result
         .already_seen
         .iter()
-        .any(|seen| seen.message_id == message_id)
+        .any(|seen| seen.message_id == message_id || seen.message_id == content_message_id)
     {
         return IngestOutcome::Stale {
             reason: StaleReason::AlreadySeen,
@@ -2066,11 +2179,12 @@ fn convergence_ingest_outcome(
     // future epoch the local context can't yet peel. A subsequent
     // canonicalize pass that advances the MLS context will re-evaluate
     // it. Keep that case as Buffered.
-    if result
-        .dropped_messages
-        .iter()
-        .any(|dropped| dropped.message_id == message_id)
-    {
+    if let Some(dropped) = result.dropped_messages.iter().find(|dropped| {
+        dropped.message_id == message_id || dropped.message_id == content_message_id
+    }) {
+        if let Some(category) = dropped.rejection_category {
+            return IngestOutcome::Rejected { category };
+        }
         return IngestOutcome::Stale {
             reason: StaleReason::PeelFailed,
         };
@@ -2078,7 +2192,7 @@ fn convergence_ingest_outcome(
     if let Some(inv) = result
         .invalidated_app_messages
         .iter()
-        .find(|inv| inv.message_id == message_id)
+        .find(|inv| inv.message_id == message_id || inv.message_id == content_message_id)
     {
         use crate::canonicalization::InvalidatedAppMessageReason;
         match inv.reason {

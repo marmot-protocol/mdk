@@ -245,7 +245,7 @@ pub(crate) fn validate_leaf_account_identity_proof_for_member(
 
 pub(crate) fn validate_staged_commit_account_identity_proofs(
     staged: &StagedCommit,
-    group: &MlsGroup,
+    _group: &MlsGroup,
     committer: &MemberId,
     ciphersuite: Ciphersuite,
 ) -> Result<Vec<MemberId>, EngineError> {
@@ -255,21 +255,6 @@ pub(crate) fn validate_staged_commit_account_identity_proofs(
         let leaf = add.add_proposal().key_package().leaf_node();
         validate_leaf_account_identity_proof(leaf, ciphersuite)?;
         added.push(crate::identity::validated_member_id_of_leaf(leaf)?);
-    }
-
-    for update in staged.update_proposals() {
-        let expected =
-            crate::identity::member_id_of_sender(update.sender(), group).ok_or_else(|| {
-                EngineError::InvalidAccountIdentityProof(
-                    "Update proposal has no authenticated member sender".into(),
-                )
-            })?;
-        validate_leaf_account_identity_proof_for_member(
-            update.update_proposal().leaf_node(),
-            ciphersuite,
-            &expected,
-            "Update proposal",
-        )?;
     }
 
     if let Some(update_path_leaf) = staged.update_path_leaf_node() {

@@ -19,14 +19,21 @@ use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
+use cgka_traits::engine::CgkaEngine;
 use cgka_traits::group::{Group, Member};
+use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::{
+    AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+};
+use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
+use openmls::prelude::tls_codec::Serialize as _;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
+use transport_nostr_peeler::{DEFAULT_EXPORTER_LABEL, NostrMlsPeeler};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
@@ -1343,11 +1350,13 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
                 message_id: hex::encode(losing_commit_id.as_slice()),
                 kind: MessageKind::Commit,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             },
             DroppedMessage {
                 message_id: hex::encode(malformed_proposal_id.as_slice()),
                 kind: MessageKind::Proposal,
                 reason: DroppedMessageReason::Malformed,
+                rejection_category: None,
             },
         ],
         already_seen: vec![],
@@ -1456,4 +1465,198 @@ fn store_created_message(
             payload: serde_json::to_vec(msg).expect("transport serializes"),
         })
         .expect("message stored");
+}
+
+#[tokio::test]
+async fn harness_convergence_rejects_unauthorized_standalone_proposal() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group("proposal-auth-harness", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        bob.storage().mls_storage(),
+    );
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load bob group")
+        .expect("bob group present");
+    let member_id = bob.member_id();
+    let binding = bob
+        .storage()
+        .account_device_signer(&member_id)
+        .expect("signer lookup")
+        .expect("signer present");
+    let signer = openmls_basic_credential::SignatureKeyPair::read(
+        bob.storage().mls_storage(),
+        &binding.mls_signature_public_key,
+        cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("signer read");
+    let credential = openmls::prelude::CredentialWithKey {
+        credential: openmls::prelude::BasicCredential::new(member_id.as_slice().to_vec()).into(),
+        signature_key: signer.public().into(),
+    };
+    let leaf_node_parameters = openmls::prelude::LeafNodeParameters::builder()
+        .with_credential_with_key(credential)
+        .build();
+    let (proposal_out, _) = mls_group
+        .propose_self_update(&provider, &signer, leaf_node_parameters)
+        .expect("bob builds standalone update at OpenMLS layer");
+    let proposal_bytes = proposal_out
+        .tls_serialize_detached()
+        .expect("serialize proposal");
+    let proposal = TransportMessage {
+        id: MessageId::new(proposal_bytes[..16].to_vec()),
+        payload: proposal_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: cgka_traits::transport::TransportSource("harness-update-proposal".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+
+    let observations = replay_openmls_messages(carol.storage(), &group_id, &[proposal])
+        .expect("replay unauthorized proposal");
+    assert!(
+        observations.iter().any(|observation| matches!(
+            observation,
+            OpenMlsReplayObservation::ProposalRejected {
+                category: cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed,
+                ..
+            }
+        )),
+        "replay must emit typed proposal rejection, got {observations:?}"
+    );
+
+    let carol_provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        carol.storage().mls_storage(),
+    );
+    let carol_group = MlsGroup::load(carol_provider.storage(), &mls_gid)
+        .expect("load carol group")
+        .expect("carol group present");
+    assert!(
+        carol_group.pending_proposals().next().is_none(),
+        "harness storage must not retain unauthorized standalone proposal"
+    );
+}
+
+#[tokio::test]
+async fn harness_tick_rejects_unauthorized_standalone_proposal() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+    let mut carol = ClientBuilder::new(pad32(b"carol"))
+        .registry(selfremove_registry())
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let carol_kp = carol.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group("proposal-auth-harness-tick", vec![bob_kp, carol_kp], vec![])
+        .await;
+    alice.confirm(pending).await;
+    bus.deliver_all();
+    bob.tick().await;
+    carol.tick().await;
+
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        bob.storage().mls_storage(),
+    );
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load bob group")
+        .expect("bob group present");
+    let member_id = bob.member_id();
+    let binding = bob
+        .storage()
+        .account_device_signer(&member_id)
+        .expect("signer lookup")
+        .expect("signer present");
+    let signer = openmls_basic_credential::SignatureKeyPair::read(
+        bob.storage().mls_storage(),
+        &binding.mls_signature_public_key,
+        cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("signer read");
+    let credential = openmls::prelude::CredentialWithKey {
+        credential: openmls::prelude::BasicCredential::new(member_id.as_slice().to_vec()).into(),
+        signature_key: signer.public().into(),
+    };
+    let leaf_node_parameters = openmls::prelude::LeafNodeParameters::builder()
+        .with_credential_with_key(credential)
+        .build();
+    let (proposal_out, _) = mls_group
+        .propose_self_update(&provider, &signer, leaf_node_parameters)
+        .expect("bob builds standalone update at OpenMLS layer");
+    let proposal_bytes = proposal_out
+        .tls_serialize_detached()
+        .expect("serialize proposal");
+    let group_context = bob
+        .engine
+        .group_context(&group_id)
+        .expect("bob group context");
+    let snapshot =
+        GroupContextSnapshot::from_context(group_context.as_ref(), &[DEFAULT_EXPORTER_LABEL]);
+    drop(group_context);
+    let proposal = NostrMlsPeeler::new()
+        .wrap_group_message(
+            &EncryptedPayload {
+                ciphertext: proposal_bytes,
+                aad: vec![],
+            },
+            &snapshot,
+        )
+        .await
+        .expect("wrap standalone proposal through production Nostr peeler");
+
+    bus.inject(carol.bus_id, proposal);
+    let outcomes = carol.tick().await;
+    assert!(
+        outcomes.iter().any(|outcome| matches!(
+            outcome,
+            Ok(cgka_traits::ingest::IngestOutcome::Rejected {
+                category: cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed
+            })
+        )),
+        "harness tick must reject unauthorized standalone proposal, got {outcomes:?}"
+    );
+
+    let carol_provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        carol.storage().mls_storage(),
+    );
+    let carol_group = MlsGroup::load(carol_provider.storage(), &mls_gid)
+        .expect("load carol group")
+        .expect("carol group present");
+    assert!(
+        carol_group.pending_proposals().next().is_none(),
+        "harness tick must not retain unauthorized standalone proposal"
+    );
 }

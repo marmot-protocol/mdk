@@ -218,3 +218,14 @@ fn validate_key_package_lifetime_policy(key_package: &MlsKeyPackage) -> Result<(
     }
     Ok(())
 }
+
+/// Validate an Add proposal's KeyPackage credential and account-identity proof.
+pub(crate) fn validate_add_proposal_key_package(
+    add: &openmls::messages::proposals::AddProposal,
+    ciphersuite: openmls::prelude::Ciphersuite,
+) -> Result<(), EngineError> {
+    let leaf = add.key_package().leaf_node();
+    crate::identity::validated_member_id_of_leaf(leaf)?;
+    crate::account_identity_proof::validate_leaf_account_identity_proof(leaf, ciphersuite)?;
+    Ok(())
+}

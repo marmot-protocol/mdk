@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
 use cgka_traits::CgkaEngine;
+use cgka_traits::StorageProvider;
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -24,6 +25,8 @@ use marmot_forensics::{
     AuditEvent, AuditEventContext, AuditEventKind, AuditHumanActionContext, AuditTransportContext,
     AuditTransportWire, JsonlRecorder,
 };
+use openmls::prelude::OpenMlsProvider;
+use openmls::prelude::tls_codec::Serialize as _;
 use storage_sqlite::SqliteAccountStorage;
 
 mod support;
@@ -400,6 +403,247 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
             );
             assert_eq!(*payload_len, 4);
             assert_eq!(payload_digest.len(), 64, "payload_digest is a SHA-256 hex");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn audit_log_records_proposal_rejection_category_without_sensitive_fields() {
+    use cgka_engine::feature_registry::FeatureRegistry;
+    use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+    use cgka_traits::engine::{CreateGroupRequest, SendResult};
+    use cgka_traits::ingest::{
+        IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory,
+    };
+    use cgka_traits::storage::AccountDeviceSignerStorage;
+
+    struct PassThroughPeeler;
+
+    fn hash_id(bytes: &[u8]) -> MessageId {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        bytes.hash(&mut h);
+        MessageId::new(h.finish().to_be_bytes().to_vec())
+    }
+
+    #[async_trait]
+    impl TransportPeeler for PassThroughPeeler {
+        async fn peel_group_message(
+            &self,
+            msg: &TransportMessage,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<PeeledMessage, PeelerError> {
+            Ok(PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: None,
+                content: PeeledContent::MlsMessage {
+                    bytes: msg.payload.clone(),
+                },
+                origin: msg.clone(),
+            })
+        }
+        async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+            Ok(PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: None,
+                content: PeeledContent::Welcome {
+                    bytes: msg.payload.clone(),
+                },
+                origin: msg.clone(),
+            })
+        }
+        async fn wrap_group_message(
+            &self,
+            payload: &EncryptedPayload,
+            _ctx: &GroupContextSnapshot,
+        ) -> Result<TransportMessage, PeelerError> {
+            Ok(TransportMessage {
+                id: hash_id(&payload.ciphertext),
+                payload: payload.ciphertext.clone(),
+                timestamp: Timestamp(0),
+                causal_deps: vec![],
+                source: TransportSource("audit-proposal-reject".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![],
+                },
+            })
+        }
+        async fn wrap_welcome(
+            &self,
+            payload: &EncryptedPayload,
+            recipient: &MemberId,
+        ) -> Result<TransportMessage, PeelerError> {
+            Ok(TransportMessage {
+                id: hash_id(&payload.ciphertext),
+                payload: payload.ciphertext.clone(),
+                timestamp: Timestamp(0),
+                causal_deps: vec![],
+                source: TransportSource("audit-proposal-reject".into()),
+                envelope: TransportEnvelope::Welcome {
+                    recipient: recipient.clone(),
+                },
+            })
+        }
+    }
+
+    fn registry() -> FeatureRegistry {
+        let mut r = FeatureRegistry::new();
+        r.register(
+            Feature("self-remove"),
+            CapabilityRequirement {
+                requires: Capability::Proposal(10),
+                level: RequirementLevel::Required,
+                description: "MIP-03",
+            },
+        );
+        r
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit-proposal-reject.jsonl");
+    let recorder = JsonlRecorder::open(&path, "audit-proposal-reject".to_string()).unwrap();
+
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = EngineBuilder::new(storage.clone())
+        .identity(valid_identity(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(registry())
+        .peeler(Box::new(PassThroughPeeler))
+        .build()
+        .unwrap();
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob = EngineBuilder::new(bob_storage.clone())
+        .identity(valid_identity(b"bob"))
+        .account_identity_proof_signer(proof_signer(b"bob"))
+        .feature_registry(registry())
+        .peeler(Box::new(PassThroughPeeler))
+        .build()
+        .unwrap();
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "audit-proposal-reject".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![Feature("self-remove")],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome_for_bob = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome_for_bob).await.unwrap();
+
+    let crypto = openmls_rust_crypto::RustCrypto::default();
+    let provider = cgka_engine::provider::EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+        &crypto,
+        bob_storage.mls_storage(),
+    );
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = openmls::group::MlsGroup::load(provider.storage(), &mls_gid)
+        .unwrap()
+        .unwrap();
+    let binding = bob_storage
+        .account_device_signer(&bob.self_id())
+        .unwrap()
+        .unwrap();
+    let signer = openmls_basic_credential::SignatureKeyPair::read(
+        bob_storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let credential = openmls::prelude::CredentialWithKey {
+        credential: openmls::prelude::BasicCredential::new(bob.self_id().as_slice().to_vec())
+            .into(),
+        signature_key: signer.public().into(),
+    };
+    let leaf_node_parameters = openmls::prelude::LeafNodeParameters::builder()
+        .with_credential_with_key(credential)
+        .build();
+    let (proposal_out, _) = mls_group
+        .propose_self_update(&provider, &signer, leaf_node_parameters)
+        .unwrap();
+    let proposal_bytes = proposal_out.tls_serialize_detached().unwrap();
+    let proposal = TransportMessage {
+        id: MessageId::new(vec![0x42; 16]),
+        payload: proposal_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("audit-proposal-reject".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    };
+
+    let mut alice_audited = EngineBuilder::new(storage)
+        .identity(valid_identity(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(registry())
+        .peeler(Box::new(PassThroughPeeler))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+    let outcome = alice_audited.ingest(proposal).await.unwrap();
+    assert!(matches!(
+        outcome,
+        IngestOutcome::Rejected {
+            category: ProposalRejectionCategory::AuthorizationFailed
+        }
+    ));
+    drop(alice_audited);
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let events: Vec<AuditEvent> = contents
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let rejection = events
+        .iter()
+        .find(|event| matches!(event.kind, AuditEventKind::Rejection { .. }))
+        .expect("Rejection audit event");
+    match &rejection.kind {
+        AuditEventKind::Rejection { reason, msg_id } => {
+            assert_eq!(reason, "authorization_failed");
+            assert_eq!(msg_id.len(), 64, "audit msg_id is SHA-256 hex of MLS bytes");
+            let rejection_kind_json = serde_json::to_string(&rejection.kind).unwrap();
+            assert!(
+                !rejection_kind_json.contains(&hex::encode(group_id.as_slice())),
+                "Rejection payload must not embed group id"
+            );
+            assert!(
+                !rejection_kind_json.contains(&hex::encode(bob.self_id().as_slice())),
+                "Rejection payload must not embed member id"
+            );
+        }
+        _ => unreachable!(),
+    }
+    let outcome_event = events
+        .iter()
+        .find(|event| matches!(event.kind, AuditEventKind::IngestOutcome { .. }))
+        .expect("IngestOutcome audit event");
+    match &outcome_event.kind {
+        AuditEventKind::IngestOutcome {
+            outcome_kind,
+            stale_reason,
+            ..
+        } => {
+            assert_eq!(outcome_kind, "rejected");
+            assert_eq!(stale_reason.as_deref(), Some("authorization_failed"));
         }
         _ => unreachable!(),
     }

@@ -479,6 +479,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         self.emit_application_replay_events(group_id, &observations);
         self.emit_invalidated_app_events(group_id, &result)?;
+        self.emit_rejected_proposal_convergence_audits(group_id, &result);
         self.emit_rolled_back_commits(group_id, &result)?;
         self.emit_superseded_processed_commits(group_id, &result)?;
 
@@ -816,6 +817,27 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         Ok(())
+    }
+
+    fn emit_rejected_proposal_convergence_audits(
+        &mut self,
+        group_id: &GroupId,
+        result: &CanonicalizationResult,
+    ) {
+        for dropped in &result.dropped_messages {
+            let Some(category) = dropped.rejection_category else {
+                continue;
+            };
+            let reason = crate::proposal_authorization::proposal_rejection_category_tag(category)
+                .to_string();
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::Rejection {
+                    msg_id: dropped.message_id.clone(),
+                    reason,
+                },
+            );
+        }
     }
 
     /// Emit a [`GroupEvent::CommitRolledBack`] for every commit that this

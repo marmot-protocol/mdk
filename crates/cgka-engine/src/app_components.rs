@@ -211,7 +211,6 @@ pub(crate) fn require_admin_for_staged_commit(
     sender: Option<&MemberId>,
     staged: &StagedCommit,
 ) -> Result<(), EngineError> {
-    reject_admin_self_remove_proposals(mls_group, group_id, staged)?;
     if !staged_commit_requires_admin(staged) {
         return Ok(());
     }
@@ -223,7 +222,7 @@ pub(crate) fn require_admin_for_staged_commit(
     require_admin(mls_group, group_id, sender)
 }
 
-fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
+pub(crate) fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
     let basic = BasicCredential::try_from(cred).ok()?;
     <[u8; 32]>::try_from(basic.identity()).ok()
 }
@@ -465,50 +464,6 @@ pub(crate) fn reject_admins_without_member_accounts(
     }
     if admins.iter().any(|admin| !member_accounts.contains(admin)) {
         return Err(EngineError::Other("admin key has no member leaf".into()));
-    }
-    Ok(())
-}
-
-fn reject_admin_self_remove_proposals(
-    mls_group: &MlsGroup,
-    group_id: &GroupId,
-    staged: &StagedCommit,
-) -> Result<(), EngineError> {
-    let admins = admins_of_group(mls_group)?;
-    if admins.is_empty() {
-        return Ok(());
-    }
-    for queued in staged.queued_proposals() {
-        if !matches!(queued.proposal(), Proposal::SelfRemove) {
-            continue;
-        }
-        // Resolve the sender's account pubkey on the SAME (length-based) basis
-        // the admin set is decoded on (`decode_admin_policy` /
-        // `credential_account_pubkey`), NOT the secp256k1-validating
-        // `identity::member_id_of_sender` (mdk#728 review). The admin set is not
-        // curve-validated, so a leaf whose 32-byte identity equals a listed
-        // admin key but fails secp256k1 validation would resolve to `None` under
-        // the validating chokepoint and SKIP this guard — letting that admin
-        // self-remove in violation of MIP-03. Matching the admin-set basis keeps
-        // both sides of the comparison comparable. Fail CLOSED: a `SelfRemove`
-        // whose sender cannot be resolved to a member account is rejected, never
-        // waved through (mirrors the Sm7 auto-committer / fork-recovery posture).
-        let sender_pubkey = match queued.sender() {
-            Sender::Member(leaf_idx) => mls_group
-                .member_at(*leaf_idx)
-                .and_then(|member| credential_account_pubkey(member.credential)),
-            _ => None,
-        };
-        let Some(sender_pubkey) = sender_pubkey else {
-            return Err(EngineError::AdminCannotSelfRemove {
-                group_id: group_id.clone(),
-            });
-        };
-        if admins.iter().any(|admin| admin == &sender_pubkey) {
-            return Err(EngineError::AdminCannotSelfRemove {
-                group_id: group_id.clone(),
-            });
-        }
     }
     Ok(())
 }

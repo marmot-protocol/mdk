@@ -57,6 +57,7 @@ pub(crate) mod message_disposition;
 pub mod message_processor;
 pub mod openmls_projection;
 pub mod pending_commit_guard;
+pub mod proposal_authorization;
 pub mod provider;
 pub mod publish;
 pub mod snapshot_guard;

@@ -4,9 +4,10 @@
 //! buffered for convergence. Outbound intents are checked against local epoch
 //! state and unresolved convergence inputs before any OpenMLS mutation.
 //!
-//! Classifiable stale ingest cases return
-//! `Ok(IngestOutcome::Stale { .. })` with a typed `StaleReason`. `Err` is
-//! reserved for storage, peeler, serialization, and OpenMLS failures.
+//! Classifiable stale ingest cases return `Ok(IngestOutcome::Stale { .. })`
+//! with a typed `StaleReason`; terminal protocol admission failures return
+//! `Ok(IngestOutcome::Rejected { .. })`. `Err` is reserved for storage, peeler,
+//! serialization, and unclassified OpenMLS failures.
 
 mod ingest;
 mod send;
@@ -106,8 +107,8 @@ struct DeferredPeelAttempts {
 }
 
 impl<S: StorageProvider> Engine<S> {
-    /// Inbound pipeline. Never panics; every classifiable stale case returns
-    /// a typed `StaleReason` inside `Ok(IngestOutcome::Stale { .. })`.
+    /// Inbound pipeline. Never panics; every classifiable stale or rejected case
+    /// returns a typed [`IngestOutcome`].
     pub(crate) async fn do_ingest(
         &mut self,
         msg: TransportMessage,
@@ -657,8 +658,8 @@ impl<S: StorageProvider> Engine<S> {
                     self.note_peel_deferred_row_retired(group_id, &record.id);
                     progressed += 1;
                 }
-                Ok(IngestOutcome::Stale { .. }) => {
-                    // Terminal stale classifications are still successful
+                Ok(IngestOutcome::Stale { .. } | IngestOutcome::Rejected { .. }) => {
+                    // Terminal stale/rejected classifications are still successful
                     // reclassifications of this raw deferred row. Retire it only
                     // while it is still awaiting retry: the reachable case is
                     // `SelfEvicted`, where re-ingesting the deferred row against a
