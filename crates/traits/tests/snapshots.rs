@@ -18,7 +18,7 @@ use cgka_traits::engine::{
     KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
@@ -662,10 +662,26 @@ fn snapshot_group_and_member() {
                 credential: vec![],
             }],
             required_capabilities: GroupCapabilities::default(),
+            protocol_profile: ProtocolProfile::Current,
             removed: false,
             join_epoch: EpochId(2),
         }
     );
+}
+
+#[test]
+fn key_package_profile_is_persisted_and_old_records_default_to_legacy() {
+    let legacy: KeyPackage = serde_json::from_value(serde_json::json!({
+        "bytes": [1, 2, 3],
+        "source": null
+    }))
+    .unwrap();
+    assert_eq!(legacy.protocol_profile, ProtocolProfile::Legacy);
+
+    let current = KeyPackage::new(vec![4, 5, 6]).with_protocol_profile(ProtocolProfile::Current);
+    let reopened: KeyPackage =
+        serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+    assert_eq!(reopened.protocol_profile, ProtocolProfile::Current);
 }
 
 #[test]

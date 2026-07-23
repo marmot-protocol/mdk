@@ -9,6 +9,20 @@ use crate::capabilities::GroupCapabilities;
 use crate::types::{EpochId, GroupId, MemberId};
 use serde::{Deserialize, Serialize};
 
+/// Wire-compatibility profile governing every protocol decision for a group or
+/// KeyPackage.
+///
+/// Existing persisted records predate this field and therefore deserialize as
+/// [`ProtocolProfile::Legacy`]. Current-profile state is always explicit; code
+/// must not infer a hybrid profile independently for each component.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolProfile {
+    #[default]
+    Legacy,
+    Current,
+}
+
 /// A group, as storage sees it. Mirrors the engine's view of the group's
 /// metadata — not the MLS tree (OpenMLS owns that).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +33,10 @@ pub struct Group {
     pub epoch: EpochId,
     pub members: Vec<Member>,
     pub required_capabilities: GroupCapabilities,
+    /// Persisted wire-compatibility profile for this group. Records written
+    /// before profile classification existed are deterministically legacy.
+    #[serde(default)]
+    pub protocol_profile: ProtocolProfile,
     /// The local copy of this group is marked removed: retained canonical
     /// state records the local member's own removal (spec
     /// `protocol-core/member-departure.md`, "Realizing removal"). The record

@@ -1,6 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for ops talk\".into(), epoch:\n    EpochId(3), members: vec![Member { id: mem_id(), credential: vec![], }],\n    required_capabilities: GroupCapabilities::default(), removed: false,\n    join_epoch: EpochId(2),\n}"
+expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for ops talk\".into(), epoch:\n    EpochId(3), members: vec![Member { id: mem_id(), credential: vec![], }],\n    required_capabilities: GroupCapabilities::default(), protocol_profile:\n    ProtocolProfile::Current, removed: false, join_epoch: EpochId(2),\n}"
 ---
 {
   "id": [
@@ -31,6 +31,7 @@ expression: "Group\n{\n    id: gid(), name: \"ops\".into(), description: \"for o
       "ids": []
     }
   },
+  "protocol_profile": "current",
   "removed": false,
   "join_epoch": 2
 }

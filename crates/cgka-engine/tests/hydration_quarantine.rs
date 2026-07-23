@@ -176,6 +176,7 @@ fn insert_marmot_group_without_openmls_state(
             members: Vec::new(),
             epoch: EpochId(epoch),
             required_capabilities: GroupCapabilities::default(),
+            protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
             removed: false,
             join_epoch: EpochId(0),
         })

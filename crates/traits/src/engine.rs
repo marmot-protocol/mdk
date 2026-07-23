@@ -21,7 +21,7 @@ use crate::app_components::{AppComponentData, AppComponentId};
 use crate::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use crate::engine_state::PendingStateRef;
 use crate::error::EngineError;
-use crate::group::Member;
+use crate::group::{Member, ProtocolProfile};
 use crate::group_context::{GroupContext, SecretBytes};
 use crate::ingest::IngestOutcome;
 use crate::transport::TransportMessage;
@@ -60,6 +60,11 @@ pub struct KeyPackage {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<KeyPackageSource>,
+    /// Persisted wire-compatibility profile. Raw KeyPackages constructed by
+    /// pre-classification callers default to legacy and must still be checked
+    /// against their decoded wire state by the engine.
+    #[serde(default)]
+    pub protocol_profile: ProtocolProfile,
 }
 
 impl KeyPackage {
@@ -67,6 +72,7 @@ impl KeyPackage {
         Self {
             bytes,
             source: None,
+            protocol_profile: ProtocolProfile::Legacy,
         }
     }
 
@@ -74,7 +80,13 @@ impl KeyPackage {
         Self {
             bytes,
             source: Some(KeyPackageSource { event_id }),
+            protocol_profile: ProtocolProfile::Legacy,
         }
+    }
+
+    pub fn with_protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
+        self.protocol_profile = protocol_profile;
+        self
     }
 
     pub fn bytes(&self) -> &[u8] {

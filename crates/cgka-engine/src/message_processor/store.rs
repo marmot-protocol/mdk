@@ -481,6 +481,7 @@ mod tests {
                 epoch: EpochId(3),
                 members: vec![],
                 required_capabilities: Default::default(),
+                protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
                 removed: false,
                 join_epoch: EpochId(0),
             })

@@ -1117,6 +1117,7 @@ async fn drain_surfaces_hydration_quarantine_without_inbound_delivery() {
                 members: Vec::new(),
                 epoch: EpochId(9),
                 required_capabilities: GroupCapabilities::default(),
+                protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
                 removed: false,
                 join_epoch: EpochId(0),
             })

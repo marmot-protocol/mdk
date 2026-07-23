@@ -1,6 +1,6 @@
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::SendIntent;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::storage::QueuedOutboundIntent;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -38,6 +38,7 @@ pub(crate) fn sample_group(id: GroupId, epoch: u64, members: usize) -> Group {
             })
             .collect(),
         required_capabilities: GroupCapabilities::default(),
+        protocol_profile: ProtocolProfile::Legacy,
         removed: false,
         join_epoch: EpochId(0),
     }

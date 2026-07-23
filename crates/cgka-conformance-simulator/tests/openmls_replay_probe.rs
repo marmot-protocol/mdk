@@ -1433,6 +1433,7 @@ fn dummy_group(group_id: GroupId) -> Group {
             credential: vec![1],
         }],
         required_capabilities: GroupCapabilities::default(),
+        protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
         removed: false,
         join_epoch: EpochId(0),
     }
