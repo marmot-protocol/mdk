@@ -207,6 +207,76 @@ fn reopened_storage_preserves_pinned_retention_and_deadline() {
 }
 
 #[test]
+fn finalize_app_event_source_retention_pins_unknown_row_once() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut event = retention_app_event("queued-send", "aa", 100, None, None);
+    event.direction = "sent".to_owned();
+    storage.record_app_event(&event).unwrap();
+
+    let update = storage
+        .finalize_app_event_source_retention("aa", "queued-send", Some("source-queued-send"), 3_600)
+        .unwrap()
+        .expect("finalize should update unknown row");
+    assert_eq!(update.group_id_hex, "aa");
+    assert_eq!(
+        stored_retention(&storage, "queued-send"),
+        (Some(3_600), Some(3_700))
+    );
+
+    assert!(
+        storage
+            .finalize_app_event_source_retention("aa", "queued-send", Some("other-source"), 60,)
+            .unwrap()
+            .is_none(),
+        "already-finalized retention must not be overwritten"
+    );
+    assert_eq!(
+        stored_retention(&storage, "queued-send"),
+        (Some(3_600), Some(3_700))
+    );
+}
+
+#[test]
+fn finalize_disabled_retention_stores_some_zero_without_expiry() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut event = retention_app_event("disabled-send", "aa", 100, None, None);
+    event.direction = "sent".to_owned();
+    storage.record_app_event(&event).unwrap();
+
+    storage
+        .finalize_app_event_source_retention("aa", "disabled-send", Some("source-disabled"), 0)
+        .unwrap()
+        .expect("finalize disabled retention");
+
+    assert_eq!(stored_retention(&storage, "disabled-send"), (Some(0), None));
+}
+
+#[test]
+fn duplicate_record_after_finalize_preserves_first_pinned_retention_fields() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut event = retention_app_event("queued-send", "aa", 100, None, None);
+    event.direction = "sent".to_owned();
+    storage.record_app_event(&event).unwrap();
+    storage
+        .finalize_app_event_source_retention("aa", "queued-send", Some("source-queued-send"), 60)
+        .unwrap();
+
+    storage
+        .record_app_event(&retention_app_event(
+            "queued-send",
+            "aa",
+            100,
+            Some(3_600),
+            Some(3_700),
+        ))
+        .unwrap();
+    assert_eq!(
+        stored_retention(&storage, "queued-send"),
+        (Some(60), Some(160))
+    );
+}
+
+#[test]
 fn full_u64_retention_duration_is_persisted_without_invalidating_message() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     storage

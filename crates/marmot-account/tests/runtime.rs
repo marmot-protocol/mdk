@@ -7,6 +7,10 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
+};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::PeelerError;
@@ -23,7 +27,7 @@ use cgka_traits::{
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
-    KeyPackagePublisher, PendingResolution, StaticTransportRouting,
+    KeyPackagePublisher, PendingResolution, PublishedApplicationMessage, StaticTransportRouting,
 };
 use storage_sqlite::SqlCipherKey;
 
@@ -162,6 +166,18 @@ fn session_with_registry(
     identity: &[u8],
     registry: FeatureRegistry,
 ) -> AccountDeviceSession {
+    session_with_registry_and_components(path, key, identity, registry, default_group_components())
+}
+
+fn session_with_registry_and_components(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+    registry: FeatureRegistry,
+    supported_app_components: std::collections::BTreeSet<
+        cgka_traits::app_components::AppComponentId,
+    >,
+) -> AccountDeviceSession {
     let keys = deterministic_nostr_keys(identity);
     AccountDeviceSession::open(
         SessionConfig::new(
@@ -171,7 +187,8 @@ fn session_with_registry(
             Box::new(MockPeeler),
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
-        .feature_registry(registry),
+        .feature_registry(registry)
+        .supported_app_components(supported_app_components),
     )
     .unwrap()
 }
@@ -204,6 +221,7 @@ struct RecordingAdapterInner {
     syncs: Mutex<Vec<TransportGroupSync>>,
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
+    reported_message_ids: Mutex<VecDeque<MessageId>>,
 }
 
 impl RecordingAdapter {
@@ -217,6 +235,14 @@ impl RecordingAdapter {
             .lock()
             .unwrap()
             .push_back(accepted_count);
+    }
+
+    fn report_message_id_next(&self, message_id: MessageId) {
+        self.inner
+            .reported_message_ids
+            .lock()
+            .unwrap()
+            .push_back(message_id);
     }
 
     fn activations(&self) -> Vec<TransportAccountActivation> {
@@ -266,7 +292,13 @@ impl TransportAdapter for RecordingAdapter {
             .pop_front()
             .unwrap_or_else(|| request.target.endpoints().len());
         Ok(TransportPublishReport {
-            message_id: request.message.id,
+            message_id: self
+                .inner
+                .reported_message_ids
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(request.message.id),
             accepted: request
                 .target
                 .endpoints()
@@ -1297,4 +1329,131 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     // The removal was applied locally: epoch advanced and bob is gone.
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 2);
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
+}
+
+fn app_payload_for(sender_hex: &str, payload: impl AsRef<[u8]>) -> Vec<u8> {
+    MarmotAppEvent::new(
+        sender_hex,
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        String::from_utf8(payload.as_ref().to_vec()).expect("test app payload is utf8"),
+    )
+    .encode()
+    .expect("test app event encodes")
+}
+
+#[tokio::test]
+async fn published_app_messages_carry_exact_identity_and_ignore_proposal_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot published app metadata key").unwrap();
+    let mut supported = default_group_components();
+    supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    let mut alice = session_with_registry_and_components(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice",
+        selfremove_registry(),
+        supported.clone(),
+    );
+    let mut bob = session_with_registry_and_components(
+        dir.path().join("bob.sqlite"),
+        &key,
+        b"bob",
+        selfremove_registry(),
+        supported,
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let alice_hex = hex::encode(alice.self_id().as_slice());
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "published app metadata".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 90u64.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let (create_pending, welcome) = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, welcomes } => (*pending, welcomes[0].clone()),
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.ingest(welcome).await.unwrap();
+
+    let adapter = RecordingAdapter::default();
+    let reported_message_id = MessageId::new(b"adapter-visible-app-message".to_vec());
+    adapter.report_message_id_next(reported_message_id.clone());
+    let adapter_handle = adapter.clone();
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://group.example".into())],
+        );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter,
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    );
+
+    let payload = app_payload_for(&alice_hex, b"typed metadata");
+    let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
+    let effects = runtime
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .unwrap();
+    assert_eq!(effects.published_app_messages.len(), 1);
+    assert_eq!(effects.reports[0].message_id, reported_message_id);
+    assert_ne!(
+        effects.reports[0].message_id,
+        adapter_handle.publishes()[0].message.id,
+        "test adapter must exercise transport id replacement"
+    );
+    assert_eq!(
+        effects.published_app_messages[0],
+        PublishedApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: app_event_id.clone(),
+            message_id: reported_message_id,
+            source_retention_duration_secs: 90,
+        }
+    );
+
+    let leave = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let proposal = match &leave.publish[0] {
+        PublishWork::Proposal { msg, .. } => msg.clone(),
+        other => panic!("expected proposal publish work, got {other:?}"),
+    };
+    let proposal_effects = runtime
+        .publish_session_effects(cgka_session::SessionEffects {
+            events: Vec::new(),
+            publish: vec![PublishWork::Proposal {
+                msg: proposal,
+                queued_intent: None,
+            }],
+            queued: Vec::new(),
+            pending_convergence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        proposal_effects.published_app_messages.is_empty(),
+        "proposal publish reports must not emit typed application-message metadata"
+    );
 }

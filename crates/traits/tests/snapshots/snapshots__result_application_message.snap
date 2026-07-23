@@ -20,6 +20,14 @@ expression: app
           "transport_group_id": []
         }
       }
-    }
+    },
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "app_event_id": "app-event-id",
+    "source_retention_duration_secs": 60
   }
 }

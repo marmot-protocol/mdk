@@ -659,6 +659,9 @@ pub struct AppMessageRecord {
     pub recorded_at: u64,
     /// Local wall-clock time when this device observed or created the row.
     pub received_at: u64,
+    /// Pinned source-epoch retention duration. `None` means legacy/unknown.
+    #[serde(default)]
+    pub source_retention_secs: Option<u64>,
     /// Local `app_events` insert order (rowid). The final LOCAL tiebreak of the
     /// raw-event replay cursor used by lag-recovery watermark/suppression (#630);
     /// not part of the cross-client display order. `#[serde(default)]` keeps
@@ -2797,6 +2800,30 @@ impl MarmotApp {
                 message, now,
             ))?;
         self.app_projection_update(label, storage_update)
+    }
+
+    /// Pin the authenticated source-epoch retention decision for a locally sent
+    /// row that was recorded before its real encryption epoch was known. Only
+    /// rows whose retention is still unknown are updated.
+    pub(crate) fn finalize_account_app_event_source_retention(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        source_message_id_hex: Option<&str>,
+        source_retention_secs: u64,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .finalize_app_event_source_retention(
+                group_id_hex,
+                message_id_hex,
+                source_message_id_hex,
+                source_retention_secs,
+            )?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
     }
 
     pub(crate) fn invalidate_timeline_source_message(

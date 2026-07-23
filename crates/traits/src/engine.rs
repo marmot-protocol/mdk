@@ -138,7 +138,15 @@ pub enum SendIntent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendResult {
     /// Pure application message — publish once, no state advance.
-    ApplicationMessage { msg: TransportMessage },
+    ApplicationMessage {
+        msg: TransportMessage,
+        group_id: GroupId,
+        /// Inner [`MarmotAppEvent::id`] from the encrypted application payload.
+        app_event_id: String,
+        /// Normalized `marmot.group.message-retention.v1` duration from the
+        /// exact MLS group state used for encryption. `0` means disabled.
+        source_retention_duration_secs: u64,
+    },
     /// The engine accepted the local intent but did not publish anything
     /// yet because the group has unresolved convergence input. The intent
     /// will be regenerated from the canonical state when the group becomes

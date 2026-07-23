@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, optional_u64_to_i64, tags_from_json, u64_to_i64,
-    unix_now_seconds,
+    SqliteAccountStorage, SqliteResultExt, i64_to_u64, optional_u64_to_i64, tags_from_json,
+    u64_to_i64, unix_now_seconds,
 };
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
@@ -44,7 +44,7 @@ fn optional_u64_to_sortable_blob(value: Option<u64>) -> Option<Vec<u8>> {
     value.map(|value| value.to_be_bytes().to_vec())
 }
 
-fn optional_u64_from_sortable_blob(
+pub(crate) fn optional_u64_from_sortable_blob(
     value: Option<Vec<u8>>,
     column: usize,
 ) -> rusqlite::Result<Option<u64>> {
@@ -363,6 +363,96 @@ impl SqliteAccountStorage {
         event: &StoredAppEvent,
     ) -> StorageResult<TimelineProjectionUpdate> {
         self.record_app_event_inner(event, true)
+    }
+
+    /// Pin the source-epoch retention decision for a row that was optimistically
+    /// recorded before its real MLS encryption epoch was known (for example a
+    /// queued outbound app message). Only rows whose `source_retention_secs` is
+    /// still `NULL` are updated, so duplicates and retries cannot change an
+    /// already-finalized decision. Expiry is derived from the row's stored
+    /// `recorded_at` plus `source_retention_secs`, never from caller-supplied
+    /// deadlines.
+    pub fn finalize_app_event_source_retention(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        source_message_id_hex: Option<&str>,
+        source_retention_secs: u64,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let recorded_at: Option<i64> = conn
+                .query_row(
+                    "SELECT recorded_at
+                     FROM app_events
+                     WHERE group_id_hex = ?1
+                       AND message_id_hex = ?2
+                       AND source_retention_secs IS NULL",
+                    params![group_id_hex, message_id_hex],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?;
+            let Some(recorded_at) = recorded_at else {
+                return Ok(None);
+            };
+            let recorded_at = i64_to_u64(recorded_at)?;
+            let expiry_timestamp = cgka_traits::app_event::disappearing_message_expiry_timestamp(
+                recorded_at,
+                source_retention_secs,
+            );
+            let updated = conn
+                .execute(
+                    "UPDATE app_events
+                     SET source_message_id_hex = COALESCE(source_message_id_hex, ?3),
+                         source_retention_secs = ?4,
+                         expiry_timestamp = ?5
+                     WHERE group_id_hex = ?1
+                       AND message_id_hex = ?2
+                       AND source_retention_secs IS NULL",
+                    params![
+                        group_id_hex,
+                        message_id_hex,
+                        source_message_id_hex,
+                        optional_u64_to_sortable_blob(Some(source_retention_secs)),
+                        optional_u64_to_sortable_blob(expiry_timestamp),
+                    ],
+                )
+                .storage()?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            let event = app_event_projection_parts_tx(&conn, group_id_hex, message_id_hex)?
+                .ok_or_else(|| {
+                    StorageError::Backend("finalized app event row missing after update".to_owned())
+                })?;
+            let (kind, tags) = event;
+            let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+                &conn,
+                group_id_hex,
+                message_id_hex,
+                kind,
+                &tags,
+            )?;
+            for message_id in &affected_message_ids {
+                upsert_message_timeline_projection_for_message_tx(&conn, group_id_hex, message_id)?;
+            }
+            let messages =
+                timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
+            let changes = timeline_changes_for_event(
+                message_id_hex,
+                kind,
+                &tags,
+                None,
+                &affected_message_ids,
+                &messages,
+            );
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex: group_id_hex.to_owned(),
+                messages,
+                changes,
+            }))
+        })
     }
 
     fn record_app_event_inner(

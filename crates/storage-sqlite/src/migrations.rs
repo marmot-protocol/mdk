@@ -739,6 +739,44 @@ mod tests {
     }
 
     #[test]
+    fn app_event_source_retention_migration_adds_group_expiry_index() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'index'
+                      AND name = 'idx_app_events_group_expiry'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT message_id_hex
+                 FROM app_events
+                 WHERE group_id_hex = ?1
+                   AND expiry_timestamp IS NOT NULL
+                   AND expiry_timestamp <= ?2",
+                params!["aa".repeat(32), vec![0_u8; 8]],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_app_events_group_expiry"),
+            "expected expiry sweep to use partial index, got: {plan}"
+        );
+    }
+
+    #[test]
     fn encrypted_reopen_does_not_reapply_migrations() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");

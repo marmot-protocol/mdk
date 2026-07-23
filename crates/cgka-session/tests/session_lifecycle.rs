@@ -618,10 +618,14 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         settlement_quiescence_ms: 3_600_000,
         ..CanonicalizationPolicy::default()
     });
+    let payload = app_payload_for(&carol, b"queued by session");
+    let app_event_id = cgka_traits::MarmotAppEvent::decode(&payload)
+        .expect("test app event decodes")
+        .id;
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
-            payload: app_payload_for(&carol, b"queued by session"),
+            payload,
         })
         .await
         .unwrap();
@@ -642,11 +646,17 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
                 work,
                 PublishWork::ApplicationMessage {
                     queued_intent: Some(regenerated),
+                    group_id,
+                    app_event_id: published_app_event_id,
+                    source_retention_duration_secs,
                     ..
                 } if regenerated == &queued_intent
+                    && group_id == &created.group_id
+                    && published_app_event_id == &app_event_id
+                    && *source_retention_duration_secs == 0
             )
         }),
-        "expected queued application message to retain its durable intent handle, got {:?}",
+        "expected queued application message to retain its durable intent handle and metadata, got {:?}",
         advanced.publish
     );
     assert!(advanced.queued.is_empty());

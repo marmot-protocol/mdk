@@ -517,7 +517,7 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
     }
     let mut messages = Vec::new();
     match result {
-        SendResult::ApplicationMessage { msg } => {
+        SendResult::ApplicationMessage { msg, .. } => {
             messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
         }
         SendResult::Proposal { msg } => {

@@ -996,6 +996,7 @@ fn latest_agent_stream_start_accepts_mixed_case_filter() {
             source_epoch: None,
             recorded_at: 0,
             received_at: 0,
+            source_retention_secs: None,
             insert_order: 0,
         }],
         Some(&stream_id_hex.to_uppercase()),
@@ -1041,6 +1042,7 @@ fn message_record(message_id_hex: &str, group_id_hex: &str, kind: u64) -> AppMes
         source_epoch: Some(7),
         recorded_at: 11,
         received_at: 12,
+        source_retention_secs: Some(3_600),
         insert_order: 0,
     }
 }
@@ -1070,6 +1072,7 @@ fn recovery_record_maps_chat_message_to_message_update() {
                 Some("Alice")
             );
             assert_eq!(received.message.source_epoch, 7);
+            assert_eq!(received.message.source_retention_secs, Some(3_600));
             assert_eq!(
                 hex::encode(received.message.group_id.as_slice()),
                 group_id_hex
@@ -1115,6 +1118,80 @@ fn recovery_record_drops_undecodable_group_id() {
         &HashMap::new(),
     );
     assert!(update.is_none());
+}
+
+#[test]
+fn recovery_record_preserves_source_retention_secs() {
+    use crate::conversions::app_message_record_from_stored;
+    use storage_sqlite::StoredAppMessageRecord;
+
+    let group_id_hex = "cd".repeat(32);
+    let stored = StoredAppMessageRecord {
+        message_id_hex: "11".repeat(32),
+        direction: "received".to_owned(),
+        group_id_hex: group_id_hex.clone(),
+        sender: "ab".repeat(32),
+        plaintext: "hello".to_owned(),
+        kind: 9,
+        tags: Vec::new(),
+        source_epoch: Some(7),
+        recorded_at: 11,
+        received_at: 12,
+        source_retention_secs: Some(60),
+        insert_order: 42,
+    };
+    let record = app_message_record_from_stored(stored);
+    let update = received_message_update_from_record(
+        "ac".repeat(32).as_str(),
+        "alice",
+        record,
+        &HashMap::new(),
+    )
+    .expect("update");
+
+    match update {
+        RuntimeMessageUpdate::Message(received) => {
+            assert_eq!(received.message.source_retention_secs, Some(60));
+        }
+        other => panic!("expected Message update, got {other:?}"),
+    }
+}
+
+#[test]
+fn recovery_record_preserves_none_source_retention_secs() {
+    use crate::conversions::app_message_record_from_stored;
+    use storage_sqlite::StoredAppMessageRecord;
+
+    let group_id_hex = "cd".repeat(32);
+    let stored = StoredAppMessageRecord {
+        message_id_hex: "11".repeat(32),
+        direction: "received".to_owned(),
+        group_id_hex,
+        sender: "ab".repeat(32),
+        plaintext: "hello".to_owned(),
+        kind: 9,
+        tags: Vec::new(),
+        source_epoch: Some(7),
+        recorded_at: 11,
+        received_at: 12,
+        source_retention_secs: None,
+        insert_order: 42,
+    };
+    let record = app_message_record_from_stored(stored);
+    let update = received_message_update_from_record(
+        "ac".repeat(32).as_str(),
+        "alice",
+        record,
+        &HashMap::new(),
+    )
+    .expect("update");
+
+    match update {
+        RuntimeMessageUpdate::Message(received) => {
+            assert_eq!(received.message.source_retention_secs, None);
+        }
+        other => panic!("expected Message update, got {other:?}"),
+    }
 }
 
 #[test]

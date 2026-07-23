@@ -8,7 +8,6 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MarmotAppEvent as MarmotInnerEvent,
 };
 
-use crate::conversions::pinned_source_epoch_retention;
 use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group};
 use crate::{
     AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
@@ -39,11 +38,11 @@ impl AppClient {
         // resurrecting the target.
         let moderation_grant = event.kind == MARMOT_APP_EVENT_KIND_DELETE
             && self.delete_moderation_grant(group_id, sender);
-        let retention = self.message_retention_for_group(group_id);
-        let (source_retention_secs, expiry_timestamp) = pinned_source_epoch_retention(
-            Some(retention.disappearing_message_secs),
-            event.created_at,
-        );
+        // Retention is pinned only after the MLS encryption epoch is known. The
+        // optimistic pre-send row and any queued-but-not-yet-published send stay
+        // unknown until publish reports arrive and
+        // `finalize_published_app_message_source_retention` runs.
+        let (source_retention_secs, expiry_timestamp) = (None, None);
         let message_projection = AppMessageProjection {
             message_id_hex: event.id.clone(),
             source_message_id_hex,
@@ -213,6 +212,27 @@ impl AppClient {
             .flatten()
             .map(|bytes| AppGroupMessageRetentionComponent::from_bytes(&bytes))
             .unwrap_or_else(AppGroupMessageRetentionComponent::disabled)
+    }
+
+    pub(crate) fn finalize_published_app_message_source_retention(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        let mut updates = Vec::new();
+        for published in &effects.published_app_messages {
+            let group_id_hex = hex::encode(published.group_id.as_slice());
+            let source_message_id_hex = hex::encode(published.message_id.as_slice());
+            if let Some(update) = self.app.finalize_account_app_event_source_retention(
+                &self.state.label,
+                &group_id_hex,
+                &published.app_event_id,
+                Some(source_message_id_hex.as_str()),
+                published.source_retention_duration_secs,
+            )? {
+                updates.push(update);
+            }
+        }
+        Ok(updates)
     }
 
     pub(crate) fn prune_plaintext_retention_for_group(

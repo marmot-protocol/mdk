@@ -352,8 +352,50 @@ where
 
         while let Some(work) = queue.pop_front() {
             match work {
-                PublishWork::ApplicationMessage { msg, queued_intent }
-                | PublishWork::Proposal { msg, queued_intent } => {
+                PublishWork::ApplicationMessage {
+                    msg,
+                    queued_intent,
+                    group_id,
+                    app_event_id,
+                    source_retention_duration_secs,
+                } => {
+                    let reports_before = output.reports.len();
+                    let status = self.publish_one(msg, &mut output, context.clone()).await?;
+                    if status.accepted_by_any_endpoint {
+                        // Transport adapters may replace the pre-wrap message id
+                        // with the externally visible id (for example a Nostr
+                        // event id). `publish_one` appends exactly one report
+                        // before deriving an accepted status.
+                        if let Some(message_id) = output
+                            .reports
+                            .get(reports_before)
+                            .map(|report| report.message_id.clone())
+                        {
+                            output
+                                .published_app_messages
+                                .push(PublishedApplicationMessage {
+                                    group_id,
+                                    app_event_id,
+                                    message_id,
+                                    source_retention_duration_secs,
+                                });
+                        } else {
+                            // Defensive safe fallback: without the adapter's
+                            // externally visible id, leave the local retention
+                            // decision unknown rather than pinning a mismatched
+                            // row. This branch is unreachable under
+                            // `publish_one`'s report-before-status contract.
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                method = "publish_session_effects_with_audit_context",
+                                error_kind = "accepted_app_publish_report_missing",
+                                "accepted application publish had no transport report"
+                            );
+                        }
+                    }
+                    self.resolve_regenerated_queued_intent(queued_intent, status);
+                }
+                PublishWork::Proposal { msg, queued_intent } => {
                     let status = self.publish_one(msg, &mut output, context.clone()).await?;
                     self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
@@ -882,6 +924,16 @@ fn publish_wire_metadata(message: &TransportMessage) -> AuditTransportWire {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedApplicationMessage {
+    pub group_id: cgka_traits::GroupId,
+    pub app_event_id: String,
+    pub message_id: cgka_traits::MessageId,
+    /// Normalized `marmot.group.message-retention.v1` duration from the MLS
+    /// encryption epoch. `0` means disabled.
+    pub source_retention_duration_secs: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccountDeviceEffects {
     pub events: Vec<GroupEvent>,
@@ -889,6 +941,10 @@ pub struct AccountDeviceEffects {
     pub pending_convergence: Vec<GroupId>,
     pub reports: Vec<TransportPublishReport>,
     pub failures: Vec<PublishFailure>,
+    /// Application messages accepted by at least one transport endpoint,
+    /// carrying the exact inner app-event identity and source-epoch retention
+    /// decision from encryption time.
+    pub published_app_messages: Vec<PublishedApplicationMessage>,
     /// Welcomes whose publish failed after their commit/create was already
     /// confirmed. Unlike `failures`, each entry carries the recipient and
     /// group so the caller can re-deliver the stored welcome via

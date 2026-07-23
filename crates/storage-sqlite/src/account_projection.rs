@@ -1,6 +1,7 @@
 use crate::{
     SqliteAccountStorage, SqliteResultExt, bool_i64, connection::retry_on_busy, tags_from_json,
-    unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
+    timeline::optional_u64_from_sortable_blob, unix_now_ms, unix_now_seconds, unix_now_seconds_i64,
+    usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{
@@ -104,6 +105,8 @@ pub struct StoredAppMessageRecord {
     pub source_epoch: Option<u64>,
     pub recorded_at: u64,
     pub received_at: u64,
+    /// Pinned source-epoch retention duration. `None` means legacy/unknown.
+    pub source_retention_secs: Option<u64>,
     /// Local `app_events` insert order (rowid). The final, LOCAL tiebreak of the
     /// raw-event replay ordering; see [`AppEventReplayCursor`]. Never used for
     /// cross-client display order (that is the materialized-timeline surface).
@@ -122,9 +125,9 @@ impl StoredAppMessageRecord {
 }
 
 /// Column list for [`SqliteAccountStorage::app_messages`], ending in
-/// `insert_order` (column index 10, read by `app_message_from_row`).
+/// `insert_order` (column index 11, read by `app_message_from_row`).
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
-     kind, tags_json, source_epoch, recorded_at, received_at, insert_order";
+     kind, tags_json, source_epoch, recorded_at, received_at, source_retention_secs, insert_order";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
 /// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
@@ -1572,7 +1575,8 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
             .and_then(|value| value.try_into().ok()),
         recorded_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
         received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        insert_order: row.get::<_, i64>(10)?,
+        source_retention_secs: optional_u64_from_sortable_blob(row.get(10)?, 10)?,
+        insert_order: row.get::<_, i64>(11)?,
     })
 }
 

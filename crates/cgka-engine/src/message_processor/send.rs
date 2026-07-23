@@ -771,9 +771,11 @@ impl<S: StorageProvider> Engine<S> {
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
+        let source_retention_duration_secs =
+            crate::app_components::message_retention_duration_secs_of_group(&mls_group)?;
         let wrap_metadata = GroupMessageMetadata::application(
             app_event.created_at,
-            crate::app_components::message_retention_seconds_of_group(&mls_group)?,
+            (source_retention_duration_secs != 0).then_some(source_retention_duration_secs),
         );
 
         let out: MlsMessageOut = mls_group
@@ -805,7 +807,12 @@ impl<S: StorageProvider> Engine<S> {
             EpochId(mls_group.epoch().as_u64()),
         )?;
 
-        Ok(SendResult::ApplicationMessage { msg: wrapped })
+        Ok(SendResult::ApplicationMessage {
+            msg: wrapped,
+            group_id,
+            app_event_id: app_event.id,
+            source_retention_duration_secs,
+        })
     }
 }
 

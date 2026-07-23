@@ -20,6 +20,9 @@ pub struct AppMessageRecordFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    /// Retention duration pinned from the message's MLS source epoch. `None`
+    /// means the historical policy is unavailable and the row is preserved.
+    pub source_retention_secs: Option<u64>,
     /// Sender-authenticated inner app-event timestamp.
     pub recorded_at: u64,
     /// Local wall-clock time when this device observed the delivery.
@@ -38,6 +41,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
+            source_retention_secs: value.source_retention_secs,
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }
@@ -71,6 +75,9 @@ pub struct ReceivedMessageFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    /// Retention duration pinned from the message's MLS source epoch. `None`
+    /// means the historical policy is unavailable and the row is preserved.
+    pub source_retention_secs: Option<u64>,
     /// Sender-authenticated inner app-event timestamp (seconds since epoch).
     pub recorded_at: u64,
     /// Local wall-clock time when this device observed the delivery.
@@ -88,6 +95,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
+            source_retention_secs: value.source_retention_secs,
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }

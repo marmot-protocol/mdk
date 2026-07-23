@@ -578,6 +578,7 @@ impl LegacyAccountProjectionDb {
                     .and_then(|value| value.try_into().ok()),
                 recorded_at: recorded_at.try_into().unwrap_or_default(),
                 received_at: received_at.try_into().unwrap_or_default(),
+                source_retention_secs: None,
                 // Frozen legacy migration reader (the old `messages` table): its
                 // records are re-inserted into `app_events` with fresh rowids by
                 // the one-time migration and are never used as a replay cursor, so

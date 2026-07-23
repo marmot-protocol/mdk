@@ -463,6 +463,9 @@ fn snapshot_send_results() {
                 transport_group_id: vec![],
             },
         },
+        group_id: gid(),
+        app_event_id: "app-event-id".into(),
+        source_retention_duration_secs: 60,
     };
     insta::assert_json_snapshot!("result_application_message", app);
     insta::assert_json_snapshot!(

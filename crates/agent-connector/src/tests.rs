@@ -3164,6 +3164,7 @@ fn received_chat_record(
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
         source_epoch: Some(1),
+        source_retention_secs: None,
         recorded_at: 100,
         received_at: 100,
         insert_order: 0,

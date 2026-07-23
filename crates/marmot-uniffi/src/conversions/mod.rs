@@ -49,8 +49,8 @@ mod tests {
     use super::*;
     use crate::markdown::{MarkdownBlockFfi, MarkdownDocumentFfi, MarkdownInlineFfi};
     use marmot_app::{
-        AppMessageRecord, SecureDeleteExpiredResult, TimelineMessageRecord, TimelinePage,
-        TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+        AppMessageRecord, ReceivedMessage, SecureDeleteExpiredResult, TimelineMessageRecord,
+        TimelinePage, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     };
     use std::collections::BTreeMap;
 
@@ -388,6 +388,7 @@ mod tests {
             kind: 7,
             tags: vec![vec!["e".to_owned(), "target".to_owned()]],
             source_epoch: None,
+            source_retention_secs: Some(60),
             recorded_at: 10,
             received_at: 11,
             insert_order: 0,
@@ -396,7 +397,30 @@ mod tests {
         let ffi = AppMessageRecordFfi::from(record);
 
         assert_eq!(ffi.kind, 7);
+        assert_eq!(ffi.source_retention_secs, Some(60));
         assert_eq!(ffi.content_tokens, MarkdownDocumentFfi::default());
+    }
+
+    #[test]
+    fn received_message_ffi_preserves_source_retention() {
+        let message = ReceivedMessage {
+            message_id_hex: "message-1".to_owned(),
+            source_message_id_hex: "source-1".to_owned(),
+            sender: "aa".repeat(32),
+            sender_display_name: Some("Alice".to_owned()),
+            group_id: cgka_traits::GroupId::new(vec![0x11; 16]),
+            source_epoch: 7,
+            source_retention_secs: Some(3_600),
+            plaintext: "hello".to_owned(),
+            kind: 9,
+            tags: Vec::new(),
+            recorded_at: 10,
+            received_at: 11,
+        };
+
+        let ffi = ReceivedMessageFfi::from(&message);
+
+        assert_eq!(ffi.source_retention_secs, Some(3_600));
     }
 
     #[test]

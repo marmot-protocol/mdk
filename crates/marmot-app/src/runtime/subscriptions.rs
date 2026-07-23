@@ -1433,7 +1433,7 @@ pub(crate) fn received_message_update_from_record(
         sender_display_name,
         group_id,
         source_epoch: record.source_epoch.unwrap_or(0),
-        source_retention_secs: None,
+        source_retention_secs: record.source_retention_secs,
         plaintext: record.plaintext,
         kind: record.kind,
         tags: record.tags,

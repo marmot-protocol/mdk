@@ -103,3 +103,92 @@ fn legacy_rows_with_source_epoch_but_unknown_retention_are_preserved() {
         .unwrap();
     assert_eq!(outcome.pruned_messages, 0);
 }
+
+fn stored_retention_via_query(
+    app: &MarmotApp,
+    label: &str,
+    group_id_hex: &str,
+    message_id: &str,
+) -> (Option<u64>, Option<u64>) {
+    let storage = app.account_storage(label).unwrap();
+    let events = storage
+        .app_messages(storage_sqlite::StoredAppMessageQuery {
+            group_id_hex: Some(group_id_hex.to_owned()),
+            limit: None,
+        })
+        .unwrap();
+    let record = events
+        .into_iter()
+        .find(|event| event.message_id_hex == message_id)
+        .expect("message row");
+    (record.source_retention_secs, None)
+}
+
+#[test]
+fn queued_sent_row_finalizes_from_actual_encryption_epoch_short_to_long() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let storage = app.account_storage("alice").unwrap();
+    let mut optimistic = retention_event("queued-short-to-long", 100, 60);
+    optimistic.direction = "sent".to_owned();
+    optimistic.source_retention_secs = None;
+    optimistic.expiry_timestamp = None;
+    optimistic.source_message_id_hex = None;
+    storage.record_app_event(&optimistic).unwrap();
+
+    app.finalize_account_app_event_source_retention(
+        "alice",
+        "aa",
+        "queued-short-to-long",
+        Some("mls-source"),
+        3_600,
+    )
+    .unwrap()
+    .expect("finalize");
+
+    assert_eq!(
+        stored_retention_via_query(&app, "alice", "aa", "queued-short-to-long").0,
+        Some(3_600)
+    );
+    storage
+        .record_app_event(&retention_event("queued-short-to-long", 100, 60))
+        .unwrap();
+    assert_eq!(
+        stored_retention_via_query(&app, "alice", "aa", "queued-short-to-long").0,
+        Some(3_600)
+    );
+}
+
+#[test]
+fn queued_sent_row_finalizes_from_actual_encryption_epoch_long_to_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let storage = app.account_storage("alice").unwrap();
+    let mut optimistic = retention_event("queued-long-to-short", 100, 3_600);
+    optimistic.direction = "sent".to_owned();
+    optimistic.source_retention_secs = None;
+    optimistic.expiry_timestamp = None;
+    optimistic.source_message_id_hex = None;
+    storage.record_app_event(&optimistic).unwrap();
+
+    app.finalize_account_app_event_source_retention(
+        "alice",
+        "aa",
+        "queued-long-to-short",
+        Some("mls-source"),
+        60,
+    )
+    .unwrap()
+    .expect("finalize");
+
+    assert_eq!(
+        stored_retention_via_query(&app, "alice", "aa", "queued-long-to-short").0,
+        Some(60)
+    );
+    let outcome = storage.secure_prune_expired_app_events("aa", 200).unwrap();
+    assert_eq!(outcome.pruned_messages, 1);
+}

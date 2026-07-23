@@ -1212,6 +1212,7 @@ impl AppClient {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
         self.remember_published_reports(&effects);
+        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         let source_message_id_hex = effects
             .reports
             .first()
@@ -1724,6 +1725,7 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_published_reports(&effects);
+        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;

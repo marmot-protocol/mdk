@@ -9,6 +9,9 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         r#"
 ALTER TABLE app_events ADD COLUMN source_retention_secs BLOB;
 ALTER TABLE app_events ADD COLUMN expiry_timestamp BLOB;
+CREATE INDEX IF NOT EXISTS idx_app_events_group_expiry
+    ON app_events(group_id_hex, expiry_timestamp)
+    WHERE expiry_timestamp IS NOT NULL;
 "#,
     )
     .storage()

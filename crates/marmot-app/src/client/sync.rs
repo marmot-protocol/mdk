@@ -326,7 +326,13 @@ impl AppClient {
         self.remember_buffered_convergence_outcome(&effects.outcome);
         self.remember_pending_convergence_effects(&effects.effects);
         self.remember_transport_cursor(outer_transport_at);
-        self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
+        self.detect_epoch_stall(
+            group_id_hint.clone(),
+            &source_message_id_hex,
+            &effects.outcome,
+        );
+        let _finalize_updates =
+            self.finalize_published_app_message_source_retention(&effects.effects)?;
         self.observe_account_device_effects(
             &effects.effects,
             display_names,
@@ -430,6 +436,7 @@ impl AppClient {
         fail_if_publish_failed(&effects)?;
         self.remember_pending_convergence_effects(&effects);
         self.remember_published_reports(&effects);
+        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;

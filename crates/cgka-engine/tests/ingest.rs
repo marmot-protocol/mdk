@@ -478,6 +478,63 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
 }
 
 #[tokio::test]
+async fn send_app_message_returns_exact_app_event_identity_and_source_retention() {
+    let mut supported = default_group_components();
+    supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice-metadata"))
+        .account_identity_proof_signer(proof_signer(b"alice-metadata"))
+        .feature_registry(selfremove_registry())
+        .supported_app_components(supported)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "metadata".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match created {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("unexpected create result: {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let payload = app_payload_for(&alice, b"identity check");
+    let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .unwrap();
+    match sent {
+        SendResult::ApplicationMessage {
+            group_id: sent_group_id,
+            app_event_id: sent_app_event_id,
+            source_retention_duration_secs,
+            ..
+        } => {
+            assert_eq!(sent_group_id, group_id);
+            assert_eq!(sent_app_event_id, app_event_id);
+            assert_eq!(source_retention_duration_secs, 60);
+        }
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn delayed_app_message_uses_authenticated_source_epoch_retention() {
     let mut supported = default_group_components();
     supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
@@ -533,7 +590,7 @@ async fn delayed_app_message_uses_authenticated_source_epoch_retention() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -632,7 +689,7 @@ async fn delayed_app_message_keeps_long_source_epoch_retention_after_policy_shor
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -874,7 +931,7 @@ async fn peel_deferred_message_retries_instead_of_short_circuiting() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -965,7 +1022,7 @@ async fn malformed_group_message_is_stale_and_does_not_wedge_ingest() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1050,7 +1107,7 @@ async fn post_peel_malformed_mls_message_is_terminal_and_does_not_wedge_ingest()
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1256,7 +1313,7 @@ async fn malformed_via_snapshot_fallback_is_stale_and_does_not_wedge_ingest() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1309,7 +1366,7 @@ async fn ingest_own_created_message_returns_own_echo() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => unreachable!(),
     };
 
@@ -1371,7 +1428,7 @@ async fn buffered_legacy_own_echo_retires_raw_retry_row() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     let own_content_id = content_id(&own_message);
@@ -1494,7 +1551,7 @@ async fn rewrapped_own_openmls_message_after_restart_returns_own_echo() {
             .await
             .unwrap()
         {
-            SendResult::ApplicationMessage { msg } => msg,
+            SendResult::ApplicationMessage { msg, .. } => msg,
             _ => unreachable!(),
         };
     }
@@ -1653,7 +1710,7 @@ async fn send_app_message_round_trips_to_another_client() {
         .unwrap();
 
     let msg = match send_res {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => panic!("expected ApplicationMessage"),
     };
 
@@ -1717,7 +1774,7 @@ async fn inbound_group_message_during_pending_publish_replays_after_rollback() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1815,7 +1872,7 @@ async fn buffered_retryable_peer_message_is_retired_terminal_after_replay() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => TransportMessage {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
             envelope: TransportEnvelope::GroupMessage {
                 transport_group_id: group_id.as_slice().to_vec(),
             },
@@ -1956,7 +2013,7 @@ async fn rewrapped_mls_message_with_new_transport_id_is_a_duplicate() {
         .await
         .unwrap()
     {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         _ => unreachable!(),
     };
 
@@ -2029,7 +2086,7 @@ async fn distinct_mls_messages_are_not_collapsed_by_content_dedup() {
             .await
             .unwrap()
         {
-            SendResult::ApplicationMessage { msg } => msg,
+            SendResult::ApplicationMessage { msg, .. } => msg,
             _ => unreachable!(),
         };
         let routed = TransportMessage {

@@ -289,6 +289,22 @@ fn build_client_with_storage(
         .unwrap()
 }
 
+fn build_client_with_supported_components(
+    id: &[u8],
+    supported: std::collections::BTreeSet<AppComponentId>,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .feature_registry(selfremove_registry())
+        .supported_app_components(supported)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
 fn build_client_with_max_past_epochs(
     id: &[u8],
     storage: SqliteAccountStorage,
@@ -4230,7 +4246,7 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
 
     assert_eq!(drained.len(), 1);
     let sent_app = match &drained[0] {
-        SendResult::ApplicationMessage { msg } => route(msg.clone(), &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg.clone(), &group_id),
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
@@ -4256,6 +4272,125 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
             .unwrap()
             .is_empty()
     );
+}
+
+async fn assert_regenerated_queued_application_message_uses_updated_retention(
+    initial_retention_secs: u64,
+    updated_retention_secs: u64,
+) {
+    use cgka_traits::app_components::{
+        AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
+    };
+
+    let mut supported = default_group_components();
+    supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    let (mut alice, _alice_storage) =
+        build_client_with_supported_components(b"alice", supported.clone());
+    let (mut bob, _bob_storage) = build_client_with_supported_components(b"bob", supported.clone());
+    let (mut carol, carol_storage) =
+        build_client_with_supported_components(b"carol", supported.clone());
+    let (mut david, _david_storage) = build_client_with_supported_components(b"david", supported);
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "queued-retention-metadata".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: initial_retention_secs.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, invite_pending) = evolution(invite);
+    let commit = route(commit, &group_id);
+    alice.confirm_published(invite_pending).await.unwrap();
+    assert!(matches!(
+        carol.ingest(commit.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+
+    let payload = app_payload_for(&carol, b"queued retention metadata");
+    let app_event_id = MarmotAppEvent::decode(&payload).unwrap().id;
+    let queued = carol
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(queued, SendResult::Queued { .. }));
+
+    let retention_update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: updated_retention_secs.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (retention_commit, retention_pending) = evolution(retention_update);
+    let retention_commit = route(retention_commit, &group_id);
+    alice.confirm_published(retention_pending).await.unwrap();
+    assert!(matches!(
+        carol.ingest(retention_commit).await.unwrap(),
+        IngestOutcome::Buffered { .. } | IngestOutcome::Processed
+    ));
+
+    let drained = carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+    match &drained[0] {
+        SendResult::ApplicationMessage {
+            app_event_id: sent_app_event_id,
+            source_retention_duration_secs,
+            ..
+        } => {
+            assert_eq!(sent_app_event_id, &app_event_id);
+            assert_eq!(*source_retention_duration_secs, updated_retention_secs);
+        }
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    }
+    assert_eq!(
+        carol_storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn regenerated_queued_application_message_carries_encryption_epoch_retention_metadata() {
+    assert_regenerated_queued_application_message_uses_updated_retention(3_600, 60).await;
+    assert_regenerated_queued_application_message_uses_updated_retention(60, 3_600).await;
 }
 
 /// mdk#736: a convergence input whose source epoch is beyond the FUTURE horizon
@@ -4695,7 +4830,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
         .unwrap();
 
     let sent_app = match sent {
-        SendResult::ApplicationMessage { msg } => route(msg, &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg, &group_id),
         other => panic!("expected ApplicationMessage after catch-up, got {other:?}"),
     };
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
@@ -5082,7 +5217,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
 
     assert_eq!(drained.len(), 1);
     let sent_app = match &drained[0] {
-        SendResult::ApplicationMessage { msg } => route(msg.clone(), &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg.clone(), &group_id),
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     assert_eq!(engine.epoch(&group_id).unwrap(), EpochId(2));
@@ -5399,7 +5534,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
 
     assert_eq!(drained.len(), 1);
     let sent_app = match &drained[0] {
-        SendResult::ApplicationMessage { msg } => route(msg.clone(), &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg.clone(), &group_id),
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
@@ -5470,7 +5605,7 @@ async fn send_app(
         .await
         .expect("send app");
     match result {
-        SendResult::ApplicationMessage { msg } => route(msg, group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg, group_id),
         other => panic!("expected app message, got {other:?}"),
     }
 }
