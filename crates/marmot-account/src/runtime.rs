@@ -547,7 +547,9 @@ where
                 .push(PendingResolution::Confirmed { pending });
             output.absorb_session_effects(effects, queue);
             for failure in &mut welcome_failures {
-                failure.group_id = group_id.clone();
+                if failure.group_id.is_none() {
+                    failure.group_id = group_id.clone();
+                }
             }
             // Only a confirmed create leaves welcomes worth re-delivering; a
             // rolled-back create discards the whole evolution, welcomes
@@ -845,10 +847,13 @@ fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
 
 /// Extract the group id from the event that confirms a create/evolution.
 ///
-/// `confirm_published` emits exactly one `GroupCreated` or `EpochChanged`
-/// event for the pending operation. Keeping this best-effort preserves the
-/// existing `WelcomeDeliveryFailure::group_id` contract without re-reading the
-/// durable sent-welcome record.
+/// Session effects are drained after every session call, so the confirmation
+/// effects contain exactly one `GroupCreated` or `EpochChanged` for this
+/// pending operation rather than events left by earlier work. This per-call
+/// drain is load-bearing: batching effects across calls would require matching
+/// the event to the pending operation explicitly. Keeping extraction
+/// best-effort preserves the existing `WelcomeDeliveryFailure::group_id`
+/// contract without re-reading the durable sent-welcome record.
 fn confirmed_group_id(effects: &SessionEffects) -> Option<GroupId> {
     effects.events.iter().find_map(|event| match event {
         GroupEvent::GroupCreated { group_id } | GroupEvent::EpochChanged { group_id, .. } => {
