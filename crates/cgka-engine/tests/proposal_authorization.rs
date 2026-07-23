@@ -1003,6 +1003,17 @@ async fn invalid_external_join_signature_returns_invalid_signature_rejection() {
         ),
         "cryptographic proposal-signature failure must map to InvalidSignature, got {outcome:?}"
     );
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, _alice_storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load alice group")
+        .expect("alice group present");
+    assert!(
+        mls_group.pending_proposals().next().is_none(),
+        "invalid-signature external join must not enter OpenMLS pending state"
+    );
 }
 
 fn evolution(msg: SendResult) -> (TransportMessage, cgka_traits::engine_state::PendingStateRef) {
@@ -1129,12 +1140,7 @@ async fn convergence_rejects_external_join_proposal_before_pending_store() {
     let group_id = three_member_group(&mut alice, &mut bob, &mut carol).await;
     let epoch = carol.epoch(&group_id).unwrap().0;
     let proposal = external_join_proposal(&group_id, epoch);
-    let routed = TransportMessage {
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-        ..proposal
-    };
+    let routed = route(proposal, &group_id);
     let proposal_id = canonicalization_message_id(&routed);
     let proposal_message_id = content_dedup_message_id(&routed);
     carol
@@ -1212,12 +1218,7 @@ async fn parent_dependent_proposal_auth_deferred_until_retained_fork_replay() {
         .unwrap();
     let (alice_commit, alice_pending) = evolution(alice_invite);
     alice.confirm_published(alice_pending).await.unwrap();
-    let alice_commit = TransportMessage {
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-        ..alice_commit
-    };
+    let alice_commit = route(alice_commit, &group_id);
     carol
         .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
         .expect("buffer alice branch commit");
@@ -1243,12 +1244,7 @@ async fn parent_dependent_proposal_auth_deferred_until_retained_fork_replay() {
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
     bob.confirm_published(bob_pending).await.unwrap();
-    let bob_commit = TransportMessage {
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-        ..bob_commit
-    };
+    let bob_commit = route(bob_commit, &group_id);
     let eve_welcome = bob_welcomes
         .into_iter()
         .find(|welcome| {
