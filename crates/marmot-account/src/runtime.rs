@@ -527,6 +527,7 @@ where
                     welcome_failures.push(self.welcome_delivery_failure(
                         welcome_id,
                         recipient,
+                        None,
                         output,
                         failures_before,
                     ));
@@ -540,10 +541,14 @@ where
 
         if all_published || any_welcome_exposed {
             let effects = self.confirm_published_retrying(pending).await?;
+            let group_id = confirmed_group_id(&effects);
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
             output.absorb_session_effects(effects, queue);
+            for failure in &mut welcome_failures {
+                failure.group_id = group_id.clone();
+            }
             // Only a confirmed create leaves welcomes worth re-delivering; a
             // rolled-back create discards the whole evolution, welcomes
             // included.
@@ -574,6 +579,7 @@ where
             // the sender from peers that ingest it, so treat unreached endpoints
             // as recoverable and proceed with welcome publication.
             let effects = self.confirm_published_retrying(pending).await?;
+            let group_id = confirmed_group_id(&effects);
             output
                 .pending
                 .push(PendingResolution::Confirmed { pending });
@@ -591,6 +597,7 @@ where
                         let failure = self.welcome_delivery_failure(
                             welcome_id,
                             recipient,
+                            group_id.clone(),
                             output,
                             failures_before,
                         );
@@ -630,13 +637,13 @@ where
         if !status.met_required_acks
             && let Some(recipient) = recipient
         {
-            let mut failure = self.welcome_delivery_failure(
+            let failure = self.welcome_delivery_failure(
                 message_id.clone(),
                 recipient,
+                Some(group_id),
                 &output,
                 failures_before,
             );
-            failure.group_id = Some(group_id);
             output.welcome_failures.push(failure);
         }
         Ok(output)
@@ -648,6 +655,7 @@ where
         &self,
         message_id: cgka_traits::MessageId,
         recipient: MemberId,
+        group_id: Option<GroupId>,
         output: &AccountDeviceEffects,
         failures_before: usize,
     ) -> WelcomeDeliveryFailure {
@@ -660,11 +668,6 @@ where
             .and_then(<[PublishFailure]>::last)
             .map(|failure| failure.reason.clone())
             .unwrap_or_else(|| "welcome publish failed".into());
-        let group_id = self
-            .session
-            .stored_sent_welcome(&message_id)
-            .ok()
-            .map(|(group_id, _)| group_id);
         WelcomeDeliveryFailure {
             message_id,
             recipient,
@@ -840,6 +843,21 @@ fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
     }
 }
 
+/// Extract the group id from the event that confirms a create/evolution.
+///
+/// `confirm_published` emits exactly one `GroupCreated` or `EpochChanged`
+/// event for the pending operation. Keeping this best-effort preserves the
+/// existing `WelcomeDeliveryFailure::group_id` contract without re-reading the
+/// durable sent-welcome record.
+fn confirmed_group_id(effects: &SessionEffects) -> Option<GroupId> {
+    effects.events.iter().find_map(|event| match event {
+        GroupEvent::GroupCreated { group_id } | GroupEvent::EpochChanged { group_id, .. } => {
+            Some(group_id.clone())
+        }
+        _ => None,
+    })
+}
+
 /// Build the outbound transport wire envelope for a publish, from the message's
 /// transport source and (for group messages) the transport-visible group id.
 /// Transport-generic: the post-wrap relay event id and ephemeral pubkey are
@@ -909,7 +927,8 @@ pub struct PublishFailure {
 pub struct WelcomeDeliveryFailure {
     pub message_id: cgka_traits::MessageId,
     pub recipient: MemberId,
-    /// From the stored sent-welcome record; best-effort.
+    /// From the already-known confirmation or stored sent-welcome record;
+    /// best-effort.
     pub group_id: Option<GroupId>,
     pub reason: String,
 }
