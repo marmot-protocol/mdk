@@ -26,18 +26,18 @@ report() {
 }
 
 # One-word and two-word project-name forms, any case.
-if hits="$(rg --hidden --glob '!.git' -n -i 'dark[- ]?matter' "${HISTORY_EXCLUDES[@]}" . 2>/dev/null)" && [ -n "$hits" ]; then
+if hits="$(rg --hidden --glob '!.git' --glob '!.claude' -n -i 'dark[- ]?matter' "${HISTORY_EXCLUDES[@]}" . 2>/dev/null)" && [ -n "$hits" ]; then
     report 'darkmatter / dark matter' "$hits"
 fi
 
 # Retired binary/artifact tokens. No legitimate uses remain anywhere.
-if hits="$(rg --hidden --glob '!.git' -n '\bdmd\b|dm-agent|dm_agent|\bDM Agent\b|\bDM_[A-Z]' "${HISTORY_EXCLUDES[@]}" . 2>/dev/null)" && [ -n "$hits" ]; then
+if hits="$(rg --hidden --glob '!.git' --glob '!.claude' -n '\bdmd\b|dm-agent|dm_agent|\bDM Agent\b|\bDM_[A-Z]' "${HISTORY_EXCLUDES[@]}" . 2>/dev/null)" && [ -n "$hits" ]; then
     report 'dmd / dm-agent / DM_* tokens' "$hits"
 fi
 
 # Bare "dm" word (the retired CLI binary). Excluded under integrations/,
 # where standalone `dm` keys mean direct-message config (dm.allowFrom).
-if hits="$(rg --hidden --glob '!.git' -n '\bdm\b' "${HISTORY_EXCLUDES[@]}" --glob '!integrations/**' . 2>/dev/null)" && [ -n "$hits" ]; then
+if hits="$(rg --hidden --glob '!.git' --glob '!.claude' -n '\bdm\b' "${HISTORY_EXCLUDES[@]}" --glob '!integrations/**' . 2>/dev/null)" && [ -n "$hits" ]; then
     report 'bare dm word' "$hits"
 fi
 
