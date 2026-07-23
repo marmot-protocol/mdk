@@ -220,6 +220,12 @@ impl<S: StorageProvider> Engine<S> {
                 group_id,
                 staged_commit,
             )?;
+            crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                staged_commit,
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
         }
         let commit_bytes = commit_out
             .tls_serialize_detached()

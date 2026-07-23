@@ -11,6 +11,7 @@ use cgka_traits::capabilities::{
     Capability as CTCapability, Feature, GroupCapabilities, RequirementLevel, TransportKind,
 };
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
 use openmls::extensions::RequiredCapabilitiesExtension;
 use openmls::prelude::{Capabilities, ExtensionType, ProposalType};
 use openmls_traits::types::Ciphersuite;
@@ -21,12 +22,15 @@ use openmls_traits::types::Ciphersuite;
 pub(crate) fn leaf_capabilities(
     registry: &FeatureRegistry,
     ciphersuite: Ciphersuite,
+    protocol_profile: ProtocolProfile,
 ) -> Capabilities {
     let mut ext_types: Vec<ExtensionType> = vec![
         ExtensionType::RequiredCapabilities,
         ExtensionType::AppDataDictionary,
-        crate::account_identity_proof::account_identity_proof_capability(),
     ];
+    if protocol_profile == ProtocolProfile::Legacy {
+        ext_types.push(crate::account_identity_proof::account_identity_proof_capability());
+    }
     let mut proposal_types: Vec<ProposalType> = vec![ProposalType::AppDataUpdate];
 
     for (_feat, req) in registry.iter() {
@@ -56,14 +60,20 @@ pub(crate) fn leaf_capabilities(
 pub(crate) fn required_capabilities_extension(
     registry: &FeatureRegistry,
     active_transports: &[TransportKind],
+    protocol_profile: ProtocolProfile,
 ) -> (GroupCapabilities, RequiredCapabilitiesExtension) {
     let mut caps = GroupCapabilities::default();
     caps.insert(CTCapability::Extension(u16::from(
         ExtensionType::AppDataDictionary,
     )));
-    caps.insert(CTCapability::Extension(
-        crate::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
-    ));
+    match protocol_profile {
+        ProtocolProfile::Legacy => caps.insert(CTCapability::Extension(
+            crate::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+        )),
+        ProtocolProfile::Current => caps.insert(CTCapability::AppComponent(
+            cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        )),
+    }
     caps.insert(CTCapability::Proposal(u16::from(
         ProposalType::AppDataUpdate,
     )));
@@ -101,8 +111,10 @@ pub(crate) fn required_capabilities_extension_for_features(
     registry: &FeatureRegistry,
     active_transports: &[TransportKind],
     requested: &[Feature],
+    protocol_profile: ProtocolProfile,
 ) -> Result<(GroupCapabilities, RequiredCapabilitiesExtension), EngineError> {
-    let (mut caps, _) = required_capabilities_extension(registry, active_transports);
+    let (mut caps, _) =
+        required_capabilities_extension(registry, active_transports, protocol_profile);
     for feature in requested {
         let req = registry
             .get(feature)
@@ -170,7 +182,16 @@ pub(crate) fn self_supported_capabilities(
     ciphersuite: Ciphersuite,
     supported_app_components: &AppComponentSet,
 ) -> GroupCapabilities {
-    let mut out = group_capabilities_from_caps(&leaf_capabilities(registry, ciphersuite));
+    // Runtime support is deliberately broader than the profile emitted by a
+    // fresh KeyPackage: one upgraded engine must continue operating existing
+    // legacy groups while producing current-profile state for new groups.
+    let mut out = group_capabilities_from_caps(&leaf_capabilities(
+        registry,
+        ciphersuite,
+        ProtocolProfile::Legacy,
+    ));
     out.app_components = supported_app_components.clone();
+    out.app_components
+        .insert(cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
     out
 }

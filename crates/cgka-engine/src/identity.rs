@@ -5,11 +5,12 @@
 //! signing key.
 
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, StorageProvider as CgkaStorageProvider, StorageResult,
 };
 use cgka_traits::types::MemberId;
-use openmls::extensions::Extension;
+use openmls::extensions::Extensions;
 use openmls::group::MlsGroup;
 use openmls::prelude::{
     BasicCredential, Credential, CredentialWithKey, LeafNode, LeafNodeIndex, Sender,
@@ -23,7 +24,7 @@ pub struct Identity {
     pub(crate) signer: SignatureKeyPair,
     pub(crate) credential_with_key: CredentialWithKey,
     pub(crate) self_id: MemberId,
-    pub(crate) account_identity_proof_extension: Extension,
+    pub(crate) account_identity_proof: crate::account_identity_proof::AccountIdentityProofMaterial,
 }
 
 impl Identity {
@@ -33,6 +34,7 @@ impl Identity {
         ciphersuite: Ciphersuite,
         identity_bytes: Vec<u8>,
         storage: &S,
+        protocol_profile: ProtocolProfile,
         proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
     ) -> Result<Self, String>
     where
@@ -54,7 +56,13 @@ impl Identity {
                 "identity storage: local signer record exists, but OpenMLS keypair is missing"
                     .to_string()
             })?;
-            return Self::from_signer(signer, identity_bytes, ciphersuite, proof_signer);
+            return Self::from_signer(
+                signer,
+                identity_bytes,
+                ciphersuite,
+                protocol_profile,
+                proof_signer,
+            );
         }
 
         let signer = SignatureKeyPair::new(scheme).map_err(|e| format!("signer: {e}"))?;
@@ -67,13 +75,20 @@ impl Identity {
                 mls_signature_public_key: signer.to_public_vec(),
             }),
         )?;
-        Self::from_signer(signer, identity_bytes, ciphersuite, proof_signer)
+        Self::from_signer(
+            signer,
+            identity_bytes,
+            ciphersuite,
+            protocol_profile,
+            proof_signer,
+        )
     }
 
     fn from_signer(
         signer: SignatureKeyPair,
         identity_bytes: Vec<u8>,
         ciphersuite: Ciphersuite,
+        protocol_profile: ProtocolProfile,
         proof_signer: &dyn crate::account_identity_proof::AccountIdentityProofSigner,
     ) -> Result<Self, String> {
         let credential = BasicCredential::new(identity_bytes.clone());
@@ -81,12 +96,18 @@ impl Identity {
             credential: credential.into(),
             signature_key: signer.public().into(),
         };
-        let account_identity_proof_extension =
-            crate::account_identity_proof::account_identity_proof_extension(
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
+            .as_secs();
+        let account_identity_proof =
+            crate::account_identity_proof::account_identity_proof_material(
                 &identity_bytes,
                 &signer.to_public_vec(),
                 ciphersuite,
                 ciphersuite.signature_algorithm(),
+                protocol_profile,
+                created_at,
                 proof_signer,
             )
             .map_err(|e| e.to_string())?;
@@ -94,12 +115,41 @@ impl Identity {
             signer,
             credential_with_key,
             self_id: MemberId::new(identity_bytes),
-            account_identity_proof_extension,
+            account_identity_proof,
         })
     }
 
     pub fn self_id(&self) -> &MemberId {
         &self.self_id
+    }
+
+    pub(crate) fn protocol_profile(&self) -> ProtocolProfile {
+        self.account_identity_proof.protocol_profile()
+    }
+
+    pub(crate) fn leaf_extensions(
+        &self,
+        supported_app_components: &cgka_traits::app_components::AppComponentSet,
+    ) -> Result<Extensions<LeafNode>, EngineError> {
+        let extensions = match &self.account_identity_proof {
+            crate::account_identity_proof::AccountIdentityProofMaterial::LegacyExtension(
+                extension,
+            ) => vec![
+                crate::app_components::leaf_app_components_extension(
+                    supported_app_components,
+                    None,
+                )?,
+                extension.clone(),
+            ],
+            crate::account_identity_proof::AccountIdentityProofMaterial::CurrentComponent(
+                component,
+            ) => vec![crate::app_components::leaf_app_components_extension(
+                supported_app_components,
+                Some(component),
+            )?],
+        };
+        Extensions::from_vec(extensions)
+            .map_err(|error| EngineError::Backend(format!("leaf extensions: {error:?}")))
     }
 }
 

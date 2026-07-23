@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
+use cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID;
 use cgka_traits::engine::KeyPackage;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::{MessageId, TransportEndpoint};
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -183,7 +185,10 @@ fn validated_cached_key_package_with_ref(
             "cached KeyPackage ref does not match decoded KeyPackageRef".into(),
         ));
     }
-    Ok((decoded, metadata.key_package_ref_hex))
+    Ok((
+        decoded.with_protocol_profile(metadata.protocol_profile),
+        metadata.key_package_ref_hex,
+    ))
 }
 
 pub(crate) fn key_package_from_hex_with_optional_source(
@@ -267,11 +272,6 @@ pub(crate) fn key_package_from_record(
         .to_owned();
     require_key_package_tag(&event, "mls_ciphersuite", |value| !value.is_empty())?;
     require_multi_value_key_package_tag(&event, "mls_extensions")?;
-    require_multi_value_key_package_tag_contains(
-        &event,
-        "mls_extensions",
-        &format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
-    )?;
     require_multi_value_key_package_tag(&event, "mls_proposals")?;
     require_multi_value_key_package_tag(&event, "app_components")?;
     let key_package_bytes = BASE64_STANDARD
@@ -288,6 +288,19 @@ pub(crate) fn key_package_from_record(
     );
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    match metadata.protocol_profile {
+        ProtocolProfile::Legacy => require_multi_value_key_package_tag_contains(
+            &event,
+            "mls_extensions",
+            &format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
+        )?,
+        ProtocolProfile::Current => require_multi_value_key_package_tag_contains(
+            &event,
+            "app_components",
+            &format!("0x{ACCOUNT_IDENTITY_PROOF_COMPONENT_ID:04x}"),
+        )?,
+    }
+    let key_package = key_package.with_protocol_profile(metadata.protocol_profile);
     if metadata.credential_identity_hex != event.pubkey {
         return Err(AppError::InvalidKeyPackageEvent(
             "transport author does not match KeyPackage credential identity".into(),
@@ -461,11 +474,7 @@ pub(crate) fn require_multi_value_key_package_tag_contains(
             "missing {name} tag"
         )));
     };
-    if tag
-        .iter()
-        .skip(1)
-        .any(|value| value.eq_ignore_ascii_case(required))
-    {
+    if tag.iter().skip(1).any(|value| value == required) {
         Ok(())
     } else {
         Err(AppError::InvalidKeyPackageEvent(format!(

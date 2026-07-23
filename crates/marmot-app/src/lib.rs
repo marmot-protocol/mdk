@@ -12,8 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cgka_engine::{
-    FeatureRegistry, account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
-    canonicalization::CanonicalizationPolicy, key_package::key_package_metadata,
+    FeatureRegistry, canonicalization::CanonicalizationPolicy, key_package::key_package_metadata,
 };
 use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
@@ -134,7 +133,7 @@ pub use groups::{
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason,
     AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
     AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
-    AppGroupSystemEvent, AppQuarantinedGroup, group_system_event_from_message,
+    AppGroupSystemEvent, AppProtocolProfile, AppQuarantinedGroup, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -2043,7 +2042,6 @@ impl MarmotApp {
             app: self.clone(),
             account_label: label.to_owned(),
             signer: signer.clone(),
-            app_components: self.supported_app_component_tags(),
         };
         let routing = self.routing_for(&state)?;
         let runtime =
@@ -2301,7 +2299,6 @@ impl MarmotApp {
             app: self.clone(),
             account_label: label.to_owned(),
             signer,
-            app_components: self.supported_app_component_tags(),
         };
         publisher
             .publish_key_package(KeyPackagePublication {
@@ -3153,13 +3150,6 @@ impl MarmotApp {
         components.into_iter().collect()
     }
 
-    fn supported_app_component_tags(&self) -> Vec<String> {
-        self.supported_app_component_ids()
-            .into_iter()
-            .map(|id| format!("0x{id:04x}"))
-            .collect()
-    }
-
     fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
@@ -3363,7 +3353,6 @@ struct AppKeyPackagePublisher {
     app: MarmotApp,
     account_label: String,
     signer: AccountSigner,
-    app_components: Vec<String>,
 }
 
 #[async_trait]
@@ -3398,13 +3387,22 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             key_package_slot_id: key_package_id.clone(),
             key_package_ref: key_package_ref_hex.clone(),
             mls_ciphersuite: "0x0001".into(),
-            mls_extensions: vec![
-                "0x0006".into(),
-                format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
-                "0x000a".into(),
-            ],
-            mls_proposals: vec!["0x0008".into(), "0x000a".into()],
-            app_components: self.app_components.clone(),
+            mls_extensions: metadata
+                .mls_extensions
+                .iter()
+                .map(|id| format!("0x{id:04x}"))
+                .collect(),
+            mls_proposals: metadata
+                .mls_proposals
+                .iter()
+                .map(|id| format!("0x{id:04x}"))
+                .collect(),
+            app_components: metadata
+                .app_components
+                .iter()
+                .filter(|id| **id >= 0x8000)
+                .map(|id| format!("0x{id:04x}"))
+                .collect(),
             publish_endpoints: publication.endpoints.clone(),
         };
         // Relay publish happens first. A failure here means no relay accepted

@@ -13,7 +13,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    Extensions, KeyPackage as MlsKeyPackage, KeyPackageVerifyError, MlsMessageBodyIn, MlsMessageIn,
+    KeyPackage as MlsKeyPackage, KeyPackageVerifyError, MlsMessageBodyIn, MlsMessageIn,
     MlsMessageOut, ProtocolVersion,
 };
 use openmls_rust_crypto::RustCrypto;
@@ -25,6 +25,10 @@ use tls_codec::{Deserialize as _, Serialize as _};
 pub struct KeyPackageMetadata {
     pub key_package_ref_hex: String,
     pub credential_identity_hex: String,
+    pub protocol_profile: ProtocolProfile,
+    pub mls_extensions: Vec<u16>,
+    pub mls_proposals: Vec<u16>,
+    pub app_components: Vec<u16>,
 }
 
 /// Parse and validate a transported KeyPackage enough for transport-directory
@@ -48,17 +52,22 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     // is correct only while the engine is single-ciphersuite; deriving it from
     // the KeyPackage keeps these directory helpers consistent with the invite
     // path the instant a second ciphersuite is supported.
-    crate::account_identity_proof::validate_leaf_account_identity_proof(
+    let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
         key_package.ciphersuite(),
     )?;
-    ensure_legacy_key_package_profile(kp)?;
+    ensure_key_package_profile(kp, protocol_profile)?;
+    let capabilities = crate::capabilities::capabilities_of_key_package(&key_package);
     let key_package_ref = key_package
         .hash_ref(&crypto)
         .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
     Ok(KeyPackageMetadata {
         key_package_ref_hex: hex::encode(key_package_ref.as_slice()),
         credential_identity_hex: hex::encode(member_id.as_slice()),
+        protocol_profile,
+        mls_extensions: capabilities.extensions.into_iter().collect(),
+        mls_proposals: capabilities.proposals.into_iter().collect(),
+        app_components: capabilities.app_components.ids.into_iter().collect(),
     })
 }
 
@@ -81,23 +90,21 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
     crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
     // See `key_package_metadata`: validate against the KeyPackage's own
     // ciphersuite, not `DEFAULT_CIPHERSUITE` (mdk#747).
-    crate::account_identity_proof::validate_leaf_account_identity_proof(
+    let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
         key_package.leaf_node(),
         key_package.ciphersuite(),
     )?;
-    ensure_legacy_key_package_profile(kp)?;
+    ensure_key_package_profile(kp, protocol_profile)?;
     Ok(key_package.last_resort())
 }
 
 impl<S: StorageProvider> Engine<S> {
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
-        let caps = leaf_capabilities(&self.registry, self.ciphersuite);
-        let leaf_extensions = Extensions::from_vec(vec![
-            crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
-            self.identity.account_identity_proof_extension.clone(),
-        ])
-        .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
+        let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
+        let leaf_extensions = self
+            .identity
+            .leaf_extensions(&self.supported_app_components)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
 
         let bundle = MlsKeyPackage::builder()
@@ -116,7 +123,7 @@ impl<S: StorageProvider> Engine<S> {
         let bytes = mls_msg
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        Ok(KeyPackage::new(bytes))
+        Ok(KeyPackage::new(bytes).with_protocol_profile(self.new_protocol_profile))
     }
 
     /// Delete a previously generated (and persisted) KeyPackage bundle from
@@ -182,26 +189,22 @@ impl<S: StorageProvider> Engine<S> {
         // identity is not a valid Marmot account identity. This single gate
         // covers both the create-group and invite invitee paths.
         crate::identity::validated_member_id_of_leaf(key_package.leaf_node())?;
-        crate::account_identity_proof::validate_leaf_account_identity_proof(
+        let protocol_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             key_package.leaf_node(),
             self.ciphersuite,
         )?;
-        ensure_legacy_key_package_profile(kp)?;
+        ensure_key_package_profile(kp, protocol_profile)?;
         Ok(key_package)
     }
 }
 
-/// Bind the persisted wrapper classification to the only account-proof
-/// carrier this pre-cutover slice can validate.
-///
-/// The stacked current-profile implementation generalizes this check by
-/// deriving the profile from the decoded proof carrier. Keeping the check here
-/// prevents callers from relabeling legacy wire bytes as current in the
-/// meantime and then dispatching on unverified metadata.
-fn ensure_legacy_key_package_profile(key_package: &KeyPackage) -> Result<(), EngineError> {
-    if key_package.protocol_profile != ProtocolProfile::Legacy {
+fn ensure_key_package_profile(
+    key_package: &KeyPackage,
+    wire_profile: ProtocolProfile,
+) -> Result<(), EngineError> {
+    if key_package.protocol_profile != wire_profile {
         return Err(EngineError::InvalidAccountIdentityProof(format!(
-            "KeyPackage metadata says {:?}, but its decoded account proof is Legacy",
+            "KeyPackage metadata says {:?}, but its proof carrier classifies as {wire_profile:?}",
             key_package.protocol_profile
         )));
     }

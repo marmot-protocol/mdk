@@ -364,6 +364,7 @@ impl AppClient {
         let group = self.runtime.group_record(group_id)?;
         Ok(AppGroupMlsState {
             group_id_hex: hex::encode(group_id.as_slice()),
+            protocol_profile: group.protocol_profile.into(),
             epoch: group.epoch.0,
             member_count: group.members.len(),
             required_app_components: group

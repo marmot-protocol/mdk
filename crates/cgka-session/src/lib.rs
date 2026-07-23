@@ -18,7 +18,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::StorageError;
@@ -66,6 +66,7 @@ pub struct SessionConfig {
     account_identity_proof_signer: Option<Arc<dyn AccountIdentityProofSigner>>,
     feature_registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
+    protocol_profile: ProtocolProfile,
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
@@ -86,6 +87,7 @@ impl SessionConfig {
             account_identity_proof_signer: None,
             feature_registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
+            protocol_profile: ProtocolProfile::Legacy,
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
             recorder: None,
@@ -117,6 +119,13 @@ impl SessionConfig {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// Select the profile emitted by fresh KeyPackages and newly created
+    /// groups. Existing groups keep their persisted profile.
+    pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
+        self.protocol_profile = protocol_profile;
         self
     }
 
@@ -214,6 +223,7 @@ impl AccountDeviceSession {
             )?)
             .feature_registry(config.feature_registry)
             .supported_app_components(config.supported_app_components.ids)
+            .protocol_profile(config.protocol_profile)
             .peeler(config.peeler);
         if let Some(recorder) = config.recorder {
             builder = builder.recorder(recorder);

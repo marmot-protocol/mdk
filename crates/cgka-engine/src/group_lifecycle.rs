@@ -19,7 +19,9 @@ use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use crate::wire_format::{PURE_PLAINTEXT_WIRE_FORMAT_POLICY, join_config};
 use cgka_traits::TransportEndpoint;
-use cgka_traits::app_components::{AppComponentSet, default_group_components};
+use cgka_traits::app_components::{
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet, default_group_components,
+};
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
 use cgka_traits::error::EngineError;
@@ -110,6 +112,7 @@ impl<S: StorageProvider> Engine<S> {
             &self.registry,
             &active_transports,
             &req.required_features,
+            self.new_protocol_profile,
         )?;
         let mut desired_components = AppComponentSet::from(default_group_components());
         for component_id in required_caps.app_components.ids.clone() {
@@ -119,12 +122,16 @@ impl<S: StorageProvider> Engine<S> {
             required_caps.app_components.insert(component.component_id);
             desired_components.insert(component.component_id);
         }
+        let mut self_supported_components = self.supported_app_components.clone();
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            self_supported_components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        }
         let self_missing = required_caps
             .app_components
-            .missing_from(&self.supported_app_components);
+            .missing_from(&self_supported_components);
         if !self_missing.is_empty() {
             let had = GroupCapabilities {
-                app_components: self.supported_app_components.clone(),
+                app_components: self_supported_components.clone(),
                 ..GroupCapabilities::default()
             };
             return Err(EngineError::MissingRequiredCapabilities {
@@ -145,13 +152,21 @@ impl<S: StorageProvider> Engine<S> {
             );
 
         let mut parsed_kps = Vec::with_capacity(req.members.len());
-        let mut negotiated_components =
-            desired_components.intersection(&self.supported_app_components);
+        let mut negotiated_components = desired_components.intersection(&self_supported_components);
         // Engine-owned components (profile + admin policy) are NON-NEGOTIABLE
         // (mdk#746).
-        let mandatory_components = AppComponentSet::from(default_group_components());
+        let mut mandatory_components = AppComponentSet::from(default_group_components());
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            mandatory_components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+        }
         for kp in &req.members {
             let parsed = self.parse_key_package(kp)?;
+            if kp.protocol_profile != self.new_protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(format!(
+                    "cannot create a {:?} group from a {:?} KeyPackage",
+                    self.new_protocol_profile, kp.protocol_profile
+                )));
+            }
             let had = capabilities_of_key_package(&parsed);
             let missing = required_caps.missing_from(&had);
             if !missing.is_empty() {
@@ -204,12 +219,16 @@ impl<S: StorageProvider> Engine<S> {
 
         // 2. Build the group config with leaf capabilities, MLS
         //    RequiredCapabilities, and Marmot app-component state.
-        let leaf_caps = leaf_capabilities(&self.registry, self.ciphersuite);
-        let leaf_extensions = Extensions::from_vec(vec![
-            crate::app_components::leaf_app_components_extension(&self.supported_app_components)?,
-            self.identity.account_identity_proof_extension.clone(),
-        ])
-        .map_err(|e| EngineError::Backend(format!("leaf extensions: {e:?}")))?;
+        let leaf_caps =
+            leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
+        debug_assert_eq!(
+            self.identity.protocol_profile(),
+            self.new_protocol_profile,
+            "identity proof material must match the new-state profile"
+        );
+        let leaf_extensions = self
+            .identity
+            .leaf_extensions(&self.supported_app_components)?;
 
         // Validate the creator (implicit admin) on the SAME x-only secp256k1
         // basis as the co-admins below (mdk#737 review), so no admin-set entry
@@ -340,11 +359,7 @@ impl<S: StorageProvider> Engine<S> {
             epoch: EpochId(mls_group.epoch().as_u64()),
             members: projected_members,
             required_capabilities: required_caps,
-            // This persistence-only slice predates the strict application
-            // profile cutover, so creation is intentionally classified
-            // Legacy. The value does not describe the MLS application-data
-            // carrier, which is already app_data_dictionary.
-            protocol_profile: ProtocolProfile::Legacy,
+            protocol_profile: self.new_protocol_profile,
             removed: false,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
@@ -658,7 +673,8 @@ impl<S: StorageProvider> Engine<S> {
                 // 5b. Reject the Welcome if any member leaf carries an invalid
                 // Marmot credential identity (foundation/identity.md,
                 // joining.md:65).
-                validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+                let protocol_profile =
+                    validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
 
                 // 5c. Reject active required capabilities this client cannot
                 // apply, including required agent-stream roles.
@@ -705,10 +721,7 @@ impl<S: StorageProvider> Engine<S> {
                     members: marmot_members(&mls_group),
                     required_capabilities:
                         crate::capability_manager::required_capabilities_from_group(&mls_group),
-                    // Welcome state remains Legacy-classified until the
-                    // strict application-profile classifier lands. This does
-                    // not imply legacy MLS application-data encoding.
-                    protocol_profile: ProtocolProfile::Legacy,
+                    protocol_profile,
                     removed: false,
                     join_epoch: EpochId(mls_group.epoch().as_u64()),
                 };
@@ -851,13 +864,22 @@ impl<S: StorageProvider> Engine<S> {
                 &self.registry,
                 self.ciphersuite,
                 &self.supported_app_components,
+                self.new_protocol_profile,
             ));
         }
         let mut it = key_packages.iter();
-        let first = self.parse_key_package(it.next().unwrap())?;
+        let first_input = it.next().unwrap();
+        let first_profile = first_input.protocol_profile;
+        let first = self.parse_key_package(first_input)?;
         let mut acc = capabilities_of_key_package(&first);
         for kp in it {
             let parsed = self.parse_key_package(kp)?;
+            if kp.protocol_profile != first_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(
+                    "cannot compute constructable capabilities across mixed-profile KeyPackages"
+                        .into(),
+                ));
+            }
             let other = capabilities_of_key_package(&parsed);
             acc = GroupCapabilities {
                 proposals: acc
@@ -959,8 +981,9 @@ pub(crate) fn validate_member_credentials(group: &MlsGroup) -> Result<(), Engine
 pub(crate) fn validate_member_credentials_and_account_proofs(
     group: &MlsGroup,
     ciphersuite: Ciphersuite,
-) -> Result<(), EngineError> {
+) -> Result<ProtocolProfile, EngineError> {
     validate_member_credentials(group)?;
+    let protocol_profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
     let tree = group.export_ratchet_tree();
     let value = serde_json::to_value(tree)
         .map_err(|e| EngineError::Backend(format!("export ratchet tree: {e}")))?;
@@ -968,19 +991,24 @@ pub(crate) fn validate_member_credentials_and_account_proofs(
         .map_err(|e| EngineError::Backend(format!("decode exported ratchet tree: {e}")))?;
     for node in nodes {
         if let Some(Node::LeafNode(leaf)) = node {
-            crate::account_identity_proof::validate_leaf_account_identity_proof(
+            let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
                 &leaf,
                 ciphersuite,
             )?;
+            if leaf_profile != protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(format!(
+                    "group contains a {leaf_profile:?} leaf in a {protocol_profile:?} profile"
+                )));
+            }
         }
     }
-    Ok(())
+    Ok(protocol_profile)
 }
 
 /// Bumped whenever the member-credential / account-identity-proof validation
 /// logic changes. A bump makes every previously stored marker mismatch, so a
 /// group's tree is fully re-validated under the new rules on the next open.
-const VALIDATED_TREE_MARKER_VERSION: u8 = 1;
+const VALIDATED_TREE_MARKER_VERSION: u8 = 2;
 
 /// Derive a cheap, content-bound marker certifying a specific ratchet-tree
 /// state passed [`validate_member_credentials_and_account_proofs`].
@@ -1030,12 +1058,21 @@ fn leaf_capabilities_as_marmot(
     registry: &crate::feature_registry::FeatureRegistry,
     _cs: openmls_traits::types::Ciphersuite,
     supported_app_components: &cgka_traits::app_components::AppComponentSet,
+    protocol_profile: ProtocolProfile,
 ) -> GroupCapabilities {
     let mut out = GroupCapabilities::default();
     for (_f, req) in registry.iter() {
         out.insert(req.requires);
     }
     out.app_components = supported_app_components.clone();
+    match protocol_profile {
+        ProtocolProfile::Legacy => out.insert(cgka_traits::capabilities::Capability::Extension(
+            crate::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+        )),
+        ProtocolProfile::Current => out
+            .app_components
+            .insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID),
+    }
     out
 }
 

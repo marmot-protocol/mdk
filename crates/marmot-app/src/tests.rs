@@ -190,6 +190,10 @@ fn key_package_id_list_tag_must_be_exactly_one() {
     // A single id-list tag is accepted.
     let one = make(vec![vec!["mls_extensions".into(), "0x0006".into()]]);
     assert!(require_multi_value_key_package_tag(&one, "mls_extensions").is_ok());
+    assert!(require_multi_value_key_package_tag_contains(&one, "mls_extensions", "0x0006").is_ok());
+    assert!(
+        require_multi_value_key_package_tag_contains(&one, "mls_extensions", "0X0006").is_err()
+    );
     // Two tags with the same id-list name MUST be rejected, not first-match read.
     let two = make(vec![
         vec!["mls_extensions".into(), "0x0006".into()],

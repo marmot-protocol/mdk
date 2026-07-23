@@ -3,13 +3,13 @@
 use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
-    APP_COMPONENTS_COMPONENT_ID, AppComponentData, AppComponentId, AppComponentSet,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, SAFE_AAD_COMPONENT_ID, decode_components_list,
-    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
+    AppComponentId, AppComponentSet, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, SAFE_AAD_COMPONENT_ID,
+    decode_components_list, decode_encrypted_media_policy_v1, decode_group_avatar_url_v1,
+    decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
@@ -30,10 +30,14 @@ pub(crate) struct InitialComponentState {
 
 pub(crate) fn leaf_app_components_extension(
     supported: &AppComponentSet,
+    account_identity_proof: Option<&[u8]>,
 ) -> Result<Extension, EngineError> {
     let mut dict = AppDataDictionary::new();
     let mut advertised = supported.ids.clone();
     advertised.insert(APP_COMPONENTS_COMPONENT_ID);
+    if account_identity_proof.is_some() {
+        advertised.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+    }
     dict.insert(
         APP_COMPONENTS_COMPONENT_ID,
         encode_components_list(&advertised),
@@ -42,6 +46,9 @@ pub(crate) fn leaf_app_components_extension(
         SAFE_AAD_COMPONENT_ID,
         encode_components_list(&BTreeSet::new()),
     );
+    if let Some(proof) = account_identity_proof {
+        dict.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof.to_vec());
+    }
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
     ))
@@ -680,6 +687,7 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
     match component.component_id {
         APP_COMPONENTS_COMPONENT_ID
         | SAFE_AAD_COMPONENT_ID
+        | ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
         | GROUP_PROFILE_COMPONENT_ID
         | GROUP_ADMIN_POLICY_COMPONENT_ID => Err(EngineError::Other(
             "group creation request cannot override engine-owned app components".into(),
@@ -705,6 +713,9 @@ pub(crate) fn validate_app_component_update(
             .map_err(|e| EngineError::Serialize(format!("invalid app_components component: {e}"))),
         SAFE_AAD_COMPONENT_ID => Err(EngineError::Other(
             "safe_aad group-component state is not supported yet".into(),
+        )),
+        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID => Err(EngineError::Other(
+            "account identity proof is LeafNode-only and cannot be updated in GroupContext".into(),
         )),
         GROUP_PROFILE_COMPONENT_ID => decode_group_profile(&component.data).map(|_| ()),
         GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(&component.data).map(|_| ()),
@@ -934,7 +945,7 @@ mod tests {
         let mut supported = AppComponentSet::from(default_group_components());
         supported.insert(NOSTR_ROUTING_COMPONENT_ID);
 
-        let ext = leaf_app_components_extension(&supported).unwrap();
+        let ext = leaf_app_components_extension(&supported, None).unwrap();
         let Extension::AppDataDictionary(ext) = ext else {
             panic!("expected an AppDataDictionary extension");
         };

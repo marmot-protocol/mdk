@@ -113,6 +113,12 @@ impl<S: StorageProvider> Engine<S> {
         let mut parsed_kps = Vec::with_capacity(key_packages.len());
         for kp in &key_packages {
             let parsed = self.parse_key_package(kp)?;
+            if kp.protocol_profile != existing.protocol_profile {
+                return Err(EngineError::InvalidAccountIdentityProof(format!(
+                    "cannot invite a {:?} KeyPackage into a {:?} group",
+                    kp.protocol_profile, existing.protocol_profile
+                )));
+            }
             let had = crate::capabilities::capabilities_of_key_package(&parsed);
             let missing = required.missing_from(&had);
             if !missing.is_empty() {
@@ -467,6 +473,12 @@ impl<S: StorageProvider> Engine<S> {
             &mls_group,
             &group_id,
             staged_commit,
+        )?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
         )?;
         let commit_priority =
             crate::app_components::commit_ordering_priority_for_staged(staged_commit);
