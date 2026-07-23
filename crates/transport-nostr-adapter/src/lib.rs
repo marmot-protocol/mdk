@@ -77,7 +77,7 @@ pub use key_package::{
 };
 pub use relay_list::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,
-    NostrAccountRelayListPublication,
+    NostrAccountRelayListPublication, NostrNip65RelaySet, parse_nip65_relay_set,
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
