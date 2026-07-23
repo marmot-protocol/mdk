@@ -413,12 +413,7 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
-        crate::capability_manager::cache_from_key_packages(
-            &self.storage,
-            &group_id,
-            &parsed_kps,
-            self.ciphersuite,
-        )?;
+        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
         crate::capability_manager::cache_self_capabilities(
             &self.storage,
             &group_id,

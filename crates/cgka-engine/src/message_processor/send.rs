@@ -231,12 +231,7 @@ impl<S: StorageProvider> Engine<S> {
         // Epoch stays at the pre-merge value; that updates on confirm.
         // On `publish_failed`, the engine re-derives from the (still-
         // unmerged) MLS state, which naturally drops the projection.
-        crate::capability_manager::cache_from_key_packages(
-            &self.storage,
-            &group_id,
-            &parsed_kps,
-            self.ciphersuite,
-        )?;
+        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
         let mut group_record = existing;
         group_record.members =
             crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;

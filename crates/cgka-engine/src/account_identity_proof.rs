@@ -563,9 +563,10 @@ pub(crate) fn validate_staged_commit_account_identity_proofs(
     }
 
     for add in staged.add_proposals() {
-        let leaf = add.add_proposal().key_package().leaf_node();
+        let key_package = add.add_proposal().key_package();
+        let leaf = key_package.leaf_node();
         ensure_profile(
-            validate_leaf_account_identity_proof(leaf, ciphersuite)?,
+            validate_leaf_account_identity_proof(leaf, key_package.ciphersuite())?,
             profile,
             "Add proposal",
         )?;

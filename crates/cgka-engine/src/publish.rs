@@ -105,10 +105,7 @@ impl<S: StorageProvider> Engine<S> {
                             .pending_commit()
                             .expect("pending commit presence checked above");
                         crate::capability_manager::cache_from_staged_commit(
-                            storage,
-                            &group_id,
-                            staged,
-                            self.ciphersuite,
+                            storage, &group_id, staged,
                         )?;
                         // Capture the convergence ordering stamp while the
                         // staged commit is still attached: stored convergence

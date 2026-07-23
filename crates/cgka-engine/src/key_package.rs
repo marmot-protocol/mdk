@@ -204,7 +204,7 @@ fn ensure_key_package_profile(
 ) -> Result<(), EngineError> {
     if key_package.protocol_profile != wire_profile {
         return Err(EngineError::InvalidAccountIdentityProof(format!(
-            "KeyPackage metadata says {:?}, but its proof carrier classifies as {wire_profile:?}",
+            "KeyPackage metadata says {:?}, but its decoded account proof is {wire_profile:?}",
             key_package.protocol_profile
         )));
     }

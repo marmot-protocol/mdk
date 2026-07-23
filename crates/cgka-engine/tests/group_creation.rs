@@ -1050,11 +1050,30 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
     );
     current
         .send(cgka_traits::engine::SendIntent::AppMessage {
-            group_id,
+            group_id: group_id.clone(),
             payload: app_payload_for(&current, "still usable"),
         })
         .await
         .expect("legacy group remains usable by current-configured engine");
+
+    let mut invitee = build_client(b"legacy-reopen-invitee", selfremove_registry());
+    let invitee_key_package = invitee.fresh_key_package().await.unwrap();
+    let invite = current
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![invitee_key_package],
+        })
+        .await
+        .expect("current-configured engine can commit to its legacy group");
+    let pending = match invite {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    current.confirm_published(pending).await.unwrap();
+    assert_eq!(
+        current.group_record(&group_id).unwrap().protocol_profile,
+        ProtocolProfile::Legacy
+    );
 }
 
 #[tokio::test]

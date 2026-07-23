@@ -85,13 +85,12 @@ pub(crate) fn cache_from_key_packages<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     kps: &[KeyPackage],
-    ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
     let group_profile = storage.get_group(group_id)?.protocol_profile;
     for kp in kps {
         let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             kp.leaf_node(),
-            ciphersuite,
+            kp.ciphersuite(),
         )?;
         if leaf_profile != group_profile {
             return Err(EngineError::InvalidAccountIdentityProof(
@@ -117,14 +116,13 @@ pub(crate) fn cache_from_staged_commit<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     staged: &StagedCommit,
-    ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
     let group_profile = storage.get_group(group_id)?.protocol_profile;
     for add in staged.add_proposals() {
         let kp = add.add_proposal().key_package();
         let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             kp.leaf_node(),
-            ciphersuite,
+            kp.ciphersuite(),
         )?;
         if leaf_profile != group_profile {
             return Err(EngineError::InvalidAccountIdentityProof(
