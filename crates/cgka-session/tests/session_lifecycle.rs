@@ -313,6 +313,7 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello through session"),
+            source_retention_secs: Some(0),
         }]
     );
 }
@@ -372,6 +373,7 @@ async fn reopened_creator_can_send_valid_group_messages() {
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello after restart"),
+            source_retention_secs: Some(0),
         }]
     );
 }

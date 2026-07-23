@@ -15,6 +15,8 @@ fn chat(id: &str, sender: &str, at: u64, plaintext: &str) -> StoredAppEvent {
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -33,6 +35,8 @@ fn reaction(id: &str, sender: &str, target: &str, at: u64, emoji: &str) -> Store
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -52,6 +56,8 @@ fn agent_operation(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEv
             received_at: at,
             origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
         }
 }
 
@@ -73,6 +79,8 @@ fn reply(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> Stor
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -91,6 +99,8 @@ fn delete(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -225,6 +235,8 @@ fn edit(id: &str, sender: &str, target: &str, at: u64, plaintext: &str) -> Store
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -259,6 +271,8 @@ fn group_system(id: &str, system_type: &str, at: u64) -> StoredAppEvent {
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -1101,6 +1115,8 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
         received_at: 1,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     };
     let final_event = StoredAppEvent {
         group_id_hex: "11".repeat(32),
@@ -1119,6 +1135,8 @@ fn stream_start_and_final_are_materialized_as_linked_timeline_records() {
         received_at: 2,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     };
 
     store.record_app_event(&start).unwrap();

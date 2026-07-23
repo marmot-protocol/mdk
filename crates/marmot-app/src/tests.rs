@@ -896,6 +896,7 @@ fn received_message_sender_is_admitted_to_directory_cache() {
         sender_display_name: None,
         group_id: GroupId::new(vec![0x01]),
         source_epoch: 0,
+        source_retention_secs: Some(0),
         plaintext: "hello".to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
@@ -1244,6 +1245,8 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             recorded_at: Some(1_700_000_101),
             origin_commit_id: None,
             moderation_grant: false,
+            source_retention_secs: None,
+            expiry_timestamp: None,
         })
         .unwrap();
     legacy
@@ -1310,6 +1313,8 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             recorded_at: Some(1_700_000_102),
             origin_commit_id: None,
             moderation_grant: false,
+            source_retention_secs: None,
+            expiry_timestamp: None,
         })
         .unwrap();
     assert_eq!(app.messages("alice").unwrap().len(), 1);
@@ -1439,6 +1444,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
         sender_display_name: None,
         group_id: group_id.clone(),
         source_epoch: 1,
+        source_retention_secs: Some(0),
         plaintext: content,
         kind: crate::notifications::MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         tags: vec![vec!["v".to_owned(), "marmot-push-v1".to_owned()]],
@@ -2029,6 +2035,7 @@ fn received_event_decodes_when_id_and_sender_match() {
         None,
         &group_id,
         0,
+        Some(0),
         "msg1",
         1_700_000_000,
         Some(42),
@@ -2072,7 +2079,16 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
     let bytes = event.encode().unwrap();
     let group_id = GroupId::new(vec![0x01]);
     let message = groups::decode_received_event(
-        &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+        &bytes,
+        SENDER_HEX,
+        None,
+        &group_id,
+        7,
+        Some(0),
+        "msg1",
+        0,
+        None,
+        false,
     )
     .expect("an out-of-policy media locator must not drop the message");
     assert_eq!(message.plaintext, "delayed media");
@@ -2129,7 +2145,16 @@ fn received_media_message_with_malformed_reference_is_rejected() {
     let group_id = GroupId::new(vec![0x01]);
     assert!(
         groups::decode_received_event(
-            &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+            &bytes,
+            SENDER_HEX,
+            None,
+            &group_id,
+            7,
+            Some(0),
+            "msg1",
+            0,
+            None,
+            false,
         )
         .is_none(),
         "a structurally malformed media reference must drop the message",
@@ -2148,7 +2173,16 @@ fn received_event_with_tampered_id_is_rejected() {
     let group_id = GroupId::new(vec![0x01]);
     assert!(
         groups::decode_received_event(
-            &bytes, SENDER_HEX, None, &group_id, 0, "msg1", 0, None, false,
+            &bytes,
+            SENDER_HEX,
+            None,
+            &group_id,
+            0,
+            Some(0),
+            "msg1",
+            0,
+            None,
+            false,
         )
         .is_none()
     );
@@ -2170,6 +2204,7 @@ fn received_event_with_wrong_sender_is_rejected() {
             None,
             &group_id,
             0,
+            Some(0),
             "msg1",
             0,
             None,
@@ -2367,6 +2402,8 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
             recorded_at: Some(10),
             origin_commit_id: None,
             moderation_grant: false,
+            source_retention_secs: None,
+            expiry_timestamp: None,
         },
         100,
     )
@@ -2446,6 +2483,8 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
             recorded_at: Some(10),
             origin_commit_id,
             moderation_grant: false,
+            source_retention_secs: None,
+            expiry_timestamp: None,
         };
     // The losing commit synthesized this row (the "B renamed the group" lie).
     app.record_account_app_event(

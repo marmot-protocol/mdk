@@ -1,7 +1,6 @@
 ---
 source: crates/traits/tests/snapshots.rs
-assertion_line: 424
-expression: "GroupEvent::MessageReceived\n{\n    group_id: gid(), epoch: EpochId(7), sender: mem_id(), payload:\n    b\"hi\".to_vec(),\n}"
+expression: "GroupEvent::MessageReceived\n{\n    group_id: gid(), epoch: EpochId(7), sender: mem_id(), payload:\n    b\"hi\".to_vec(), source_retention_secs: 0,\n}"
 ---
 {
   "MessageReceived": {
@@ -22,6 +21,7 @@ expression: "GroupEvent::MessageReceived\n{\n    group_id: gid(), epoch: EpochId
     "payload": [
       104,
       105
-    ]
+    ],
+    "source_retention_secs": 0
   }
 }

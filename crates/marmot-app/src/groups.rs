@@ -960,6 +960,7 @@ pub(crate) fn decode_received_event(
     sender_display_name: Option<String>,
     group_id: &GroupId,
     source_epoch: u64,
+    source_retention_secs: Option<u64>,
     source_message_id_hex: &str,
     source_received_at: u64,
     outer_transport_at: Option<u64>,
@@ -1026,6 +1027,7 @@ pub(crate) fn decode_received_event(
         sender_display_name,
         group_id: group_id.clone(),
         source_epoch,
+        source_retention_secs,
         plaintext: event.content,
         kind: event.kind,
         tags: event.tags,
@@ -1078,6 +1080,7 @@ pub(crate) fn observe_event(
             sender,
             epoch,
             payload,
+            source_retention_secs,
         } => {
             if let Some(projection) = group_projection {
                 add_group(
@@ -1103,6 +1106,7 @@ pub(crate) fn observe_event(
                 sender_display_name,
                 group_id,
                 epoch.0,
+                *source_retention_secs,
                 source_message_id_hex,
                 source_received_at,
                 outer_transport_at,
@@ -1463,6 +1467,7 @@ mod inner_tag_tests {
             None,
             &GroupId::new(vec![0x01; 32]),
             1,
+            Some(0),
             &"00".repeat(32),
             0,
             None,

@@ -768,6 +768,7 @@ impl<S: StorageProvider> Engine<S> {
                 source_epoch,
                 sender,
                 payload,
+                source_retention_secs,
                 ..
             } = observation
             else {
@@ -790,6 +791,7 @@ impl<S: StorageProvider> Engine<S> {
                 epoch: cgka_traits::EpochId(*source_epoch),
                 sender: MemberId::new(sender.clone()),
                 payload: payload.clone(),
+                source_retention_secs: *source_retention_secs,
             });
         }
     }

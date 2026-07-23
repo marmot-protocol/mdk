@@ -205,6 +205,7 @@ fn received_message(
         sender_display_name: None,
         group_id: cgka_traits::GroupId::new(vec![0x22; 32]),
         source_epoch: 7,
+        source_retention_secs: Some(0),
         plaintext: plaintext.into(),
         kind,
         tags,

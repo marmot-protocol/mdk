@@ -243,6 +243,17 @@ struct RawStoredAccountGroup {
     self_membership: SelfMembership,
 }
 
+enum SecurePruneAction<'a> {
+    BeforeCutoff {
+        group_id_hex: &'a str,
+        cutoff_recorded_at: u64,
+    },
+    Expired {
+        group_id_hex: &'a str,
+        now_unix_seconds: u64,
+    },
+}
+
 impl SqliteAccountStorage {
     pub fn ensure_account_projection(&self, label: &str) -> StorageResult<()> {
         self.lock()?
@@ -704,6 +715,27 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         cutoff_recorded_at: u64,
     ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
+        self.run_secure_prune(SecurePruneAction::BeforeCutoff {
+            group_id_hex,
+            cutoff_recorded_at,
+        })
+    }
+
+    pub fn secure_prune_expired_app_events(
+        &self,
+        group_id_hex: &str,
+        now_unix_seconds: u64,
+    ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
+        self.run_secure_prune(SecurePruneAction::Expired {
+            group_id_hex,
+            now_unix_seconds,
+        })
+    }
+
+    fn run_secure_prune(
+        &self,
+        action: SecurePruneAction<'_>,
+    ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
         // `secure_delete` must be ON *before* the prune transaction begins:
         // SQLite does not guarantee zero-on-free for pages freed in the same
         // transaction that toggles the pragma, so setting it inside the
@@ -723,11 +755,24 @@ impl SqliteAccountStorage {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .storage()?;
-                let outcome = crate::timeline::secure_prune_app_events_before_tx(
-                    &tx,
-                    group_id_hex,
-                    cutoff_recorded_at,
-                )?;
+                let outcome = match action {
+                    SecurePruneAction::BeforeCutoff {
+                        group_id_hex,
+                        cutoff_recorded_at,
+                    } => crate::timeline::secure_prune_app_events_before_tx(
+                        &tx,
+                        group_id_hex,
+                        cutoff_recorded_at,
+                    )?,
+                    SecurePruneAction::Expired {
+                        group_id_hex,
+                        now_unix_seconds,
+                    } => crate::timeline::secure_prune_expired_app_events_tx(
+                        &tx,
+                        group_id_hex,
+                        now_unix_seconds,
+                    )?,
+                };
                 tx.commit().storage()?;
                 Ok(outcome)
             })();

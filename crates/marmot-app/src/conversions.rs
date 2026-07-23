@@ -223,6 +223,20 @@ pub(crate) fn app_message_record_from_stored(record: StoredAppMessageRecord) -> 
     }
 }
 
+use cgka_traits::app_event::disappearing_message_expiry_timestamp;
+
+pub(crate) fn pinned_source_epoch_retention(
+    disappearing_message_secs: Option<u64>,
+    recorded_at: u64,
+) -> (Option<u64>, Option<u64>) {
+    let Some(disappearing_message_secs) = disappearing_message_secs else {
+        return (None, None);
+    };
+    let expiry_timestamp =
+        disappearing_message_expiry_timestamp(recorded_at, disappearing_message_secs);
+    (Some(disappearing_message_secs), expiry_timestamp)
+}
+
 pub(crate) fn stored_app_event_from_projection(
     message: &AppMessageProjection,
     received_at: u64,
@@ -241,6 +255,8 @@ pub(crate) fn stored_app_event_from_projection(
         received_at,
         origin_commit_id: message.origin_commit_id.clone(),
         moderation_grant: message.moderation_grant,
+        source_retention_secs: message.source_retention_secs,
+        expiry_timestamp: message.expiry_timestamp,
     }
 }
 
@@ -261,6 +277,8 @@ pub(crate) fn stored_app_event_from_message_record(record: &AppMessageRecord) ->
         // Legacy-import records predate moderation deletes, so none carries a
         // grant.
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 

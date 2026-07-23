@@ -510,6 +510,7 @@ fn snapshot_group_events() {
             epoch: EpochId(7),
             sender: mem_id(),
             payload: b"hi".to_vec(),
+            source_retention_secs: Some(0),
         }
     );
     insta::assert_json_snapshot!(

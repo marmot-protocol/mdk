@@ -7,6 +7,7 @@ use storage_sqlite::clamp_to_max_future_skew;
 use tokio::time::timeout;
 use transport_nostr_peeler::NostrTransportEvent;
 
+use crate::conversions::pinned_source_epoch_retention;
 use crate::groups::{EventGroupProjection, event_group_id, fail_if_publish_failed, observe_event};
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
@@ -561,6 +562,10 @@ impl AppClient {
                 // event so later admin-set changes cannot flip the verdict.
                 let moderation_grant = message.kind == MARMOT_APP_EVENT_KIND_DELETE
                     && self.delete_moderation_grant(&message.group_id, &message.sender);
+                let (source_retention_secs, expiry_timestamp) = pinned_source_epoch_retention(
+                    message.source_retention_secs,
+                    message.recorded_at,
+                );
                 let message_projection = AppMessageProjection {
                     message_id_hex: message.message_id_hex.clone(),
                     source_message_id_hex: Some(message.source_message_id_hex.clone()),
@@ -575,6 +580,8 @@ impl AppClient {
                     // Received app messages are not synthesized system rows.
                     origin_commit_id: None,
                     moderation_grant,
+                    source_retention_secs,
+                    expiry_timestamp,
                 };
                 let projection_update = self.app.record_account_app_event_at(
                     &self.state.label,

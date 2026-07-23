@@ -54,6 +54,8 @@ mod migration_0026_message_drafts;
 mod migration_0027_app_event_moderation_grant;
 #[path = "migrations/0028_ingress_dedup.rs"]
 mod migration_0028_ingress_dedup;
+#[path = "migrations/0029_app_event_source_retention.rs"]
+mod migration_0029_app_event_source_retention;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -205,6 +207,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 28,
         name: "0028_ingress_dedup",
         apply: migration_0028_ingress_dedup::apply,
+    },
+    Migration {
+        version: 29,
+        name: "0029_app_event_source_retention",
+        apply: migration_0029_app_event_source_retention::apply,
     },
 ];
 
@@ -686,6 +693,49 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn app_event_source_retention_migration_leaves_legacy_rows_unknown() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..28]).unwrap();
+
+        let group = "aa".repeat(32);
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, source_message_id_hex, direction, sender,
+                plaintext, kind, tags_json, recorded_at, received_at
+             )
+             VALUES (?1, 'legacy', 'source-legacy', 'received', 'sender',
+                     'legacy', 9, '[]', 10, 10)",
+            params![group],
+        )
+        .unwrap();
+
+        run(&mut conn, &MIGRATIONS[28..]).unwrap();
+
+        assert!(connection_has_column(
+            &conn,
+            "app_events",
+            "source_retention_secs"
+        ));
+        assert!(connection_has_column(
+            &conn,
+            "app_events",
+            "expiry_timestamp"
+        ));
+        let (source_retention_secs, expiry_timestamp): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT source_retention_secs, expiry_timestamp
+                 FROM app_events
+                 WHERE message_id_hex = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source_retention_secs, None);
+        assert_eq!(expiry_timestamp, None);
     }
 
     #[test]

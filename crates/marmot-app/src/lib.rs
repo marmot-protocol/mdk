@@ -593,6 +593,10 @@ pub struct ReceivedMessage {
     pub sender_display_name: Option<String>,
     pub group_id: GroupId,
     pub source_epoch: u64,
+    /// `marmot.group.message-retention.v1` duration pinned from the MLS source
+    /// epoch when the message was accepted. `None` means the historical source
+    /// state was unavailable; retention must preserve the message.
+    pub source_retention_secs: Option<u64>,
     /// Displayed text for the inner app event (its `content`).
     pub plaintext: String,
     /// Nostr `kind` of the inner Marmot app event.
@@ -789,6 +793,10 @@ pub(crate) struct AppMessageProjection {
     /// the signed MLS group state when the delete is recorded and persisted
     /// with the event. `false` for every other projection.
     pub(crate) moderation_grant: bool,
+    /// Pinned source-epoch retention duration. `None` means legacy/unknown.
+    pub(crate) source_retention_secs: Option<u64>,
+    /// Checked absolute expiry from the pinned duration and `recorded_at`.
+    pub(crate) expiry_timestamp: Option<u64>,
 }
 
 fn generate_telemetry_install_id() -> String {
@@ -2895,6 +2903,19 @@ impl MarmotApp {
         })
     }
 
+    pub(crate) fn secure_prune_account_expired_app_events(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        now_unix_seconds: u64,
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
+        Ok(self
+            .account_storage(label)?
+            .secure_prune_expired_app_events(group_id_hex, now_unix_seconds)?
+            .into())
+    }
+
+    #[cfg(test)]
     pub(crate) fn secure_prune_account_app_events_before(
         &self,
         label: &str,

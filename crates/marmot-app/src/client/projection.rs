@@ -8,6 +8,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MarmotAppEvent as MarmotInnerEvent,
 };
 
+use crate::conversions::pinned_source_epoch_retention;
 use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group};
 use crate::{
     AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
@@ -38,6 +39,11 @@ impl AppClient {
         // resurrecting the target.
         let moderation_grant = event.kind == MARMOT_APP_EVENT_KIND_DELETE
             && self.delete_moderation_grant(group_id, sender);
+        let retention = self.message_retention_for_group(group_id);
+        let (source_retention_secs, expiry_timestamp) = pinned_source_epoch_retention(
+            Some(retention.disappearing_message_secs),
+            event.created_at,
+        );
         let message_projection = AppMessageProjection {
             message_id_hex: event.id.clone(),
             source_message_id_hex,
@@ -53,6 +59,8 @@ impl AppClient {
             // ordinary sent app events do not.
             origin_commit_id: None,
             moderation_grant,
+            source_retention_secs,
+            expiry_timestamp,
         };
         // The reconciling post-publish projection (advance_read_marker) runs
         // after group sync, so its recomputed moderation grant supersedes the
@@ -219,15 +227,11 @@ impl AppClient {
         &self,
         group_id: &GroupId,
     ) -> Result<SecureDeleteExpiredResult, AppError> {
-        let retention = self.message_retention_for_group(group_id);
-        if retention.disappearing_message_secs == 0 {
-            return Ok(SecureDeleteExpiredResult::default());
-        }
-        let cutoff = unix_now_seconds().saturating_sub(retention.disappearing_message_secs);
-        self.app.secure_prune_account_app_events_before(
+        let now = unix_now_seconds();
+        self.app.secure_prune_account_expired_app_events(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
-            cutoff,
+            now,
         )
     }
 
@@ -408,6 +412,8 @@ fn build_group_system_projection(
         source_epoch: Some(epoch),
         recorded_at: Some(recorded_at),
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
         // Non-unique link to the origin commit so a losing-branch rollback can
         // invalidate every row this commit synthesized (1:N).
         origin_commit_id,

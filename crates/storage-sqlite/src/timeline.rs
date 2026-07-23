@@ -37,6 +37,35 @@ const DEFAULT_TIMELINE_LIMIT: usize = 50;
 pub const MAX_TIMELINE_LIMIT: usize = 200;
 const SQLITE_BIND_PARAMETER_CHUNK: usize = 900;
 
+// SQLite INTEGER is signed, while the protocol defines both retention values
+// over the full uint64 range. Fixed-width big-endian blobs preserve every value
+// and retain unsigned lexical ordering for expiry sweeps.
+fn optional_u64_to_sortable_blob(value: Option<u64>) -> Option<Vec<u8>> {
+    value.map(|value| value.to_be_bytes().to_vec())
+}
+
+fn optional_u64_from_sortable_blob(
+    value: Option<Vec<u8>>,
+    column: usize,
+) -> rusqlite::Result<Option<u64>> {
+    value
+        .map(|value| {
+            let bytes: [u8; 8] = value.try_into().map_err(|value: Vec<u8>| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Blob,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("expected 8-byte uint64 blob, got {} bytes", value.len()),
+                    )
+                    .into(),
+                )
+            })?;
+            Ok(u64::from_be_bytes(bytes))
+        })
+        .transpose()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
     pub group_id_hex: String,
@@ -65,6 +94,13 @@ pub struct StoredAppEvent {
     /// recomputed after group sync supersedes the optimistic pre-send one.
     /// `false` for every other event.
     pub moderation_grant: bool,
+    /// Pinned `marmot.group.message-retention.v1` duration from the message's
+    /// authenticated MLS source epoch. `None` means legacy/unknown and must be
+    /// safe-preserved by sweeps. `Some(0)` means known disabled/no expiry.
+    pub source_retention_secs: Option<u64>,
+    /// Checked absolute expiry (`created_at + source_retention_secs`). `None`
+    /// means no expiry (disabled, legacy/unknown, or overflow).
+    pub expiry_timestamp: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -244,6 +280,8 @@ struct RawAppEvent {
     invalidated: bool,
     invalidation_reason: Option<String>,
     moderation_grant: bool,
+    _source_retention_secs: Option<u64>,
+    _expiry_timestamp: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -368,9 +406,9 @@ impl SqliteAccountStorage {
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id,
-                    moderation_grant
+                    moderation_grant, source_retention_secs, expiry_timestamp
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
                     source_message_id_hex = excluded.source_message_id_hex,
                     source_epoch = excluded.source_epoch,
@@ -382,7 +420,7 @@ impl SqliteAccountStorage {
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
-                    moderation_grant = CASE WHEN ?14 THEN excluded.moderation_grant ELSE app_events.moderation_grant END,
+                    moderation_grant = CASE WHEN ?16 THEN excluded.moderation_grant ELSE app_events.moderation_grant END,
                     invalidated = 0,
                     invalidation_reason = NULL",
                 params![
@@ -399,6 +437,8 @@ impl SqliteAccountStorage {
                     u64_to_i64(event.received_at)?,
                     &event.origin_commit_id,
                     event.moderation_grant,
+                    optional_u64_to_sortable_blob(event.source_retention_secs),
+                    optional_u64_to_sortable_blob(event.expiry_timestamp),
                     refresh_moderation_grant,
                 ],
             )
@@ -821,6 +861,58 @@ pub(crate) fn secure_prune_app_events_before_tx(
     })
 }
 
+/// Securely prune application rows whose pinned [`StoredAppEvent::expiry_timestamp`]
+/// is at or before `now_unix_seconds`. Rows with unknown/legacy retention
+/// (`expiry_timestamp IS NULL`) are never selected.
+pub(crate) fn secure_prune_expired_app_events_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    now_unix_seconds: u64,
+) -> StorageResult<SecurePruneAppEventsResult> {
+    debug_assert_eq!(
+        tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0),
+        1,
+        "secure_delete must be ON before the prune transaction is opened"
+    );
+    let pruned_events = app_events_past_expiry_tx(tx, group_id_hex, now_unix_seconds)?;
+    if pruned_events.is_empty() {
+        return Ok(SecurePruneAppEventsResult::default());
+    }
+
+    let mut pruned_message_ids = BTreeSet::new();
+    let mut affected_message_ids = BTreeSet::new();
+    let mut media_ciphertext_sha256 = BTreeSet::new();
+    for event in &pruned_events {
+        pruned_message_ids.insert(event.message_id_hex.clone());
+        collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
+        affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
+            tx,
+            group_id_hex,
+            &event.message_id_hex,
+            event.kind,
+            &event.tags,
+        )?);
+    }
+
+    scrub_app_events_by_message_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+
+    let pruned = delete_app_events_by_message_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+
+    delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
+    for message_id in affected_message_ids {
+        upsert_message_timeline_projection_for_message_tx(tx, group_id_hex, &message_id)?;
+    }
+    refresh_chat_list_last_message_after_secure_prune_tx(tx, group_id_hex)?;
+
+    Ok(SecurePruneAppEventsResult {
+        pruned_messages: pruned,
+        media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
+    })
+}
+
 fn refresh_chat_list_last_message_after_secure_prune_tx(
     tx: &Connection,
     group_id_hex: &str,
@@ -970,7 +1062,8 @@ fn project_single_message_timeline_tx(
         .query_row(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason, moderation_grant
+                    invalidated, invalidation_reason, moderation_grant,
+                    source_retention_secs, expiry_timestamp
              FROM app_events
              WHERE group_id_hex = ?1 AND message_id_hex = ?2",
             params![group_id_hex, message_id_hex],
@@ -1205,7 +1298,8 @@ fn app_events_targeting_message_tx(
                     app_events.plaintext, app_events.kind, app_events.tags_json,
                     app_events.recorded_at, app_events.received_at,
                     app_events.invalidated, app_events.invalidation_reason,
-                    app_events.moderation_grant
+                    app_events.moderation_grant, app_events.source_retention_secs,
+                    app_events.expiry_timestamp
              FROM message_modifier_edges AS edges
              JOIN app_events
                ON app_events.group_id_hex = edges.group_id_hex
@@ -1318,7 +1412,8 @@ fn app_events_for_rebuild_tx(
         .prepare(
             "SELECT group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at,
-                    invalidated, invalidation_reason, moderation_grant
+                    invalidated, invalidation_reason, moderation_grant,
+                    source_retention_secs, expiry_timestamp
              FROM app_events
              WHERE group_id_hex = ?1
              ORDER BY recorded_at, message_id_hex, insert_order",
@@ -1366,6 +1461,112 @@ fn app_events_before_cutoff_tx(
     .storage()
 }
 
+fn app_events_past_expiry_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    now_unix_seconds: u64,
+) -> StorageResult<Vec<PrunedAppEvent>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT message_id_hex, kind, tags_json
+             FROM app_events
+             WHERE group_id_hex = ?1
+               AND expiry_timestamp IS NOT NULL
+               AND expiry_timestamp <= ?2
+             ORDER BY recorded_at, message_id_hex, insert_order",
+        )
+        .storage()?;
+    stmt.query_map(
+        params![
+            group_id_hex,
+            optional_u64_to_sortable_blob(Some(now_unix_seconds))
+        ],
+        |row| {
+            let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok(PrunedAppEvent {
+                message_id_hex: row.get(0)?,
+                kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+                tags,
+            })
+        },
+    )
+    .storage()?
+    .collect::<Result<Vec<_>, _>>()
+    .storage()
+}
+
+fn scrub_app_events_by_message_ids_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<()> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        tx.execute(
+            &format!(
+                "UPDATE app_events
+                 SET source_message_id_hex = NULL,
+                     source_epoch = NULL,
+                     direction = '',
+                     sender = '',
+                     plaintext = zeroblob(length(plaintext)),
+                     tags_json = zeroblob(length(tags_json)),
+                     invalidation_reason = NULL,
+                     origin_commit_id = NULL,
+                     source_retention_secs = NULL,
+                     expiry_timestamp = NULL
+                 WHERE group_id_hex = ?
+                   AND message_id_hex IN ({placeholders})"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
+fn delete_app_events_by_message_ids_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<usize> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut deleted = 0usize;
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        deleted += tx
+            .execute(
+                &format!(
+                    "DELETE FROM app_events
+                     WHERE group_id_hex = ?
+                       AND message_id_hex IN ({placeholders})"
+                ),
+                params_from_iter(values.iter()),
+            )
+            .storage()?;
+    }
+    Ok(deleted)
+}
+
 fn scrub_app_events_before_cutoff_tx(
     tx: &Connection,
     group_id_hex: &str,
@@ -1380,7 +1581,9 @@ fn scrub_app_events_before_cutoff_tx(
              plaintext = zeroblob(length(plaintext)),
              tags_json = zeroblob(length(tags_json)),
              invalidation_reason = NULL,
-             origin_commit_id = NULL
+             origin_commit_id = NULL,
+             source_retention_secs = NULL,
+             expiry_timestamp = NULL
          WHERE group_id_hex = ?1
            AND recorded_at < ?2",
         params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
@@ -2351,6 +2554,8 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAppEvent> 
         invalidated: row.get::<_, i64>(11)? != 0,
         invalidation_reason: row.get(12)?,
         moderation_grant: row.get::<_, i64>(13)? != 0,
+        _source_retention_secs: optional_u64_from_sortable_blob(row.get(14)?, 14)?,
+        _expiry_timestamp: optional_u64_from_sortable_blob(row.get(15)?, 15)?,
     })
 }
 
@@ -2528,5 +2733,7 @@ fn reaction_summary_from_json(json: String) -> Result<TimelineReactionSummary, s
     serde_json::from_str(&json)
 }
 
+#[cfg(test)]
+mod retention_tests;
 #[cfg(test)]
 mod tests;

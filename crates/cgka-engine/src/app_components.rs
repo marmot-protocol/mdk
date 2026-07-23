@@ -158,13 +158,19 @@ pub(crate) fn app_component_data_of_group(
     app_component_bytes(mls_group, component_id).map(ToOwned::to_owned)
 }
 
+pub(crate) fn message_retention_duration_secs_of_group(
+    mls_group: &MlsGroup,
+) -> Result<u64, EngineError> {
+    let Some(bytes) = app_component_bytes(mls_group, GROUP_MESSAGE_RETENTION_COMPONENT_ID) else {
+        return Ok(0);
+    };
+    decode_message_retention(bytes)
+}
+
 pub(crate) fn message_retention_seconds_of_group(
     mls_group: &MlsGroup,
 ) -> Result<Option<u64>, EngineError> {
-    let Some(bytes) = app_component_bytes(mls_group, GROUP_MESSAGE_RETENTION_COMPONENT_ID) else {
-        return Ok(None);
-    };
-    let seconds = decode_message_retention(bytes)?;
+    let seconds = message_retention_duration_secs_of_group(mls_group)?;
     if seconds == 0 {
         Ok(None)
     } else {

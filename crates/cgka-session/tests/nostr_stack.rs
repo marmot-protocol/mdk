@@ -60,6 +60,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
             epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"hello through the nostr stack"),
+            source_retention_secs: Some(0),
         }]
     );
 }
@@ -163,6 +164,7 @@ async fn group_delivery_requires_synced_group_subscription() {
             epoch: EpochId(1),
             sender: alice.session.self_id(),
             payload: app_payload_for(&alice, b"sync gated"),
+            source_retention_secs: Some(0),
         }]
     );
 }

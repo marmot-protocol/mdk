@@ -646,6 +646,12 @@ impl<S: StorageProvider> Engine<S> {
                 ));
             }
 
+            let source_retention_secs = if msg_content_type == ContentType::Application {
+                self.message_retention_at_source_epoch(&group_id, &mls_group, msg_epoch, &msg.id)?
+            } else {
+                None
+            };
+
             self.persist_openmls_wire_message(
                 &openmls_msg,
                 &group_id,
@@ -878,6 +884,7 @@ impl<S: StorageProvider> Engine<S> {
                         sender,
                         epoch: msg_epoch,
                         payload,
+                        source_retention_secs,
                     });
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
                     // In-memory fast path mirrors the durable record, keyed on
@@ -1955,6 +1962,74 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(false)
+    }
+
+    fn message_retention_at_source_epoch(
+        &self,
+        group_id: &GroupId,
+        current_group: &MlsGroup,
+        source_epoch: EpochId,
+        message_id: &MessageId,
+    ) -> Result<Option<u64>, EngineError> {
+        let current_epoch = EpochId(current_group.epoch().as_u64());
+        if source_epoch == current_epoch {
+            return crate::app_components::message_retention_duration_secs_of_group(current_group)
+                .map(Some);
+        }
+        if source_epoch > current_epoch {
+            return Ok(None);
+        }
+
+        let source_snapshot = self
+            .storage
+            .list_group_snapshots(group_id)?
+            .into_iter()
+            .find(|name| retained_anchor_epoch_from_snapshot_name(name) == Some(source_epoch.0));
+        let Some(source_snapshot) = source_snapshot else {
+            // The MLS secret tree may still decrypt a past message after the
+            // full source-epoch snapshot was pruned. In that case the protocol
+            // decision is unknown: preserve the plaintext instead of applying
+            // the current epoch's potentially more destructive policy.
+            return Ok(None);
+        };
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"cgka-engine-retention-restore/v1");
+        hasher.update(group_id.as_slice());
+        hasher.update(current_epoch.0.to_be_bytes());
+        hasher.update(source_epoch.0.to_be_bytes());
+        hasher.update(message_id.as_slice());
+        let digest = hasher.finalize();
+        let restore_snapshot = format!(
+            "retention-restore-{}-{}",
+            current_epoch.0,
+            hex::encode(&digest[..8])
+        );
+        let guard =
+            SnapshotRollbackGuard::create(&self.storage, group_id.clone(), restore_snapshot)?;
+        let result = (|| {
+            self.storage
+                .rollback_group_to_snapshot(group_id, &source_snapshot)?;
+            let provider =
+                EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+            let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+            let source_group = MlsGroup::load(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+                &mls_gid,
+            )
+            .map_err(|e| EngineError::Backend(format!("load retention snapshot group: {e:?}")))?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+            if source_group.epoch().as_u64() != source_epoch.0 {
+                return Err(EngineError::Backend(
+                    "retained source-epoch snapshot had an unexpected epoch".into(),
+                ));
+            }
+            crate::app_components::message_retention_duration_secs_of_group(&source_group).map(Some)
+        })();
+        guard.commit()?;
+        result
     }
 
     pub(crate) fn available_past_peel_snapshots(

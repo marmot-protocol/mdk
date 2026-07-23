@@ -46,6 +46,8 @@ use crate::{
 mod audit;
 mod epoch_stall;
 mod projection;
+#[cfg(test)]
+mod projection_retention_tests;
 mod push;
 mod sync;
 

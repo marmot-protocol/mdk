@@ -246,6 +246,7 @@ pub enum OpenMlsReplayObservation {
         sender: Vec<u8>,
         payload: Vec<u8>,
         decrypted_payload_ref: String,
+        source_retention_secs: Option<u64>,
     },
     Ignored {
         message_id: String,
@@ -1932,6 +1933,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         .ok_or(OpenMlsProjectionError::MissingGroup)?;
 
     let mut observations = Vec::new();
+    let mut source_retention_by_epoch = BTreeMap::new();
     // An own commit is pre-validated only while every commit replayed before
     // it was canonical (`Processed`): it was created from the canonical state
     // at its source epoch, so on a diverging prefix its anchor state would
@@ -1953,6 +1955,19 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 .ok_or(OpenMlsProjectionError::UnsupportedMessageKind(
                     projection.kind,
                 ))?;
+        let replay_epoch = mls_group.epoch().as_u64();
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            source_retention_by_epoch.entry(replay_epoch)
+        {
+            entry.insert(
+                crate::app_components::message_retention_duration_secs_of_group(&mls_group)
+                    .map_err(|err| {
+                        OpenMlsProjectionError::Replay(format!(
+                            "message_retention_duration_secs_of_group: {err:?}"
+                        ))
+                    })?,
+            );
+        }
         if projection.kind == OpenMlsContentKind::Commit
             && prefix_canonical
             && let Some(stamp) = own_commits.stamp(&projection.message_digest)
@@ -2160,6 +2175,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     crate::app_payload::validate_app_payload_for_sender(&payload, sender).is_ok()
                 });
                 if let Some(sender) = validated_sender {
+                    let source_retention_secs =
+                        source_retention_by_epoch.get(&replay_epoch).copied();
                     observations.push(OpenMlsReplayObservation::ApplicationProcessed {
                         message_id,
                         source_epoch,
@@ -2169,6 +2186,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             "sha256:{}",
                             hex::encode(message_digest(payload.as_slice()))
                         ),
+                        source_retention_secs,
                     });
                 } else {
                     observations.push(OpenMlsReplayObservation::Ignored {

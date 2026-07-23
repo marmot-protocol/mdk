@@ -58,6 +58,20 @@ pub const GROUP_SYSTEM_TYPE_GROUP_AVATAR_CHANGED: &str = "group_avatar_changed";
 /// component changing (the app calls this the disappearing-message timer).
 pub const GROUP_SYSTEM_TYPE_DISAPPEARING_TIMER_CHANGED: &str = "disappearing_timer_changed";
 
+/// Absolute expiry for a disappearing application message from its
+/// sender-authenticated `created_at` and the `marmot.group.message-retention.v1`
+/// duration pinned from the MLS source epoch. `0` duration and overflow both mean
+/// no expiry while the message remains valid.
+pub fn disappearing_message_expiry_timestamp(
+    created_at: u64,
+    disappearing_message_secs: u64,
+) -> Option<u64> {
+    if disappearing_message_secs == 0 {
+        return None;
+    }
+    created_at.checked_add(disappearing_message_secs)
+}
+
 /// Human-readable fallback `text` for kind-1210 group system rows. These strings
 /// feed `content` → `id_preimage` → `canonical_event_id`, so they must stay in
 /// lockstep across every caller that synthesizes or dedups group-system rows.
@@ -758,5 +772,12 @@ mod tests {
         assert_eq!(event.system_type, GROUP_SYSTEM_TYPE_GROUP_RENAMED);
         assert_eq!(event.data_str(GROUP_SYSTEM_DATA_NAME), Some("Team Two"));
         assert_eq!(event.data_str(GROUP_SYSTEM_DATA_OLD_NAME), Some("Team One"));
+    }
+
+    #[test]
+    fn disappearing_message_expiry_timestamp_overflow_means_no_expiry() {
+        assert_eq!(disappearing_message_expiry_timestamp(0, 0), None);
+        assert_eq!(disappearing_message_expiry_timestamp(100, 60), Some(160));
+        assert_eq!(disappearing_message_expiry_timestamp(u64::MAX, 1), None);
     }
 }

@@ -308,6 +308,7 @@ fn received_reaction(emoji: &str, target_message_id: &str) -> ReceivedMessage {
         sender_display_name: None,
         group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
         source_epoch: 1,
+        source_retention_secs: Some(0),
         plaintext: emoji.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_REACTION,
         tags: vec![vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]],
@@ -324,6 +325,7 @@ fn received_chat(plaintext: &str, tags: Vec<Vec<String>>) -> ReceivedMessage {
         sender_display_name: None,
         group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
         source_epoch: 1,
+        source_retention_secs: Some(0),
         plaintext: plaintext.to_owned(),
         kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
         tags,
@@ -724,6 +726,7 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
             sender_display_name: Some("Agent".to_owned()),
             group_id: cgka_traits::GroupId::new(vec![0xEE; 32]),
             source_epoch: 1,
+            source_retention_secs: Some(0),
             plaintext: r#"{"status":"running","text":"Searching relays"}"#.to_owned(),
             kind: MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
             // Even a receiver p-tag must not make a non-chat kind a mention.

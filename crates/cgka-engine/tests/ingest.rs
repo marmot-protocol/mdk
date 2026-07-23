@@ -477,6 +477,204 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
     );
 }
 
+#[tokio::test]
+async fn delayed_app_message_uses_authenticated_source_epoch_retention() {
+    let mut supported = default_group_components();
+    supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice-retention-epoch"))
+        .account_identity_proof_signer(proof_signer(b"alice-retention-epoch"))
+        .feature_registry(selfremove_registry())
+        .supported_app_components(supported.clone())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"bob-retention-epoch"))
+        .account_identity_proof_signer(proof_signer(b"bob-retention-epoch"))
+        .feature_registry(selfremove_registry())
+        .supported_app_components(supported)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let alice_id = alice.self_id().clone();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "source epoch retention".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![alice_id],
+        })
+        .await
+        .unwrap();
+    let (create_pending, bob_welcome) = match created {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+    alice.drain_events();
+    bob.drain_events();
+
+    let delayed = match bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, b"old retention"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 3_600u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let update_pending = match update {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(update_pending).await.unwrap();
+
+    assert!(matches!(
+        alice.ingest(delayed).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let events = alice.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived {
+                payload,
+                source_retention_secs: Some(60),
+                ..
+            } if app_content(payload) == b"old retention"
+        )),
+        "delayed message must retain its authenticated source-epoch duration: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn delayed_app_message_keeps_long_source_epoch_retention_after_policy_shortens() {
+    let mut supported = default_group_components();
+    supported.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice-long-retention"))
+        .account_identity_proof_signer(proof_signer(b"alice-long-retention"))
+        .feature_registry(selfremove_registry())
+        .supported_app_components(supported.clone())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let mut bob = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"bob-long-retention"))
+        .account_identity_proof_signer(proof_signer(b"bob-long-retention"))
+        .feature_registry(selfremove_registry())
+        .supported_app_components(supported)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let alice_id = alice.self_id().clone();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "long source epoch retention".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 3_600u64.to_be_bytes().to_vec(),
+            }],
+            initial_admins: vec![alice_id],
+        })
+        .await
+        .unwrap();
+    let (create_pending, bob_welcome) = match created {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(bob_welcome).await.unwrap();
+    alice.drain_events();
+    bob.drain_events();
+
+    let delayed = match bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, b"long retention"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: group_id.clone(),
+            updates: vec![AppComponentData {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                data: 60u64.to_be_bytes().to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let update_pending = match update {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(update_pending).await.unwrap();
+
+    assert!(matches!(
+        alice.ingest(delayed).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let events = alice.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived {
+                payload,
+                source_retention_secs: Some(3_600),
+                ..
+            } if app_content(payload) == b"long retention"
+        )),
+        "delayed message must keep the longer authenticated source-epoch duration: {events:?}"
+    );
+}
+
 // ── Every StaleReason reachable ─────────────────────────────────────────────
 
 #[tokio::test]

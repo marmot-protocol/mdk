@@ -62,6 +62,8 @@ fn chat_with_tags(
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -97,6 +99,8 @@ fn reaction(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 

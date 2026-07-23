@@ -348,6 +348,12 @@ pub enum GroupEvent {
         sender: MemberId,
         epoch: EpochId,
         payload: Vec<u8>,
+        /// `marmot.group.message-retention.v1` duration in seconds from the
+        /// authenticated MLS source-epoch group state. `Some(0)` means disabled
+        /// (component absent or explicitly zero). `None` means the historical
+        /// source state was unavailable and downstream retention must preserve
+        /// the message rather than consult current group policy.
+        source_retention_secs: Option<u64>,
     },
     AppMessageInvalidated {
         group_id: GroupId,

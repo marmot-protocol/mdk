@@ -61,6 +61,8 @@ fn app_event(id: &str, group_id_hex: &str, at: u64) -> StoredAppEvent {
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -84,6 +86,8 @@ fn agent_stream_start_event(
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -105,6 +109,8 @@ fn reply_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> StoredApp
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -123,6 +129,8 @@ fn reaction_event(id: &str, group_id_hex: &str, target: &str, at: u64) -> Stored
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
@@ -147,6 +155,8 @@ fn delete_event(
         received_at: at,
         origin_commit_id: None,
         moderation_grant: false,
+        source_retention_secs: None,
+        expiry_timestamp: None,
     }
 }
 
