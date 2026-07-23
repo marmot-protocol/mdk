@@ -9,6 +9,46 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test]
+async fn daemon_stream_response_write_times_out_when_flush_stalls() {
+    struct FlushStallingWriter;
+
+    impl tokio::io::AsyncWrite for FlushStallingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    let started = Instant::now();
+    let written = write_stream_response_within(
+        &mut FlushStallingWriter,
+        &DaemonStreamResponse::ok(serde_json::json!({"type": "test"})),
+        Duration::from_millis(10),
+    )
+    .await;
+
+    assert!(!written, "a stalled flush must fail the stream write");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
 async fn run_server_validates_relays_before_creating_runtime_artifacts() {
     let home = tempfile::tempdir().expect("tempdir");
     let home_path = home.path().to_path_buf();

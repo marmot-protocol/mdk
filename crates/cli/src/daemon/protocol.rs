@@ -389,11 +389,29 @@ pub(crate) async fn write_stream_response(
     stream: &mut UnixStream,
     response: &DaemonStreamResponse,
 ) -> bool {
+    write_stream_response_within(stream, response, DAEMON_RESPONSE_WRITE_TIMEOUT).await
+}
+
+pub(crate) async fn write_stream_response_within<W>(
+    stream: &mut W,
+    response: &DaemonStreamResponse,
+    timeout_after: Duration,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     let Ok(mut bytes) = serde_json::to_vec(response) else {
         return false;
     };
     bytes.push(b'\n');
-    stream.write_all(&bytes).await.is_ok()
+    matches!(
+        tokio::time::timeout(timeout_after, async {
+            stream.write_all(&bytes).await?;
+            stream.flush().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 pub(crate) async fn write_stream_end(stream: &mut UnixStream) -> bool {

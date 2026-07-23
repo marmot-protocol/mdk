@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use agent_stream_compose::{StreamComposeCommand, StreamComposeReport, run_stream_compose_session};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -59,6 +59,9 @@ const MAX_DAEMON_REQUEST_BYTES: usize = 1024 * 1024;
 /// and starve every other client of `Status`/`Ping`/etc. On timeout the read is
 /// treated like any other per-connection failure: report and `continue`.
 const DAEMON_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-frame deadline for daemon responses. A client that stops draining its
+/// socket must release its connection permit instead of pinning the worker.
+const DAEMON_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_SOCKET_DIR_MODE: u32 = 0o700;
 const DAEMON_SOCKET_MODE: u32 = 0o600;
 /// Cap on concurrently served daemon connections. The socket is same-UID

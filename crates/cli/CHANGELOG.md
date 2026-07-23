@@ -62,6 +62,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 - Release builds now reject `WN_DEV_SETTLEMENT_QUIESCENCE_MS` instead of allowing it to override the protocol-pinned
   convergence window. Debug builds retain the override for local development and integration tests.
+- `wnd` streaming subscription responses now have a 15-second whole-frame write deadline, including socket flush, so
+  a client that stops reading cannot retain a connection permit indefinitely.
 - `wn-agent` now denies path-based media sends by default and accepts only regular, non-symlink files beneath explicit
   repeatable `--media-allowed-root` directories. Bundled Hermes and OpenClaw launchers stage short-lived copies in a
   dedicated approved directory and clean them up after each send.
