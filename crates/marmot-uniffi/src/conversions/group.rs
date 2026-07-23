@@ -17,6 +17,9 @@ use crate::errors::MarmotKitError;
 pub struct AppGroupRecordFfi {
     pub group_id_hex: String,
     pub endpoint: String,
+    /// Whether `marmot.group.profile.v1` is present. A present profile may still
+    /// carry empty `name` and `description` fields.
+    pub profile_present: bool,
     pub name: String,
     pub description: String,
     pub admins: Vec<String>,
@@ -44,11 +47,13 @@ pub struct AppGroupRecordFfi {
     pub via_welcome_message_id_hex: Option<String>,
 }
 
+fn profile_ffi_fields(profile: AppGroupProfileComponent) -> (bool, String, String) {
+    (profile.present, profile.name, profile.description)
+}
+
 impl From<AppGroupRecord> for AppGroupRecordFfi {
     fn from(value: AppGroupRecord) -> Self {
-        let AppGroupProfileComponent {
-            name, description, ..
-        } = value.profile;
+        let (profile_present, name, description) = profile_ffi_fields(value.profile);
         let AppGroupAdminPolicyComponent { admins, .. } = value.admin_policy;
         let AppGroupNostrRoutingComponent {
             nostr_group_id_hex,
@@ -60,6 +65,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
         Self {
             group_id_hex: value.group_id_hex,
             endpoint: value.endpoint,
+            profile_present,
             name,
             description,
             admins,
@@ -396,5 +402,37 @@ impl From<AppQuarantinedGroup> for AppQuarantinedGroupFfi {
             group_id_hex: value.group_id_hex,
             reason: value.reason.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_presence_tests {
+    use super::*;
+
+    fn profile(present: bool) -> AppGroupProfileComponent {
+        AppGroupProfileComponent {
+            component_id: 0x8001,
+            component: "marmot.group.profile.v1".to_owned(),
+            present,
+            name: String::new(),
+            description: String::new(),
+            data_hex: if present {
+                "0000".to_owned()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    #[test]
+    fn ffi_profile_fields_distinguish_absent_from_present_empty() {
+        assert_eq!(
+            profile_ffi_fields(profile(false)),
+            (false, String::new(), String::new())
+        );
+        assert_eq!(
+            profile_ffi_fields(profile(true)),
+            (true, String::new(), String::new())
+        );
     }
 }

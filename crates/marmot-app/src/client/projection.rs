@@ -2,7 +2,7 @@ use cgka_traits::GroupId;
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MarmotAppEvent as MarmotInnerEvent,
@@ -12,8 +12,8 @@ use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group
 use crate::{
     AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageInput,
-    AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupRecord,
-    AppMessageProjection, SecureDeleteExpiredResult, unix_now_seconds,
+    AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupProfileComponent,
+    AppGroupRecord, AppMessageProjection, SecureDeleteExpiredResult, unix_now_seconds,
 };
 
 use super::AppClient;
@@ -124,6 +124,7 @@ impl AppClient {
         let projection = EventGroupProjection {
             nostr_routing,
             group_metadata: group_metadata.as_ref(),
+            profile: self.profile_for_group(group_id),
             admin_policy: self.admin_policy_for_group(group_id),
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
@@ -146,6 +147,7 @@ impl AppClient {
         let projection = EventGroupProjection {
             nostr_routing,
             group_metadata: group_metadata.as_ref(),
+            profile: self.profile_for_group(group_id),
             admin_policy: self.admin_policy_for_group(group_id),
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),
@@ -183,6 +185,15 @@ impl AppClient {
             self.add_group(group_id)?;
         }
         Ok(!missing.is_empty())
+    }
+
+    pub(crate) fn profile_for_group(&self, group_id: &GroupId) -> AppGroupProfileComponent {
+        self.runtime
+            .app_component(group_id, GROUP_PROFILE_COMPONENT_ID)
+            .ok()
+            .flatten()
+            .map(|bytes| AppGroupProfileComponent::from_bytes(&bytes))
+            .unwrap_or_else(AppGroupProfileComponent::absent)
     }
 
     pub(crate) fn admin_policy_for_group(

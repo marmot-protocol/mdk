@@ -10,8 +10,8 @@
 //! - [`codec`]: QUIC-varint / var-bytes primitives and the `ComponentsList`
 //!   encoder,
 //! - [`host_safety`]: public-IP / loopback host classifiers,
-//! - per-schema component state and codecs: [`routing`], [`encrypted_media`],
-//!   and [`avatar_url`].
+//! - per-schema component state and codecs: [`routing`], [`profile`],
+//!   [`blossom_image`], [`encrypted_media`], and [`avatar_url`].
 //!
 //! Everything public is re-exported here, so every `cgka_traits::app_components::*`
 //! path is unchanged.
@@ -20,9 +20,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 mod avatar_url;
+mod blossom_image;
 mod codec;
 mod encrypted_media;
 mod host_safety;
+mod profile;
 mod routing;
 
 #[cfg(test)]
@@ -31,6 +33,10 @@ mod tests;
 pub use avatar_url::{
     GroupAvatarUrlV1, decode_group_avatar_url_v1, encode_group_avatar_url_v1,
     validate_and_normalize_group_avatar_url,
+};
+pub use blossom_image::{
+    GroupBlossomImageV1, canonicalize_marmot_media_type, decode_group_blossom_image_v1,
+    encode_group_blossom_image_v1,
 };
 pub use codec::{
     decode_components_list, decode_quic_varint, encode_component_vectors, encode_components_list,
@@ -44,7 +50,14 @@ pub use host_safety::{
     is_loopback_candidate_host, is_loopback_host, is_loopback_ip, is_public_ip, is_public_ipv4,
     is_public_ipv6, reject_non_public_ip, reject_non_public_socket_addr,
 };
-pub use routing::{NostrRoutingV1, decode_nostr_routing_v1, encode_nostr_routing_v1};
+pub use profile::{
+    GROUP_PROFILE_DESCRIPTION_MAX_LEN, GROUP_PROFILE_NAME_MAX_LEN, GroupProfileV1,
+    decode_group_profile_v1, encode_group_profile_v1,
+};
+pub use routing::{
+    NOSTR_RELAY_URL_MAX_LEN, NOSTR_ROUTING_MAX_RELAYS, NostrRoutingV1, decode_nostr_routing_v1,
+    encode_nostr_routing_v1,
+};
 
 /// MLS ComponentID.
 pub type AppComponentId = u16;

@@ -1781,6 +1781,7 @@ impl AppClient {
         let projection = EventGroupProjection {
             nostr_routing,
             group_metadata: group_metadata.as_ref(),
+            profile: self.profile_for_group(group_id),
             admin_policy: self.admin_policy_for_group(group_id),
             message_retention: self.message_retention_for_group(group_id),
             agent_text_stream: self.agent_text_stream_for_group(group_id),

@@ -63,6 +63,7 @@ mod tests {
         AppGroupRecordFfi {
             group_id_hex: "01".repeat(32),
             endpoint: "marmot:group:01".into(),
+            profile_present: true,
             name: "Test".into(),
             description: String::new(),
             admins: admins.into_iter().map(ToOwned::to_owned).collect(),

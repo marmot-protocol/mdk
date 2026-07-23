@@ -1145,6 +1145,36 @@ fn empty_follow_fetch_preserves_cached_edges() {
 }
 
 #[test]
+fn profile_presence_round_trips_through_account_projection() {
+    let mut group = AppGroupRecord::new(
+        "aa".to_owned(),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        String::new(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+
+    assert!(group.profile.present);
+    assert_eq!(group.profile.data_hex, "0000");
+    let restored_present =
+        app_group_from_stored_group(stored_group_from_app_group(&group)).unwrap();
+    assert!(restored_present.profile.present);
+    assert_eq!(restored_present.profile.data_hex, "0000");
+
+    group.profile = AppGroupProfileComponent::absent();
+    let restored_absent = app_group_from_stored_group(stored_group_from_app_group(&group)).unwrap();
+    assert!(!restored_absent.profile.present);
+    assert!(restored_absent.profile.data_hex.is_empty());
+    assert_eq!(restored_absent.profile.name, "");
+    assert_eq!(restored_absent.profile.description, "");
+}
+
+#[test]
 fn avatar_url_round_trips_through_account_projection() {
     let mut group = AppGroupRecord::new(
         "aa".to_owned(),

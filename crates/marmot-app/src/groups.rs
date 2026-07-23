@@ -11,10 +11,11 @@ use cgka_traits::app_components::{
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT,
     GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
-    GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_encrypted_media_policy_v1,
-    encode_group_avatar_url_v1, encode_nostr_routing_v1, encode_quic_varint,
+    GroupAvatarUrlV1, GroupProfileV1, NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, decode_encrypted_media_policy_v1, decode_group_avatar_url_v1,
+    decode_group_profile_v1, decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors,
+    encode_encrypted_media_policy_v1, encode_group_avatar_url_v1, encode_nostr_routing_v1,
+    encode_quic_varint,
 };
 use cgka_traits::app_event::{
     GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS,
@@ -170,10 +171,16 @@ pub struct AppQuarantinedGroup {
     pub reason: AppGroupHydrationQuarantineReason,
 }
 
+fn profile_present_by_default() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupProfileComponent {
     pub component_id: u16,
     pub component: String,
+    #[serde(default = "profile_present_by_default")]
+    pub present: bool,
     pub name: String,
     pub description: String,
     pub data_hex: String,
@@ -372,10 +379,7 @@ impl AppGroupRecord {
         self.avatar_url = projection.avatar_url.clone();
         self.encrypted_media = projection.encrypted_media.clone();
         self.image = AppGroupImageComponent::new(projection.image.clone());
-        if let Some(group) = projection.group_metadata {
-            self.profile =
-                AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
-        }
+        self.profile = projection.profile.clone();
     }
 
     pub(crate) fn apply_confirmation_state(&mut self, state: GroupConfirmationProjection) {
@@ -417,9 +421,39 @@ impl AppGroupProfileComponent {
         Self {
             component_id: GROUP_PROFILE_COMPONENT_ID,
             component: GROUP_PROFILE_COMPONENT.to_owned(),
+            present: true,
             name,
             description,
             data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn absent() -> Self {
+        Self {
+            component_id: GROUP_PROFILE_COMPONENT_ID,
+            component: GROUP_PROFILE_COMPONENT.to_owned(),
+            present: false,
+            name: String::new(),
+            description: String::new(),
+            data_hex: String::new(),
+        }
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        match decode_group_profile_v1(bytes) {
+            Ok(GroupProfileV1 { name, description }) => {
+                let mut profile = Self::new(name, description);
+                profile.data_hex = hex::encode(bytes);
+                profile
+            }
+            Err(_) => Self {
+                component_id: GROUP_PROFILE_COMPONENT_ID,
+                component: GROUP_PROFILE_COMPONENT.to_owned(),
+                present: true,
+                name: String::new(),
+                description: String::new(),
+                data_hex: hex::encode(bytes),
+            },
         }
     }
 }
@@ -466,8 +500,8 @@ impl AppGroupAvatarUrlComponent {
     ) -> Result<Self, AppError> {
         let avatar = GroupAvatarUrlV1 {
             url,
-            dim,
-            thumbhash,
+            dim: dim.map(String::into_bytes).unwrap_or_default(),
+            thumbhash: thumbhash.map(String::into_bytes).unwrap_or_default(),
         };
         let data = encode_group_avatar_url_v1(&avatar).map_err(AppError::InvalidGroupAvatarUrl)?;
         // Decode the encoded bytes back so the struct fields carry the normalized
@@ -500,13 +534,20 @@ impl AppGroupAvatarUrlComponent {
     }
 
     fn from_decoded(avatar: GroupAvatarUrlV1, data: Vec<u8>) -> Self {
+        let GroupAvatarUrlV1 {
+            url,
+            dim,
+            thumbhash,
+        } = avatar;
         Self {
             component_id: GROUP_AVATAR_URL_COMPONENT_ID,
             component: GROUP_AVATAR_URL_COMPONENT.to_owned(),
-            present: !avatar.url.is_empty(),
-            url: avatar.url,
-            dim: avatar.dim,
-            thumbhash: avatar.thumbhash,
+            present: !url.is_empty(),
+            url,
+            dim: String::from_utf8(dim).ok().filter(|hint| !hint.is_empty()),
+            thumbhash: String::from_utf8(thumbhash)
+                .ok()
+                .filter(|hint| !hint.is_empty()),
             data_hex: hex::encode(data),
         }
     }
@@ -818,6 +859,7 @@ fn read_component_vector(cursor: &mut &[u8]) -> Option<Vec<u8>> {
 pub(crate) struct EventGroupProjection<'a> {
     pub(crate) nostr_routing: AppGroupNostrRoutingComponent,
     pub(crate) group_metadata: Option<&'a Group>,
+    pub(crate) profile: AppGroupProfileComponent,
     pub(crate) admin_policy: AppGroupAdminPolicyComponent,
     pub(crate) message_retention: AppGroupMessageRetentionComponent,
     pub(crate) agent_text_stream: AppAgentTextStreamComponent,
@@ -1175,6 +1217,7 @@ pub(crate) fn add_group(
         projection.encrypted_media.clone(),
         projection.image.clone(),
     );
+    group.profile = projection.profile.clone();
     group.apply_confirmation_state(confirmation);
     state.groups.push(group);
 }

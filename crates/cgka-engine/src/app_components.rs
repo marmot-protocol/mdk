@@ -6,10 +6,11 @@ use cgka_traits::app_components::{
     APP_COMPONENTS_COMPONENT_ID, AppComponentData, AppComponentId, AppComponentSet,
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, SAFE_AAD_COMPONENT_ID, decode_components_list,
-    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupProfileV1,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, SAFE_AAD_COMPONENT_ID, decode_components_list,
+    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
+    decode_group_profile_v1, decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors,
+    encode_components_list, encode_group_profile_v1,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
@@ -129,19 +130,9 @@ pub(crate) fn group_profile_of_group(
 }
 
 pub(crate) fn decode_group_profile(bytes: &[u8]) -> Result<(String, String), EngineError> {
-    let mut cursor = bytes;
-    let name = decode_var_bytes(&mut cursor, 256, "profile name")?;
-    let description = decode_var_bytes(&mut cursor, 4096, "profile description")?;
-    if !cursor.is_empty() {
-        return Err(EngineError::Serialize(
-            "profile component has trailing bytes".into(),
-        ));
-    }
-    let name = String::from_utf8(name)
-        .map_err(|e| EngineError::Serialize(format!("profile name is not UTF-8: {e}")))?;
-    let description = String::from_utf8(description)
-        .map_err(|e| EngineError::Serialize(format!("profile description is not UTF-8: {e}")))?;
-    Ok((name, description))
+    let profile = decode_group_profile_v1(bytes)
+        .map_err(|e| EngineError::Serialize(format!("profile component decode failed: {e}")))?;
+    Ok((profile.name, profile.description))
 }
 
 pub(crate) fn admins_of_group(mls_group: &MlsGroup) -> Result<Vec<[u8; 32]>, EngineError> {
@@ -598,20 +589,11 @@ pub(crate) fn admin_pubkey_from_member_id(id: &MemberId) -> Result<[u8; 32], Eng
 }
 
 pub(crate) fn encode_group_profile(name: &str, description: &str) -> Result<Vec<u8>, EngineError> {
-    if name.len() > 256 {
-        return Err(EngineError::Other(
-            "group profile name must be at most 256 UTF-8 bytes".into(),
-        ));
-    }
-    if description.len() > 4096 {
-        return Err(EngineError::Other(
-            "group profile description must be at most 4096 UTF-8 bytes".into(),
-        ));
-    }
-    Ok(encode_component_vectors(&[
-        name.as_bytes(),
-        description.as_bytes(),
-    ]))
+    encode_group_profile_v1(&GroupProfileV1 {
+        name: name.to_owned(),
+        description: description.to_owned(),
+    })
+    .map_err(EngineError::Other)
 }
 
 pub(crate) fn encode_admin_policy(admins: &[[u8; 32]]) -> Result<Vec<u8>, EngineError> {
@@ -749,38 +731,9 @@ fn validate_group_avatar_url(bytes: &[u8]) -> Result<(), EngineError> {
 }
 
 fn validate_group_image(bytes: &[u8]) -> Result<(), EngineError> {
-    let mut cursor = bytes;
-    let image_hash = decode_var_bytes(&mut cursor, 32, "group image hash")?;
-    let image_key = decode_var_bytes(&mut cursor, 32, "group image key")?;
-    let image_nonce = decode_var_bytes(&mut cursor, 12, "group image nonce")?;
-    let image_upload_key = decode_var_bytes(&mut cursor, 32, "group image upload key")?;
-    let media_type = decode_var_bytes(&mut cursor, 128, "group image media type")?;
-    if !cursor.is_empty() {
-        return Err(EngineError::Serialize(
-            "group image component has trailing bytes".into(),
-        ));
-    }
-    let present = !image_hash.is_empty()
-        || !image_key.is_empty()
-        || !image_nonce.is_empty()
-        || !image_upload_key.is_empty()
-        || !media_type.is_empty();
-    if !present {
-        return Ok(());
-    }
-    if image_hash.len() != 32
-        || image_key.len() != 32
-        || image_nonce.len() != 12
-        || image_upload_key.len() != 32
-        || media_type.is_empty()
-    {
-        return Err(EngineError::Serialize(
-            "group image component has invalid partial state".into(),
-        ));
-    }
-    std::str::from_utf8(&media_type)
-        .map_err(|e| EngineError::Serialize(format!("group image media type is not UTF-8: {e}")))?;
-    Ok(())
+    decode_group_blossom_image_v1(bytes)
+        .map(|_| ())
+        .map_err(|e| EngineError::Serialize(format!("invalid group image component: {e}")))
 }
 
 /// Whether avatar/image component bytes encode a *present* avatar. An empty
@@ -994,6 +947,31 @@ mod tests {
 
         assert!(validate_initial_app_component(&component).is_err());
         assert!(validate_app_component_update(&component).is_err());
+    }
+
+    #[test]
+    fn blossom_image_requires_canonical_media_type() {
+        let component = |media_type: &[u8]| {
+            encode_component_vectors(&[&[1u8; 32], &[2u8; 32], &[3u8; 12], &[4u8; 32], media_type])
+        };
+
+        for canonical in [b"image/png".as_slice(), b"image/jpeg".as_slice()] {
+            validate_group_image(&component(canonical)).expect("canonical media type");
+        }
+        for non_canonical in [
+            b"Image/PNG".as_slice(),
+            b"image/png; charset=utf-8".as_slice(),
+            b"image/jpg".as_slice(),
+            b" image/png ".as_slice(),
+            b"image/png/extra".as_slice(),
+            b"image/(png)".as_slice(),
+        ] {
+            assert!(
+                validate_group_image(&component(non_canonical)).is_err(),
+                "non-canonical media type {:?} must be rejected",
+                String::from_utf8_lossy(non_canonical)
+            );
+        }
     }
 
     #[test]

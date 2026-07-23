@@ -123,8 +123,8 @@ fn setup_store() -> SqliteAccountStorage {
 fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {
     let bytes = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
         url: url.to_owned(),
-        dim: None,
-        thumbhash: None,
+        dim: Vec::new(),
+        thumbhash: Vec::new(),
     })
     .unwrap();
     StoredAccountGroupComponent {

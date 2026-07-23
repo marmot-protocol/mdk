@@ -42,6 +42,8 @@ OpenMLS appears only where the storage aggregate needs the OpenMLS storage trait
 | `src/app_components/codec.rs` | QUIC-varint / var-bytes primitives and the `ComponentsList` encoder. |
 | `src/app_components/host_safety.rs` | Canonical public-IP / loopback host classifiers shared by app-component URL policy and media SSRF guards. |
 | `src/app_components/routing.rs` | `NostrRoutingV1` state and codec. |
+| `src/app_components/profile.rs` | `GroupProfileV1` state and codec. |
+| `src/app_components/blossom_image.rs` | `GroupBlossomImageV1` state, codec, and media-type canonicalization. |
 | `src/app_components/encrypted_media.rs` | `EncryptedMediaPolicyV1` / `BlobStoreEndpointV1` state, codec, and endpoint-URL validation. |
 | `src/app_components/avatar_url.rs` | `GroupAvatarUrlV1` state, codec, and avatar-URL validation. |
 | `src/app_event.rs` | Typed `MarmotAppEvent` application-message event and sender-validation errors. |

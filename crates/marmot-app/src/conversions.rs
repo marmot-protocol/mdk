@@ -11,9 +11,10 @@ use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent,
     AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
     AppGroupImageInput, AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent,
-    AppGroupRecord, AppMessageProjection, AppMessageRecord, AuditLogSettings,
-    ChatNotificationSettings, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID,
+    AppGroupProfileComponent, AppGroupRecord, AppMessageProjection, AppMessageRecord,
+    AuditLogSettings, ChatNotificationSettings, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID,
     NotificationSettings, PushPlatform, PushRegistration, RelayTelemetrySettings,
 };
 use storage_sqlite::{
@@ -77,12 +78,15 @@ pub(crate) fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccou
 pub(crate) fn stored_components_from_app_group(
     group: &AppGroupRecord,
 ) -> Vec<StoredAccountGroupComponent> {
-    let mut components = vec![
-        StoredAccountGroupComponent {
+    let mut components = Vec::new();
+    if group.profile.present {
+        components.push(StoredAccountGroupComponent {
             component_id: group.profile.component_id,
             component_name: group.profile.component.clone(),
             component_data_hex: group.profile.data_hex.clone(),
-        },
+        });
+    }
+    components.extend([
         StoredAccountGroupComponent {
             component_id: group.image.component_id,
             component_name: group.image.component.clone(),
@@ -103,7 +107,7 @@ pub(crate) fn stored_components_from_app_group(
             component_name: group.nostr_routing.component.clone(),
             component_data_hex: group.nostr_routing.data_hex.clone(),
         },
-    ];
+    ]);
     if group.agent_text_stream.required {
         components.push(StoredAccountGroupComponent {
             component_id: group.agent_text_stream.component_id,
@@ -136,6 +140,9 @@ pub(crate) fn app_group_from_stored_group(
             || AppError::InvalidNostrRouting("stored group is missing routing".into()),
         )?,
     )?;
+    let profile_bytes = account_component_data_hex(&stored.components, GROUP_PROFILE_COMPONENT_ID)
+        .map(hex::decode)
+        .transpose()?;
     let retention =
         account_component_data_hex(&stored.components, GROUP_MESSAGE_RETENTION_COMPONENT_ID)
             .map(hex::decode)
@@ -157,6 +164,10 @@ pub(crate) fn app_group_from_stored_group(
         AppGroupAdminPolicyComponent::new(parse_admin_keys_hex(&stored.admin_keys_hex)),
         retention,
     );
+    group.profile = profile_bytes
+        .as_deref()
+        .map(AppGroupProfileComponent::from_bytes)
+        .unwrap_or_else(AppGroupProfileComponent::absent);
     if let Some(agent_hex) =
         account_component_data_hex(&stored.components, AGENT_TEXT_STREAM_COMPONENT_ID)
         && !agent_hex.is_empty()

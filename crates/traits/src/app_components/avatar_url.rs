@@ -1,46 +1,45 @@
 //! `marmot.group.avatar-url.v1` component state and codec.
 
-use url::{Host, Url};
+use url::Url;
 
 use super::codec::{decode_var_bytes, encode_var_bytes};
-use super::host_safety::{is_loopback_host, reject_non_routable_ipv4, reject_non_routable_ipv6};
 use super::{GROUP_AVATAR_HINT_MAX_LEN, GROUP_AVATAR_URL_MAX_LEN};
 
 /// Decoded `marmot.group.avatar-url.v1` state. An absent avatar is an empty `url`.
+/// Render hints stay as opaque bytes so decoding and re-encoding never rewrites
+/// or drops a valid hint that an application cannot interpret.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GroupAvatarUrlV1 {
     pub url: String,
-    pub dim: Option<String>,
-    pub thumbhash: Option<String>,
+    pub dim: Vec<u8>,
+    pub thumbhash: Vec<u8>,
 }
 
 /// Encode `marmot.group.avatar-url.v1` state. The URL is validated and normalized;
 /// an empty `url` encodes the absent/cleared avatar (all fields empty).
 pub fn encode_group_avatar_url_v1(avatar: &GroupAvatarUrlV1) -> Result<Vec<u8>, String> {
-    if avatar.url.is_empty() && (avatar.dim.is_some() || avatar.thumbhash.is_some()) {
+    if avatar.url.is_empty() && (!avatar.dim.is_empty() || !avatar.thumbhash.is_empty()) {
         return Err("group avatar absent state must not include hints".into());
+    }
+    if avatar.dim.len() > GROUP_AVATAR_HINT_MAX_LEN {
+        return Err(format!(
+            "group avatar dim exceeds {GROUP_AVATAR_HINT_MAX_LEN} bytes"
+        ));
+    }
+    if avatar.thumbhash.len() > GROUP_AVATAR_HINT_MAX_LEN {
+        return Err(format!(
+            "group avatar thumbhash exceeds {GROUP_AVATAR_HINT_MAX_LEN} bytes"
+        ));
     }
     let url = if avatar.url.is_empty() {
         String::new()
     } else {
         validate_and_normalize_group_avatar_url(&avatar.url)?
     };
-    let dim = avatar.dim.as_deref().unwrap_or("");
-    let thumbhash = avatar.thumbhash.as_deref().unwrap_or("");
-    if dim.len() > GROUP_AVATAR_HINT_MAX_LEN {
-        return Err(format!(
-            "group avatar dim exceeds {GROUP_AVATAR_HINT_MAX_LEN} bytes"
-        ));
-    }
-    if thumbhash.len() > GROUP_AVATAR_HINT_MAX_LEN {
-        return Err(format!(
-            "group avatar thumbhash exceeds {GROUP_AVATAR_HINT_MAX_LEN} bytes"
-        ));
-    }
-    let mut out = Vec::with_capacity(url.len() + dim.len() + thumbhash.len() + 6);
+    let mut out = Vec::with_capacity(url.len() + avatar.dim.len() + avatar.thumbhash.len() + 6);
     encode_var_bytes(url.as_bytes(), &mut out);
-    encode_var_bytes(dim.as_bytes(), &mut out);
-    encode_var_bytes(thumbhash.as_bytes(), &mut out);
+    encode_var_bytes(&avatar.dim, &mut out);
+    encode_var_bytes(&avatar.thumbhash, &mut out);
     Ok(out)
 }
 
@@ -69,29 +68,18 @@ pub fn decode_group_avatar_url_v1(bytes: &[u8]) -> Result<GroupAvatarUrlV1, Stri
             return Err("group avatar URL is not normalized".into());
         }
     }
-    // `dim` and `thumbhash` are opaque length-bounded hints: a decoder validates
-    // only their length (done above by decode_var_bytes) and interprets the bytes
-    // as UTF-8 only for rendering. A non-UTF-8 hint is treated as ABSENT and MUST
-    // NOT invalidate otherwise-valid state (spec/app-components/group-avatar-url-v1.md
-    // and spec/foundation/canonical-encoding.md, "opaque hints"). Rejecting it
-    // here would make the same commit accepted by some clients and not others.
+    // `dim` and `thumbhash` are opaque length-bounded hints. Preserve their exact
+    // bytes here; interpretation belongs at the application rendering boundary.
     Ok(GroupAvatarUrlV1 {
         url,
-        dim: if dim.is_empty() {
-            None
-        } else {
-            String::from_utf8(dim).ok()
-        },
-        thumbhash: if thumbhash.is_empty() {
-            None
-        } else {
-            String::from_utf8(thumbhash).ok()
-        },
+        dim,
+        thumbhash,
     })
 }
 
 /// Validate and normalize a group avatar URL: `https` only, length-bounded, no
-/// credentials or fragment, and not pointing at localhost or a non-routable IP.
+/// credentials or fragment. Destination contact safety is local application
+/// policy and deliberately does not affect component validity.
 /// Returns the normalized URL string.
 pub fn validate_and_normalize_group_avatar_url(raw: &str) -> Result<String, String> {
     if raw.is_empty() {
@@ -112,15 +100,7 @@ pub fn validate_and_normalize_group_avatar_url(raw: &str) -> Result<String, Stri
     if url.fragment().is_some() {
         return Err("group avatar URL must not include a fragment".into());
     }
-    let host = url.host().ok_or("group avatar URL must include a host")?;
-    if is_loopback_host(host.clone()) {
-        return Err("group avatar URL must not point at localhost".into());
-    }
-    match host {
-        Host::Domain(_) => {}
-        Host::Ipv4(addr) => reject_non_routable_ipv4(addr)?,
-        Host::Ipv6(addr) => reject_non_routable_ipv6(addr)?,
-    }
+    url.host().ok_or("group avatar URL must include a host")?;
     let normalized = url.as_str();
     if normalized.len() > GROUP_AVATAR_URL_MAX_LEN {
         return Err(format!(

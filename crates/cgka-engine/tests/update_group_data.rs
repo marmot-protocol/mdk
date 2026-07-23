@@ -2586,6 +2586,50 @@ async fn update_group_data_during_pending_publish_is_rejected() {
     assert!(matches!(err, EngineError::InvalidTransition(_)));
 }
 
+#[tokio::test]
+async fn unrelated_profile_update_preserves_unknown_optional_component_bytes() {
+    const UNKNOWN_OPTIONAL_COMPONENT_ID: u16 = 0xf400;
+    let unknown_bytes = vec![0xff, 0x00, 0x80, 0x01, 0x7f];
+    let (mut alice, _bob, gid) = create_pair().await;
+
+    let add_unknown = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: UNKNOWN_OPTIONAL_COMPONENT_ID,
+                data: unknown_bytes.clone(),
+            }],
+        })
+        .await
+        .unwrap();
+    let pending = match add_unknown {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let rename = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("renamed".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let pending = match rename {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    assert_eq!(
+        alice
+            .app_component(&gid, UNKNOWN_OPTIONAL_COMPONENT_ID)
+            .unwrap(),
+        Some(unknown_bytes)
+    );
+}
+
 // ── #105 group avatar-url component ──────────────────────────────────────────
 
 #[tokio::test]
@@ -2593,8 +2637,8 @@ async fn valid_group_avatar_url_component_is_accepted_and_stored() {
     let (mut alice, _bob, gid) = create_pair().await;
     let data = encode_group_avatar_url_v1(&GroupAvatarUrlV1 {
         url: "https://cdn.example.com/avatar.png".to_owned(),
-        dim: Some("512x512".to_owned()),
-        thumbhash: None,
+        dim: b"512x512".to_vec(),
+        thumbhash: Vec::new(),
     })
     .unwrap();
 

@@ -5,12 +5,17 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use cgka_traits::app_components::canonicalize_marmot_media_type;
+
 use super::DEFAULT_BLOSSOM_SERVER_URL;
 use super::blossom::{blossom_blob_url, fetch_blossom_blob, upload_blossom_blob};
-use super::crypto::canonical_media_type;
 use crate::AppError;
 
 const GROUP_IMAGE_VERSION: &str = "marmot-group-image-v1";
+
+fn canonical_group_image_media_type(value: &str) -> Result<String, AppError> {
+    canonicalize_marmot_media_type(value).map_err(AppError::InvalidEncryptedMedia)
+}
 
 /// Result of encrypting + uploading a group avatar. Maps directly onto the
 /// `marmot.group.blossom.image.v1` component fields. Unlike message media, the
@@ -54,12 +59,8 @@ pub(crate) async fn upload_group_image(
             "group image cannot be empty".into(),
         ));
     }
-    let media_type = canonical_media_type(media_type)?;
-    if media_type.len() > 128 {
-        return Err(AppError::InvalidEncryptedMedia(
-            "group image media type must be at most 128 bytes".into(),
-        ));
-    }
+    let media_type = canonical_group_image_media_type(media_type)?;
+
     let mut content_key = Zeroizing::new([0_u8; 32]);
     OsRng.fill_bytes(content_key.as_mut());
     let mut nonce = [0_u8; 12];
@@ -105,7 +106,7 @@ pub(crate) async fn fetch_group_image(
     media_type: &str,
     server: Option<&str>,
 ) -> Result<Vec<u8>, AppError> {
-    let media_type = canonical_media_type(media_type)?;
+    let media_type = canonical_group_image_media_type(media_type)?;
     let content_key: Zeroizing<[u8; 32]> = Zeroizing::new(
         Zeroizing::new(hex::decode(image_key_hex)?)
             .as_slice()
