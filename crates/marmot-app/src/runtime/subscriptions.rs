@@ -830,7 +830,7 @@ impl MarmotAppRuntime {
                                 continue;
                             }
                             let message_id = message.message_id_hex.clone();
-                            if !message_id.is_empty() && !seen_message_ids.insert(message_id) {
+                            if !seen_message_ids.should_emit(message_id) {
                                 continue;
                             }
                             if updates_tx.send(update).await.is_err() {
@@ -855,7 +855,7 @@ impl MarmotAppRuntime {
                     continue;
                 }
                 let message_id = message.message_id_hex.clone();
-                if !message_id.is_empty() && !seen_message_ids.insert(message_id) {
+                if !seen_message_ids.should_emit(message_id) {
                     continue;
                 }
                 if updates_tx.send(update).await.is_err() {

@@ -171,6 +171,13 @@ impl MessageSubscriptionSeenIds {
         true
     }
 
+    /// Apply the shared live/recovery subscription dedupe rule. Empty ids are
+    /// emitted without entering the seen set, so one malformed update cannot
+    /// suppress later distinct updates that also lack a canonical id.
+    fn should_emit(&mut self, id: String) -> bool {
+        id.is_empty() || self.insert(id)
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.ids.len()
