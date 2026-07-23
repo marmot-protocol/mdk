@@ -61,7 +61,7 @@ use storage_sqlite::{
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrKeyPackagePublication,
-    NostrKeyPackagePublisher, NostrRelayClient, NostrSdkRelayClient,
+    NostrKeyPackagePublisher, NostrRelayClient, NostrSdkRelayClient, parse_nip65_relay_set,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
@@ -511,6 +511,11 @@ impl MissingRelayListKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountRelayListState {
     pub kind: u64,
+    /// Direction-appropriate relay targets for this list.
+    ///
+    /// For NIP-65 kind 10002 this is specifically the write-capable set:
+    /// unmarked and `write` entries, excluding `read`-only entries. For the
+    /// Marmot inbox list this is the declared inbox relay set.
     pub relays: Vec<String>,
 }
 
@@ -3974,8 +3979,15 @@ fn sqlite_file_requires_key(path: &Path) -> bool {
 }
 
 fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
+    if event.kind == KIND_NIP65_RELAY_LIST {
+        return parse_nip65_relay_set(event)
+            .write_relays
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect();
+    }
+
     let tag_name = match event.kind {
-        KIND_NIP65_RELAY_LIST => "r",
         KIND_MARMOT_INBOX_RELAY_LIST => "relay",
         _ => return Vec::new(),
     };

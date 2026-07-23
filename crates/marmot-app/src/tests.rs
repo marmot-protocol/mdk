@@ -281,6 +281,34 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
     );
 }
 
+#[test]
+fn nip65_relay_list_targets_only_include_write_capable_entries() {
+    let event = NostrTransportEvent::new_unsigned(
+        "11".repeat(32),
+        KIND_NIP65_RELAY_LIST,
+        vec![
+            vec!["r".into(), "wss://both.example".into()],
+            vec!["r".into(), "wss://read-only.example".into(), "read".into()],
+            vec![
+                "r".into(),
+                "wss://write-only.example".into(),
+                "write".into(),
+            ],
+            vec!["r".into(), "wss://unknown.example".into(), "future".into()],
+            vec!["r".into(), "wss://both.example".into()],
+        ],
+        String::new(),
+    );
+
+    assert_eq!(
+        relays_from_relay_list_event(&event),
+        vec![
+            "wss://both.example".to_owned(),
+            "wss://write-only.example".to_owned(),
+        ]
+    );
+}
+
 #[derive(Clone, Debug)]
 struct TestExternalAccountSigner {
     keys: nostr::Keys,
