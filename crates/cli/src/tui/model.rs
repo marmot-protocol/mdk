@@ -453,10 +453,17 @@ impl ProfileField {
     }
 }
 
-/// What a list picker acts on. Extends for 5b (group picker for user search).
+/// What a list picker acts on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PickerPurpose {
     Invites,
+    /// Choose which existing chat to add a found user to (user-search `a`).
+    /// Carries the found user's pubkey and display label so `Enter` can chain
+    /// into the add-user confirm for the highlighted chat.
+    Groups {
+        pubkey: String,
+        label: String,
+    },
 }
 
 /// One row of a list-picker popup: an opaque id the action targets plus a
@@ -470,12 +477,14 @@ pub(crate) struct PickerItem {
 /// The outcome of routing one key into an open popup. `None` means the popup
 /// handled the key internally (edit/navigate) and stays open; `Dismiss` closes
 /// it with no side effect; `Submit` closes it and asks the app to run one CLI
-/// call.
+/// call; `Open` replaces it with the next popup of a multi-step flow (the
+/// group picker's `Enter` opens the add-user confirm) with no CLI call yet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PopupAction {
     None,
     Dismiss,
     Submit(PopupSubmit),
+    Open(Popup),
 }
 
 /// A resolved popup submission: exactly one CLI call, chosen by mapping the
@@ -524,6 +533,46 @@ impl Popup {
             title: "Pending Invites".to_owned(),
             items,
             selected,
+        }
+    }
+
+    /// The group picker for adding a found user to an existing chat
+    /// (user-search `a`): one row per loaded chat, `Enter` chains into the
+    /// add-user confirm for the highlighted chat.
+    pub(crate) fn add_user_group_picker(
+        pubkey: String,
+        label: String,
+        items: Vec<PickerItem>,
+        selected: usize,
+    ) -> Self {
+        Popup::Picker {
+            purpose: PickerPurpose::Groups { pubkey, label },
+            title: "Add to Chat".to_owned(),
+            items,
+            selected,
+        }
+    }
+
+    /// The add-user-to-chat confirm. Built by the group picker's `Enter` (which
+    /// chose the target chat), so the guarding step and its wording live in one
+    /// place.
+    pub(crate) fn confirm_add_user_to_chat(
+        group_id: &str,
+        chat_label: &str,
+        pubkey: &str,
+        user_label: &str,
+    ) -> Self {
+        Popup::Confirm {
+            purpose: ConfirmPurpose::AddUserToChat {
+                group_id: group_id.to_owned(),
+                pubkey: pubkey.to_owned(),
+            },
+            title: "Add to Chat".to_owned(),
+            body: vec![format!(
+                "Add {} to {}?",
+                shorten(&terminal_safe_text(user_label), 24),
+                shorten(&terminal_safe_text(chat_label), 24),
+            )],
         }
     }
 
@@ -697,6 +746,17 @@ fn picker_purpose_action(
             }),
             _ => PopupAction::None,
         },
+        PickerPurpose::Groups { pubkey, label } => match key {
+            // The picker only chooses the target chat; the confirm it opens
+            // still guards the actual add.
+            KeyCode::Enter => PopupAction::Open(Popup::confirm_add_user_to_chat(
+                &item.id,
+                &item.label,
+                pubkey,
+                label,
+            )),
+            _ => PopupAction::None,
+        },
     }
 }
 
@@ -710,6 +770,10 @@ pub(crate) fn popup_hint(popup: &Popup) -> &'static str {
             purpose: PickerPurpose::Invites,
             ..
         } => "[a] accept  [d] decline  [j/k] move  [Esc] close",
+        Popup::Picker {
+            purpose: PickerPurpose::Groups { .. },
+            ..
+        } => "[Enter] select  [j/k] move  [Esc] close",
         Popup::Card { .. } | Popup::Image { .. } => "[any key] dismiss",
     }
 }
@@ -724,7 +788,7 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "On the selected message: r react (Enter sends +), u unreact, d delete, R reply.",
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
         "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
-        "User search: type + Enter searches; Enter opens a card; c chat; a add to open chat.",
+        "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat.",
         "Profile: j/k move; Enter edits a field; f follow; x unfollow. Relay health: r refresh.",
         "Popups capture every key; Esc or the shown key closes them.",
         "",

@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: `a` on a user-search result now picks which chat the found user is added to. It opens a group picker over the
+  loaded chats list (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), one row per chat in the list's
+  order with the open chat preselected when one is loaded; `Enter` then opens the same confirm popup that guards the
+  add (`groups add-members`), naming both the user and the chosen chat. With no chats a status notice explains and
+  points at `c` (start a new chat with the found user). Previously the action targeted only the open chat and errored
+  without one. No JSON response shapes changed.
 - TUI: made the armed message-interaction state durable and guarded reaction content, fixing a field report where a
   user armed `/react` (via `r`), did not register the prefill, typed a whole message, and published his prose as a
   reaction. While the composer begins with `/react`, `/reply`, or `/delete`, the hints line now shows a persistent
@@ -33,8 +39,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   profile (`p`), and relay health (`h`) — each a one-shot load that returns to the main view on `Esc`. User search runs
   `users search` (default radius `0..2`) over the cached follow graph; its two-region screen types the query in query
   focus (`Enter` runs it) and navigates results in results focus, where `Enter` opens a profile card (`users show`),
-  `c` starts a new chat, and `a` adds the user to the open chat (guarded to when a chat is loaded) — both return to
-  the main view on the affected chat on success. Profile shows your
+  `c` starts a new chat, and `a` adds the user to an existing chat (via the group picker described above) — both
+  return to the main view on the affected chat on success. Profile shows your
   `profile show` fields (picture URL as literal text — no avatar fetch) and `follows list`; editing a field publishes
   only that field via `profile update --<field>`, `f` follows (`follows add`) and `x` unfollows (`follows remove`), and
   there is no nsec export. Relay health renders the redacted `relay-stats` snapshot — health summary, counters,

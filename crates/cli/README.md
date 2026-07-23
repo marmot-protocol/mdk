@@ -614,9 +614,11 @@ User search (`s` from the chat list, or `/users [query]`) is a one-shot search o
 (`users search`, default radius `0..2`). The screen has two regions and a two-state focus: in query focus you type the
 query (so `j`/`k` are literal text) and `Enter` runs the search; once there are results, focus moves to the list where
 `j`/`k` (or arrows) navigate, `Enter` opens the selected user's profile card (`users show`, dismiss-on-any-key), `c`
-starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to the open chat (a confirm
-popup, guarded so it only offers this when a chat is loaded). `i` returns to the query, and `Esc` returns to the main
-view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
+starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to an existing chat: a
+group picker lists your chats (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), preselecting the open
+chat when one is loaded, and `Enter` opens the confirm popup that guards the add (`groups add-members`), naming both
+the user and the chosen chat. With no chats a status notice explains and points at `c`. `i` returns to the query, and
+`Esc` returns to the main view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
 attribution the search returns.
 
 Profile (`p` from the chat list) shows your own profile — name, display name, about, picture URL (as literal text; no

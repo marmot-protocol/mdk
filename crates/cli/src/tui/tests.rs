@@ -1151,10 +1151,81 @@ fn chat_row_line_shows_unread_count_in_bold() {
 }
 
 #[test]
+fn chat_row_line_renders_the_unread_badge_yellow_and_bold() {
+    let chat = ChatRow {
+        group_id: "group-a".to_owned(),
+        name: "Project Room".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+
+    let line = chat_row_line(&chat, false, 3);
+
+    // The name keeps its own style while the `(N)` badge is a separate yellow
+    // bold span (the wn-tui look the spec pins).
+    assert_eq!(line_text(&line), "  Project Room (3)");
+    let name = &line.spans[1];
+    assert_eq!(name.content.as_ref(), "Project Room");
+    assert_eq!(name.style.fg, Some(Color::Green));
+    assert!(name.style.add_modifier.contains(Modifier::BOLD));
+    let badge = &line.spans[2];
+    assert_eq!(badge.content.as_ref(), " (3)");
+    assert_eq!(badge.style.fg, Some(Color::Yellow));
+    assert!(badge.style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn chat_row_line_selected_badge_takes_the_row_fg_bump() {
+    let chat = ChatRow {
+        group_id: "group-a".to_owned(),
+        name: "Project Room".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+
+    let line = chat_row_line(&chat, true, 3);
+
+    // The selected row renders black-on-white; the badge takes the same fg bump
+    // as the name (`row_label_style`) so it stays readable on the white bg.
+    let badge = &line.spans[2];
+    assert_eq!(badge.content.as_ref(), " (3)");
+    assert_eq!(badge.style.fg, Some(Color::Black));
+    assert!(badge.style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn chat_row_line_read_chat_has_no_badge_span() {
+    let chat = ChatRow {
+        group_id: "group-a".to_owned(),
+        name: "Project Room".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+
+    let line = chat_row_line(&chat, false, 0);
+
+    assert_eq!(line_text(&line), "  Project Room");
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::Yellow)),
+        "a read chat renders no badge span"
+    );
+}
+
+#[test]
 fn chat_label_keeps_unread_count_when_truncated() {
+    // The name is truncated to leave room for the whole badge within `max_len`,
+    // so the badge always survives truncation intact.
     assert_eq!(
         chat_label("A very long group display name", 12, 18),
-        "A very ...ame (12)"
+        ("A ver... name".to_owned(), Some(" (12)".to_owned()))
+    );
+    assert_eq!(
+        chat_label("ops", 0, 18),
+        ("ops".to_owned(), None),
+        "a read chat has no badge part"
     );
 }
 
@@ -5698,6 +5769,60 @@ fn popup_key_invites_picker_navigates_accepts_and_declines() {
 }
 
 #[test]
+fn popup_key_group_picker_navigates_and_chains_into_the_add_confirm() {
+    let items = vec![
+        PickerItem {
+            id: "g1".to_owned(),
+            label: "Room A".to_owned(),
+        },
+        PickerItem {
+            id: "g2".to_owned(),
+            label: "Room B".to_owned(),
+        },
+    ];
+    let picker =
+        || Popup::add_user_group_picker("pk".to_owned(), "Alice".to_owned(), items.clone(), 0);
+
+    // j then Enter chains into the add-user confirm for the highlighted chat —
+    // the picker chooses the target, the confirm still guards the action.
+    let mut choose = picker();
+    assert_eq!(
+        popup_key(&mut choose, KeyCode::Char('j')),
+        PopupAction::None
+    );
+    let action = popup_key(&mut choose, KeyCode::Enter);
+    let PopupAction::Open(Popup::Confirm {
+        purpose,
+        title,
+        body,
+    }) = action
+    else {
+        panic!("Enter must open the add-user confirm, got {action:?}");
+    };
+    assert_eq!(
+        purpose,
+        ConfirmPurpose::AddUserToChat {
+            group_id: "g2".to_owned(),
+            pubkey: "pk".to_owned(),
+        }
+    );
+    assert_eq!(title, "Add to Chat");
+    assert_eq!(body, vec!["Add Alice to Room B?".to_owned()]);
+
+    // The invites action keys mean nothing here, and Esc closes the picker.
+    let mut dismiss = picker();
+    assert_eq!(
+        popup_key(&mut dismiss, KeyCode::Char('a')),
+        PopupAction::None
+    );
+    assert_eq!(
+        popup_key(&mut dismiss, KeyCode::Char('d')),
+        PopupAction::None
+    );
+    assert_eq!(popup_key(&mut dismiss, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
 fn leave_group_decision_covers_sole_admin_co_admin_and_non_admin() {
     assert_eq!(
         leave_group_decision(true, 1),
@@ -7955,43 +8080,43 @@ fn slash_users_query_runs_the_search_immediately() {
 }
 
 #[test]
-fn user_search_add_to_chat_is_guarded_on_no_loaded_chat() {
-    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
-    let view = UserSearchView {
-        results: vec![UserSearchResultRow {
-            pubkey: "aa".to_owned(),
-            npub: "npubaa".to_owned(),
-            display_name: Some("Alice".to_owned()),
-            matched_field: "name".to_owned(),
-            match_quality: "exact".to_owned(),
-            radius: 0,
-        }],
-        focus: UserSearchFocus::Results,
-        ..UserSearchView::default()
-    };
-    app.user_search = Some(view);
-    app.screen = Screen::UserSearch;
-    app.messages_group_id = None;
+fn user_search_add_is_guarded_when_there_are_no_chats() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    assert!(app.chats.is_empty());
 
-    // No loaded chat: the add action is guarded to a status notice, no popup.
+    // No chats at all: the add action is guarded to a status notice, no popup.
     app.handle_key(char_key('a')).expect("a guarded");
-    assert!(app.popup.is_none(), "no popup without a loaded chat");
+    assert!(app.popup.is_none(), "no popup without any chat");
     assert!(
-        app.status.contains("open a chat"),
+        app.status.contains("no chats"),
         "status explains the guard: {}",
         app.status
     );
+}
 
-    // With a loaded chat: a confirm popup targets the open chat.
-    app.messages_group_id = Some("g1".to_owned());
-    app.handle_key(char_key('a')).expect("a add");
-    assert!(matches!(
-        app.popup,
-        Some(Popup::Confirm {
-            purpose: ConfirmPurpose::AddUserToChat { .. },
-            ..
-        })
-    ));
+#[test]
+fn user_search_add_preselects_the_open_chat_in_the_picker() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    app.chats = vec![
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Room One".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g2".to_owned(),
+            name: "Room Two".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+    app.messages_group_id = Some("g2".to_owned());
+
+    app.handle_key(char_key('a')).expect("a opens the picker");
+
+    let Some(Popup::Picker { selected, .. }) = &app.popup else {
+        panic!("a must open the group picker, got {:?}", app.popup);
+    };
+    assert_eq!(*selected, 1, "the open chat is preselected");
 }
 
 #[test]
@@ -8358,6 +8483,46 @@ fn user_search_app_with_selected_result(client: WnClient) -> TuiApp {
 }
 
 #[test]
+fn user_search_add_opens_the_group_picker_over_the_chats_list() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    app.chats = vec![
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Room One".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g2".to_owned(),
+            name: "Room Two".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+
+    app.handle_key(char_key('a')).expect("a opens the picker");
+
+    let Some(Popup::Picker {
+        purpose: PickerPurpose::Groups { pubkey, label },
+        items,
+        selected,
+        ..
+    }) = &app.popup
+    else {
+        panic!("a must open the group picker, got {:?}", app.popup);
+    };
+    assert_eq!(pubkey, "bb", "the picker carries the found user");
+    assert_eq!(label, "Bob");
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| (item.id.as_str(), item.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("g1", "Room One"), ("g2", "Room Two")],
+        "one row per chat, in the chats-list order already in state"
+    );
+    assert_eq!(*selected, 0, "no open chat: the first row is preselected");
+}
+
+#[test]
 fn new_chat_from_search_navigates_into_the_created_chat() {
     let (_dir, client) = test_json_client(
         r#"{"ok":true,"result":{"group_id":"abcd","chats":[{"group_id":"abcd","profile":{"name":"New Room"}}]}}"#,
@@ -8393,8 +8558,9 @@ fn add_to_open_chat_from_search_navigates_into_that_chat() {
         },
     ];
     app.messages_group_id = Some("g1".to_owned());
-    app.handle_key(char_key('a'))
-        .expect("a opens add-to-chat popup");
+    app.handle_key(char_key('a')).expect("a opens the picker");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter picks the preselected open chat");
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .expect("confirm add to chat");
     assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
@@ -8404,4 +8570,101 @@ fn add_to_open_chat_from_search_navigates_into_that_chat() {
         Some("g1"),
         "the affected chat is selected"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn add_to_a_picker_chosen_chat_from_search_confirms_and_navigates_into_it() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let mut app = user_search_app_with_selected_result(client);
+    app.chats = vec![
+        ChatRow {
+            group_id: "other".to_owned(),
+            name: "Other".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Open Room".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+    app.messages_group_id = Some("g1".to_owned());
+
+    // k moves off the preselected open chat; Enter reaches the confirm for the
+    // chosen group, not the open one.
+    app.handle_key(char_key('a')).expect("a opens the picker");
+    app.handle_key(char_key('k')).expect("k moves up");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter picks the highlighted chat");
+    let Some(Popup::Confirm {
+        purpose: ConfirmPurpose::AddUserToChat { group_id, pubkey },
+        ..
+    }) = &app.popup
+    else {
+        panic!("Enter must open the add-user confirm, got {:?}", app.popup);
+    };
+    assert_eq!(group_id, "other", "the confirm targets the chosen group");
+    assert_eq!(pubkey, "bb");
+
+    // The confirm still guards the action; y runs the real add and navigates.
+    app.handle_key(char_key('y')).expect("y confirms the add");
+    assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.selected_chat_row().map(|chat| chat.group_id.as_str()),
+        Some("other"),
+        "the chosen chat is selected"
+    );
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(
+        recorded.contains("groups add-members other bb"),
+        "the confirm submit runs the real add against the chosen group: {recorded}"
+    );
+}
+
+#[test]
+fn group_picker_esc_closes_with_zero_side_effects() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    app.chats = vec![ChatRow {
+        group_id: "g1".to_owned(),
+        name: "Room One".to_owned(),
+        ..ChatRow::default()
+    }];
+    app.status = "before".to_owned();
+
+    // One consistent rule: the picker opens whenever any chat exists, even for
+    // a single chat (no direct-to-confirm special case).
+    app.handle_key(char_key('a')).expect("a opens the picker");
+    assert!(
+        matches!(
+            app.popup,
+            Some(Popup::Picker {
+                purpose: PickerPurpose::Groups { .. },
+                ..
+            })
+        ),
+        "a single chat still goes through the picker"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("Esc closes the picker");
+
+    assert!(app.popup.is_none(), "the picker is closed");
+    assert_eq!(app.status, "before", "no status change");
+    assert_eq!(app.screen, Screen::UserSearch, "still on the search screen");
+    assert!(app.user_search.is_some(), "the search view is intact");
+    assert_eq!(app.chats.len(), 1, "chats untouched");
+    assert_eq!(app.selected_chat, 0, "selection untouched");
 }

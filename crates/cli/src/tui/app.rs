@@ -1076,6 +1076,9 @@ impl TuiApp {
         match popup_key(popup, key.code) {
             PopupAction::None => {}
             PopupAction::Dismiss => self.popup = None,
+            // A multi-step flow: the reducer resolved the next popup (the group
+            // picker's Enter opens the add-user confirm). No CLI call yet.
+            PopupAction::Open(next) => self.popup = Some(next),
             PopupAction::Submit(submit) => {
                 // The invites picker stays open across actions so one
                 // accept/decline does not lose the user's place: capture the
@@ -1137,7 +1140,7 @@ impl TuiApp {
         }
     }
 
-    /// After a user-search action opens a new chat or adds someone to the open one,
+    /// After a user-search action opens a new chat or adds someone to a picked chat,
     /// leave the search screen for the main view so the freshly selected chat is
     /// visible. Mirrors the invite-accept return: the search screen would otherwise
     /// hide the chat the action just targeted. A no-op off the search screen, so the
@@ -1415,8 +1418,8 @@ impl TuiApp {
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
-    /// query), `Enter` opens the profile card, `c` starts a chat, `a` adds to the
-    /// open chat, and `i`/`/` return to the query.
+    /// query), `Enter` opens the profile card, `c` starts a chat, `a` picks a chat
+    /// to add the user to, and `i`/`/` return to the query.
     fn handle_user_search_results_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1469,8 +1472,11 @@ impl TuiApp {
         });
     }
 
-    /// Add the selected found user to the open chat. Guarded: only when a chat is
-    /// loaded (the open conversation); otherwise a status-line notice explains.
+    /// Add the selected found user to an existing chat: opens a group picker
+    /// over the loaded chats list (one row per chat, in the list's order),
+    /// preselecting the open chat when one is loaded. `Enter` chains into the
+    /// add-user confirm for the highlighted chat; `Esc` closes with no side
+    /// effects. With no chats a status-line notice explains.
     fn open_add_user_to_chat_popup(&mut self) {
         let Some(result) = self
             .user_search
@@ -1481,18 +1487,24 @@ impl TuiApp {
         };
         let pubkey = result.pubkey.clone();
         let label = result.display_label();
-        let Some(group_id) = self.messages_group_id.clone() else {
-            self.status = "open a chat first to add a user to it".to_owned();
+        if self.chats.is_empty() {
+            self.status = "no chats to add a user to; c starts a new chat".to_owned();
             return;
-        };
-        self.popup = Some(Popup::Confirm {
-            purpose: ConfirmPurpose::AddUserToChat { group_id, pubkey },
-            title: "Add to Chat".to_owned(),
-            body: vec![format!(
-                "Add {} to the open chat?",
-                shorten(&terminal_safe_text(&label), 24)
-            )],
-        });
+        }
+        let items = self
+            .chats
+            .iter()
+            .map(|chat| PickerItem {
+                id: chat.group_id.clone(),
+                label: chat.name.clone(),
+            })
+            .collect();
+        let selected = self
+            .messages_group_id
+            .as_deref()
+            .and_then(|group_id| self.chats.iter().position(|chat| chat.group_id == group_id))
+            .unwrap_or(0);
+        self.popup = Some(Popup::add_user_group_picker(pubkey, label, items, selected));
     }
 
     /// Profile-screen keys: `j`/`k` move the field/follow cursor, `Enter` edits

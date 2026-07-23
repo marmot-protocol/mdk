@@ -190,19 +190,39 @@ pub(crate) fn chat_row_line(chat: &ChatRow, selected: bool, unread_count: usize)
         ambient_style = ambient_style.add_modifier(Modifier::BOLD);
         label_style = label_style.add_modifier(Modifier::BOLD);
     }
-    Line::from(vec![
+    let (name, badge) = chat_label(&chat.name, unread_count, 24);
+    let mut spans = vec![
         Span::styled(format!("{marker} "), ambient_style),
-        Span::styled(chat_label(&chat.name, unread_count, 24), label_style),
-        Span::styled(archived.to_owned(), ambient_style),
-    ])
+        Span::styled(name, label_style),
+    ];
+    if let Some(badge) = badge {
+        // The yellow bold unread badge. On the selected (black-on-white) row it
+        // takes the same fg bump as the name so it stays readable.
+        spans.push(Span::styled(
+            badge,
+            row_label_style(selected, Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(archived.to_owned(), ambient_style));
+    Line::from(spans)
 }
 
-pub(crate) fn chat_label(name: &str, unread_count: usize, max_len: usize) -> String {
+/// A chat row's name and unread badge, split so the badge can carry its own
+/// style: `(name, Some(" (N)"))` when unread, `(name, None)` when read. The
+/// name is truncated to leave the whole badge within `max_len`, so the badge
+/// survives truncation intact.
+pub(crate) fn chat_label(
+    name: &str,
+    unread_count: usize,
+    max_len: usize,
+) -> (String, Option<String>) {
     let name = terminal_safe_text(name);
     if unread_count == 0 {
-        return shorten(&name, max_len);
+        return (shorten(&name, max_len), None);
     }
-    shorten(&format!("{name} ({unread_count})"), max_len)
+    let badge = format!(" ({unread_count})");
+    let budget = max_len.saturating_sub(badge.chars().count());
+    (shorten(&name, budget), Some(badge))
 }
 
 /// The dark-gray last-message preview line under a chat row (wn-tui style):
