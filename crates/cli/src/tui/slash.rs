@@ -45,10 +45,30 @@ pub(crate) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "daemon" => parse_daemon_command(rest),
         "chat" => parse_chat_command(rest),
         "members" => parse_members_command(rest),
+        "react" => parse_react_command(rest),
+        "unreact" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Unreact)
+            } else {
+                Err("/unreact does not accept arguments".to_owned())
+            }
+        }
+        "delete" => {
+            if rest.is_empty() {
+                Ok(SlashCommand::Delete)
+            } else {
+                Err("/delete does not accept arguments".to_owned())
+            }
+        }
+        "reply" => parse_reply_command(rest),
+        "retry" => parse_retry_command(rest),
         "image" => parse_image_command(rest),
         "keys" => parse_keys_command(rest),
         "profile" => parse_profile_command(rest),
         "name" => parse_profile_name_command(rest),
+        "users" => Ok(SlashCommand::UsersSearch {
+            query: (!rest.is_empty()).then(|| rest.join(" ")),
+        }),
         "stream" => parse_stream_command(rest),
         "quit" | "q" => Ok(SlashCommand::Quit),
         other => Err(format!("unknown slash command: /{other}")),
@@ -234,6 +254,44 @@ pub(crate) fn parse_members_command(args: Vec<String>) -> Result<SlashCommand, S
         }
         [] => Err("/members expects add, remove, or list".to_owned()),
         _ => Err("/members expects add, remove, or list".to_owned()),
+    }
+}
+
+/// `/react [emoji]`: the emoji defaults to `+` (matching the `messages react`
+/// CLI default) so the `r` accelerator sends the default on a bare Enter.
+pub(crate) fn parse_react_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [] => Ok(SlashCommand::React {
+            emoji: "+".to_owned(),
+        }),
+        [emoji] => Ok(SlashCommand::React {
+            emoji: emoji.clone(),
+        }),
+        _ => Err("/react expects an optional single emoji".to_owned()),
+    }
+}
+
+/// `/reply <text>`: reply to the selected message. The text is required and joins
+/// the remaining words; the target message resolves at submit against the
+/// selected row. The `R` accelerator prefills `/reply ` in the composer.
+pub(crate) fn parse_reply_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    if args.is_empty() {
+        return Err("/reply requires message text".to_owned());
+    }
+    Ok(SlashCommand::Reply {
+        text: args.join(" "),
+    })
+}
+
+/// `/retry <event-id>`: retries a failed outbound event by id (not the selected
+/// message; timeline rows carry no failed-send state to target from).
+pub(crate) fn parse_retry_command(args: Vec<String>) -> Result<SlashCommand, String> {
+    match args.as_slice() {
+        [event_id] => Ok(SlashCommand::Retry {
+            event_id: event_id.clone(),
+        }),
+        [] => Err("/retry expects an event id".to_owned()),
+        _ => Err("/retry expects exactly one event id".to_owned()),
     }
 }
 

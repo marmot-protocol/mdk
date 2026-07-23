@@ -1,14 +1,18 @@
 //! `chats` command namespace handlers and chat-archive output helper.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use marmot_account::AccountHome;
-use marmot_app::{ChatNotificationSettings, MarmotApp, MarmotAppRuntime};
+use marmot_app::{
+    AppGroupRecord, ChatListRow, ChatNotificationSettings, MarmotApp, MarmotAppRuntime,
+};
 use serde_json::{Value, json};
 
 use crate::{
-    ChatsCommand, CommandOutput, WnError, ensure_local_signing, group_json, group_list_plain,
-    group_show_output, normalize_group_id_hex, npub_for_account_id, resolve_account,
+    ChatsCommand, CommandOutput, WnError, chat_json, ensure_local_signing, group_json,
+    group_list_plain, group_show_output, insert_chat_projection, normalize_group_id_hex,
+    npub_for_account_id, resolve_account,
 };
 
 pub(crate) async fn chats_command(
@@ -38,13 +42,15 @@ pub(crate) async fn chats_command_with_runtime(
             } else {
                 app.visible_groups(&account.label)?
             };
+            let plain = group_list_plain(&chats);
+            let chats_json = chat_rows_json(app, &account.label, include_archived, chats)?;
             Ok(CommandOutput {
-                plain: group_list_plain(&chats),
+                plain,
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
                     "include_archived": include_archived,
-                    "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
+                    "chats": chats_json,
                 }),
             })
         }
@@ -73,12 +79,14 @@ pub(crate) async fn chats_command_with_runtime(
                 .into_iter()
                 .filter(|group| group.archived)
                 .collect::<Vec<_>>();
+            let plain = group_list_plain(&chats);
+            let chats_json = chat_rows_json(app, &account.label, true, chats)?;
             Ok(CommandOutput {
-                plain: group_list_plain(&chats),
+                plain,
                 json: json!({
                     "account_id": account.account_id_hex,
                     "npub": npub_for_account_id(&account.account_id_hex)?,
-                    "chats": chats.into_iter().map(group_json).collect::<Vec<_>>(),
+                    "chats": chats_json,
                 }),
             })
         }
@@ -104,7 +112,96 @@ pub(crate) async fn chats_command_with_runtime(
                 json: chat_notification_json(account.account_id_hex, settings),
             })
         }
+        ChatsCommand::MarkRead { group, message_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            let group_id = normalize_group_id_hex(&group)?;
+            // An explicit message id marks the chat read up to that message; the
+            // runtime's read marker is a forward-only high-water mark, so a
+            // partial mark leaves any newer messages unread and re-marking an
+            // older message never moves the marker backward. With no id, mark the
+            // newest message read (the "clear on chat open" semantics): the newest
+            // markable message is the chat-list projection's `last_message` (the
+            // latest kind-9 preview), which is exactly what the marker operates on,
+            // so we resolve it through the runtime rather than re-querying the
+            // timeline. An empty chat has nothing to mark and is already fully
+            // read; return its current (empty) projection unchanged rather than
+            // erroring, matching how chats rows report empty defaults.
+            let row = match message_id {
+                Some(message_id) => {
+                    runtime.mark_timeline_message_read(&account.label, &group_id, &message_id)?
+                }
+                None => {
+                    let projection = runtime.chat_list_row(&account.label, &group_id)?;
+                    match projection
+                        .as_ref()
+                        .and_then(|row| row.last_message.as_ref())
+                    {
+                        Some(message) => runtime.mark_timeline_message_read(
+                            &account.label,
+                            &group_id,
+                            &message.message_id_hex,
+                        )?,
+                        None => projection,
+                    }
+                }
+            };
+            Ok(CommandOutput {
+                plain: format!("marked chat {group_id} read"),
+                json: chat_mark_read_json(&account.account_id_hex, &group_id, row)?,
+            })
+        }
     }
+}
+
+/// Render the `chats mark-read` response: the account/group identity plus the
+/// refreshed chat-list projection (unread state, last-message preview, last-read
+/// marker) via [`insert_chat_projection`], so the five projection keys are
+/// byte-identical to the `chats list` rows and the `chats subscribe` feed.
+fn chat_mark_read_json(
+    account_id_hex: &str,
+    group_id_hex: &str,
+    chat_list_row: Option<ChatListRow>,
+) -> Result<Value, WnError> {
+    let mut value = json!({
+        "account_id": account_id_hex,
+        "npub": npub_for_account_id(account_id_hex)?,
+        "group_id": group_id_hex,
+    });
+    insert_chat_projection(&mut value, chat_list_row);
+    Ok(value)
+}
+
+/// Build the JSON rows for a `chats list`/`list-archived` response: each group
+/// record enriched with its durable chat-list projection (unread state,
+/// last-message preview, last-read marker) via [`chat_json`].
+///
+/// The projection is read through the batched `marmot-app` `chat_list` accessor
+/// exactly once and indexed by `group_id_hex`, rather than an N+1 per-group
+/// `chat_list_row` call — each of which re-runs the projection
+/// ensure/completeness/hydration pass. A group absent from the index yields the
+/// same empty defaults as an absent single-row read. `include_archived` matches
+/// the caller's row set (the archived-only `list-archived` reads with it set) so
+/// every rendered group is covered. A read failure propagates (one-shot),
+/// matching the list command's error contract.
+fn chat_rows_json(
+    app: &MarmotApp,
+    label: &str,
+    include_archived: bool,
+    chats: Vec<AppGroupRecord>,
+) -> Result<Vec<Value>, WnError> {
+    let mut projections: HashMap<String, ChatListRow> = app
+        .chat_list(label, include_archived)?
+        .into_iter()
+        .map(|row| (row.group_id_hex.clone(), row))
+        .collect();
+    Ok(chats
+        .into_iter()
+        .map(|chat| {
+            let projection = projections.remove(&chat.group_id_hex);
+            chat_json(chat, projection)
+        })
+        .collect())
 }
 
 fn parse_mute_duration(duration: &str) -> Result<Option<i64>, WnError> {

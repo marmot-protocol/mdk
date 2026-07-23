@@ -9,6 +9,38 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: `R` on the selected message replies to it. It prefills `/reply` followed by a space in the composer
+  (draft-protected like the `r`
+  and `d` accelerators) and names the reply target on the status line; you type the reply and `Enter` sends it. Also
+  available as the `/reply <text>` slash command. The target resolves at submit against the selected row (a clear
+  status-line error when nothing is selected), the send runs `messages send --group <loaded-group> --reply-to
+  <selected-message-id> <text>` with `--reply-to` before the text as the guard requires, and the sent reply upserts
+  optimistically without a list reload.
+- TUI: added three full-view screens reached from the chat list — user search (`s` or `/users [query]`), your own
+  profile (`p`), and relay health (`h`) — each a one-shot load that returns to the main view on `Esc`. User search runs
+  `users search` (default radius `0..2`) over the cached follow graph; its two-region screen types the query in query
+  focus (`Enter` runs it) and navigates results in results focus, where `Enter` opens a profile card (`users show`),
+  `c` starts a new chat, and `a` adds the user to the open chat (guarded to when a chat is loaded) — both return to
+  the main view on the affected chat on success. Profile shows your
+  `profile show` fields (picture URL as literal text — no avatar fetch) and `follows list`; editing a field publishes
+  only that field via `profile update --<field>`, `f` follows (`follows add`) and `x` unfollows (`follows remove`), and
+  there is no nsec export. Relay health renders the redacted `relay-stats` snapshot — health summary, counters,
+  delivery spread with histogram p50/p99, sync timing, and per-relay first-deliverer/timing rows keyed by an opaque
+  device-local index — with no relay URLs shown (privacy decision); `r` refreshes and `j`/`k` scroll. The popup system
+  gained profile-field-edit, follow-by-pubkey, new-chat-name, unfollow, and add-to-chat purposes; help and the hints
+  lines cover the new screens. No JSON response shapes changed.
+- TUI: added a modal popup system and a group-detail screen. One `Option<Popup>` captures every key while open
+  (the screen behind it is inert), with text-entry, confirm, list-picker, and dismiss-on-any-key card variants; the
+  help overlay became a card, which fixes `q` under help quitting the app. `g` on the selected chat opens a
+  group-detail screen showing members (with admin and `(you)` badges), relays, and name/description loaded on entry
+  from `groups members`/`groups admins`/`groups relays`/`groups show`; from it `A` adds a member (`groups
+  add-members`), `x` removes one (`groups remove-members`), `P` promotes to admin (`groups promote`), `R` renames the
+  group (`groups rename`), and `L` leaves (`groups leave`) — an admin is blocked from leaving with a "Cannot Leave
+  Group" info card (sole-admin vs step-down message) while a non-admin gets a confirm, and `?` shows the help card.
+  `I` (from the chat list or group detail) opens a pending-invites picker over `groups invites`, accepting
+  (`groups accept`) or declining (`groups decline`) in place; the picker stays open across actions and closes only
+  once no invites remain, and accepting from the group-detail screen returns to the main view. The group-invite
+  status notice now prompts `I`. No JSON response shapes changed.
 - WN Agent control clients and the connector now speak the incompatible `marmot.agent-control.v2` protocol.
   `stream_begin` returns a random per-stream bearer capability that every later stream operation must present; exact
   request-id retries return the original begin receipt, and stream-id collisions no longer replace active sessions.
@@ -29,9 +61,43 @@ versioning through the workspace version in the root `Cargo.toml`.
   message-offset model — `j`/`k` select, `G`/`g` jump to newest/oldest, `PageUp`/`PageDown` page, and scrolling past
   the oldest loaded message pages in older history; incoming messages hold your position unless you are pinned to the
   bottom. Timestamps render in local wall-clock time. No JSON response shapes changed.
+- TUI: rewrote the composer with a cursor-editing input. `Left`/`Right`/`Home`/`End` move the cursor,
+  `Backspace`/`Delete` remove a character, and mid-string edits keep multi-byte characters intact. `Enter` still
+  submits and there is no keyboard newline; multi-line content arrives only by paste (bracketed paste keeps its
+  newlines). The composer auto-grows with its wrapped content up to 8 rows, taking the space from the messages pane.
+  The login nsec-entry field reuses this input's masked mode. No JSON response shapes changed.
+- TUI: unread badges are now runtime-backed instead of counted in the TUI. Each chat row's badge and the status
+  bar's `{u} unread` total derive from the `chats list` projection (`unread_count`), so they survive a TUI restart;
+  the TUI-local unread tally and its plain-`messages subscribe`-feed counting are gone (that feed now serves only
+  QUIC stream previews). Chat rows gained a wn-tui-style last-message preview line (sender plus truncated text, dark
+  gray; group-system rows render their summary, deleted rows a tombstone), and the chat list orders by last activity
+  (`last_message.timeline_at` descending; equal-activity chats keep the `chats list` order). Opening a chat clears
+  its badge immediately by calling `chats mark-read` and folding the returned projection (a failed mark-read leaves
+  the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
+  chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
+  `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
+  tick (notification events deduplicated by `notification_key`). Group-invite notifications surface as a status-line
+  notice. Background re-lists and reorders keep the highlighted chat selected by group id. No JSON response shapes
+  changed.
 
 ### Added
 
+- TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
+  loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
+  decode, delivering the result over an `mpsc` channel drained on tick) and drawn inline via `ratatui-image` on
+  terminals with a graphics protocol (Kitty/iTerm2/Sixel; iTerm2 forced via `ITERM_SESSION_ID`). Placeholders walk
+  `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or `[name failed: err]`, and stay
+  `[img name]` where no image protocol exists. `o` opens the selected message's image full-size in a dismiss-on-any-key
+  viewer. Decrypted files cache under the TUI home in `tui-media-cache/`. No JSON response shapes changed (the
+  existing `media download --json` `output_path` is passed via `--output`).
+- TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
+  `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
+  accelerators `r` (prefills `/react` followed by a space), `u` (removes your reaction immediately), and `d`
+  (prefills `/delete`) drive
+  them from the messages pane. Reaction and deletion results fold in from the timeline projection, so the list is not
+  reloaded on success. `/delete` is refused for messages you did not send, and `/retry` takes an event id rather than
+  acting on the selection because timeline rows carry no per-message failed-send state. No JSON response shapes
+  changed.
 - Markdown autolinks now carry a renderer-facing destination classification across Rust and MarmotKit surfaces. The
   original destination is preserved, while web, contact, app, public Nostr, relative, unknown, dangerous, and
   sensitive targets are distinguished for client policy.
@@ -52,6 +118,21 @@ versioning through the workspace version in the root `Cargo.toml`.
   error code `reply_to_after_message_text` (put `--reply-to` before the text with `--group`). Tradeoff: the guard
   rejects any message whose text contains a bare `--reply-to` or `--reply-to=<id>` token anywhere (e.g.
   `hello --reply-to friend`), so such text can no longer be sent this way.
+- `chats list`, `chats list-archived`, and the `chats subscribe`/`subscribe-archived` feeds now project the runtime's
+  durable per-chat state onto each chat row as additive JSON keys, so a chat list can render unread badges and a
+  last-message preview without a second query. New keys: `unread_count` (number), `has_unread` (bool), `last_message`
+  (`{ message_id_hex, sender, sender_display_name, plaintext, kind, timeline_at, deleted }` or `null`),
+  `last_read_message_id_hex` (string or `null`), and `last_read_timeline_at` (number or `null`). The names and the
+  `last_message` shape match the `chat_list_row` object already emitted on the `messages timeline subscribe` feed so
+  the two feeds agree; a chat with no messages or reads yet reports empty defaults (`0`/`false`/`null`) rather than
+  omitting the keys. All existing chat-row keys are unchanged.
+- `chats mark-read <group-hex> [<message-id-hex>]` advances a chat's read marker and clears its unread count, giving the
+  chat-list projection a CLI read path (previously unread cleared only when the account itself sent into the chat). With
+  no message id it marks the newest message read (the "clear on chat open" case); with an explicit message id it marks
+  read up to that message. The read marker is a forward-only high-water mark, so marking an older message leaves newer
+  ones unread and re-marking never moves it backward; a chat with no messages is a no-op success. The JSON response
+  carries `account_id`, `npub`, `group_id`, and the refreshed projection as the same five keys the chat rows expose
+  (`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
 - MarmotKit/UniFFI now exposes encrypted per-account composer draft storage with metadata-only list, full load, upsert,
   and delete operations. Drafts retain their text, reply target, ordered attachment bytes, and attachment presentation
   metadata in the account's SQLCipher database; attachment bytes are loaded only for the selected draft.

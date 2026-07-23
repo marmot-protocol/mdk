@@ -2402,6 +2402,21 @@ impl MarmotAppRuntime {
             .chat_list(&account.label, include_archived)
     }
 
+    /// Read the durable chat-list projection row for a single group (unread
+    /// state, last-message preview, last-read marker). Read-only counterpart to
+    /// [`Self::chat_list`], used to enrich the per-group `chats subscribe`
+    /// snapshot and update feed without re-querying the whole list.
+    pub fn chat_list_row(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .chat_list_row(&account.label, group_id_hex)
+    }
+
     /// Per-account unread aggregate for the account-switcher badge
     /// (mdk#461). Computed from each account's materialized chat-list
     /// projection without loading a full session/timeline, so accounts that are

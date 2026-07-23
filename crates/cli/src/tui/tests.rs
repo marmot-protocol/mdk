@@ -193,7 +193,7 @@ fn composer_renders_filtered_slash_command_popup() {
         test_unused_client(),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
-    app.input = "/chat r".to_owned();
+    app.input.set_value("/chat r");
 
     let backend = ratatui::backend::TestBackend::new(100, 30);
     let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -210,6 +210,36 @@ fn composer_renders_filtered_slash_command_popup() {
     assert!(rendered.contains("Commands"));
     assert!(rendered.contains("/chat rename <name>"));
     assert!(!rendered.contains("/members add <npub-or-hex>"));
+}
+
+#[test]
+fn chat_list_scrolls_the_selection_into_view() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    // A chat list far taller than the panel, with the selection at the bottom.
+    app.chats = (0..40)
+        .map(|i| projected_chat(&format!("group{i:02}"), &format!("room{i:02}"), 0, Some(i)))
+        .collect();
+    let last = app.chats.len() - 1;
+    app.chats[last].name = "BOTTOMROOM".to_owned();
+    app.selected_chat = last;
+    app.focus = Focus::Chats;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(
+        rendered.contains("BOTTOMROOM"),
+        "the selected chat at the bottom must scroll into view, not clip off-panel"
+    );
 }
 
 #[test]
@@ -586,6 +616,7 @@ fn chat_row_line_shows_unread_count_in_bold() {
         group_id: "group-a".to_owned(),
         name: "Project Room".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     };
 
     let line = chat_row_line(&chat, false, 3);
@@ -718,6 +749,7 @@ fn render_lines_strip_terminal_control_sequences_from_untrusted_text() {
         group_id: "group-a".to_owned(),
         name: "ops\u{1b}[5m".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     };
     assert_eq!(line_text(&chat_row_line(&chat, false, 0)), "  ops[5m");
 
@@ -846,6 +878,7 @@ fn active_stream_preview_pins_to_open_time_group_after_selection_shift() {
         group_id: other_group.to_owned(),
         name: "other".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     // Selection now points at a DIFFERENT group than the streamed-into one.
     app.selected_chat = 0;
@@ -855,7 +888,7 @@ fn active_stream_preview_pins_to_open_time_group_after_selection_shift() {
         pending_text: String::new(),
         last_flush: Instant::now(),
     });
-    app.input = "hello".to_owned();
+    app.input.set_value("hello");
 
     // A keystroke-driven preview upsert must land under the pinned group.
     app.upsert_active_stream_preview(stream_id);
@@ -1021,6 +1054,7 @@ fn chat_subscription_result_inserts_live_invite_without_account_switch() {
             group_id: group_id.to_owned(),
             name: "new invite".to_owned(),
             archived: false,
+            projection: ChatProjection::default(),
         }]
     );
 }
@@ -1097,43 +1131,17 @@ fn subscription_final_message_removes_live_stream_preview() {
 }
 
 #[test]
-fn all_chat_subscription_marks_nonselected_messages_unread() {
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut previews = Vec::new();
-    let mut unread_counts = HashMap::new();
-
-    let status = apply_tui_subscription_result(
-        &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
-        &serde_json::json!({
-            "trigger": "MessageReceived",
-            "type": "message",
-            "message": {
-                "message_id": "02",
-                "direction": "received",
-                "group_id": unread_group_id,
-                "from": "alice",
-                "plaintext": "hello elsewhere"
-            }
-        }),
-    );
-
-    assert_eq!(unread_counts.get(unread_group_id), Some(&1));
-    assert_eq!(
-        status,
-        Some("unread message in bbbbbbb...bbbbbbbb; count=1".to_owned())
-    );
-}
-
-#[test]
-fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_message() {
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let unread_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+fn plain_feed_cleans_up_stream_preview_on_agent_final() {
+    // Phase 4 retired the plain feed's local unread counting (unread is
+    // runtime-backed now). The feed still owns QUIC stream previews: an agent
+    // stream's final row clears the live preview, with no message appended.
+    // (Retired with the local counting: all_chat_subscription_marks_nonselected_
+    // messages_unread, _does_not_count_selected_group_as_unread, and
+    // _ignores_initial_replay_for_unread_counts.)
+    let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let stream_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let mut previews = vec![LiveStreamPreview {
-        group_id: unread_group_id.to_owned(),
+        group_id: group_id.to_owned(),
         stream_id: stream_id.to_owned(),
         author: "alice".to_owned(),
         status: "streaming".to_owned(),
@@ -1141,19 +1149,16 @@ fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_mes
         error: None,
         optimistic: false,
     }];
-    let mut unread_counts = HashMap::new();
 
-    apply_tui_subscription_result(
+    apply_subscription_result(
         &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
         &serde_json::json!({
             "trigger": "AgentStreamFinalized",
             "type": "agent_stream_final",
             "message": {
                 "message_id": "final",
                 "direction": "received",
-                "group_id": unread_group_id,
+                "group_id": group_id,
                 "from": "alice",
                 "plaintext": "{\"marmot_payload\":\"marmot.agent_text_stream.v1\"}",
                 "agent_text_stream": {
@@ -1166,125 +1171,13 @@ fn all_chat_subscription_cleans_up_off_chat_stream_preview_without_appending_mes
     );
 
     assert!(previews.is_empty());
-    assert_eq!(unread_counts.get(unread_group_id), Some(&1));
 }
 
-#[test]
-fn all_chat_subscription_does_not_count_selected_group_as_unread() {
-    // A message for the loaded group must not bump its unread count; the pane is
-    // driven by the timeline feed, so the plain feed only counts off-screen groups.
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let mut previews = Vec::new();
-    let mut unread_counts = HashMap::new();
-
-    let status = apply_tui_subscription_result(
-        &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
-        &serde_json::json!({
-            "trigger": "MessageReceived",
-            "type": "message",
-            "message": {
-                "message_id": "01",
-                "direction": "received",
-                "group_id": selected_group_id,
-                "from": "alice",
-                "plaintext": "hello here"
-            }
-        }),
-    );
-
-    assert_eq!(status, None);
-    assert_eq!(unread_counts.get(selected_group_id), None);
-}
-
-#[test]
-fn all_chat_subscription_ignores_initial_replay_for_unread_counts() {
-    let selected_group_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let replay_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let mut previews = Vec::new();
-    let mut unread_counts = HashMap::new();
-
-    let status = apply_tui_subscription_result(
-        &mut previews,
-        &mut unread_counts,
-        Some(selected_group_id),
-        &serde_json::json!({
-            "trigger": "InitialMessage",
-            "type": "message",
-            "message": {
-                "message_id": "old",
-                "direction": "received",
-                "group_id": replay_group_id,
-                "from": "alice",
-                "plaintext": "old message"
-            }
-        }),
-    );
-
-    assert_eq!(status, None);
-    assert!(unread_counts.is_empty());
-}
-
-#[test]
-fn message_subscription_gates_on_loaded_chat_not_highlighted_chat() {
-    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let loaded_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let highlighted_group_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    let mut app = test_tui_app(test_unused_client(), account_id);
-    app.chats = vec![
-        ChatRow {
-            group_id: loaded_group_id.to_owned(),
-            name: "loaded".to_owned(),
-            archived: false,
-        },
-        ChatRow {
-            group_id: highlighted_group_id.to_owned(),
-            name: "highlighted".to_owned(),
-            archived: false,
-        },
-    ];
-    app.selected_chat = 1;
-    app.messages_group_id = Some(loaded_group_id.to_owned());
-    let (tx, rx) = mpsc::channel();
-    app.message_subscription = Some(MessageSubscription {
-        account_id: account_id.to_owned(),
-        child: test_sleep_child(),
-        rx,
-    });
-
-    tx.send(SubscriptionEvent::Result(serde_json::json!({
-        "trigger": "MessageReceived",
-        "type": "message",
-        "message": {
-            "message_id": "highlighted",
-            "direction": "received",
-            "group_id": highlighted_group_id,
-            "from": "alice",
-            "plaintext": "hello highlighted"
-        }
-    })))
-    .expect("send highlighted message event");
-
-    assert!(app.drain_message_subscription());
-    assert_eq!(app.unread_counts.get(highlighted_group_id), Some(&1));
-
-    tx.send(SubscriptionEvent::Result(serde_json::json!({
-        "trigger": "MessageReceived",
-        "type": "message",
-        "message": {
-            "message_id": "loaded",
-            "direction": "received",
-            "group_id": loaded_group_id,
-            "from": "bob",
-            "plaintext": "hello loaded"
-        }
-    })))
-    .expect("send loaded message event");
-
-    assert!(app.drain_message_subscription());
-    assert_eq!(app.unread_counts.get(loaded_group_id), None);
-}
+// Retired in Phase 4: message_subscription_gates_on_loaded_chat_not_highlighted_chat
+// asserted the plain feed's local unread counting, which no longer exists — unread
+// is runtime-backed. The loaded-vs-highlighted gating that still matters (the
+// timeline feed and mark-read target the loaded pane) is covered by the timeline
+// and mark-read tests below.
 
 #[test]
 fn drain_status_leaves_the_login_prompt_untouched_but_updates_main() {
@@ -1341,7 +1234,7 @@ fn selected_message_subscription_retains_account_wide_stream_without_selected_ch
 }
 
 #[test]
-fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
+fn refresh_accounts_clears_chat_state_when_no_accounts_remain() {
     let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"accounts":[]}}"#);
@@ -1350,10 +1243,15 @@ fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
         group_id: group_id.to_owned(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection {
+            unread_count: 3,
+            has_unread: true,
+            ..ChatProjection::default()
+        },
     }];
-    app.unread_counts.insert(group_id.to_owned(), 3);
     app.chat_subscription = Some(test_chat_subscription(account_id, false));
     app.message_subscription = Some(test_message_subscription(account_id));
+    app.notification_subscription = Some(test_notification_subscription(account_id));
     app.group_diagnostics = Some(GroupDiagnostics::unavailable(group_id, "old"));
 
     app.refresh_accounts().expect("refresh accounts");
@@ -1361,9 +1259,9 @@ fn refresh_accounts_clears_unread_counts_when_no_accounts_remain() {
     assert!(app.accounts.is_empty());
     assert!(app.chats.is_empty());
     assert!(app.timeline.is_empty());
-    assert!(app.unread_counts.is_empty());
     assert!(app.chat_subscription.is_none());
     assert!(app.message_subscription.is_none());
+    assert!(app.notification_subscription.is_none());
     assert!(app.group_diagnostics.is_none());
 }
 
@@ -1412,6 +1310,7 @@ fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
         group_id: previous_group.to_owned(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     app.messages_account_id = Some(previous_account.to_owned());
     app.messages_group_id = Some(previous_group.to_owned());
@@ -1428,6 +1327,7 @@ fn refresh_chats_clears_stale_send_targets_for_public_only_account() {
     assert!(app.chat_subscription.is_none());
     assert!(app.message_subscription.is_none());
     assert!(app.group_state_subscription.is_none());
+    assert!(app.notification_subscription.is_none());
     assert!(app.group_diagnostics.is_none());
 }
 
@@ -1705,31 +1605,53 @@ fn leading_question_mark_inserts_into_empty_composer() {
     let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
     app.focus = Focus::Composer;
     assert!(app.input.is_empty());
-    assert!(!app.show_help);
+    assert!(app.popup.is_none());
 
     app.handle_key(char_key('?')).expect("handle '?'");
 
-    assert_eq!(app.input, "?");
-    assert!(!app.show_help, "'?' in composer must not toggle help");
+    assert_eq!(app.input.value(), "?");
+    assert!(app.popup.is_none(), "'?' in composer must not open help");
 
     app.handle_key(char_key('h')).expect("handle 'h'");
     app.handle_key(char_key('i')).expect("handle 'i'");
-    assert_eq!(app.input, "?hi");
+    assert_eq!(app.input.value(), "?hi");
 }
 
 #[test]
-fn question_mark_toggles_help_outside_composer() {
-    // '?' still toggles help when the composer is not focused.
+fn question_mark_opens_help_popup_outside_composer() {
+    // '?' opens the help popup when the composer is not focused; a second key
+    // (routed to the modal) dismisses the dismiss-on-any-key card.
     let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
     app.focus = Focus::Chats;
-    assert!(!app.show_help);
+    assert!(app.popup.is_none());
 
     app.handle_key(char_key('?')).expect("handle '?'");
-    assert!(app.show_help, "'?' outside composer toggles help on");
+    assert!(
+        matches!(app.popup, Some(Popup::Card { .. })),
+        "'?' outside composer opens the help card"
+    );
     assert!(app.input.is_empty());
 
     app.handle_key(char_key('?')).expect("handle '?'");
-    assert!(!app.show_help, "'?' outside composer toggles help off");
+    assert!(
+        app.popup.is_none(),
+        "a key under the help card dismisses it"
+    );
+}
+
+#[test]
+fn q_under_open_help_dismisses_the_card_without_quitting() {
+    // Regression: with the old boolean help overlay, `q` under help quit the
+    // app. As a modal card, `q` is captured and dismisses the card instead.
+    let mut app = test_tui_app(test_unused_client(), "aa".repeat(32).as_str());
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('?')).expect("open help");
+    assert!(app.popup.is_some());
+
+    app.handle_key(char_key('q')).expect("q under help");
+
+    assert!(app.popup.is_none(), "q dismisses the help card");
+    assert!(app.running, "q under help must not quit the app");
 }
 
 fn line_text(line: &Line<'_>) -> String {
@@ -1760,7 +1682,6 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         selected_chat: 0,
         messages_account_id: None,
         messages_group_id: None,
-        unread_counts: HashMap::new(),
         show_archived_chats: false,
         timeline: Vec::new(),
         timeline_scroll: TimelineScroll::default(),
@@ -1769,15 +1690,24 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         message_subscription: None,
         timeline_subscription: None,
         group_state_subscription: None,
+        notification_subscription: None,
+        pending_chat_relist: false,
+        pending_mark_read: false,
+        seen_notification_keys: SeenNotificationKeys::new(),
         daemon: DaemonView {
             running: true,
             ..DaemonView::default()
         },
         group_diagnostics: None,
-        input: String::new(),
+        input: Input::default(),
         streaming: None,
         status: String::new(),
-        show_help: false,
+        popup: None,
+        group_detail: None,
+        user_search: None,
+        profile_view: None,
+        relay_health: None,
+        media: MediaState::new(),
     }
 }
 
@@ -1810,6 +1740,40 @@ fn test_json_client(response: &str) -> (tempfile::TempDir, WnClient) {
     (tempdir, client)
 }
 
+/// A fake `wn` whose `groups invites` calls return `first` on the first call and
+/// `rest` afterward, while every other subcommand returns a benign empty result.
+/// This lets a test drive the invites picker across an accept/decline where the
+/// refreshed list shrinks (the fixed-response fake cannot model that).
+#[cfg(unix)]
+fn test_invites_seq_client(first: &str, rest: &str) -> (tempfile::TempDir, WnClient) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let counter = tempdir.path().join("invites-seen");
+    let exe = tempdir.path().join("wn-json");
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  *\" invites \"*)\n    if [ -f '{counter}' ]; then\ncat <<'JSON'\n{rest}\nJSON\n    else\n      : > '{counter}'\ncat <<'JSON'\n{first}\nJSON\n    fi\n    ;;\n  *)\ncat <<'JSON'\n{{\"ok\":true,\"result\":{{}}}}\nJSON\n    ;;\nesac\n",
+        counter = counter.display(),
+    );
+    std::fs::write(&exe, script).expect("write fake wn");
+    let mut permissions = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    let client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    (tempdir, client)
+}
+
 #[cfg(unix)]
 fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -1823,6 +1787,31 @@ fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
     exe
+}
+
+/// A fake `wn` that records its argv (one arg per line) to a sidecar file and
+/// then prints `response`, so a test can assert which command was spawned.
+/// Returns the executable path and the args-file path.
+#[cfg(unix)]
+fn test_arg_recording_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe = dir.join("wn-json");
+    let args_file = dir.join("recorded-args");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat <<'JSON'\n{response}\nJSON\n",
+            args_file.display()
+        ),
+    )
+    .expect("write fake wn");
+    let mut permissions = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    (exe, args_file)
 }
 
 #[cfg(windows)]
@@ -1936,7 +1925,7 @@ fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
         pending_text: String::new(),
         last_flush: Instant::now(),
     });
-    app.input = "hello".to_owned();
+    app.input.set_value("hello");
 
     let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -1960,7 +1949,8 @@ fn streaming_enter_failure_is_caught_into_status_and_keeps_tui_running() {
         "composer must be restored after a compose-finish failure so Enter/Esc retries the stream"
     );
     assert_eq!(
-        app.input, "hello",
+        app.input.value(),
+        "hello",
         "draft text must be preserved for retry after a compose-finish failure"
     );
 }
@@ -1980,7 +1970,7 @@ fn streaming_enter_failure_before_finish_preserves_composer() {
         pending_text: "queued".to_owned(),
         last_flush: Instant::now(),
     });
-    app.input = "queued".to_owned();
+    app.input.set_value("queued");
 
     let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -2008,6 +1998,707 @@ fn test_message_subscription(account_id: &str) -> MessageSubscription {
         child,
         rx,
     }
+}
+
+fn test_notification_subscription(account_id: &str) -> NotificationSubscription {
+    let child = test_sleep_child();
+    let (_tx, rx) = mpsc::channel();
+    NotificationSubscription {
+        account_id: account_id.to_owned(),
+        child,
+        rx,
+    }
+}
+
+/// A chat row carrying a runtime projection: `unread` unread messages and, when
+/// `last_activity` is set, a `last_message` from "Bob" at that timestamp.
+fn projected_chat(
+    group_id: &str,
+    name: &str,
+    unread: usize,
+    last_activity: Option<u64>,
+) -> ChatRow {
+    ChatRow {
+        group_id: group_id.to_owned(),
+        name: name.to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            unread_count: unread,
+            has_unread: unread > 0,
+            last_message: last_activity.map(|timeline_at| ChatLastMessage {
+                sender: Some("bob".to_owned()),
+                sender_display_name: Some("Bob".to_owned()),
+                plaintext: "hello".to_owned(),
+                kind: Some(9),
+                timeline_at,
+                deleted: false,
+            }),
+            ..ChatProjection::default()
+        },
+    }
+}
+
+/// A `notifications subscribe` daemon event with the runtime DTO nested under
+/// `notification`, matching the real feed's envelope.
+fn notification_json(trigger: &str, group_id: &str, notification_key: &str) -> Value {
+    serde_json::json!({
+        "trigger": "Notification",
+        "type": "notification",
+        "group_id": group_id,
+        "notification_key": notification_key,
+        "notification": {
+            "trigger": trigger,
+            "group_id_hex": group_id,
+            "notification_key": notification_key
+        }
+    })
+}
+
+// ── Phase 4 ambient state: projection, previews, ordering, notifications ────
+
+#[test]
+fn parse_chat_reads_runtime_projection_fields() {
+    let chat = parse_chat(&serde_json::json!({
+        "group_id": "aa",
+        "profile": {"name": "ops"},
+        "archived": false,
+        "unread_count": 4,
+        "has_unread": true,
+        "last_message": {
+            "message_id_hex": "m1",
+            "sender": "bob_hex",
+            "sender_display_name": "Bob",
+            "plaintext": "hey there",
+            "kind": 9,
+            "timeline_at": 1_700_000_050_u64,
+            "deleted": false
+        },
+        "last_read_message_id_hex": "r1",
+        "last_read_timeline_at": 1_700_000_000_u64
+    }))
+    .expect("chat parses");
+
+    assert_eq!(chat.projection.unread_count, 4);
+    assert!(chat.projection.has_unread);
+    let last = chat.projection.last_message.expect("last message present");
+    assert_eq!(last.sender_display_name.as_deref(), Some("Bob"));
+    assert_eq!(last.plaintext, "hey there");
+    assert_eq!(last.kind, Some(9));
+    assert_eq!(last.timeline_at, 1_700_000_050);
+    assert!(!last.deleted);
+    assert_eq!(
+        chat.projection.last_read_message_id_hex.as_deref(),
+        Some("r1")
+    );
+    assert_eq!(chat.projection.last_read_timeline_at, Some(1_700_000_000));
+}
+
+#[test]
+fn parse_chat_defaults_projection_when_keys_absent() {
+    // Tolerant parse: a legacy/partial row (no projection keys) is still a chat.
+    let chat = parse_chat(&serde_json::json!({
+        "group_id": "aa",
+        "profile": {"name": "ops"}
+    }))
+    .expect("chat parses");
+
+    assert_eq!(chat.projection, ChatProjection::default());
+    assert_eq!(chat.projection.unread_count, 0);
+    assert!(!chat.projection.has_unread);
+    assert!(chat.projection.last_message.is_none());
+}
+
+#[test]
+fn status_bar_unread_total_sums_runtime_projections() {
+    // The status bar's `{u} unread` is the sum of the runtime projection counts —
+    // no local counting anywhere.
+    let chats = vec![
+        projected_chat("aa", "ops", 2, Some(10)),
+        projected_chat("bb", "eng", 0, Some(20)),
+        projected_chat("cc", "ops2", 5, Some(30)),
+    ];
+    assert_eq!(total_unread(&chats), 7);
+}
+
+#[test]
+fn chat_row_badge_and_preview_come_from_the_projection() {
+    let chat = projected_chat("aa", "ops", 2, Some(30));
+
+    let line = chat_row_line(&chat, false, chat.projection.unread_count);
+    assert_eq!(line_text(&line), "  ops (2)");
+
+    let preview = chat_preview_line(&chat).expect("a chat with a last message has a preview");
+    assert_eq!(line_text(&preview), "    Bob: hello");
+    assert_eq!(
+        preview.spans.last().expect("preview span").style.fg,
+        Some(Color::DarkGray)
+    );
+}
+
+#[test]
+fn chat_without_last_message_has_no_preview_line() {
+    let chat = projected_chat("aa", "ops", 0, None);
+    assert!(chat_preview_line(&chat).is_none());
+}
+
+#[test]
+fn chat_preview_renders_tombstone_and_group_system_summary() {
+    let mut deleted = projected_chat("aa", "ops", 0, Some(30));
+    deleted
+        .projection
+        .last_message
+        .as_mut()
+        .expect("last message")
+        .deleted = true;
+    assert_eq!(
+        line_text(&chat_preview_line(&deleted).expect("preview")),
+        "    message deleted"
+    );
+
+    let mut system = projected_chat("bb", "eng", 0, Some(30));
+    let last = system
+        .projection
+        .last_message
+        .as_mut()
+        .expect("last message");
+    last.kind = Some(GROUP_SYSTEM_KIND);
+    last.sender_display_name = Some("Alice".to_owned());
+    last.plaintext = r#"{"system_type":"member_added","data":{"subject":"carol"}}"#.to_owned();
+    assert_eq!(
+        line_text(&chat_preview_line(&system).expect("preview")),
+        "    Alice added carol"
+    );
+}
+
+#[test]
+fn chats_order_by_last_activity_preserving_selection() {
+    let mut chats = vec![
+        projected_chat("aa", "old", 0, Some(10)),
+        projected_chat("bb", "new", 0, Some(30)),
+        projected_chat("cc", "mid", 0, Some(20)),
+    ];
+    let mut selected = 0; // highlighting "aa"
+
+    resort_chats_preserving_selection(&mut chats, &mut selected);
+
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| chat.group_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bb", "cc", "aa"],
+        "chats order by last activity, newest first"
+    );
+    assert_eq!(
+        chats[selected].group_id, "aa",
+        "the highlight follows its chat across the reorder"
+    );
+}
+
+#[test]
+fn message_less_chats_keep_the_list_order_as_a_stable_fallback() {
+    // Equal-activity rows (here: all message-less) keep the order they came in —
+    // the documented stable fallback.
+    let mut chats = vec![
+        projected_chat("aa", "first", 0, None),
+        projected_chat("bb", "second", 0, None),
+        projected_chat("cc", "third", 0, None),
+    ];
+    sort_chats_by_activity(&mut chats);
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| chat.group_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aa", "bb", "cc"]
+    );
+}
+
+#[test]
+fn timeline_chat_list_row_folds_into_the_loaded_chat() {
+    let mut chats = vec![
+        projected_chat("aa", "ops", 0, Some(10)),
+        projected_chat("bb", "eng", 0, Some(20)),
+    ];
+    let mut selected = 0; // highlighting "aa"
+    let event = serde_json::json!({
+        "type": "timeline_projection_updated",
+        "group_id": "aa",
+        "chat_list_row": {
+            "unread_count": 3,
+            "has_unread": true,
+            "last_message": {
+                "sender_display_name": "Bob",
+                "plaintext": "new here",
+                "kind": 9,
+                "timeline_at": 30,
+                "deleted": false
+            }
+        }
+    });
+
+    let (group_id, projection) = timeline_chat_list_row(&event).expect("chat_list_row present");
+    assert!(fold_chat_projection(
+        &mut chats,
+        &mut selected,
+        &group_id,
+        projection
+    ));
+
+    // aa now has the newest activity (30), so it sorts to the top and the
+    // highlight follows it there.
+    assert_eq!(chats[0].group_id, "aa");
+    assert_eq!(chats[0].projection.unread_count, 3);
+    assert_eq!(chats[selected].group_id, "aa");
+    assert_eq!(
+        chats[1].projection.unread_count, 0,
+        "the other chat is untouched"
+    );
+}
+
+#[test]
+fn timeline_chat_list_row_is_none_without_a_projection() {
+    let ready = serde_json::json!({"type": "timeline_subscription_ready"});
+    assert!(timeline_chat_list_row(&ready).is_none());
+}
+
+#[test]
+fn chats_feed_default_projection_does_not_clobber_a_live_one() {
+    // A transient producer-side projection read failure degrades a chats-feed
+    // row to all-default keys. The full-row replace must not wipe a live badge
+    // and preview, so an entirely-default incoming projection keeps the
+    // existing non-default one.
+    let mut chats = vec![projected_chat("aa", "ops", 4, Some(30))];
+    let bare = ChatRow {
+        group_id: "aa".to_owned(),
+        name: "ops".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+    upsert_chat(&mut chats, bare, false);
+    assert_eq!(
+        chats[0].projection.unread_count, 4,
+        "an all-default feed row keeps the existing live badge"
+    );
+    assert!(
+        chats[0].projection.last_message.is_some(),
+        "the last-message preview is preserved too"
+    );
+}
+
+#[test]
+fn chats_feed_nonempty_projection_still_replaces() {
+    // A legitimate projection (here a read that lowers the badge) is not
+    // entirely default, so it still replaces the existing one.
+    let mut chats = vec![projected_chat("aa", "ops", 4, Some(30))];
+    let read = ChatRow {
+        group_id: "aa".to_owned(),
+        name: "ops".to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            last_message: Some(ChatLastMessage {
+                sender: Some("bob".to_owned()),
+                sender_display_name: Some("Bob".to_owned()),
+                plaintext: "hello".to_owned(),
+                kind: Some(9),
+                timeline_at: 40,
+                deleted: false,
+            }),
+            ..ChatProjection::default()
+        },
+    };
+    upsert_chat(&mut chats, read, false);
+    assert_eq!(
+        chats[0].projection.unread_count, 0,
+        "a non-default incoming projection replaces (a real read lowers the badge)"
+    );
+}
+
+#[test]
+fn notifications_for_other_chats_schedule_one_pending_relist() {
+    // N distinct NewMessage events for non-loaded chats, drained in one window,
+    // set exactly one pending re-list (coalesced by the debounce flag).
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+    for key in ["msg:1", "msg:2", "msg:3"] {
+        let event = parse_notification_event(&notification_json("NewMessage", "bb", key));
+        assert_eq!(
+            apply_notification_event(&mut seen, &mut pending, Some("aa"), event),
+            NotificationOutcome::ScheduledRelist
+        );
+    }
+    assert!(
+        pending,
+        "several NewMessage events set the single pending flag"
+    );
+    assert_eq!(seen.len(), 3);
+}
+
+#[test]
+fn duplicate_notification_key_does_not_retrigger() {
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+
+    let first = parse_notification_event(&notification_json("NewMessage", "bb", "msg:1"));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), first),
+        NotificationOutcome::ScheduledRelist
+    );
+
+    pending = false; // as the tick loop would, after performing the re-list
+    let duplicate = parse_notification_event(&notification_json("NewMessage", "bb", "msg:1"));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), duplicate),
+        NotificationOutcome::Ignored
+    );
+    assert!(!pending, "a duplicated emission does not re-schedule");
+}
+
+#[test]
+fn notification_for_the_loaded_chat_is_ignored() {
+    // The loaded pane's badge is kept fresh by the timeline feed + mark-read, so
+    // its NewMessage notifications never schedule a re-list.
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+    let event = parse_notification_event(&notification_json("NewMessage", "aa", "msg:1"));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), event),
+        NotificationOutcome::Ignored
+    );
+    assert!(!pending);
+}
+
+#[test]
+fn group_invite_notification_surfaces_a_notice() {
+    let mut seen = SeenNotificationKeys::new();
+    let mut pending = false;
+    let event = parse_notification_event(&serde_json::json!({
+        "type": "notification",
+        "group_id": "bb",
+        "notification": {
+            "trigger": "GroupInvite",
+            "group_id_hex": "bb",
+            "group_name": "Secret Room",
+            "notification_key": "invite:1"
+        }
+    }));
+    assert_eq!(
+        apply_notification_event(&mut seen, &mut pending, Some("aa"), event),
+        NotificationOutcome::Invite("invited to Secret Room — press I to view invites".to_owned())
+    );
+    assert!(!pending, "an invite does not schedule a re-list this phase");
+}
+
+#[test]
+fn drain_notification_subscription_coalesces_to_one_pending_relist() {
+    let account_id = "aa".repeat(32);
+    let loaded_group = "aa".repeat(32);
+    let other_group = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_group_id = Some(loaded_group);
+    let (tx, rx) = mpsc::channel();
+    app.notification_subscription = Some(NotificationSubscription {
+        account_id: account_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    for key in ["m1", "m2", "m3"] {
+        tx.send(SubscriptionEvent::Result(notification_json(
+            "NewMessage",
+            &other_group,
+            key,
+        )))
+        .expect("send notification event");
+    }
+
+    assert!(app.drain_notification_subscription());
+    assert!(
+        app.pending_chat_relist,
+        "several NewMessage events in one drain set exactly one pending re-list"
+    );
+    assert_eq!(app.seen_notification_keys.len(), 3);
+}
+
+#[test]
+fn drain_notification_subscription_drops_other_accounts_events() {
+    // The runtime-wide feed carries every local account's notifications. An
+    // event routed to a different account must change nothing on this one: no
+    // notice, no pending re-list, no dedup-key insertion.
+    let account_id = "aa".repeat(32);
+    let other_account = "cc".repeat(32);
+    let other_group = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_group_id = None;
+    let (tx, rx) = mpsc::channel();
+    app.notification_subscription = Some(NotificationSubscription {
+        account_id: account_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    let mut new_message = notification_json("NewMessage", &other_group, "m1");
+    new_message["account_id"] = Value::String(other_account.clone());
+    tx.send(SubscriptionEvent::Result(new_message))
+        .expect("send new-message event");
+    let invite = serde_json::json!({
+        "type": "notification",
+        "account_id": other_account,
+        "notification": {
+            "trigger": "GroupInvite",
+            "group_name": "Secret Room",
+            "notification_key": "invite:1"
+        }
+    });
+    tx.send(SubscriptionEvent::Result(invite))
+        .expect("send invite event");
+
+    app.drain_notification_subscription();
+
+    assert!(
+        !app.pending_chat_relist,
+        "another account's message never arms a re-list"
+    );
+    assert!(
+        app.seen_notification_keys.is_empty(),
+        "another account's dedup key is never recorded"
+    );
+    assert_eq!(
+        app.status, "",
+        "another account's invite surfaces no notice on this account"
+    );
+}
+
+#[test]
+fn seen_notification_keys_are_bounded() {
+    // Dedup only needs to cover the recent event window, so the set is capped
+    // and evicts oldest-first instead of growing unbounded over a session.
+    let mut seen = SeenNotificationKeys::new();
+    for i in 0..(TUI_SEEN_NOTIFICATION_KEYS_LIMIT + 50) {
+        assert!(
+            seen.insert(format!("k{i}")),
+            "each distinct key is newly inserted"
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        TUI_SEEN_NOTIFICATION_KEYS_LIMIT,
+        "the dedup set is capped, not unbounded"
+    );
+    assert!(
+        seen.insert("k0".to_owned()),
+        "the oldest key aged out, so it is treated as new again"
+    );
+    let recent = format!("k{}", TUI_SEEN_NOTIFICATION_KEYS_LIMIT + 49);
+    assert!(
+        !seen.insert(recent),
+        "a key inside the recent window is still deduplicated"
+    );
+}
+
+#[test]
+fn tick_performs_the_pending_relist_exactly_once() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"chats":[]}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // no live subscriptions to drain
+    app.pending_chat_relist = true;
+
+    let changed = app.tick();
+
+    assert!(changed);
+    assert!(
+        !app.pending_chat_relist,
+        "tick runs the pending re-list once, then clears the debounce flag"
+    );
+}
+
+#[test]
+fn should_mark_loaded_chat_read_only_for_the_loaded_chat_with_unread() {
+    let with_unread = ChatProjection {
+        unread_count: 2,
+        ..ChatProjection::default()
+    };
+    let read = ChatProjection::default();
+    assert!(should_mark_loaded_chat_read(Some("aa"), "aa", &with_unread));
+    assert!(
+        !should_mark_loaded_chat_read(Some("aa"), "aa", &read),
+        "no unread on the loaded chat means nothing to mark"
+    );
+    assert!(
+        !should_mark_loaded_chat_read(Some("aa"), "bb", &with_unread),
+        "a non-loaded chat keeps its badge (the ambient path owns it)"
+    );
+    assert!(
+        !should_mark_loaded_chat_read(None, "aa", &with_unread),
+        "no loaded chat means nothing to mark"
+    );
+}
+
+#[test]
+fn timeline_fold_arms_a_mark_read_for_the_viewed_chat() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.chats = vec![projected_chat(&group_id, "general", 0, Some(10))];
+    app.selected_chat = 0;
+    let (tx, rx) = mpsc::channel();
+    app.timeline_subscription = Some(TimelineSubscription {
+        account_id: account_id.clone(),
+        group_id: group_id.clone(),
+        child: test_sleep_child(),
+        rx,
+    });
+    // The viewed chat accrues unread while we read it; the timeline feed imports
+    // the growing count through its chat_list_row.
+    tx.send(SubscriptionEvent::Result(serde_json::json!({
+        "type": "timeline_projection_updated",
+        "group_id": group_id,
+        "chat_list_row": {"unread_count": 3, "has_unread": true},
+        "changes": []
+    })))
+    .expect("send chat_list_row");
+
+    assert!(app.drain_timeline_subscription());
+    assert!(
+        app.pending_mark_read,
+        "importing a nonzero count for the viewed chat schedules a mark-read"
+    );
+}
+
+#[test]
+fn tick_marks_the_viewed_chat_read_once_and_clears_the_badge() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"unread_count":0,"has_unread":false,"last_message":null}}"#,
+    );
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // no live subscriptions to drain
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.chats = vec![projected_chat(&group_id, "general", 3, Some(30))];
+    app.selected_chat = 0;
+    app.pending_mark_read = true;
+
+    assert!(app.tick());
+    assert_eq!(
+        app.chats[0].projection.unread_count, 0,
+        "tick folds the mark-read response and clears the viewed chat's badge"
+    );
+    assert!(
+        !app.pending_mark_read,
+        "a successful mark-read clears the flag"
+    );
+
+    // The folded projection is now zero, so a second tick re-arms nothing.
+    app.tick();
+    assert!(!app.pending_mark_read, "no re-arm once the badge is clear");
+}
+
+#[test]
+fn a_failed_relist_re_arms_for_the_next_tick() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // no live subscriptions to drain
+    app.pending_chat_relist = true;
+
+    app.tick();
+
+    assert!(
+        app.pending_chat_relist,
+        "a failed re-list re-arms instead of dropping the batch"
+    );
+    assert!(
+        app.status.contains("re-list failed"),
+        "the error still surfaces on the status line"
+    );
+}
+
+#[test]
+fn a_failed_mark_read_re_arms_for_the_next_tick() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default();
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.chats = vec![projected_chat(&group_id, "general", 3, Some(30))];
+    app.pending_mark_read = true;
+
+    app.tick();
+
+    assert!(
+        app.pending_mark_read,
+        "a failed mark-read re-arms for the next tick"
+    );
+    assert!(
+        app.status.contains("mark-read failed"),
+        "the error still surfaces on the status line"
+    );
+}
+
+#[test]
+fn opening_a_chat_marks_it_read_and_clears_the_badge() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    // The fake returns one response for every call; both `messages timeline list`
+    // and `chats mark-read` see the empty-timeline/read projection.
+    let (_tempdir, client) = test_json_client(
+        r#"{"ok":true,"result":{"messages":[],"has_more_before":false,"unread_count":0,"has_unread":false,"last_message":null}}"#,
+    );
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // mark-read is a normal command, daemon or not
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            unread_count: 5,
+            has_unread: true,
+            ..ChatProjection::default()
+        },
+    }];
+    app.selected_chat = 0;
+
+    app.refresh_messages().expect("refresh messages");
+
+    assert_eq!(
+        app.chats[0].projection.unread_count, 0,
+        "opening a chat folds the mark-read response and clears the badge immediately"
+    );
+}
+
+#[test]
+fn mark_read_failure_keeps_the_badge_honest() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+        projection: ChatProjection {
+            unread_count: 5,
+            has_unread: true,
+            ..ChatProjection::default()
+        },
+    }];
+    app.selected_chat = 0;
+
+    let result = app.mark_selected_chat_read(&account_id, &group_id);
+
+    assert!(
+        result.is_err(),
+        "a failed mark-read is surfaced, not swallowed"
+    );
+    assert_eq!(
+        app.chats[0].projection.unread_count, 5,
+        "a failed mark-read never zeroes the badge locally"
+    );
 }
 
 #[cfg(not(windows))]
@@ -2160,7 +2851,7 @@ fn parse_timeline_row_reads_media_imeta_mime_and_filename() {
                     "v encrypted-media-v1",
                     "locator blossom-v1 https://blossom.example/abc",
                     "ciphertext_sha256 deadbeef",
-                    "plaintext_sha256 cafebabe",
+                    "plaintext_sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "nonce 00112233",
                     "m image/png",
                     "filename pixel.png"
@@ -2182,13 +2873,56 @@ fn parse_timeline_row_reads_media_imeta_mime_and_filename() {
             TimelineAttachment {
                 mime: Some("image/png".to_owned()),
                 filename: Some("pixel.png".to_owned()),
+                plaintext_hash: Some("aa".repeat(32)),
             },
             TimelineAttachment {
                 mime: Some("application/pdf".to_owned()),
                 filename: Some("spec.pdf".to_owned()),
+                plaintext_hash: None,
             },
         ]
     );
+}
+
+/// A malicious member can put anything in the `imeta` `plaintext_sha256` field.
+/// The parse boundary is the only place that decides whether a hash is trusted:
+/// it must reject any value that is not exactly 64 lowercase hex characters,
+/// dropping the attachment to `plaintext_hash: None` (a plain placeholder that
+/// never downloads and never reaches the cache path or the `wn media download`
+/// argv). Storage always emits lowercase hex (`hex::encode`), so uppercase is
+/// not a legitimate hash and is rejected too, rather than normalized.
+#[test]
+fn parse_timeline_attachment_rejects_unsafe_plaintext_hash() {
+    let hostile = [
+        "../../../../etc/passwd", // path traversal
+        "aa/bb",                  // path separator, right length family
+        "nothex_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", // non-hex
+        "aaaa",                   // too short
+        &"aa".repeat(33),         // too long (66 chars)
+        &"AA".repeat(32),         // uppercase hex, correct length
+    ];
+    for value in hostile {
+        let row = serde_json::json!({
+            "message_id": "m",
+            "media": { "imeta": [["imeta", "m image/png", "filename x.png",
+                format!("plaintext_sha256 {value}")]] }
+        });
+        let attachment = &parse_timeline_row(&row).expect("row parses").attachments[0];
+        assert_eq!(
+            attachment.plaintext_hash, None,
+            "unsafe hash {value:?} must be rejected at the parse boundary"
+        );
+    }
+
+    // A genuine 64-char lowercase-hex hash is accepted unchanged.
+    let good = "0123456789abcdef".repeat(4);
+    let row = serde_json::json!({
+        "message_id": "m",
+        "media": { "imeta": [["imeta", "m image/png", "filename x.png",
+            format!("plaintext_sha256 {good}")]] }
+    });
+    let attachment = &parse_timeline_row(&row).expect("row parses").attachments[0];
+    assert_eq!(attachment.plaintext_hash, Some(good));
 }
 
 #[test]
@@ -2969,15 +3703,245 @@ fn timeline_row_lines_render_attachment_placeholders() {
         TimelineAttachment {
             mime: Some("image/png".to_owned()),
             filename: Some("pixel.png".to_owned()),
+            plaintext_hash: Some("cafebabe".to_owned()),
         },
         TimelineAttachment {
             mime: Some("application/pdf".to_owned()),
             filename: Some("spec.pdf".to_owned()),
+            plaintext_hash: None,
         },
     ];
+    // With an empty (unsupported) media view, an image with a hash still shows the
+    // `[img ...]` placeholder — capability detection has not enabled rendering.
     let lines = timeline_row_lines(&row, None);
     assert_eq!(line_text(&lines[1]).trim_start(), "[img pixel.png]");
     assert_eq!(line_text(&lines[2]).trim_start(), "[file spec.pdf]");
+}
+
+// ---- Phase 6: inbound media ----
+
+fn image_attachment(hash: &str) -> TimelineAttachment {
+    TimelineAttachment {
+        mime: Some("image/png".to_owned()),
+        filename: Some("pixel.png".to_owned()),
+        plaintext_hash: Some(hash.to_owned()),
+    }
+}
+
+/// A media state with an image-capable (halfblocks) picker and one decoded,
+/// ready image, built without a terminal or network via the test hooks.
+fn media_with_ready_image(hash: &str) -> MediaState {
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    // Larger than the halfblocks font cell (10x20) so it occupies cells, and
+    // vertically varied so the encoder emits half-block glyphs (a uniform image
+    // collapses each cell to a space).
+    let mut buffer = image::RgbImage::new(200, 160);
+    for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+        *pixel = image::Rgb([(x % 256) as u8, y.wrapping_mul(3) as u8, 200]);
+    }
+    media.apply_for_test(MediaLoad::Decoded {
+        hash: hash.to_owned(),
+        image: Box::new(image::DynamicImage::ImageRgb8(buffer)),
+    });
+    media
+}
+
+#[test]
+fn media_view_slot_walks_the_placeholder_ladder() {
+    let hash = "cafebabe";
+    let attachment = image_attachment(hash);
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[img pixel.png]".to_owned())
+    );
+    media.begin_download(hash.to_owned());
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[downloading pixel.png...]".to_owned())
+    );
+    media.apply_for_test(MediaLoad::Downloaded {
+        hash: hash.to_owned(),
+    });
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[loading pixel.png...]".to_owned())
+    );
+    media.apply_for_test(MediaLoad::Failed {
+        hash: hash.to_owned(),
+        error: "boom".to_owned(),
+    });
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[pixel.png failed: boom]".to_owned())
+    );
+}
+
+#[test]
+fn media_view_slot_ready_image_reserves_a_block() {
+    let media = media_with_ready_image("cafebabe");
+    assert!(media.is_ready("cafebabe"));
+    assert_eq!(
+        media.view().slot(&image_attachment("cafebabe")),
+        MediaSlot::Image { rows: 8 }
+    );
+}
+
+#[test]
+fn media_view_slot_without_capability_stays_placeholder() {
+    // No picker: an image never advances past `[img ...]`; no download is armed.
+    let media = MediaState::new();
+    assert!(!media.supported());
+    assert_eq!(
+        media.view().slot(&image_attachment("cafebabe")),
+        MediaSlot::Placeholder("[img pixel.png]".to_owned())
+    );
+}
+
+#[test]
+fn media_view_slot_non_image_is_a_file_placeholder() {
+    let attachment = TimelineAttachment {
+        mime: Some("application/pdf".to_owned()),
+        filename: Some("spec.pdf".to_owned()),
+        plaintext_hash: Some("cafebabe".to_owned()),
+    };
+    let media = media_with_ready_image("cafebabe");
+    assert_eq!(
+        media.view().slot(&attachment),
+        MediaSlot::Placeholder("[file spec.pdf]".to_owned())
+    );
+}
+
+#[test]
+fn media_drain_folds_duplicate_decoded_events_idempotently() {
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    for _ in 0..2 {
+        media.apply_for_test(MediaLoad::Decoded {
+            hash: "cafebabe".to_owned(),
+            image: Box::new(image::DynamicImage::new_rgb8(2, 2)),
+        });
+    }
+    assert!(media.is_ready("cafebabe"));
+}
+
+#[test]
+fn media_downloads_are_capped_at_three_in_flight() {
+    // Ten images all want to download. The cap keeps at most three workers in
+    // flight; the rest are slotted as running downloads complete.
+    let hashes: Vec<String> = (0..10).map(|i| format!("hash{i}")).collect();
+    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+
+    for _ in 0..1000 {
+        for hash in media.downloads_to_start(&hashes) {
+            media.begin_download(hash);
+        }
+        assert!(
+            media.in_flight() <= 3,
+            "never more than three downloads run at once"
+        );
+        if hashes.iter().all(|hash| media.is_ready(hash)) {
+            break;
+        }
+        // A worker completes, freeing one in-flight slot for the next tick.
+        if let Some(hash) = hashes
+            .iter()
+            .find(|hash| media.is_tracked(hash) && !media.is_ready(hash))
+        {
+            media.apply_for_test(MediaLoad::Decoded {
+                hash: hash.clone(),
+                image: Box::new(image::DynamicImage::new_rgb8(2, 2)),
+            });
+        }
+    }
+
+    assert!(
+        hashes.iter().all(|hash| media.is_ready(hash)),
+        "all ten images are eventually tracked as completions arrive"
+    );
+}
+
+#[test]
+fn timeline_row_height_media_reserves_rows_for_a_ready_image() {
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+
+    let placeholder_height = timeline_row_height(&row, None, 80);
+    let media = media_with_ready_image("cafebabe");
+    let ready_height = timeline_row_height_media(&row, None, 80, media.view());
+
+    // A ready image reserves 8 rows where the placeholder used one line.
+    assert_eq!(ready_height, placeholder_height + 7);
+}
+
+#[test]
+fn timeline_row_image_blocks_locates_the_reserved_block() {
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    let media = media_with_ready_image("cafebabe");
+
+    let blocks = timeline_row_image_blocks(&row, None, 80, media.view());
+    assert_eq!(blocks.len(), 1);
+    let (hash, offset, rows) = &blocks[0];
+    assert_eq!(hash, "cafebabe");
+    // One content line above the block, so it starts at row 1 and reserves 8.
+    assert_eq!(*offset, 1);
+    assert_eq!(*rows, 8);
+}
+
+#[test]
+fn timeline_row_image_blocks_place_image_before_a_trailing_file_placeholder() {
+    // A ready image followed by a non-image attachment: the file placeholder
+    // renders *after* the image block, so it must not push the image's offset
+    // down. Deriving the offset from the row layout (not by subtracting from the
+    // bottom) keeps the drawn image on its reserved blanks.
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![
+        image_attachment("cafebabe"),
+        TimelineAttachment {
+            mime: Some("application/pdf".to_owned()),
+            filename: Some("spec.pdf".to_owned()),
+            plaintext_hash: None,
+        },
+    ];
+    let media = media_with_ready_image("cafebabe");
+
+    let blocks = timeline_row_image_blocks(&row, None, 80, media.view());
+    assert_eq!(blocks.len(), 1);
+    let (hash, offset, rows) = &blocks[0];
+    assert_eq!(hash, "cafebabe");
+    // One content line above the image; the trailing file placeholder sits below
+    // the block and must not shift it.
+    assert_eq!(*offset, 1);
+    assert_eq!(*rows, 8);
+}
+
+#[test]
+fn ready_image_renders_over_its_placeholder_in_the_message_pane() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+    app.media = media_with_ready_image("cafebabe");
+
+    let rendered = rendered_buffer(&mut app);
+    // The halfblocks protocol draws half-block glyphs, and the `[img ...]`
+    // placeholder is gone because the image filled its reserved block.
+    assert!(
+        rendered.contains('▀') || rendered.contains('▄'),
+        "expected halfblock image cells"
+    );
+    assert!(
+        !rendered.contains("pixel.png"),
+        "the placeholder should be replaced by the image"
+    );
 }
 
 #[test]
@@ -3406,6 +4370,41 @@ fn send_message_upserts_an_optimistic_timeline_row() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn send_message_uses_the_documented_plural_messages_namespace() {
+    // `messages send` is the documented surface; `message send` is a hidden
+    // deprecated alias. The message interactions (react/unreact/delete/retry)
+    // all spawn the plural form, so send must too, for a consistent surface.
+    let account_id = "aa".repeat(32);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_arg_recording_executable(
+        tempdir.path(),
+        r#"{"ok":true,"result":{"published":1,"message_ids":["m1"]}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+
+    app.send_message("hello there".to_owned()).expect("send");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let args: Vec<&str> = recorded.lines().collect();
+    let send_index = args
+        .iter()
+        .position(|arg| *arg == "send")
+        .expect("a send subcommand was spawned");
+    assert_eq!(
+        args[send_index - 1],
+        "messages",
+        "send must spawn the plural `messages send`, not the singular alias; got {args:?}"
+    );
+}
+
 #[test]
 fn refresh_messages_loads_the_materialized_timeline_page() {
     let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -3418,6 +4417,7 @@ fn refresh_messages_loads_the_materialized_timeline_page() {
         group_id: group_id.to_owned(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     app.selected_chat = 0;
 
@@ -3755,11 +4755,32 @@ fn status_bar_line_strips_control_sequences_from_untrusted_fields() {
 fn hints_line_matches_the_keymap_per_screen_and_focus() {
     assert_eq!(
         hints_line(Screen::Main, Focus::Chats, true),
-        "j/k navigate  Enter open  A accounts  / command  ? help  q quit"
+        "j/k move  Enter open  g detail  s search  p profile  h relays  I invites  A accounts  ? help"
+    );
+    assert_eq!(
+        hints_line(Screen::Profile, Focus::Chats, true),
+        "j/k move  Enter edit  f follow  x unfollow  Esc back"
+    );
+    assert_eq!(
+        hints_line(Screen::RelayHealth, Focus::Chats, true),
+        "r refresh  j/k scroll  Esc back"
+    );
+    // The user-search screen's hint is focus-aware (rendered via `user_search_hint`).
+    assert_eq!(
+        user_search_hint(UserSearchFocus::Query),
+        "type query  Enter search  Down results  Esc back"
+    );
+    assert_eq!(
+        user_search_hint(UserSearchFocus::Results),
+        "j/k move  Enter profile  c chat  a add  i query  Esc back"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Messages, true),
-        "j/k select  G/g ends  PgUp older  i compose  Tab cycle"
+        "j/k select  G/g ends  r react  u unreact  d delete  R reply  i compose"
+    );
+    assert_eq!(
+        hints_line(Screen::GroupDetail, Focus::Chats, true),
+        "j/k move  A add  x remove  P promote  R rename  L leave  I invites  ? help  Esc back"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Composer, true),
@@ -3783,6 +4804,646 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
         hints_line(Screen::Login(LoginMode::NsecEntry), Focus::Chats, false),
         "Enter submit  Esc back"
     );
+}
+
+// ---- Phase 5a: popups, group detail, invites ----
+
+#[test]
+fn popup_key_text_entry_submits_purpose_and_cancels() {
+    let mut rename = Popup::Text {
+        purpose: TextPurpose::RenameGroup {
+            group_id: "g1".to_owned(),
+        },
+        title: "Rename Group".to_owned(),
+        input: Input::default(),
+    };
+    for character in "ops".chars() {
+        assert_eq!(
+            popup_key(&mut rename, KeyCode::Char(character)),
+            PopupAction::None
+        );
+    }
+    assert_eq!(
+        popup_key(&mut rename, KeyCode::Enter),
+        PopupAction::Submit(PopupSubmit::RenameGroup {
+            group_id: "g1".to_owned(),
+            name: "ops".to_owned(),
+        })
+    );
+
+    let mut add = Popup::Text {
+        purpose: TextPurpose::AddMemberByPubkey {
+            group_id: "g1".to_owned(),
+        },
+        title: "Add Member".to_owned(),
+        input: Input::default(),
+    };
+    // An empty submit is a no-op; Esc cancels with no side effect.
+    assert_eq!(popup_key(&mut add, KeyCode::Enter), PopupAction::None);
+    for character in "npub1".chars() {
+        popup_key(&mut add, KeyCode::Char(character));
+    }
+    assert_eq!(
+        popup_key(&mut add, KeyCode::Enter),
+        PopupAction::Submit(PopupSubmit::AddMember {
+            group_id: "g1".to_owned(),
+            pubkey: "npub1".to_owned(),
+        })
+    );
+    let mut cancel = Popup::Text {
+        purpose: TextPurpose::AddMemberByPubkey {
+            group_id: "g1".to_owned(),
+        },
+        title: "Add Member".to_owned(),
+        input: Input::default(),
+    };
+    assert_eq!(popup_key(&mut cancel, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
+fn popup_key_confirm_accepts_y_or_enter_and_cancels_n_or_esc() {
+    let leave = || Popup::Confirm {
+        purpose: ConfirmPurpose::LeaveGroup {
+            group_id: "g1".to_owned(),
+        },
+        title: "Leave Group".to_owned(),
+        body: Vec::new(),
+    };
+    let expect = PopupAction::Submit(PopupSubmit::LeaveGroup {
+        group_id: "g1".to_owned(),
+    });
+    assert_eq!(popup_key(&mut leave(), KeyCode::Char('y')), expect);
+    assert_eq!(popup_key(&mut leave(), KeyCode::Enter), expect);
+    assert_eq!(
+        popup_key(&mut leave(), KeyCode::Char('n')),
+        PopupAction::Dismiss
+    );
+    assert_eq!(popup_key(&mut leave(), KeyCode::Esc), PopupAction::Dismiss);
+    // A confirm ignores unrelated keys instead of acting on them.
+    assert_eq!(
+        popup_key(&mut leave(), KeyCode::Char('x')),
+        PopupAction::None
+    );
+}
+
+#[test]
+fn popup_key_card_dismisses_on_any_key() {
+    for key in [
+        KeyCode::Char('q'),
+        KeyCode::Char('j'),
+        KeyCode::Enter,
+        KeyCode::Esc,
+    ] {
+        assert_eq!(popup_key(&mut Popup::help(), key), PopupAction::Dismiss);
+    }
+}
+
+#[test]
+fn popup_key_invites_picker_navigates_accepts_and_declines() {
+    let items = vec![
+        PickerItem {
+            id: "g1".to_owned(),
+            label: "Room A".to_owned(),
+        },
+        PickerItem {
+            id: "g2".to_owned(),
+            label: "Room B".to_owned(),
+        },
+    ];
+    let picker = || Popup::Picker {
+        purpose: PickerPurpose::Invites,
+        title: "Pending Invites".to_owned(),
+        items: items.clone(),
+        selected: 0,
+    };
+    let mut accept = picker();
+    assert_eq!(popup_key(&mut accept, KeyCode::Down), PopupAction::None);
+    assert_eq!(
+        popup_key(&mut accept, KeyCode::Char('a')),
+        PopupAction::Submit(PopupSubmit::AcceptInvite {
+            group_id: "g2".to_owned(),
+        })
+    );
+    let mut decline = picker();
+    assert_eq!(
+        popup_key(&mut decline, KeyCode::Char('d')),
+        PopupAction::Submit(PopupSubmit::DeclineInvite {
+            group_id: "g1".to_owned(),
+        })
+    );
+    assert_eq!(popup_key(&mut decline, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
+fn leave_group_decision_covers_sole_admin_co_admin_and_non_admin() {
+    assert_eq!(
+        leave_group_decision(true, 1),
+        LeaveDecision::Blocked(LEAVE_SOLE_ADMIN_MESSAGE)
+    );
+    assert_eq!(
+        leave_group_decision(true, 3),
+        LeaveDecision::Blocked(LEAVE_CO_ADMIN_MESSAGE)
+    );
+    assert_eq!(leave_group_decision(false, 3), LeaveDecision::Confirm);
+    // The exact wn-tui messages, pinned so a reword is a deliberate change.
+    assert_eq!(
+        LEAVE_SOLE_ADMIN_MESSAGE,
+        "You're the only admin. Promote another member to admin before you can leave."
+    );
+    assert_eq!(
+        LEAVE_CO_ADMIN_MESSAGE,
+        "You're an admin of this group. Step down as admin before leaving."
+    );
+}
+
+#[test]
+fn build_group_detail_tags_admins_and_self() {
+    let members = vec![
+        ("aa".to_owned(), "npubself".to_owned()),
+        ("bb".to_owned(), "npubbob".to_owned()),
+    ];
+    let admins = vec!["aa".to_owned()];
+    let view = build_group_detail(
+        "g1",
+        "Ops",
+        "desc",
+        &members,
+        &admins,
+        &["wss://relay.example".to_owned()],
+        "aa",
+    );
+    assert!(view.members[0].is_admin && view.members[0].is_self);
+    assert!(!view.members[1].is_admin && !view.members[1].is_self);
+    assert!(view.account_is_admin);
+    assert_eq!(view.admin_count, 1);
+    assert_eq!(view.relays, vec!["wss://relay.example".to_owned()]);
+}
+
+#[test]
+fn group_detail_parsers_read_members_admins_relays_profile_and_invites() {
+    let result = serde_json::json!({
+        "members": [{"member_id": "aa", "npub": "npuba", "local": true}],
+        "admins": [{"admin_id": "aa", "npub": "npuba"}],
+        "relays": ["wss://relay.example", ""],
+        "profile": {"name": "Ops", "description": "the ops room"},
+    });
+    assert_eq!(
+        parse_group_members(&result),
+        vec![("aa".to_owned(), "npuba".to_owned())]
+    );
+    assert_eq!(parse_group_admins(&result), vec!["aa".to_owned()]);
+    // The empty relay string is filtered out.
+    assert_eq!(
+        parse_group_relays(&result),
+        vec!["wss://relay.example".to_owned()]
+    );
+    assert_eq!(
+        parse_group_profile(&result),
+        Some(("Ops".to_owned(), "the ops room".to_owned()))
+    );
+
+    let invites = serde_json::json!({
+        "invites": [
+            {"group_id": "g1", "profile": {"name": "Room A"}, "pending_confirmation": true},
+            {"group_id": "g2", "profile": {"name": "Room B"}, "pending_confirmation": false},
+        ]
+    });
+    assert_eq!(
+        parse_invite_items(&invites),
+        vec![PickerItem {
+            id: "g1".to_owned(),
+            label: "Room A".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn open_group_detail_loads_state_and_esc_returns_to_main() {
+    let self_id = "aa".repeat(32);
+    let bob_id = "bb".repeat(32);
+    let response = format!(
+        r#"{{"ok":true,"result":{{"profile":{{"name":"Ops","description":"ops room"}},"members":[{{"member_id":"{self_id}","npub":"npubself"}},{{"member_id":"{bob_id}","npub":"npubbob"}}],"admins":[{{"admin_id":"{self_id}","npub":"npubself"}}],"relays":["wss://relay.example"]}}}}"#
+    );
+    let (_tempdir, client) = test_json_client(&response);
+    let mut app = test_tui_app(client, &self_id);
+    app.focus = Focus::Chats;
+    app.chats = vec![ChatRow {
+        group_id: "cc".repeat(32),
+        name: "Ops".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    }];
+    app.selected_chat = 0;
+
+    app.handle_key(char_key('g')).expect("g opens group detail");
+
+    assert_eq!(app.screen, Screen::GroupDetail);
+    let view = app.group_detail.as_ref().expect("group detail loaded");
+    assert_eq!(view.members.len(), 2);
+    assert!(view.account_is_admin);
+    assert_eq!(view.admin_count, 1);
+    assert!(view.members[0].is_self);
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves group detail");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(
+        app.group_detail.is_none(),
+        "group-detail state is dropped on exit"
+    );
+}
+
+#[test]
+fn group_detail_leave_guard_blocks_admins_and_confirms_non_admins() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops".to_owned(),
+        description: String::new(),
+        members: Vec::new(),
+        relays: Vec::new(),
+        account_is_admin: true,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('L')).expect("L (sole admin)");
+    match &app.popup {
+        Some(Popup::Card { title, body }) => {
+            assert_eq!(title, CANNOT_LEAVE_TITLE);
+            assert_eq!(body[0], LEAVE_SOLE_ADMIN_MESSAGE);
+        }
+        other => panic!("expected sole-admin info card, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.group_detail.as_mut().unwrap().admin_count = 2;
+    app.handle_key(char_key('L')).expect("L (co-admin)");
+    match &app.popup {
+        Some(Popup::Card { body, .. }) => assert_eq!(body[0], LEAVE_CO_ADMIN_MESSAGE),
+        other => panic!("expected co-admin info card, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.group_detail.as_mut().unwrap().account_is_admin = false;
+    app.handle_key(char_key('L')).expect("L (non-admin)");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::LeaveGroup { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn group_detail_add_and_rename_open_text_popups_with_expected_prefill() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: String::new(),
+        members: vec![GroupMemberRow {
+            member_id: "bb".to_owned(),
+            npub: "npubbob".to_owned(),
+            is_admin: false,
+            is_self: false,
+        }],
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('A')).expect("A add member");
+    match &app.popup {
+        Some(Popup::Text { purpose, input, .. }) => {
+            assert_eq!(
+                *purpose,
+                TextPurpose::AddMemberByPubkey {
+                    group_id: "g1".to_owned()
+                }
+            );
+            assert!(input.is_empty(), "add-member starts empty");
+        }
+        other => panic!("expected add-member text popup, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.handle_key(char_key('R')).expect("R rename");
+    match &app.popup {
+        Some(Popup::Text { purpose, input, .. }) => {
+            assert_eq!(
+                *purpose,
+                TextPurpose::RenameGroup {
+                    group_id: "g1".to_owned()
+                }
+            );
+            assert_eq!(
+                input.value(),
+                "Ops Room",
+                "rename prefills the current name"
+            );
+        }
+        other => panic!("expected rename text popup, got {other:?}"),
+    }
+
+    app.popup = None;
+    app.handle_key(char_key('P')).expect("P promote");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::PromoteMember { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn question_mark_in_group_detail_opens_the_help_card() {
+    // `?` is bound to the help card on the group-detail screen too, so the same
+    // help is reachable there and not only from the main chat list.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: String::new(),
+        members: Vec::new(),
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('?')).expect("? in group detail");
+
+    assert!(
+        matches!(app.popup, Some(Popup::Card { .. })),
+        "'?' opens the help card on the group-detail screen"
+    );
+}
+
+#[test]
+fn promote_yourself_is_blocked_with_a_status_not_a_confirm() {
+    // Mirrors the remove-self guard: you cannot promote yourself, so `P` on your
+    // own row sets a status line instead of opening a confirm popup.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: String::new(),
+        members: vec![GroupMemberRow {
+            member_id: "aa".to_owned(),
+            npub: "npubme".to_owned(),
+            is_admin: false,
+            is_self: true,
+        }],
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('P')).expect("P promote self");
+
+    assert!(
+        app.popup.is_none(),
+        "promoting yourself opens no confirm popup"
+    );
+    assert!(
+        app.status.contains("promote yourself"),
+        "a clear status explains the block, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn popup_captures_keys_so_the_screen_behind_it_is_inert() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    app.chats = vec![
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "one".to_owned(),
+            archived: false,
+            projection: ChatProjection::default(),
+        },
+        ChatRow {
+            group_id: "g2".to_owned(),
+            name: "two".to_owned(),
+            archived: false,
+            projection: ChatProjection::default(),
+        },
+    ];
+    app.selected_chat = 0;
+    app.popup = Some(Popup::help());
+
+    app.handle_key(char_key('j')).expect("j under popup");
+
+    assert_eq!(
+        app.selected_chat, 0,
+        "the chat list behind the popup does not move"
+    );
+    assert!(
+        app.popup.is_none(),
+        "the dismiss-on-any-key card closed instead"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invites_picker_accept_closes_the_popup_once_the_last_invite_is_gone() {
+    let account_id = "aa".repeat(32);
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Invited Room"},"pending_confirmation":true}]}}"#;
+    let empty = r#"{"ok":true,"result":{"invites":[]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(one, empty);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    assert!(matches!(app.popup, Some(Popup::Picker { .. })));
+
+    app.handle_key(char_key('a')).expect("accept invite");
+    assert!(
+        app.popup.is_none(),
+        "the picker closes once the refreshed list is empty"
+    );
+    assert!(
+        app.status.contains("accepted invite"),
+        "status should confirm the accept, got {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invites_picker_decline_closes_the_popup_once_the_last_invite_is_gone() {
+    let account_id = "aa".repeat(32);
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Invited Room"},"pending_confirmation":true}]}}"#;
+    let empty = r#"{"ok":true,"result":{"invites":[]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(one, empty);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    app.handle_key(char_key('d')).expect("decline invite");
+
+    assert!(app.popup.is_none());
+    assert!(
+        app.status.contains("declined invite"),
+        "status should confirm the decline, got {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invites_picker_stays_open_after_accepting_one_of_several() {
+    // Accepting one invite refolds the refreshed list back into the still-open
+    // picker instead of closing after a single action.
+    let account_id = "aa".repeat(32);
+    let two = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Room D"},"pending_confirmation":true},{"group_id":"eeee","profile":{"name":"Room E"},"pending_confirmation":true}]}}"#;
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"eeee","profile":{"name":"Room E"},"pending_confirmation":true}]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(two, one);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    match &app.popup {
+        Some(Popup::Picker { items, .. }) => assert_eq!(items.len(), 2, "two invites shown"),
+        other => panic!("expected the invites picker, got {other:?}"),
+    }
+
+    app.handle_key(char_key('a'))
+        .expect("accept the first invite");
+
+    match &app.popup {
+        Some(Popup::Picker {
+            items, selected, ..
+        }) => {
+            assert_eq!(
+                items.len(),
+                1,
+                "the picker stays open with the remaining invite"
+            );
+            assert!(*selected < items.len(), "the selection is clamped in range");
+        }
+        other => panic!("expected the picker to stay open, got {other:?}"),
+    }
+    assert!(
+        app.status.contains("accepted invite"),
+        "status confirms the accept, got {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn accepting_an_invite_from_group_detail_returns_to_main() {
+    // Accepting via `I` from the group-detail screen leaves that (now stale)
+    // screen so the refreshed chat list and selection are visible.
+    let account_id = "aa".repeat(32);
+    let one = r#"{"ok":true,"result":{"invites":[{"group_id":"dddd","profile":{"name":"Invited Room"},"pending_confirmation":true}]}}"#;
+    let empty = r#"{"ok":true,"result":{"invites":[]}}"#;
+    let (_tempdir, client) = test_invites_seq_client(one, empty);
+    let mut app = test_tui_app(client, &account_id);
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g0".to_owned(),
+        name: "Old Room".to_owned(),
+        description: String::new(),
+        members: Vec::new(),
+        relays: Vec::new(),
+        account_is_admin: false,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    app.handle_key(char_key('I')).expect("I opens invites");
+    app.handle_key(char_key('a')).expect("accept invite");
+
+    assert_eq!(
+        app.screen,
+        Screen::Main,
+        "accepting returns to the main view"
+    );
+    assert!(
+        app.group_detail.is_none(),
+        "the stale group-detail view is cleared"
+    );
+    assert!(app.popup.is_none(), "the sole invite emptied the picker");
+}
+
+#[test]
+fn empty_invites_shows_an_info_card_not_a_picker() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"invites":[]}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Chats;
+
+    app.handle_key(char_key('I')).expect("I with no invites");
+
+    assert!(matches!(app.popup, Some(Popup::Card { .. })));
+}
+
+#[test]
+fn popup_overlay_frame_shows_title_body_and_hint() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.popup = Some(Popup::Confirm {
+        purpose: ConfirmPurpose::LeaveGroup {
+            group_id: "g1".to_owned(),
+        },
+        title: "Leave Group".to_owned(),
+        body: vec!["Leave ops-room?".to_owned()],
+    });
+
+    let rendered = rendered_buffer(&mut app);
+
+    assert!(rendered.contains("Leave Group"), "popup title present");
+    assert!(rendered.contains("Leave ops-room?"), "popup body present");
+    assert!(rendered.contains("[y] yes"), "popup hint present");
+}
+
+#[test]
+fn group_detail_frame_shows_members_with_badges_and_relays() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::GroupDetail;
+    app.group_detail = Some(GroupDetailView {
+        group_id: "g1".to_owned(),
+        name: "Ops Room".to_owned(),
+        description: "the ops".to_owned(),
+        members: vec![
+            GroupMemberRow {
+                member_id: "aa".to_owned(),
+                npub: "npubself".to_owned(),
+                is_admin: true,
+                is_self: true,
+            },
+            GroupMemberRow {
+                member_id: "bb".to_owned(),
+                npub: "npubbob".to_owned(),
+                is_admin: false,
+                is_self: false,
+            },
+        ],
+        relays: vec!["wss://relay.example".to_owned()],
+        account_is_admin: true,
+        admin_count: 1,
+        selected: 0,
+    });
+
+    let rendered = rendered_buffer(&mut app);
+
+    assert!(rendered.contains("Ops Room"), "group name present");
+    assert!(rendered.contains("npubself"), "member npub present");
+    assert!(rendered.contains("[admin]"), "admin badge present");
+    assert!(rendered.contains("(you)"), "self badge present");
+    assert!(rendered.contains("Relays"), "relay section present");
+    assert!(rendered.contains("relay.example"), "relay hint present");
 }
 
 #[test]
@@ -3883,16 +5544,19 @@ fn nsec_entry_accepts_masked_input_and_esc_returns_to_picker() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
     app.input.clear();
+    app.input.set_masked(true);
 
     for character in "nsec1secret".chars() {
         app.handle_key(char_key(character)).expect("char");
     }
-    assert_eq!(app.input, "nsec1secret");
-    assert_eq!(masked_secret(&app.input), "***********");
+    assert_eq!(app.input.value(), "nsec1secret");
+    // The field reuses the composer input's masked mode: it renders `*` per char,
+    // never the secret.
+    assert_eq!(app.input.display(), "***********");
 
     app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
         .expect("backspace");
-    assert_eq!(app.input, "nsec1secre");
+    assert_eq!(app.input.value(), "nsec1secre");
 
     // Esc clears the secret and returns to the picker (one account exists).
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -3906,7 +5570,8 @@ fn nsec_entry_esc_returns_to_the_menu_without_accounts() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.accounts.clear();
     app.screen = Screen::Login(LoginMode::NsecEntry);
-    app.input = "partial".to_owned();
+    app.input.set_value("partial");
+    app.input.set_masked(true);
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
         .expect("esc");
     assert!(app.input.is_empty());
@@ -3920,10 +5585,15 @@ fn nsec_entry_q_is_typed_not_a_quit() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
     app.input.clear();
+    app.input.set_masked(true);
 
     app.handle_key(char_key('q')).expect("q");
 
-    assert_eq!(app.input, "q", "q is entered into the masked nsec field");
+    assert_eq!(
+        app.input.value(),
+        "q",
+        "q is entered into the masked nsec field"
+    );
     assert!(app.running, "q must not quit during nsec entry");
 }
 
@@ -3931,7 +5601,8 @@ fn nsec_entry_q_is_typed_not_a_quit() {
 fn nsec_entry_empty_submit_reports_and_stays() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
-    app.input = "   ".to_owned();
+    app.input.set_value("   ");
+    app.input.set_masked(true);
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .expect("enter");
     assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
@@ -4048,6 +5719,7 @@ fn enter_opens_the_chat_and_focuses_messages() {
         group_id: group_id.clone(),
         name: "general".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     app.selected_chat = 0;
 
@@ -4161,6 +5833,7 @@ fn main_frame_shows_chats_and_messages_with_bars_and_toggled_diagnostics() {
         group_id: "bb".repeat(32),
         name: "ops-room".to_owned(),
         archived: false,
+        projection: ChatProjection::default(),
     }];
     let mut row = timeline_row("m0", 0);
     row.from_display_name = Some("Al".to_owned());
@@ -4177,10 +5850,7 @@ fn main_frame_shows_chats_and_messages_with_bars_and_toggled_diagnostics() {
         !rendered.contains("Accounts"),
         "the accounts pane is gone from the main view"
     );
-    assert!(
-        rendered.contains("j/k navigate"),
-        "chats hints line present"
-    );
+    assert!(rendered.contains("g detail"), "chats hints line present");
     assert!(rendered.contains("daemon"), "status bar present");
     assert!(
         !rendered.contains("Diagnostics"),
@@ -4223,7 +5893,8 @@ fn login_menu_frame_shows_options_and_hints() {
 fn nsec_entry_frame_masks_the_secret() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Login(LoginMode::NsecEntry);
-    app.input = "nsec1supersecret".to_owned();
+    app.input.set_value("nsec1supersecret");
+    app.input.set_masked(true);
 
     let rendered = rendered_buffer(&mut app);
     assert!(
@@ -4233,5 +5904,1434 @@ fn nsec_entry_frame_masks_the_secret() {
     assert!(
         rendered.contains("****"),
         "the field renders as mask characters"
+    );
+}
+
+// --- Phase 3: composer input model + editing ---
+
+#[test]
+fn input_inserts_deletes_and_moves_across_multibyte_chars() {
+    let mut input = Input::default();
+    for character in "café".chars() {
+        input.insert(character);
+    }
+    assert_eq!(input.value(), "café");
+    assert_eq!(input.cursor(), 4);
+
+    // Backspace removes the multi-byte 'é' as one char.
+    input.backspace();
+    assert_eq!(input.value(), "caf");
+    assert_eq!(input.cursor(), 3);
+
+    // Move left twice and insert mid-string.
+    input.left();
+    input.left();
+    assert_eq!(input.cursor(), 1);
+    input.insert('x');
+    assert_eq!(input.value(), "cxaf");
+    assert_eq!(input.cursor(), 2);
+
+    // Forward-delete removes the char at the cursor ('a').
+    input.delete();
+    assert_eq!(input.value(), "cxf");
+    assert_eq!(input.cursor(), 2);
+
+    // Cursor movement clamps at both ends; deletes at the edges are no-ops.
+    input.home();
+    assert_eq!(input.cursor(), 0);
+    input.left();
+    assert_eq!(input.cursor(), 0, "left clamps at the start");
+    input.backspace();
+    assert_eq!(input.value(), "cxf", "backspace at the start is a no-op");
+    input.end();
+    assert_eq!(input.cursor(), 3);
+    input.right();
+    assert_eq!(input.cursor(), 3, "right clamps at the end");
+    input.delete();
+    assert_eq!(input.value(), "cxf", "delete at the end is a no-op");
+}
+
+#[test]
+fn input_handles_astral_plane_characters_as_single_stops() {
+    let mut input = Input::default();
+    input.insert('a');
+    input.insert('😀'); // 4-byte UTF-8: one char, one cursor stop
+    input.insert('b');
+    assert_eq!(input.value(), "a😀b");
+    assert_eq!(input.cursor(), 3);
+
+    input.left(); // between 😀 and b
+    input.backspace(); // removes 😀 whole, not a broken byte
+    assert_eq!(input.value(), "ab");
+    assert_eq!(input.cursor(), 1);
+}
+
+#[test]
+fn input_insert_str_pastes_multibyte_and_multiline_at_the_cursor() {
+    let mut input = Input::default();
+    input.set_value("ac");
+    input.left(); // cursor between 'a' and 'c'
+    input.insert_str("b\nx"); // multi-line paste
+    assert_eq!(input.value(), "ab\nxc");
+    assert_eq!(
+        input.cursor(),
+        4,
+        "cursor advances by the pasted char count"
+    );
+
+    // Multi-byte paste advances by char count, not byte count.
+    let mut other = Input::default();
+    other.insert_str("héllo");
+    assert_eq!(other.cursor(), 5);
+}
+
+#[test]
+fn input_masked_display_hides_the_value_but_preserves_it() {
+    let mut input = Input::default();
+    input.set_value("nsec1secret");
+    assert_eq!(input.display(), "nsec1secret", "plain display by default");
+
+    input.set_masked(true);
+    assert_eq!(
+        input.display(),
+        "***********",
+        "masked renders one * per char"
+    );
+    assert_eq!(
+        input.value(),
+        "nsec1secret",
+        "the value is preserved under the mask"
+    );
+
+    // Multi-byte chars each mask to a single *.
+    let mut emoji = Input::default();
+    emoji.set_value("aé😀");
+    emoji.set_masked(true);
+    assert_eq!(emoji.display(), "***");
+}
+
+#[test]
+fn composer_height_grows_with_lines_and_clamps_between_three_and_eight() {
+    let mut input = Input::default();
+    // A single (empty) line is the 3-row minimum (1 content + 2 borders).
+    assert_eq!(composer_height(&input, true, false, 40), 3);
+
+    // More wrapped lines grow the composer.
+    input.set_value("a\nb\nc");
+    assert_eq!(composer_height(&input, true, false, 40), 5);
+
+    // A long single line wraps by width and grows the composer beyond one row.
+    input.set_value("x".repeat(100));
+    assert!(
+        composer_height(&input, false, false, 40) > 3,
+        "a wrapped long line grows the composer past the minimum"
+    );
+
+    // Beyond the clamp, height caps at 8.
+    input.set_value("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
+    assert_eq!(composer_height(&input, true, false, 40), 8);
+}
+
+#[test]
+fn composer_grows_with_content_and_renders_the_cursor_cell() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    // No selected chat row and no timeline selection, so the only black-on-white
+    // cell in the frame is the composer's cursor cell.
+    app.chats.clear();
+    app.timeline.clear();
+    app.input.set_value("line one\nline two\nTAILMARKER");
+
+    let backend = ratatui::backend::TestBackend::new(60, 24);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    let buffer = terminal.backend().buffer().clone();
+
+    let rendered = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    // A fixed 3-row composer would clip the tail; growth shows every pasted line.
+    assert!(
+        rendered.contains("TAILMARKER"),
+        "the grown composer shows every pasted line"
+    );
+    // The status bar still renders, so growth stole from the messages row, not the bars.
+    assert!(
+        rendered.contains("daemon"),
+        "the status bar survives composer growth"
+    );
+    // The focused composer draws a black-on-white cursor cell.
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|cell| cell.fg == Color::Black && cell.bg == Color::White),
+        "the focused composer renders the cursor cell"
+    );
+}
+
+/// Count the black-on-white cursor cells in a set of composer lines.
+fn cursor_cell_contents(lines: &[Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .filter(|span| span.style.fg == Some(Color::Black) && span.style.bg == Some(Color::White))
+        .map(|span| span.content.to_string())
+        .collect()
+}
+
+#[test]
+fn composer_cursor_cell_renders_at_display_end_when_redaction_shrinks_the_value() {
+    // nsec redaction shrinks the display (`/login nsec1…` -> `/login <hidden
+    // nsec>`), so the raw cursor at the end of the value lies beyond the display.
+    // The cursor must still render exactly one cell, clamped to the display end,
+    // instead of vanishing because no display segment holds the raw index.
+    let mut input = Input::default();
+    input.set_value("/login nsec1supersecretvalue");
+    input.end();
+
+    let lines = composer_lines(&input, true, false);
+    assert_eq!(
+        cursor_cell_contents(&lines),
+        vec![" ".to_owned()],
+        "exactly one cursor cell renders, a trailing space at the redacted display end"
+    );
+}
+
+#[test]
+fn composer_cursor_keeps_exact_placement_for_unredacted_input() {
+    // Normal input (display == value) keeps the cursor on the exact character.
+    let mut input = Input::default();
+    input.set_value("hello");
+    input.home();
+    input.right();
+
+    let lines = composer_lines(&input, true, false);
+    assert_eq!(
+        cursor_cell_contents(&lines),
+        vec!["e".to_owned()],
+        "the cursor cell sits on the exact char for unredacted input"
+    );
+}
+
+#[test]
+fn nsec_entry_reuses_masked_mode_and_clears_it_on_exit() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.accounts.clear();
+    app.screen = Screen::Login(LoginMode::Menu);
+
+    // `l` begins nsec entry with the shared input switched into masked mode.
+    app.handle_key(char_key('l')).expect("l");
+    assert_eq!(app.screen, Screen::Login(LoginMode::NsecEntry));
+    for character in "nsec1secret".chars() {
+        app.handle_key(char_key(character)).expect("char");
+    }
+    assert_eq!(
+        app.input.display(),
+        "***********",
+        "the nsec field reuses the input's masked mode"
+    );
+    assert_eq!(app.input.value(), "nsec1secret");
+
+    // Leaving nsec entry returns the shared input to plain composer mode.
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    app.input.set_value("hello");
+    assert_eq!(
+        app.input.display(),
+        "hello",
+        "the composer input is no longer masked after nsec entry"
+    );
+}
+
+// --- Phase 3: message interactions ---
+
+#[test]
+fn slash_command_parser_handles_message_interactions() {
+    assert_eq!(
+        parse_slash_command("/react"),
+        Ok(SlashCommand::React {
+            emoji: "+".to_owned()
+        }),
+        "a bare /react uses the default + emoji"
+    );
+    assert_eq!(
+        parse_slash_command("/react 🔥"),
+        Ok(SlashCommand::React {
+            emoji: "🔥".to_owned()
+        })
+    );
+    assert_eq!(parse_slash_command("/unreact"), Ok(SlashCommand::Unreact));
+    assert_eq!(parse_slash_command("/delete"), Ok(SlashCommand::Delete));
+    assert_eq!(
+        parse_slash_command("/retry evt123"),
+        Ok(SlashCommand::Retry {
+            event_id: "evt123".to_owned()
+        })
+    );
+
+    // Argument-shape errors surface to the status line instead of panicking.
+    assert!(parse_slash_command("/react a b").is_err());
+    assert!(parse_slash_command("/unreact x").is_err());
+    assert!(parse_slash_command("/delete x").is_err());
+    assert!(parse_slash_command("/retry").is_err());
+    assert!(parse_slash_command("/retry a b").is_err());
+}
+
+#[test]
+fn messages_r_prefills_the_react_command_in_the_composer() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+
+    app.handle_key(char_key('r')).expect("r");
+
+    assert_eq!(app.focus, Focus::Composer, "r focuses the composer");
+    assert_eq!(
+        app.input.value(),
+        "/react ",
+        "r prefills the react command so Enter sends the default +"
+    );
+}
+
+#[test]
+fn messages_d_prefills_the_delete_command_in_the_composer() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+
+    app.handle_key(char_key('d')).expect("d");
+
+    assert_eq!(app.focus, Focus::Composer, "d focuses the composer");
+    assert_eq!(
+        app.input.value(),
+        "/delete",
+        "d prefills /delete so Enter is the visible confirmation"
+    );
+}
+
+#[test]
+fn messages_r_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
+    // A draft typed in the composer survives Tab-cycling to Messages. Pressing
+    // `r` there must not silently overwrite it with `/react `; it leaves the
+    // draft intact and explains the suppression on the status line.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.input.set_value("half-written draft");
+
+    app.handle_key(char_key('r')).expect("r");
+
+    assert_eq!(
+        app.input.value(),
+        "half-written draft",
+        "r must not clobber an existing composer draft"
+    );
+    assert!(
+        app.status.contains("draft"),
+        "the status line explains why r/d was suppressed, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn messages_d_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.input.set_value("half-written draft");
+
+    app.handle_key(char_key('d')).expect("d");
+
+    assert_eq!(
+        app.input.value(),
+        "half-written draft",
+        "d must not clobber an existing composer draft"
+    );
+    assert!(
+        app.status.contains("draft"),
+        "the status line explains why r/d was suppressed, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn slash_command_parser_handles_reply() {
+    assert_eq!(
+        parse_slash_command("/reply hello there"),
+        Ok(SlashCommand::Reply {
+            text: "hello there".to_owned()
+        }),
+        "/reply joins the trailing words into the reply text"
+    );
+    assert_eq!(
+        parse_slash_command("/reply \"quoted body\""),
+        Ok(SlashCommand::Reply {
+            text: "quoted body".to_owned()
+        })
+    );
+    assert!(
+        parse_slash_command("/reply").is_err(),
+        "a bare /reply has no text to send"
+    );
+}
+
+#[test]
+fn reply_send_args_places_reply_to_flag_before_text() {
+    // The CLI send guard treats a `--reply-to` after the text as literal message
+    // text and rejects it, so the flag must precede the trailing text.
+    let args = reply_send_args("group-hex", "parent-id", "the reply body");
+    assert_eq!(
+        args,
+        vec![
+            "messages".to_owned(),
+            "send".to_owned(),
+            "--group".to_owned(),
+            "group-hex".to_owned(),
+            "--reply-to".to_owned(),
+            "parent-id".to_owned(),
+            "the reply body".to_owned(),
+        ]
+    );
+    let flag = args
+        .iter()
+        .position(|arg| arg == "--reply-to")
+        .expect("flag");
+    let text = args
+        .iter()
+        .position(|arg| arg == "the reply body")
+        .expect("text");
+    assert!(flag < text, "--reply-to must come before the trailing text");
+}
+
+#[test]
+fn messages_r_capital_prefills_reply_and_names_the_target_on_the_status_line() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Alice".to_owned());
+    row.display_text = "hello world".to_owned();
+    app.timeline = vec![row];
+
+    app.handle_key(char_key('R')).expect("R");
+
+    assert_eq!(app.focus, Focus::Composer, "R focuses the composer");
+    assert_eq!(
+        app.input.value(),
+        "/reply ",
+        "R prefills the reply command so typing then Enter sends"
+    );
+    assert_eq!(
+        app.status, "replying to Alice: \"hello world\"",
+        "R names the reply target on the status line"
+    );
+}
+
+#[test]
+fn messages_r_capital_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.input.set_value("half-written draft");
+    app.timeline = vec![timeline_row("m0", 0)];
+
+    app.handle_key(char_key('R')).expect("R");
+
+    assert_eq!(
+        app.input.value(),
+        "half-written draft",
+        "R must not clobber an existing composer draft"
+    );
+    assert!(
+        app.status.contains("draft"),
+        "the status line explains why R was suppressed, got {}",
+        app.status
+    );
+}
+
+#[test]
+fn reply_without_a_selected_message_errors_at_submit() {
+    // The target resolves at submit; an empty pane surfaces the same clear error
+    // the other interactions use, before any subprocess runs.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+
+    let error = app
+        .send_reply("no target".to_owned())
+        .expect_err("a reply with nothing selected is rejected");
+    assert!(
+        matches!(error, TuiError::Cli(message) if message.contains("no message selected")),
+        "expected a no-message-selected error"
+    );
+}
+
+#[test]
+fn reply_target_status_clips_long_text_and_strips_terminal_controls() {
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Bob".to_owned());
+    row.display_text = "0123456789012345678901234567890123".to_owned();
+    assert_eq!(
+        reply_target_status(&row),
+        "replying to Bob: \"012345678901234567890123456789...\"",
+        "the preview clips at 30 chars with an ellipsis"
+    );
+
+    row.from_display_name = Some("a\u{1b}\u{7}\u{202e}b".to_owned());
+    row.display_text = "safe".to_owned();
+    assert_eq!(
+        reply_target_status(&row),
+        "replying to ab: \"safe\"",
+        "terminal control sequences are stripped from the target preview"
+    );
+}
+
+#[test]
+fn message_accelerator_under_open_help_dismisses_the_card_and_does_not_act() {
+    // The help card is a modal: a message-accelerator key (`u`) under it is
+    // captured by the popup and dismisses the card instead of unreacting.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    app.popup = Some(Popup::help());
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+
+    app.handle_key(char_key('u')).expect("u");
+
+    assert!(app.popup.is_none(), "u under the help card dismisses it");
+}
+
+#[test]
+fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.focus = Focus::Messages;
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+    app.timeline = vec![timeline_row("m0", 0)];
+
+    app.handle_key(char_key('u')).expect("u");
+
+    assert_eq!(
+        app.focus,
+        Focus::Messages,
+        "u acts immediately; it never focuses the composer"
+    );
+    assert!(app.input.is_empty(), "u does not prefill the composer");
+    assert_eq!(app.status, "removed reaction");
+    assert_eq!(
+        app.timeline.len(),
+        1,
+        "no list reload on interaction success"
+    );
+}
+
+#[test]
+fn messages_u_without_a_selected_message_surfaces_a_status_error() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Messages;
+    // A resolvable group but an empty pane: nothing to unreact.
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+
+    app.handle_key(char_key('u')).expect("u");
+
+    assert_eq!(app.focus, Focus::Messages, "u never prefills the composer");
+    assert!(app.input.is_empty());
+    assert!(
+        app.status.contains("no message selected"),
+        "got {}",
+        app.status
+    );
+}
+
+#[test]
+fn delete_rejects_foreign_messages_before_shelling_out() {
+    // The row's `direction` makes the ownership check trivial, so a clear
+    // status-line error fires early instead of a CLI rejection. The client is
+    // unused: the early return means no subprocess runs.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.messages_account_id = Some("aa".repeat(32));
+    app.messages_group_id = Some("bb".repeat(32));
+    let mut foreign = timeline_row("m0", 0);
+    foreign.direction = "received".to_owned();
+    app.timeline = vec![foreign];
+
+    let error = app
+        .delete_selected_message()
+        .expect_err("foreign delete is rejected");
+    assert!(
+        matches!(error, TuiError::Cli(message) if message.contains("your own")),
+        "expected an own-messages-only error"
+    );
+}
+
+#[test]
+fn delete_allows_own_message_arriving_via_the_received_path() {
+    // Ownership must match render ownership: the renderer colors a row as yours
+    // when `timeline_row_is_self` holds, which also matches `from` against the
+    // loaded account id/npub/label. Your own message can arrive on the received
+    // path (a second device, a re-sync echo, projection upserts overwriting
+    // `direction`); it renders as yours and must therefore delete as yours,
+    // even though `direction` is not "sent".
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+    let mut own_via_received = timeline_row("m0", 0);
+    own_via_received.direction = "received".to_owned();
+    own_via_received.from = account_id.clone();
+    app.timeline = vec![own_via_received];
+
+    app.delete_selected_message()
+        .expect("an own message on the received path renders as yours and is deletable");
+    assert_eq!(app.status, "deleted message");
+}
+
+#[test]
+fn own_message_interactions_do_not_reload_the_timeline() {
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_json_client(r#"{"ok":true,"result":{"published":true}}"#);
+    let mut app = test_tui_app(client, &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+    let mut own = timeline_row("m0", 0);
+    own.direction = "sent".to_owned();
+    app.timeline = vec![own];
+
+    app.react_to_selected_message("+".to_owned())
+        .expect("react");
+    assert_eq!(app.status, "reacted +");
+    assert_eq!(app.timeline.len(), 1, "react does not reload the list");
+
+    app.delete_selected_message().expect("delete own");
+    assert_eq!(app.status, "deleted message");
+    assert_eq!(
+        app.timeline.len(),
+        1,
+        "delete does not reload the list; the projection tombstones the row"
+    );
+}
+
+#[test]
+fn reaction_projection_updates_the_selected_row_without_reloading() {
+    let mut rows = vec![timeline_row("m0", 0), timeline_row("m1", 1)];
+    let mut scroll = TimelineScroll {
+        selection: Some(1),
+        ..TimelineScroll::default()
+    };
+    let before_len = rows.len();
+
+    // A ReactionAdded projection change arrives as an upsert of the same row with
+    // the reaction already folded in (Phase 1 machinery). It updates in place.
+    let mut reacted = timeline_row("m1", 1);
+    reacted.reactions = vec![TimelineReaction {
+        emoji: "+".to_owned(),
+        count: 1,
+    }];
+    apply_timeline_event(
+        &mut rows,
+        &mut scroll,
+        Some("g"),
+        TimelineEvent::ProjectionUpdated {
+            group_id: "g".to_owned(),
+            changes: vec![TimelineChange::Upsert(Box::new(reacted))],
+        },
+    );
+
+    assert_eq!(
+        rows.len(),
+        before_len,
+        "no row appended: the fold is a reload-free upsert"
+    );
+    assert_eq!(
+        scroll.resolved_selection(rows.len()),
+        Some(1),
+        "the selection stays on the same row"
+    );
+    let selected = &rows[scroll.resolved_selection(rows.len()).unwrap()];
+    assert_eq!(selected.message_id, "m1");
+    assert_eq!(
+        selected.reactions,
+        vec![TimelineReaction {
+            emoji: "+".to_owned(),
+            count: 1,
+        }],
+        "the selected row shows the folded reaction without a list reload"
+    );
+}
+
+// --- Phase 3: bracketed-paste routing ---
+
+#[test]
+fn handle_paste_inserts_at_the_composer_cursor_and_normalizes_newlines() {
+    // A paste lands as literal characters at the cursor, with CRLF and lone CR
+    // normalized to `\n` so multi-line content keeps its line breaks without
+    // firing a send per line.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    app.input.set_value("ac");
+    app.input.left(); // cursor between 'a' and 'c'
+
+    app.handle_paste("X\r\nY\rZ".to_owned());
+
+    assert_eq!(
+        app.input.value(),
+        "aX\nY\nZc",
+        "paste inserts at the cursor with CRLF and lone CR normalized to \\n"
+    );
+    assert_eq!(
+        app.input.cursor(),
+        6,
+        "the cursor advances past the pasted text"
+    );
+}
+
+#[test]
+fn handle_paste_into_masked_nsec_entry_appends_and_stays_masked() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Login(LoginMode::NsecEntry);
+    app.input.set_masked(true);
+
+    app.handle_paste("nsec1pasted".to_owned());
+
+    assert_eq!(
+        app.input.value(),
+        "nsec1pasted",
+        "paste fills the nsec field"
+    );
+    assert_eq!(
+        app.input.display(),
+        "***********",
+        "the pasted nsec stays masked and never renders"
+    );
+}
+
+#[test]
+fn handle_paste_while_streaming_appends_to_pending_text_and_updates_status() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.streaming = Some(StreamComposer {
+        stream_id: "s1".to_owned(),
+        group_id: "bb".repeat(32),
+        pending_text: "typed".to_owned(),
+        last_flush: Instant::now(),
+    });
+
+    app.handle_paste("PASTED".to_owned());
+
+    let streaming = app.streaming.as_ref().expect("still streaming after paste");
+    assert_eq!(
+        streaming.pending_text, "typedPASTED",
+        "paste appends to the stream's pending text"
+    );
+    assert_eq!(
+        app.status, "queued 11 byte(s) on s1",
+        "paste updates the status line the same way typed chars do"
+    );
+    assert_eq!(
+        app.input.value(),
+        "PASTED",
+        "paste is also mirrored into the composer buffer"
+    );
+}
+
+#[test]
+fn handle_paste_is_ignored_on_the_login_menu_and_when_messages_focused() {
+    // The login menu accepts single-key choices, not text; paste is a no-op.
+    let mut menu = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    menu.screen = Screen::Login(LoginMode::Menu);
+    menu.handle_paste("ignored".to_owned());
+    assert!(menu.input.is_empty(), "paste is ignored on the login menu");
+
+    // The messages pane is not a text input; paste there is a no-op too.
+    let mut messages = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    messages.screen = Screen::Main;
+    messages.focus = Focus::Messages;
+    messages.handle_paste("ignored".to_owned());
+    assert!(
+        messages.input.is_empty(),
+        "paste is ignored when the messages pane is focused"
+    );
+}
+
+#[test]
+fn handle_paste_into_a_text_popup_lands_in_its_input_not_the_composer() {
+    // Pasting an npub into the Add Member text popup fills the popup's input,
+    // never the composer hidden behind it.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    app.popup = Some(Popup::Text {
+        purpose: TextPurpose::AddMemberByPubkey {
+            group_id: "g1".to_owned(),
+        },
+        title: "Add Member".to_owned(),
+        input: Input::default(),
+    });
+
+    app.handle_paste("npub1pasted".to_owned());
+
+    match &app.popup {
+        Some(Popup::Text { input, .. }) => {
+            assert_eq!(input.value(), "npub1pasted", "paste fills the popup input");
+        }
+        other => panic!("expected the text popup to stay open, got {other:?}"),
+    }
+    assert!(
+        app.input.is_empty(),
+        "the composer behind the popup stays untouched"
+    );
+}
+
+#[test]
+fn handle_paste_under_a_card_leaves_the_composer_untouched() {
+    // A dismiss-on-any-key card has no text field; a paste under it is swallowed
+    // and must not leak into the composer hidden behind it.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    app.input.set_value("draft");
+    app.popup = Some(Popup::help());
+
+    app.handle_paste("leaked".to_owned());
+
+    assert_eq!(
+        app.input.value(),
+        "draft",
+        "paste does not leak into the composer behind the card"
+    );
+    assert!(
+        matches!(app.popup, Some(Popup::Card { .. })),
+        "the card stays open"
+    );
+}
+
+#[test]
+fn composer_min_and_max_height_coexist_with_the_diagnostics_panel() {
+    // With the diagnostics panel toggled on, the composer still clamps to its
+    // 3..=8 range and the diagnostics panel plus the hints and status bars all
+    // keep rendering at both extremes (growth steals from the messages row only).
+    let render_with = |value: &str, expected_composer_rows: u16| {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.screen = Screen::Main;
+        app.focus = Focus::Composer;
+        app.show_diagnostics = true;
+        app.group_diagnostics = None; // renders "MLS no group selected"
+        app.chats.clear();
+        app.timeline.clear();
+        app.input.set_value(value);
+
+        assert_eq!(
+            composer_height(&app.input, true, false, 60 - 2),
+            expected_composer_rows,
+            "composer clamps to {expected_composer_rows} rows"
+        );
+
+        let backend = ratatui::backend::TestBackend::new(60, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Diagnostics"),
+            "the diagnostics panel renders at composer height {expected_composer_rows}"
+        );
+        assert!(
+            rendered.contains("MLS no group selected"),
+            "the diagnostics content renders alongside the composer"
+        );
+        assert!(
+            rendered.contains("daemon"),
+            "the status bar survives at composer height {expected_composer_rows}"
+        );
+    };
+
+    render_with("", 3);
+    render_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj", 8);
+}
+
+// ---- Phase 5b: user search, profile, and relay health screens ----
+
+/// A fake `wn` that appends each invocation's argv (space-joined, one line per
+/// call) to a sidecar file, so a test can assert a multi-call flow's commands.
+#[cfg(unix)]
+fn test_appending_arg_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exe = dir.join("wn-json");
+    let args_file = dir.join("recorded-args");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncat <<'JSON'\n{response}\nJSON\n",
+            args_file.display()
+        ),
+    )
+    .expect("write fake wn");
+    let mut permissions = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    (exe, args_file)
+}
+
+#[test]
+fn user_search_opens_from_s_and_esc_returns_to_main() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    // `s` opens the search screen without shelling out (there is no query to run).
+    app.handle_key(char_key('s')).expect("s opens user search");
+    assert_eq!(app.screen, Screen::UserSearch);
+    assert!(app.user_search.is_some());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves user search");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(app.user_search.is_none(), "search state dropped on exit");
+}
+
+#[test]
+fn profile_opens_from_p_and_esc_returns_to_main() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"npub":"npub1self","profile":{"name":"Al","display_name":"Alice"},"follows":[{"npub":"npub1bob"}]}}"#,
+    );
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('p')).expect("p opens profile");
+    assert_eq!(app.screen, Screen::Profile);
+    let view = app.profile_view.as_ref().expect("profile loaded");
+    assert_eq!(view.field_value(ProfileField::Name), Some("Al"));
+    assert_eq!(view.field_value(ProfileField::DisplayName), Some("Alice"));
+    assert_eq!(view.follows, vec!["npub1bob".to_owned()]);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves profile");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(app.profile_view.is_none());
+}
+
+#[test]
+fn relay_health_opens_from_h_and_esc_returns_to_main() {
+    let (_dir, client) =
+        test_json_client(r#"{"ok":true,"result":{"health":{"total_relays":2,"connected":2}}}"#);
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.focus = Focus::Chats;
+    app.handle_key(char_key('h')).expect("h opens relay health");
+    assert_eq!(app.screen, Screen::RelayHealth);
+    let view = app.relay_health.as_ref().expect("relay health loaded");
+    assert_eq!(view.data.total_relays, 2);
+    assert_eq!(view.data.connected, 2);
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc leaves relay health");
+    assert_eq!(app.screen, Screen::Main);
+    assert!(app.relay_health.is_none());
+}
+
+#[test]
+fn parse_user_search_results_reads_profile_and_match_attribution() {
+    let result = serde_json::json!({
+        "users": [
+            {"account_id_hex": "aa", "npub": "npubaa", "radius": 1, "matched_field": "name", "match_quality": "prefix", "profile": {"display_name": "Alice"}},
+            {"account_id_hex": "bb", "npub": "npubbb", "radius": 2, "matched_field": "npub", "match_quality": "contains"},
+        ]
+    });
+    let rows = parse_user_search_results(&result);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].display_label(), "Alice");
+    assert_eq!(rows[0].matched_field, "name");
+    assert_eq!(rows[0].match_quality, "prefix");
+    assert_eq!(rows[0].radius, 1);
+    // No display name/name falls back to a shortened npub.
+    assert_eq!(rows[1].display_label(), shorten("npubbb", 16));
+}
+
+#[test]
+fn user_search_runs_query_and_navigates_results() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"users":[{"account_id_hex":"aa","npub":"npubaa","radius":0,"matched_field":"name","match_quality":"exact","profile":{"display_name":"Alice"}},{"account_id_hex":"bb","npub":"npubbb","radius":1,"matched_field":"npub","match_quality":"prefix"}]}}"#,
+    );
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.open_user_search(None);
+    // Query focus: typed characters edit the query (j/k are literal text here).
+    for character in "ali".chars() {
+        app.handle_key(char_key(character)).expect("type query");
+    }
+    assert_eq!(app.user_search.as_ref().unwrap().query.value(), "ali");
+    // Enter runs the one-shot search and moves focus into the results.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("run search");
+    {
+        let view = app.user_search.as_ref().expect("search view");
+        assert_eq!(view.results.len(), 2);
+        assert_eq!(view.focus, UserSearchFocus::Results);
+        assert_eq!(view.selected, 0);
+    }
+    // Results focus: j/k navigate; k at the top returns to the query.
+    app.handle_key(char_key('j')).expect("j down");
+    assert_eq!(app.user_search.as_ref().unwrap().selected, 1);
+    app.handle_key(char_key('k')).expect("k up");
+    assert_eq!(app.user_search.as_ref().unwrap().selected, 0);
+    app.handle_key(char_key('k')).expect("k to query");
+    assert_eq!(
+        app.user_search.as_ref().unwrap().focus,
+        UserSearchFocus::Query
+    );
+}
+
+#[test]
+fn slash_users_query_runs_the_search_immediately() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"users":[{"account_id_hex":"aa","npub":"npubaa","radius":0,"matched_field":"name","match_quality":"exact"}]}}"#,
+    );
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.open_user_search(Some("alice".to_owned()));
+    let view = app.user_search.as_ref().expect("search view");
+    assert_eq!(view.query.value(), "alice");
+    assert_eq!(view.results.len(), 1);
+    assert_eq!(view.focus, UserSearchFocus::Results);
+}
+
+#[test]
+fn user_search_add_to_chat_is_guarded_on_no_loaded_chat() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    let view = UserSearchView {
+        results: vec![UserSearchResultRow {
+            pubkey: "aa".to_owned(),
+            npub: "npubaa".to_owned(),
+            display_name: Some("Alice".to_owned()),
+            matched_field: "name".to_owned(),
+            match_quality: "exact".to_owned(),
+            radius: 0,
+        }],
+        focus: UserSearchFocus::Results,
+        ..UserSearchView::default()
+    };
+    app.user_search = Some(view);
+    app.screen = Screen::UserSearch;
+    app.messages_group_id = None;
+
+    // No loaded chat: the add action is guarded to a status notice, no popup.
+    app.handle_key(char_key('a')).expect("a guarded");
+    assert!(app.popup.is_none(), "no popup without a loaded chat");
+    assert!(
+        app.status.contains("open a chat"),
+        "status explains the guard: {}",
+        app.status
+    );
+
+    // With a loaded chat: a confirm popup targets the open chat.
+    app.messages_group_id = Some("g1".to_owned());
+    app.handle_key(char_key('a')).expect("a add");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Confirm {
+            purpose: ConfirmPurpose::AddUserToChat { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn parse_profile_view_reads_fields_and_follows() {
+    let show = serde_json::json!({
+        "npub": "npub1self",
+        "profile": {"name": "al", "display_name": "Alice", "about": "hi", "picture": "https://x/y.png"}
+    });
+    let follows = serde_json::json!({"follows": [{"npub": "npub1bob"}, {"npub": "npub1carol"}]});
+    let view = parse_profile_view(&show, &follows);
+    assert_eq!(view.npub, "npub1self");
+    assert_eq!(view.field_value(ProfileField::DisplayName), Some("Alice"));
+    // Picture URLs are stored (and rendered) as literal text, never fetched.
+    assert_eq!(
+        view.field_value(ProfileField::Picture),
+        Some("https://x/y.png")
+    );
+    assert_eq!(view.field_value(ProfileField::Nip05), None);
+    assert_eq!(
+        view.follows,
+        vec!["npub1bob".to_owned(), "npub1carol".to_owned()]
+    );
+    // A single cursor spans the six fields then the follows.
+    assert_eq!(view.row_count(), 6 + 2);
+    assert_eq!(
+        view.selected_target(),
+        Some(ProfileTarget::Field(ProfileField::Name))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_edit_publishes_only_the_selected_field() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.screen = Screen::Profile;
+    let mut view = ProfileView {
+        npub: "npub1self".to_owned(),
+        ..ProfileView::default()
+    };
+    view.fields[1] = Some("Al".to_owned()); // display_name
+    view.selected = 1;
+    app.profile_view = Some(view);
+
+    // Enter opens the edit popup for the selected field, prefilled.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("open edit popup");
+    assert!(matches!(
+        app.popup,
+        Some(Popup::Text {
+            purpose: TextPurpose::EditProfileField {
+                field: ProfileField::DisplayName
+            },
+            ..
+        })
+    ));
+    // Enter submits the prefilled value, publishing only --display-name.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("submit edit");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line.contains("profile update --display-name Al")),
+        "expected a single-field update argv, got:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("--about") && !recorded.contains("--picture"),
+        "only the changed field is published:\n{recorded}"
+    );
+}
+
+#[test]
+fn parse_relay_health_reads_counters_histograms_and_per_relay() {
+    let snapshot = serde_json::json!({
+        "metrics": {"active_accounts": 1, "inbound_events_seen": 10, "inbound_events_delivered": 9, "publish_attempts": 4, "publish_successes": 3},
+        "delivery_spread": {
+            "observed": 5, "corroborated": 3, "single_source": 2,
+            "spread": {"buckets": [{"upper_bound_ms": 50, "count": 3}, {"upper_bound_ms": 200, "count": 1}], "overflow_count": 0},
+            "per_relay": [{"relay_index": 0, "delivered_first": 3, "delivered_later": 1}]
+        },
+        "sync": {
+            "tracked_subscriptions": 2, "synced_subscriptions": 2,
+            "first_event": {"buckets": [{"upper_bound_ms": 100, "count": 4}], "overflow_count": 0},
+            "eose": {"buckets": [{"upper_bound_ms": 300, "count": 2}], "overflow_count": 0},
+            "per_relay": [{"relay_index": 0, "first_event": {"buckets": [{"upper_bound_ms": 100, "count": 2}], "overflow_count": 0}, "eose": {"buckets": [{"upper_bound_ms": 300, "count": 1}], "overflow_count": 0}}]
+        },
+        "health": {"sdk_backed": true, "total_relays": 3, "connected": 2, "connecting": 0, "disconnected": 1, "connection_attempts": 5, "connection_successes": 4}
+    });
+    let data = parse_relay_health(&snapshot, true);
+    assert_eq!(data.inbound_seen, 10);
+    assert_eq!(data.total_relays, 3);
+    assert_eq!(data.connected, 2);
+    assert_eq!(data.observed, 5);
+    assert_eq!(data.spread_samples, 4);
+    // p50 of 4 samples: ceil(0.5*4)=2 falls in the first (<=50ms) bucket.
+    assert_eq!(data.spread_p50, "50ms");
+    // p99 of 4: ceil(0.99*4)=4 reaches the second (<=200ms) bucket.
+    assert_eq!(data.spread_p99, "200ms");
+    assert_eq!(data.first_event_p50, "100ms");
+    assert_eq!(data.eose_p50, "300ms");
+    assert_eq!(data.per_relay.len(), 1);
+    assert_eq!(data.per_relay[0].relay_index, 0);
+    assert_eq!(data.per_relay[0].first_deliverer, "75%"); // 3/(3+1)
+    assert_eq!(data.per_relay[0].first_event_p50, "100ms");
+}
+
+#[test]
+fn histogram_percentile_label_is_honest_about_empty_and_overflow() {
+    let empty = serde_json::json!({"buckets": [], "overflow_count": 0});
+    assert_eq!(histogram_percentile_label(&empty, 0.5), "n/a");
+    // A distribution dominated by the overflow region is wider than measured.
+    let overflowing =
+        serde_json::json!({"buckets": [{"upper_bound_ms": 100, "count": 1}], "overflow_count": 9});
+    assert_eq!(histogram_percentile_label(&overflowing, 0.99), ">100ms");
+}
+
+#[test]
+fn relay_health_render_never_shows_relay_urls() {
+    // Relay URLs injected into unexpected fields must never reach the rendered
+    // output (decision 3: redacted rows, opaque indices, no URLs).
+    let snapshot = serde_json::json!({
+        "metrics": {"active_accounts": 1, "relay_url": "wss://leak.example"},
+        "delivery_spread": {
+            "observed": 2, "url": "ws://leak.two",
+            "spread": {"buckets": [{"upper_bound_ms": 50, "count": 2}], "overflow_count": 0},
+            "per_relay": [{"relay_index": 0, "relay_url": "wss://leak.three", "delivered_first": 2, "delivered_later": 0}]
+        },
+        "sync": {"per_relay": [{"relay_index": 0, "endpoint": "wss://leak.four", "first_event": {"buckets": [], "overflow_count": 0}, "eose": {"buckets": [], "overflow_count": 0}}]},
+        "health": {"total_relays": 1, "url": "wss://leak.five"}
+    });
+    let data = parse_relay_health(&snapshot, false);
+    let rendered = relay_health_lines(&data)
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect::<String>();
+    assert!(!rendered.contains("ws://"), "no ws:// urls in:\n{rendered}");
+    assert!(
+        !rendered.contains("wss://"),
+        "no wss:// urls in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("relay#0"),
+        "per-relay row keyed by opaque index:\n{rendered}"
+    );
+}
+
+#[test]
+fn user_search_frame_shows_query_and_results() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::UserSearch;
+    let mut view = UserSearchView {
+        results: vec![UserSearchResultRow {
+            pubkey: "aa".to_owned(),
+            npub: "npubALICE".to_owned(),
+            display_name: Some("Alice".to_owned()),
+            matched_field: "name".to_owned(),
+            match_quality: "prefix".to_owned(),
+            radius: 1,
+        }],
+        focus: UserSearchFocus::Results,
+        ..UserSearchView::default()
+    };
+    view.query.set_value("alice");
+    app.user_search = Some(view);
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("User Search"), "screen title present");
+    assert!(rendered.contains("alice"), "query text present");
+    assert!(rendered.contains("Alice"), "result label present");
+    assert!(rendered.contains("prefix"), "match quality present");
+    assert!(rendered.contains("radius 1"), "radius present");
+}
+
+#[test]
+fn profile_frame_shows_fields_and_follows() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Profile;
+    let mut view = ProfileView {
+        npub: "npubSELF".to_owned(),
+        follows: vec!["npubBOB".to_owned()],
+        ..ProfileView::default()
+    };
+    view.fields[1] = Some("Alice".to_owned());
+    app.profile_view = Some(view);
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("Profile"), "screen title present");
+    assert!(rendered.contains("display name"), "field label present");
+    assert!(rendered.contains("Alice"), "field value present");
+    assert!(rendered.contains("Fields"), "fields section present");
+    assert!(rendered.contains("Follows"), "follows section present");
+    assert!(rendered.contains("npubBOB"), "follow present");
+    assert!(rendered.contains("(unset)"), "unset field rendered");
+}
+
+#[test]
+fn relay_health_frame_shows_redacted_summary_without_urls() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::RelayHealth;
+    let data = parse_relay_health(
+        &serde_json::json!({
+            "health": {"total_relays": 2, "connected": 2},
+            "delivery_spread": {"per_relay": [{"relay_index": 0, "delivered_first": 1, "delivered_later": 0}], "spread": {"buckets": [], "overflow_count": 0}}
+        }),
+        true,
+    );
+    app.relay_health = Some(RelayHealthView { data, scroll: 0 });
+
+    let rendered = rendered_buffer(&mut app);
+    assert!(rendered.contains("Relay Health"), "screen title present");
+    assert!(rendered.contains("health:"), "health summary present");
+    assert!(
+        rendered.contains("relay#0"),
+        "per-relay opaque index present"
+    );
+    assert!(
+        !rendered.contains("ws://") && !rendered.contains("wss://"),
+        "no relay urls in the frame:\n{rendered}"
+    );
+}
+
+#[test]
+fn slash_command_parser_handles_users_search() {
+    assert_eq!(
+        parse_slash_command("/users"),
+        Ok(SlashCommand::UsersSearch { query: None })
+    );
+    assert_eq!(
+        parse_slash_command("/users alice smith"),
+        Ok(SlashCommand::UsersSearch {
+            query: Some("alice smith".to_owned())
+        })
+    );
+}
+
+#[test]
+fn help_card_documents_the_new_screens() {
+    let help = help_card_lines().join("\n");
+    assert!(help.contains("s search"), "help mentions user search");
+    assert!(help.contains("p profile"), "help mentions profile");
+    assert!(help.contains("h relays"), "help mentions relay health");
+    assert!(help.contains("/users"), "help mentions the /users command");
+}
+
+#[cfg(unix)]
+#[test]
+fn follows_child_invocation_borrows_the_setup_relay_only_without_a_global_relay() {
+    // `follows add`/`profile update` require a relay; without a launch-time global
+    // `--relay` the TUI lends the first configured setup relay so the child does not
+    // hard-fail. `--relay` is a global clap flag, so a command-local position lands
+    // in the same slot the handler reads, and it is never appended twice.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_arg_recording_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+    let mut client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: vec!["wss://discovery".to_owned()],
+        default_account_relays: vec!["wss://default".to_owned()],
+        secret_store: None,
+        keychain_service: None,
+    };
+    let mut app = test_tui_app(client.clone(), &account_id);
+    app.follow_user("npub1bob").expect("follow");
+    let args: Vec<String> = std::fs::read_to_string(&args_file)
+        .expect("args file")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        args.windows(2)
+            .any(|window| window == ["--relay", "wss://default"]),
+        "follows add borrows the default account relay: {args:?}"
+    );
+
+    // No relay configured at all: nothing is fabricated, so the child still reaches
+    // the CLI's clear MissingRelay error naming the setup flags.
+    client.discovery_relays.clear();
+    client.default_account_relays.clear();
+    let mut app = test_tui_app(client, &account_id);
+    app.follow_user("npub1bob").expect("follow");
+    let recorded = std::fs::read_to_string(&args_file).expect("args file");
+    assert!(
+        !recorded.lines().any(|line| line == "--relay"),
+        "no relay is invented when none is configured: {recorded:?}"
+    );
+}
+
+#[test]
+fn relay_health_scroll_clamps_to_content_height() {
+    let snapshot = serde_json::json!({
+        "metrics": {"active_accounts": 1, "inbound_events_seen": 10, "inbound_events_delivered": 9},
+        "delivery_spread": {
+            "observed": 5, "corroborated": 3, "single_source": 2,
+            "per_relay": [{"relay_index": 0, "delivered_first": 3, "delivered_later": 1}]
+        },
+        "sync": {"tracked_subscriptions": 2, "synced_subscriptions": 2, "per_relay": [{"relay_index": 0}]},
+        "health": {"sdk_backed": true, "total_relays": 3, "connected": 2, "connecting": 0, "disconnected": 1}
+    });
+    let data = parse_relay_health(&snapshot, true);
+    let max_scroll = relay_health_lines(&data).len().saturating_sub(1) as u16;
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.relay_health = Some(RelayHealthView { data, scroll: 0 });
+    app.screen = Screen::RelayHealth;
+
+    // PageDown far past the end parks at the last content line, never beyond.
+    for _ in 0..64 {
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .expect("page down");
+    }
+    assert_eq!(app.relay_health.as_ref().unwrap().scroll, max_scroll);
+    // Scrolling back up still works from the clamped position.
+    app.handle_key(char_key('k')).expect("k up");
+    assert_eq!(
+        app.relay_health.as_ref().unwrap().scroll,
+        max_scroll.saturating_sub(1)
+    );
+}
+
+fn user_search_app_with_selected_result(client: WnClient) -> TuiApp {
+    let mut app = test_tui_app(client, &"aa".repeat(32));
+    app.user_search = Some(UserSearchView {
+        results: vec![UserSearchResultRow {
+            pubkey: "bb".to_owned(),
+            npub: "npubbb".to_owned(),
+            display_name: Some("Bob".to_owned()),
+            matched_field: "name".to_owned(),
+            match_quality: "exact".to_owned(),
+            radius: 0,
+        }],
+        focus: UserSearchFocus::Results,
+        ..UserSearchView::default()
+    });
+    app.screen = Screen::UserSearch;
+    app
+}
+
+#[test]
+fn new_chat_from_search_navigates_into_the_created_chat() {
+    let (_dir, client) = test_json_client(
+        r#"{"ok":true,"result":{"group_id":"abcd","chats":[{"group_id":"abcd","profile":{"name":"New Room"}}]}}"#,
+    );
+    let mut app = user_search_app_with_selected_result(client);
+    app.handle_key(char_key('c'))
+        .expect("c opens new-chat popup");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("submit new chat");
+    assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.selected_chat_row().map(|chat| chat.group_id.as_str()),
+        Some("abcd"),
+        "the new chat is selected"
+    );
+}
+
+#[test]
+fn add_to_open_chat_from_search_navigates_into_that_chat() {
+    let (_dir, client) = test_json_client(r#"{"ok":true,"result":{}}"#);
+    let mut app = user_search_app_with_selected_result(client);
+    app.chats = vec![
+        ChatRow {
+            group_id: "other".to_owned(),
+            name: "Other".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Open Room".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+    app.messages_group_id = Some("g1".to_owned());
+    app.handle_key(char_key('a'))
+        .expect("a opens add-to-chat popup");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("confirm add to chat");
+    assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.selected_chat_row().map(|chat| chat.group_id.as_str()),
+        Some("g1"),
+        "the affected chat is selected"
     );
 }

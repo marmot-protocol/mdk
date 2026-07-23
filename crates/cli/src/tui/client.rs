@@ -54,6 +54,20 @@ impl WnClient {
             .cloned()
     }
 
+    /// Append the first-run setup relay as a command-local `--relay` when no global
+    /// `--relay` already covers the child. `profile update` and `follows add|remove`
+    /// require a relay; `--relay` is a global clap flag, so this command-local
+    /// position lands in the same slot those handlers read. Mirrors
+    /// `account_setup_relay`'s only-when-absent rule, so a global relay is never
+    /// passed twice.
+    pub(crate) fn with_setup_relay(&self, mut args: Vec<String>) -> Vec<String> {
+        if let Some(relay) = self.account_setup_relay() {
+            args.push("--relay".to_owned());
+            args.push(relay);
+        }
+        args
+    }
+
     pub(crate) fn run_json<S>(&self, account: Option<&str>, args: &[S]) -> TuiResult<Value>
     where
         S: AsRef<str>,
@@ -172,6 +186,22 @@ pub(crate) fn media_upload_send_args(
     args
 }
 
+/// Build the argv for a reply send: `messages send --group <g> --reply-to <id>
+/// <text>`. The `--reply-to` flag must precede the trailing text; a `--reply-to`
+/// placed after the text is swallowed as literal message text and rejected by
+/// the CLI send guard (`reply_to_after_message_text`).
+pub(crate) fn reply_send_args(group_id: &str, reply_to: &str, text: &str) -> Vec<String> {
+    vec![
+        "messages".to_owned(),
+        "send".to_owned(),
+        "--group".to_owned(),
+        group_id.to_owned(),
+        "--reply-to".to_owned(),
+        reply_to.to_owned(),
+        text.to_owned(),
+    ]
+}
+
 pub(crate) fn spawn_subscription_reader(
     child: &mut Child,
     label: &'static str,
@@ -220,7 +250,9 @@ impl TuiApp {
     pub(crate) fn send_message(&mut self, text: String) -> TuiResult<()> {
         let account_id = self.message_account_id()?;
         let group_id = self.message_group_id()?;
-        let args = vec!["message", "send", &group_id, &text];
+        // Use the documented plural `messages` surface, matching the react /
+        // unreact / delete / retry interactions (`message` is a hidden alias).
+        let args = vec!["messages", "send", &group_id, &text];
         let result = self.client.run_json(Some(&account_id), &args)?;
         let status = publish_status("sent message", &result);
         if let Some(message_id) = result
@@ -255,6 +287,140 @@ impl TuiApp {
             self.refresh_messages()?;
         }
         self.status = status;
+        Ok(())
+    }
+
+    /// Send the composer text as a reply to the selected message
+    /// (`messages send --group <g> --reply-to <id> <text>`). The `--reply-to`
+    /// flag goes before the trailing text: the CLI send guard treats a
+    /// `--reply-to` that lands after the text as literal message text and rejects
+    /// it (`reply_to_after_message_text`). The target resolves here, at submit,
+    /// with the same clear error the other interactions use when nothing is
+    /// selected. No list refetch: mirrors `send_message`'s optimistic row, which
+    /// the timeline projection upserts over by id once the reply lands.
+    pub(crate) fn send_reply(&mut self, text: String) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let reply_to = self.selected_timeline_message_id()?;
+        let args = reply_send_args(&group_id, &reply_to, &text);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = self.client.run_json(Some(&account_id), &arg_refs)?;
+        let status = publish_status("sent reply", &result);
+        if let Some(message_id) = result
+            .get("message_ids")
+            .and_then(Value::as_array)
+            .and_then(|ids| ids.first())
+            .and_then(Value::as_str)
+        {
+            let now = unix_now_seconds();
+            let row = TimelineRow {
+                message_id: message_id.to_owned(),
+                direction: "sent".to_owned(),
+                from: account_id,
+                from_display_name: None,
+                plaintext: text.clone(),
+                display_text: text,
+                timeline_at: now,
+                received_at: now,
+                deleted: false,
+                reactions: Vec::new(),
+                reply: Some(TimelineReply {
+                    reply_to_message_id: reply_to,
+                    preview: None,
+                }),
+                attachments: Vec::new(),
+            };
+            if let TimelineFoldOutcome::Inserted(index) =
+                apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
+            {
+                self.timeline_scroll.on_insert(index, self.timeline.len());
+            }
+        } else {
+            self.refresh_messages()?;
+        }
+        self.status = status;
+        Ok(())
+    }
+
+    /// The message id of the currently selected timeline row. Errors when the
+    /// pane is empty (nothing to target), surfaced on the status line.
+    pub(crate) fn selected_timeline_message_id(&self) -> TuiResult<String> {
+        let index = self
+            .timeline_scroll
+            .resolved_selection(self.timeline.len())
+            .ok_or_else(|| TuiError::Cli("no message selected".to_owned()))?;
+        Ok(self.timeline[index].message_id.clone())
+    }
+
+    /// React to the selected message (`messages react <group> <id> [emoji]`). No
+    /// list refetch: the timeline projection subscription folds the reaction in
+    /// both directions, so success only updates the status line.
+    pub(crate) fn react_to_selected_message(&mut self, emoji: String) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let message_id = self.selected_timeline_message_id()?;
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "react", &group_id, &message_id, &emoji],
+        )?;
+        self.status = format!("reacted {emoji}");
+        Ok(())
+    }
+
+    /// Remove your own reaction from the selected message
+    /// (`messages unreact <group> <id>`). No list refetch (see `react_to_...`).
+    pub(crate) fn unreact_selected_message(&mut self) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let message_id = self.selected_timeline_message_id()?;
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "unreact", &group_id, &message_id],
+        )?;
+        self.status = "removed reaction".to_owned();
+        Ok(())
+    }
+
+    /// Delete the selected message (`messages delete <group> <id>`). Delete only
+    /// makes sense for your own messages; the row's `direction` makes the check
+    /// trivial, so a clear status-line error fires early instead of a CLI
+    /// rejection. No list refetch: the projection tombstones the row.
+    pub(crate) fn delete_selected_message(&mut self) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        let index = self
+            .timeline_scroll
+            .resolved_selection(self.timeline.len())
+            .ok_or_else(|| TuiError::Cli("no message selected".to_owned()))?;
+        // Gate on the same ownership predicate the renderer uses to color a row
+        // as yours, resolved against the loaded message account. A `direction`
+        // check alone diverges: an own message arriving on the received path (a
+        // second device, a re-sync echo) renders as yours but would be refused.
+        if !timeline_row_is_self(&self.timeline[index], self.message_account_row()) {
+            return Err(TuiError::Cli(
+                "can only delete your own messages".to_owned(),
+            ));
+        }
+        let message_id = self.timeline[index].message_id.clone();
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "delete", &group_id, &message_id],
+        )?;
+        self.status = "deleted message".to_owned();
+        Ok(())
+    }
+
+    /// Retry a failed outbound event (`messages retry <group> <event-id>`). The
+    /// event id is an explicit argument, not the selected row: timeline rows carry
+    /// no failed-send state to target from (documented in the README).
+    pub(crate) fn retry_message(&mut self, event_id: String) -> TuiResult<()> {
+        let account_id = self.message_account_id()?;
+        let group_id = self.message_group_id()?;
+        self.client.run_json(
+            Some(&account_id),
+            &["messages", "retry", &group_id, &event_id],
+        )?;
+        self.status = format!("retried {}", shorten(&event_id, 18));
         Ok(())
     }
 
@@ -353,7 +519,7 @@ impl TuiApp {
                 stream_id: stream_id.to_owned(),
                 author: "me".to_owned(),
                 status: "streaming".to_owned(),
-                text: self.input.clone(),
+                text: self.input.value().to_owned(),
                 error: None,
                 optimistic: true,
             },
@@ -501,17 +667,15 @@ impl TuiApp {
 
     pub(crate) fn update_profile_name(&mut self, name: String) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
-        let result = self.client.run_json(
-            Some(&account_id),
-            &[
-                "profile",
-                "update",
-                "--name",
-                &name,
-                "--display-name",
-                &name,
-            ],
-        )?;
+        let args = self.client.with_setup_relay(vec![
+            "profile".to_owned(),
+            "update".to_owned(),
+            "--name".to_owned(),
+            name.clone(),
+            "--display-name".to_owned(),
+            name.clone(),
+        ]);
+        let result = self.client.run_json(Some(&account_id), &args)?;
         self.refresh_accounts()?;
         let label = result
             .get("profile")
@@ -570,6 +734,376 @@ impl TuiApp {
         self.refresh_messages()?;
         self.status = status;
         Ok(())
+    }
+
+    /// Enter the group-detail screen for the selected chat, loading its data
+    /// (one-shot; no per-view subscriptions). A fresh selection starts at the top.
+    pub(crate) fn open_group_detail(&mut self) -> TuiResult<()> {
+        let group_id = self.require_selected_group()?;
+        self.group_detail = None;
+        self.load_group_detail(&group_id)?;
+        self.screen = Screen::GroupDetail;
+        self.status = "group detail".to_owned();
+        Ok(())
+    }
+
+    /// Load (or reload) the group-detail view: members with admin badges from
+    /// `groups members` + `groups admins`, relay hints from `groups relays`, and
+    /// name/description from `groups show`. The member selection is preserved and
+    /// clamped across reloads so a membership change never jumps the cursor.
+    pub(crate) fn load_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let members_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "members", group_id])?;
+        let admins_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "admins", group_id])?;
+        let relays_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "relays", group_id])?;
+        let show_result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "show", group_id])?;
+        let (name, description) = parse_group_profile(&show_result).unwrap_or_else(|| {
+            (
+                self.selected_chat_row()
+                    .map(|chat| chat.name.clone())
+                    .unwrap_or_default(),
+                String::new(),
+            )
+        });
+        let members = parse_group_members(&members_result);
+        let admins = parse_group_admins(&admins_result);
+        let relays = parse_group_relays(&relays_result);
+        let previous = self.group_detail.as_ref().map_or(0, |view| view.selected);
+        let mut view = build_group_detail(
+            group_id,
+            &name,
+            &description,
+            &members,
+            &admins,
+            &relays,
+            &account_id,
+        );
+        view.selected = previous.min(view.members.len().saturating_sub(1));
+        self.group_detail = Some(view);
+        Ok(())
+    }
+
+    fn reload_group_detail_if_active(&mut self, group_id: &str) -> TuiResult<()> {
+        if matches!(self.screen, Screen::GroupDetail) {
+            self.load_group_detail(group_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rename_group(&mut self, group_id: &str, name: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self.client.run_json(
+            Some(&account_id),
+            &["groups", "rename", group_id, name.as_str()],
+        )?;
+        let status = publish_status("renamed group", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.refresh_chats()?;
+        self.status = status;
+        Ok(())
+    }
+
+    pub(crate) fn add_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let mut args = vec![
+            "groups".to_owned(),
+            "add-members".to_owned(),
+            group_id.to_owned(),
+        ];
+        args.extend(unique_member_refs(vec![pubkey]));
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        let status = publish_status("added member(s)", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.status = status;
+        Ok(())
+    }
+
+    pub(crate) fn remove_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let mut args = vec![
+            "groups".to_owned(),
+            "remove-members".to_owned(),
+            group_id.to_owned(),
+        ];
+        args.extend(unique_member_refs(vec![pubkey]));
+        let result = self.client.run_json(Some(&account_id), &args)?;
+        let status = publish_status("removed member(s)", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.status = status;
+        Ok(())
+    }
+
+    pub(crate) fn promote_group_member(&mut self, group_id: &str, pubkey: String) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self.client.run_json(
+            Some(&account_id),
+            &["groups", "promote", group_id, pubkey.as_str()],
+        )?;
+        let status = publish_status("promoted admin", &result);
+        self.reload_group_detail_if_active(group_id)?;
+        self.status = status;
+        Ok(())
+    }
+
+    /// Leave the group and return to the main view. On success the chat is gone
+    /// from the list, so the group-detail state is dropped and the chats are
+    /// re-listed before the screen shows again.
+    pub(crate) fn leave_group(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "leave", group_id])?;
+        let status = publish_status("left group", &result);
+        self.leave_group_detail();
+        self.refresh_chats()?;
+        self.status = status;
+        Ok(())
+    }
+
+    /// Open the pending-invites list picker (`groups invites`). An empty result
+    /// shows an info card rather than an empty picker.
+    pub(crate) fn open_invites(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "invites"])?;
+        let items = parse_invite_items(&result);
+        self.popup = Some(if items.is_empty() {
+            Popup::info("Invites", "No pending invites.")
+        } else {
+            Popup::invites(items, 0)
+        });
+        Ok(())
+    }
+
+    /// After an accept/decline from the invites picker, re-read the pending
+    /// invites and refold the refreshed list back into the still-open picker,
+    /// clamping the selection so one action does not lose the user's place. An
+    /// empty result closes the picker; the accept/decline status already reports
+    /// the outcome.
+    pub(crate) fn refold_invites_picker(&mut self, prev_selected: usize) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["groups", "invites"])?;
+        let items = parse_invite_items(&result);
+        self.popup = match items.len() {
+            0 => None,
+            len => Some(Popup::invites(items, prev_selected.min(len - 1))),
+        };
+        Ok(())
+    }
+
+    /// Accept a pending invite, then refresh the chat list and select the newly
+    /// joined chat so it is immediately open. Accepting from the group-detail
+    /// screen returns to the main view: that screen shows the previously selected
+    /// group, which the refreshed list and selection have now moved past.
+    pub(crate) fn accept_invite(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        self.client
+            .run_json(Some(&account_id), &["groups", "accept", group_id])?;
+        self.refresh_chats()?;
+        self.select_chat_by_group_id(group_id)?;
+        if self.screen == Screen::GroupDetail {
+            self.leave_group_detail();
+        }
+        self.status = format!("accepted invite {}", shorten(group_id, 18));
+        Ok(())
+    }
+
+    pub(crate) fn decline_invite(&mut self, group_id: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        self.client
+            .run_json(Some(&account_id), &["groups", "decline", group_id])?;
+        self.refresh_chats()?;
+        self.status = format!("declined invite {}", shorten(group_id, 18));
+        Ok(())
+    }
+
+    // ---- Phase 5b: user search, profile, and relay health ----
+
+    /// Enter the user-search screen. A query (from `/users <query>`) runs
+    /// immediately; an empty open lands on the query field awaiting input.
+    pub(crate) fn open_user_search(&mut self, query: Option<String>) {
+        let mut view = UserSearchView::default();
+        if let Some(query) = query
+            .map(|query| query.trim().to_owned())
+            .filter(|q| !q.is_empty())
+        {
+            view.query.set_value(query);
+        }
+        let run_now = !view.query.is_empty();
+        self.user_search = Some(view);
+        self.screen = Screen::UserSearch;
+        self.status = "user search".to_owned();
+        if run_now && let Err(err) = self.run_user_search() {
+            self.status = format!("error: {err}");
+        }
+    }
+
+    /// Run the one-shot `users search <query>` at the default radius and fold the
+    /// results into the view. An empty query is a no-op with a status hint.
+    pub(crate) fn run_user_search(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let query = self
+            .user_search
+            .as_ref()
+            .map(|view| view.query.value().trim().to_owned())
+            .unwrap_or_default();
+        if query.is_empty() {
+            self.status = "type a query, then Enter to search".to_owned();
+            return Ok(());
+        }
+        let result = self
+            .client
+            .run_json(Some(&account_id), &["users", "search", &query])?;
+        let results = parse_user_search_results(&result);
+        let count = results.len();
+        if let Some(view) = self.user_search.as_mut() {
+            view.focus = if results.is_empty() {
+                UserSearchFocus::Query
+            } else {
+                UserSearchFocus::Results
+            };
+            view.results = results;
+            view.selected = 0;
+        }
+        self.status = format!("found {count} user(s)");
+        Ok(())
+    }
+
+    /// Open the dismiss-on-any-key profile card for the selected search result
+    /// (`users show <pubkey>`).
+    pub(crate) fn open_search_profile_card(&mut self) -> TuiResult<()> {
+        let Some(pubkey) = self
+            .user_search
+            .as_ref()
+            .and_then(UserSearchView::selected_result)
+            .map(|result| result.pubkey.clone())
+        else {
+            return Ok(());
+        };
+        let result = self.client.run_json(None, &["users", "show", &pubkey])?;
+        self.popup = Some(Popup::Card {
+            title: "Profile".to_owned(),
+            body: profile_card_lines(&result),
+        });
+        Ok(())
+    }
+
+    /// Enter the own-profile screen, loading fields (`profile show`) and follows
+    /// (`follows list`) as a one-shot read.
+    pub(crate) fn open_profile(&mut self) -> TuiResult<()> {
+        self.profile_view = None;
+        self.load_profile()?;
+        self.screen = Screen::Profile;
+        self.status = "profile".to_owned();
+        Ok(())
+    }
+
+    /// Load (or reload) the profile view, preserving and clamping the cursor so a
+    /// field edit or (un)follow never jumps the selection.
+    pub(crate) fn load_profile(&mut self) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let show = self
+            .client
+            .run_json(Some(&account_id), &["profile", "show"])?;
+        let follows = self
+            .client
+            .run_json(Some(&account_id), &["follows", "list"])?;
+        let previous = self.profile_view.as_ref().map_or(0, |view| view.selected);
+        let mut view = parse_profile_view(&show, &follows);
+        view.selected = previous.min(view.row_count().saturating_sub(1));
+        self.profile_view = Some(view);
+        Ok(())
+    }
+
+    /// Publish a single profile field (`profile update --<field> <value>`). The
+    /// CLI fetches the current profile and overlays only this flag, so the other
+    /// fields survive. Reloads the profile and account list on success.
+    pub(crate) fn update_profile_field(
+        &mut self,
+        field: ProfileField,
+        value: String,
+    ) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let args = self.client.with_setup_relay(vec![
+            "profile".to_owned(),
+            "update".to_owned(),
+            field.flag().to_owned(),
+            value,
+        ]);
+        self.client.run_json(Some(&account_id), &args)?;
+        self.load_profile()?;
+        self.refresh_accounts()?;
+        self.status = format!("updated {}", field.label());
+        Ok(())
+    }
+
+    pub(crate) fn follow_user(&mut self, pubkey: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let args = self.client.with_setup_relay(vec![
+            "follows".to_owned(),
+            "add".to_owned(),
+            pubkey.to_owned(),
+        ]);
+        self.client.run_json(Some(&account_id), &args)?;
+        self.reload_follows()?;
+        self.status = format!("followed {}", shorten(pubkey, 18));
+        Ok(())
+    }
+
+    pub(crate) fn unfollow_user(&mut self, pubkey: &str) -> TuiResult<()> {
+        let account_id = self.require_selected_local_account()?;
+        let args = self.client.with_setup_relay(vec![
+            "follows".to_owned(),
+            "remove".to_owned(),
+            pubkey.to_owned(),
+        ]);
+        self.client.run_json(Some(&account_id), &args)?;
+        self.reload_follows()?;
+        self.status = format!("unfollowed {}", shorten(pubkey, 18));
+        Ok(())
+    }
+
+    fn reload_follows(&mut self) -> TuiResult<()> {
+        if self.profile_view.is_some() {
+            self.load_profile()?;
+        }
+        Ok(())
+    }
+
+    /// Enter the relay-health screen, loading the redacted `relay-stats` snapshot.
+    /// `relay-stats` reads the live `wnd` runtime when a socket exists and falls
+    /// back to a fresh in-process read otherwise, so it always returns a snapshot.
+    pub(crate) fn open_relay_health(&mut self) -> TuiResult<()> {
+        let data = self.load_relay_health()?;
+        self.relay_health = Some(RelayHealthView { data, scroll: 0 });
+        self.screen = Screen::RelayHealth;
+        self.status = "relay health".to_owned();
+        Ok(())
+    }
+
+    /// Re-read `relay-stats`, preserving the scroll offset.
+    pub(crate) fn refresh_relay_health(&mut self) -> TuiResult<()> {
+        let data = self.load_relay_health()?;
+        let scroll = self.relay_health.as_ref().map_or(0, |view| view.scroll);
+        self.relay_health = Some(RelayHealthView { data, scroll });
+        self.status = "refreshed relay health".to_owned();
+        Ok(())
+    }
+
+    fn load_relay_health(&mut self) -> TuiResult<RelayHealthData> {
+        let result = self.client.run_json(None, &["relay-stats"])?;
+        Ok(parse_relay_health(&result, self.daemon.running))
     }
 
     pub(crate) fn update_selected_chat(
@@ -830,6 +1364,7 @@ impl TuiApp {
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
         self.ensure_selected_timeline_subscription();
+        self.ensure_selected_notification_subscription();
         Ok(())
     }
 
@@ -844,6 +1379,7 @@ impl TuiApp {
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
         self.ensure_selected_timeline_subscription();
+        self.ensure_selected_notification_subscription();
         self.status = daemon_status_sentence(&self.daemon);
         Ok(())
     }
@@ -855,6 +1391,7 @@ impl TuiApp {
         self.message_subscription = None;
         self.group_state_subscription = None;
         self.timeline_subscription = None;
+        self.notification_subscription = None;
         self.status = "daemon stopped".to_owned();
         Ok(())
     }
@@ -881,10 +1418,10 @@ impl TuiApp {
             self.clear_timeline_pane();
             self.messages_account_id = None;
             self.messages_group_id = None;
-            self.unread_counts.clear();
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
+            self.notification_subscription = None;
             self.group_diagnostics = None;
             self.status = "no identities yet; create one from the login screen".to_owned();
         }
@@ -908,6 +1445,7 @@ impl TuiApp {
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
+            self.notification_subscription = None;
             self.group_diagnostics = None;
             self.status = "no account selected".to_owned();
             return Ok(());
@@ -920,6 +1458,7 @@ impl TuiApp {
             self.chat_subscription = None;
             self.message_subscription = None;
             self.group_state_subscription = None;
+            self.notification_subscription = None;
             self.group_diagnostics = None;
             self.status =
                 "selected account is public-only; choose a local signing account".to_owned();
@@ -937,11 +1476,14 @@ impl TuiApp {
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
             .unwrap_or_default();
-        retain_unread_counts_for_chats(&mut self.unread_counts, &self.chats);
+        sort_chats_by_activity(&mut self.chats);
         self.selected_chat =
             selected_chat_index(&self.chats, previous_group_id.as_deref()).unwrap_or(0);
         if let Err(err) = self.ensure_chat_subscription(&account.account_id) {
             self.status = format!("chat subscription failed: {err}");
+        }
+        if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
+            self.status = format!("notification subscription failed: {err}");
         }
         if self.chats.is_empty() {
             self.clear_timeline_pane();
@@ -981,7 +1523,6 @@ impl TuiApp {
         };
         self.messages_account_id = Some(account_id.clone());
         self.messages_group_id = Some(group_id.clone());
-        self.unread_counts.remove(&group_id);
         // Establish all three subscriptions regardless of any one's outcome. The
         // timeline feed drives the pane's live updates and its `ensure_*` also
         // kills a stale prior-group child, so a failed plain feed must not skip
@@ -1013,10 +1554,73 @@ impl TuiApp {
         } else {
             self.refresh_group_diagnostics(&account_id, &group_id);
         }
+        // Opening a chat clears its badge immediately: mark it read and fold the
+        // returned projection into the row rather than waiting for a push (the
+        // chats feed does not emit one after a local mark-read). A failure leaves
+        // the badge untouched — never zeroed locally — and surfaces on the status
+        // line behind any subscription error.
+        let mark_read_error = self
+            .mark_selected_chat_read(&account_id, &group_id)
+            .err()
+            .map(|err| format!("mark-read failed: {err}"));
         self.status = message_subscription_error
             .or(timeline_subscription_error)
             .or(group_state_subscription_error)
+            .or(mark_read_error)
             .unwrap_or_else(|| format!("loaded {} message(s)", self.timeline.len()));
+        Ok(())
+    }
+
+    /// Mark the loaded chat read up to its newest message and fold the refreshed
+    /// projection into its row, clearing the badge without waiting for a push.
+    /// The runtime read marker is forward-only, so re-marking is idempotent. On
+    /// failure the badge is left honest (never zeroed locally) and the error is
+    /// returned for the status line.
+    pub(crate) fn mark_selected_chat_read(
+        &mut self,
+        account_id: &str,
+        group_id: &str,
+    ) -> TuiResult<()> {
+        let result = self
+            .client
+            .run_json(Some(account_id), &["chats", "mark-read", group_id])?;
+        fold_chat_projection(
+            &mut self.chats,
+            &mut self.selected_chat,
+            group_id,
+            parse_chat_projection(&result),
+        );
+        Ok(())
+    }
+
+    /// Background chats re-list for ambient state: re-read `chats list` and
+    /// refresh each row's projection (unread + last-message) while preserving the
+    /// messages pane, its subscriptions, and the highlighted chat by group id.
+    /// Unlike `refresh_chats` this never reloads the timeline or resets
+    /// subscriptions; it is the debounced response to a notification for a
+    /// non-selected chat. Silent on success (ambient), so it never clobbers the
+    /// status line.
+    pub(crate) fn relist_chats(&mut self) -> TuiResult<()> {
+        let Some(account) = self.selected_account_row().cloned() else {
+            return Ok(());
+        };
+        if !account.local_signing {
+            return Ok(());
+        }
+        let previous_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
+        let mut args = vec!["chats".to_owned(), "list".to_owned()];
+        if self.show_archived_chats {
+            args.push("--include-archived".to_owned());
+        }
+        let result = self.client.run_json(Some(&account.account_id), &args)?;
+        self.chats = result
+            .get("chats")
+            .and_then(Value::as_array)
+            .map(|chats| chats.iter().filter_map(parse_chat).collect())
+            .unwrap_or_default();
+        sort_chats_by_activity(&mut self.chats);
+        self.selected_chat = selected_chat_index(&self.chats, previous_group_id.as_deref())
+            .unwrap_or_else(|| self.selected_chat.min(self.chats.len().saturating_sub(1)));
         Ok(())
     }
 
@@ -1209,6 +1813,35 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Keep the runtime-wide notification subscription alive for `account_id`.
+    /// Account-keyed (not per group) like the message feed, and daemon-only: with
+    /// no daemon it is dropped. Idempotent — a live child for the same account is
+    /// left in place. Same keyed re-spawn / Drop lifecycle as the other feeds.
+    pub(crate) fn ensure_notification_subscription(&mut self, account_id: &str) -> TuiResult<()> {
+        if !self.daemon.running {
+            self.notification_subscription = None;
+            return Ok(());
+        }
+        if self
+            .notification_subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.account_id == account_id)
+        {
+            return Ok(());
+        }
+
+        self.notification_subscription = None;
+        let args = notification_subscription_args();
+        let mut child = self.client.spawn_json_lines(Some(account_id), &args)?;
+        let rx = spawn_subscription_reader(&mut child, "notification")?;
+        self.notification_subscription = Some(NotificationSubscription {
+            account_id: account_id.to_owned(),
+            child,
+            rx,
+        });
+        Ok(())
+    }
+
     /// Clear the messages pane: drop the loaded timeline rows, reset the scroll
     /// model to its pinned default, and stop the per-group timeline subscription.
     pub(crate) fn clear_timeline_pane(&mut self) {
@@ -1279,12 +1912,29 @@ impl TuiApp {
         }
     }
 
+    /// Re-establish the runtime-wide notification subscription for the selected
+    /// local signing account, dropping it for no account or a public-only one.
+    /// Mirrors `ensure_selected_message_subscription`; both are account-wide.
+    pub(crate) fn ensure_selected_notification_subscription(&mut self) {
+        let Some(account) = self.selected_account_row().cloned() else {
+            self.notification_subscription = None;
+            return;
+        };
+        if !account.local_signing {
+            self.notification_subscription = None;
+            return;
+        }
+        if let Err(err) = self.ensure_notification_subscription(&account.account_id) {
+            self.status = format!("notification subscription failed: {err}");
+        }
+    }
+
     /// Assign a status produced by a background drain, but only while the main
     /// view is showing. On the login/account-select screen the status line
     /// carries the nsec prompt and picker guidance; a live drain (a picker
     /// reached via `A` keeps its subscriptions running) must apply its state
     /// changes without clobbering that prompt.
-    fn set_drain_status(&mut self, status: String) {
+    pub(crate) fn set_drain_status(&mut self, status: String) {
         if self.screen == Screen::Main {
             self.status = status;
         }
@@ -1422,13 +2072,13 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
-                    let loaded_group_id = self.messages_group_id.clone();
-                    if let Some(status) = apply_tui_subscription_result(
-                        &mut self.live_stream_previews,
-                        &mut self.unread_counts,
-                        loaded_group_id.as_deref(),
-                        &result,
-                    ) {
+                    // The plain feed drives only QUIC stream previews now (unread
+                    // is runtime-backed). Skip initial replays, then apply preview
+                    // updates; no local counting happens here.
+                    if !is_initial_subscription_result(&result)
+                        && let Some(status) =
+                            apply_subscription_result(&mut self.live_stream_previews, &result)
+                    {
                         self.set_drain_status(status);
                     }
                 }
@@ -1466,6 +2116,27 @@ impl TuiApp {
         for event in events {
             match event {
                 SubscriptionEvent::Result(result) => {
+                    // The timeline feed is the live source for the loaded chat's
+                    // badge and preview: fold its `chat_list_row` into that chat's
+                    // row (the chats feed does not push these), then drive the pane.
+                    if let Some((group_id, projection)) = timeline_chat_list_row(&result) {
+                        // Viewing is reading: if the imported count for the
+                        // viewed chat is nonzero, schedule a mark-read so the
+                        // badge clears instead of re-accruing as we read.
+                        if should_mark_loaded_chat_read(
+                            loaded_group_id.as_deref(),
+                            &group_id,
+                            &projection,
+                        ) {
+                            self.pending_mark_read = true;
+                        }
+                        fold_chat_projection(
+                            &mut self.chats,
+                            &mut self.selected_chat,
+                            &group_id,
+                            projection,
+                        );
+                    }
                     apply_timeline_event(
                         &mut self.timeline,
                         &mut self.timeline_scroll,
@@ -1478,6 +2149,66 @@ impl TuiApp {
                 }
                 SubscriptionEvent::Ended => {
                     self.timeline_subscription = None;
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    /// Drain the runtime-wide notification feed. Each event folds through the
+    /// pure `apply_notification_event` reducer, which deduplicates by
+    /// `notification_key`: a NewMessage for a non-loaded chat sets the debounce
+    /// flag (tick coalesces to one re-list), a GroupInvite surfaces a status
+    /// notice, and everything else is ignored.
+    pub(crate) fn drain_notification_subscription(&mut self) -> bool {
+        let Some(subscription) = self.notification_subscription.as_ref() else {
+            return false;
+        };
+        // The feed is runtime-wide, so it carries every local account's events;
+        // filter by the envelope account against the account this subscription
+        // was opened for before acting on any of them.
+        let subscription_account_id = subscription.account_id.clone();
+        let mut events = Vec::new();
+        loop {
+            match subscription.rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    events.push(SubscriptionEvent::Ended);
+                    break;
+                }
+            }
+        }
+        if events.is_empty() {
+            return false;
+        }
+        let loaded_group_id = self.messages_group_id.clone();
+        for event in events {
+            match event {
+                SubscriptionEvent::Result(result) => {
+                    // Drop another account's notification before it can insert a
+                    // dedup key, arm a re-list, or surface a notice on this
+                    // account's status line.
+                    if notification_event_account(&result)
+                        .is_some_and(|account| account != subscription_account_id)
+                    {
+                        continue;
+                    }
+                    if let NotificationOutcome::Invite(notice) = apply_notification_event(
+                        &mut self.seen_notification_keys,
+                        &mut self.pending_chat_relist,
+                        loaded_group_id.as_deref(),
+                        parse_notification_event(&result),
+                    ) {
+                        self.set_drain_status(notice);
+                    }
+                }
+                SubscriptionEvent::Error(err) => {
+                    self.set_drain_status(format!("notification subscription failed: {err}"));
+                }
+                SubscriptionEvent::Ended => {
+                    self.notification_subscription = None;
                     break;
                 }
             }

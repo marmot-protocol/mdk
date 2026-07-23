@@ -174,7 +174,35 @@ wn --account <npub-or-hex> chats unarchive <group-hex>
 wn --account <npub-or-hex> chats mute <group-hex> 1h
 wn --account <npub-or-hex> chats mute <group-hex> forever
 wn --account <npub-or-hex> chats unmute <group-hex>
+wn --account <npub-or-hex> chats mark-read <group-hex>
+wn --account <npub-or-hex> chats mark-read <group-hex> <message-id-hex>
 ```
+
+Each `chats list`, `chats list-archived`, and `chats subscribe`/`subscribe-archived` row carries the group
+record plus a per-chat projection so a chat list can render unread badges and a last-message preview without a
+second query: `unread_count` (number), `has_unread` (bool), `last_message` (the last chat message as
+`{ message_id_hex, sender, sender_display_name, plaintext, kind, timeline_at, deleted }`, or `null`), and the
+`last_read_message_id_hex` / `last_read_timeline_at` read marker (either may be `null`). These keys use the same
+names and `last_message` shape as the `chat_list_row` object on the `messages timeline subscribe` feed, so both
+feeds agree. A chat with no messages or reads yet reports empty defaults (`0` / `false` / `null`) rather than
+omitting the keys.
+
+On the `chats subscribe`/`subscribe-archived` feeds these projection keys refresh only when the feed emits a
+row, and the feed emits on group-state changes (create, rename, archive/unarchive, membership) — not on every
+new message or read. So the unread count and last-message preview on a subscribed row are a point-in-time
+snapshot taken at the last group-state emit, and live unread/last-message deltas ride the
+`messages timeline subscribe` feed's `chat_list_row` object instead. `chats mark-read` returns the refreshed
+projection directly in its own response.
+
+`chats mark-read <group-hex> [<message-id-hex>]` advances the chat's read marker and clears its unread count.
+With no message id it marks the newest message read (the "clear on chat open" case); with an explicit message id
+it marks read up to that message. The read marker is a forward-only high-water mark, so marking an older message
+leaves any newer ones unread and re-marking never moves it backward; an empty chat is a no-op success. A
+`<message-id-hex>` that is not a kind-9 chat message in the chat — foreign, non-existent, or a different event
+kind — likewise leaves the marker untouched and returns the current projection as success, the same silent
+contract as `messages react`/`delete` with unknown ids. It returns
+`account_id`, `npub`, `group_id`, and the same five projection keys as the `chats list` rows
+(`unread_count`, `has_unread`, `last_message`, `last_read_message_id_hex`, `last_read_timeline_at`).
 
 Group commands:
 
@@ -462,8 +490,9 @@ real time.
 
 `wn tui` is a Ratatui interface over the real `wn --json` command surface. It opens on a login screen when it has
 no single obvious account, then drops into a chat-first main view: the chat list on the left, the materialized
-message timeline on the right (with reactions, reply context, deletion tombstones, and `[img name]`/`[file name]`
-media placeholders), the composer below them, and a one-line hints bar plus a one-line status bar at the bottom.
+message timeline on the right (with reactions, reply context, deletion tombstones, and inline images on graphics-capable
+terminals with `[img name]`/`[file name]` placeholders otherwise), the composer below them, and a one-line hints bar
+plus a one-line status bar at the bottom.
 
 ```sh
 wn tui
@@ -500,16 +529,95 @@ Login screen controls:
 Main view controls:
 
 - `Tab`/`BackTab`: cycle the chat list, messages, and composer.
-- Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `A` reopens the
-  account picker.
+- Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `g` opens the
+  group-detail screen for the selected chat; `s` opens user search; `p` opens your profile; `h` opens the relay-health
+  screen; `I` opens the pending-invites picker; `A` reopens the
+  account picker. Each row shows an unread badge (bold name plus `(N)`) and a dark-gray last-message preview (sender
+  plus truncated text), and the list orders by last activity, newest first. The badge and the status bar's unread
+  total come from the runtime's per-chat projection (`chats list`), so they survive a restart rather than being
+  counted in the TUI. Opening a chat clears its badge immediately (via `chats mark-read`); a chat you are viewing
+  updates its badge and preview live from the timeline feed, and other chats refresh from a background
+  `notifications subscribe` feed (a debounced `chats list` re-read on each new message elsewhere). A group invite
+  surfaces as a one-line status notice that prompts `I` to open the invites picker. A background refresh never moves the highlight off the chat you have
+  selected. These ambient updates require a running `wnd`: without a daemon, off-screen badges and previews
+  update only when you manually refresh (`/refresh`) or re-open the chat. The badge and unread total still
+  survive a restart either way, since they come from the runtime's durable `chats list` projection.
 - Messages: `j`/`k` or arrows move the message selection; `PageUp`/`PageDown` page; `G`/`End` jump to the newest
   message (and pin to the bottom), `g`/`Home` to the oldest. New messages stay pinned to the bottom while you are at
   the newest message and hold your position when you have scrolled up. Scrolling past the oldest loaded message loads
   the previous page of history. `i` or `Enter` focuses the composer.
-- Composer: `Enter` submits.
-- `?`: open help.
-- `Esc`: close the help popup or clear the composer input.
+- Messages, on the selected message: `r` reacts (it prefills `/react` followed by a space in the composer, so
+  `Enter` sends the default
+  `+` and typing an emoji first customizes it); `u` removes your own reaction immediately; `d` deletes your own
+  message (it prefills `/delete`, so `Enter` is the visible confirmation); `R` replies (it prefills `/reply`
+  followed by a space and
+  shows the reply target on the status line, so you type the reply and `Enter` sends it). Counts update live in both
+  directions from the timeline projection; the list is not reloaded, and a sent reply upserts optimistically the same
+  way a plain send does. The `r`, `d`, and `R` prefills are skipped when the composer already holds a draft, so an
+  in-progress message is never clobbered (a status-line notice explains the skip). These also work as the `/react`,
+  `/unreact`, `/delete`, and `/reply <text>` slash commands, which resolve the target at submit and error to the
+  status line when no message is selected (and `/delete` when the message is not yours). `/reply` sends
+  `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
+  text as the guard requires. `o` opens the selected message's downloaded image full-size in a dismiss-on-any-key
+  viewer (see "Inbound media" below).
+- Inbound media: an image attachment renders inline in the message pane on terminals with a graphics protocol
+  (Kitty, iTerm2, or Sixel; iTerm2 is detected via `ITERM_SESSION_ID`). Each image is downloaded and decoded in the
+  background — never blocking the event loop — and its placeholder walks `[img name]` -> `[downloading name...]` ->
+  `[loading name...]` -> the inline image, or `[name failed: err]` on error. Terminals without an image protocol keep
+  the `[img name]` placeholder (and non-image attachments always show `[file name]`). Downloaded files are cached
+  under the TUI home in `tui-media-cache/` (a private directory), so passing `--home` keeps the cache with the
+  account data.
+- Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
+  character, and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard newline, so
+  multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8 rows), taking
+  the space from the messages pane.
+- `?`: open the help popup.
+- `Esc`: clear the composer input (or, with a popup open, close it).
 - `Ctrl-C`: quit.
+
+Popups are modal: while one is open it captures every key and the screen behind it is inert. A text-entry popup
+submits on `Enter` (when non-empty) and cancels on `Esc`; a confirm popup takes `y`/`Enter` or `n`/`Esc`; a list
+picker moves with `j`/`k` and closes on `Esc`; and dismiss-on-any-key cards (help, info, errors) close on the next
+key. Because the help card is a popup, `q` under it closes the card instead of quitting.
+
+Group detail (`g` from the chat list) shows the selected group's members with admin badges (and a `(you)` marker),
+its relay hints, and its name and description; `Esc` returns to the main view. Its keys: `j`/`k` move the member
+selection; `A` adds a member by npub/hex (text popup → `groups add-members`); `x` removes the selected member
+(confirm → `groups remove-members`); `P` promotes the selected member to admin (confirm → `groups promote`); `R`
+renames the group (text popup prefilled with the current name → `groups rename`); `L` leaves the group. An admin
+cannot leave: `L` shows a "Cannot Leave Group" info card (sole admins are told to promote another member first,
+co-admins to step down as admin), while a non-admin gets a confirm popup (→ `groups leave`) and, on success, the
+chat leaves the list and the view returns to the main screen. `I` opens the invites picker from here too.
+
+Invites (`I` from the chat list or group detail) opens a picker of pending invites (`groups invites`): `a` or
+`Enter` accepts the highlighted invite (`groups accept`) and opens the newly joined chat, `d` declines it
+(`groups decline`), and `Esc` closes the picker. The picker stays open across actions, refolding the refreshed
+list after each accept or decline and closing only once no invites remain; accepting from the group-detail screen
+returns to the main view. With no pending invites it shows an info card instead.
+
+User search (`s` from the chat list, or `/users [query]`) is a one-shot search over the cached follow-graph directory
+(`users search`, default radius `0..2`). The screen has two regions and a two-state focus: in query focus you type the
+query (so `j`/`k` are literal text) and `Enter` runs the search; once there are results, focus moves to the list where
+`j`/`k` (or arrows) navigate, `Enter` opens the selected user's profile card (`users show`, dismiss-on-any-key), `c`
+starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to the open chat (a confirm
+popup, guarded so it only offers this when a chat is loaded). `i` returns to the query, and `Esc` returns to the main
+view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
+attribution the search returns.
+
+Profile (`p` from the chat list) shows your own profile — name, display name, about, picture URL (as literal text; no
+avatar is fetched), nip05, lud16, and npub — from `profile show`, plus your follows from `follows list`. `j`/`k` move a
+single cursor over the six fields then the follows; `Enter` on a field opens a text popup prefilled with the current
+value and, on submit, publishes only that one field (`profile update --<field>`, which merges over the current profile
+so the other fields survive); `f` follows a user by npub/hex (`follows add`), and `x` unfollows the selected follow
+(confirm → `follows remove`). There is no nsec export anywhere. `Esc` returns to the main view.
+
+Relay health (`h` from the chat list) is a redacted, device-local telemetry dashboard from `relay-stats` (which reads
+the live `wnd` runtime when a socket exists and a fresh in-process read otherwise, so it always renders something —
+the header notes the daemon state). It shows the connection-health summary, lifecycle counters, cross-relay delivery
+spread (with p50/p99 derived from the fixed-bucket histograms, honest about `n/a` and `>Nms` overflow), subscription
+first-event/EOSE sync timing, and per-relay first-deliverer and timing rows keyed by an opaque device-local index.
+Per privacy decision, no relay URLs appear anywhere on this screen. `r` refreshes, `j`/`k` and PageUp/PageDown scroll,
+and `Esc` returns to the main view.
 
 Group MLS/component diagnostics are hidden by default; `/diagnostics` toggles a diagnostics panel between the
 messages pane and the composer.
@@ -537,11 +645,16 @@ Composer slash commands:
 /members add <npub-or-hex> [...]
 /members remove <npub-or-hex> [...]
 /members list
+/react [emoji]
+/unreact
+/delete
+/retry <event-id>
 /image <file-path> [caption]
 /keys fetch <npub-or-hex>
 /keys rotate
 /name <display-name>
 /profile name <display-name>
+/users [query]
 /stream [--stream-id <hex>] [--quic-candidate <quic-url>]
 /stream start [--stream-id <hex>] --quic-candidate <quic-url>
 /stream watch [--stream-id <hex>] [--insecure-local]
@@ -557,6 +670,11 @@ Composer slash commands:
 `/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the
 visible-chat list. Member commands operate on the selected chat and call the same group membership commands exposed by
 the CLI.
+`/react`, `/unreact`, and `/delete` operate on the selected message in the messages pane and call the real
+`messages react|unreact|delete` commands; `/react` defaults to the `+` emoji. On success they only update the status
+line — the timeline projection folds the reaction or tombstone into the existing row, so the list is not reloaded.
+`/retry <event-id>` retries a failed outbound event by id; it takes the id as an argument rather than acting on the
+selected message, because timeline rows do not carry per-message failed-send state to target from.
 `/image` uses the real encrypted media path (`wn media upload <group> <file> --send`) and sends the optional caption
 as the media message text; it does not send plaintext file paths or placeholder messages.
 Stream commands operate on the selected chat. `/stream watch` starts a daemon background watch and completed previews

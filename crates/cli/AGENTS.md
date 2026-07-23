@@ -37,8 +37,8 @@ Command-line app, background daemon, and terminal UI for the White Noise/Marmot 
   private key material.
 - `keys`: list/publish/check/delete the selected local account's KeyPackage records, force-mint a replacement with
   `keys rotate` (alias `force-publish`), and fetch another account's latest KeyPackage.
-- `chats`: list, list-archived, show, subscribe, subscribe-archived, archive, unarchive, mute, and unmute local chat
-  projections/notification policy.
+- `chats`: list, list-archived, show, subscribe, subscribe-archived, archive, unarchive, mute, unmute, and mark-read
+  local chat projections/notification policy.
 - `group` and `groups`: create groups, list/show groups, list members/admins/relays, invite/add/remove members, update
   profile fields, and subscribe to runtime-owned group-state updates through the daemon.
 - `messages`: send text messages, list/search projected messages with Whitenoise-shaped cursor flags, subscribe to
