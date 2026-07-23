@@ -655,7 +655,18 @@ impl<S: StorageProvider> Engine<S> {
                 // joining.md:65).
                 validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
 
-                // 5c. Reject active required capabilities this client cannot
+                // 5c. Validate every known GroupContext component before any
+                // joined state leaves this transaction. Commit ingest validates
+                // AppDataUpdate payloads, but a Welcome installs a complete
+                // dictionary without traversing that seam.
+                crate::app_components::validate_app_component_dictionary(&mls_group).map_err(
+                    |error| match error {
+                        storage @ EngineError::Storage(_) => storage,
+                        _ => EngineError::InvalidWelcome,
+                    },
+                )?;
+
+                // 5d. Reject active required capabilities this client cannot
                 // apply, including required agent-stream roles.
                 let mut group_required =
                     crate::capability_manager::required_capabilities_from_group(&mls_group);
@@ -676,10 +687,10 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
 
-                // 5d. The authenticated Welcome sender must be an admin.
+                // 5e. The authenticated Welcome sender must be an admin.
                 crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
 
-                // 5e. Every advertised admin must have a current member leaf.
+                // 5f. Every advertised admin must have a current member leaf.
                 crate::app_components::reject_admins_without_member_leaf(
                     &mls_group,
                     &group_id,
@@ -1054,15 +1065,20 @@ pub(crate) fn build_group_context_snapshot<S: StorageProvider>(
 }
 
 /// Mirror signed app-component state into the local app-facing group record.
-/// Missing profile state leaves the record's existing values unchanged.
 pub(crate) fn mirror_app_components_into_record(
     mls_group: &MlsGroup,
     record: &mut cgka_traits::group::Group,
 ) {
-    if let Ok(Some((name, description))) = crate::app_components::group_profile_of_group(mls_group)
-    {
-        record.name = name;
-        record.description = description;
+    match crate::app_components::group_profile_of_group(mls_group) {
+        Ok(Some((name, description))) => {
+            record.name = name;
+            record.description = description;
+        }
+        Ok(None) => {
+            record.name.clear();
+            record.description.clear();
+        }
+        Err(_) => {}
     }
     if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
         record.required_capabilities.app_components = components;

@@ -17,9 +17,11 @@ use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
-    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, default_group_components, encode_group_avatar_url_v1, encode_nostr_routing_v1,
+    APP_COMPONENTS_COMPONENT_ID, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    decode_components_list, decode_group_profile_v1, default_group_components,
+    encode_components_list, encode_group_avatar_url_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
@@ -492,6 +494,78 @@ fn malicious_app_component_commit(
             transport_group_id: group_id.as_slice().to_vec(),
         },
     }
+}
+
+fn remove_profile_from_live_group(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+) {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load sender MLS group")
+        .expect("sender created group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+
+    let current = mls_group
+        .extensions()
+        .app_data_dictionary()
+        .expect("group carries app_data_dictionary");
+    let mut required = current
+        .dictionary()
+        .get(&APP_COMPONENTS_COMPONENT_ID)
+        .map(|data| decode_components_list(data).unwrap())
+        .expect("group carries app_components");
+    required.remove(&GROUP_PROFILE_COMPONENT_ID);
+    let proposals = [
+        Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(&required),
+        ))),
+        Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::remove(
+            GROUP_PROFILE_COMPONENT_ID,
+        ))),
+    ];
+    let mut builder = mls_group.commit_builder();
+    for proposal in proposals {
+        builder = builder.add_proposal(proposal);
+    }
+    let mut builder = builder.load_psks(provider.storage()).expect("load PSKs");
+    let mut app_data = builder.app_data_dictionary_updater();
+    for proposal in builder.app_data_update_proposals() {
+        match proposal.operation() {
+            AppDataUpdateOperation::Update(data) => {
+                app_data.set(ComponentData::from_parts(
+                    proposal.component_id(),
+                    data.clone(),
+                ));
+            }
+            AppDataUpdateOperation::Remove => {
+                app_data.remove(&proposal.component_id());
+            }
+        }
+    }
+    builder.with_app_data_dictionary_updates(app_data.changes());
+    builder
+        .build(provider.rand(), provider.crypto(), &signer, |_| true)
+        .expect("profile removal commit builds")
+        .stage_commit(&provider)
+        .expect("profile removal commit stages");
+    mls_group
+        .merge_pending_commit(&provider)
+        .expect("profile removal commit merges");
 }
 
 async fn create_pair() -> (
@@ -1019,6 +1093,83 @@ async fn update_group_data_with_only_name_preserves_description() {
         )),
         "local rename must carry the previous group name, got: {events:?}",
     );
+}
+
+#[tokio::test]
+async fn partial_profile_update_after_absence_uses_empty_missing_field() {
+    for (identity, name, description, expected_name, expected_description) in [
+        (
+            b"name-after-absence".as_slice(),
+            Some("fresh name".to_owned()),
+            None,
+            "fresh name",
+            "",
+        ),
+        (
+            b"description-after-absence".as_slice(),
+            None,
+            Some("fresh description".to_owned()),
+            "",
+            "fresh description",
+        ),
+    ] {
+        let (mut alice, storage) = build_with_storage(identity);
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "stale name".into(),
+                description: "stale description".into(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let pending = match created {
+            SendResult::GroupCreated { pending, .. } => pending,
+            other => panic!("expected GroupCreated, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+
+        remove_profile_from_live_group(&storage, &alice.self_id(), &group_id);
+        drop(alice);
+        let mut alice = build_with_storage_and_peeler(identity, storage.clone(), mock_peeler());
+        assert_eq!(
+            alice
+                .app_component(&group_id, GROUP_PROFILE_COMPONENT_ID)
+                .unwrap(),
+            None,
+            "setup must have absent profile state"
+        );
+        // Reproduce the stale local projection that existed after profile removal.
+        // The replacement bytes must come from current MLS state, not these fields.
+        let mut stale_record = storage.get_group(&group_id).unwrap();
+        stale_record.name = "stale name".into();
+        stale_record.description = "stale description".into();
+        storage.put_group(&stale_record).unwrap();
+
+        let updated = alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name,
+                description,
+            })
+            .await
+            .unwrap();
+        let pending = match updated {
+            SendResult::GroupEvolution { pending, .. } => pending,
+            other => panic!("expected GroupEvolution, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+
+        let profile_bytes = alice
+            .app_component(&group_id, GROUP_PROFILE_COMPONENT_ID)
+            .unwrap()
+            .expect("partial update installs a profile");
+        let profile = decode_group_profile_v1(&profile_bytes).unwrap();
+        assert_eq!(profile.name, expected_name);
+        assert_eq!(profile.description, expected_description);
+    }
 }
 
 // ── Rollback ────────────────────────────────────────────────────────────────

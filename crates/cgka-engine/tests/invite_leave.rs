@@ -6,7 +6,11 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::EngineError;
-use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
+use cgka_traits::app_components::{
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, encode_component_vectors, encode_nostr_routing_v1,
+};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
@@ -364,6 +368,78 @@ fn welcome_from_fork_with_self_promoted_admin(
         timestamp: Timestamp(0),
         causal_deps: vec![],
         source: TransportSource("malicious-openmls".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: recipient_id,
+        },
+    }
+}
+
+fn welcome_from_admin_with_component_update(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    invitee_key_package: &KeyPackage,
+    update: AppComponentData,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load admin's MLS group")
+        .expect("admin created group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+    let invitee = clone_key_package_for_invite(invitee_key_package);
+    let recipient = BasicCredential::try_from(invitee.leaf_node().credential().clone())
+        .expect("invitee uses BasicCredential");
+    let recipient_id = MemberId::new(recipient.identity().to_vec());
+
+    let proposal = Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
+        update.component_id,
+        update.data,
+    )));
+    let mut builder = mls_group
+        .commit_builder()
+        .propose_adds(std::iter::once(invitee))
+        .add_proposal(proposal)
+        .load_psks(provider.storage())
+        .expect("load PSKs");
+    let mut app_data = builder.app_data_dictionary_updater();
+    for proposal in builder.app_data_update_proposals() {
+        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+            app_data.set(ComponentData::from_parts(
+                proposal.component_id(),
+                data.clone(),
+            ));
+        }
+    }
+    builder.with_app_data_dictionary_updates(app_data.changes());
+    let welcome_msg = builder
+        .build(provider.rand(), provider.crypto(), &signer, |_| true)
+        .expect("build Add+AppDataUpdate commit")
+        .stage_commit(&provider)
+        .expect("stage Add+AppDataUpdate commit")
+        .into_welcome_msg()
+        .expect("an Add commit produces a Welcome");
+    let welcome_bytes = welcome_msg
+        .tls_serialize_detached()
+        .expect("serialize malformed-state Welcome");
+
+    TransportMessage {
+        id: hash_id(&welcome_bytes),
+        payload: welcome_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("malformed-component-welcome".into()),
         envelope: TransportEnvelope::Welcome {
             recipient: recipient_id,
         },
@@ -1565,6 +1641,99 @@ async fn join_rejects_welcome_authored_by_existing_non_admin() {
         matches!(err, EngineError::NotGroupAdmin { .. }),
         "expected NotGroupAdmin for non-admin Welcome signer, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn join_rejects_welcome_with_invalid_known_app_component_state() {
+    let blossom = encode_component_vectors(&[
+        &[0x11; 32],
+        &[0x22; 32],
+        &[0x33; 12],
+        &[0x44; 32],
+        b"IMAGE/PNG",
+    ]);
+    let mut routing = encode_nostr_routing_v1(
+        &NostrRoutingV1::new([0x55; 32], vec!["wss://relay.example".into()]).unwrap(),
+    )
+    .unwrap();
+    routing.push(0);
+
+    let invalid_components = [
+        (
+            "profile",
+            AppComponentData {
+                component_id: GROUP_PROFILE_COMPONENT_ID,
+                // A zero-length name encoded with a non-minimal two-byte QUIC varint.
+                data: vec![0x40, 0x00, 0x00],
+            },
+        ),
+        (
+            "blossom",
+            AppComponentData {
+                component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                // Structurally complete, but media type is not canonical lowercase.
+                data: blossom,
+            },
+        ),
+        (
+            "avatar",
+            AppComponentData {
+                component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+                // The WHATWG serializer lowercases this host, so these stored bytes are noncanonical.
+                data: encode_component_vectors(&[b"https://EXAMPLE.com/avatar.png", &[], &[]]),
+            },
+        ),
+        (
+            "routing",
+            AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                // A canonical routing value followed by forbidden trailing bytes.
+                data: routing,
+            },
+        ),
+    ];
+
+    for (case, invalid_component) in invalid_components {
+        let (mut alice, alice_storage) = build_with_storage(b"welcome-component-admin");
+        let mut invitee = build_client(case.as_bytes());
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "welcome component validation".into(),
+                description: "".into(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let pending = match created {
+            SendResult::GroupCreated { pending, .. } => pending,
+            other => panic!("expected GroupCreated, got {other:?}"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+
+        let invitee_kp = invitee.fresh_key_package().await.unwrap();
+        let welcome = welcome_from_admin_with_component_update(
+            &alice_storage,
+            &alice.self_id(),
+            &group_id,
+            &invitee_kp,
+            invalid_component,
+        );
+        let err = invitee
+            .join_welcome(welcome)
+            .await
+            .expect_err("invalid known component state must reject the Welcome");
+        assert!(
+            matches!(err, EngineError::InvalidWelcome),
+            "{case}: expected InvalidWelcome, got {err:?}"
+        );
+        assert!(
+            invitee.members(&group_id).is_err(),
+            "{case}: rejected Welcome must not persist joined state"
+        );
+    }
 }
 
 #[tokio::test]

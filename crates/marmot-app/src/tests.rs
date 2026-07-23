@@ -11,7 +11,7 @@ use cgka_traits::app_event::{
     STREAM_TAG, STREAM_TYPE_TAG,
 };
 use marmot_account::AccountHomeError;
-use storage_sqlite::StoredRelayTelemetrySettings;
+use storage_sqlite::{StoredAccountGroupComponent, StoredRelayTelemetrySettings};
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
@@ -1172,6 +1172,36 @@ fn profile_presence_round_trips_through_account_projection() {
     assert!(restored_absent.profile.data_hex.is_empty());
     assert_eq!(restored_absent.profile.name, "");
     assert_eq!(restored_absent.profile.description, "");
+}
+
+#[test]
+fn unknown_optional_component_round_trips_through_account_projection() {
+    let group = AppGroupRecord::new(
+        "aa".to_owned(),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0xAA; 32], vec!["wss://relay.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "group".to_owned(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+    let unknown = StoredAccountGroupComponent {
+        component_id: 0xf400,
+        component_name: "unknown.optional.component".to_owned(),
+        component_data_hex: "ff0080017f".to_owned(),
+    };
+    let mut stored = stored_group_from_app_group(&group);
+    stored.components.push(unknown.clone());
+
+    let restored = app_group_from_stored_group(stored).unwrap();
+    let resaved = stored_group_from_app_group(&restored);
+    assert!(
+        resaved.components.contains(&unknown),
+        "projection saves must preserve unknown optional component bytes"
+    );
 }
 
 #[test]

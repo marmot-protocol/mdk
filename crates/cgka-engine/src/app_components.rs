@@ -678,26 +678,45 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
     }
 }
 
+/// Validate every known component in a complete GroupContext dictionary.
+/// Unknown optional components remain opaque and are intentionally accepted.
+pub(crate) fn validate_app_component_dictionary(mls_group: &MlsGroup) -> Result<(), EngineError> {
+    let Some(dictionary) = mls_group.extensions().app_data_dictionary() else {
+        return Ok(());
+    };
+    for entry in dictionary.dictionary().entries() {
+        validate_app_component_bytes(entry.id(), entry.data())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_app_component_update(
     component: &AppComponentData,
 ) -> Result<(), EngineError> {
-    match component.component_id {
-        APP_COMPONENTS_COMPONENT_ID => decode_components_list(&component.data)
+    validate_app_component_bytes(component.component_id, &component.data)
+}
+
+fn validate_app_component_bytes(
+    component_id: AppComponentId,
+    data: &[u8],
+) -> Result<(), EngineError> {
+    match component_id {
+        APP_COMPONENTS_COMPONENT_ID => decode_components_list(data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid app_components component: {e}"))),
         SAFE_AAD_COMPONENT_ID => Err(EngineError::Other(
             "safe_aad group-component state is not supported yet".into(),
         )),
-        GROUP_PROFILE_COMPONENT_ID => decode_group_profile(&component.data).map(|_| ()),
-        GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(&component.data).map(|_| ()),
-        NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(&component.data)
+        GROUP_PROFILE_COMPONENT_ID => decode_group_profile(data).map(|_| ()),
+        GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(data).map(|_| ()),
+        NOSTR_ROUTING_COMPONENT_ID => decode_nostr_routing_v1(data)
             .map(|_| ())
             .map_err(|e| EngineError::Serialize(format!("invalid Nostr routing component: {e}"))),
-        GROUP_BLOSSOM_IMAGE_COMPONENT_ID => validate_group_image(&component.data),
-        GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(&component.data),
-        GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(&component.data),
-        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(&component.data),
-        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(&component.data),
+        GROUP_BLOSSOM_IMAGE_COMPONENT_ID => validate_group_image(data),
+        GROUP_AVATAR_URL_COMPONENT_ID => validate_group_avatar_url(data),
+        GROUP_MESSAGE_RETENTION_COMPONENT_ID => validate_message_retention(data),
+        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID => validate_agent_text_stream_policy(data),
+        GROUP_ENCRYPTED_MEDIA_COMPONENT_ID => validate_encrypted_media_policy(data),
         _ => Ok(()),
     }
 }

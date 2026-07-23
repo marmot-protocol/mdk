@@ -19,6 +19,7 @@ use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{LeafNodeIndex, MlsMessageOut};
+use openmls_traits::OpenMlsProvider;
 use std::collections::BTreeSet;
 use tls_codec::Serialize as _;
 
@@ -35,11 +36,16 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        // A partial update must carry the other field forward exactly. Never
-        // turn a transient/corrupt storage read into an empty field that would
-        // be committed for every group member.
-        let current_group = self.storage.get_group(&group_id)?;
-        let current_profile = (current_group.name, current_group.description);
+        // A partial update must carry the other field forward from canonical
+        // MLS state. The local Group record is only a projection and can lag a
+        // component removal; using it here can resurrect removed profile data.
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+        let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+            .map_err(|error| EngineError::Backend(format!("load group: {error:?}")))?
+            .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        let current_profile =
+            crate::app_components::group_profile_of_group(&mls_group)?.unwrap_or_default();
         let projected_name = name.unwrap_or(current_profile.0);
         let projected_description = description.unwrap_or(current_profile.1);
         let profile_bytes =

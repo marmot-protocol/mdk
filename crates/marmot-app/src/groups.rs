@@ -49,6 +49,10 @@ pub struct AppGroupRecord {
     pub agent_text_stream: AppAgentTextStreamComponent,
     #[serde(default)]
     pub encrypted_media: AppGroupEncryptedMediaComponent,
+    /// Unknown optional app-component records retained byte-for-byte across
+    /// projection loads and unrelated saves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_components: Vec<AppGroupOpaqueComponent>,
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]
@@ -61,6 +65,25 @@ pub struct AppGroupRecord {
     pub welcomer_account_id_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via_welcome_message_id_hex: Option<String>,
+}
+
+/// Opaque app-component state that this app version does not interpret.
+/// `data_hex` may contain sensitive MLS-protected state, so Debug redacts it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupOpaqueComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub data_hex: String,
+}
+
+impl std::fmt::Debug for AppGroupOpaqueComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupOpaqueComponent")
+            .field("component_id", &self.component_id)
+            .field("component", &self.component)
+            .field("data_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,6 +354,7 @@ impl AppGroupRecord {
             message_retention,
             agent_text_stream: AppAgentTextStreamComponent::disabled(),
             encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
+            unknown_components: Vec::new(),
             archived: false,
             pending_confirmation: false,
             self_membership: SelfMembership::Member,

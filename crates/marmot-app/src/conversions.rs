@@ -11,8 +11,9 @@ use crate::{
     AGENT_TEXT_STREAM_COMPONENT_ID, AccountState, AppAgentTextStreamComponent,
     AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
     AppGroupImageInput, AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent,
-    AppGroupProfileComponent, AppGroupRecord, AppMessageProjection, AppMessageRecord,
-    AuditLogSettings, ChatNotificationSettings, GROUP_AVATAR_URL_COMPONENT_ID,
+    AppGroupOpaqueComponent, AppGroupProfileComponent, AppGroupRecord, AppMessageProjection,
+    AppMessageRecord, AuditLogSettings, ChatNotificationSettings, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID,
     NotificationSettings, PushPlatform, PushRegistration, RelayTelemetrySettings,
@@ -129,12 +130,33 @@ pub(crate) fn stored_components_from_app_group(
             component_data_hex: group.encrypted_media.data_hex.clone(),
         });
     }
+    components.extend(
+        group
+            .unknown_components
+            .iter()
+            .filter(|component| !is_projected_group_component(component.component_id))
+            .map(|component| StoredAccountGroupComponent {
+                component_id: component.component_id,
+                component_name: component.component.clone(),
+                component_data_hex: component.data_hex.clone(),
+            }),
+    );
     components
 }
 
 pub(crate) fn app_group_from_stored_group(
     stored: StoredAccountGroup,
 ) -> Result<AppGroupRecord, AppError> {
+    let unknown_components = stored
+        .components
+        .iter()
+        .filter(|component| !is_projected_group_component(component.component_id))
+        .map(|component| AppGroupOpaqueComponent {
+            component_id: component.component_id,
+            component: component.component_name.clone(),
+            data_hex: component.component_data_hex.clone(),
+        })
+        .collect();
     let routing_bytes = hex::decode(
         account_component_data_hex(&stored.components, NOSTR_ROUTING_COMPONENT_ID).ok_or_else(
             || AppError::InvalidNostrRouting("stored group is missing routing".into()),
@@ -194,7 +216,22 @@ pub(crate) fn app_group_from_stored_group(
     group.self_membership = stored.self_membership;
     group.welcomer_account_id_hex = stored.welcomer_account_id_hex;
     group.via_welcome_message_id_hex = stored.via_welcome_message_id_hex;
+    group.unknown_components = unknown_components;
     Ok(group)
+}
+
+fn is_projected_group_component(component_id: u16) -> bool {
+    matches!(
+        component_id,
+        GROUP_PROFILE_COMPONENT_ID
+            | GROUP_BLOSSOM_IMAGE_COMPONENT_ID
+            | GROUP_ADMIN_POLICY_COMPONENT_ID
+            | NOSTR_ROUTING_COMPONENT_ID
+            | GROUP_MESSAGE_RETENTION_COMPONENT_ID
+            | AGENT_TEXT_STREAM_COMPONENT_ID
+            | GROUP_AVATAR_URL_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_COMPONENT_ID
+    )
 }
 
 pub(crate) fn account_component_data_hex(
