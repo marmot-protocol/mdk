@@ -29,6 +29,7 @@
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::OutboundFanout;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
@@ -43,6 +44,29 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<GroupEvent, EngineError> {
+        self.do_confirm_published_with_fanout(pending, None).await
+    }
+
+    pub(crate) async fn do_confirm_published_with_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        mut fanout: Option<&mut OutboundFanout>,
+    ) -> Result<GroupEvent, EngineError> {
+        let confirmed_fanout = fanout
+            .as_deref()
+            .map(|fanout| {
+                if fanout.pending_ref() != Some(pending) || fanout.outcome().accepted_targets == 0 {
+                    return Err(EngineError::Other(
+                        "fanout does not contain an accepted matching pending publish".into(),
+                    ));
+                }
+                let mut confirmed = fanout.clone();
+                confirmed.mark_mls_confirmed().map_err(|_| {
+                    EngineError::Other("fanout MLS confirmation transition failed".into())
+                })?;
+                Ok(confirmed)
+            })
+            .transpose()?;
         // Look up which group this pending belongs to without consuming the
         // entry — we need the MlsGroup load to succeed before we burn the
         // state-machine slot.
@@ -163,6 +187,9 @@ impl<S: StorageProvider> Engine<S> {
                 if let Some((_, intent_id)) = queued_intent.as_ref() {
                     storage.delete_queued_outbound_intent(intent_id)?;
                 }
+                if let Some(fanout) = confirmed_fanout.as_ref() {
+                    storage.put_outbound_fanout(fanout)?;
+                }
                 Ok(())
             })?;
 
@@ -180,6 +207,9 @@ impl<S: StorageProvider> Engine<S> {
         // backend) plus best-effort cleanup. Kind discriminates create (always
         // `GroupCreated`) from evolution (always `EpochChanged`).
         let (group_id, new_epoch) = self.epoch_manager.confirm_publish(pending)?;
+        if let (Some(fanout), Some(confirmed)) = (fanout.take(), confirmed_fanout) {
+            *fanout = confirmed;
+        }
         self.queued_intent_by_pending.remove(&pending);
         self.audit_with_context(
             Some(&group_id),
@@ -265,6 +295,14 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         pending: PendingStateRef,
     ) -> Result<(), EngineError> {
+        self.do_publish_failed_with_fanout(pending, None).await
+    }
+
+    pub(crate) async fn do_publish_failed_with_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        mut fanout: Option<&mut OutboundFanout>,
+    ) -> Result<(), EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
 
         let group_id = self
@@ -277,30 +315,53 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
 
-        if mls_group.pending_commit().is_some() {
-            self.storage.with_transaction(|storage| {
-                let tx_provider =
-                    EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-                mls_group
-                    .clear_pending_commit(tx_provider.storage())
-                    .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))
-            })?;
-        }
+        let rolled_back_fanout = fanout
+            .as_deref()
+            .map(|fanout| {
+                let outcome = fanout.outcome();
+                if fanout.pending_ref() != Some(pending)
+                    || outcome.accepted_targets != 0
+                    || !outcome.fanout_complete
+                {
+                    return Err(EngineError::Other(
+                        "fanout is not a complete all-failed matching pending publish".into(),
+                    ));
+                }
+                let mut rolled_back = fanout.clone();
+                rolled_back.mark_mls_rolled_back().map_err(|_| {
+                    EngineError::Other("fanout MLS rollback transition failed".into())
+                })?;
+                Ok(rolled_back)
+            })
+            .transpose()?;
 
-        // Roll back the Marmot record's projected fields. The send paths
-        // wrote a projected `members` list (+ for upgrade, projected
-        // `required_capabilities`); after `clear_pending_commit` the MLS
-        // group is back to its pre-stage shape, so re-deriving from MLS
-        // restores the prior projection. The capability cache for newly-
-        // invited members stays — it's not visible via `members()` once
-        // we drop them from the Marmot record, and the next successful
-        // invite simply overwrites.
-        if let Ok(mut g) = self.storage.get_group(&group_id) {
-            g.epoch = EpochId(mls_group.epoch().as_u64());
-            g.members = crate::group_lifecycle::marmot_members(&mls_group);
-            g.required_capabilities = required_capabilities_from_group(&mls_group);
-            crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
-            self.storage.put_group(&g)?;
+        let has_pending_commit = mls_group.pending_commit().is_some();
+        self.storage
+            .with_transaction(|storage| -> Result<(), EngineError> {
+                if has_pending_commit {
+                    let tx_provider =
+                        EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
+                    mls_group
+                        .clear_pending_commit(tx_provider.storage())
+                        .map_err(|e| EngineError::Backend(format!("clear_pending: {e:?}")))?;
+                }
+
+                // Re-derive the Marmot projection in the same durable unit as the
+                // MLS clear and fanout terminal state.
+                let mut g = storage.get_group(&group_id)?;
+                g.epoch = EpochId(mls_group.epoch().as_u64());
+                g.members = crate::group_lifecycle::marmot_members(&mls_group);
+                g.required_capabilities = required_capabilities_from_group(&mls_group);
+                crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut g);
+                storage.put_group(&g)?;
+                if let Some(fanout) = rolled_back_fanout.as_ref() {
+                    storage.put_outbound_fanout(fanout)?;
+                }
+                Ok(())
+            })?;
+
+        if let (Some(fanout), Some(rolled_back)) = (fanout.take(), rolled_back_fanout) {
+            *fanout = rolled_back;
         }
 
         let kind = self

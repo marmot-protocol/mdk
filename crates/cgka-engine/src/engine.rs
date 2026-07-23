@@ -12,13 +12,14 @@ use crate::bounded_id_set::{BoundedIdSet, DEDUP_CACHE_CAPACITY};
 use crate::feature_registry::FeatureRegistry;
 use crate::identity::Identity;
 use async_trait::async_trait;
+use cgka_traits::OutboundFanout;
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities};
 use cgka_traits::engine::{
-    AutoPublish, CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason,
-    GroupStateChange, KeyPackage, SendIntent, SendResult,
+    AutoPublish, CgkaEngine, CommitOrderingKey, CreateGroupRequest, GroupEvent,
+    GroupHydrationQuarantineReason, GroupStateChange, KeyPackage, SendIntent, SendResult,
 };
-use cgka_traits::engine_state::PendingStateRef;
+use cgka_traits::engine_state::{PendingStateRef, StagedCommitHandle};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContext;
@@ -390,6 +391,47 @@ impl<S: StorageProvider> EngineBuilder<S> {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Persist a frozen transport fanout before or after one lifecycle edge.
+    pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> Result<(), EngineError> {
+        self.storage.put_outbound_fanout(fanout)?;
+        Ok(())
+    }
+
+    /// Read all frozen fanouts in original staging order.
+    pub fn outbound_fanouts(&self) -> Result<Vec<OutboundFanout>, EngineError> {
+        Ok(self.storage.list_outbound_fanouts()?)
+    }
+
+    /// Resolve the group owning a live pending reference without exposing
+    /// epoch-manager internals across the session/runtime boundary.
+    pub fn pending_group_id(&self, pending: PendingStateRef) -> Result<GroupId, EngineError> {
+        self.epoch_manager
+            .group_for_pending(pending)
+            .ok_or(EngineError::UnknownPending)
+    }
+
+    /// Confirm MLS and persist the matching fanout's terminal MLS edge in the
+    /// same backend transaction.
+    pub async fn confirm_published_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> Result<GroupEvent, EngineError> {
+        self.do_confirm_published_with_fanout(pending, Some(fanout))
+            .await
+    }
+
+    /// Roll back MLS and persist the matching all-failed fanout edge in the
+    /// same backend transaction.
+    pub async fn publish_failed_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> Result<(), EngineError> {
+        self.do_publish_failed_with_fanout(pending, Some(fanout))
+            .await
+    }
+
     pub async fn ingest_with_audit_context(
         &mut self,
         msg: TransportMessage,
@@ -847,6 +889,74 @@ impl<S: StorageProvider> Engine<S> {
             .get_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
+        let durable_pending_fanout = self
+            .storage
+            .list_outbound_fanouts()
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
+            .into_iter()
+            .find(|fanout| {
+                fanout.group_id() == Some(group_id)
+                    && matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+            });
+        let mut restored_pending = false;
+        if mls_group.pending_commit().is_some()
+            && let Some(fanout) = durable_pending_fanout.as_ref()
+        {
+            let pending_ref = fanout
+                .pending_ref()
+                .expect("pending fanout state retains its pending ref");
+            let prior_epoch = EpochId(mls_group.epoch().as_u64());
+            self.epoch_manager
+                .restore_pending(
+                    group_id.clone(),
+                    prior_epoch,
+                    EpochId(prior_epoch.0.saturating_add(1)),
+                    StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+                    pending_ref,
+                    crate::epoch_manager::PendingKind::GroupEvolution,
+                )
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+
+            let stored = self
+                .storage
+                .get_message(fanout.message_id())
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let payload = StoredMessagePayload::decode(&stored.payload)
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let commit_bytes = payload
+                .as_openmls_wire()
+                .map(|message| message.payload.as_slice())
+                .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let priority = crate::app_components::commit_ordering_priority_for_staged(
+                mls_group
+                    .pending_commit()
+                    .expect("pending commit presence checked above"),
+            );
+            let snapshot_prefix = format!("fork-{}-", prior_epoch.0);
+            let snapshot_name = self
+                .storage
+                .list_group_snapshots(group_id)
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
+                .into_iter()
+                .filter(|name| name.starts_with(&snapshot_prefix))
+                .max()
+                .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            self.fork_recovery.record_pending(
+                pending_ref,
+                group_id.clone(),
+                prior_epoch,
+                fanout.message_id().clone(),
+                CommitOrderingKey::from_commit_bytes(
+                    prior_epoch,
+                    priority,
+                    self.identity.self_id().clone(),
+                    commit_bytes,
+                ),
+                snapshot_name,
+            );
+            restored_pending = true;
+        }
+
         // A staged commit that survived process restart *may* mean the
         // application crashed mid-publish. Clear it (treat as
         // publish-failed) so the group is not permanently wedged, then
@@ -868,7 +978,7 @@ impl<S: StorageProvider> Engine<S> {
                 )
             })
         });
-        if mls_group.pending_commit().is_some() && !staged_removes_member {
+        if mls_group.pending_commit().is_some() && !staged_removes_member && !restored_pending {
             // Clear the staged commit transactionally (preserves the #421
             // crash-safety fix): the MLS storage mutation must be atomic so a
             // crash mid-clear cannot leave torn group state.
@@ -922,7 +1032,9 @@ impl<S: StorageProvider> Engine<S> {
         // MLS load above (kept pre-validation so quarantined groups resolve
         // too); nothing on this path changes it.
 
-        self.epoch_manager.set_stable(group_id.clone(), group.epoch);
+        if !restored_pending {
+            self.epoch_manager.set_stable(group_id.clone(), group.epoch);
+        }
         self.audit_group(
             group_id,
             crate::audit_helpers::epoch_state_changed_event(

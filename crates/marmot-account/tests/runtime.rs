@@ -13,19 +13,21 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::OutboundFanoutStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::{
-    MemberId, MessageId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
-    TransportEndpointReceipt, TransportGroupSync, TransportPublishReport, TransportPublishRequest,
+    FanoutMlsState, FanoutTargetStatus, MemberId, MessageId, OutboundFanout,
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointReceipt,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
     KeyPackagePublisher, PendingResolution, StaticTransportRouting,
 };
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     deterministic_nostr_keys(name)
@@ -204,6 +206,7 @@ struct RecordingAdapterInner {
     syncs: Mutex<Vec<TransportGroupSync>>,
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
+    timeout_pattern: Mutex<VecDeque<bool>>,
 }
 
 impl RecordingAdapter {
@@ -217,6 +220,10 @@ impl RecordingAdapter {
             .lock()
             .unwrap()
             .push_back(accepted_count);
+    }
+
+    fn timeout_pattern(&self, pattern: impl IntoIterator<Item = bool>) {
+        self.inner.timeout_pattern.lock().unwrap().extend(pattern);
     }
 
     fn activations(&self) -> Vec<TransportAccountActivation> {
@@ -258,6 +265,16 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        if self
+            .inner
+            .timeout_pattern
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(false)
+        {
+            return Err(TransportAdapterError::Publish("simulated timeout".into()));
+        }
         let accepted_count = self
             .inner
             .accepted_counts
@@ -272,6 +289,72 @@ impl TransportAdapter for RecordingAdapter {
                 .endpoints()
                 .iter()
                 .take(accepted_count)
+                .cloned()
+                .map(|endpoint| TransportEndpointReceipt {
+                    endpoint,
+                    accepted_at: None,
+                })
+                .collect(),
+            failed: Vec::new(),
+            required_acks: request.required_acks,
+        })
+    }
+
+    async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Default)]
+struct CrashAfterFirstAcceptanceAdapter {
+    publishes: Arc<Mutex<Vec<TransportPublishRequest>>>,
+}
+
+impl CrashAfterFirstAcceptanceAdapter {
+    fn publishes(&self) -> Vec<TransportPublishRequest> {
+        self.publishes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TransportAdapter for CrashAfterFirstAcceptanceAdapter {
+    async fn activate_account(
+        &self,
+        _activation: TransportAccountActivation,
+    ) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn sync_account_groups(
+        &self,
+        _sync: TransportGroupSync,
+    ) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn deactivate_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish(
+        &self,
+        request: TransportPublishRequest,
+    ) -> Result<TransportPublishReport, TransportAdapterError> {
+        let call = {
+            let mut publishes = self.publishes.lock().unwrap();
+            publishes.push(request.clone());
+            publishes.len()
+        };
+        assert_ne!(call, 2, "simulated process crash after the first relay ack");
+        Ok(TransportPublishReport {
+            message_id: request.message.id,
+            accepted: request
+                .target
+                .endpoints()
+                .iter()
                 .cloned()
                 .map(|endpoint| TransportEndpointReceipt {
                     endpoint,
@@ -1014,6 +1097,7 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
 
     let adapter = RecordingAdapter::default();
     adapter.accept_next(1);
+    adapter.accept_next(0);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(2)
@@ -1070,13 +1154,17 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
     );
 
     let publishes = adapter.publishes();
-    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes.len(), 3);
     assert!(matches!(
         publishes[0].message.envelope,
         TransportEnvelope::GroupMessage { .. }
     ));
     assert!(matches!(
         publishes[1].message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    ));
+    assert!(matches!(
+        publishes[2].message.envelope,
         TransportEnvelope::Welcome { .. }
     ));
 }
@@ -1239,6 +1327,7 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     // this back; the fix must confirm it.
     let adapter = RecordingAdapter::default();
     adapter.accept_only_next(1);
+    adapter.accept_next(0);
     let alice_id = alice.self_id();
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
@@ -1297,4 +1386,390 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     // The removal was applied locally: epoch advanced and bob is gone.
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 2);
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
+}
+
+async fn assert_frozen_fanout_case(accept_at: Option<usize>, timeout_at: Option<usize>) {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot fanout matrix key").unwrap();
+    let mut alice = session(
+        dir.path().join("alice.sqlite"),
+        &key,
+        b"alice-fanout-matrix",
+    );
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob-fanout-matrix");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "fanout matrix".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+
+    let endpoints = vec![
+        TransportEndpoint("wss://fanout-one.example".into()),
+        TransportEndpoint("wss://fanout-two.example".into()),
+        TransportEndpoint("wss://fanout-three.example".into()),
+    ];
+    let adapter = RecordingAdapter::default();
+    adapter.timeout_pattern((0..endpoints.len()).map(|index| timeout_at == Some(index)));
+    for index in 0..endpoints.len() {
+        if timeout_at != Some(index) {
+            adapter.accept_next(usize::from(accept_at == Some(index)));
+        }
+    }
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            endpoints.clone(),
+        );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let effects = runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("fanout result".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(adapter.publishes().len(), endpoints.len());
+    assert_eq!(effects.reports.len(), 1);
+    assert_eq!(effects.fanout.len(), 1);
+    assert!(effects.fanout[0].fanout_complete);
+    assert_eq!(effects.fanout[0].outstanding_targets, 0);
+    let stored = runtime.session().outbound_fanouts().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].request().target.endpoints(), endpoints);
+
+    if let Some(accepted_index) = accept_at {
+        assert!(effects.fanout[0].mls_confirmed);
+        assert_eq!(effects.fanout[0].accepted_targets, 1);
+        assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 2);
+        assert!(matches!(
+            effects.pending.as_slice(),
+            [PendingResolution::Confirmed { .. }]
+        ));
+        assert_eq!(stored[0].mls_state(), FanoutMlsState::Confirmed);
+        assert_eq!(
+            stored[0].target_status(accepted_index),
+            Some(FanoutTargetStatus::Accepted)
+        );
+    } else {
+        assert!(!effects.fanout[0].mls_confirmed);
+        assert_eq!(effects.fanout[0].accepted_targets, 0);
+        assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
+        assert!(matches!(
+            effects.pending.as_slice(),
+            [PendingResolution::RolledBack { .. }]
+        ));
+        assert_eq!(stored[0].mls_state(), FanoutMlsState::RolledBack);
+    }
+
+    let privacy_safe = serde_json::to_string(&effects.fanout[0]).unwrap();
+    assert!(!privacy_safe.contains("wss://"));
+    let publish_count = adapter.publishes().len();
+    let duplicate_resume = runtime.resume_outbound_fanouts().await.unwrap();
+    assert!(duplicate_resume.reports.is_empty());
+    assert!(duplicate_resume.pending.is_empty());
+    assert_eq!(adapter.publishes().len(), publish_count);
+}
+
+#[tokio::test]
+async fn frozen_fanout_first_middle_last_ack_and_all_fail_are_terminal() {
+    for accept_at in [Some(0), Some(1), Some(2), None] {
+        assert_frozen_fanout_case(accept_at, None).await;
+    }
+}
+
+#[tokio::test]
+async fn frozen_fanout_mixed_ack_failure_and_timeout_still_completes() {
+    assert_frozen_fanout_case(Some(0), Some(1)).await;
+}
+
+async fn assert_frozen_fanout_restart_edge(send_before_ack_persist: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-restart-edge.sqlite");
+    let key_text = "marmot fanout restart edge key";
+    let key = SqlCipherKey::new(key_text).unwrap();
+    let mut alice = session(&alice_path, &key, b"alice-fanout-restart-edge");
+    let mut bob = session(
+        dir.path().join("bob-restart-edge.sqlite"),
+        &key,
+        b"bob-fanout-restart-edge",
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "fanout restart edge".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+
+    let staged = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("resume frozen bytes".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let (message, pending) = match &staged.publish[0] {
+        PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        other => panic!("expected GroupEvolution publish work, got {other:?}"),
+    };
+    let transport_group_id = match &message.envelope {
+        TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
+        other => panic!("expected group message, got {other:?}"),
+    };
+    let endpoints = vec![
+        TransportEndpoint("wss://restart-one.example".into()),
+        TransportEndpoint("wss://restart-two.example".into()),
+        TransportEndpoint("wss://restart-three.example".into()),
+    ];
+    let request = TransportPublishRequest {
+        account_id: alice.self_id(),
+        message: message.clone(),
+        target: TransportPublishTarget::Group {
+            group_id: group_id.clone(),
+            transport_group_id: transport_group_id.clone(),
+            endpoints: endpoints.clone(),
+        },
+        required_acks: 1,
+    };
+    let mut fanout =
+        OutboundFanout::stage(request.clone(), Some(pending), Some(group_id.clone()), 0).unwrap();
+    alice.put_outbound_fanout(&fanout).unwrap();
+
+    let adapter = RecordingAdapter::default();
+    if send_before_ack_persist {
+        fanout.mark_attempt_started(0).unwrap();
+        alice.put_outbound_fanout(&fanout).unwrap();
+        adapter
+            .publish(TransportPublishRequest {
+                account_id: request.account_id.clone(),
+                message: message.clone(),
+                target: TransportPublishTarget::Group {
+                    group_id: group_id.clone(),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![endpoints[0].clone()],
+                },
+                required_acks: 1,
+            })
+            .await
+            .unwrap();
+    }
+    let pre_restart_publish_count = adapter.publishes().len();
+    drop(alice);
+
+    let reopened = session(
+        &alice_path,
+        &SqlCipherKey::new(key_text).unwrap(),
+        b"alice-fanout-restart-edge",
+    );
+    let replacement_policy = StaticTransportRouting::new(vec![TransportEndpoint(
+        "wss://replacement-inbox.example".into(),
+    )])
+    .with_group_route(
+        group_id.clone(),
+        vec![0xEE; 32],
+        vec![TransportEndpoint("wss://replacement.example".into())],
+    );
+    let mut resumed = AccountDeviceRuntime::new(
+        reopened,
+        adapter.clone(),
+        replacement_policy,
+        RecordingKeyPackages::default(),
+    );
+    let effects = resumed.drain().await.unwrap();
+
+    assert!(effects.fanout[0].mls_confirmed);
+    assert!(effects.fanout[0].fanout_complete);
+    assert_eq!(resumed.session().epoch(&group_id).unwrap().0, 2);
+    let attempts = adapter.publishes();
+    let resumed_attempts = &attempts[pre_restart_publish_count..];
+    assert_eq!(resumed_attempts.len(), endpoints.len());
+    assert!(resumed_attempts.iter().all(|attempt| {
+        attempt.message.id == message.id && attempt.message.payload == message.payload
+    }));
+    assert_eq!(
+        resumed_attempts
+            .iter()
+            .flat_map(|attempt| attempt.target.endpoints())
+            .collect::<Vec<_>>(),
+        endpoints.iter().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn frozen_fanout_resumes_after_intent_and_after_send_before_ack_persistence() {
+    assert_frozen_fanout_restart_edge(false).await;
+    assert_frozen_fanout_restart_edge(true).await;
+}
+
+#[tokio::test]
+async fn frozen_fanout_survives_crash_and_ignores_changed_routing_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-frozen-fanout.sqlite");
+    let key_text = "marmot frozen fanout key";
+    let key = SqlCipherKey::new(key_text).unwrap();
+    let mut alice = session(&alice_path, &key, b"alice-frozen-fanout");
+    let mut bob = session(
+        dir.path().join("bob-frozen-fanout.sqlite"),
+        &key,
+        b"bob-frozen-fanout",
+    );
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "frozen fanout".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+
+    let original_endpoints = vec![
+        TransportEndpoint("wss://original-one.example".into()),
+        TransportEndpoint("wss://original-two.example".into()),
+        TransportEndpoint("wss://original-three.example".into()),
+    ];
+    let crash_adapter = CrashAfterFirstAcceptanceAdapter::default();
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                original_endpoints.clone(),
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        crash_adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+    let crashed = tokio::spawn(async move {
+        runtime
+            .send(SendIntent::UpdateGroupData {
+                group_id,
+                name: Some("published before crash".into()),
+                description: None,
+            })
+            .await
+    })
+    .await;
+    assert!(crashed.unwrap_err().is_panic());
+
+    let first_attempts = crash_adapter.publishes();
+    assert_eq!(first_attempts.len(), 2);
+    assert_eq!(
+        first_attempts[0].target.endpoints(),
+        &original_endpoints[..1]
+    );
+    let frozen_id = first_attempts[0].message.id.clone();
+    let frozen_bytes = first_attempts[0].message.payload.clone();
+
+    {
+        let stored = SqliteAccountStorage::open_encrypted(
+            &alice_path,
+            &SqlCipherKey::new(key_text).unwrap(),
+        )
+        .unwrap();
+        let fanouts = stored.list_outbound_fanouts().unwrap();
+        assert_eq!(fanouts.len(), 1);
+        assert_eq!(fanouts[0].message_id(), &frozen_id);
+        assert_eq!(fanouts[0].request().message.payload, frozen_bytes);
+        assert_eq!(fanouts[0].request().target.endpoints(), original_endpoints);
+        assert_eq!(
+            fanouts[0].target_statuses(),
+            &[
+                FanoutTargetStatus::Accepted,
+                FanoutTargetStatus::Attempting,
+                FanoutTargetStatus::NotAttempted,
+            ]
+        );
+        assert_eq!(fanouts[0].mls_state(), FanoutMlsState::Confirmed);
+    }
+
+    let reopened = session(
+        &alice_path,
+        &SqlCipherKey::new(key_text).unwrap(),
+        b"alice-frozen-fanout",
+    );
+    let replacement_endpoints = vec![TransportEndpoint("wss://replacement.example".into())];
+    let resumed_adapter = RecordingAdapter::default();
+    let replacement_policy = StaticTransportRouting::new(vec![TransportEndpoint(
+        "wss://replacement-inbox.example".into(),
+    )])
+    .with_group_route(
+        created.group_id.clone(),
+        vec![0xEE; 32],
+        replacement_endpoints,
+    );
+    let mut resumed = AccountDeviceRuntime::new(
+        reopened,
+        resumed_adapter.clone(),
+        replacement_policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let effects = resumed.resume_outbound_fanouts().await.unwrap();
+    assert_eq!(effects.reports.len(), 1);
+    assert_eq!(effects.fanout.len(), 1);
+    assert!(effects.fanout[0].mls_confirmed);
+    assert!(effects.fanout[0].fanout_complete);
+
+    let resumed_attempts = resumed_adapter.publishes();
+    assert_eq!(resumed_attempts.len(), 2);
+    assert_eq!(
+        resumed_attempts
+            .iter()
+            .flat_map(|request| request.target.endpoints())
+            .collect::<Vec<_>>(),
+        vec![&original_endpoints[1], &original_endpoints[2]]
+    );
+    assert!(resumed_attempts.iter().all(|request| {
+        request.message.id == frozen_id && request.message.payload == frozen_bytes
+    }));
+
+    let duplicate_resume = resumed.resume_outbound_fanouts().await.unwrap();
+    assert!(duplicate_resume.reports.is_empty());
+    assert_eq!(resumed_adapter.publishes().len(), 2);
 }

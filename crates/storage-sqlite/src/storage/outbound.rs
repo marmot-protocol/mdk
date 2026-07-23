@@ -1,10 +1,11 @@
 use crate::connection::retry_on_busy;
 use crate::{SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, serialize};
+use cgka_traits::OutboundFanout;
 use cgka_traits::storage::{
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageResult,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageResult,
 };
 use cgka_traits::types::{GroupId, MessageId};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 impl OutboundIntentStorage for SqliteAccountStorage {
     fn put_queued_outbound_intent(&self, record: &QueuedOutboundIntent) -> StorageResult<()> {
@@ -84,11 +85,193 @@ impl OutboundIntentStorage for SqliteAccountStorage {
     }
 }
 
+impl OutboundFanoutStorage for SqliteAccountStorage {
+    fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> StorageResult<()> {
+        let serialized = serialize(fanout)?;
+        let write = || {
+            let conn = self.lock()?;
+            let previous = conn
+                .query_row(
+                    "SELECT record FROM cgka_outbound_fanout WHERE message_id = ?1",
+                    params![fanout.message_id().as_slice()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .storage()?
+                .map(|record| deserialize::<OutboundFanout>(&record))
+                .transpose()?;
+            if let Some(previous) = previous {
+                fanout.validate_successor_of(&previous).map_err(|_| {
+                    StorageError::Backend(
+                        "outbound fanout update would alter or regress durable state".into(),
+                    )
+                })?;
+            }
+            conn.execute(
+                "INSERT INTO cgka_outbound_fanout (message_id, group_id, record)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    group_id = excluded.group_id,
+                    record = excluded.record",
+                params![
+                    fanout.message_id().as_slice(),
+                    fanout.group_id().map(GroupId::as_slice),
+                    serialized,
+                ],
+            )
+            .storage()?;
+            Ok(())
+        };
+        if self.connection.is_current_thread_transaction_owner() {
+            write()
+        } else {
+            retry_on_busy(write)
+        }
+    }
+
+    fn outbound_fanout(&self, message_id: &MessageId) -> StorageResult<Option<OutboundFanout>> {
+        let conn = self.lock()?;
+        let record = conn
+            .query_row(
+                "SELECT record FROM cgka_outbound_fanout WHERE message_id = ?1",
+                params![message_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .storage()?;
+        record.map(|record| deserialize(&record)).transpose()
+    }
+
+    fn list_outbound_fanouts(&self) -> StorageResult<Vec<OutboundFanout>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT record FROM cgka_outbound_fanout
+                 ORDER BY insert_order",
+            )
+            .storage()?;
+        let records = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        records.iter().map(|record| deserialize(record)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::SqliteAccountStorage;
     use crate::storage::test_support::{gid, mid, sample_group, sample_queued_intent};
-    use cgka_traits::storage::{GroupStorage, OutboundIntentStorage};
+    use cgka_traits::engine_state::PendingStateRef;
+    use cgka_traits::storage::{GroupStorage, OutboundFanoutStorage, OutboundIntentStorage};
+    use cgka_traits::{
+        MemberId, OutboundFanout, Timestamp, TransportEndpoint, TransportEnvelope,
+        TransportMessage, TransportPublishRequest, TransportPublishTarget, TransportSource,
+    };
+
+    fn sample_fanout(id: u8) -> OutboundFanout {
+        OutboundFanout::stage(
+            TransportPublishRequest {
+                account_id: MemberId::new(vec![0xA1; 32]),
+                message: TransportMessage {
+                    id: mid(id),
+                    payload: vec![id; 64],
+                    timestamp: Timestamp(55),
+                    causal_deps: Vec::new(),
+                    source: TransportSource("marmot.transport.nostr".into()),
+                    envelope: TransportEnvelope::GroupMessage {
+                        transport_group_id: vec![0xC3; 32],
+                    },
+                },
+                target: TransportPublishTarget::Group {
+                    group_id: gid(1),
+                    transport_group_id: vec![0xC3; 32],
+                    endpoints: vec![
+                        TransportEndpoint("wss://one.example".into()),
+                        TransportEndpoint("wss://two.example".into()),
+                    ],
+                },
+                required_acks: 1,
+            },
+            Some(PendingStateRef::new(41)),
+            Some(gid(1)),
+            99,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn frozen_outbound_fanout_round_trips_and_updates_in_place() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let mut fanout = sample_fanout(7);
+
+        store.put_outbound_fanout(&fanout).unwrap();
+        fanout.mark_attempt_started(0).unwrap();
+        store.put_outbound_fanout(&fanout).unwrap();
+        fanout.mark_target_accepted(0).unwrap();
+        store.put_outbound_fanout(&fanout).unwrap();
+
+        assert_eq!(
+            store.outbound_fanout(&mid(7)).unwrap(),
+            Some(fanout.clone())
+        );
+        assert_eq!(store.list_outbound_fanouts().unwrap(), vec![fanout]);
+    }
+
+    #[test]
+    fn frozen_outbound_fanout_survives_reopen_with_exact_bytes_and_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fanout.sqlite");
+        let key = crate::SqlCipherKey::new("durable fanout key").unwrap();
+        let expected = sample_fanout(8);
+        {
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+            store.put_outbound_fanout(&expected).unwrap();
+        }
+
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(reopened.outbound_fanout(&mid(8)).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn frozen_outbound_fanout_rejects_route_replacement_and_state_regression() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let initial = sample_fanout(9);
+        store.put_outbound_fanout(&initial).unwrap();
+
+        let mut replacement_request = initial.request().clone();
+        replacement_request.target = TransportPublishTarget::Group {
+            group_id: gid(1),
+            transport_group_id: vec![0xC3; 32],
+            endpoints: vec![TransportEndpoint("wss://replacement.example".into())],
+        };
+        let replacement = OutboundFanout::stage(
+            replacement_request,
+            Some(PendingStateRef::new(41)),
+            Some(gid(1)),
+            99,
+        )
+        .unwrap();
+        assert!(store.put_outbound_fanout(&replacement).is_err());
+        assert_eq!(
+            store.outbound_fanout(&mid(9)).unwrap(),
+            Some(initial.clone())
+        );
+
+        let mut attempting = initial.clone();
+        attempting.mark_attempt_started(0).unwrap();
+        store.put_outbound_fanout(&attempting).unwrap();
+        let mut accepted = attempting.clone();
+        accepted.mark_target_accepted(0).unwrap();
+        store.put_outbound_fanout(&accepted).unwrap();
+
+        assert!(store.put_outbound_fanout(&attempting).is_err());
+        assert_eq!(store.outbound_fanout(&mid(9)).unwrap(), Some(accepted));
+    }
 
     #[test]
     fn queued_outbound_intents_are_group_scoped_and_ordered() {

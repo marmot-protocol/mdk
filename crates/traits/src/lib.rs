@@ -81,13 +81,14 @@ pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, Stored
 pub use peeler::{GroupMessageMetadata, GroupMessageMetadataError, TransportPeeler};
 pub use storage::{
     CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MessageStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
-    WelcomeStorage,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
+    StorageProvider, StorageResult, WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 pub use transport_adapter::{
+    FanoutMlsState, FanoutTargetStatus, OutboundFanout, OutboundFanoutOutcome,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
     TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointFailure,
     TransportEndpointReceipt, TransportGroupSubscription, TransportGroupSync,

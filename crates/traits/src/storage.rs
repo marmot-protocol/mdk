@@ -13,6 +13,7 @@ use crate::capabilities::{CapabilityRequirement, GroupCapabilities};
 use crate::engine::SendIntent;
 use crate::group::{Group, Member};
 use crate::message::{MessageRecord, MessageState};
+use crate::transport_adapter::OutboundFanout;
 use crate::types::{Backend, EpochId, GroupId, MemberId, MessageId};
 use crate::welcome::PendingWelcome;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider as OpenMlsStorageProvider};
@@ -121,6 +122,17 @@ pub trait OutboundIntentStorage {
         group_id: &GroupId,
     ) -> StorageResult<Vec<QueuedOutboundIntent>>;
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()>;
+}
+
+// ── OutboundFanoutStorage ──────────────────────────────────────────────────
+
+/// Durable frozen transport fanouts, keyed by the signed message id.
+pub trait OutboundFanoutStorage {
+    fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> StorageResult<()>;
+
+    fn outbound_fanout(&self, message_id: &MessageId) -> StorageResult<Option<OutboundFanout>>;
+
+    fn list_outbound_fanouts(&self) -> StorageResult<Vec<OutboundFanout>>;
 }
 
 // ── LeaveRequestStorage ────────────────────────────────────────────────────
@@ -249,6 +261,7 @@ pub trait StorageProvider:
     GroupStorage
     + MessageStorage
     + OutboundIntentStorage
+    + OutboundFanoutStorage
     + LeaveRequestStorage
     + WelcomeStorage
     + CapabilityStorage
