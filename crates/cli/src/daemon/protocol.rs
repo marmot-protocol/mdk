@@ -327,12 +327,30 @@ impl DaemonClient {
 }
 
 pub(crate) async fn write_daemon_output(stream: &mut UnixStream, output: &CliOutput) {
+    let _ = write_daemon_output_within(stream, output, DAEMON_RESPONSE_WRITE_TIMEOUT).await;
+}
+
+pub(crate) async fn write_daemon_output_within<W>(
+    stream: &mut W,
+    output: &CliOutput,
+    timeout_after: Duration,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
     let Ok(mut response) = serde_json::to_vec(output) else {
-        return;
+        return false;
     };
     response.push(b'\n');
-    let _ = stream.write_all(&response).await;
-    let _ = stream.shutdown().await;
+    matches!(
+        tokio::time::timeout(timeout_after, async {
+            stream.write_all(&response).await?;
+            stream.flush().await?;
+            stream.shutdown().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 pub(crate) async fn read_daemon_request(

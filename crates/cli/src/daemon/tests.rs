@@ -49,6 +49,50 @@ async fn daemon_stream_response_write_times_out_when_flush_stalls() {
 }
 
 #[tokio::test]
+async fn daemon_one_shot_response_timeout_includes_shutdown() {
+    struct ShutdownStallingWriter;
+
+    impl tokio::io::AsyncWrite for ShutdownStallingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    let started = Instant::now();
+    let written = write_daemon_output_within(
+        &mut ShutdownStallingWriter,
+        &CliOutput {
+            code: 0,
+            stdout: "test".to_owned(),
+            stderr: String::new(),
+        },
+        Duration::from_millis(10),
+    )
+    .await;
+
+    assert!(!written, "a stalled shutdown must fail the one-shot write");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
 async fn run_server_validates_relays_before_creating_runtime_artifacts() {
     let home = tempfile::tempdir().expect("tempdir");
     let home_path = home.path().to_path_buf();

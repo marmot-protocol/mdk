@@ -64,6 +64,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   convergence window. Debug builds retain the override for local development and integration tests.
 - `wnd` streaming subscription responses now have a 15-second whole-frame write deadline, including socket flush, so
   a client that stops reading cannot retain a connection permit indefinitely.
+- `wnd` one-shot responses now apply the same deadline across write, flush, and socket shutdown, preventing a
+  non-reading local client from pinning status, stop, or command workers.
 - `wn-agent` now denies path-based media sends by default and accepts only regular, non-symlink files beneath explicit
   repeatable `--media-allowed-root` directories. Bundled Hermes and OpenClaw launchers stage short-lived copies in a
   dedicated approved directory and clean them up after each send.
