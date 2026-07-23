@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.90-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /workspace
 COPY . .
 ARG TARGETARCH
 RUN case "${TARGETARCH:-$(uname -m)}" in \
-        amd64|x86_64) rustup_toolchain="1.90.0-x86_64-unknown-linux-gnu" ;; \
-        arm64|aarch64) rustup_toolchain="1.90.0-aarch64-unknown-linux-gnu" ;; \
+        amd64|x86_64) rustup_toolchain="1.91.0-x86_64-unknown-linux-gnu" ;; \
+        arm64|aarch64) rustup_toolchain="1.91.0-aarch64-unknown-linux-gnu" ;; \
         *) echo "unsupported build architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
     esac \
     && RUSTUP_TOOLCHAIN="$rustup_toolchain" cargo build --locked --release -p transport-quic-broker --bin marmot-quic-broker

@@ -31,13 +31,16 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-# OpenMLS family — tilde-pinned to avoid silent companion-crate skew.
-openmls = { version = "~0.8.1", features = ["extensions-draft-08"] }
-openmls_basic_credential = "~0.5"
-openmls_memory_storage = { version = "~0.5", features = ["extensions-draft-08"] }
-openmls_rust_crypto = "~0.5"
-openmls_traits = { version = "~0.5", features = ["extensions-draft-08"] }
-tls_codec = "~0.4"
+# OpenMLS family — exact-pinned to the draft-10 last-resort KeyPackage fix.
+# Keep every companion crate on the same repository commit to prevent source skew.
+# Migration: once an upstream OpenMLS release contains this fix, replace all five
+# git entries together with one matching upstream release series and remove the fork pin.
+openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d", features = ["extensions-draft"] }
+openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d" }
+openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d", features = ["extensions-draft"] }
+openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d" }
+openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d", features = ["extensions-draft"] }
+tls_codec = "~0.5"
 
 # async
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }

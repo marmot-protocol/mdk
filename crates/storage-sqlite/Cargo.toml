@@ -23,4 +23,4 @@ zeroize.workspace = true
 tempfile.workspace = true
 
 [features]
-extensions-draft-08 = ["openmls_traits/extensions-draft-08"]
+extensions-draft = ["openmls_traits/extensions-draft"]

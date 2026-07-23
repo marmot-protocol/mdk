@@ -32,7 +32,9 @@ use cgka_traits::transport::{
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
-use openmls::group::MlsGroup;
+use openmls::group::{
+    AppDataUpdateValidationError, CreateCommitError, CreateGroupContextExtProposalError, MlsGroup,
+};
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::BasicCredential;
 use openmls_basic_credential::SignatureKeyPair;
@@ -406,19 +408,20 @@ fn raw_app_message_with_payload(
     }
 }
 
-/// Raw OpenMLS commit that removes `targets` and ALSO replaces the
+/// Assert that OpenMLS rejects a commit that removes `targets` and ALSO replaces the
 /// GroupContext extensions with a copy that drops the `app_data_dictionary`
 /// entirely, so the resulting epoch carries no admin-policy bytes at all.
-/// OpenMLS accepts this shape (its draft-08 dictionary guard only applies to
-/// commits that carry AppDataUpdate proposals), so the Marmot engine must
-/// evaluate the admin/leaf coupling against the carried-forward admin set
-/// (admin-policy-v1.md "Validation") instead of skipping the check.
-fn raw_remove_members_commit_dropping_app_data_dictionary(
+///
+/// This used to construct a malicious wire commit for the MDK receive seams.
+/// OpenMLS upstream commit 34222ef6 now enforces the draft rule during both
+/// construction and receive-side staging, so the public API can no longer
+/// produce that fixture.
+fn assert_openmls_rejects_remove_members_commit_dropping_app_data_dictionary(
     storage: &SqliteAccountStorage,
     sender: &MemberId,
     group_id: &GroupId,
     targets: &[MemberId],
-) -> TransportMessage {
+) {
     let crypto = openmls_rust_crypto::RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
@@ -456,31 +459,24 @@ fn raw_remove_members_commit_dropping_app_data_dictionary(
 
     let mut stripped_extensions = mls_group.extensions().clone();
     stripped_extensions.remove(openmls::extensions::ExtensionType::AppDataDictionary);
-    let commit_bundle = mls_group
+    let result = mls_group
         .commit_builder()
         .propose_removals(leaf_indices)
         .propose_group_context_extensions(stripped_extensions)
         .expect("propose GCE without app_data_dictionary")
         .load_psks(provider.storage())
         .expect("load PSKs")
-        .build(provider.rand(), provider.crypto(), &signer, |_| true)
-        .expect("build raw remove+GCE commit")
-        .stage_commit(&provider)
-        .expect("stage raw remove+GCE commit");
-    let (commit, _welcome, _group_info) = commit_bundle.into_contents();
-    let payload = commit
-        .tls_serialize_detached()
-        .expect("serialize raw remove+GCE commit");
-    TransportMessage {
-        id: hash_id(&payload),
-        payload,
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("raw-openmls-remove-drop-dict".into()),
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-    }
+        .build(provider.rand(), provider.crypto(), &signer, |_| true);
+    let error = match result {
+        Ok(_) => panic!("OpenMLS accepted remove+GCE commit that drops app_data_dictionary"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        CreateCommitError::AppDataUpdateValidationError(
+            AppDataUpdateValidationError::CannotUpdateDictionaryDirectly
+        )
+    );
 }
 
 fn raw_remove_members_commit_with_admin_policy(
@@ -566,8 +562,8 @@ fn raw_remove_members_commit_with_admin_policy(
     }
 }
 
-/// How a raw GroupContextExtensions commit tampers with the group's
-/// `app_data_dictionary` (see [`raw_group_context_extensions_tamper_commit`]).
+/// How a GroupContextExtensions commit attempts to tamper with the group's
+/// `app_data_dictionary`.
 enum GceDictionaryTamper {
     /// Replace the extensions with a set omitting the dictionary entirely.
     StripDictionary,
@@ -578,17 +574,14 @@ enum GceDictionaryTamper {
     ReplaceEntry(AppComponentId, Vec<u8>),
 }
 
-/// Build a raw OpenMLS GroupContextExtensions-only commit (no member changes)
-/// that tampers with the Marmot component state in the resulting GroupContext.
-/// OpenMLS's draft-08 dictionary guard only runs when a commit carries
-/// `AppDataUpdate` proposals, so every tamper here builds and stages cleanly —
-/// only the engine's app-component integrity check can reject it.
-fn raw_group_context_extensions_tamper_commit(
+/// Assert that OpenMLS rejects a GroupContextExtensions-only commit (no member
+/// changes) that tampers with the app-data dictionary.
+fn assert_openmls_rejects_group_context_extensions_tamper(
     storage: &SqliteAccountStorage,
     sender: &MemberId,
     group_id: &GroupId,
     tamper: GceDictionaryTamper,
-) -> TransportMessage {
+) {
     let crypto = openmls_rust_crypto::RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
@@ -637,22 +630,19 @@ fn raw_group_context_extensions_tamper_commit(
     }
     let new_extensions = Extensions::from_vec(new_extensions).expect("tampered extensions build");
 
-    let (commit, _welcome, _group_info) = mls_group
-        .update_group_context_extensions(&provider, new_extensions, &signer)
-        .expect("raw OpenMLS GroupContextExtensions tamper commit");
-    let payload = commit
-        .tls_serialize_detached()
-        .expect("serialize raw GCE tamper commit");
-    TransportMessage {
-        id: hash_id(&payload),
-        payload,
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("raw-openmls-gce-tamper".to_string()),
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: group_id.as_slice().to_vec(),
-        },
-    }
+    let error = match mls_group.update_group_context_extensions(&provider, new_extensions, &signer)
+    {
+        Ok(_) => panic!("OpenMLS accepted direct app_data_dictionary tamper"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CreateGroupContextExtProposalError::CreateCommitError(
+            CreateCommitError::AppDataUpdateValidationError(
+                AppDataUpdateValidationError::CannotUpdateDictionaryDirectly
+            )
+        )
+    ));
 }
 
 #[tokio::test]
@@ -888,29 +878,23 @@ async fn convergence_rejects_remove_that_leaves_orphan_admin_key() {
 }
 
 #[tokio::test]
-async fn convergence_rejects_remove_whose_context_carries_no_admin_policy_bytes() {
-    // mdk#393 / admin-policy-v1.md "Validation": the cross-component
-    // check runs on every commit that changes the member leaf set, whether or
-    // not the commit carries admin-policy bytes. Bob's raw commit removes
-    // Alice's last member leaf and swaps in GroupContext extensions with no
-    // app_data_dictionary, so the staged context has no admin-policy entry to
-    // read. The resulting epoch's admin set is the prior set carried forward
-    // ({Alice, Bob}), so the commit must be rejected instead of skipping the
-    // check on the missing bytes.
+async fn openmls_rejects_remove_commit_dropping_app_data_dictionary_at_construction() {
+    // OpenMLS upstream commit 34222ef6 moved this draft invariant into the
+    // shared validation used by commit construction and receive-side staging.
+    // Pin the construction seam here: a malicious wire fixture can no longer
+    // be produced through the public API, and the same validation method runs
+    // before an inbound commit is staged.
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut bob, bob_storage) = build_client(b"bob");
-    let (mut carol, carol_storage) = build_client(b"carol");
     let bob_id = bob.self_id();
     let alice_id = alice.self_id();
-    let carol_id = carol.self_id();
     let bob_kp = bob.fresh_key_package().await.unwrap();
-    let carol_kp = carol.fresh_key_package().await.unwrap();
 
     let (group_id, create) = alice
         .create_group(CreateGroupRequest {
-            name: "convergence-carried-forward-admins".into(),
+            name: "openmls-rejects-dictionary-drop".into(),
             description: "".into(),
-            members: vec![bob_kp, carol_kp],
+            members: vec![bob_kp],
             required_features: vec![],
             app_components: vec![],
             initial_admins: vec![bob_id.clone()],
@@ -925,158 +909,12 @@ async fn convergence_rejects_remove_whose_context_carries_no_admin_policy_bytes(
     bob.join_welcome(welcome_for(&welcomes, b"bob"))
         .await
         .unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
-        .await
-        .unwrap();
 
-    let invalid_remove = route(
-        raw_remove_members_commit_dropping_app_data_dictionary(
-            &bob_storage,
-            &bob.self_id(),
-            &group_id,
-            std::slice::from_ref(&alice_id),
-        ),
+    assert_openmls_rejects_remove_members_commit_dropping_app_data_dictionary(
+        &bob_storage,
+        &bob.self_id(),
         &group_id,
-    );
-    carol
-        .buffer_openmls_convergence_message(&group_id, invalid_remove.clone(), 1_000)
-        .expect("invalid remove commit buffered");
-
-    let result = carol
-        .converge_stored_openmls_messages(&group_id, 1_000_000)
-        .expect("stored OpenMLS messages converge");
-
-    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert!(
-        result.accepted_commits.is_empty(),
-        "remove with no admin-policy bytes must not be accepted: {result:?}"
-    );
-    assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.kind == MessageKind::Commit
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
-                && dropped.message_id == content_hex(&invalid_remove)
-        }),
-        "expected invalid remove dropped as InvalidAgainstCandidateState, got {:?}",
-        result.dropped_messages
-    );
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
-    let stored_group = carol_storage.get_group(&group_id).expect("group stored");
-    assert_eq!(stored_group.epoch, EpochId(1));
-    assert_eq!(
-        stored_group.members.len(),
-        3,
-        "invalid convergence commit must not change stored member count"
-    );
-    let projected_members = carol.members(&group_id).expect("members projected");
-    assert_eq!(
-        projected_members.len(),
-        3,
-        "invalid convergence commit must not change projected member count"
-    );
-    for expected in [&alice_id, &bob_id, &carol_id] {
-        assert!(
-            projected_members
-                .iter()
-                .any(|member| member.id == *expected),
-            "projected members should still contain {expected:?}: {projected_members:?}"
-        );
-    }
-    assert_message_state(
-        &carol_storage,
-        &invalid_remove,
-        MessageState::EpochInvalidated,
-    );
-}
-
-#[tokio::test]
-async fn live_ingest_rejects_remove_whose_context_carries_no_admin_policy_bytes() {
-    // Sibling of the stored-convergence test above, pushed through the live
-    // `ingest` entry point instead of pre-buffering — pinning the hot path a
-    // relay-delivered commit takes. The invalid remove must never be applied:
-    // the outcome is terminal, and Carol's epoch, membership, and admin view
-    // stay untouched.
-    let (mut alice, _alice_storage) = build_client(b"alice");
-    let (mut bob, bob_storage) = build_client(b"bob");
-    let (mut carol, carol_storage) = build_client(b"carol");
-    let bob_id = bob.self_id();
-    let alice_id = alice.self_id();
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let carol_kp = carol.fresh_key_package().await.unwrap();
-
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "live-ingest-carried-forward-admins".into(),
-            description: "".into(),
-            members: vec![bob_kp, carol_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![bob_id.clone()],
-        })
-        .await
-        .unwrap();
-    let (pending, welcomes) = match create {
-        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
-        other => panic!("expected GroupCreated, got {other:?}"),
-    };
-    alice.confirm_published(pending).await.unwrap();
-    bob.join_welcome(welcome_for(&welcomes, b"bob"))
-        .await
-        .unwrap();
-    carol
-        .join_welcome(welcome_for(&welcomes, b"carol"))
-        .await
-        .unwrap();
-
-    let invalid_remove = route(
-        raw_remove_members_commit_dropping_app_data_dictionary(
-            &bob_storage,
-            &bob.self_id(),
-            &group_id,
-            std::slice::from_ref(&alice_id),
-        ),
-        &group_id,
-    );
-
-    let outcome = carol.ingest(invalid_remove.clone()).await.unwrap();
-    assert!(
-        !matches!(outcome, IngestOutcome::Processed),
-        "invalid remove must not be applied via live ingest, got {outcome:?}"
-    );
-    // Drive convergence to quiescence in case the inline pass left the commit
-    // pending; the commit must still never be accepted.
-    let result = carol
-        .converge_stored_openmls_messages(&group_id, u64::MAX)
-        .expect("stored OpenMLS messages converge");
-    assert!(
-        result.accepted_commits.is_empty(),
-        "invalid remove must not be accepted after quiescence: {result:?}"
-    );
-
-    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
-    let stored_group = carol_storage.get_group(&group_id).expect("group stored");
-    assert_eq!(stored_group.epoch, EpochId(1));
-    assert_eq!(stored_group.members.len(), 3);
-    let projected_members = carol.members(&group_id).expect("members projected");
-    assert_eq!(projected_members.len(), 3);
-    assert!(
-        projected_members.iter().any(|member| member.id == alice_id),
-        "alice must remain a member on carol's view: {projected_members:?}"
-    );
-    let alice_admin: [u8; 32] = alice_id.as_slice().try_into().unwrap();
-    let bob_admin: [u8; 32] = bob_id.as_slice().try_into().unwrap();
-    let mut expected_admins = vec![alice_admin, bob_admin];
-    expected_admins.sort();
-    assert_eq!(
-        carol.admin_pubkeys(&group_id).unwrap(),
-        expected_admins,
-        "carol's admin view must be unchanged"
-    );
-    assert_message_state(
-        &carol_storage,
-        &invalid_remove,
-        MessageState::EpochInvalidated,
+        std::slice::from_ref(&alice_id),
     );
 }
 
@@ -1199,264 +1037,44 @@ async fn bootstrap_gce_tamper_group(
     group_id
 }
 
-fn admin_key(member: &MemberId) -> [u8; 32] {
-    member
-        .as_slice()
-        .try_into()
-        .expect("test identities are 32-byte account keys")
-}
-
-/// Ingest `tampered` on `recipient` and assert the GCE tamper commit is
-/// rejected: outcome `Stale`, epoch and sole admin unchanged, and the stored
-/// message never `Processed`. Inbound same-epoch commits route through
-/// convergence, and the ingest-driven pass runs inside the input window, so
-/// the terminal disposition may not be persisted yet — the pinned invariant is
-/// that the tamper commit is never applied.
-async fn assert_gce_tamper_rejected_by_ingest(
-    recipient: &mut Engine<SqliteAccountStorage>,
-    recipient_storage: &SqliteAccountStorage,
-    group_id: &GroupId,
-    tampered: &TransportMessage,
-    expected_admin: &MemberId,
-) {
-    let outcome = recipient
-        .ingest(tampered.clone())
-        .await
-        .expect("ingest completes");
-    assert!(
-        matches!(outcome, IngestOutcome::Stale { .. }),
-        "GCE tamper commit must not be processed: {outcome:?}"
-    );
-    assert_eq!(recipient.epoch(group_id).unwrap(), EpochId(1));
-    assert_eq!(
-        recipient.admin_pubkeys(group_id).unwrap(),
-        vec![admin_key(expected_admin)],
-        "the tampered component state must not take effect"
-    );
-    let record = recipient_storage
-        .get_message(&content_id(tampered))
-        .expect("tamper commit remains stored");
-    assert_ne!(record.state, MessageState::Processed);
-}
-
-/// Buffer `tampered` into STORED CONVERGENCE on `recipient` and converge with
-/// a closed input window; assert the pass settles with the commit dropped as
-/// `InvalidAgainstCandidateState`, epoch and sole admin unchanged, and the
-/// message `EpochInvalidated`.
-fn assert_gce_tamper_rejected_by_convergence(
-    recipient: &mut Engine<SqliteAccountStorage>,
-    recipient_storage: &SqliteAccountStorage,
-    group_id: &GroupId,
-    tampered: &TransportMessage,
-    expected_admin: &MemberId,
-) {
-    recipient
-        .buffer_openmls_convergence_message(group_id, tampered.clone(), 1_000)
-        .expect("GCE tamper commit buffered");
-    let result = recipient
-        .converge_stored_openmls_messages(group_id, 1_000_000)
-        .expect("stored OpenMLS messages converge");
-
-    assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
-    assert!(
-        result.accepted_commits.is_empty(),
-        "GCE tamper commit must not be accepted: {result:?}"
-    );
-    assert!(
-        result.dropped_messages.iter().any(|dropped| {
-            dropped.kind == MessageKind::Commit
-                && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
-                && dropped.message_id == content_hex(tampered)
-        }),
-        "expected GCE tamper commit dropped as InvalidAgainstCandidateState, got {:?}",
-        result.dropped_messages
-    );
-    assert_eq!(recipient.epoch(group_id).unwrap(), EpochId(1));
-    assert_eq!(
-        recipient_storage
-            .get_group(group_id)
-            .expect("group stored")
-            .epoch,
-        EpochId(1)
-    );
-    assert_eq!(
-        recipient.admin_pubkeys(group_id).unwrap(),
-        vec![admin_key(expected_admin)],
-        "the tampered component state must not take effect"
-    );
-    assert_message_state(recipient_storage, tampered, MessageState::EpochInvalidated);
-}
-
 #[tokio::test]
-async fn ingest_rejects_group_context_commit_stripping_app_data_dictionary() {
-    // Regression: OpenMLS's draft-08 dictionary guard only validates the
-    // GroupContext against a commit's AppDataUpdate proposals, so an
-    // admin-authored GroupContextExtensions-only commit could replace the
-    // extensions with a set that omits the app_data_dictionary entirely.
-    // Merging it cannot orphan an admin key (the absent component is the empty
-    // admin set), but it silently makes the group admin-less and freezes every
-    // admin-gated operation. `ingest` must classify the strip commit invalid
-    // instead of materializing the admin-less epoch.
+async fn openmls_rejects_bare_gce_dictionary_tampering_at_construction() {
+    // OpenMLS upstream commit 34222ef6 closes the bare-GCE bypass before the
+    // no-AppDataUpdate early return. The same validator is called by inbound
+    // staged-commit processing, while this test pins all three mutations at
+    // the public construction seam available to MDK integration tests.
     let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut bob, bob_storage) = build_client(b"bob");
-    let alice_id = alice.self_id();
-    let group_id =
-        bootstrap_gce_tamper_group(&mut alice, &mut bob, b"bob", "ingest-gce-dictionary-strip")
-            .await;
-
-    let strip = route(
-        raw_group_context_extensions_tamper_commit(
-            &alice_storage,
-            &alice_id,
-            &group_id,
-            GceDictionaryTamper::StripDictionary,
-        ),
-        &group_id,
-    );
-    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &strip, &alice_id)
-        .await;
-}
-
-#[tokio::test]
-async fn ingest_rejects_group_context_commit_dropping_required_component_entry() {
-    // Entry-level variant of the dictionary strip: the GroupContextExtensions
-    // commit keeps the app_data_dictionary but replaces it with one that omits
-    // the required admin-policy component's state. validate_app_component_remove
-    // only sees AppDataUpdate::Remove operations, so without the staged-commit
-    // integrity check this strip would also merge.
-    let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut bob, bob_storage) = build_client(b"bob");
-    let alice_id = alice.self_id();
-    let group_id = bootstrap_gce_tamper_group(
-        &mut alice,
-        &mut bob,
-        b"bob",
-        "ingest-gce-admin-policy-strip",
-    )
-    .await;
-
-    let strip = route(
-        raw_group_context_extensions_tamper_commit(
-            &alice_storage,
-            &alice_id,
-            &group_id,
-            GceDictionaryTamper::DropEntry(GROUP_ADMIN_POLICY_COMPONENT_ID),
-        ),
-        &group_id,
-    );
-    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &strip, &alice_id)
-        .await;
-}
-
-#[tokio::test]
-async fn convergence_rejects_group_context_commit_stripping_app_data_dictionary() {
-    // The same dictionary-strip commit through STORED CONVERGENCE. Before the
-    // integrity check, a GCE-only strip commit with no member removals was
-    // ACCEPTED here — convergence materialized the admin-less epoch. It must
-    // classify the commit as invalid instead.
-    let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_client(b"carol");
-    let alice_id = alice.self_id();
-    let group_id = bootstrap_gce_tamper_group(
-        &mut alice,
-        &mut carol,
-        b"carol",
-        "convergence-gce-dictionary-strip",
-    )
-    .await;
-
-    let strip = route(
-        raw_group_context_extensions_tamper_commit(
-            &alice_storage,
-            &alice_id,
-            &group_id,
-            GceDictionaryTamper::StripDictionary,
-        ),
-        &group_id,
-    );
-    assert_gce_tamper_rejected_by_convergence(
-        &mut carol,
-        &carol_storage,
-        &group_id,
-        &strip,
-        &alice_id,
-    );
-}
-
-#[tokio::test]
-async fn ingest_rejects_group_context_commit_rewriting_admin_policy_bytes() {
-    // Content-integrity variant: the GroupContextExtensions commit keeps the
-    // app_data_dictionary and every required entry PRESENT, but rewrites the
-    // admin-policy bytes to a different (well-formed) admin set — with no
-    // AppDataUpdate proposal carrying the change. The rewritten set names a
-    // member with a leaf, so the admin-leaf coupling check passes, and the
-    // presence rules pass too; only the AppDataUpdate attribution rule can
-    // reject it. Without it, an admin could rewrite any required component's
-    // bytes (admin set, profile, routing, retention) bypassing the component
-    // validators entirely.
-    let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut bob, _bob_storage) = build_client(b"bob");
     let alice_id = alice.self_id();
     let bob_id = bob.self_id();
     let group_id = bootstrap_gce_tamper_group(
         &mut alice,
         &mut bob,
         b"bob",
-        "ingest-gce-admin-policy-rewrite",
+        "openmls-rejects-bare-gce-tamper",
     )
     .await;
 
-    let rewrite = route(
-        raw_group_context_extensions_tamper_commit(
-            &alice_storage,
-            &alice_id,
-            &group_id,
-            GceDictionaryTamper::ReplaceEntry(
-                GROUP_ADMIN_POLICY_COMPONENT_ID,
-                encode_admin_policy_for_test(std::slice::from_ref(&bob_id)),
-            ),
-        ),
-        &group_id,
-    );
-    assert_gce_tamper_rejected_by_ingest(&mut bob, &bob_storage, &group_id, &rewrite, &alice_id)
-        .await;
-}
-
-#[tokio::test]
-async fn convergence_rejects_group_context_commit_rewriting_admin_policy_bytes() {
-    // The same admin-policy byte rewrite through STORED CONVERGENCE with a
-    // closed input window: the commit must be classified invalid, not
-    // materialize an epoch whose admin set was swapped outside AppDataUpdate.
-    let (mut alice, alice_storage) = build_client(b"alice");
-    let (mut carol, carol_storage) = build_client(b"carol");
-    let alice_id = alice.self_id();
-    let carol_id = carol.self_id();
-    let group_id = bootstrap_gce_tamper_group(
-        &mut alice,
-        &mut carol,
-        b"carol",
-        "convergence-gce-admin-policy-rewrite",
-    )
-    .await;
-
-    let rewrite = route(
-        raw_group_context_extensions_tamper_commit(
-            &alice_storage,
-            &alice_id,
-            &group_id,
-            GceDictionaryTamper::ReplaceEntry(
-                GROUP_ADMIN_POLICY_COMPONENT_ID,
-                encode_admin_policy_for_test(std::slice::from_ref(&carol_id)),
-            ),
-        ),
-        &group_id,
-    );
-    assert_gce_tamper_rejected_by_convergence(
-        &mut carol,
-        &carol_storage,
-        &group_id,
-        &rewrite,
+    assert_openmls_rejects_group_context_extensions_tamper(
+        &alice_storage,
         &alice_id,
+        &group_id,
+        GceDictionaryTamper::StripDictionary,
+    );
+    assert_openmls_rejects_group_context_extensions_tamper(
+        &alice_storage,
+        &alice_id,
+        &group_id,
+        GceDictionaryTamper::DropEntry(GROUP_ADMIN_POLICY_COMPONENT_ID),
+    );
+    assert_openmls_rejects_group_context_extensions_tamper(
+        &alice_storage,
+        &alice_id,
+        &group_id,
+        GceDictionaryTamper::ReplaceEntry(
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            encode_admin_policy_for_test(std::slice::from_ref(&bob_id)),
+        ),
     );
 }
 

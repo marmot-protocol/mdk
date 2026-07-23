@@ -1,4 +1,4 @@
-FROM rust:1.90-bookworm
+FROM rust:1.91-bookworm
 
 ARG HERMES_AGENT_REPO_URL=https://github.com/NousResearch/hermes-agent.git
 ARG HERMES_AGENT_REF=

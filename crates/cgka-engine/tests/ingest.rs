@@ -14,7 +14,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
-use cgka_traits::storage::MessageStorage;
+use cgka_traits::storage::{MessageStorage, StorageError};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -1130,6 +1130,127 @@ async fn ingest_own_created_message_returns_own_echo() {
         }
     ));
     let _ = (bob, create);
+}
+
+/// A database created before durable sent-content markers existed can still
+/// contain an outbound MLS message that OpenMLS itself recognizes as ours.
+/// If that echo was buffered before peeling, the library-level `OwnPrivateMessage`
+/// fallback must retire the raw retry row instead of leaving it replayable.
+#[tokio::test]
+async fn buffered_legacy_own_echo_retires_raw_retry_row() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_client_with_storage(storage.clone(), b"alice-legacy-own-echo");
+    let mut bob = build_client(b"bob-legacy-own-echo");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "legacy own echo".into(),
+            description: "".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, mut welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    // Roll the local store back across the send to model a legacy database
+    // that has the MLS group state but no durable sent-content marker.
+    const SNAPSHOT: &str = "before-legacy-own-echo";
+    storage.create_group_snapshot(&group_id, SNAPSHOT).unwrap();
+    let own_message = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, b"legacy own echo"),
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg } => msg,
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    };
+    let own_content_id = content_id(&own_message);
+    assert_eq!(
+        storage.get_message(&own_content_id).unwrap().state,
+        MessageState::Sent,
+        "the modern send path must first create the marker removed below"
+    );
+    storage
+        .rollback_group_to_snapshot(&group_id, SNAPSHOT)
+        .unwrap();
+    storage.release_group_snapshot(&group_id, SNAPSHOT).unwrap();
+    assert!(
+        matches!(
+            storage.get_message(&own_content_id),
+            Err(StorageError::NotFound)
+        ),
+        "the simulated legacy store must not retain the sent-content marker"
+    );
+
+    // Rebuild to clear the hot-process sent-id cache as a real restart would.
+    drop(alice);
+    let mut alice = build_client_with_storage(storage.clone(), b"alice-legacy-own-echo");
+    alice.hydrate_stable_groups_from_storage().unwrap();
+
+    // Buffer the echo before peeling while a local commit awaits publication.
+    let staged = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    let raw_id = MessageId::new(b"legacy-own-echo-wrapper".to_vec());
+    let echoed = TransportMessage {
+        id: raw_id.clone(),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..own_message
+    };
+    assert!(
+        matches!(
+            alice.ingest(echoed).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ),
+        "the own echo must enter through the raw retry lifecycle"
+    );
+    assert_eq!(
+        storage.get_message(&raw_id).unwrap().state,
+        MessageState::Retryable
+    );
+
+    alice.publish_failed(staged).await.unwrap();
+
+    assert_eq!(
+        storage.get_message(&own_content_id).unwrap().state,
+        MessageState::Processed,
+        "OpenMLS must classify and terminalize the legacy own content"
+    );
+    assert_eq!(
+        storage.get_message(&raw_id).unwrap().state,
+        MessageState::Failed,
+        "the raw retry row must be retired by the OwnEcho fallback"
+    );
+    assert!(
+        alice
+            .drain_events()
+            .into_iter()
+            .all(|event| !matches!(event, GroupEvent::MessageReceived { .. })),
+        "an own echo must not surface as an inbound application message"
+    );
 }
 
 #[tokio::test]

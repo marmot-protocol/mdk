@@ -17,11 +17,13 @@ use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
-use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError, ValidationError};
-use openmls::messages::proposals::{AppDataUpdateOperation, Proposal, ProposalOrRef};
+use openmls::group::{
+    MlsGroup, MlsGroupStateError, ProcessMessageError, ResolveAppDataCommitError, ValidationError,
+};
+use openmls::messages::proposals::AppDataUpdateOperation;
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
-    ProcessedMessageContent, ProtocolMessage, ProtocolVersion,
+    ProcessedMessageContent, ProtocolMessage,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
@@ -2181,6 +2183,26 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     kind: projection.kind,
                 });
             }
+            ProcessedMessageContent::OwnPendingCommit
+            | ProcessedMessageContent::OwnPrivateMessage => {
+                // Own sends are replay evidence only. In particular, never
+                // merge an OwnPendingCommit here: MDK realizes confirmed own
+                // commits from retained anchor snapshots above, preserving
+                // the publish-before-apply lifecycle.
+                observations.push(OpenMlsReplayObservation::Ignored {
+                    message_id,
+                    kind: projection.kind,
+                });
+            }
+            ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                // Commit processing above always resolves this variant before
+                // returning. Treat an unexpected residual value as a replay
+                // error instead of accepting a commit without applying its
+                // AppDataDictionary changes.
+                return Err(OpenMlsProjectionError::Replay(
+                    "commit retained unresolved app-data updates".into(),
+                ));
+            }
         }
     }
     Ok(OpenMlsReplayOutput {
@@ -2251,58 +2273,59 @@ pub(crate) fn process_commit_with_app_data_updates<S: StorageProvider>(
         >>::Error,
     >,
 > {
-    let unverified = mls_group.unprotect_message(provider, proto)?;
+    let processed = mls_group.process_message(provider, proto)?;
+    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved) = processed.content() else {
+        return Ok(processed);
+    };
+
+    // OpenMLS has already resolved referenced proposals and ordered them by
+    // component id. Clone the small proposal list so the processed message can
+    // subsequently be consumed by `resolve_app_data_commit`.
+    let app_data_updates = unresolved
+        .app_data_update_proposals()
+        .cloned()
+        .collect::<Vec<_>>();
     let mut updater = mls_group.app_data_dictionary_updater();
-    if let Some(committed_proposals) = unverified.committed_proposals() {
-        for proposal_or_ref in committed_proposals {
-            let validated = proposal_or_ref.clone().validate(
-                provider.crypto(),
-                mls_group.ciphersuite(),
-                ProtocolVersion::Mls10,
-            )?;
-            let proposal = match validated {
-                ProposalOrRef::Proposal(proposal) => proposal,
-                ProposalOrRef::Reference(reference) => mls_group
-                    .proposal_store()
-                    .proposals()
-                    .find(|p| p.proposal_reference_ref() == &*reference)
-                    .map(|p| Box::new(p.proposal().clone()))
-                    .ok_or(ProcessMessageError::FoundAppDataUpdateProposal)?,
-            };
-            if let Proposal::AppDataUpdate(update) = proposal.as_ref() {
-                match update.operation() {
-                    AppDataUpdateOperation::Update(data) => {
-                        crate::app_components::validate_app_component_update(&AppComponentData {
-                            component_id: update.component_id(),
-                            data: data.as_slice().to_vec(),
-                        })
-                        .map_err(|_| {
-                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
-                        })?;
-                        updater.set(ComponentData::from_parts(
-                            update.component_id(),
-                            data.clone(),
-                        ));
-                    }
-                    AppDataUpdateOperation::Remove => {
-                        crate::app_components::validate_app_component_remove(
-                            mls_group,
-                            update.component_id(),
-                        )
-                        .map_err(|_| {
-                            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
-                        })?;
-                        updater.remove(&update.component_id());
-                    }
-                }
+    for update in app_data_updates {
+        match update.operation() {
+            AppDataUpdateOperation::Update(data) => {
+                crate::app_components::validate_app_component_update(&AppComponentData {
+                    component_id: update.component_id(),
+                    data: data.as_slice().to_vec(),
+                })
+                .map_err(|_| {
+                    ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+                })?;
+                updater.set(ComponentData::from_parts(
+                    update.component_id(),
+                    data.clone(),
+                ));
+            }
+            AppDataUpdateOperation::Remove => {
+                crate::app_components::validate_app_component_remove(
+                    mls_group,
+                    update.component_id(),
+                )
+                .map_err(|_| {
+                    ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+                })?;
+                updater.remove(&update.component_id());
             }
         }
     }
-    mls_group.process_unverified_message_with_app_data_updates(
-        provider,
-        unverified,
-        updater.changes(),
-    )
+
+    mls_group
+        .resolve_app_data_commit(provider, processed, updater.changes())
+        .map_err(|error| match error {
+            ResolveAppDataCommitError::StageCommit(error) => {
+                ProcessMessageError::InvalidCommit(error)
+            }
+            ResolveAppDataCommitError::NotAnUnresolvedAppDataCommit => {
+                // Guarded by the content match above. Keep this non-panicking
+                // because the value still originated from inbound data.
+                ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+            }
+        })
 }
 
 fn message_digest(bytes: &[u8]) -> [u8; 32] {
