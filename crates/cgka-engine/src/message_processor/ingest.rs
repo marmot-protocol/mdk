@@ -1252,6 +1252,10 @@ impl<S: StorageProvider> Engine<S> {
                     // pending commit: MDK applies local commits only through
                     // its explicit publish-before-apply confirmation path.
                     self.update_stored_message_state(&msg.id, MessageState::Processed)?;
+                    self.mark_raw_transport_message_failed_if_awaiting_retry(
+                        &raw_msg_id,
+                        "own_echo",
+                    )?;
                     self.seen_message_ids.insert(msg.id.clone());
                     Ok(IngestOutcome::Stale {
                         reason: StaleReason::OwnEcho,
