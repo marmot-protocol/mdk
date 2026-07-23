@@ -164,6 +164,31 @@ impl EpochManager {
         Ok(())
     }
 
+    /// Recreate a pending-publish slot from its durable frozen fanout after a
+    /// process restart. The restored ref also advances the allocator so a new
+    /// pending operation cannot reuse it in this session.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_pending(
+        &mut self,
+        group_id: GroupId,
+        pre_commit_epoch: EpochId,
+        new_epoch: EpochId,
+        pending: StagedCommitHandle,
+        pending_ref: PendingStateRef,
+        kind: PendingKind,
+    ) -> Result<(), EngineError> {
+        self.pending_counter = self.pending_counter.max(pending_ref.as_u64());
+        self.begin_pending(
+            group_id,
+            pre_commit_epoch,
+            new_epoch,
+            pending,
+            pending_ref,
+            kind,
+            None,
+        )
+    }
+
     /// Peek at which group a pending publish belongs to without consuming
     /// the entry. Used by `do_confirm_published` / `do_publish_failed` so
     /// the engine can load the MLS group BEFORE we burn the state-machine

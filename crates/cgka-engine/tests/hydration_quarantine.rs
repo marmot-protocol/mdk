@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::Backend;
+use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilities};
 use cgka_traits::engine::{
     CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendResult,
@@ -14,7 +15,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
     ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage,
+    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
     QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
 };
@@ -418,6 +419,27 @@ impl OutboundIntentStorage for FlakyGroupRecordStorage {
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+}
+
+impl OutboundFanoutStorage for FlakyGroupRecordStorage {
+    fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> StorageResult<()> {
+        self.inner.put_outbound_fanout(fanout)
+    }
+    fn outbound_fanout(&self, id: &MessageId) -> StorageResult<Option<OutboundFanout>> {
+        self.inner.outbound_fanout(id)
+    }
+    fn list_outbound_fanouts(&self) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts()
+    }
+    fn list_outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts_for_group(group_id)
+    }
+    fn delete_outbound_fanout(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_outbound_fanout(id)
     }
 }
 

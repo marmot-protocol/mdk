@@ -18,20 +18,21 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::OutboundFanoutStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::{
-    EpochId, MemberId, MessageId, TransportAccountActivation, TransportAdapter,
-    TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
-    TransportEndpoint, TransportEndpointReceipt, TransportGroupSync, TransportPublishReport,
-    TransportPublishRequest,
+    EpochId, FanoutMlsState, FanoutTargetStatus, MemberId, MessageId, OutboundFanout,
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointReceipt,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
     KeyPackagePublisher, PendingResolution, PublishedApplicationMessage, StaticTransportRouting,
 };
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     deterministic_nostr_keys(name)
@@ -246,6 +247,7 @@ struct RecordingAdapterInner {
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
+    timeout_pattern: Mutex<VecDeque<bool>>,
 }
 
 impl RecordingAdapter {
@@ -267,6 +269,10 @@ impl RecordingAdapter {
             .lock()
             .unwrap()
             .push_back(message_id);
+    }
+
+    fn timeout_pattern(&self, pattern: impl IntoIterator<Item = bool>) {
+        self.inner.timeout_pattern.lock().unwrap().extend(pattern);
     }
 
     fn activations(&self) -> Vec<TransportAccountActivation> {
@@ -308,6 +314,16 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        if self
+            .inner
+            .timeout_pattern
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(false)
+        {
+            return Err(TransportAdapterError::Publish("simulated timeout".into()));
+        }
         let accepted_count = self
             .inner
             .accepted_counts
@@ -343,6 +359,8 @@ impl TransportAdapter for RecordingAdapter {
         Ok(None)
     }
 }
+
+include!("runtime/frozen_fanout.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {

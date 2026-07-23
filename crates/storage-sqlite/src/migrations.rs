@@ -58,6 +58,8 @@ mod migration_0028_ingress_dedup;
 mod migration_0029_app_event_retention_decision;
 #[path = "migrations/0030_prior_nostr_routes.rs"]
 mod migration_0030_prior_nostr_routes;
+#[path = "migrations/0031_outbound_fanout.rs"]
+mod migration_0031_outbound_fanout;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -219,6 +221,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 30,
         name: "0030_prior_nostr_routes",
         apply: migration_0030_prior_nostr_routes::apply,
+    },
+    Migration {
+        version: 31,
+        name: "0031_outbound_fanout",
+        apply: migration_0031_outbound_fanout::apply,
     },
 ];
 

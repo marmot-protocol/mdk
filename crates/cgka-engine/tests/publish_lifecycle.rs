@@ -18,6 +18,7 @@ use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::EngineError;
+use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
@@ -30,7 +31,7 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
     ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage,
+    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
     QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
     WelcomeStorage,
 };
@@ -881,6 +882,27 @@ impl OutboundIntentStorage for FaultStorage {
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
         self.inner.delete_queued_outbound_intent(id)
+    }
+}
+
+impl OutboundFanoutStorage for FaultStorage {
+    fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> StorageResult<()> {
+        self.inner.put_outbound_fanout(fanout)
+    }
+    fn outbound_fanout(&self, id: &MessageId) -> StorageResult<Option<OutboundFanout>> {
+        self.inner.outbound_fanout(id)
+    }
+    fn list_outbound_fanouts(&self) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts()
+    }
+    fn list_outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<OutboundFanout>> {
+        self.inner.list_outbound_fanouts_for_group(group_id)
+    }
+    fn delete_outbound_fanout(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_outbound_fanout(id)
     }
 }
 
