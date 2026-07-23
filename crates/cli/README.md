@@ -666,6 +666,7 @@ Composer slash commands:
 /react [emoji]
 /unreact
 /delete
+/reply <text>
 /retry <event-id>
 /image <file-path> [caption]
 /keys fetch <npub-or-hex>
