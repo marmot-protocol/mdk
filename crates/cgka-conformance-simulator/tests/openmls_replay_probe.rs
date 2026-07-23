@@ -19,9 +19,7 @@ use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
-use cgka_traits::engine::CgkaEngine;
 use cgka_traits::group::{Group, Member};
-use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -33,7 +31,7 @@ use openmls::group::MlsGroup;
 use openmls::prelude::tls_codec::Serialize as _;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
-use transport_nostr_peeler::{DEFAULT_EXPORTER_LABEL, NostrMlsPeeler};
+use transport_nostr_peeler::NostrMlsPeeler;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
@@ -1618,13 +1616,7 @@ async fn harness_tick_rejects_unauthorized_standalone_proposal() {
     let proposal_bytes = proposal_out
         .tls_serialize_detached()
         .expect("serialize proposal");
-    let group_context = bob
-        .engine
-        .group_context(&group_id)
-        .expect("bob group context");
-    let snapshot =
-        GroupContextSnapshot::from_context(group_context.as_ref(), &[DEFAULT_EXPORTER_LABEL]);
-    drop(group_context);
+    let snapshot = bob.group_context_snapshot().expect("bob group context");
     let proposal = NostrMlsPeeler::new()
         .wrap_group_message(
             &EncryptedPayload {

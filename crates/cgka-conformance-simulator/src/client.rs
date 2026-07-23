@@ -874,6 +874,16 @@ impl HarnessClient {
         self.default_group.clone().expect("group")
     }
 
+    /// Peeler snapshot for the client's default group.
+    pub fn group_context_snapshot(&self) -> Result<GroupContextSnapshot, EngineError> {
+        let gid = self.default_group.clone().expect("group");
+        let ctx = self.engine.group_context(&gid)?;
+        Ok(GroupContextSnapshot::from_context(
+            ctx.as_ref(),
+            &[transport_nostr_peeler::DEFAULT_EXPORTER_LABEL],
+        ))
+    }
+
     fn next_app_payload(&mut self, payload: Vec<u8>) -> Vec<u8> {
         let seq = self.app_event_counter;
         self.app_event_counter = self

@@ -845,6 +845,28 @@ impl<S: StorageProvider> Engine<S> {
                     });
                 }
                 Err(e) => {
+                    if msg_content_type == ContentType::Proposal
+                        && crate::proposal_authorization::is_parent_dependent_process_message_error(
+                            &e,
+                            msg_content_type,
+                        )
+                    {
+                        // The current state cannot prove this proposal invalid:
+                        // sender and membership-tag authentication can succeed
+                        // on a retained same-epoch fork. Let canonicalization
+                        // try every retained parent and keep the durable row
+                        // retryable if its parent commit has not arrived yet.
+                        let now_ms = self.convergence_now_ms();
+                        let result = self
+                            .converge_stored_openmls_messages(&group_id, now_ms)
+                            .map_err(|err| EngineError::Backend(format!("converge: {err}")))?;
+                        return Ok(convergence_ingest_outcome(
+                            &result,
+                            msg,
+                            group_id,
+                            current_epoch,
+                        ));
+                    }
                     if let Some(category) =
                         crate::proposal_authorization::classify_process_message_error(
                             &e,
@@ -1321,8 +1343,12 @@ impl<S: StorageProvider> Engine<S> {
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-                    self.update_stored_message_state(&msg.id, MessageState::Processed)?;
-                    Ok(IngestOutcome::Processed)
+                    return self.terminalize_rejected_proposal(
+                        &group_id,
+                        &msg.id,
+                        &raw_msg_id,
+                        crate::proposal_authorization::external_join_proposal_rejection_category(),
+                    );
                 }
                 ProcessedMessageContent::OwnPendingCommit
                 | ProcessedMessageContent::OwnPrivateMessage => {

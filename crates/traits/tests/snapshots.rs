@@ -397,6 +397,30 @@ fn snapshot_ingest_outcomes() {
             category: cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed
         }
     );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_unsupported_proposal",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::UnsupportedProposal
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_encoding",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidEncoding
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_signature",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidSignature
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_self_remove",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidSelfRemove
+        }
+    );
 }
 
 #[test]

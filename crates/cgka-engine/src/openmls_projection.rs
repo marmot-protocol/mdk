@@ -796,13 +796,14 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
             .collect()
     };
 
+    let (preflight_drops, pending_messages) = preflight_current_epoch_pending_proposals(
+        storage,
+        group_id,
+        current_epoch,
+        pending_messages,
+    )?;
+
     if replay_start_epoch < current_epoch {
-        let (preflight_drops, pending_messages) = preflight_current_epoch_pending_proposals(
-            storage,
-            group_id,
-            current_epoch,
-            pending_messages,
-        )?;
         let mut result = canonicalize_stored_openmls_messages_from_retained_anchor(
             storage,
             group_id,
@@ -823,12 +824,6 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
         return Ok(result);
     }
 
-    let (preflight_drops, pending_messages) = preflight_current_epoch_pending_proposals(
-        storage,
-        group_id,
-        current_epoch,
-        pending_messages,
-    )?;
     let mut result = canonicalize_stored_openmls_messages_from_current(
         storage,
         group_id,
@@ -2233,6 +2228,16 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 return Err(replay_error("process_message", err));
             }
             Err(err) if projection.kind == OpenMlsContentKind::Proposal => {
+                if crate::proposal_authorization::is_parent_dependent_process_message_error(
+                    &err,
+                    ContentType::Proposal,
+                ) {
+                    observations.push(OpenMlsReplayObservation::Ignored {
+                        message_id,
+                        kind: projection.kind,
+                    });
+                    continue;
+                }
                 if let Some(category) =
                     crate::proposal_authorization::classify_process_message_error(
                         &err,
@@ -2445,9 +2450,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 }
             }
             ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-                observations.push(OpenMlsReplayObservation::Ignored {
+                observations.push(OpenMlsReplayObservation::ProposalRejected {
                     message_id,
-                    kind: projection.kind,
+                    category:
+                        crate::proposal_authorization::external_join_proposal_rejection_category(),
                 });
             }
             ProcessedMessageContent::OwnPendingCommit

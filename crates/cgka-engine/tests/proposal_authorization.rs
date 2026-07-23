@@ -5,6 +5,8 @@
 //! auto-commit scheduling, or convergence replay.
 
 use async_trait::async_trait;
+use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_engine::convergence::ConvergencePolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
@@ -15,6 +17,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{
     IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
 };
+use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{AccountDeviceSignerStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::{
@@ -23,11 +26,12 @@ use cgka_traits::transport::{
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
 use openmls::group::MlsGroup;
+use openmls::messages::external_proposals::JoinProposal;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, CredentialWithKey, LeafNodeParameters};
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::RustCrypto;
-use openmls_traits::OpenMlsProvider as _;
+use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
+use openmls_traits::OpenMlsProvider;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::{Deserialize as _, Serialize as _};
 
@@ -982,19 +986,13 @@ async fn rejected_proposal_does_not_block_or_alter_later_valid_commit() {
 }
 
 #[tokio::test]
-async fn tampered_standalone_proposal_returns_invalid_signature_rejection() {
+async fn invalid_external_join_signature_returns_invalid_signature_rejection() {
     let (mut alice, _alice_storage) = build_with_storage(b"alice");
-    let (mut bob, bob_storage) = build_with_storage(b"bob");
+    let (mut bob, _bob_storage) = build_with_storage(b"bob");
     let mut carol = build(b"carol");
     let group_id = three_member_group(&mut alice, &mut bob, &mut carol).await;
-    let crypto = RustCrypto::default();
-    let mut proposal =
-        non_admin_self_update_proposal(&bob_storage, &crypto, &bob.self_id(), &group_id);
-    if let Some(byte) = proposal.payload.get_mut(32) {
-        *byte ^= 0xff;
-    } else {
-        proposal.payload.push(0xff);
-    }
+    let epoch = alice.epoch(&group_id).unwrap().0;
+    let proposal = external_join_proposal_with_signature(&group_id, epoch, false);
     let outcome = alice.ingest(proposal).await.unwrap();
     assert!(
         matches!(
@@ -1003,6 +1001,315 @@ async fn tampered_standalone_proposal_returns_invalid_signature_rejection() {
                 category: ProposalRejectionCategory::InvalidSignature
             }
         ),
-        "OpenMLS ValidationError on proposal must map to InvalidSignature, got {outcome:?}"
+        "cryptographic proposal-signature failure must map to InvalidSignature, got {outcome:?}"
+    );
+}
+
+fn evolution(msg: SendResult) -> (TransportMessage, cgka_traits::engine_state::PendingStateRef) {
+    match msg {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    }
+}
+
+fn proposal(msg: SendResult) -> TransportMessage {
+    match msg {
+        SendResult::Proposal { msg } => msg,
+        other => panic!("expected Proposal, got {other:?}"),
+    }
+}
+
+fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
+    TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    }
+}
+
+fn fresh_openmls_key_package(
+    identity: &[u8],
+    signer: &SignatureKeyPair,
+) -> openmls::prelude::KeyPackage {
+    let provider = OpenMlsRustCrypto::default();
+    let credential_with_key = CredentialWithKey {
+        credential: BasicCredential::new(pad32(identity)).into(),
+        signature_key: signer.public().into(),
+    };
+    openmls::key_packages::KeyPackage::builder()
+        .leaf_node_capabilities(openmls::prelude::Capabilities::default())
+        .build(DEFAULT_CIPHERSUITE, &provider, signer, credential_with_key)
+        .expect("build openmls key package")
+        .key_package()
+        .clone()
+}
+
+fn external_join_proposal(group_id: &GroupId, epoch: u64) -> TransportMessage {
+    external_join_proposal_with_signature(group_id, epoch, true)
+}
+
+fn external_join_proposal_with_signature(
+    group_id: &GroupId,
+    epoch: u64,
+    valid_signature: bool,
+) -> TransportMessage {
+    let key_package_signer = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm())
+        .expect("external join key package signer");
+    let other_signer = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm())
+        .expect("alternate external join signer");
+    let proposal_signer = if valid_signature {
+        &key_package_signer
+    } else {
+        &other_signer
+    };
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let proposal_out =
+        JoinProposal::new::<<OpenMlsRustCrypto as OpenMlsProvider>::StorageProvider>(
+            fresh_openmls_key_package(b"external-joiner", &key_package_signer),
+            mls_gid,
+            openmls::group::GroupEpoch::from(epoch),
+            proposal_signer,
+        )
+        .expect("build external join proposal");
+    let proposal_bytes = proposal_out
+        .tls_serialize_detached()
+        .expect("serialize external join proposal");
+    TransportMessage {
+        id: hash_id(&proposal_bytes),
+        payload: proposal_bytes,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("external-join-proposal".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn direct_ingest_rejects_external_join_proposal() {
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, _bob_storage) = build_with_storage(b"bob");
+    let mut carol = build(b"carol");
+    let group_id = three_member_group(&mut alice, &mut bob, &mut carol).await;
+    let epoch = alice.epoch(&group_id).unwrap().0;
+    let proposal = external_join_proposal(&group_id, epoch);
+
+    let outcome = alice.ingest(proposal).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Rejected {
+                category: ProposalRejectionCategory::UnsupportedProposal
+            }
+        ),
+        "external join must be rejected before pending state, got {outcome:?}"
+    );
+    assert!(alice.drain_auto_publish().is_empty());
+
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, _alice_storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load alice group")
+        .expect("alice group present");
+    assert!(
+        mls_group.pending_proposals().next().is_none(),
+        "external join must not enter OpenMLS pending state"
+    );
+}
+
+#[tokio::test]
+async fn convergence_rejects_external_join_proposal_before_pending_store() {
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, _bob_storage) = build_with_storage(b"bob");
+    let (mut carol, carol_storage) = build_with_storage(b"carol");
+    let group_id = three_member_group(&mut alice, &mut bob, &mut carol).await;
+    let epoch = carol.epoch(&group_id).unwrap().0;
+    let proposal = external_join_proposal(&group_id, epoch);
+    let routed = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..proposal
+    };
+    let proposal_id = canonicalization_message_id(&routed);
+    let proposal_message_id = content_dedup_message_id(&routed);
+    carol
+        .buffer_openmls_convergence_message(&group_id, routed, 1_000)
+        .expect("buffer external join for convergence replay");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("convergence run");
+    assert!(result.accepted_proposals.is_empty());
+    assert!(
+        result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == proposal_id
+                && dropped.kind == cgka_engine::canonicalization::MessageKind::Proposal
+                && dropped.reason
+                    == cgka_engine::canonicalization::DroppedMessageReason::InvalidAgainstCandidateState
+                && dropped.rejection_category
+                    == Some(ProposalRejectionCategory::UnsupportedProposal)
+        }),
+        "external join must be dropped through typed rejection: {:?}",
+        result.dropped_messages
+    );
+    let record = carol_storage
+        .get_message(&proposal_message_id)
+        .expect("durable proposal row");
+    assert_eq!(
+        record.state,
+        MessageState::Failed,
+        "rejected external join durable row must be terminal"
+    );
+}
+
+#[tokio::test]
+async fn parent_dependent_proposal_auth_deferred_until_retained_fork_replay() {
+    let (mut alice, _alice_storage) = build_with_storage(b"alice");
+    let (mut bob, _bob_storage) = build_with_storage(b"bob");
+    let (mut carol, carol_storage) = build_with_storage(b"carol");
+    let (mut david, _david_storage) = build_with_storage(b"david");
+    let (mut eve, _eve_storage) = build_with_storage(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "parent-dependent-proposal".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![Feature("self-remove")],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes[0].clone()).await.unwrap();
+    carol.join_welcome(welcomes[1].clone()).await.unwrap();
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    });
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, alice_pending) = evolution(alice_invite);
+    alice.confirm_published(alice_pending).await.unwrap();
+    let alice_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..alice_commit
+    };
+    carol
+        .buffer_openmls_convergence_message(&group_id, alice_commit.clone(), 1_000)
+        .expect("buffer alice branch commit");
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("alice branch settles and retains epoch-1 anchor");
+    assert_eq!(carol.epoch(&group_id).unwrap().0, 2);
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, bob_pending, bob_welcomes) = match bob_invite {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => (msg, pending, welcomes),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    bob.confirm_published(bob_pending).await.unwrap();
+    let bob_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..bob_commit
+    };
+    let eve_welcome = bob_welcomes
+        .into_iter()
+        .find(|welcome| {
+            matches!(
+                &welcome.envelope,
+                TransportEnvelope::Welcome { recipient } if recipient == &eve.self_id()
+            )
+        })
+        .expect("bob welcome for eve");
+    eve.join_welcome(eve_welcome).await.unwrap();
+
+    let fork_proposal = route(
+        proposal(
+            eve.send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        ),
+        &group_id,
+    );
+    let proposal_message_id = content_dedup_message_id(&fork_proposal);
+    let proposal_id = canonicalization_message_id(&fork_proposal);
+
+    // The proposal deliberately arrives before the commit that creates its
+    // source-epoch parent. The current canonical state cannot authenticate it,
+    // but that is not proof of an invalid signature.
+    let ingest_outcome = carol.ingest(fork_proposal.clone()).await.unwrap();
+    assert!(
+        matches!(ingest_outcome, IngestOutcome::Buffered { .. }),
+        "parent-dependent auth must defer while its candidate parent is absent, got {ingest_outcome:?}"
+    );
+    let record = carol_storage
+        .get_message(&proposal_message_id)
+        .expect("proposal durable row");
+    assert_ne!(
+        record.state,
+        MessageState::Failed,
+        "proposal must stay retryable while its candidate parent is absent"
+    );
+
+    carol
+        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
+        .expect("buffer competing fork commit");
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("retained replay with alternate parent");
+    assert!(
+        !result.dropped_messages.iter().any(|dropped| {
+            dropped.message_id == proposal_id
+                && dropped.rejection_category == Some(ProposalRejectionCategory::InvalidSignature)
+        }),
+        "alternate-parent replay must not classify the proposal as an invalid signature: {:?}",
+        result.dropped_messages
+    );
+    let record = carol_storage
+        .get_message(&proposal_message_id)
+        .expect("proposal durable row");
+    assert_ne!(
+        record.state,
+        MessageState::Failed,
+        "proposal must stay retryable until retained fork replay authenticates a parent"
     );
 }

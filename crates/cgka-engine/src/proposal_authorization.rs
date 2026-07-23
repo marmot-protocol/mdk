@@ -223,6 +223,29 @@ pub(crate) fn authorize_staged_commit_queued_proposals(
     ProposalAuthorizationOutcome::Authorized
 }
 
+/// Membership-tag and sender-leaf authentication depend on the source-epoch
+/// group state. Failures here must be retried against retained fork parents
+/// before they may become terminal proposal rejections.
+pub(crate) fn is_parent_dependent_process_message_error<StorageError>(
+    err: &ProcessMessageError<StorageError>,
+    content_type: ContentType,
+) -> bool {
+    matches!(
+        (content_type, err),
+        (
+            ContentType::Proposal,
+            ProcessMessageError::ValidationError(
+                ValidationError::UnknownMember | ValidationError::InvalidMembershipTag
+            )
+        )
+    )
+}
+
+/// Marmot v1 does not admit standalone external-join proposals.
+pub(crate) fn external_join_proposal_rejection_category() -> ProposalRejectionCategory {
+    ProposalRejectionCategory::UnsupportedProposal
+}
+
 /// Map only proposal-specific OpenMLS processing failures into the stable
 /// rejection taxonomy. Unrelated commit/path failures remain ordinary engine
 /// errors so callers do not mislabel them as rejected proposals.
@@ -230,6 +253,9 @@ pub(crate) fn classify_process_message_error<StorageError>(
     err: &ProcessMessageError<StorageError>,
     content_type: ContentType,
 ) -> Option<ProposalRejectionCategory> {
+    if is_parent_dependent_process_message_error(err, content_type) {
+        return None;
+    }
     match (content_type, err) {
         (ContentType::Proposal, ProcessMessageError::UnsupportedProposalType) => {
             Some(ProposalRejectionCategory::UnsupportedProposal)
@@ -240,9 +266,7 @@ pub(crate) fn classify_process_message_error<StorageError>(
         (ContentType::Proposal, ProcessMessageError::ValidationError(validation)) => {
             match validation {
                 ValidationError::WrongEpoch => None,
-                ValidationError::UnknownMember
-                | ValidationError::MissingMembershipTag
-                | ValidationError::InvalidMembershipTag
+                ValidationError::MissingMembershipTag
                 | ValidationError::InvalidSignature
                 | ValidationError::UnauthorizedExternalSender
                 | ValidationError::NoExternalSendersExtension
@@ -343,6 +367,18 @@ mod tests {
         assert_eq!(
             proposal_rejection_category_tag(ProposalRejectionCategory::UnsupportedProposal),
             "unsupported_proposal"
+        );
+        assert_eq!(
+            proposal_rejection_category_tag(ProposalRejectionCategory::InvalidEncoding),
+            "invalid_encoding"
+        );
+        assert_eq!(
+            proposal_rejection_category_tag(ProposalRejectionCategory::InvalidSignature),
+            "invalid_signature"
+        );
+        assert_eq!(
+            proposal_rejection_category_tag(ProposalRejectionCategory::InvalidSelfRemove),
+            "invalid_self_remove"
         );
     }
 }
