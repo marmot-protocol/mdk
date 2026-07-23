@@ -659,7 +659,7 @@ impl<S: StorageProvider> Engine<S> {
                     self.note_peel_deferred_row_retired(group_id, &record.id);
                     progressed += 1;
                 }
-                Ok(IngestOutcome::Stale { .. }) => {
+                Ok(IngestOutcome::Stale { .. } | IngestOutcome::Rejected { .. }) => {
                     // Terminal stale classifications are still successful
                     // reclassifications of this raw deferred row. Retire it only
                     // while it is still awaiting retry: the reachable case is

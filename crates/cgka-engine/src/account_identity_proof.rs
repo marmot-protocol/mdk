@@ -35,7 +35,7 @@ use nostr::{
 };
 use openmls::extensions::{Extension, ExtensionType, Extensions, UnknownExtension};
 use openmls::group::{GroupContext as OpenMlsGroupContext, MlsGroup, StagedCommit};
-use openmls::prelude::{BasicCredential, LeafNode, SignatureScheme};
+use openmls::prelude::{BasicCredential, LeafNode, Proposal, QueuedProposal, SignatureScheme};
 use openmls_traits::types::Ciphersuite;
 
 /// Deployed legacy custom LeafNode proof extension.
@@ -603,6 +603,49 @@ pub(crate) fn validate_staged_commit_account_identity_proofs(
     }
 
     Ok(added)
+}
+
+/// Validate the account identity carried by a standalone Add or Update before
+/// the proposal is admitted to Marmot's durable pending set.
+///
+/// Commit validation performs the same checks again against the authenticated
+/// candidate parent. Keeping this proposal seam separate is intentional: a
+/// syntactically valid MLS proposal must not sit pending until a later Commit
+/// discovers that its leaf proof or profile is invalid.
+pub(crate) fn validate_standalone_proposal_account_identity_proof(
+    proposal: &QueuedProposal,
+    group: &MlsGroup,
+    ciphersuite: Ciphersuite,
+) -> Result<(), EngineError> {
+    let profile = protocol_profile_of_group(group)?;
+    match proposal.proposal() {
+        Proposal::Add(add) => {
+            let leaf = add.key_package().leaf_node();
+            ensure_profile(
+                validate_leaf_account_identity_proof(leaf, ciphersuite)?,
+                profile,
+                "standalone Add proposal",
+            )?;
+            crate::identity::validated_member_id_of_leaf(leaf)?;
+        }
+        Proposal::Update(update) => {
+            let expected = crate::identity::member_id_of_sender(proposal.sender(), group)
+                .ok_or_else(|| {
+                    EngineError::InvalidAccountIdentityProof(
+                        "standalone Update proposal has no authenticated member sender".into(),
+                    )
+                })?;
+            let update_profile = validate_leaf_account_identity_proof_for_member(
+                update.leaf_node(),
+                ciphersuite,
+                &expected,
+                "standalone Update proposal",
+            )?;
+            ensure_profile(update_profile, profile, "standalone Update proposal")?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn account_identity_proof_capability() -> ExtensionType {

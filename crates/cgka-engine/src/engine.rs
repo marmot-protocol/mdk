@@ -1181,6 +1181,7 @@ impl<S: StorageProvider> Engine<S> {
             };
             if let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content()
                 && matches!(queued.proposal(), Proposal::SelfRemove)
+                && crate::app_components::authorize_standalone_proposal(mls_group, &queued).is_ok()
             {
                 return Ok(true);
             }

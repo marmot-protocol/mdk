@@ -22,6 +22,25 @@ pub enum IngestOutcome {
     /// Message was not applied. The variant names why — callers log by
     /// category rather than pattern-matching error strings.
     Stale { reason: StaleReason },
+    /// A standalone or commit-carried MLS proposal failed Marmot semantic
+    /// admission before it could enter pending state or affect group state.
+    Rejected { category: ProposalRejectionCategory },
+}
+
+/// Stable rejection taxonomy for authenticated MLS proposals that fail
+/// Marmot's semantic admission rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProposalRejectionCategory {
+    /// The authenticated sender is not authorized for this proposal.
+    AuthorizationFailed,
+    /// The active protocol profile does not admit this proposal type.
+    UnsupportedProposal,
+    /// Proposal bytes, component data, or resulting state are invalid.
+    InvalidEncoding,
+    /// The proposal cannot be authenticated to a valid current member.
+    InvalidSignature,
+    /// SelfRemove violates the active member-departure or admin rules.
+    InvalidSelfRemove,
 }
 
 /// Why an inbound message was not processed.
