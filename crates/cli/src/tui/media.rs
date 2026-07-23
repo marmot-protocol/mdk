@@ -297,8 +297,19 @@ pub(crate) fn spawn_media_download(
 /// A missing directory and per-entry errors are ignored (the sweep is advisory).
 /// Only the directory's own entries are touched — the layout is flat, so no
 /// recursion is needed — and `remove_file` unlinks a symlink rather than
-/// following it, so nothing outside the directory is ever removed.
+/// following it, so nothing outside the directory is ever removed. The root
+/// itself must be a real directory: `read_dir` follows a symlink at the path,
+/// and the no-home fallback lives under the shared temp dir where a symlinked
+/// `tui-media-cache` could be pre-planted to redirect the unlinks. The check
+/// races `read_dir` in principle; the sweep is best-effort startup cleanup,
+/// not a security boundary for an already-writable directory.
 pub(crate) fn sweep_media_cache_dir(dir: &Path) {
+    let is_real_dir = dir
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_dir());
+    if !is_real_dir {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

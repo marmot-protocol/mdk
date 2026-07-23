@@ -4791,6 +4791,34 @@ fn startup_media_sweep_unlinks_symlinks_without_following_them() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn startup_media_sweep_refuses_a_symlinked_cache_root() {
+    // `read_dir` follows a symlink at the path itself, so a cache root replaced
+    // by a symlink would redirect the sweep's unlinks into the target directory
+    // (the no-home fallback lives under the shared temp dir, where such a root
+    // can be pre-planted). The sweep must refuse a root that is not a real
+    // directory.
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("victim-dir");
+    std::fs::create_dir_all(&target).expect("seed target dir");
+    std::fs::write(target.join("precious"), b"must survive").expect("seed victim file");
+    std::os::unix::fs::symlink(&target, home.path().join("tui-media-cache"))
+        .expect("seed symlinked cache root");
+
+    let client = WnClient {
+        home: Some(home.path().to_path_buf()),
+        ..test_unused_client()
+    };
+    let app = test_tui_app(client, &"aa".repeat(32));
+    app.sweep_media_cache();
+
+    assert!(
+        target.join("precious").exists(),
+        "a symlinked cache root must never redirect the sweep's unlinks"
+    );
+}
+
 /// Drive the download worker to completion and return its terminal result,
 /// skipping the intermediate `Downloaded` ladder step. The worker removes the
 /// on-disk artifact before sending the terminal result, so once this returns the
