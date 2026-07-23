@@ -282,13 +282,15 @@ impl<S: StorageProvider> Engine<S> {
         // crash or write fault cannot leave a partial, undiscoverable group.
         let mut mls_group = self.storage.with_transaction(|storage| {
             let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-            MlsGroup::new(
+            let group = MlsGroup::new(
                 &provider,
                 &self.identity.signer,
                 &group_config,
                 self.identity.credential_with_key.clone(),
             )
-            .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))
+            .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
+            crate::app_components::validate_current_profile_group_invariants(&group)?;
+            Ok::<MlsGroup, EngineError>(group)
         })?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
@@ -334,6 +336,21 @@ impl<S: StorageProvider> Engine<S> {
                 &provider,
                 group_id.clone(),
             ));
+            let own_leaf_index = mls_group.own_leaf_index();
+            let staged = mls_group.pending_commit().ok_or_else(|| {
+                EngineError::Backend("founding add produced no pending commit".into())
+            })?;
+            crate::app_components::validate_current_profile_invariants_for_staged_commit(
+                &mls_group,
+                staged,
+                own_leaf_index,
+            )?;
+            crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+                staged,
+                &mls_group,
+                self.identity.self_id(),
+                self.ciphersuite,
+            )?;
             let bytes = welcome_out
                 .tls_serialize_detached()
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -670,6 +687,8 @@ impl<S: StorageProvider> Engine<S> {
                 // joining.md:65).
                 let protocol_profile =
                     validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+                crate::app_components::validate_current_profile_group_invariants(&mls_group)
+                    .map_err(|_| EngineError::InvalidWelcome)?;
 
                 // 5c. Reject active required capabilities this client cannot
                 // apply, including required agent-stream roles.

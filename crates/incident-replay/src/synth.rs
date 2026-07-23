@@ -96,6 +96,7 @@ fn synthesize_group_data_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         vector_version: "1".to_owned(),
         conformance_version: env!("CARGO_PKG_VERSION").to_owned(),
         seed: None,
+        application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
             spec_version: "1".to_owned(),
@@ -212,6 +213,7 @@ fn synthesize_membership_fork(name: &str, winner: &str, loser: &str) -> VectorFi
         vector_version: "1".to_owned(),
         conformance_version: env!("CARGO_PKG_VERSION").to_owned(),
         seed: None,
+        application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
             spec_version: "1".to_owned(),
@@ -344,6 +346,7 @@ fn convergence_fixture(
         vector_version: "1".to_owned(),
         conformance_version: env!("CARGO_PKG_VERSION").to_owned(),
         seed: None,
+        application_profile: None,
         scenario: ScenarioSpec {
             name: name.to_owned(),
             spec_version: "1".to_owned(),

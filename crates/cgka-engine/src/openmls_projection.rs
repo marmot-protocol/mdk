@@ -9,7 +9,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
-use cgka_traits::app_components::AppComponentData;
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::group::Member;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
@@ -23,7 +22,7 @@ use openmls::group::{
 use openmls::messages::proposals::AppDataUpdateOperation;
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
-    ProcessedMessageContent, ProtocolMessage,
+    ProcessedMessageContent, ProtocolMessage, Sender,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
@@ -2036,6 +2035,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             }
             Err(e) => return Err(replay_error("process_message", e)),
         };
+        let sender_leaf_index = match processed.sender() {
+            Sender::Member(index) => Some(*index),
+            _ => None,
+        };
         let sender_id = crate::identity::member_id_of_sender(processed.sender(), &mls_group);
 
         match processed.into_content() {
@@ -2093,6 +2096,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         "commit has no authenticated member sender".into(),
                     ));
                 }
+                let Some(committer_index) = sender_leaf_index else {
+                    return Err(OpenMlsProjectionError::Replay(
+                        "commit has no authenticated member leaf".into(),
+                    ));
+                };
                 let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
                 let committer = sender_id
                     .as_ref()
@@ -2120,6 +2128,18 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         reason: format!("invalid credential identity or account proof: {err}"),
                     });
                 }
+                if let Err(err) =
+                    crate::app_components::validate_current_profile_invariants_for_staged_commit(
+                        &mls_group,
+                        &staged,
+                        committer_index,
+                    )
+                {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: format!("current-profile resulting state: {err}"),
+                    });
+                }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
                 let mut consumed_proposal_refs = staged
                     .queued_proposals()
@@ -2127,7 +2147,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .collect::<Result<Vec<_>, _>>()?;
                 consumed_proposal_refs.sort();
                 observations.push(OpenMlsReplayObservation::CommitStaged {
-                    message_id,
+                    message_id: message_id.clone(),
                     source_epoch,
                     resulting_epoch,
                     priority,
@@ -2138,6 +2158,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .merge_staged_commit(&provider, *staged)
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
+                    })?;
+                crate::app_components::validate_current_profile_group_invariants(&mls_group)
+                    .map_err(|error| OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: format!("current-profile merged state: {error}"),
                     })?;
                 prefix_canonical =
                     prefix_canonical && own_commits.is_canonical(&projection.message_digest);
@@ -2285,30 +2310,18 @@ pub(crate) fn process_commit_with_app_data_updates<S: StorageProvider>(
         .app_data_update_proposals()
         .cloned()
         .collect::<Vec<_>>();
+    crate::app_components::validate_app_data_update_batch(mls_group, app_data_updates.iter())
+        .map_err(|_| ProcessMessageError::ValidationError(ValidationError::WrongWireFormat))?;
     let mut updater = mls_group.app_data_dictionary_updater();
     for update in app_data_updates {
         match update.operation() {
             AppDataUpdateOperation::Update(data) => {
-                crate::app_components::validate_app_component_update(&AppComponentData {
-                    component_id: update.component_id(),
-                    data: data.as_slice().to_vec(),
-                })
-                .map_err(|_| {
-                    ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
-                })?;
                 updater.set(ComponentData::from_parts(
                     update.component_id(),
                     data.clone(),
                 ));
             }
             AppDataUpdateOperation::Remove => {
-                crate::app_components::validate_app_component_remove(
-                    mls_group,
-                    update.component_id(),
-                )
-                .map_err(|_| {
-                    ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
-                })?;
                 updater.remove(&update.component_id());
             }
         }

@@ -20,6 +20,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent};
 use cgka_traits::peeler::TransportPeeler;
@@ -46,6 +47,7 @@ pub struct HarnessClient {
     identity: Vec<u8>,
     signer: nostr::Keys,
     registry: FeatureRegistry,
+    protocol_profile: ProtocolProfile,
     pending_events: Vec<GroupEvent>,
     /// Default MLS group id used by single-group scenarios. Set
     /// automatically after the first create/join.
@@ -60,6 +62,7 @@ pub struct ClientBuilder {
     identity: Vec<u8>,
     signer: nostr::Keys,
     registry: FeatureRegistry,
+    protocol_profile: ProtocolProfile,
     storage_mode: HarnessStorageMode,
 }
 
@@ -112,6 +115,7 @@ impl ClientBuilder {
             identity,
             signer,
             registry: FeatureRegistry::new(),
+            protocol_profile: ProtocolProfile::Legacy,
             storage_mode: HarnessStorageMode::from_env(),
         }
     }
@@ -126,6 +130,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn protocol_profile(mut self, profile: ProtocolProfile) -> Self {
+        self.protocol_profile = profile;
+        self
+    }
+
     pub fn attach(self, bus: &TransportBus) -> HarnessClient {
         let (storage, storage_dir) = self.storage_mode.open().expect("storage opens");
         let audit_capture = AuditCapture::default();
@@ -134,6 +143,7 @@ impl ClientBuilder {
             &self.identity,
             &self.signer,
             &self.registry,
+            self.protocol_profile,
             &audit_capture,
         );
         let bus_id = bus.attach(MemberId::new(self.identity.clone()));
@@ -146,6 +156,7 @@ impl ClientBuilder {
             identity: self.identity,
             signer: self.signer,
             registry: self.registry,
+            protocol_profile: self.protocol_profile,
             pending_events: Vec::new(),
             default_group: None,
             app_event_counter: 0,
@@ -163,6 +174,7 @@ fn build_harness_engine(
     identity: &[u8],
     signer: &nostr::Keys,
     registry: &FeatureRegistry,
+    protocol_profile: ProtocolProfile,
     audit_capture: &AuditCapture,
 ) -> Engine<SqliteAccountStorage> {
     let peeler = NostrMlsPeeler::new().with_welcome_signer(signer.clone());
@@ -171,6 +183,7 @@ fn build_harness_engine(
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
             keys: signer.clone(),
         }))
+        .protocol_profile(protocol_profile)
         .feature_registry(registry.clone())
         .supported_app_components(harness_supported_app_components())
         .peeler(Box::new(peeler))
@@ -226,10 +239,12 @@ fn key_package_with_harness_source(key_package: KeyPackage) -> KeyPackage {
     let mut hasher = Sha256::new();
     hasher.update(b"marmot-cgka-conformance-key-package-event-id-v1");
     hasher.update(key_package.bytes());
+    let protocol_profile = key_package.protocol_profile;
     KeyPackage::with_source_event_id(
         key_package.bytes().to_vec(),
         MessageId::new(hasher.finalize().to_vec()),
     )
+    .with_protocol_profile(protocol_profile)
 }
 
 #[derive(Clone)]
@@ -302,6 +317,7 @@ impl HarnessClient {
             &self.identity,
             &self.signer,
             &self.registry,
+            self.protocol_profile,
             &self.audit_capture,
         );
         engine

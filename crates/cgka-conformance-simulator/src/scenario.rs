@@ -15,6 +15,7 @@ use cgka_traits::EngineError;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::engine_state::PendingStateRef;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::types::MemberId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -258,7 +259,7 @@ pub async fn run_scenario_report(
     spec: &ScenarioSpec,
     expected_trace: Option<ScenarioTrace>,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    run_scenario_report_inner(spec, expected_trace, vec![], None).await
+    run_scenario_report_inner(spec, expected_trace, vec![], None, ProtocolProfile::Legacy).await
 }
 
 pub async fn run_scenario_report_with_outcomes(
@@ -266,12 +267,33 @@ pub async fn run_scenario_report_with_outcomes(
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
 ) -> Result<ScenarioReport, ScenarioRunError> {
-    run_scenario_report_inner(spec, expected_trace, expected_outcomes, None).await
+    run_scenario_report_inner(
+        spec,
+        expected_trace,
+        expected_outcomes,
+        None,
+        ProtocolProfile::Legacy,
+    )
+    .await
 }
 
 pub async fn run_vector_fixture_report(
     fixture: &VectorFixture,
 ) -> Result<ScenarioReport, ScenarioRunError> {
+    let protocol_profile = match fixture
+        .application_profile
+        .as_ref()
+        .map(|profile| profile.name.as_str())
+    {
+        None | Some("legacy") => ProtocolProfile::Legacy,
+        Some("current") => ProtocolProfile::Current,
+        Some(name) => {
+            return Err(ScenarioRunError {
+                step_index: None,
+                message: format!("unsupported application profile {name}"),
+            });
+        }
+    };
     run_scenario_report_inner(
         &fixture.scenario,
         fixture.expected_trace.clone(),
@@ -282,6 +304,7 @@ pub async fn run_vector_fixture_report(
             conformance_version: fixture.conformance_version.clone(),
             seed: fixture.seed,
         }),
+        protocol_profile,
     )
     .await
 }
@@ -291,6 +314,7 @@ async fn run_scenario_report_inner(
     expected_trace: Option<ScenarioTrace>,
     expected_outcomes: Vec<TraceExpectation>,
     fixture: Option<VectorFixtureMetadata>,
+    protocol_profile: ProtocolProfile,
 ) -> Result<ScenarioReport, ScenarioRunError> {
     if spec.spec_version != "1" {
         return Err(ScenarioRunError {
@@ -309,6 +333,7 @@ async fn run_scenario_report_inner(
         }
         let client = ClientBuilder::new(pad32(label.as_bytes()))
             .registry(scenario_registry())
+            .protocol_profile(protocol_profile)
             .attach(&bus);
         clients.insert(label.clone(), client);
     }

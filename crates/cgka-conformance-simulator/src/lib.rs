@@ -55,7 +55,7 @@ pub use scenario::{
     run_vector_fixture_report,
 };
 pub use vector::{
-    AppInvalidationObservation, ClientEventCounts, ClientObservation,
+    AppInvalidationObservation, ApplicationProfileContract, ClientEventCounts, ClientObservation,
     ConvergenceDecisionObservation, EpochChangeObservation, ExpectationFailure,
     ForkRecoveryObservation, PendingResolutionObservation, RecoveryOrderingKeyObservation,
     ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioTrace, TraceExpectation,

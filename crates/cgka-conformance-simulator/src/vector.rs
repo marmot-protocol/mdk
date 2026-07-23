@@ -19,11 +19,26 @@ pub struct VectorFixture {
     pub vector_version: String,
     pub conformance_version: String,
     pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_profile: Option<ApplicationProfileContract>,
     pub scenario: ScenarioSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_trace: Option<ScenarioTrace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_outcomes: Vec<TraceExpectation>,
+}
+
+/// Portable registry-level contract attached to scenarios that pin an
+/// application profile. Values use the specification's hexadecimal registry
+/// notation so fixtures remain implementation-neutral.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationProfileContract {
+    pub name: String,
+    pub required_group_context_extensions: Vec<String>,
+    pub required_proposals: Vec<String>,
+    pub required_app_components: Vec<String>,
+    pub required_group_context_state_components: Vec<String>,
+    pub leaf_only_app_components: Vec<String>,
 }
 
 impl VectorFixture {

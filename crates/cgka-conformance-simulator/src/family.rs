@@ -34,6 +34,7 @@ impl GeneratedScenarioCase {
             vector_version: "1".into(),
             conformance_version: conformance_version.into(),
             seed: Some(self.seed),
+            application_profile: None,
             scenario: self.scenario.clone(),
             expected_trace,
             expected_outcomes: self.expected_outcomes.clone(),

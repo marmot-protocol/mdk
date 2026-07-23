@@ -57,6 +57,14 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: normal metadata commit path.
 - Expected: recipients advance one epoch and keep the same member set.
 
+### `current-profile-required-set/v1`
+
+- File: `vectors/current-profile-required-set.v1.json`
+- Setup: Alice creates a current-profile group with Bob and Bob joins from the founding Welcome.
+- Contract: GroupContext requires extension `0x0006`, proposal `0x0008`, and application components `0x8003` and
+  `0x8009`; `0x8003` has GroupContext state while `0x8009` is LeafNode-only.
+- Expected: both clients accept the profile, converge at epoch 1, and retain the two-member group.
+
 ### `admin-policy-update/v1`
 
 - File: `vectors/admin-policy-update.v1.json`

@@ -114,6 +114,25 @@ fn assert_even_hex(hex: &str, path: &Path) {
     );
 }
 
+#[test]
+fn current_profile_vector_pins_the_adopted_required_set() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/current-profile-required-set.v1.json");
+    let fixture: cgka_conformance_simulator::VectorFixture =
+        serde_json::from_str(&fs::read_to_string(&path).expect("profile fixture exists"))
+            .expect("profile fixture parses");
+    let profile = fixture
+        .application_profile
+        .expect("current profile contract is present");
+
+    assert_eq!(profile.name, "current");
+    assert_eq!(profile.required_group_context_extensions, ["0x0006"]);
+    assert_eq!(profile.required_proposals, ["0x0008"]);
+    assert_eq!(profile.required_app_components, ["0x8003", "0x8009"]);
+    assert_eq!(profile.required_group_context_state_components, ["0x8003"]);
+    assert_eq!(profile.leaf_only_app_components, ["0x8009"]);
+}
+
 /// The byte fixtures are portable cross-implementation vectors, so they MUST
 /// round-trip through the reference Marmot codec — not merely be well-formed hex
 /// (closes the gap that let the fixtures drift to a TLS layout the codec rejects).

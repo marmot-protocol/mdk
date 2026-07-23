@@ -17,13 +17,17 @@ use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
-    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT_ID,
-    NostrRoutingV1, default_group_components, encode_group_avatar_url_v1, encode_nostr_routing_v1,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    default_group_components, encode_component_vectors, encode_components_list,
+    encode_group_avatar_url_v1, encode_nostr_routing_v1,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
@@ -298,6 +302,49 @@ fn build_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccount
     (engine, storage)
 }
 
+fn build_current(id: &[u8]) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+fn build_current_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
+fn build_with_storage_and_component(
+    id: &[u8],
+    component_id: u16,
+) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut components: Vec<_> = default_group_components().into_iter().collect();
+    components.push(component_id);
+    let engine = EngineBuilder::new(storage.clone())
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(registry())
+        .supported_app_components(components)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    (engine, storage)
+}
+
 fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
     let result = engine
         .converge_stored_openmls_messages(group_id, 1_000_000)
@@ -326,6 +373,7 @@ fn build_with_opaque_component(id: &[u8], component_id: u16) -> Engine<SqliteAcc
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(components)
         .peeler(Box::new(MockPeeler))
@@ -443,6 +491,23 @@ fn malicious_app_component_commit(
     group_id: &GroupId,
     updates: Vec<AppComponentData>,
 ) -> TransportMessage {
+    raw_app_data_commit(
+        storage,
+        sender,
+        group_id,
+        updates
+            .into_iter()
+            .map(|update| AppDataUpdateProposal::update(update.component_id, update.data))
+            .collect(),
+    )
+}
+
+fn raw_app_data_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    proposals: Vec<AppDataUpdateProposal>,
+) -> TransportMessage {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
@@ -461,27 +526,27 @@ fn malicious_app_component_commit(
     )
     .expect("MLS signer exists");
 
-    let proposals = updates
-        .iter()
-        .map(|update| {
-            Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::update(
-                update.component_id,
-                update.data.clone(),
-            )))
-        })
-        .collect::<Vec<_>>();
     let mut builder = mls_group
         .commit_builder()
-        .add_proposals(proposals)
+        .add_proposals(
+            proposals
+                .into_iter()
+                .map(|proposal| Proposal::AppDataUpdate(Box::new(proposal))),
+        )
         .load_psks(provider.storage())
         .expect("load PSKs");
     let mut app_data = builder.app_data_dictionary_updater();
     for proposal in builder.app_data_update_proposals() {
-        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
-            app_data.set(ComponentData::from_parts(
-                proposal.component_id(),
-                data.clone(),
-            ));
+        match proposal.operation() {
+            AppDataUpdateOperation::Update(data) => {
+                app_data.set(ComponentData::from_parts(
+                    proposal.component_id(),
+                    data.clone(),
+                ));
+            }
+            AppDataUpdateOperation::Remove => {
+                app_data.remove(&proposal.component_id());
+            }
         }
     }
     builder.with_app_data_dictionary_updates(app_data.changes());
@@ -932,6 +997,73 @@ async fn convergence_rejects_non_admin_admin_policy_update() {
 }
 
 #[tokio::test]
+async fn inbound_commit_cannot_unrequire_current_admin_policy() {
+    let (mut alice, alice_storage) = build_current_with_storage(b"alice");
+    let mut bob = build_current(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "mandatory-invariants".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let malicious = raw_app_data_commit(
+        &alice_storage,
+        &alice.self_id(),
+        &gid,
+        vec![AppDataUpdateProposal::update(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(
+                &[
+                    GROUP_PROFILE_COMPONENT_ID,
+                    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )],
+    );
+    bob.ingest(malicious.clone())
+        .await
+        .expect("commit is retained for convergence");
+    let result = bob
+        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .expect("invalid commit receives a terminal disposition");
+
+    assert!(result.accepted_commits.is_empty());
+    assert!(result.dropped_messages.iter().any(|dropped| {
+        dropped.message_id == hex::encode(content_id(&malicious).as_slice())
+            && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
+    }));
+    assert_eq!(bob.epoch(&gid).unwrap().0, 1);
+    assert!(
+        bob.group_record(&gid)
+            .unwrap()
+            .required_capabilities
+            .app_components
+            .contains(GROUP_ADMIN_POLICY_COMPONENT_ID)
+    );
+    assert_eq!(
+        bob.admin_pubkeys(&gid).unwrap(),
+        vec![<[u8; 32]>::try_from(pad32(b"alice")).unwrap()]
+    );
+}
+
+#[tokio::test]
 async fn non_admin_cannot_update_admin_policy_component() {
     let (_alice, mut bob, gid) = create_pair().await;
     let alice_id = pad32(b"alice");
@@ -1012,10 +1144,7 @@ async fn unrelated_update_and_invite_preserve_opaque_app_component_for_all_membe
             description: "orig description".into(),
             members: vec![bob_kp],
             required_features: vec![],
-            app_components: vec![AppComponentData {
-                component_id: OPAQUE_COMPONENT_ID,
-                data: OPAQUE_BYTES.to_vec(),
-            }],
+            app_components: vec![],
             initial_admins: vec![],
         })
         .await
@@ -1028,6 +1157,34 @@ async fn unrelated_update_and_invite_preserve_opaque_app_component_for_all_membe
     bob.join_welcome(welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
+
+    // Add opaque state without listing it as required. Current-profile clients
+    // fail closed on unknown required components, but must preserve unknown
+    // OPTIONAL entries byte-for-byte across unrelated commits.
+    let result = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id: OPAQUE_COMPONENT_ID,
+                data: OPAQUE_BYTES.to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match result {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: gid.as_slice().to_vec(),
+        },
+        ..commit
+    })
+    .await
+    .unwrap();
+    converge_buffered_commit(&mut bob, &gid);
 
     let result = alice
         .send(SendIntent::UpdateGroupData {
@@ -1103,6 +1260,82 @@ async fn unrelated_update_and_invite_preserve_opaque_app_component_for_all_membe
             "{name} must retain the opaque component through Add/Welcome"
         );
     }
+}
+
+#[tokio::test]
+async fn inbound_commit_atomically_unrequires_and_removes_optional_component() {
+    let (mut alice, alice_storage) =
+        build_with_storage_and_component(b"alice", GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+    let mut bob = build_with_opaque_component(b"bob", GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let absent_image = encode_component_vectors(&[&[], &[], &[], &[], &[]]);
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "atomic-remove".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                data: absent_image,
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+
+    let resulting_required = [
+        GROUP_PROFILE_COMPONENT_ID,
+        GROUP_ADMIN_POLICY_COMPONENT_ID,
+        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+    ]
+    .into_iter()
+    .collect();
+    let commit = raw_app_data_commit(
+        &alice_storage,
+        &alice.self_id(),
+        &gid,
+        vec![
+            AppDataUpdateProposal::update(
+                APP_COMPONENTS_COMPONENT_ID,
+                encode_components_list(&resulting_required),
+            ),
+            AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
+        ],
+    );
+    bob.ingest(commit)
+        .await
+        .expect("atomic unrequire and remove is retained");
+    let result = bob
+        .converge_stored_openmls_messages(&gid, 1_000_000)
+        .expect("atomic unrequire and remove converges");
+    assert_eq!(
+        result.accepted_commits.len(),
+        1,
+        "atomic transition was rejected: {result:?}"
+    );
+
+    assert_eq!(bob.epoch(&gid).unwrap().0, 2);
+    assert_eq!(
+        bob.app_component(&gid, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+            .unwrap(),
+        None
+    );
+    assert!(
+        !bob.group_record(&gid)
+            .unwrap()
+            .required_capabilities
+            .app_components
+            .contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+    );
 }
 
 #[tokio::test]
