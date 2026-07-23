@@ -81,6 +81,7 @@ fn shared_host_safety_classifies_canonical_ipv6_ranges() {
     assert!(is_public_ip(IpAddr::V6("2606:4700::1".parse().unwrap())));
     assert!(is_public_ipv6("3ffe::1".parse().unwrap()));
     assert!(is_public_ipv6("3fff:1000::1".parse().unwrap()));
+    assert!(is_public_ipv6("2001:200::1".parse().unwrap()));
 
     for raw in [
         "::1",              // loopback
@@ -92,6 +93,11 @@ fn shared_host_safety_classifies_canonical_ipv6_ranges() {
         "fe80::1",          // link-local
         "2002::1",          // 6to4 transition prefix
         "2001::1",          // Teredo 2001:0000::/32
+        "2001:1::1",        // PCP anycast in IANA special-purpose 2001::/23
+        "2001:2::1",        // IPv6 benchmarking
+        "2001:4:112::1",    // AS112-v6
+        "2001:20::1",       // ORCHIDv2
+        "2001:1ff:ffff::1", // end of IANA special-purpose 2001::/23
         "2001:db8::1",      // documentation
         "3fff::1",          // documentation 3fff::/20
         "4000::1",          // outside global-unicast 2000::/3
@@ -130,6 +136,7 @@ fn shared_dial_gate_rejects_non_public_addresses() {
         "192.168.1.1",      // private
         "fc00::1",          // unique-local
         "fe80::1",          // link-local
+        "2001:2::1",        // IPv6 benchmarking
         "::ffff:10.0.0.1",  // mapped private IPv4
         "::ffff:127.0.0.1", // mapped loopback
     ] {
