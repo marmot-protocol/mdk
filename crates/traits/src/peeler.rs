@@ -65,30 +65,25 @@ impl GroupMessageMetadata {
     }
 
     /// Compute the transport-level expiration timestamp, if any.
-    pub fn expiration_timestamp(&self) -> Result<Option<u64>, GroupMessageMetadataError> {
+    pub fn expiration_timestamp(&self) -> Option<u64> {
         let Self::Application {
             inner_created_at,
             retention_seconds,
         } = self
         else {
-            return Ok(None);
+            return None;
         };
         let Some(retention_seconds) = retention_seconds else {
-            return Ok(None);
+            return None;
         };
         if *retention_seconds == 0 {
-            return Ok(None);
+            return None;
         }
-        inner_created_at
-            .checked_add(*retention_seconds)
-            .map(Some)
-            .ok_or(GroupMessageMetadataError::ExpirationTimestampOverflow)
+        // Expiration is only a transport hint. If the sum is not
+        // representable, the hint is undefined and must be omitted without
+        // rejecting the otherwise-valid application message.
+        inner_created_at.checked_add(*retention_seconds)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupMessageMetadataError {
-    ExpirationTimestampOverflow,
 }
 
 /// Unwrap and rewrap transport-layer envelopes. A single peeler typically
