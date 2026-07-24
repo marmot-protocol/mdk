@@ -481,7 +481,7 @@ impl SqliteAccountStorage {
                         pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
                         conversation_created_at, updated_at
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                      ON CONFLICT(group_id_hex) DO UPDATE SET
                         endpoint = excluded.endpoint,
                         profile_name = excluded.profile_name,
@@ -525,6 +525,7 @@ impl SqliteAccountStorage {
                         bool_i64(group.pending_confirmation),
                         &group.welcomer_account_id_hex,
                         &group.via_welcome_message_id_hex,
+                        now_i64,
                         now_i64
                     ],
                 )
