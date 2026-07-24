@@ -20,7 +20,7 @@ pub fn parse_media_imeta_tag(
     source_epoch: u64,
 ) -> Result<MediaAttachmentReferenceFfi, MarmotKitError> {
     marmot_app::media_attachment_from_imeta_tag(&tag.values, Some(source_epoch), false)
-        .map(Into::into)
+        .and_then(MediaAttachmentReferenceFfi::try_from)
         .map_err(media_reference_error)
 }
 
