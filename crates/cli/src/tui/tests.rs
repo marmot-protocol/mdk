@@ -1208,7 +1208,8 @@ fn chat_row_line_shows_unread_count_in_bold() {
     assert_eq!(line_text(&line), "  Project Room (3)");
     assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
     assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(line.spans[1].style.fg, Some(Color::Green));
+    // Chat-list labels are cyan (chrome), reserving green strictly for self.
+    assert_eq!(line.spans[1].style.fg, Some(Color::Cyan));
 }
 
 #[test]
@@ -1227,7 +1228,7 @@ fn chat_row_line_renders_the_unread_badge_yellow_and_bold() {
     assert_eq!(line_text(&line), "  Project Room (3)");
     let name = &line.spans[1];
     assert_eq!(name.content.as_ref(), "Project Room");
-    assert_eq!(name.style.fg, Some(Color::Green));
+    assert_eq!(name.style.fg, Some(Color::Cyan));
     assert!(name.style.add_modifier.contains(Modifier::BOLD));
     let badge = &line.spans[2];
     assert_eq!(badge.content.as_ref(), " (3)");
@@ -6536,12 +6537,12 @@ fn messages_pane_shows_loading_while_an_open_chat_load_is_in_flight() {
         .collect::<String>();
 
     assert!(
-        rendered.contains("loading chat..."),
-        "an in-flight load shows honest feedback in the pane, not 'no messages'"
+        rendered.contains("loading messages..."),
+        "an in-flight load shows honest feedback in the pane, not an empty notice"
     );
     assert!(
-        !rendered.contains("no messages"),
-        "'no messages' is only shown once the load settles empty"
+        !rendered.contains("no messages yet"),
+        "'no messages yet' is only shown once the load settles empty"
     );
 }
 
@@ -6592,27 +6593,106 @@ fn masked_secret_hides_every_character() {
 }
 
 #[test]
-fn status_bar_line_assembles_daemon_counts_and_status() {
-    assert_eq!(
-        status_bar_line("alice", true, 3, 5, "loaded 2 message(s)", 200),
-        "alice · daemon on · 3 chats · 5 unread · loaded 2 message(s)"
+fn status_bar_line_assembles_account_counts_and_status() {
+    let line = status_bar_line(
+        None,
+        Some("npub1alice"),
+        true,
+        3,
+        5,
+        "loaded 2 message(s)",
+        200,
     );
-    assert_eq!(
-        status_bar_line("bob", false, 0, 0, "", 200),
-        "bob · daemon off · 0 chats · 0 unread · "
+    let text = line_text(&line);
+    assert!(text.contains("npub1alice"), "account: {text:?}");
+    assert!(text.contains("3 chats"), "chats: {text:?}");
+    assert!(text.contains("5 unread"), "unread: {text:?}");
+    assert!(text.contains("loaded 2 message(s)"), "status: {text:?}");
+    // A width that fits the fixed segments but not the whole status truncates
+    // the status segment (trailing ellipsis) so the assembled line fits.
+    let narrow = status_bar_line(None, Some("npub1a"), true, 3, 0, "loaded slowly now", 30);
+    let narrow_text = line_text(&narrow);
+    assert!(
+        narrow_text.chars().count() <= 30,
+        "over width: {narrow_text:?}"
     );
-    // Narrow widths shorten the assembled line (middle ellipsis keeps head + tail).
-    let narrow = status_bar_line("alice", true, 3, 5, "loaded", 20);
-    assert!(narrow.chars().count() <= 20, "over width: {narrow:?}");
-    assert!(narrow.contains("..."), "expected truncation: {narrow:?}");
+    assert!(
+        narrow_text.contains("..."),
+        "expected truncation: {narrow_text:?}"
+    );
+    // A width too small for any status drops the segment rather than overflowing.
+    let tiny = status_bar_line(None, Some("npub1a"), true, 3, 0, "loaded", 20);
+    assert!(
+        !line_text(&tiny).contains("loaded"),
+        "dropped: {:?}",
+        line_text(&tiny)
+    );
+}
+
+#[test]
+fn status_bar_line_dot_reflects_daemon_state() {
+    fn dot(line: &Line<'_>) -> (String, Option<Color>) {
+        let span = line
+            .spans
+            .iter()
+            .find(|s| s.content == "●" || s.content == "○")
+            .expect("dot span");
+        (span.content.to_string(), span.style.fg)
+    }
+    let on = status_bar_line(None, Some("npub1a"), true, 0, 0, "", 200);
+    assert_eq!(dot(&on), ("●".to_owned(), Some(Color::Green)));
+    let off = status_bar_line(None, Some("npub1a"), false, 0, 0, "", 200);
+    assert_eq!(dot(&off), ("○".to_owned(), Some(Color::Red)));
+}
+
+#[test]
+fn status_bar_line_hides_zero_unread_and_shows_nonzero_yellow() {
+    let zero = status_bar_line(None, Some("npub1a"), true, 3, 0, "", 200);
+    assert!(
+        !line_text(&zero).contains("unread"),
+        "zero hidden: {:?}",
+        line_text(&zero)
+    );
+    let some = status_bar_line(None, Some("npub1a"), true, 3, 7, "", 200);
+    let badge = some
+        .spans
+        .iter()
+        .find(|s| s.content.contains("unread"))
+        .expect("unread badge");
+    assert_eq!(badge.content.as_ref(), "7 unread");
+    assert_eq!(badge.style.fg, Some(Color::Yellow));
+}
+
+#[test]
+fn status_bar_line_shows_display_name_distinct_from_npub() {
+    let line = status_bar_line(Some("Alice"), Some("npub1alice"), true, 0, 0, "", 200);
+    let text = line_text(&line);
+    assert!(text.contains("Alice"), "name: {text:?}");
+    assert!(text.contains("npub1alice"), "npub: {text:?}");
+    // The npub segment is styled gray, distinct from the name.
+    let npub_span = line
+        .spans
+        .iter()
+        .find(|s| s.content.contains("npub1alice"))
+        .expect("npub span");
+    assert_eq!(npub_span.style.fg, Some(Color::Gray));
 }
 
 #[test]
 fn status_bar_line_strips_control_sequences_from_untrusted_fields() {
-    assert_eq!(
-        status_bar_line("al\u{1b}[31mice", true, 1, 0, "ok\u{1b}[2J", 200),
-        "al[31mice · daemon on · 1 chats · 0 unread · ok[2J"
+    let line = status_bar_line(
+        None,
+        Some("al\u{1b}[31mice"),
+        true,
+        1,
+        0,
+        "ok\u{1b}[2J",
+        200,
     );
+    let text = line_text(&line);
+    assert!(text.contains("al[31mice"), "account stripped: {text:?}");
+    assert!(text.contains("ok[2J"), "status stripped: {text:?}");
+    assert!(!text.contains('\u{1b}'), "no escape: {text:?}");
 }
 
 #[test]
@@ -7671,6 +7751,29 @@ fn account_picker_l_opens_nsec_entry() {
 }
 
 #[test]
+fn account_picker_renders_without_panic_in_a_tiny_terminal() {
+    // Regression: with the account picker open, a terminal of height <= 3 shrinks
+    // the login body below the popup's 4-row floor. `rows.clamp(4, body.height)`
+    // panicked ("min > max") because the requested floor exceeded the available
+    // height. The rect must instead be built with a plain `max(4)` floor and left
+    // to `centered_cell_rect` to clamp down to the body.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.accounts.push(AccountRow {
+        account_id: "bb".repeat(32),
+        npub: "npub1bob".to_owned(),
+        display_name: None,
+        local_signing: false,
+    });
+    app.screen = Screen::Login(LoginMode::AccountSelect);
+
+    let backend = ratatui::backend::TestBackend::new(50, 3);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("account picker must render without panicking in a 3-row terminal");
+}
+
+#[test]
 fn shift_a_reopens_the_account_picker_from_the_chat_list() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.screen = Screen::Main;
@@ -7825,8 +7928,13 @@ fn main_frame_shows_chats_and_messages_with_bars_and_toggled_diagnostics() {
         !rendered.contains("Accounts"),
         "the accounts pane is gone from the main view"
     );
-    assert!(rendered.contains("g detail"), "chats hints line present");
-    assert!(rendered.contains("daemon"), "status bar present");
+    // The keymap hint renders keycaps (boxed keys) + dim labels; the `detail`
+    // label sits after the boxed `g` keycap.
+    assert!(rendered.contains("detail"), "chats hints line present");
+    assert!(
+        rendered.contains("loaded 1 message(s)"),
+        "status bar shows the latest status segment"
+    );
     assert!(
         !rendered.contains("Diagnostics"),
         "the diagnostics panel is off by default"
@@ -7859,7 +7967,7 @@ fn login_menu_frame_shows_options_and_hints() {
     assert!(rendered.contains("Create a new identity"));
     assert!(rendered.contains("Log in with an nsec"));
     assert!(
-        rendered.contains("c create identity"),
+        rendered.contains("create identity"),
         "login hints line present"
     );
 }
@@ -8035,8 +8143,8 @@ fn composer_grows_with_content_and_renders_the_cursor_cell() {
     );
     // The status bar still renders, so growth stole from the messages row, not the bars.
     assert!(
-        rendered.contains("daemon"),
-        "the status bar survives composer growth"
+        rendered.contains('●'),
+        "the status bar (connection dot) survives composer growth"
     );
     // The focused composer draws a black-on-white cursor cell.
     assert!(
@@ -8330,6 +8438,191 @@ fn messages_d_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
 }
 
 #[test]
+fn keymap_hint_spans_box_keys_and_dim_labels() {
+    let spans = keymap_hint_spans("j/k move  Enter open");
+    // The keycap for `j/k`: white bold text on a dark-gray block, padded. White-on-
+    // dark-gray reads clearly on dark themes where black-on-dark-gray washed out.
+    let keycap = spans
+        .iter()
+        .find(|s| s.content.contains("j/k"))
+        .expect("j/k keycap");
+    assert_eq!(keycap.content.as_ref(), " j/k ");
+    assert_eq!(keycap.style.fg, Some(Color::White));
+    assert_eq!(keycap.style.bg, Some(Color::DarkGray));
+    assert!(keycap.style.add_modifier.contains(Modifier::BOLD));
+    // The label after it is dim, no keycap background.
+    let label = spans
+        .iter()
+        .find(|s| s.content.contains("move"))
+        .expect("move label");
+    assert_eq!(label.style.fg, Some(Color::DarkGray));
+    assert_eq!(label.style.bg, None);
+    // `Enter` is boxed like any other key.
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.content.as_ref() == " Enter " && s.style.bg == Some(Color::DarkGray)),
+        "Enter keycap present"
+    );
+}
+
+#[test]
+fn keymap_hint_spans_leave_prose_leading_segment_unboxed() {
+    // `type query` is prose, not a key press — its first token must not be boxed.
+    let spans = keymap_hint_spans("type query  Enter search");
+    assert!(
+        !spans.iter().any(|s| s.content.as_ref() == " type "),
+        "the prose word `type` is not rendered as a keycap"
+    );
+    // The real key `Enter` is still boxed.
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.content.as_ref() == " Enter " && s.style.bg == Some(Color::DarkGray)),
+        "Enter keycap present"
+    );
+}
+
+#[test]
+fn armed_hint_spans_box_only_enter_and_esc() {
+    let spans = armed_hint_spans("reacting to Alice — Enter sends the reaction, Esc clears");
+    let boxed = spans
+        .iter()
+        .filter(|s| s.style.bg == Some(Color::DarkGray))
+        .map(|s| s.content.trim().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(boxed, vec!["Enter".to_owned(), "Esc".to_owned()]);
+    // The prose target still renders (dim), preserving the whole hint text.
+    let text = spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+    assert!(text.contains("Alice"), "target preserved: {text:?}");
+}
+
+#[test]
+fn popup_hint_spans_color_bracket_keys_cyan_and_desc_gray() {
+    let spans = popup_hint_spans("[Enter] submit  [Esc] cancel");
+    let key = spans
+        .iter()
+        .find(|s| s.content.contains("[Enter]"))
+        .expect("[Enter] span");
+    assert_eq!(key.style.fg, Some(Color::Cyan));
+    let desc = spans
+        .iter()
+        .find(|s| s.content.contains("submit"))
+        .expect("submit desc");
+    assert_eq!(desc.style.fg, Some(Color::DarkGray));
+}
+
+#[test]
+fn empty_messages_notice_distinguishes_loading_no_chat_and_empty_chat() {
+    // In-flight load: yellow, regardless of whether a chat is already loaded.
+    assert_eq!(
+        empty_messages_notice(true, false),
+        ("loading messages...", Color::Yellow)
+    );
+    assert_eq!(
+        empty_messages_notice(true, true),
+        ("loading messages...", Color::Yellow)
+    );
+    // Settled, no chat loaded into the pane: the pick-a-chat prompt (dark gray).
+    assert_eq!(
+        empty_messages_notice(false, false),
+        ("select a chat to start messaging", Color::DarkGray)
+    );
+    // Settled, a chat is loaded but has no messages: genuinely empty (dark gray).
+    assert_eq!(
+        empty_messages_notice(false, true),
+        ("no messages yet", Color::DarkGray)
+    );
+}
+
+#[test]
+fn messages_pane_renders_the_three_empty_states() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+
+    // Loading a chat's timeline off the event loop.
+    app.loading_chat = Some("gg".repeat(32));
+    assert!(rendered_buffer(&mut app).contains("loading messages..."));
+
+    // Settled, no chat loaded.
+    app.loading_chat = None;
+    app.messages_group_id = None;
+    assert!(rendered_buffer(&mut app).contains("select a chat to start messaging"));
+
+    // Settled, a chat loaded but empty.
+    app.messages_group_id = Some("gg".repeat(32));
+    assert!(rendered_buffer(&mut app).contains("no messages yet"));
+
+    // Chats pane empty state.
+    assert!(rendered_buffer(&mut app).contains("no chats yet"));
+}
+
+#[test]
+fn popup_rect_sizes_a_short_confirm_to_content_and_centers() {
+    let popup = Popup::Confirm {
+        purpose: ConfirmPurpose::LeaveGroup {
+            group_id: "gg".repeat(32),
+        },
+        title: "Leave Group".to_owned(),
+        body: vec!["Leave ops-room?".to_owned()],
+    };
+    let area = Rect::new(0, 0, 100, 30);
+    let rect = popup_rect(&popup, area);
+    // Content-sized: 55 wide, snug height for one body line (not 70% of screen).
+    assert_eq!(rect.width, 55, "confirm width");
+    assert_eq!(
+        rect.height, 5,
+        "confirm height = body(1) + blank + hint + borders"
+    );
+    // Centered exactly.
+    assert_eq!(rect.x, (100 - 55) / 2);
+    assert_eq!(rect.y, (30 - 5) / 2);
+}
+
+#[test]
+fn popup_rect_clamps_to_a_small_area() {
+    let popup = Popup::info("Info", "hello");
+    let area = Rect::new(0, 0, 20, 4);
+    let rect = popup_rect(&popup, area);
+    assert!(rect.width <= 20, "width clamps: {}", rect.width);
+    assert!(rect.height <= 4, "height clamps: {}", rect.height);
+}
+
+#[test]
+fn popup_body_lines_color_confirm_yellow_and_logout_red() {
+    let confirm = Popup::Confirm {
+        purpose: ConfirmPurpose::LeaveGroup {
+            group_id: "gg".repeat(32),
+        },
+        title: "Leave Group".to_owned(),
+        body: vec!["Leave ops-room?".to_owned()],
+    };
+    let lines = popup_body_lines(&confirm);
+    assert_eq!(
+        lines[0].spans[0].style.fg,
+        Some(Color::Yellow),
+        "confirm body yellow"
+    );
+
+    let logout = Popup::Text {
+        purpose: TextPurpose::ConfirmLogout {
+            account_id: "aa".repeat(32),
+            npub: "npub1a".to_owned(),
+        },
+        title: "Log out".to_owned(),
+        body: vec!["This permanently destroys the signing key.".to_owned()],
+        input: Input::default(),
+    };
+    let lines = popup_body_lines(&logout);
+    assert_eq!(
+        lines[0].spans[0].style.fg,
+        Some(Color::Red),
+        "logout danger body red"
+    );
+}
+
+#[test]
 fn armed_interaction_hint_names_the_action_and_target() {
     // While the composer holds an interaction command, the hint tells the user
     // what Enter will do and to which message — the durable signal the field
@@ -8386,19 +8679,21 @@ fn render_hints_shows_the_persistent_armed_interaction_hint() {
     app.input.set_value("/react ");
 
     let armed = rendered_buffer(&mut app);
+    // The armed hint boxes `Enter`/`Esc` as keycaps, so the surrounding words are
+    // separate spans; assert on the prose fragments rather than exact spacing.
     assert!(
-        armed.contains("reacting to Alice") && armed.contains("Esc clears"),
+        armed.contains("reacting to Alice") && armed.contains("clears"),
         "armed hint must name the action and target, got: {armed:?}"
     );
     assert!(
-        !armed.contains("r react  u unreact"),
+        !armed.contains("unreact"),
         "the static messages keymap must be replaced while armed, got: {armed:?}"
     );
 
     app.input.clear();
     let idle = rendered_buffer(&mut app);
     assert!(
-        idle.contains("r react  u unreact"),
+        idle.contains("unreact"),
         "the static keymap returns once the composer is cleared, got: {idle:?}"
     );
 }
@@ -8458,6 +8753,121 @@ fn esc_preserves_a_hand_typed_draft() {
             "Esc must preserve a hand-typed draft, not destroy it"
         );
     }
+}
+
+#[test]
+fn sidebar_width_shrinks_on_narrow_terminals() {
+    // 5c: fixed 36 on a wide terminal, but never more than a third of the width so
+    // a narrow terminal gives the conversation more room.
+    assert_eq!(sidebar_width(120), 36, "wide: capped at 36");
+    assert_eq!(sidebar_width(108), 36, "108/3 == 36, still 36");
+    assert_eq!(sidebar_width(90), 30, "narrow: a third of 90");
+    assert_eq!(sidebar_width(30), 10, "very narrow: a third of 30");
+}
+
+#[test]
+fn esc_moves_focus_back_spatially_on_main() {
+    // 5a: Esc is spatial back on Main — Composer -> Messages -> Chats -> (no-op).
+    // A hand-typed draft is never destroyed; only the focus changes.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.screen = Screen::Main;
+    app.focus = Focus::Composer;
+    app.input.set_value("draft in progress");
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert_eq!(app.focus, Focus::Messages, "Composer -> Messages");
+    assert_eq!(app.input.value(), "draft in progress", "draft preserved");
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert_eq!(app.focus, Focus::Chats, "Messages -> Chats");
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("esc");
+    assert_eq!(app.focus, Focus::Chats, "Chats -> no-op");
+    assert_eq!(
+        app.input.value(),
+        "draft in progress",
+        "draft still preserved"
+    );
+}
+
+/// Whether the rendered frame has any cell holding `ch` with the DarkGray
+/// selection-highlight background (used to detect the messages-pane row
+/// highlight, which only the message body carries).
+fn cell_with_char_has_darkgray_bg(app: &mut TuiApp, ch: char) -> bool {
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .any(|cell| cell.symbol() == ch.to_string() && cell.bg == Color::DarkGray)
+}
+
+#[test]
+fn messages_highlight_renders_only_when_messages_focused() {
+    // 5b: the messages-pane row highlight is gated on focus, so a chat previewed
+    // while focus stays on the list (flick-through) shows no stray highlight.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.messages_group_id = Some("gg".repeat(32));
+    let mut row = timeline_row("m0", 0);
+    row.display_text = "ZEBRAMSG".to_owned();
+    app.timeline = vec![row];
+
+    app.focus = Focus::Messages;
+    assert!(
+        cell_with_char_has_darkgray_bg(&mut app, 'Z'),
+        "the selected row is highlighted when the messages pane is focused"
+    );
+
+    app.focus = Focus::Chats;
+    assert!(
+        !cell_with_char_has_darkgray_bg(&mut app, 'Z'),
+        "no highlight on the message row when focus is elsewhere"
+    );
+}
+
+#[test]
+fn messages_highlight_stays_while_an_interaction_is_armed() {
+    // Arming r/d/R moves focus to the composer, but the highlighted row is the
+    // exact target of the pending action — it must keep its highlight while armed
+    // so the user can see what they are about to react to / delete / reply to.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.messages_group_id = Some("gg".repeat(32));
+    let mut row = timeline_row("m0", 0);
+    row.display_text = "ZEBRAMSG".to_owned();
+    app.timeline = vec![row];
+
+    // `r` arms /react from the messages pane and moves focus to the composer.
+    app.focus = Focus::Messages;
+    app.handle_key(char_key('r')).expect("r arms /react");
+    assert_eq!(app.focus, Focus::Composer, "r moves focus to the composer");
+    assert!(
+        is_armed_interaction(app.input.value()),
+        "r leaves an armed /react in the composer, got {:?}",
+        app.input.value()
+    );
+    assert!(
+        cell_with_char_has_darkgray_bg(&mut app, 'Z'),
+        "the target row stays highlighted while an interaction is armed"
+    );
+
+    // Companion: focus on the chat list with nothing armed keeps the highlight
+    // hidden, so flick-through browsing shows no stray highlight.
+    app.input.clear();
+    app.focus = Focus::Chats;
+    assert!(
+        !cell_with_char_has_darkgray_bg(&mut app, 'Z'),
+        "no highlight when focus is elsewhere and nothing is armed"
+    );
 }
 
 #[test]
@@ -9078,7 +9488,7 @@ fn composer_min_and_max_height_coexist_with_the_diagnostics_panel() {
             "the diagnostics content renders alongside the composer"
         );
         assert!(
-            rendered.contains("daemon"),
+            rendered.contains('●'),
             "the status bar survives at composer height {expected_composer_rows}"
         );
     };

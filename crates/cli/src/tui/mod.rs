@@ -44,7 +44,10 @@ const UI_EVENT_WAIT: Duration = Duration::from_millis(50);
 /// the tick loop counts it down (no separate timer).
 const FLICK_PREVIEW_DEBOUNCE_TICKS: u32 = 3;
 const STREAM_APPEND_FLUSH_INTERVAL: Duration = Duration::from_millis(125);
-const FOCUS_ACCENT: Color = Color::Green;
+/// Chrome accent: focused borders, labels, prompts, and selected markers. Cyan
+/// in the color-role split — green is reserved strictly for self (own messages)
+/// and the daemon-connection dot.
+const FOCUS_ACCENT: Color = Color::Cyan;
 const ACCOUNT_ACCENT: Color = Color::White;
 const DEFAULT_STREAM_CANDIDATE: &str = crate::DEFAULT_PRODUCTION_QUIC_BROKER_CANDIDATE;
 const SLASH_SUGGESTION_LIMIT: usize = 8;

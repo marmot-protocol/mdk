@@ -109,6 +109,33 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI polish bundle: `Esc` on the main view is now spatial back (Composer → Messages → Chats, a no-op from Chats)
+  after the armed-interaction clear, and never destroys a hand-typed draft. The messages-pane row highlight renders
+  when that pane holds focus or while an interaction is armed — arming `/react`/`/reply`/`/delete` moves focus to the
+  composer, but the target row stays lit so you can see what the action is aimed at; a flick-through preview (focus on
+  the chat list with nothing armed) still shows no stray highlight. The chat sidebar shrinks to at
+  most a third of the width on narrow terminals (was a fixed 36 columns). Color roles are split: cyan for
+  chrome/labels/focused borders/selected markers, green reserved strictly for your own messages and the
+  daemon-connection dot; the unread badge stays yellow. The login screen centers its brand/menu block as a focused
+  card.
+- TUI: loading and empty states are now centered and color-coded — yellow while a load is in flight
+  (`loading messages...`, `searching...`, and the group-detail/profile/relay-health screen loads), dark gray when
+  genuinely empty (`no chats yet`, `no messages yet`). The messages pane distinguishes its three cases: no chat loaded
+  ("select a chat to start messaging"), a load in flight, and a loaded-but-empty chat.
+- TUI: popups are now sized to their content in cells and centered exactly, instead of always covering 70% of the
+  screen — a short confirmation is a small box, not a full panel. Confirmation bodies render yellow, the irreversible
+  typed-token logout body renders red, the title shows as a cyan-bold ` Title ` on the cyan border, and the hint row is
+  centered at the bottom. Every popup's key/paste modality and purpose is unchanged (styling and geometry only); the
+  image viewer keeps its aspect-fit 80%×80% card.
+- TUI: the hints bar now renders each key as a keycap (bold white text on a dark-gray block) followed by a dim label,
+  instead of one uniform gray string. The armed-interaction hint keeps its priority over the keymap while a
+  `/react`/`/reply`/`/delete` prefill is held, and boxes its `Enter`/`Esc` key references the same way. Popup hint rows
+  color the bracketed `[key]` cyan with a gray description.
+- TUI: the bottom status bar is now a full-width bar with a green ● / red ○ daemon-connection dot, the account display
+  name styled distinctly from its shortened npub, gray `│` separators, and hide-when-zero badges — the unread count
+  (yellow) only shows when nonzero instead of a permanent `0 unread`. Our last-action/error status segment is kept as a
+  trailing bar segment, truncated to fit. Existing redactions (terminal-safe account label and status, no relay URLs)
+  are unchanged.
 - TUI: user-initiated actions no longer freeze the interface for a `wn` subprocess round-trip. Sending a message,
   replying, reacting/unreacting, deleting, opening a chat, searching users, opening group detail, and listing invites
   now run on a dedicated background worker and fold their result back into the view on the next frame, so typing,

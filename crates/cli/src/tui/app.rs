@@ -508,6 +508,16 @@ impl TuiApp {
             KeyCode::Esc if is_armed_interaction(self.input.value()) => {
                 self.input.clear();
             }
+            // Otherwise Esc is spatial back: Composer -> Messages -> Chats, and a
+            // no-op from Chats. It never clears a hand-typed draft (only an armed
+            // interaction clears, handled above), so leaving the composer keeps the
+            // draft intact for when focus returns.
+            KeyCode::Esc => {
+                self.focus = match self.focus {
+                    Focus::Composer => Focus::Messages,
+                    Focus::Messages | Focus::Chats => Focus::Chats,
+                };
+            }
             KeyCode::Char('/') if self.focus != Focus::Composer => {
                 self.focus = Focus::Composer;
                 self.input.insert('/');

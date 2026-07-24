@@ -1827,23 +1827,95 @@ impl Input {
     }
 }
 
-/// The one-line status bar for the main view:
-/// `{account} · daemon {on|off} · {n} chats · {u} unread · {latest status}`.
-/// Untrusted fields (the account label and the status message) pass through
-/// `terminal_safe_text`, and the assembled line is shortened to `width`.
+/// The one-line bottom status bar as styled spans: a daemon-connection dot
+/// (green ● up / red ○ down), the account display name styled distinctly from
+/// its shortened npub (gray), gray `│` separators, the chat count, a
+/// hide-when-zero yellow unread badge, and our own last-action/error status
+/// segment truncated to fit the remaining width. The full-width DarkGray bar
+/// background is filled by the rendering `Paragraph`; the spans set only a
+/// foreground so the fill shows through. Untrusted fields (the account label
+/// and the status message) pass through `terminal_safe_text`.
+///
+/// Kept as our content over wn-tui's: the trailing status segment has no
+/// wn-tui equivalent and stays, and the pending-invites badge wn-tui showed is
+/// omitted because this TUI keeps no persistent pending-invites count (invites
+/// load on demand into a picker).
 pub(crate) fn status_bar_line(
-    account_label: &str,
+    display_name: Option<&str>,
+    npub: Option<&str>,
     daemon_running: bool,
     chats: usize,
     unread: usize,
     status: &str,
     width: usize,
-) -> String {
-    let account = shorten(&terminal_safe_text(account_label), 24);
-    let daemon = if daemon_running { "on" } else { "off" };
+) -> Line<'static> {
+    let sep = || Span::styled(" │ ", Style::default().fg(Color::Gray));
+    let (dot, dot_color) = if daemon_running {
+        ("●", Color::Green)
+    } else {
+        ("○", Color::Red)
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(dot, Style::default().fg(dot_color)),
+    ];
+
+    match (display_name.filter(|name| !name.trim().is_empty()), npub) {
+        (Some(name), Some(npub)) => {
+            spans.push(Span::styled(
+                format!(" {}", shorten(&terminal_safe_text(name), 24)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {}", shorten(&terminal_safe_text(npub), 20)),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        (None, Some(npub)) => spans.push(Span::raw(format!(
+            " {}",
+            shorten(&terminal_safe_text(npub), 24)
+        ))),
+        _ => spans.push(Span::styled(
+            " not logged in".to_owned(),
+            Style::default().fg(Color::Gray),
+        )),
+    }
+
+    spans.push(sep());
+    spans.push(Span::raw(format!("{chats} chats")));
+    if unread > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("{unread} unread"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
     let status = terminal_safe_text(status);
-    let line = format!("{account} · daemon {daemon} · {chats} chats · {unread} unread · {status}");
-    shorten(&line, width)
+    if !status.is_empty() {
+        let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+        // 3 covers the leading " │ " separator the status segment adds.
+        let remaining = width.saturating_sub(used + 3);
+        if remaining >= 4 {
+            spans.push(sep());
+            spans.push(Span::raw(truncate_status(&status, remaining)));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Trailing-truncate a status segment to `max` chars, appending an ellipsis
+/// when clipped. Trailing (not middle) truncation reads better for prose than
+/// `shorten`'s id-shaped middle ellipsis.
+fn truncate_status(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    if max <= 3 {
+        return text.chars().take(max).collect();
+    }
+    let kept = text.chars().take(max - 3).collect::<String>();
+    format!("{kept}...")
 }
 
 /// The per-screen, per-focus hints line. Terse and kept in lockstep with the
@@ -1948,6 +2020,138 @@ pub(crate) fn armed_interaction_hint(input: &str, row: Option<&TimelineRow>) -> 
         "{} {target} — {}, Esc clears",
         armed.verb, armed.action
     ))
+}
+
+/// The chat-list sidebar width in cells: a fixed 36, but never more than a third
+/// of the available width, so a narrow terminal gives the conversation more room
+/// instead of a sidebar that crowds it out.
+pub(crate) fn sidebar_width(total_width: u16) -> u16 {
+    36.min(total_width / 3)
+}
+
+/// The centered notice shown in the messages pane when the timeline is empty,
+/// as `(text, color)`. Three distinct cases, keyed off the async load flag and
+/// whether a chat is loaded into the pane: an in-flight load is yellow
+/// ("loading messages..."); a settled pane with no chat loaded shows the
+/// dark-gray pick-a-chat prompt; a settled pane holding a chat with no messages
+/// is a genuinely empty (dark-gray) "no messages yet".
+pub(crate) fn empty_messages_notice(loading: bool, chat_loaded: bool) -> (&'static str, Color) {
+    if loading {
+        ("loading messages...", Color::Yellow)
+    } else if !chat_loaded {
+        ("select a chat to start messaging", Color::DarkGray)
+    } else {
+        ("no messages yet", Color::DarkGray)
+    }
+}
+
+/// A single keycap: the key text in a dark-gray-background block (bold white fg),
+/// space-padded so it reads as a raised cap. White-on-dark-gray stays legible on
+/// dark themes, where the previous black-on-dark-gray washed out. The bg is what
+/// distinguishes a key reference from its dim label.
+fn keycap_span(key: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {key} "),
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// A dim (dark-gray) hint label span with a leading space, so it sits a cell off
+/// the keycap that precedes it.
+fn hint_label_span(label: &str) -> Span<'static> {
+    Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray))
+}
+
+/// Whether a hint segment's leading token is a key press to box as a keycap
+/// (rather than prose to dim). A key is a single character, a slash-combo
+/// (`j/k`, `G/g`), or a capitalized key name (`Enter`, `Esc`, `Down`,
+/// `Ctrl-U`); a lowercase multi-char word (`type`) is prose. This keeps the one
+/// prose-leading hint (`type query`) from boxing the word "type" while every
+/// real key stays boxed.
+fn looks_like_key(token: &str) -> bool {
+    token.chars().count() == 1
+        || token.contains('/')
+        || token.starts_with(|ch: char| ch.is_uppercase())
+}
+
+/// Render a per-focus keymap hint string (`"j/k move  Enter open  ..."`) as
+/// keycap+label spans: each `"  "`-separated segment becomes a boxed keycap for
+/// its leading key token followed by a dim label. A segment whose leading token
+/// is prose (not a key) renders entirely dim. The hint strings are trusted
+/// static keymaps, so no terminal-safe filtering is needed.
+pub(crate) fn keymap_hint_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, segment) in text.split("  ").filter(|s| !s.is_empty()).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        match segment.split_once(' ') {
+            Some((key, label)) if looks_like_key(key) => {
+                spans.push(keycap_span(key));
+                spans.push(hint_label_span(label));
+            }
+            None if looks_like_key(segment) => spans.push(keycap_span(segment)),
+            _ => spans.push(Span::styled(
+                segment.to_owned(),
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
+    }
+    spans
+}
+
+/// Render the persistent armed-interaction hint as spans: the prose stays dim,
+/// but the `Enter`/`Esc` key references are boxed as keycaps so the armed state
+/// styles its keys consistently with the keymap it replaces. The text is
+/// already terminal-safe (see `timeline_target_label`).
+pub(crate) fn armed_hint_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, word) in text.split(' ').enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        if word == "Enter" || word == "Esc" {
+            spans.push(keycap_span(word));
+        } else {
+            spans.push(Span::styled(
+                word.to_owned(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    spans
+}
+
+/// Render a popup hint row (`"[Enter] submit  [Esc] cancel"`) as spans: the
+/// bracketed `[key]` token cyan, its description gray — the popup convention,
+/// distinct from the main-screen keycap blocks. Trusted static text.
+pub(crate) fn popup_hint_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, segment) in text.split("  ").filter(|s| !s.is_empty()).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        match segment.split_once(' ') {
+            Some((key, desc)) => {
+                spans.push(Span::styled(
+                    key.to_owned(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                spans.push(Span::styled(
+                    format!(" {desc}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            None => spans.push(Span::styled(
+                segment.to_owned(),
+                Style::default().fg(Color::Cyan),
+            )),
+        }
+    }
+    spans
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
