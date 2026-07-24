@@ -78,6 +78,9 @@ pub const GROUP_AVATAR_URL_COMPONENT_ID: AppComponentId = 0x8007;
 pub const GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID: AppComponentId = 0x8008;
 /// Backward-compatible name for the frozen V1 component. New code should use
 /// the explicit V1/V2 constants so a group cannot silently change formats.
+#[deprecated(
+    note = "use GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID or GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID"
+)]
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId =
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID;
 /// LeafNode-only account identity proof binding the Marmot account key to the
@@ -102,6 +105,7 @@ pub const AGENT_TEXT_STREAM_QUIC_COMPONENT: &str = "marmot.group.agent-text-stre
 pub const GROUP_AVATAR_URL_COMPONENT: &str = "marmot.group.avatar-url.v1";
 pub const GROUP_ENCRYPTED_MEDIA_V1_COMPONENT: &str = "marmot.group.encrypted-media.v1";
 /// Backward-compatible name for the frozen V1 component.
+#[deprecated(note = "use GROUP_ENCRYPTED_MEDIA_V1_COMPONENT or GROUP_ENCRYPTED_MEDIA_V2_COMPONENT")]
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = GROUP_ENCRYPTED_MEDIA_V1_COMPONENT;
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT: &str = "marmot.member.account-identity-proof.v2";
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT: &str = "marmot.group.encrypted-media.v2";

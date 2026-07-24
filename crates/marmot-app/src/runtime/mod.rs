@@ -1040,6 +1040,10 @@ impl MarmotAppRuntime {
         }
     }
 
+    /// Create a locally canonical group. A successful return does not imply
+    /// every invitation Welcome was delivered; subscribe for
+    /// [`MarmotAppEvent::WelcomeDeliveryPending`] or query
+    /// [`Self::pending_welcome_deliveries`] before presenting invite success.
     pub async fn create_group(
         &self,
         account_ref: &str,
@@ -1803,6 +1807,20 @@ impl MarmotAppRuntime {
     ) -> Result<MediaUploadResult, AppError> {
         self.accounts
             .upload_media(account_ref, group_id, request)
+            .await
+    }
+
+    /// Build an authenticated `imeta` tag for an optimistic host-side record
+    /// without publishing it. The account worker derives the target group's
+    /// media profile and rejects a reference from the other media version.
+    pub async fn build_media_imeta_tag(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+    ) -> Result<Vec<String>, AppError> {
+        self.accounts
+            .build_media_imeta_tag(account_ref, group_id, reference)
             .await
     }
 

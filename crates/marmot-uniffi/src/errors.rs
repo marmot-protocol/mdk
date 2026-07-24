@@ -13,6 +13,10 @@ pub enum MarmotKitError {
     /// Host-supplied draft attachment metadata is malformed.
     #[error("invalid message draft: {details}")]
     InvalidMessageDraft { details: String },
+    /// Host-supplied encrypted-media metadata is malformed or does not match
+    /// the target group's selected media profile.
+    #[error("invalid media reference: {details}")]
+    InvalidMediaReference { details: String },
     #[error("invalid hex: {details}")]
     InvalidHex { details: String },
     #[error("invalid nostr identity: {details}")]

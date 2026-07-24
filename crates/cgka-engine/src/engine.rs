@@ -1579,16 +1579,17 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Return the stored outbound welcome for `id` along with its group.
     ///
-    /// Wrapped welcomes are persisted at wrap time as `Sent` raw-transport
-    /// records, so a welcome whose publish failed after the commit was already
-    /// confirmed can be re-delivered from storage without re-committing
-    /// (mdk#352). Errors if the id does not resolve to a sent raw-transport
-    /// welcome record.
+    /// New wrapped welcomes are persisted at wrap time as delivery-aware
+    /// `OutboundWelcome` records. Historical `Sent` raw-transport Welcome
+    /// records remain directly re-deliverable by a known id for compatibility,
+    /// but are not rediscovered as outstanding after an upgrade because older
+    /// versions did not persist acknowledgement completion (mdk#352).
     pub fn stored_sent_welcome(
         &self,
         id: &MessageId,
     ) -> Result<(GroupId, TransportMessage), EngineError> {
         let record = self.storage.get_message(id)?;
+        self.ensure_group_live(&record.group_id)?;
         if record.state != MessageState::Sent {
             return Err(EngineError::Backend(
                 "stored message is not an outbound sent record".into(),
@@ -1596,15 +1597,88 @@ impl<S: StorageProvider> Engine<S> {
         }
         let payload = StoredMessagePayload::decode(&record.payload)
             .map_err(|e| EngineError::Backend(format!("stored payload decode: {e}")))?;
-        let message = payload.as_raw_transport().ok_or_else(|| {
-            EngineError::Backend("stored message is not a raw transport record".into())
-        })?;
+        let message = payload
+            .as_outbound_welcome()
+            .or_else(|| payload.as_raw_transport())
+            .ok_or_else(|| {
+                EngineError::Backend(
+                    "stored message is not an outbound Welcome transport record".into(),
+                )
+            })?;
         if !matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
             return Err(EngineError::Backend(
                 "stored message is not a welcome".into(),
             ));
         }
         Ok((record.group_id.clone(), message.clone()))
+    }
+
+    /// Return every retained outbound Welcome whose delivery policy has not
+    /// yet been acknowledged.
+    ///
+    /// Founding creation persists delivery-aware `OutboundWelcome` records in
+    /// the same transaction that makes the group canonical. This scan is
+    /// therefore the authoritative cold-restart recovery index even if a
+    /// higher-layer pending-delivery projection was not written before process
+    /// termination. Historical raw `Sent` Welcome rows are deliberately
+    /// excluded because their acknowledgement state is unknowable.
+    pub fn outstanding_sent_welcomes(
+        &self,
+    ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
+        let mut welcomes = Vec::new();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                continue;
+            }
+            for record in self.storage.list_messages(&group_id, EpochId(0))? {
+                if record.state != MessageState::Sent {
+                    continue;
+                }
+                let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                    continue;
+                };
+                let Some(message) = payload.as_outbound_welcome() else {
+                    continue;
+                };
+                if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
+                    welcomes.push((group_id.clone(), message.clone()));
+                }
+            }
+        }
+        Ok(welcomes)
+    }
+
+    /// IDs of every delivery-aware outbound Welcome retained by this engine,
+    /// including completed obligations.
+    ///
+    /// Higher layers use this to distinguish their founding-Welcome projection
+    /// rows from older pending-delivery rows that are intentionally backed by
+    /// historical raw `Sent` payloads.
+    pub fn tracked_outbound_welcome_ids(&self) -> Result<Vec<MessageId>, EngineError> {
+        let mut ids = Vec::new();
+        for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                continue;
+            }
+            for record in self.storage.list_messages(&group_id, EpochId(0))? {
+                let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
+                    continue;
+                };
+                if payload.as_outbound_welcome().is_some() {
+                    ids.push(record.id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Mark one retained outbound Welcome's independent delivery obligation
+    /// complete. The canonical group lifecycle is unaffected.
+    pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> Result<(), EngineError> {
+        // Validate the exact retained artifact before using `Processed` as its
+        // terminal delivery state.
+        let _ = self.stored_sent_welcome(id)?;
+        self.update_stored_message_state(id, MessageState::Processed)
     }
 
     /// Return the current Marmot admin policy keys mirrored from signed MLS

@@ -103,6 +103,39 @@ fn outbound_media_never_crosses_group_version() {
         v2.validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
             .is_err()
     );
+    assert!(
+        v1.build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v2.build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err()
+    );
+}
+
+#[test]
+fn checked_imeta_builder_preserves_version_and_present_empty_optional_fields() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
+    let v1_tag = v1
+        .build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+        .unwrap();
+    assert!(v1_tag.iter().any(|field| field == "v encrypted-media-v1"));
+
+    let mut v2 = media_attachment_from_imeta_tag(&valid_v2_imeta_tag(), Some(2), false).unwrap();
+    v2.dim = Some(String::new());
+    v2.thumbhash = Some(" ".to_owned());
+    let v2_tag = v2
+        .build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+        .unwrap();
+    assert!(v2_tag.iter().any(|field| field == "v encrypted-media-v2"));
+    assert!(v2_tag.iter().any(|field| field == "dim "));
+    assert!(v2_tag.iter().any(|field| field == "thumbhash  "));
+
+    let round_trip = media_attachment_from_imeta_tag(&v2_tag, Some(2), false).unwrap();
+    assert_eq!(round_trip.version, ENCRYPTED_MEDIA_FORMAT_V2);
+    assert_eq!(round_trip.dim.as_deref(), Some(""));
+    assert_eq!(round_trip.thumbhash.as_deref(), Some(" "));
 }
 
 #[test]

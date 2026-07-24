@@ -40,6 +40,9 @@ impl AccountManager {
         }
     }
 
+    /// Create the group and return its canonical id. Invitation delivery is
+    /// reported independently through `WelcomeDeliveryPending` events and
+    /// `pending_welcome_deliveries`.
     pub async fn create_group(
         &self,
         account_ref: &str,
@@ -866,6 +869,25 @@ impl AccountManager {
             self.schedule_audit_log_tracker_update("upload_media_send");
         }
         Ok(result)
+    }
+
+    pub(crate) async fn build_media_imeta_tag(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        reference: MediaAttachmentReference,
+    ) -> Result<Vec<String>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::BuildMediaImetaTag {
+                group_id: group_id.clone(),
+                reference,
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     pub(crate) async fn download_media(

@@ -209,6 +209,11 @@ pub(crate) enum AccountWorkerCommand {
         intent: AppMessageIntent,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    BuildMediaImetaTag {
+        group_id: GroupId,
+        reference: MediaAttachmentReference,
+        respond: oneshot::Sender<Result<Vec<String>, AppError>>,
+    },
     UploadMedia {
         group_id: GroupId,
         request: MediaUploadRequest,
@@ -1124,6 +1129,14 @@ async fn handle_account_worker_command(
                 send_started_at.elapsed(),
                 result.is_ok(),
             );
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::BuildMediaImetaTag {
+            group_id,
+            reference,
+            respond,
+        } => {
+            let result = client.build_media_imeta_tag(&group_id, &reference).await;
             let _ = respond.send(result);
         }
         AccountWorkerCommand::UploadMedia {

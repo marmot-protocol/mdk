@@ -15,7 +15,8 @@ use marmot_uniffi::{
     AuditDataModeFfi, AuditLogSettingsFfi, AuditLogTrackerConfigFfi, AuditLogUploadSourceFfi,
     CursorPersistenceFfi, Marmot, MarmotKitError, MediaAttachmentReferenceFfi, MediaLocatorFfi,
     MediaUploadAttachmentRequestFfi, MediaUploadRequestFfi, MessageDraftAttachmentFfi,
-    NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi, TimelineMessageQueryFfi,
+    MessageTagFfi, NotificationWakeSourceFfi, PushPlatformFfi, RelayTelemetrySettingsFfi,
+    TimelineMessageQueryFfi, parse_media_imeta_tag,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -403,16 +404,54 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     assert!(format!("{send_error}").contains("invalid hex"));
 
     let singular_send_error = kit
-        .send_media_reference("alice".into(), "not-hex".into(), reference, None)
+        .send_media_reference("alice".into(), "not-hex".into(), reference.clone(), None)
         .await
         .expect_err("singular compatibility helper should validate group hex");
     assert!(format!("{singular_send_error}").contains("invalid hex"));
+
+    let build_error = kit
+        .build_media_imeta_tag("alice".into(), "not-hex".into(), reference.clone())
+        .await
+        .expect_err("optimistic tag builder should validate group hex");
+    assert!(format!("{build_error}").contains("invalid hex"));
 
     let upload_error = kit
         .upload_media("alice".into(), "not-hex".into(), request)
         .await
         .expect_err("invalid group hex should fail before upload");
     assert!(format!("{upload_error}").contains("invalid hex"));
+
+    let tag = MessageTagFfi {
+        values: vec![
+            "imeta".into(),
+            "v encrypted-media-v1".into(),
+            format!(
+                "locator blossom-v1 https://blossom.example/{}",
+                "01".repeat(32)
+            ),
+            format!("ciphertext_sha256 {}", "01".repeat(32)),
+            format!("plaintext_sha256 {}", "02".repeat(32)),
+            format!("nonce {}", "03".repeat(12)),
+            "m text/plain".into(),
+            "filename note.txt".into(),
+        ],
+    };
+    let parsed = parse_media_imeta_tag(tag.clone(), 7).expect("valid V1 tag");
+    assert_eq!(parsed.version, marmot_uniffi::EncryptedMediaVersionFfi::V1);
+    assert_eq!(parsed.source_epoch, 7);
+
+    let mut v2 = tag;
+    v2.values[1] = "v encrypted-media-v2".into();
+    let parsed = parse_media_imeta_tag(v2.clone(), 8).expect("valid V2 tag");
+    assert_eq!(parsed.version, marmot_uniffi::EncryptedMediaVersionFfi::V2);
+    assert_eq!(parsed.source_epoch, 8);
+
+    v2.values[6] = "m Text/Plain".into();
+    let invalid = parse_media_imeta_tag(v2, 8).expect_err("noncanonical V2 type must fail");
+    assert!(matches!(
+        invalid,
+        MarmotKitError::InvalidMediaReference { .. }
+    ));
 }
 
 #[tokio::test]

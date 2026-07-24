@@ -551,13 +551,16 @@ where
         let mut all_published = true;
         let mut any_welcome_exposed = false;
         let mut welcome_failures = Vec::new();
+        let mut delivered_welcome_ids = Vec::new();
         for welcome in welcomes {
             let recipient = welcome_recipient(&welcome);
             let welcome_id = welcome.id.clone();
             let failures_before = output.failures.len();
             let status = self.publish_one(welcome, output, context.clone()).await?;
             any_welcome_exposed |= status.accepted_by_any_endpoint;
-            if !status.met_required_acks {
+            if status.met_required_acks {
+                delivered_welcome_ids.push(welcome_id);
+            } else {
                 if let Some(recipient) = recipient {
                     welcome_failures.push(self.welcome_delivery_failure(
                         welcome_id,
@@ -581,6 +584,9 @@ where
                 .pending
                 .push(PendingResolution::Confirmed { pending });
             output.absorb_session_effects(effects, queue);
+            for message_id in &delivered_welcome_ids {
+                self.mark_welcome_delivered_best_effort(message_id);
+            }
             for failure in &mut welcome_failures {
                 if failure.group_id.is_none() {
                     failure.group_id = group_id.clone();
@@ -615,9 +621,9 @@ where
             let welcome_id = welcome.id.clone();
             let failures_before = output.failures.len();
             let status = self.publish_one(welcome, output, context.clone()).await?;
-            if !status.met_required_acks
-                && let Some(recipient) = recipient
-            {
+            if status.met_required_acks {
+                self.mark_welcome_delivered_best_effort(&welcome_id);
+            } else if let Some(recipient) = recipient {
                 output.welcome_failures.push(self.welcome_delivery_failure(
                     welcome_id,
                     recipient,
@@ -657,7 +663,9 @@ where
                 let welcome_id = welcome.id.clone();
                 let failures_before = output.failures.len();
                 let status = self.publish_one(welcome, output, context.clone()).await?;
-                if !status.met_required_acks {
+                if status.met_required_acks {
+                    self.mark_welcome_delivered_best_effort(&welcome_id);
+                } else {
                     // The commit is already confirmed, so this member's join
                     // hinges on re-delivering exactly this welcome.
                     if let Some(recipient) = recipient {
@@ -701,9 +709,9 @@ where
         let mut output = AccountDeviceEffects::default();
         let failures_before = output.failures.len();
         let status = self.publish_one(message, &mut output, None).await?;
-        if !status.met_required_acks
-            && let Some(recipient) = recipient
-        {
+        if status.met_required_acks {
+            self.mark_welcome_delivered_best_effort(message_id);
+        } else if let Some(recipient) = recipient {
             let failure = self.welcome_delivery_failure(
                 message_id.clone(),
                 recipient,
@@ -714,6 +722,39 @@ where
             output.welcome_failures.push(failure);
         }
         Ok(output)
+    }
+
+    /// Retained outbound Welcome obligations that have not met their
+    /// acknowledgement policy. Unlike app projections, this list is rooted in
+    /// the engine transaction that made the corresponding group state
+    /// canonical, so non-app callers and cold restarts can recover it.
+    pub fn outstanding_welcome_deliveries(
+        &self,
+    ) -> AccountResult<Vec<(GroupId, TransportMessage)>> {
+        Ok(self.session.outstanding_sent_welcomes()?)
+    }
+
+    /// IDs of delivery-aware outbound Welcomes, including completed ones.
+    ///
+    /// This lets app projections clear a completed founding intent without
+    /// disturbing older pending-delivery rows whose engine payloads predate
+    /// delivery-aware tagging.
+    pub fn tracked_outbound_welcome_ids(&self) -> AccountResult<Vec<cgka_traits::MessageId>> {
+        Ok(self.session.tracked_outbound_welcome_ids()?)
+    }
+
+    /// Delivery is already externally visible when this runs. A local state
+    /// write failure must therefore leave the Welcome conservatively retryable
+    /// rather than turn canonical creation/evolution into a false hard error.
+    fn mark_welcome_delivered_best_effort(&self, message_id: &cgka_traits::MessageId) {
+        if let Err(error) = self.session.mark_sent_welcome_delivered(message_id) {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "mark_welcome_delivered_best_effort",
+                transient = error.is_transient(),
+                "acknowledged Welcome remains conservatively retryable"
+            );
+        }
     }
 
     /// Build the structured re-delivery record for a welcome that just failed
