@@ -431,9 +431,9 @@ where
                     retention,
                 } => {
                     let reports_before = output.reports.len();
-                    let status = self
-                        .publish_one(msg, None, output, queue, context.clone())
-                        .await?;
+                    let status =
+                        Box::pin(self.publish_one(msg, None, output, queue, context.clone()))
+                            .await?;
                     if status.accepted_by_any_endpoint {
                         if let Some(message_id) = output
                             .reports
@@ -461,14 +461,20 @@ where
                     self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
                 PublishWork::Proposal { msg, queued_intent } => {
-                    let status = self
-                        .publish_one(msg, None, output, queue, context.clone())
-                        .await?;
+                    let status =
+                        Box::pin(self.publish_one(msg, None, output, queue, context.clone()))
+                            .await?;
                     self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
                 PublishWork::GroupCreated { welcomes, pending } => {
-                    self.publish_group_created(welcomes, pending, output, queue, context.clone())
-                        .await?;
+                    Box::pin(self.publish_group_created(
+                        welcomes,
+                        pending,
+                        output,
+                        queue,
+                        context.clone(),
+                    ))
+                    .await?;
                 }
                 PublishWork::FoundingGroupCreated { welcomes } => {
                     self.publish_founding_group_created(welcomes, output, queue, context.clone())
@@ -479,14 +485,14 @@ where
                     welcomes,
                     pending,
                 } => {
-                    self.publish_group_evolution(
+                    Box::pin(self.publish_group_evolution(
                         msg,
                         welcomes,
                         pending,
                         output,
                         queue,
                         context.clone(),
-                    )
+                    ))
                     .await?;
                 }
                 PublishWork::AutoPublish { msg, pending } => {
@@ -508,8 +514,7 @@ where
             if outcome.outstanding_targets > 0
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
             {
-                self.drive_outbound_fanout(fanout, &mut output, &mut queue, None)
-                    .await?;
+                Box::pin(self.drive_outbound_fanout(fanout, &mut output, &mut queue, None)).await?;
             } else {
                 self.session.delete_outbound_fanout(fanout.message_id())?;
             }
@@ -630,8 +635,7 @@ where
             return Ok(());
         };
         debug_assert!(messages.next().is_none());
-        self.publish_one(message, Some(pending), output, queue, context)
-            .await?;
+        Box::pin(self.publish_one(message, Some(pending), output, queue, context)).await?;
         Ok(())
     }
 
@@ -651,9 +655,8 @@ where
             let recipient = welcome_recipient(&welcome);
             let welcome_id = welcome.id.clone();
             let failures_before = output.failures.len();
-            let status = self
-                .publish_one(welcome, None, output, queue, context.clone())
-                .await?;
+            let status =
+                Box::pin(self.publish_one(welcome, None, output, queue, context.clone())).await?;
             any_welcome_exposed |= status.accepted_by_any_endpoint;
             if status.met_required_acks {
                 delivered_welcome_ids.push(welcome_id);
@@ -745,18 +748,18 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        let commit_status = self
-            .publish_one(commit, Some(pending), output, queue, context.clone())
-            .await?;
+        let commit_status =
+            Box::pin(self.publish_one(commit, Some(pending), output, queue, context.clone()))
+                .await?;
         if commit_status.accepted_by_any_endpoint {
             let group_id = confirmed_group_id_from_events(&output.events);
             for welcome in welcomes {
                 let recipient = welcome_recipient(&welcome);
                 let welcome_id = welcome.id.clone();
                 let failures_before = output.failures.len();
-                let status = self
-                    .publish_one(welcome, None, output, queue, context.clone())
-                    .await?;
+                let status =
+                    Box::pin(self.publish_one(welcome, None, output, queue, context.clone()))
+                        .await?;
                 if status.met_required_acks {
                     self.mark_welcome_delivered_best_effort(&welcome_id);
                 } else {
@@ -797,9 +800,8 @@ where
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
         let failures_before = output.failures.len();
-        let status = self
-            .publish_one(message, None, &mut output, &mut queue, None)
-            .await?;
+        let status =
+            Box::pin(self.publish_one(message, None, &mut output, &mut queue, None)).await?;
         if status.met_required_acks {
             self.mark_welcome_delivered_best_effort(message_id);
         } else if let Some(recipient) = recipient {
@@ -917,8 +919,7 @@ where
                 0,
             )?;
             self.session.put_outbound_fanout(&fanout)?;
-            self.drive_outbound_fanout(fanout, output, queue, context)
-                .await
+            Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await
         } else {
             self.publish_legacy_one(message, output, context).await
         }
