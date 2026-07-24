@@ -135,6 +135,92 @@ fn avatar_url_component(url: &str) -> StoredAccountGroupComponent {
 }
 
 #[test]
+fn never_messaged_rows_sort_by_creation_then_group_id_across_rebuilds() {
+    let second_group = StoredAccountGroup {
+        group_id_hex: "22".to_owned(),
+        profile_name: "Second".to_owned(),
+        ..group()
+    };
+    let tied_group = StoredAccountGroup {
+        group_id_hex: "33".to_owned(),
+        profile_name: "Tied".to_owned(),
+        ..group()
+    };
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![group(), second_group, tied_group],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups
+             SET conversation_created_at = CASE group_id_hex
+                 WHEN ?1 THEN 100
+                 WHEN ?2 THEN 200
+                 WHEN ?3 THEN 100
+             END",
+            params![GROUP, "22", "33"],
+        )
+        .unwrap();
+    }
+
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let before = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap();
+    assert_eq!(
+        before
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<Vec<_>>(),
+        vec!["22", GROUP, "33"]
+    );
+    assert_eq!(before[0].conversation_created_at, 200);
+    assert_eq!(before[0].activity_sort_at, 200);
+    assert_eq!(before[1].conversation_created_at, 100);
+    assert_eq!(before[1].activity_sort_at, 100);
+
+    let semantic_before = before
+        .iter()
+        .map(|row| {
+            (
+                row.group_id_hex.clone(),
+                row.conversation_created_at,
+                row.activity_sort_at,
+            )
+        })
+        .collect::<Vec<_>>();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute("UPDATE chat_list_rows SET updated_at = 4000000000", [])
+            .unwrap();
+    }
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let after = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap();
+    let semantic_after = after
+        .iter()
+        .map(|row| {
+            (
+                row.group_id_hex.clone(),
+                row.conversation_created_at,
+                row.activity_sort_at,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(semantic_after, semantic_before);
+}
+
+#[test]
 fn initialize_chat_read_state_returns_none_for_unknown_group() {
     let store = setup_store();
 
@@ -143,6 +229,101 @@ fn initialize_chat_read_state_returns_none_for_unknown_group() {
         .unwrap();
 
     assert_eq!(row, None);
+}
+
+#[test]
+fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates() {
+    for mark_read in [false, true] {
+        let store = setup_store();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "UPDATE account_groups SET conversation_created_at = 5 WHERE group_id_hex = ?1",
+                params![GROUP],
+            )
+            .unwrap();
+        }
+        store
+            .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+            .unwrap();
+        store
+            .record_app_event(&chat("visible", REMOTE, 100, "semantic activity"))
+            .unwrap();
+        let mut row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row");
+        assert_eq!(row.conversation_created_at, 5);
+        assert_eq!(row.activity_sort_at, 100);
+        assert_eq!(row.unread_count, 1);
+
+        if mark_read {
+            row = store
+                .mark_timeline_message_read(LOCAL, GROUP, "visible", &no_mentions)
+                .unwrap()
+                .expect("chat row");
+            assert_eq!(row.unread_count, 0);
+            assert_eq!(row.activity_sort_at, 100);
+        }
+
+        let mut renamed = group();
+        renamed.profile_name = "Renamed Lab".to_owned();
+        renamed
+            .components
+            .push(avatar_url_component("https://cdn.example.com/new.png"));
+        store
+            .save_account_projection_state(
+                &StoredAccountState {
+                    label: "alice".to_owned(),
+                    groups: vec![renamed],
+                    ..StoredAccountState::default()
+                },
+                256,
+                MAX_FUTURE_SKEW_SECS,
+            )
+            .unwrap();
+        store
+            .set_group_self_membership(GROUP, SelfMembership::Removed)
+            .unwrap();
+        row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row");
+        assert_eq!(row.conversation_created_at, 5);
+        assert_eq!(row.activity_sort_at, 100);
+
+        store.secure_prune_app_events_before(GROUP, 101).unwrap();
+        row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+        assert_eq!(row.last_message, None);
+        assert_eq!(row.unread_count, u64::from(!mark_read));
+        assert_eq!(row.activity_sort_at, 100);
+
+        if mark_read {
+            // A read cursor is durable source history: even if projection repair
+            // must recreate the row after pruning, it recovers the last visible
+            // activity rather than falling back to conversation creation.
+            let conn = store.lock().unwrap();
+            conn.execute(
+                "DELETE FROM chat_list_rows WHERE group_id_hex = ?1",
+                params![GROUP],
+            )
+            .unwrap();
+        }
+        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+        assert_eq!(row.last_message, None);
+        assert_eq!(row.conversation_created_at, 5);
+        assert_eq!(row.activity_sort_at, 100);
+
+        store
+            .record_app_event(&chat("new-visible", REMOTE, 200, "new activity"))
+            .unwrap();
+        row = store
+            .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+            .unwrap()
+            .expect("chat row");
+        assert_eq!(row.activity_sort_at, 200);
+    }
 }
 
 #[test]

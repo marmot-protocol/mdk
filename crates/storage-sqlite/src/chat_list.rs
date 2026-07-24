@@ -90,6 +90,11 @@ pub struct ChatListRow {
     pub first_unread_message_id_hex: Option<String>,
     pub last_read_message_id_hex: Option<String>,
     pub last_read_timeline_at: Option<u64>,
+    /// Immutable local observation time for the conversation's creation.
+    pub conversation_created_at: u64,
+    /// Durable user-visible activity anchor. Projection maintenance never
+    /// advances this value.
+    pub activity_sort_at: u64,
     pub updated_at: u64,
     /// The local account's membership in this group (active member, left, or
     /// removed). Denormalized from `account_groups.self_membership`.
@@ -104,6 +109,7 @@ struct AccountGroupRow {
     profile_name: String,
     avatar_url: Option<String>,
     avatar: Option<ChatListAvatar>,
+    conversation_created_at: u64,
     self_membership: SelfMembership,
 }
 
@@ -297,11 +303,22 @@ fn rebuild_all_chat_list_rows_tx(
     local_account_id_hex: &str,
     mention_classifier: &MentionClassifier<'_>,
 ) -> StorageResult<()> {
-    tx.execute("DELETE FROM chat_list_rows", []).storage()?;
     let groups = account_groups_tx(tx)?;
     for group in groups {
         rebuild_chat_list_row_for_group_tx(tx, local_account_id_hex, group, mention_classifier)?;
     }
+    // Upsert in place so durable activity anchors survive a projection rebuild
+    // after their preview rows have been securely pruned. Remove only true
+    // orphans; normal account-group deletion already cascades this table.
+    tx.execute(
+        "DELETE FROM chat_list_rows
+         WHERE NOT EXISTS (
+             SELECT 1 FROM account_groups AS ag
+             WHERE ag.group_id_hex = chat_list_rows.group_id_hex
+         )",
+        [],
+    )
+    .storage()?;
     // #750: a full rebuild recomputes every mention count, so the projection is
     // current — advance the marker so warm-up completeness checks skip the
     // per-group recompute.
@@ -417,6 +434,7 @@ fn chat_list_projection_complete_tx(
                         WHEN 'removed' THEN 'removed'
                         ELSE 'member'
                       END
+                   OR row.conversation_created_at IS NOT ag.conversation_created_at
                    OR row.updated_at < COALESCE(avatar_url.updated_at, 0)
                    OR row.updated_at < ag.updated_at
              )",
@@ -505,6 +523,15 @@ fn chat_list_projection_complete_tx(
                         ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
                         LIMIT 1
                      ), 0)
+                   OR row.activity_sort_at < COALESCE((
+                        SELECT mt.timeline_at
+                        FROM message_timeline AS mt
+                        WHERE mt.group_id_hex = ag.group_id_hex
+                          AND mt.kind = ?1
+                          AND mt.invalidation_status IS NULL
+                        ORDER BY mt.timeline_at DESC, mt.message_id_hex DESC
+                        LIMIT 1
+                     ), ag.conversation_created_at)
              )",
         params![u64_to_i64(MARMOT_APP_EVENT_KIND_CHAT)?],
     )? {
@@ -577,6 +604,16 @@ fn rebuild_chat_list_row_for_group_tx(
         read_state.as_ref(),
         mention_classifier,
     )?;
+    let activity_sort_at = latest
+        .as_ref()
+        .map(|message| message.timeline_at)
+        .into_iter()
+        .chain(
+            read_state
+                .as_ref()
+                .and_then(|state| state.last_read_timeline_at),
+        )
+        .fold(group.conversation_created_at, u64::max);
     let now = unix_now_seconds();
     tx.execute(
         "INSERT INTO chat_list_rows (
@@ -587,12 +624,13 @@ fn rebuild_chat_list_row_for_group_tx(
             last_message_id_hex, last_message_sender, last_message_preview,
             last_message_kind, last_message_timeline_at, last_message_deleted,
             unread_count, unread_mention_count, first_unread_message_id_hex,
-            last_read_message_id_hex, last_read_timeline_at, updated_at,
-            self_membership
+            last_read_message_id_hex, last_read_timeline_at,
+            conversation_created_at, activity_sort_at, updated_at, self_membership
          )
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+            ?21, ?22, ?23, ?24, ?25, ?26
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -616,6 +654,8 @@ fn rebuild_chat_list_row_for_group_tx(
             first_unread_message_id_hex = excluded.first_unread_message_id_hex,
             last_read_message_id_hex = excluded.last_read_message_id_hex,
             last_read_timeline_at = excluded.last_read_timeline_at,
+            conversation_created_at = excluded.conversation_created_at,
+            activity_sort_at = MAX(chat_list_rows.activity_sort_at, excluded.activity_sort_at),
             updated_at = excluded.updated_at,
             self_membership = excluded.self_membership",
         params![
@@ -671,6 +711,8 @@ fn rebuild_chat_list_row_for_group_tx(
                     .as_ref()
                     .and_then(|state| state.last_read_timeline_at)
             )?,
+            u64_to_i64(group.conversation_created_at)?,
+            u64_to_i64(activity_sort_at)?,
             u64_to_i64(now)?,
             group.self_membership.as_str(),
         ],
@@ -772,7 +814,7 @@ fn account_groups_tx(tx: &Connection) -> StorageResult<Vec<AccountGroupRow>> {
             "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                     image_hash_hex, image_key_hex, image_nonce_hex,
                     image_upload_key_hex, image_media_type, avatar_url.component_data_hex,
-                    ag.self_membership
+                    ag.conversation_created_at, ag.self_membership
              FROM account_groups AS ag
              LEFT JOIN account_group_app_components AS avatar_url
                 ON avatar_url.group_id_hex = ag.group_id_hex
@@ -793,7 +835,7 @@ fn account_group_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
         "SELECT ag.group_id_hex, ag.archived, ag.pending_confirmation, ag.profile_name,
                 image_hash_hex, image_key_hex, image_nonce_hex,
                 image_upload_key_hex, image_media_type, avatar_url.component_data_hex,
-                ag.self_membership
+                ag.conversation_created_at, ag.self_membership
          FROM account_groups AS ag
          LEFT JOIN account_group_app_components AS avatar_url
             ON avatar_url.group_id_hex = ag.group_id_hex
@@ -813,7 +855,8 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
     let image_upload_key_hex: String = row.get(7)?;
     let media_type: Option<String> = row.get(8)?;
     let avatar_url_component_hex: Option<String> = row.get(9)?;
-    let self_membership: String = row.get(10)?;
+    let conversation_created_at = row.get::<_, i64>(10)?.try_into().unwrap_or_default();
+    let self_membership: String = row.get(11)?;
     let has_avatar = !image_hash_hex.is_empty()
         || !image_key_hex.is_empty()
         || !image_nonce_hex.is_empty()
@@ -832,6 +875,7 @@ fn account_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountGr
             image_upload_key_hex,
             media_type,
         }),
+        conversation_created_at,
         self_membership: SelfMembership::from_storage(&self_membership),
     })
 }
@@ -919,9 +963,10 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 last_message_kind, last_message_timeline_at, last_message_deleted,
                 unread_count, unread_mention_count, first_unread_message_id_hex,
                 last_read_message_id_hex,
-                last_read_timeline_at, updated_at, self_membership
+                last_read_timeline_at, conversation_created_at, activity_sort_at,
+                updated_at, self_membership
          FROM chat_list_rows
-         ORDER BY last_message_timeline_at DESC, group_id_hex"
+         ORDER BY activity_sort_at DESC, group_id_hex"
     } else {
         "SELECT group_id_hex, archived, pending_confirmation, title, group_name,
                 avatar_url,
@@ -931,10 +976,11 @@ fn chat_list_rows_tx(tx: &Connection, query: ChatListQuery) -> StorageResult<Vec
                 last_message_kind, last_message_timeline_at, last_message_deleted,
                 unread_count, unread_mention_count, first_unread_message_id_hex,
                 last_read_message_id_hex,
-                last_read_timeline_at, updated_at, self_membership
+                last_read_timeline_at, conversation_created_at, activity_sort_at,
+                updated_at, self_membership
          FROM chat_list_rows
          WHERE archived = 0
-         ORDER BY last_message_timeline_at DESC, group_id_hex"
+         ORDER BY activity_sort_at DESC, group_id_hex"
     };
     let mut stmt = tx.prepare(sql).storage()?;
     stmt.query_map([], chat_list_row_from_row)
@@ -953,7 +999,8 @@ fn chat_list_row_tx(tx: &Connection, group_id_hex: &str) -> StorageResult<Option
                 last_message_kind, last_message_timeline_at, last_message_deleted,
                 unread_count, unread_mention_count, first_unread_message_id_hex,
                 last_read_message_id_hex,
-                last_read_timeline_at, updated_at, self_membership
+                last_read_timeline_at, conversation_created_at, activity_sort_at,
+                updated_at, self_membership
          FROM chat_list_rows
          WHERE group_id_hex = ?1",
         params![group_id_hex],
@@ -1025,8 +1072,10 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListR
         last_read_timeline_at: row
             .get::<_, Option<i64>>(21)?
             .and_then(|value| value.try_into().ok()),
-        updated_at: row.get::<_, i64>(22)?.try_into().unwrap_or_default(),
-        self_membership: SelfMembership::from_storage(&row.get::<_, String>(23)?),
+        conversation_created_at: row.get::<_, i64>(22)?.try_into().unwrap_or_default(),
+        activity_sort_at: row.get::<_, i64>(23)?.try_into().unwrap_or_default(),
+        updated_at: row.get::<_, i64>(24)?.try_into().unwrap_or_default(),
+        self_membership: SelfMembership::from_storage(&row.get::<_, String>(25)?),
     })
 }
 

@@ -1024,6 +1024,8 @@ fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
         first_unread_message_id_hex: None,
         last_read_message_id_hex: None,
         last_read_timeline_at: None,
+        conversation_created_at: 0,
+        activity_sort_at: 0,
         updated_at: 0,
         self_membership: crate::SelfMembership::Member,
     }
