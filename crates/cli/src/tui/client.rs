@@ -461,19 +461,22 @@ impl TuiApp {
         }
     }
 
-    /// Wait for the launch daemon auto-start's one-shot thread to report and fold
-    /// its outcome, for end-to-end tests over a fake `wn`. Panics if no auto-start
-    /// is in flight or the thread stalls.
+    /// Wait for the launch daemon auto-start's one-shot thread to report, and
+    /// hand the outcome back unfolded, for end-to-end tests over a fake `wn`.
+    /// Folding is the caller's explicit next step (`fold_daemon_start`): the
+    /// fold re-ensures the daemon-backed subscriptions, which spawns further
+    /// `wn` children against the same fake, so a test that inspects the fake's
+    /// recorded argv must read it between the receive and the fold — once the
+    /// result is in hand the `daemon start` child has exited and nothing else
+    /// has run yet. Panics if no auto-start is in flight or the thread stalls.
     #[cfg(test)]
-    pub(crate) fn settle_daemon_autostart(&mut self) {
+    pub(crate) fn recv_daemon_autostart(&mut self) -> Result<Value, String> {
         let rx = self
             .daemon_autostart
             .take()
             .expect("a daemon auto-start is in flight");
-        let result = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("daemon auto-start produced a result");
-        self.fold_daemon_start(result);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("daemon auto-start produced a result")
     }
 
     /// Send the composer text off the event loop. The optimistic row folds in

@@ -2491,6 +2491,13 @@ fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
 /// A fake `wn` that records its argv (one arg per line) to a sidecar file and
 /// then prints `response`, so a test can assert which command was spawned.
 /// Returns the executable path and the args-file path.
+///
+/// Every invocation truncates and rewrites the recorder, so read it only at a
+/// point where the invocation under test is the last to have run. Beware
+/// actions whose fold spawns follow-up `wn` children (the daemon-adopt path
+/// re-ensures the live subscriptions): read the recorder before such a fold,
+/// or the children rewrite it out from under the assertion. For a flow that
+/// must observe several sequential calls, use `test_appending_arg_executable`.
 #[cfg(unix)]
 fn test_arg_recording_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
     let exe = dir.join("wn-json");
@@ -11368,7 +11375,14 @@ fn launch_with_no_daemon_and_relay_flags_auto_starts_the_daemon() {
         "auto-start runs on its own one-shot thread, not the shared effect worker"
     );
 
-    app.settle_daemon_autostart();
+    // Read the recorded argv after the result lands but before folding it: the
+    // received result proves the `daemon start` child ran to completion, and
+    // the fold below is what re-ensures the daemon-backed subscriptions —
+    // spawning further `wn` children against this same fake, each of which
+    // rewrites the truncating argv recorder. A read placed after the fold
+    // races those children (on a loaded CI box they win: the recorder held
+    // `messages subscribe` argv instead).
+    let result = app.recv_daemon_autostart();
     let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
     let args: Vec<&str> = recorded.lines().collect();
     assert!(
@@ -11380,6 +11394,8 @@ fn launch_with_no_daemon_and_relay_flags_auto_starts_the_daemon() {
             .any(|pair| pair == ["--discovery-relays", "wss://d.example"]),
         "the TUI relay passthrough reaches the daemon-start child; got {args:?}"
     );
+
+    app.fold_daemon_start(result);
     assert!(
         app.daemon.running,
         "the fold adopts the started daemon, flipping the status-bar dot's data source"
