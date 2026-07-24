@@ -734,7 +734,8 @@ pub trait CgkaEngine: Send + Sync {
     ) -> Result<FeatureStatus, EngineError>;
 
     /// Capabilities that would result from constructing a group with the
-    /// given members (intersection of every invitee's advertised caps).
+    /// given members (intersection of the creator's and every invitee's
+    /// advertised caps).
     fn constructable_capabilities(
         &self,
         key_packages: &[KeyPackage],

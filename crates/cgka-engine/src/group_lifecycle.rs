@@ -1128,27 +1128,20 @@ impl<S: StorageProvider> Engine<S> {
         &self,
         key_packages: &[cgka_traits::engine::KeyPackage],
     ) -> Result<GroupCapabilities, EngineError> {
-        if key_packages.is_empty() {
-            return Ok(leaf_capabilities_as_marmot(
-                &self.registry,
-                self.ciphersuite,
-                &self.supported_app_components,
-                self.new_protocol_profile,
-            ));
-        }
-        let mut it = key_packages.iter();
-        let first_input = it.next().unwrap();
-        let first_profile = first_input.protocol_profile;
-        let first = self.parse_key_package(first_input)?;
-        let mut acc = capabilities_of_key_package(&first);
-        for kp in it {
-            let parsed = self.parse_key_package(kp)?;
-            if kp.protocol_profile != first_profile {
+        let mut acc = leaf_capabilities_as_marmot(
+            &self.registry,
+            self.ciphersuite,
+            &self.supported_app_components,
+            self.new_protocol_profile,
+        );
+        for kp in key_packages {
+            if kp.protocol_profile != self.new_protocol_profile {
                 return Err(EngineError::InvalidAccountIdentityProof(
-                    "cannot compute constructable capabilities across mixed-profile KeyPackages"
+                    "cannot compute constructable capabilities across mixed-profile founding members"
                         .into(),
                 ));
             }
+            let parsed = self.parse_key_package(kp)?;
             let other = capabilities_of_key_package(&parsed);
             acc = GroupCapabilities {
                 proposals: acc
