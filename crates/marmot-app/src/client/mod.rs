@@ -2148,7 +2148,7 @@ impl AppClient {
                 tracing::warn!(
                     target: "marmot_app::client",
                     method = "refresh_group_routes",
-                    error_kind = "invalid_persisted_group_id",
+                    error_kind = "invalid_persisted_route_identifier",
                     "skipping malformed persisted group route",
                 );
                 continue;
