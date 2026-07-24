@@ -45,4 +45,5 @@ url.workspace = true
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true
+nostr-sdk.workspace = true
 tempfile.workspace = true

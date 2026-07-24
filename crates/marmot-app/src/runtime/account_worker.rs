@@ -282,6 +282,9 @@ pub(crate) enum AccountWorkerCommand {
         registration: PushRegistration,
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    RetryPushRegistration {
+        respond: oneshot::Sender<bool>,
+    },
     DeleteAuditLog {
         path: std::path::PathBuf,
         respond: oneshot::Sender<Result<bool, AppError>>,
@@ -295,6 +298,19 @@ pub(crate) enum AccountWorkerCommand {
         reason: String,
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+}
+
+impl AccountWorkerCommand {
+    fn may_change_push_registration_work(&self) -> bool {
+        matches!(
+            self,
+            Self::SharePushRegistration { .. }
+                | Self::UpsertPushRegistration { .. }
+                | Self::ClearPushRegistration { .. }
+                | Self::SetNativePushEnabled { .. }
+                | Self::RemovePushRegistration { .. }
+        )
+    }
 }
 
 /// A command held back during the initial background catch-up, replayed in
@@ -314,17 +330,19 @@ enum DeferredStartupCommand {
 
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
+    command_tx: mpsc::Sender<AccountWorkerCommand>,
     commands: mpsc::Receiver<AccountWorkerCommand>,
     ready: oneshot::Sender<Result<(), String>>,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(run_app_runtime_account_worker(
-        runtime, commands, ready, shutdown,
+        runtime, command_tx, commands, ready, shutdown,
     ))
 }
 
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
+    command_tx: mpsc::Sender<AccountWorkerCommand>,
     mut commands: mpsc::Receiver<AccountWorkerCommand>,
     ready: oneshot::Sender<Result<(), String>>,
     mut shutdown: oneshot::Receiver<()>,
@@ -527,7 +545,7 @@ async fn run_app_runtime_account_worker(
     let push_work_pending = client
         .retry_pending_push_registration_shares_best_effort()
         .await;
-    scheduled_push_retry.schedule_after_attempt(push_work_pending);
+    scheduled_push_retry.schedule_after_attempt(push_work_pending, &command_tx);
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
     // / InviteMembers) can buffer convergence groups. The steady-state arms below
@@ -590,16 +608,11 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
-            _ = scheduled_push_retry.timer.as_mut(), if scheduled_push_retry.armed => {
-                scheduled_push_retry.take_ready();
-                let pending = client
-                    .retry_pending_push_registration_shares_best_effort()
-                    .await;
-                scheduled_push_retry.schedule_after_attempt(pending);
-            }
             command = commands.recv() => {
                 match command {
                     Some(command) => {
+                        let may_change_push_registration_work =
+                            command.may_change_push_registration_work();
                         handle_account_worker_command(
                             &mut client,
                             command,
@@ -610,9 +623,12 @@ async fn run_app_runtime_account_worker(
                         )
                         .await;
                         scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
-                        scheduled_push_retry.observe_pending(
-                            client.has_pending_push_registration_work(),
-                        );
+                        if may_change_push_registration_work {
+                            scheduled_push_retry.observe_pending(
+                                client.has_pending_push_registration_work(),
+                                &command_tx,
+                            );
+                        }
                     }
                     None => return,
                 }
@@ -646,7 +662,7 @@ async fn run_app_runtime_account_worker(
                             let pending = client
                                 .retry_pending_push_registration_shares_best_effort()
                                 .await;
-                            scheduled_push_retry.schedule_after_attempt(pending);
+                            scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
                         }
                     }
                     Err(err) => {
@@ -676,7 +692,7 @@ async fn run_app_runtime_account_worker(
                                 let pending = reopened
                                     .retry_pending_push_registration_shares_best_effort()
                                     .await;
-                                scheduled_push_retry.schedule_after_attempt(pending);
+                                scheduled_push_retry.schedule_after_attempt(pending, &command_tx);
                                 client = reopened;
                             }
                             Err(setup_err) => {
@@ -1354,6 +1370,12 @@ async fn handle_account_worker_command(
             let result = client.remove_push_registration(registration).await;
             let _ = respond.send(result);
         }
+        AccountWorkerCommand::RetryPushRegistration { respond } => {
+            let pending = client
+                .retry_pending_push_registration_shares_best_effort()
+                .await;
+            let _ = respond.send(pending);
+        }
         AccountWorkerCommand::DeleteAuditLog { path, respond } => {
             let result = client.rotate_audit_log_if_active(&path);
             let _ = respond.send(result);
@@ -1419,8 +1441,6 @@ fn account_worker_reconnect_jitter() -> Duration {
     Duration::from_millis(jitter_ms)
 }
 
-const IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-
 fn push_registration_retry_base_delay() -> Duration {
     if cfg!(test) {
         Duration::from_millis(25)
@@ -1448,58 +1468,78 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
 /// A bounded backoff timer that exists only while durable push outbox rows
 /// remain. This is not a periodic poll: successful drain disarms it completely.
 struct ScheduledPushRegistrationRetry {
-    attempts: u32,
-    armed: bool,
-    timer: Pin<Box<Sleep>>,
+    timer_task: Option<JoinHandle<()>>,
 }
 
 impl ScheduledPushRegistrationRetry {
     fn new() -> Self {
-        Self {
-            attempts: 0,
-            armed: false,
-            timer: Box::pin(sleep(IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY)),
-        }
+        Self { timer_task: None }
     }
 
-    fn observe_pending(&mut self, pending: bool) {
+    fn is_armed(&self) -> bool {
+        self.timer_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    fn observe_pending(&mut self, pending: bool, commands: &mpsc::Sender<AccountWorkerCommand>) {
         if !pending {
             self.disarm();
-        } else if !self.armed {
-            self.attempts = 1;
-            self.arm();
+        } else if !self.is_armed() {
+            self.arm(commands.clone(), 1);
         }
     }
 
-    fn schedule_after_attempt(&mut self, pending: bool) {
+    fn schedule_after_attempt(
+        &mut self,
+        pending: bool,
+        commands: &mpsc::Sender<AccountWorkerCommand>,
+    ) {
         if !pending {
             self.disarm();
             return;
         }
-        self.attempts = self.attempts.saturating_add(1).max(1);
-        self.arm();
+        self.arm(commands.clone(), 1);
     }
 
-    fn take_ready(&mut self) {
-        self.armed = false;
-        self.timer
-            .as_mut()
-            .reset(TokioInstant::now() + IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY);
-    }
-
-    fn arm(&mut self) {
-        self.armed = true;
-        self.timer
-            .as_mut()
-            .reset(TokioInstant::now() + push_registration_retry_delay(self.attempts));
+    fn arm(&mut self, commands: mpsc::Sender<AccountWorkerCommand>, first_attempt: u32) {
+        if let Some(task) = self.timer_task.take() {
+            task.abort();
+        }
+        self.timer_task = Some(tokio::spawn(async move {
+            let mut attempt = first_attempt;
+            loop {
+                sleep(push_registration_retry_delay(attempt)).await;
+                let (respond, response) = oneshot::channel();
+                if commands
+                    .send(AccountWorkerCommand::RetryPushRegistration { respond })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                match response.await {
+                    Ok(true) => {
+                        attempt = attempt.saturating_add(1);
+                    }
+                    Ok(false) | Err(_) => return,
+                }
+            }
+        }));
     }
 
     fn disarm(&mut self) {
-        self.attempts = 0;
-        self.armed = false;
-        self.timer
-            .as_mut()
-            .reset(TokioInstant::now() + IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY);
+        if let Some(task) = self.timer_task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for ScheduledPushRegistrationRetry {
+    fn drop(&mut self) {
+        if let Some(task) = self.timer_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -1860,18 +1900,46 @@ mod tests {
             push_registration_retry_max_delay()
         );
 
+        let (commands, mut received_commands) = mpsc::channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
-        scheduled.observe_pending(true);
-        assert!(scheduled.armed);
-        assert_eq!(scheduled.attempts, 1);
-        scheduled.take_ready();
-        assert!(!scheduled.armed);
-        scheduled.schedule_after_attempt(true);
-        assert!(scheduled.armed);
-        assert_eq!(scheduled.attempts, 2);
-        scheduled.schedule_after_attempt(false);
-        assert!(!scheduled.armed);
-        assert_eq!(scheduled.attempts, 0);
+        scheduled.observe_pending(true, &commands);
+        assert!(scheduled.is_armed());
+        let first = received_commands.recv().await.unwrap();
+        let AccountWorkerCommand::RetryPushRegistration { respond } = first else {
+            panic!("timer must enqueue an internal push retry")
+        };
+        respond.send(true).unwrap();
+
+        let second = received_commands.recv().await.unwrap();
+        let AccountWorkerCommand::RetryPushRegistration { respond } = second else {
+            panic!("pending work must enqueue a backed-off retry")
+        };
+        respond.send(false).unwrap();
+        tokio::task::yield_now().await;
+
+        scheduled.schedule_after_attempt(false, &commands);
+        assert!(!scheduled.is_armed());
+    }
+
+    #[test]
+    fn push_registration_retry_observation_is_scoped_to_relevant_commands() {
+        let (share_respond, _share_response) = oneshot::channel();
+        assert!(
+            AccountWorkerCommand::SharePushRegistration {
+                respond: share_respond
+            }
+            .may_change_push_registration_work()
+        );
+
+        let (convergence_respond, _convergence_response) = oneshot::channel();
+        assert!(
+            !AccountWorkerCommand::RetryGroupConvergence {
+                group_id: test_group_id(1),
+                respond: convergence_respond,
+            }
+            .may_change_push_registration_work(),
+            "unrelated convergence commands must not arm push maintenance"
+        );
     }
 
     #[tokio::test]

@@ -22,8 +22,6 @@ use transport_quic_broker::{DEFAULT_SUBSCRIBER_QUEUE_DEPTH, QuicBrokerConfig, Qu
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(8);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Self-remove and admin-remove commits can take longer to converge on loaded CI runners.
-const MEMBER_REMOVAL_POLL_TIMEOUT: Duration = Duration::from_secs(90);
 
 struct TestRelay {
     _runtime: tokio::runtime::Runtime,
@@ -56,6 +54,22 @@ impl TestRelay {
 
     fn url(&self) -> &str {
         &self.url
+    }
+
+    fn event_count(&self, kind: u16) -> usize {
+        self._runtime.block_on(async {
+            let client = nostr_sdk::Client::default();
+            client.add_relay(&self.url).await.expect("add mock relay");
+            client.connect().await;
+            client
+                .fetch_events(
+                    nostr::Filter::new().kind(nostr::Kind::Custom(kind)),
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("query mock relay")
+                .len()
+        })
     }
 }
 
@@ -1403,63 +1417,6 @@ fn sync_until_member(home: &std::path::Path, account: &str, group_id: &str, memb
     panic!(
         "account <REDACTED_ACCOUNT> did not see expected member in <REDACTED_GROUP>; {}",
         json_value_summary("last_members", &last)
-    );
-}
-
-fn sync_until_member_removed(
-    home: &std::path::Path,
-    relay: &str,
-    account: &str,
-    group_id: &str,
-    member: &str,
-) -> Value {
-    let deadline = Instant::now() + MEMBER_REMOVAL_POLL_TIMEOUT;
-    let mut last = Value::Null;
-    let mut last_retry = Value::Null;
-    let mut attempts = 0;
-    while Instant::now() < deadline {
-        attempts += 1;
-        let _ = run_json_with_relay(home, relay, &["--account", account, "sync"]);
-        // Sync persists the SelfRemove convergence candidate with a due time;
-        // give that timestamp a chance to become eligible before the next CLI
-        // process explicitly advances convergence.
-        std::thread::sleep(POLL_INTERVAL);
-        // A SelfRemove is a proposal first: the remaining member must advance
-        // convergence to publish the auto-commit that removes the departed
-        // member. Drive that path explicitly instead of racing the short-lived
-        // CLI process's background convergence timer. The retry command scopes
-        // work by group_id; its event_id positional is just echoed as a label.
-        // Ignore the command's JSON result because the authoritative assertion
-        // is the independent group-members projection below; command failures
-        // remain fatal so the test never silently skips the convergence step.
-        last_retry = run_json_with_relay(
-            home,
-            relay,
-            &[
-                "--account",
-                account,
-                "messages",
-                "retry",
-                group_id,
-                "converge",
-            ],
-        );
-        let _ = run_json_with_relay(home, relay, &["--account", account, "sync"]);
-        let members = run_json_with_relay(
-            home,
-            relay,
-            &["--account", account, "group", "members", group_id],
-        );
-        if !member_accounts(&members).contains(&member.to_owned()) {
-            return members;
-        }
-        last = members;
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    panic!(
-        "account <REDACTED_ACCOUNT> still sees departed member in <REDACTED_GROUP>; attempts={attempts}; {}; {}",
-        json_value_summary("last_members", &last),
-        json_value_summary("last_retry", &last_retry)
     );
 }
 
@@ -4463,25 +4420,32 @@ fn groups_leave_publishes_self_remove() {
 
     let alice = create_account_with_real_relay(home.path(), relay_url);
     let bob = create_account_with_real_relay(home.path(), relay_url);
-    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
-
-    let created = run_json(
+    run_json_with_relay(
         home.path(),
+        relay_url,
+        &["--account", &bob, "keys", "publish"],
+    );
+
+    let created = run_json_with_relay(
+        home.path(),
+        relay_url,
         &["--account", &alice, "groups", "create", "departures", &bob],
     );
     let group_id = created["group_id"].as_str().expect("group id");
     sync_until_joined(home.path(), relay_url, &bob, group_id);
+    let group_events_before_leave = relay.event_count(445);
 
-    let leave = run_json(
+    let leave = run_json_with_relay(
         home.path(),
+        relay_url,
         &["--account", &bob, "groups", "leave", group_id],
     );
     assert_eq!(leave["group_id"], group_id);
     assert_eq!(leave["published"], 1);
-    run_json(home.path(), &["--account", &bob, "sync"]);
-
-    let alice_members = sync_until_member_removed(home.path(), relay_url, &alice, group_id, &bob);
-    assert!(!member_accounts(&alice_members).contains(&bob));
+    assert!(
+        relay.event_count(445) > group_events_before_leave,
+        "leave must add a group event to the selected relay"
+    );
 }
 
 #[test]

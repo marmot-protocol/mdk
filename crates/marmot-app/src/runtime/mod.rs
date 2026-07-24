@@ -2885,6 +2885,7 @@ impl AccountManager {
                             lifecycle: self.shared.lifecycle(),
                             shared: self.shared.clone(),
                         },
+                        command_tx.clone(),
                         command_rx,
                         ready_tx,
                         shutdown_rx,

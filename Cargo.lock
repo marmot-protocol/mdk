@@ -7157,6 +7157,7 @@ dependencies = [
  "marmot-app",
  "nostr",
  "nostr-relay-builder",
+ "nostr-sdk",
  "ratatui",
  "ratatui-image",
  "serde",
