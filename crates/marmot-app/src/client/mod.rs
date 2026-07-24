@@ -349,7 +349,7 @@ impl AppClient {
                     tracing::warn!(
                         target: "marmot_app::maintenance",
                         method = "advance_post_join_maintenance_subscriptions",
-                        error_kind = "invalid_group_id",
+                        error_kind = "malformed_route_identifier",
                         "skipping malformed post-join maintenance group"
                     );
                     continue;
