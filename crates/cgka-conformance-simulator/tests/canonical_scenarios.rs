@@ -1096,6 +1096,7 @@ async fn vector_fixture_report_records_semantic_expectation_failures() {
         vector_version: "1".into(),
         conformance_version: env!("CARGO_PKG_VERSION").into(),
         seed: None,
+        application_profile: None,
         scenario: group_data_fork_recovery_spec(),
         expected_trace: None,
         expected_outcomes: vec![TraceExpectation::ClientState {
@@ -1700,9 +1701,11 @@ async fn canonical_vector_fixtures_match_generated_traces() {
         let fixture: VectorFixture =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture contents"))
                 .unwrap_or_else(|e| panic!("{fixture_name} parses: {e}"));
-        let observed_trace = run_scenario_spec(&fixture.scenario)
+        let observed_trace = run_vector_fixture_report(&fixture)
             .await
-            .expect("fixture scenario runs");
+            .expect("fixture scenario runs")
+            .observed_trace
+            .expect("successful fixture report has an observed trace");
         assert_vector_fixture_matches(fixture_name, &fixture, observed_trace);
     }
 }

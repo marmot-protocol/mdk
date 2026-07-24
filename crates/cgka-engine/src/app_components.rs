@@ -13,12 +13,32 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::types::{GroupId, MemberId};
-use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
-use openmls::group::{MlsGroup, StagedCommit};
-use openmls::messages::proposals::{AppDataUpdateOperation, Proposal};
-use openmls::prelude::{BasicCredential, LeafNode, Sender};
+use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
+use openmls::group::{GroupContext, MlsGroup, StagedCommit};
+use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
+use openmls::prelude::{
+    BasicCredential, ExtensionType, LeafNode, LeafNodeIndex, ProposalType, Sender,
+};
+use openmls::treesync::Node;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Registry-level contract enforced for every current-profile group state.
+///
+/// These values are public so portable conformance vectors can cross-check
+/// their implementation-neutral hexadecimal contract against the exact set the
+/// engine validator consumes.
+pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS: [u16; 1] = [0x0006];
+pub const CURRENT_PROFILE_REQUIRED_PROPOSALS: [u16; 1] = [0x0008];
+pub const CURRENT_PROFILE_REQUIRED_APP_COMPONENTS: [AppComponentId; 2] = [
+    GROUP_ADMIN_POLICY_COMPONENT_ID,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+];
+pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS: [AppComponentId; 1] =
+    [GROUP_ADMIN_POLICY_COMPONENT_ID];
+pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
+    [ACCOUNT_IDENTITY_PROOF_COMPONENT_ID];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InitialComponentState {
@@ -343,9 +363,8 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
 /// Enforced rules, in order:
 /// 1. the `app_data_dictionary` extension itself may never be dropped;
 /// 2. the engine-owned `app_components` entry and the state entry of every
-///    component in the current epoch's required set may never be dropped
-///    (mirrors [`validate_app_component_remove`]: a component becomes
-///    droppable only after a prior commit removes it from the required list);
+///    component in the resulting epoch's required set may never be dropped;
+///    one Commit may atomically unrequire and remove an optional component;
 /// 3. every dictionary entry that changes relative to the current epoch —
 ///    added, rewritten, or removed — must match one of this commit's own
 ///    `AppDataUpdate` operations, whose payloads passed the component
@@ -365,12 +384,40 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
     let current = current.map(|ext| ext.dictionary());
     let resulting = resulting.map(|ext| ext.dictionary());
 
-    let mut protected = required_app_components_of_group(mls_group)?.ids;
-    protected.insert(APP_COMPONENTS_COMPONENT_ID);
+    // Protect the RESULTING required set. This deliberately permits one
+    // authorized Commit to atomically unrequire and remove an optional
+    // component, while still rejecting a required entry that disappears.
+    let is_current = crate::account_identity_proof::protocol_profile_of_group(mls_group)?
+        == ProtocolProfile::Current;
+    let mut protected = if resulting
+        .and_then(|dictionary| dictionary.get(&APP_COMPONENTS_COMPONENT_ID))
+        .is_some()
+    {
+        required_app_components_of_extensions(
+            staged.group_context().extensions(),
+            "resulting GroupContext",
+        )?
+        .ids
+    } else if is_current {
+        return Err(EngineError::Other(
+            "commit is invalid: resulting GroupContext drops current-profile app_components".into(),
+        ));
+    } else {
+        BTreeSet::new()
+    };
+    if is_current
+        || current.is_some_and(|dictionary| dictionary.contains(&APP_COMPONENTS_COMPONENT_ID))
+    {
+        protected.insert(APP_COMPONENTS_COMPONENT_ID);
+    }
     for component_id in &protected {
-        let currently_present = current.is_some_and(|dict| dict.contains(component_id));
+        // The account proof is required by the GroupContext but its data is
+        // LeafNode-only. It must never appear as GroupContext state.
+        if *component_id == ACCOUNT_IDENTITY_PROOF_COMPONENT_ID {
+            continue;
+        }
         let still_present = resulting.is_some_and(|dict| dict.contains(component_id));
-        if currently_present && !still_present {
+        if !still_present {
             return Err(EngineError::Other(format!(
                 "commit is invalid: resulting GroupContext drops required app component \
                  {component_id:#06x}"
@@ -412,6 +459,285 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
                 "commit is invalid: resulting GroupContext changes app component \
                  {component_id:#06x} outside an AppDataUpdate proposal"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the complete current application profile carried by an already
+/// materialized MLS group.
+///
+/// Legacy groups deliberately skip these current-profile requirements. Their
+/// deployed proof/component rules remain selected by their explicit profile.
+pub(crate) fn validate_current_profile_group_invariants(
+    group: &MlsGroup,
+) -> Result<(), EngineError> {
+    let profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
+    if profile == ProtocolProfile::Legacy {
+        return Ok(());
+    }
+    let required_components =
+        validate_current_profile_group_context(group.extensions(), "group state")?;
+    let leaves = ratchet_tree_leaves(group.export_ratchet_tree())?;
+    validate_resulting_leaf_capabilities(leaves.iter(), group.extensions(), &required_components)
+}
+
+/// Validate current-profile invariants against the complete state a staged
+/// Commit would produce, before the Commit can mutate canonical group state.
+pub(crate) fn validate_current_profile_invariants_for_staged_commit(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    committer_index: LeafNodeIndex,
+) -> Result<(), EngineError> {
+    let profile = crate::account_identity_proof::protocol_profile_of_group(group)?;
+    if profile == ProtocolProfile::Legacy {
+        return Ok(());
+    }
+    let extensions = staged.group_context().extensions();
+    let required_components =
+        validate_current_profile_group_context(extensions, "resulting group state")?;
+    let leaves = conceptual_resulting_leaves(group, staged, committer_index)?;
+    validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)
+}
+
+fn validate_current_profile_group_context(
+    extensions: &Extensions<GroupContext>,
+    context: &str,
+) -> Result<AppComponentSet, EngineError> {
+    let required = extensions.required_capabilities().ok_or_else(|| {
+        EngineError::Other(format!(
+            "invalid current-profile {context}: missing required_capabilities"
+        ))
+    })?;
+    if !CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_EXTENSIONS
+        .iter()
+        .all(|extension_type| {
+            required
+                .extension_types()
+                .contains(&ExtensionType::from(*extension_type))
+        })
+    {
+        return Err(EngineError::Other(format!(
+            "invalid current-profile {context}: app_data_dictionary is not a required extension"
+        )));
+    }
+    if !CURRENT_PROFILE_REQUIRED_PROPOSALS
+        .iter()
+        .all(|proposal_type| {
+            required
+                .proposal_types()
+                .contains(&ProposalType::from(*proposal_type))
+        })
+    {
+        return Err(EngineError::Other(format!(
+            "invalid current-profile {context}: app_data_update is not a required proposal"
+        )));
+    }
+
+    let dictionary = extensions.app_data_dictionary().ok_or_else(|| {
+        EngineError::Other(format!(
+            "invalid current-profile {context}: missing app_data_dictionary"
+        ))
+    })?;
+    let required_components = required_app_components_of_extensions(extensions, context)?;
+    for mandatory in CURRENT_PROFILE_REQUIRED_APP_COMPONENTS {
+        if !required_components.contains(mandatory) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: missing mandatory component requirement \
+                 {mandatory:#06x}"
+            )));
+        }
+    }
+    for component_id in CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS {
+        if dictionary.dictionary().contains(&component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: leaf-only account proof appears in GroupContext"
+            )));
+        }
+    }
+    for component_id in CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS {
+        if !dictionary.dictionary().contains(&component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: required component {component_id:#06x} \
+                 has no GroupContext state"
+            )));
+        }
+    }
+
+    for entry in dictionary.dictionary().entries() {
+        let component_id = entry.id();
+        if is_known_group_component(component_id) {
+            validate_app_component_update(&AppComponentData {
+                component_id,
+                data: entry.data().to_vec(),
+            })?;
+        }
+    }
+    for component_id in &required_components.ids {
+        if CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(component_id) {
+            continue;
+        }
+        if !is_known_group_component(*component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: unsupported required component \
+                 {component_id:#06x}"
+            )));
+        }
+        if !dictionary.dictionary().contains(component_id) {
+            return Err(EngineError::Other(format!(
+                "invalid current-profile {context}: required component {component_id:#06x} \
+                 has no GroupContext state"
+            )));
+        }
+    }
+    Ok(required_components)
+}
+
+fn required_app_components_of_extensions(
+    extensions: &Extensions<GroupContext>,
+    context: &str,
+) -> Result<AppComponentSet, EngineError> {
+    let dictionary = extensions.app_data_dictionary().ok_or_else(|| {
+        EngineError::Other(format!("invalid {context}: missing app_data_dictionary"))
+    })?;
+    let bytes = dictionary
+        .dictionary()
+        .get(&APP_COMPONENTS_COMPONENT_ID)
+        .ok_or_else(|| {
+            EngineError::Other(format!(
+                "invalid {context}: missing app_components requirement list"
+            ))
+        })?;
+    let ids = decode_components_list(bytes).map_err(|error| {
+        EngineError::Serialize(format!("invalid {context} app_components: {error}"))
+    })?;
+    Ok(AppComponentSet::from(ids))
+}
+
+fn is_known_group_component(component_id: AppComponentId) -> bool {
+    matches!(
+        component_id,
+        APP_COMPONENTS_COMPONENT_ID
+            | SAFE_AAD_COMPONENT_ID
+            | GROUP_PROFILE_COMPONENT_ID
+            | GROUP_BLOSSOM_IMAGE_COMPONENT_ID
+            | GROUP_ADMIN_POLICY_COMPONENT_ID
+            | NOSTR_ROUTING_COMPONENT_ID
+            | GROUP_MESSAGE_RETENTION_COMPONENT_ID
+            | AGENT_TEXT_STREAM_QUIC_COMPONENT_ID
+            | GROUP_AVATAR_URL_COMPONENT_ID
+            | GROUP_ENCRYPTED_MEDIA_COMPONENT_ID
+    )
+}
+
+pub(crate) fn ratchet_tree_nodes(
+    tree: openmls::treesync::RatchetTree,
+) -> Result<Vec<Option<Node>>, EngineError> {
+    // RatchetTree intentionally keeps its node vector private. Its stable
+    // serde representation exposes the same public Node enum that MDK already
+    // uses for cold-path proof and capability validation.
+    let value = serde_json::to_value(tree)
+        .map_err(|error| EngineError::Backend(format!("export ratchet tree: {error}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| EngineError::Backend(format!("decode ratchet tree: {error}")))
+}
+
+fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafNode>, EngineError> {
+    Ok(ratchet_tree_nodes(tree)?
+        .into_iter()
+        .filter_map(|node| match node {
+            Some(Node::LeafNode(leaf)) => Some(*leaf),
+            _ => None,
+        })
+        .collect())
+}
+
+fn indexed_ratchet_tree_leaves(
+    tree: openmls::treesync::RatchetTree,
+) -> Result<BTreeMap<u32, LeafNode>, EngineError> {
+    let mut leaves = BTreeMap::new();
+    for (node_index, node) in ratchet_tree_nodes(tree)?.into_iter().enumerate() {
+        if let Some(Node::LeafNode(leaf)) = node {
+            let leaf_index = u32::try_from(node_index / 2)
+                .map_err(|_| EngineError::Backend("ratchet tree index overflow".into()))?;
+            leaves.insert(leaf_index, *leaf);
+        }
+    }
+    Ok(leaves)
+}
+
+fn conceptual_resulting_leaves(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    committer_index: LeafNodeIndex,
+) -> Result<Vec<LeafNode>, EngineError> {
+    let mut leaves = indexed_ratchet_tree_leaves(group.export_ratchet_tree())?;
+    for remove in staged.remove_proposals() {
+        leaves.remove(&remove.remove_proposal().removed().u32());
+    }
+    for queued in staged.queued_proposals() {
+        if matches!(queued.proposal(), Proposal::SelfRemove)
+            && let Sender::Member(index) = queued.sender()
+        {
+            leaves.remove(&index.u32());
+        }
+    }
+    for update in staged.update_proposals() {
+        let Sender::Member(index) = update.sender() else {
+            return Err(EngineError::Other(
+                "invalid resulting group state: Update has no member sender".into(),
+            ));
+        };
+        leaves.insert(index.u32(), update.update_proposal().leaf_node().clone());
+    }
+    if let Some(path_leaf) = staged.update_path_leaf_node() {
+        leaves.insert(committer_index.u32(), path_leaf.clone());
+    }
+    let mut result = leaves.into_values().collect::<Vec<_>>();
+    result.extend(
+        staged
+            .add_proposals()
+            .map(|add| add.add_proposal().key_package().leaf_node().clone()),
+    );
+    Ok(result)
+}
+
+fn validate_resulting_leaf_capabilities<'a>(
+    leaves: impl Iterator<Item = &'a LeafNode>,
+    extensions: &Extensions<GroupContext>,
+    required_components: &AppComponentSet,
+) -> Result<(), EngineError> {
+    let required = extensions.required_capabilities().ok_or_else(|| {
+        EngineError::Other(
+            "invalid current-profile group state: missing required_capabilities".into(),
+        )
+    })?;
+    for leaf in leaves {
+        let capabilities = leaf.capabilities();
+        let supports_required = required
+            .extension_types()
+            .iter()
+            .all(|required| capabilities.extensions().contains(required))
+            && required
+                .proposal_types()
+                .iter()
+                .all(|required| capabilities.proposals().contains(required))
+            && required
+                .credential_types()
+                .iter()
+                .all(|required| capabilities.credentials().contains(required));
+        if !supports_required {
+            return Err(EngineError::Other(
+                "invalid current-profile resulting state: member lacks a required MLS capability"
+                    .into(),
+            ));
+        }
+        let advertised = app_components_of_leaf(leaf)?;
+        if !required_components.missing_from(&advertised).is_empty() {
+            return Err(EngineError::Other(
+                "invalid current-profile resulting state: member lacks a required app component"
+                    .into(),
+            ));
         }
     }
     Ok(())
@@ -731,8 +1057,71 @@ pub(crate) fn validate_app_component_update(
     }
 }
 
-pub(crate) fn validate_app_component_remove(
+/// Validate all AppDataUpdate operations in one Commit as a batch.
+///
+/// Removal legality is evaluated against the resulting `app_components`
+/// requirement list, not the parent epoch's list. That permits the spec's
+/// atomic "unrequire and remove" operation while still failing closed if the
+/// resulting epoch requires a component whose GroupContext data is removed.
+pub(crate) fn validate_app_data_update_batch<'a>(
     mls_group: &MlsGroup,
+    updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
+) -> Result<(), EngineError> {
+    validate_app_data_update_batch_against(required_app_components_of_group(mls_group)?, updates)
+}
+
+fn validate_app_data_update_batch_against<'a>(
+    mut resulting_required: AppComponentSet,
+    updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
+) -> Result<(), EngineError> {
+    let updates = updates.into_iter().collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+
+    for update in &updates {
+        if !seen.insert(update.component_id()) {
+            return Err(EngineError::Other(format!(
+                "commit contains multiple AppDataUpdate operations for component {:#06x}",
+                update.component_id()
+            )));
+        }
+        if update.component_id() == APP_COMPONENTS_COMPONENT_ID {
+            match update.operation() {
+                AppDataUpdateOperation::Update(data) => {
+                    resulting_required = AppComponentSet::from(
+                        decode_components_list(data.as_slice()).map_err(|error| {
+                            EngineError::Serialize(format!(
+                                "invalid app_components component: {error}"
+                            ))
+                        })?,
+                    );
+                }
+                AppDataUpdateOperation::Remove => {
+                    return Err(EngineError::Other(
+                        "app_components component cannot be removed".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    for update in updates {
+        match update.operation() {
+            AppDataUpdateOperation::Update(data) => {
+                validate_app_component_update(&AppComponentData {
+                    component_id: update.component_id(),
+                    data: data.as_slice().to_vec(),
+                })?;
+            }
+            AppDataUpdateOperation::Remove => {
+                validate_app_component_remove_against(&resulting_required, update.component_id())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_app_component_remove_against(
+    resulting_required: &AppComponentSet,
     component_id: AppComponentId,
 ) -> Result<(), EngineError> {
     if component_id == APP_COMPONENTS_COMPONENT_ID {
@@ -745,7 +1134,7 @@ pub(crate) fn validate_app_component_remove(
             "safe_aad group-component state is not supported yet".into(),
         ));
     }
-    if required_app_components_of_group(mls_group)?.contains(component_id) {
+    if resulting_required.contains(component_id) {
         return Err(EngineError::Other(
             "required Marmot app components cannot be removed".into(),
         ));
@@ -886,6 +1275,40 @@ fn decode_var_bytes(
 mod tests {
     use super::*;
     use cgka_traits::app_components::default_group_components;
+    use openmls::extensions::RequiredCapabilitiesExtension;
+
+    fn current_profile_extensions(
+        required_components: impl IntoIterator<Item = AppComponentId>,
+        include_admin_state: bool,
+        include_leaf_only_proof_state: bool,
+        required_extensions: &[ExtensionType],
+        required_proposals: &[ProposalType],
+    ) -> Extensions<GroupContext> {
+        let required_components = required_components.into_iter().collect();
+        let mut dictionary = AppDataDictionary::new();
+        dictionary.insert(
+            APP_COMPONENTS_COMPONENT_ID,
+            encode_components_list(&required_components),
+        );
+        if include_admin_state {
+            dictionary.insert(
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                encode_admin_policy(&[[1; 32]]).unwrap(),
+            );
+        }
+        if include_leaf_only_proof_state {
+            dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, vec![0; 104]);
+        }
+        Extensions::from_vec(vec![
+            Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+                required_extensions,
+                required_proposals,
+                &[],
+            )),
+            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+        ])
+        .unwrap()
+    }
 
     /// Build the group-creation `app_data_dictionary` for `required` with no
     /// initial component bytes, then assert that every entry the engine writes
@@ -1037,5 +1460,189 @@ mod tests {
         .unwrap_err();
 
         assert!(!error.to_string().contains(&hex::encode([0xA5; 32])));
+    }
+
+    #[test]
+    fn app_data_update_batch_rejects_duplicate_component_operations() {
+        let updates = [
+            AppDataUpdateProposal::update(GROUP_PROFILE_COMPONENT_ID, vec![0, 0]),
+            AppDataUpdateProposal::remove(GROUP_PROFILE_COMPONENT_ID),
+        ];
+
+        let error =
+            validate_app_data_update_batch_against(AppComponentSet::default(), updates.iter())
+                .expect_err("one operation per component id");
+
+        assert!(error.to_string().contains("multiple AppDataUpdate"));
+    }
+
+    #[test]
+    fn app_data_update_batch_allows_atomic_unrequire_and_remove() {
+        let initial = AppComponentSet::new([
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        ]);
+        let resulting = [GROUP_PROFILE_COMPONENT_ID, GROUP_ADMIN_POLICY_COMPONENT_ID]
+            .into_iter()
+            .collect();
+        let updates = [
+            AppDataUpdateProposal::update(
+                APP_COMPONENTS_COMPONENT_ID,
+                encode_components_list(&resulting),
+            ),
+            AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
+        ];
+
+        validate_app_data_update_batch_against(initial, updates.iter())
+            .expect("the component is optional in the resulting epoch");
+    }
+
+    #[test]
+    fn app_data_update_batch_rejects_removing_resulting_required_component() {
+        let initial = AppComponentSet::new([
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        ]);
+        let updates = [AppDataUpdateProposal::remove(
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        )];
+
+        let error = validate_app_data_update_batch_against(initial, updates.iter())
+            .expect_err("required state must remain present");
+
+        assert!(error.to_string().contains("required Marmot app components"));
+    }
+
+    #[test]
+    fn current_profile_group_context_requires_the_complete_mandatory_set() {
+        struct Case {
+            label: &'static str,
+            components: Vec<AppComponentId>,
+            admin_state: bool,
+            proof_state: bool,
+            extensions: Vec<ExtensionType>,
+            proposals: Vec<ProposalType>,
+            expected_error: &'static str,
+        }
+        let mandatory = vec![
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        ];
+        let cases = [
+            Case {
+                label: "missing admin requirement",
+                components: vec![ACCOUNT_IDENTITY_PROOF_COMPONENT_ID],
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "0x8003",
+            },
+            Case {
+                label: "missing proof requirement",
+                components: vec![GROUP_ADMIN_POLICY_COMPONENT_ID],
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "0x8009",
+            },
+            Case {
+                label: "missing admin state",
+                components: mandatory.clone(),
+                admin_state: false,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "has no GroupContext state",
+            },
+            Case {
+                label: "proof incorrectly in GroupContext",
+                components: mandatory.clone(),
+                admin_state: true,
+                proof_state: true,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "leaf-only account proof",
+            },
+            Case {
+                label: "unknown required component",
+                components: vec![
+                    GROUP_ADMIN_POLICY_COMPONENT_ID,
+                    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+                    0xF301,
+                ],
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "unsupported required component 0xf301",
+            },
+            Case {
+                label: "missing dictionary capability",
+                components: mandatory.clone(),
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![],
+                proposals: vec![ProposalType::AppDataUpdate],
+                expected_error: "not a required extension",
+            },
+            Case {
+                label: "missing update capability",
+                components: mandatory,
+                admin_state: true,
+                proof_state: false,
+                extensions: vec![ExtensionType::AppDataDictionary],
+                proposals: vec![],
+                expected_error: "not a required proposal",
+            },
+        ];
+
+        for case in cases {
+            let extensions = current_profile_extensions(
+                case.components,
+                case.admin_state,
+                case.proof_state,
+                &case.extensions,
+                &case.proposals,
+            );
+            let error = validate_current_profile_group_context(&extensions, case.label)
+                .expect_err(case.label);
+            assert!(
+                error.to_string().contains(case.expected_error),
+                "{}: {error}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn current_profile_group_context_preserves_unknown_optional_state() {
+        let mut extensions = current_profile_extensions(
+            [
+                GROUP_ADMIN_POLICY_COMPONENT_ID,
+                ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+            ],
+            true,
+            false,
+            &[ExtensionType::AppDataDictionary],
+            &[ProposalType::AppDataUpdate],
+        );
+        let mut dictionary = extensions
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .clone();
+        dictionary.insert(0xF301, vec![0xde, 0xad, 0xbe, 0xef]);
+        extensions = Extensions::from_vec(vec![
+            Extension::RequiredCapabilities(extensions.required_capabilities().unwrap().clone()),
+            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+        ])
+        .unwrap();
+
+        validate_current_profile_group_context(&extensions, "test")
+            .expect("unknown optional component state is opaque");
     }
 }

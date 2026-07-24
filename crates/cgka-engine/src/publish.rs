@@ -122,6 +122,7 @@ impl<S: StorageProvider> Engine<S> {
                     mls_group
                         .merge_pending_commit(&tx_provider)
                         .map_err(|e| EngineError::Backend(format!("merge_pending: {e:?}")))?;
+                    crate::app_components::validate_current_profile_group_invariants(&mls_group)?;
                 }
 
                 // Now the MLS group is at the new epoch. Mirror the Marmot

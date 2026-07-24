@@ -31,7 +31,7 @@ use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::group::{MlsGroup, MlsGroupStateError, ProcessMessageError};
 use openmls::prelude::{
     ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessageContent, Proposal,
-    ProtocolMessage, QueuedProposal, ValidationError,
+    ProtocolMessage, QueuedProposal, Sender, ValidationError,
 };
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
@@ -812,6 +812,10 @@ impl<S: StorageProvider> Engine<S> {
             };
 
             // Classify content.
+            let sender_leaf_index = match processed.sender() {
+                Sender::Member(index) => Some(*index),
+                _ => None,
+            };
             let sender_id = member_id_of_sender(processed.sender(), &mls_group);
             return match processed.into_content() {
                 ProcessedMessageContent::ApplicationMessage(bytes) => {
@@ -928,6 +932,12 @@ impl<S: StorageProvider> Engine<S> {
                             "commit has no authenticated member sender".into(),
                         ));
                     };
+                    let Some(committer_index) = sender_leaf_index else {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(EngineError::Backend(
+                            "commit has no authenticated member leaf".into(),
+                        ));
+                    };
                     let commit_priority =
                         crate::app_components::commit_ordering_priority_for_staged(&staged);
                     // foundation/identity.md: reject inbound commits that
@@ -946,6 +956,16 @@ impl<S: StorageProvider> Engine<S> {
                             return Err(err);
                         }
                     };
+                    if let Err(err) =
+                        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+                            &mls_group,
+                            &staged,
+                            committer_index,
+                        )
+                    {
+                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
+                        return Err(err);
+                    }
                     // Classify departures before the merge consumes the staged
                     // commit and the leaving leaves disappear: a SelfRemove is a
                     // member leaving (attributed to themselves); a Remove is an
@@ -992,7 +1012,8 @@ impl<S: StorageProvider> Engine<S> {
                             .merge_staged_commit(&tx_provider, *staged)
                             .map_err(|e| {
                                 EngineError::Backend(format!("merge_staged_commit: {e:?}"))
-                            })
+                            })?;
+                        crate::app_components::validate_current_profile_group_invariants(&mls_group)
                     })?;
                     let after = EpochId(mls_group.epoch().as_u64());
                     let after_members = group_lifecycle::marmot_members(&mls_group);
@@ -1501,6 +1522,20 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, _welcome_opt, _gi) = mls_group
             .commit_to_pending_proposals(&provider, &self.identity.signer)
             .map_err(|e| EngineError::Backend(format!("auto_commit: {e:?}")))?;
+        let staged_commit = mls_group
+            .pending_commit()
+            .ok_or_else(|| EngineError::Backend("auto-commit produced no pending commit".into()))?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            mls_group,
+            staged_commit,
+            mls_group.own_leaf_index(),
+        )?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -1524,10 +1559,8 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let commit_priority = mls_group
-            .pending_commit()
-            .map(crate::app_components::commit_ordering_priority_for_staged)
-            .ok_or_else(|| EngineError::Backend("auto-commit produced no pending commit".into()))?;
+        let commit_priority =
+            crate::app_components::commit_ordering_priority_for_staged(staged_commit);
         let pending_ref = self.epoch_manager.next_pending_ref();
         let staged =
             cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());

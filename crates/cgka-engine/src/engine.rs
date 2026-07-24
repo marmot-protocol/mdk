@@ -816,6 +816,8 @@ impl<S: StorageProvider> Engine<S> {
         let wire_protocol_profile =
             crate::account_identity_proof::protocol_profile_of_group(&mls_group)
                 .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
+        crate::app_components::validate_current_profile_group_invariants(&mls_group)
+            .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
 
         // Member-credential + account-identity-proof validation runs one
         // BIP-340 schnorr verification per leaf. All of this state was already

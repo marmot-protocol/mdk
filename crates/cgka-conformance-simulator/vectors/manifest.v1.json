@@ -1,6 +1,6 @@
 {
   "manifest_version": "1",
-  "updated": "2026-07-06",
+  "updated": "2026-07-23",
   "purpose": "Inventory of current CGKA conformance artifacts and the next vectorization state for each one.",
   "entries": [
     {
@@ -63,6 +63,21 @@
         "stable member set across metadata update"
       ],
       "next": "Extend with explicit group profile state once ScenarioTrace carries component state."
+    },
+    {
+      "id": "current-profile-required-set/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "current-profile-required-set.v1.json",
+      "coverage": [
+        "current application profile registry contract",
+        "required app_data_dictionary extension 0x0006",
+        "required app_data_update proposal 0x0008",
+        "mandatory admin-policy component 0x8003",
+        "mandatory LeafNode-only account-proof component 0x8009",
+        "creation and Welcome join under the current profile"
+      ],
+      "next": "Keep registry ids synchronized with the adopted application profile."
     },
     {
       "id": "admin-policy-update/v1",

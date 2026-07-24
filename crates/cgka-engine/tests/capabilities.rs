@@ -286,7 +286,7 @@ async fn group_creation_retains_non_negotiable_mandatory_components() {
 }
 
 #[tokio::test]
-async fn upgrade_group_capabilities_promotes_optional_app_component_to_required() {
+async fn upgrade_group_capabilities_rejects_app_component_without_group_state() {
     let mut supported = default_group_components();
     supported.insert(TEST_APP_COMPONENT);
     let mut alice = build_engine_with_registry_and_components(
@@ -332,21 +332,24 @@ async fn upgrade_group_capabilities_promotes_optional_app_component_to_required(
             .contains(TEST_APP_COMPONENT)
     );
 
-    let upgrade = alice.upgrade_group_capabilities(&group_id).await.unwrap();
-    let pending = match upgrade {
-        SendResult::GroupEvolution { pending, .. } => pending,
-        _ => unreachable!(),
-    };
-    alice.confirm_published(pending).await.unwrap();
+    let error = alice
+        .upgrade_group_capabilities(&group_id)
+        .await
+        .expect_err("a required GroupContext component must have resulting state");
+    assert!(
+        error
+            .to_string()
+            .contains("drops required app component 0x8101")
+    );
 
     assert!(matches!(
         alice
             .feature_status(&group_id, &Feature("test-app-component"))
             .unwrap(),
-        FeatureStatus::Available
+        FeatureStatus::Upgradeable
     ));
     assert!(
-        alice
+        !alice
             .group_record(&group_id)
             .unwrap()
             .required_capabilities

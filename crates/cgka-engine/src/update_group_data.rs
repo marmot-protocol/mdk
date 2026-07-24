@@ -241,6 +241,11 @@ impl<S: StorageProvider> Engine<S> {
             self.identity.self_id(),
             self.ciphersuite,
         )?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            mls_group.own_leaf_index(),
+        )?;
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
@@ -385,22 +390,16 @@ impl<S: StorageProvider> Engine<S> {
         proposals: Vec<Proposal>,
         context: &str,
     ) -> Result<MlsMessageOut, EngineError> {
-        // Mirror the receiver-side guard: a Remove of the negotiation
-        // component or a group-required component must fail at staging, not
-        // surface as a recipient-side rejection. Checked before the builder
-        // takes its mutable borrow of `mls_group`. No current caller produces
-        // a Remove (all send intents carry Update bytes); this keeps the
-        // shared helper in parity with the projection for future callers.
-        for proposal in &proposals {
-            if let Proposal::AppDataUpdate(update) = proposal
-                && matches!(update.operation(), AppDataUpdateOperation::Remove)
-            {
-                crate::app_components::validate_app_component_remove(
-                    mls_group,
-                    update.component_id(),
-                )?;
-            }
-        }
+        // Validate the proposal set as one operation. In particular, removal
+        // legality is based on the resulting requirement list so one Commit
+        // may atomically unrequire and remove an optional component.
+        crate::app_components::validate_app_data_update_batch(
+            mls_group,
+            proposals.iter().filter_map(|proposal| match proposal {
+                Proposal::AppDataUpdate(update) => Some(update.as_ref()),
+                _ => None,
+            }),
+        )?;
         let mut builder = mls_group
             .commit_builder()
             .propose_removals(removals)

@@ -168,6 +168,21 @@ impl<S: StorageProvider> Engine<S> {
         let (commit_out, welcome_out, _gi) = mls_group
             .add_members(&provider, &self.identity.signer, &parsed_kps)
             .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
+        let own_leaf_index = mls_group.own_leaf_index();
+        let staged_commit = mls_group
+            .pending_commit()
+            .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            own_leaf_index,
+        )?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
 
         let commit_bytes = commit_out
             .tls_serialize_detached()
@@ -474,6 +489,11 @@ impl<S: StorageProvider> Engine<S> {
             &mls_group,
             self.identity.self_id(),
             self.ciphersuite,
+        )?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            mls_group.own_leaf_index(),
         )?;
         let commit_priority =
             crate::app_components::commit_ordering_priority_for_staged(staged_commit);
