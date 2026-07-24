@@ -948,11 +948,11 @@ where
             };
             let accepted = match self.adapter.publish(attempt).await {
                 Ok(report) => {
-                    report.message_id == *fanout.message_id()
-                        && report
-                            .accepted
-                            .iter()
-                            .any(|receipt| receipt.endpoint == endpoint)
+                    fanout.record_published_message_id(report.message_id)?;
+                    report
+                        .accepted
+                        .iter()
+                        .any(|receipt| receipt.endpoint == endpoint)
                 }
                 Err(_) => false,
             };
@@ -1239,7 +1239,10 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
         }
     }
     TransportPublishReport {
-        message_id: fanout.message_id().clone(),
+        message_id: fanout
+            .published_message_id()
+            .unwrap_or_else(|| fanout.message_id())
+            .clone(),
         accepted,
         failed,
         required_acks: fanout.request().required_acks,

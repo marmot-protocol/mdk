@@ -217,6 +217,8 @@ pub enum FanoutMlsState {
 pub struct OutboundFanout {
     request: TransportPublishRequest,
     group_id: Option<GroupId>,
+    #[serde(default)]
+    published_message_id: Option<MessageId>,
     target_statuses: Vec<FanoutTargetStatus>,
     mls_state: FanoutMlsState,
     created_at_ms: u64,
@@ -247,6 +249,7 @@ impl OutboundFanout {
         Ok(Self {
             request,
             group_id: target_group_id.or(pending_group_id),
+            published_message_id: None,
             target_statuses: vec![FanoutTargetStatus::NotAttempted; target_count],
             mls_state: pending.map_or(FanoutMlsState::NotApplicable, FanoutMlsState::Pending),
             created_at_ms,
@@ -259,6 +262,14 @@ impl OutboundFanout {
 
     pub fn message_id(&self) -> &MessageId {
         &self.request.message.id
+    }
+
+    /// Transport-visible message id reported by the adapter.
+    ///
+    /// The frozen request remains keyed by the engine message id, while this
+    /// value captures the deterministic signed-event id exposed to apps.
+    pub fn published_message_id(&self) -> Option<&MessageId> {
+        self.published_message_id.as_ref()
     }
 
     pub fn group_id(&self) -> Option<&GroupId> {
@@ -324,6 +335,22 @@ impl OutboundFanout {
         self.mark_target_terminal(index, FanoutTargetStatus::Failed)
     }
 
+    pub fn record_published_message_id(
+        &mut self,
+        message_id: MessageId,
+    ) -> Result<bool, TransportAdapterError> {
+        match &self.published_message_id {
+            None => {
+                self.published_message_id = Some(message_id);
+                Ok(true)
+            }
+            Some(previous) if previous == &message_id => Ok(false),
+            Some(_) => Err(TransportAdapterError::Other(
+                "adapter changed the transport-visible id for a frozen fanout".into(),
+            )),
+        }
+    }
+
     pub fn mark_mls_confirmed(&mut self) -> Result<bool, TransportAdapterError> {
         match self.mls_state {
             FanoutMlsState::Pending(_) => {
@@ -367,7 +394,10 @@ impl OutboundFanout {
             .filter(|status| status.is_outstanding())
             .count();
         OutboundFanoutOutcome {
-            message_id: self.request.message.id.clone(),
+            message_id: self
+                .published_message_id
+                .clone()
+                .unwrap_or_else(|| self.request.message.id.clone()),
             mls_confirmation_required: accepted_targets > 0
                 && matches!(self.mls_state, FanoutMlsState::Pending(_)),
             mls_confirmed: self.mls_state == FanoutMlsState::Confirmed,
@@ -390,7 +420,14 @@ impl OutboundFanout {
             && self.group_id == previous.group_id
             && self.created_at_ms == previous.created_at_ms
             && self.target_statuses.len() == previous.target_statuses.len();
+        let published_id_advances =
+            match (&previous.published_message_id, &self.published_message_id) {
+                (None, _) => true,
+                (Some(previous), Some(next)) => previous == next,
+                (Some(_), None) => false,
+            };
         let targets_advance = immutable_matches
+            && published_id_advances
             && self
                 .target_statuses
                 .iter()

@@ -1296,6 +1296,7 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
 
     let adapter = RecordingAdapter::default();
     adapter.accept_next(1);
+    adapter.accept_next(0);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(2)
@@ -1352,13 +1353,17 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
     );
 
     let publishes = adapter.publishes();
-    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes.len(), 3);
     assert!(matches!(
         publishes[0].message.envelope,
         TransportEnvelope::GroupMessage { .. }
     ));
     assert!(matches!(
         publishes[1].message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    ));
+    assert!(matches!(
+        publishes[2].message.envelope,
         TransportEnvelope::Welcome { .. }
     ));
 }
@@ -1522,6 +1527,7 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     // this back; the fix must confirm it.
     let adapter = RecordingAdapter::default();
     adapter.accept_only_next(1);
+    adapter.accept_next(0);
     let alice_id = alice.self_id();
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])

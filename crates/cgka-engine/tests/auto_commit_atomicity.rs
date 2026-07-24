@@ -30,9 +30,9 @@ use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
     ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage, OutboundIntentStorage,
-    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
-    WelcomeStorage,
+    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage,
+    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
+    StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
