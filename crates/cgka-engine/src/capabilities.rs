@@ -25,7 +25,6 @@ pub(crate) fn leaf_capabilities(
     let mut ext_types: Vec<ExtensionType> = vec![
         ExtensionType::RequiredCapabilities,
         ExtensionType::AppDataDictionary,
-        ExtensionType::LastResort,
         crate::account_identity_proof::account_identity_proof_capability(),
     ];
     let mut proposal_types: Vec<ProposalType> = vec![ProposalType::AppDataUpdate];

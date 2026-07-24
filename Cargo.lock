@@ -3648,7 +3648,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openmls"
 version = "0.8.1"
-source = "git+https://github.com/erskingardner/openmls.git?rev=85990fd44634bd054f010f14dc4d8987c9adfb3d#85990fd44634bd054f010f14dc4d8987c9adfb3d"
+source = "git+https://github.com/erskingardner/openmls.git?rev=59e7d3b27a7e95237879dd5478de1fd90eff7ada#59e7d3b27a7e95237879dd5478de1fd90eff7ada"
 dependencies = [
  "log",
  "openmls_serialization_helpers",
@@ -3664,7 +3664,7 @@ dependencies = [
 [[package]]
 name = "openmls_basic_credential"
 version = "0.5.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=85990fd44634bd054f010f14dc4d8987c9adfb3d#85990fd44634bd054f010f14dc4d8987c9adfb3d"
+source = "git+https://github.com/erskingardner/openmls.git?rev=59e7d3b27a7e95237879dd5478de1fd90eff7ada#59e7d3b27a7e95237879dd5478de1fd90eff7ada"
 dependencies = [
  "ed25519-dalek",
  "ml-dsa",
@@ -3680,7 +3680,7 @@ dependencies = [
 [[package]]
 name = "openmls_memory_storage"
 version = "0.5.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=85990fd44634bd054f010f14dc4d8987c9adfb3d#85990fd44634bd054f010f14dc4d8987c9adfb3d"
+source = "git+https://github.com/erskingardner/openmls.git?rev=59e7d3b27a7e95237879dd5478de1fd90eff7ada#59e7d3b27a7e95237879dd5478de1fd90eff7ada"
 dependencies = [
  "log",
  "openmls_traits",
@@ -3692,7 +3692,7 @@ dependencies = [
 [[package]]
 name = "openmls_rust_crypto"
 version = "0.5.1"
-source = "git+https://github.com/erskingardner/openmls.git?rev=85990fd44634bd054f010f14dc4d8987c9adfb3d#85990fd44634bd054f010f14dc4d8987c9adfb3d"
+source = "git+https://github.com/erskingardner/openmls.git?rev=59e7d3b27a7e95237879dd5478de1fd90eff7ada#59e7d3b27a7e95237879dd5478de1fd90eff7ada"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -3718,7 +3718,7 @@ dependencies = [
 [[package]]
 name = "openmls_serialization_helpers"
 version = "0.1.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=85990fd44634bd054f010f14dc4d8987c9adfb3d#85990fd44634bd054f010f14dc4d8987c9adfb3d"
+source = "git+https://github.com/erskingardner/openmls.git?rev=59e7d3b27a7e95237879dd5478de1fd90eff7ada#59e7d3b27a7e95237879dd5478de1fd90eff7ada"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3729,7 +3729,7 @@ dependencies = [
 [[package]]
 name = "openmls_traits"
 version = "0.5.0"
-source = "git+https://github.com/erskingardner/openmls.git?rev=85990fd44634bd054f010f14dc4d8987c9adfb3d#85990fd44634bd054f010f14dc4d8987c9adfb3d"
+source = "git+https://github.com/erskingardner/openmls.git?rev=59e7d3b27a7e95237879dd5478de1fd90eff7ada#59e7d3b27a7e95237879dd5478de1fd90eff7ada"
 dependencies = [
  "serde",
  "tls_codec",

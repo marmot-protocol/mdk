@@ -30,6 +30,9 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{MemberId, MessageId};
 use openmls::component::ComponentType;
+use openmls::extensions::{
+    AppDataDictionary, AppDataDictionaryExtension, Extension, LastResortExtension,
+};
 use openmls::prelude::{
     BasicCredential, Capabilities, CredentialWithKey, ExtensionType, Extensions,
     KeyPackage as MlsKeyPackage, Lifetime, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut,
@@ -139,6 +142,88 @@ fn key_package_with_account_identity_proof_and_lifetime(
         .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
         .key_package_lifetime(lifetime)
         .mark_as_last_resort()
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
+fn key_package_with_malformed_last_resort_component(
+    identity_seed: &[u8],
+) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential = BasicCredential::new(credential_identity.clone());
+    let credential_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_extension = account_identity_proof_extension(
+        &credential_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        proof_signer(identity_seed).as_ref(),
+    )
+    .unwrap();
+    let mut dictionary = AppDataDictionary::new();
+    dictionary.insert(ComponentType::LastResortKeyPackage.into(), vec![0xff]);
+    let key_package_extension =
+        Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary));
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[
+                ExtensionType::Unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE),
+                ExtensionType::AppDataDictionary,
+            ]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
+        .key_package_extensions(Extensions::single(key_package_extension).unwrap())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
+fn legacy_last_resort_key_package(identity_seed: &[u8]) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential = BasicCredential::new(credential_identity.clone());
+    let credential_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_extension = account_identity_proof_extension(
+        &credential_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        proof_signer(identity_seed).as_ref(),
+    )
+    .unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[
+                ExtensionType::Unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE),
+                ExtensionType::LastResort,
+            ]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
+        .key_package_extensions(
+            Extensions::single(Extension::LastResort(LastResortExtension::new())).unwrap(),
+        )
         .build(ciphersuite, &provider, &signer, credential_with_key)
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
@@ -819,6 +904,22 @@ async fn fresh_key_package_uses_draft10_last_resort_component() {
         !key_package.extensions().contains(ExtensionType::LastResort),
         "new KeyPackages must not use the legacy last_resort extension"
     );
+    assert!(
+        key_package
+            .leaf_node()
+            .capabilities()
+            .extensions()
+            .contains(&ExtensionType::AppDataDictionary),
+        "new KeyPackages must advertise the app_data_dictionary carrier"
+    );
+    assert!(
+        !key_package
+            .leaf_node()
+            .capabilities()
+            .extensions()
+            .contains(&ExtensionType::LastResort),
+        "last-resort is an application-data component, not an advertised extension capability"
+    );
     let dictionary = key_package
         .extensions()
         .app_data_dictionary()
@@ -829,6 +930,36 @@ async fn fresh_key_package_uses_draft10_last_resort_component() {
             .get(&ComponentType::LastResortKeyPackage.into()),
         Some(&[][..]),
         "draft-10 last-resort component 0x0004 must carry empty data"
+    );
+}
+
+#[tokio::test]
+async fn create_group_rejects_malformed_last_resort_component() {
+    let mut alice = build_client(b"alice", selfremove_registry());
+    let key_package = key_package_with_malformed_last_resort_component(b"malformed-last-resort");
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "malformed-last-resort".into(),
+            description: String::new(),
+            members: vec![key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("create_group must reject non-empty last-resort component data");
+    assert!(
+        matches!(&error, EngineError::Backend(message) if message.contains("MalformedLastResortComponent")),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn legacy_last_resort_extension_remains_decodable() {
+    let key_package = legacy_last_resort_key_package(b"legacy-last-resort");
+    assert!(
+        is_last_resort_key_package(&key_package)
+            .expect("legacy KeyPackage remains valid for compatibility")
     );
 }
 

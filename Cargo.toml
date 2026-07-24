@@ -35,11 +35,11 @@ publish = false
 # Keep every companion crate on the same repository commit to prevent source skew.
 # Migration: once an upstream OpenMLS release contains this fix, replace all five
 # git entries together with one matching upstream release series and remove the fork pin.
-openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d", features = ["extensions-draft"] }
-openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d" }
-openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d", features = ["extensions-draft"] }
-openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d" }
-openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "85990fd44634bd054f010f14dc4d8987c9adfb3d", features = ["extensions-draft"] }
+openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
+openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
+openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
+openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
+openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
 tls_codec = "~0.5"
 
 # async

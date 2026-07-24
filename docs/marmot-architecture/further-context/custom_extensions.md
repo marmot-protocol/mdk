@@ -1,7 +1,7 @@
 ---
 title: "Custom Proposals & Extensions — When to Inherit vs Define"
 created: 2026-04-18
-updated: 2026-06-09
+updated: 2026-07-23
 tags: [marmot, mls, extensions, proposals, capabilities, design]
 status: exploration
 related:
@@ -531,9 +531,13 @@ Each MIP was read in full. For each, the analysis is based on what the MIP actua
 
 ### 6.1 MIP-00 — Credentials & KeyPackages
 
-**Current approach:** Uses standard MLS `BasicCredential` with Nostr pubkey in the identity field. Uses standard
-kind-30443 addressable Nostr events for KeyPackage distribution. MUST advertise `0xF2EE` (marmot_group_data) and
-`0x000a` (last_resort — standard MLS extension draft).
+**Historical MIP-00 approach:** Uses standard MLS `BasicCredential` with Nostr pubkey in the identity field and
+kind-30443 addressable Nostr events for KeyPackage distribution. The old profile advertised `0xF2EE`
+(`marmot_group_data`) and `0x000a` (`last_resort`).
+
+**Adopted current approach:** KeyPackages advertise the MLS `app_data_dictionary` carrier. Last-resort status is
+component `0x0004` with empty data inside KeyPackage application data; current encoders neither emit nor advertise the
+obsolete `0x000a` extension. Legacy decoding remains separate for compatibility.
 
 **Inherit vs Custom check:**
 
@@ -542,7 +546,8 @@ kind-30443 addressable Nostr events for KeyPackage distribution. MUST advertise 
 - KeyPackage event format: Marmot-specific (kind 30443, `d` tag, `i` tag, `mls_ciphersuite` tag, `mls_extensions` tag,
   `mls_proposals` tag, `app_components` tag). **Correct custom** — this is Nostr-layer event format, not
   MLS-layer; no standard exists.
-- `last_resort` extension: standard, inherited. **Correct.**
+- Historical `last_resort` extension: retained only on the legacy decode path. Current encoding uses application-data
+  component `0x0004`.
 - `KeyPackageRef` calculation: standard RFC 9420. **Correct to inherit.**
 
 **No issues.** MIP-00 is cleanly split: MLS-layer primitives are inherited; Nostr-layer event structure is Marmot-custom
