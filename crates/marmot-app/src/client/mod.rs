@@ -84,6 +84,30 @@ pub struct AppClient {
     pub(crate) epoch_backfill_pending: bool,
 }
 
+/// Cross the point-of-no-return for current-profile group creation without
+/// allowing repairable follow-up work to turn a canonical group into an
+/// apparent create failure. Returning `Err` after that boundary encourages a
+/// caller to retry and create a second group. The engine's retained outbound
+/// Welcome index and account-open reconciliation repair any missed projection
+/// work.
+fn recover_post_canonical_result<T: Default>(
+    method: &'static str,
+    result: Result<T, AppError>,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method,
+                error_kind = error.privacy_safe_kind(),
+                "canonical group creation outpaced repairable follow-up work"
+            );
+            T::default()
+        }
+    }
+}
+
 /// A point-in-time copy of the live session's read-only group projections
 /// (`members`, `group_mls_state`, `quarantined_groups`).
 ///
@@ -287,18 +311,32 @@ impl AppClient {
         // transport delivery. Persist every exact Welcome obligation before
         // the first external side effect, so a crash between recipients
         // cannot lose the still-undelivered work or induce a second group.
-        let founding_welcome_intents =
-            self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects)?;
-        let effects = self
-            .runtime
-            .publish_prepared_session_effects_with_audit_context(
-                prepared.effects,
-                audit_context.clone(),
-            )
-            .await?;
-        self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects)?;
-        fail_if_publish_failed(&effects)?;
-        self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
+        let founding_welcome_intents = recover_post_canonical_result(
+            "record_founding_welcome_delivery_intents",
+            self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects),
+        );
+        let effects = recover_post_canonical_result(
+            "publish_prepared_founding_group",
+            self.runtime
+                .publish_prepared_session_effects_with_audit_context(
+                    prepared.effects,
+                    audit_context.clone(),
+                )
+                .await
+                .map_err(AppError::from),
+        );
+        recover_post_canonical_result(
+            "clear_delivered_founding_welcome_intents",
+            self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects),
+        );
+        recover_post_canonical_result(
+            "classify_founding_welcome_publish",
+            fail_if_publish_failed(&effects),
+        );
+        recover_post_canonical_result(
+            "record_founding_welcome_delivery_failures",
+            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects),
+        );
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         // The engine group is already published and confirmed. Projection,
@@ -2302,6 +2340,24 @@ fn local_account_removed_from_roster(
     !members
         .iter()
         .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
+}
+
+#[cfg(test)]
+mod post_canonical_create_tests {
+    use super::recover_post_canonical_result;
+    use crate::AppError;
+
+    #[test]
+    fn post_canonical_failures_default_instead_of_escaping() {
+        let recovered: Vec<String> = recover_post_canonical_result(
+            "test_post_canonical_failure",
+            Err(AppError::Publish("injected failure".into())),
+        );
+        assert!(recovered.is_empty());
+
+        let successful: u8 = recover_post_canonical_result("test_post_canonical_success", Ok(7));
+        assert_eq!(successful, 7);
+    }
 }
 
 #[cfg(test)]

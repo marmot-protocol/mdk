@@ -1563,6 +1563,7 @@ impl<S: StorageProvider> Engine<S> {
         id: &MessageId,
     ) -> Result<(GroupId, TransportMessage), EngineError> {
         let record = self.storage.get_message(id)?;
+        self.ensure_group_live(&record.group_id)?;
         if record.state != MessageState::Sent {
             return Err(EngineError::Backend(
                 "stored message is not an outbound sent record".into(),
@@ -1600,6 +1601,9 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
         let mut welcomes = Vec::new();
         for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                continue;
+            }
             for record in self.storage.list_messages(&group_id, EpochId(0))? {
                 if record.state != MessageState::Sent {
                     continue;
@@ -1627,6 +1631,9 @@ impl<S: StorageProvider> Engine<S> {
     pub fn tracked_outbound_welcome_ids(&self) -> Result<Vec<MessageId>, EngineError> {
         let mut ids = Vec::new();
         for group_id in self.storage.list_groups()? {
+            if self.ensure_group_live(&group_id).is_err() {
+                continue;
+            }
             for record in self.storage.list_messages(&group_id, EpochId(0))? {
                 let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
                     continue;

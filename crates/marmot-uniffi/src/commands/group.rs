@@ -211,9 +211,11 @@ impl Marmot {
 
     /// Create a new MLS group with `name` and the given members. Members are
     /// referenced by `npub` or hex account id. Returns the locally canonical
-    /// group id as hex; this does not imply every Welcome reached its
-    /// recipient. Hosts must observe `WelcomeDeliveryPending` events before
-    /// presenting invitation success.
+    /// group id as hex; this confirms local canonicalization, not Welcome
+    /// delivery. `WelcomeDeliveryPending` is a delivery-failure signal, not an
+    /// acknowledgement. Hosts should subscribe before creation and/or query
+    /// `pending_welcome_deliveries` afterward before presenting invitation
+    /// success.
     pub async fn create_group(
         &self,
         account_ref: String,

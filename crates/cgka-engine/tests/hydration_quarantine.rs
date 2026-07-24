@@ -521,6 +521,90 @@ fn build_flaky_engine(storage: FlakyGroupRecordStorage) -> Engine<FlakyGroupReco
         .expect("build flaky engine")
 }
 
+fn build_current_flaky_engine(
+    storage: FlakyGroupRecordStorage,
+    name: &[u8],
+) -> Engine<FlakyGroupRecordStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build current-profile flaky engine")
+}
+
+fn build_current_named_client(name: &[u8]) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().expect("storage"))
+        .identity(pad32(name))
+        .account_identity_proof_signer(proof_signer(name))
+        .protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .expect("build current-profile client")
+}
+
+#[tokio::test]
+async fn welcome_delivery_accessors_hide_quarantined_groups() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut alice = build_current_flaky_engine(storage.clone(), b"alice-quarantined-welcome");
+    let mut bob = build_current_named_client(b"bob-quarantined-welcome");
+    let bob_key_package = bob.fresh_key_package().await.expect("bob key package");
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "quarantined welcome".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect("create current-profile group");
+    let welcome_id = match result {
+        SendResult::FoundingGroupCreated { welcomes } => {
+            welcomes.into_iter().next().expect("founding Welcome").id
+        }
+        other => panic!("expected founding group creation, got {other:?}"),
+    };
+    assert_eq!(alice.outstanding_sent_welcomes().unwrap().len(), 1);
+    drop(alice);
+
+    storage.set_fail_get_group(true);
+    let mut engine = build_current_flaky_engine(storage.clone(), b"alice-quarantined-welcome");
+    engine
+        .hydrate_stable_groups_from_storage()
+        .expect("unreadable group is quarantined");
+    assert_eq!(
+        engine.quarantined_groups(),
+        vec![(
+            group_id.clone(),
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed
+        )]
+    );
+
+    // Make the underlying record readable again without retrying hydration.
+    // The quarantine gate, rather than the transient storage failure, must
+    // continue to hide every delivery accessor until explicit recovery.
+    storage.set_fail_get_group(false);
+    assert!(matches!(
+        engine.stored_sent_welcome(&welcome_id),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    assert!(matches!(
+        engine.mark_sent_welcome_delivered(&welcome_id),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    assert!(
+        engine.outstanding_sent_welcomes().unwrap().is_empty(),
+        "quarantined groups must not contribute outstanding Welcome work"
+    );
+    assert!(
+        engine.tracked_outbound_welcome_ids().unwrap().is_empty(),
+        "quarantined groups must not contribute tracked Welcome ids"
+    );
+}
+
 async fn create_confirmed_group_flaky(engine: &mut Engine<FlakyGroupRecordStorage>) -> GroupId {
     let (group_id, send_result) = engine
         .create_group(CreateGroupRequest {

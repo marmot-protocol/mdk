@@ -223,7 +223,7 @@ fn snapshot_transport_adapter_boundary_types() {
 }
 
 #[test]
-fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
+fn stored_message_payload_distinguishes_raw_outbound_welcome_and_openmls_wire() {
     let raw = TransportMessage {
         id: mid(),
         payload: vec![1, 2, 3],
