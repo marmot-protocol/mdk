@@ -145,14 +145,7 @@ impl NostrMlsPeeler {
             nostr::TagKind::custom(GROUP_TAG),
             [hex::encode(group_id)],
         )];
-        if let Some(expiration) = metadata
-            .map(|metadata| metadata.expiration_timestamp())
-            .transpose()
-            .map_err(|err| {
-                PeelerError::WrapFailed(format!("invalid group-message metadata: {err:?}"))
-            })?
-            .flatten()
-        {
+        if let Some(expiration) = metadata.and_then(GroupMessageMetadata::expiration_timestamp) {
             tags.push(Tag::custom(
                 nostr::TagKind::custom(EXPIRATION_TAG),
                 [expiration.to_string()],

@@ -80,7 +80,7 @@ pub use ingest::{
     IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
 };
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
-pub use peeler::{GroupMessageMetadata, GroupMessageMetadataError, TransportPeeler};
+pub use peeler::{GroupMessageMetadata, TransportPeeler};
 pub use storage::{
     CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MessageStorage,
     OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
