@@ -888,7 +888,13 @@ impl MarmotApp {
     /// Whether this build may act on loopback-HTTP blob endpoints (dev/test
     /// only). Production builds return `false` and skip such endpoints in the
     /// upload/download act paths.
-    pub(crate) fn allow_loopback_blob_endpoints(&self) -> bool {
+    /// Whether this runtime was explicitly configured to act on cleartext
+    /// loopback blob endpoints for development or testing.
+    ///
+    /// Consumers that parse stored V1 media references outside the account
+    /// worker must pass this same policy to the shared media parser so
+    /// reference validation and the eventual fetch path cannot disagree.
+    pub fn allow_loopback_blob_endpoints(&self) -> bool {
         self.config.allow_loopback_blob_endpoints
     }
 

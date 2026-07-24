@@ -21,3 +21,5 @@ mod push;
 mod relay;
 mod subscription;
 mod timeline;
+
+pub use media::parse_media_imeta_tag;

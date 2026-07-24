@@ -5,12 +5,47 @@ use marmot_app::AppMessageQuery;
 use crate::Marmot;
 use crate::conversions::{
     MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaUploadRequestFfi,
-    MediaUploadResultFfi, SendSummaryFfi, group_id_from_hex, media_records_ffi,
+    MediaUploadResultFfi, MessageTagFfi, SendSummaryFfi, group_id_from_hex, media_records_ffi,
 };
 use crate::errors::MarmotKitError;
 
+/// Parse one authenticated encrypted-media `imeta` tag using MDK's frozen V1
+/// or current V2 validation rules.
+///
+/// `source_epoch` is required because it is MLS metadata rather than an
+/// `imeta` field and is needed to download the attachment later.
+#[uniffi::export]
+pub fn parse_media_imeta_tag(
+    tag: MessageTagFfi,
+    source_epoch: u64,
+) -> Result<MediaAttachmentReferenceFfi, MarmotKitError> {
+    marmot_app::media_attachment_from_imeta_tag(&tag.values, Some(source_epoch), false)
+        .map(Into::into)
+        .map_err(media_reference_error)
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Build one outbound encrypted-media `imeta` tag without publishing it.
+    ///
+    /// The account worker derives the target group's actual media profile and
+    /// rejects a V1 reference for a V2 group (or a V2 reference for a legacy
+    /// V1 group).
+    pub async fn build_media_imeta_tag(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        reference: MediaAttachmentReferenceFfi,
+    ) -> Result<MessageTagFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let values = self
+            .runtime
+            .build_media_imeta_tag(&account_ref, &group_id, reference.into())
+            .await
+            .map_err(media_reference_error)?;
+        Ok(MessageTagFfi { values })
+    }
+
     /// Send already-uploaded encrypted media attachments as a kind-9 chat
     /// carrying ordered NIP-92 `imeta` tags.
     pub async fn send_media_attachments(
@@ -96,5 +131,15 @@ impl Marmot {
             },
         )?;
         Ok(media_records_ffi(records))
+    }
+}
+
+fn media_reference_error(error: marmot_app::AppError) -> MarmotKitError {
+    match error {
+        marmot_app::AppError::InvalidAppMessagePayload(details)
+        | marmot_app::AppError::InvalidEncryptedMedia(details) => {
+            MarmotKitError::InvalidMediaReference { details }
+        }
+        other => other.into(),
     }
 }
