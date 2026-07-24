@@ -162,6 +162,7 @@ pub use notifications::{
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE, NotificationCollectionStatus, NotificationSettings,
     NotificationTrafficClass, NotificationTrigger, NotificationUpdate, NotificationUser,
     NotificationWakeSource, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationShareStatus, PushRegistrationSyncResult,
     build_notification_gift_wrap, build_notification_rumor_content, encrypted_push_token,
     parse_provider_token, push_token_fingerprint,
 };
@@ -189,9 +190,10 @@ use conversions::{
     account_state_from_stored, app_message_record_from_stored,
     chat_notification_settings_from_account, group_push_token_from_account,
     normalize_relay_telemetry_settings, notification_settings_from_account,
-    relay_telemetry_settings_from_storage, relay_telemetry_settings_to_storage,
-    stored_app_event_from_message_record, stored_app_event_from_projection,
-    stored_push_registration_from_account, stored_state_from_account_state,
+    pending_push_registration_removal_from_account, relay_telemetry_settings_from_storage,
+    relay_telemetry_settings_to_storage, stored_app_event_from_message_record,
+    stored_app_event_from_projection, stored_push_registration_from_account,
+    stored_state_from_account_state,
 };
 use directory::{DirectoryCache, DirectorySyncHandle};
 use ids::parse_account_id_hex;
@@ -409,6 +411,8 @@ pub struct MarmotApp {
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
@@ -1009,6 +1013,8 @@ impl MarmotApp {
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
@@ -1053,6 +1059,8 @@ impl MarmotApp {
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_relay_client: None,
             shared_storage: Arc::new(Mutex::new(None)),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
@@ -1075,6 +1083,17 @@ impl MarmotApp {
     }
 
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
+        #[cfg(test)]
+        let relay_plane = self
+            .test_relay_client
+            .as_ref()
+            .map(|client| MarmotRelayPlane::new(None, client.clone()))
+            .unwrap_or_else(|| {
+                MarmotRelayPlane::full_history_with_loopback(
+                    self.config.allow_loopback_relay_endpoints,
+                )
+            });
+        #[cfg(not(test))]
         let relay_plane = MarmotRelayPlane::full_history_with_loopback(
             self.config.allow_loopback_relay_endpoints,
         );
@@ -1798,16 +1817,10 @@ impl MarmotApp {
     ) -> Result<NotificationSettings, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let storage = self.account_storage(&account.label)?;
-        let settings = notification_settings_from_account(storage.set_native_push_enabled(
-            &account.label,
-            &account.account_id_hex,
-            enabled,
-        )?);
-        if !enabled {
-            let _ = storage.clear_push_registration(&account.label)?;
-        }
-        Ok(settings)
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?,
+        ))
     }
 
     pub fn push_registration(
@@ -1884,13 +1897,136 @@ impl MarmotApp {
     pub(crate) fn mark_push_registration_shared(
         &self,
         account_ref: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
         shared_at_ms: i64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .mark_push_registration_shared(
+                &account.label,
+                token_fingerprint,
+                registration_updated_at_ms,
+                shared_at_ms,
+            )?)
+    }
+
+    pub(crate) fn pending_push_registration_shares(
+        &self,
+        account_ref: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .pending_push_registration_shares(token_fingerprint, registration_updated_at_ms)?)
+    }
+
+    pub(crate) fn mark_push_registration_share_attempted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+        attempted_at_ms: i64,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
-            .mark_push_registration_shared(&account.label, shared_at_ms)?;
+            .mark_push_registration_share_attempted(
+                group_id_hex,
+                token_fingerprint,
+                registration_updated_at_ms,
+                attempted_at_ms,
+            )?;
         Ok(())
+    }
+
+    pub(crate) fn complete_push_registration_share(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .complete_push_registration_share(
+                group_id_hex,
+                token_fingerprint,
+                registration_updated_at_ms,
+            )?)
+    }
+
+    pub(crate) fn queue_push_registration_removals(
+        &self,
+        account_ref: &str,
+        registration: PushRegistration,
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .queue_push_registration_removals(
+                &account_push_registration_from_app(registration),
+                notifications::unix_now_ms(),
+            )?)
+    }
+
+    pub(crate) fn pending_push_registration_removals(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<(String, PushRegistration)>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .pending_push_registration_removals()?
+            .into_iter()
+            .map(pending_push_registration_removal_from_account)
+            .collect()
+    }
+
+    pub(crate) fn mark_push_registration_removal_attempted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+        attempted_at_ms: i64,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let pending = storage_sqlite::AccountPendingPushRegistrationRemoval {
+            group_id_hex: group_id_hex.to_owned(),
+            registration: account_push_registration_from_app(registration.clone()),
+            last_attempted_at_ms: None,
+        };
+        self.account_storage(&account.label)?
+            .mark_push_registration_removal_attempted(&pending, attempted_at_ms)?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_push_registration_removal(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let pending = storage_sqlite::AccountPendingPushRegistrationRemoval {
+            group_id_hex: group_id_hex.to_owned(),
+            registration: account_push_registration_from_app(registration.clone()),
+            last_attempted_at_ms: None,
+        };
+        Ok(self
+            .account_storage(&account.label)?
+            .complete_push_registration_removal(&pending)?)
     }
 
     pub(crate) fn upsert_group_push_token(
@@ -3625,9 +3761,20 @@ impl MarmotApp {
         signer: Arc<dyn nostr::NostrSigner>,
         endpoints: &[TransportEndpoint],
     ) -> Arc<dyn NostrRelayClient> {
+        #[cfg(test)]
+        if let Some(client) = &self.test_relay_client {
+            return client.clone();
+        }
         let _ = endpoints;
         let client = NostrSdkClient::builder().signer(signer).build();
         Arc::new(NostrSdkRelayClient::new(client))
+    }
+
+    #[cfg(test)]
+    fn with_test_relay_client(mut self, client: Arc<dyn NostrRelayClient>) -> Self {
+        self.relay_plane = MarmotRelayPlane::new(None, client.clone());
+        self.test_relay_client = Some(client);
+        self
     }
 
     pub async fn register_external_signer<S>(

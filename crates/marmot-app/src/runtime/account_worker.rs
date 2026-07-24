@@ -12,6 +12,7 @@ use rand::rngs::OsRng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, Sleep, sleep, timeout};
+use zeroize::Zeroizing;
 
 use super::{
     MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
@@ -27,8 +28,9 @@ use crate::{
     AppGroupMlsState, AppGroupRecord, AppInitialGroupImage, AppProjectionUpdate,
     AppQuarantinedGroup, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
     MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    PendingWelcomeDelivery, PushRegistration, ReceivedMessage, SecureDeleteExpiredResult,
-    SendSummary, SyncSummary,
+    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
+    SecureDeleteExpiredResult, SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -260,7 +262,21 @@ pub(crate) enum AccountWorkerCommand {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
     SharePushRegistration {
-        respond: oneshot::Sender<Result<usize, AppError>>,
+        respond: oneshot::Sender<Result<PushRegistrationShareOutcome, AppError>>,
+    },
+    UpsertPushRegistration {
+        platform: PushPlatform,
+        raw_token: Zeroizing<String>,
+        server_pubkey_hex: String,
+        relay_hint: Option<String>,
+        respond: oneshot::Sender<Result<PushRegistrationSyncResult, AppError>>,
+    },
+    ClearPushRegistration {
+        respond: oneshot::Sender<Result<PushRegistrationShareOutcome, AppError>>,
+    },
+    SetNativePushEnabled {
+        enabled: bool,
+        respond: oneshot::Sender<Result<NotificationSettings, AppError>>,
     },
     RemovePushRegistration {
         registration: PushRegistration,
@@ -483,7 +499,6 @@ async fn run_app_runtime_account_worker(
             Err(message)
         }
     };
-
     // Replay commands deferred during the initial catch-up in arrival order, now
     // on live state. Coalesced `CatchUp` waiters are fulfilled at their position
     // with the initial catch-up's result.
@@ -505,6 +520,12 @@ async fn run_app_runtime_account_worker(
             }
         }
     }
+    // Automatic gossip is best-effort network work. Run it only after startup
+    // callers have received their deferred responses so a degraded relay cannot
+    // extend account-open latency.
+    client
+        .retry_pending_push_registration_shares_best_effort()
+        .await;
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
     // / InviteMembers) can buffer convergence groups. The steady-state arms below
@@ -609,6 +630,11 @@ async fn run_app_runtime_account_worker(
                         if sync_summary_triggers_audit_tracker_update(&summary) {
                             shared.schedule_audit_log_tracker_update("receive");
                         }
+                        if !summary.joined_groups.is_empty() {
+                            client
+                                .retry_pending_push_registration_shares_best_effort()
+                                .await;
+                        }
                     }
                     Err(err) => {
                         publish_app_runtime_account_error(
@@ -627,13 +653,16 @@ async fn run_app_runtime_account_worker(
                             _ = &mut shutdown => return,
                             result = app.runtime_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                         } {
-                            Ok(reopened) => {
+                            Ok(mut reopened) => {
                                 // The reopen re-hydrates + reconnects + resubscribes
                                 // (via `runtime_client`) but does NOT run the
                                 // catch-up `sync()` on the readiness path — it
                                 // resumes the live `next_event` tail below — so it
                                 // does not reintroduce the catch-up blocking this
                                 // worker removed from startup.
+                                reopened
+                                    .retry_pending_push_registration_shares_best_effort()
+                                    .await;
                                 client = reopened;
                             }
                             Err(setup_err) => {
@@ -708,7 +737,13 @@ async fn handle_account_worker_command(
                 sync_started_at.elapsed(),
                 result.is_ok(),
             );
+            let retry_after_response = result.is_ok();
             let _ = respond.send(result);
+            if retry_after_response {
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+            }
         }
         AccountWorkerCommand::CreateGroup {
             name,
@@ -739,7 +774,13 @@ async fn handle_account_worker_command(
                 );
             }
             publish_pending_welcome_delivery_events(events, account_id_hex, account_label, client);
+            let retry_after_response = result.is_ok();
             let _ = respond.send(result);
+            if retry_after_response {
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+            }
         }
         AccountWorkerCommand::Members { group_id, respond } => {
             let result = client.members(&group_id);
@@ -942,7 +983,13 @@ async fn handle_account_worker_command(
                     &group_id,
                 );
             }
+            let retry_after_response = result.is_ok();
             let _ = respond.send(result);
+            if retry_after_response {
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+            }
         }
         AccountWorkerCommand::DeclineGroupInvite { group_id, respond } => {
             let result = client.decline_group_invite(&group_id).await;
@@ -1252,6 +1299,39 @@ async fn handle_account_worker_command(
         AccountWorkerCommand::SharePushRegistration { respond } => {
             let result = client.share_push_registration().await;
             let _ = respond.send(result);
+        }
+        AccountWorkerCommand::UpsertPushRegistration {
+            platform,
+            raw_token,
+            server_pubkey_hex,
+            relay_hint,
+            respond,
+        } => {
+            let result = client
+                .upsert_and_share_push_registration(
+                    platform,
+                    &raw_token,
+                    &server_pubkey_hex,
+                    relay_hint,
+                )
+                .await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::ClearPushRegistration { respond } => {
+            let result = client.clear_and_share_push_registration().await;
+            let _ = respond.send(result);
+        }
+        AccountWorkerCommand::SetNativePushEnabled { enabled, respond } => {
+            let result = client
+                .app
+                .set_native_push_enabled(&client.state.label, enabled);
+            let should_retry = result.is_ok();
+            let _ = respond.send(result);
+            if should_retry {
+                client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+            }
         }
         AccountWorkerCommand::RemovePushRegistration {
             registration,

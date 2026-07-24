@@ -1,4 +1,5 @@
 use super::*;
+use async_trait::async_trait;
 use cgka_traits::Timestamp;
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
@@ -12,6 +13,8 @@ use cgka_traits::app_event::{
 };
 use marmot_account::AccountHomeError;
 use storage_sqlite::StoredRelayTelemetrySettings;
+use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
+use transport_nostr_peeler::NostrTransportEvent;
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
@@ -26,6 +29,300 @@ use crate::key_package_records::{
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
+
+#[derive(Default)]
+struct ScriptedPushRelayClient {
+    publish_results: std::sync::Mutex<std::collections::VecDeque<bool>>,
+    block_next_publish: std::sync::atomic::AtomicBool,
+    publish_started: tokio::sync::Notify,
+    publish_release: tokio::sync::Notify,
+}
+
+impl ScriptedPushRelayClient {
+    fn script(&self, results: impl IntoIterator<Item = bool>) {
+        *self.publish_results.lock().unwrap() = results.into_iter().collect();
+    }
+
+    fn block_next_publish(&self) {
+        self.block_next_publish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn wait_for_blocked_publish(&self) {
+        self.publish_started.notified().await;
+    }
+
+    fn release_publish(&self) {
+        self.publish_release.notify_one();
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for ScriptedPushRelayClient {
+    async fn subscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &cgka_traits::MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        if self
+            .block_next_publish
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.publish_started.notify_one();
+            self.publish_release.notified().await;
+        }
+        if self
+            .publish_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(true)
+        {
+            Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+        } else {
+            Err(cgka_traits::TransportAdapterError::Publish(
+                "injected publish failure".to_owned(),
+            ))
+        }
+    }
+}
+
+#[tokio::test]
+async fn disabling_native_push_persists_removal_before_returning_without_waiting_for_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime
+        .create_group("alice", "alpha", &[], None)
+        .await
+        .unwrap();
+    runtime
+        .set_native_push_enabled("alice", true)
+        .await
+        .unwrap();
+    runtime
+        .upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "retired-token",
+            &nostr::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    relay.block_next_publish();
+    let settings = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        runtime.set_native_push_enabled("alice", false),
+    )
+    .await
+    .expect("settings response must not wait for removal gossip")
+    .unwrap();
+    assert!(!settings.native_push_enabled);
+    assert!(app.push_registration("alice").unwrap().is_none());
+    assert_eq!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .len(),
+        1,
+        "removal intent must be durable before the settings response"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_publish(),
+    )
+    .await
+    .expect("the serialized worker should start removal gossip after responding");
+    relay.release_publish();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if app
+                .pending_push_registration_removals("alice")
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("removal gossip should drain after the relay unblocks");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_registration_update_retry_survives_failure_partial_success_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    client.create_group("alpha", &[]).await.unwrap();
+    client.create_group("beta", &[]).await.unwrap();
+    app.set_native_push_enabled("alice", true).unwrap();
+    let server_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
+    app.upsert_push_registration(
+        "alice",
+        PushPlatform::Fcm,
+        "opaque-token",
+        &server_pubkey_hex,
+        None,
+    )
+    .unwrap();
+
+    relay.script([false, false]);
+    let all_failed = client.share_push_registration().await.unwrap();
+    assert_eq!(all_failed.status, PushRegistrationShareStatus::Pending);
+    assert_eq!(all_failed.attempted_groups, 2);
+    assert_eq!(all_failed.succeeded_groups, 0);
+    assert_eq!(all_failed.failed_groups, 2);
+    assert_eq!(all_failed.pending_groups, 2);
+
+    relay.script([true, false]);
+    let partial = client.share_push_registration().await.unwrap();
+    assert_eq!(partial.status, PushRegistrationShareStatus::Pending);
+    assert_eq!(partial.attempted_groups, 2);
+    assert_eq!(partial.succeeded_groups, 1);
+    assert_eq!(partial.failed_groups, 1);
+    assert_eq!(partial.pending_groups, 1);
+
+    drop(client);
+    drop(app);
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = MarmotAppRuntime::new(reopened.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let registration = reopened.push_registration("alice").unwrap().unwrap();
+            if reopened
+                .pending_push_registration_shares(
+                    "alice",
+                    &registration.token_fingerprint,
+                    registration.updated_at_ms,
+                )
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup retry should drain the persisted update intent");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_registration_removal_retry_survives_clear_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime
+        .create_group("alice", "alpha", &[], None)
+        .await
+        .unwrap();
+    runtime
+        .create_group("alice", "beta", &[], None)
+        .await
+        .unwrap();
+    runtime
+        .set_native_push_enabled("alice", true)
+        .await
+        .unwrap();
+    let server_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
+    let registered = runtime
+        .upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "retired-token",
+            &server_pubkey_hex,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registered.share.status,
+        PushRegistrationShareStatus::Complete
+    );
+
+    relay.script([false, false]);
+    let cleared = runtime.clear_push_registration("alice").await.unwrap();
+    assert_eq!(cleared.status, PushRegistrationShareStatus::Pending);
+    assert_eq!(cleared.attempted_groups, 2);
+    assert_eq!(cleared.failed_groups, 2);
+    assert_eq!(cleared.pending_groups, 2);
+    assert!(app.push_registration("alice").unwrap().is_none());
+    assert_eq!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let reopened_runtime = MarmotAppRuntime::new(reopened.clone());
+    reopened_runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if reopened
+                .pending_push_registration_removals("alice")
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("startup retry should drain the persisted removal intent");
+    reopened_runtime.shutdown().await;
+}
 
 #[tokio::test]
 async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_restart() {
