@@ -272,6 +272,7 @@ fn commit_edges_materialize_candidate_branches_before_selection() {
             message_id: "withheld-1".into(),
             kind: MessageKind::Commit,
             reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            rejection_category: None,
         }]
     );
 }
@@ -394,16 +395,19 @@ fn proposals_are_accepted_only_when_consumed_by_canonical_commits() {
                 message_id: "losing-commit".into(),
                 kind: MessageKind::Commit,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             },
             DroppedMessage {
                 message_id: "losing-proposal".into(),
                 kind: MessageKind::Proposal,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             },
             DroppedMessage {
                 message_id: "pending-proposal".into(),
                 kind: MessageKind::Proposal,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             },
         ]
     );
@@ -448,11 +452,13 @@ fn materialized_candidates_drive_commit_and_proposal_dispositions() {
                 message_id: "losing-commit".into(),
                 kind: MessageKind::Commit,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             },
             DroppedMessage {
                 message_id: "losing-proposal".into(),
                 kind: MessageKind::Proposal,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             },
         ]
     );
@@ -514,6 +520,7 @@ fn commit_beyond_rollback_horizon_is_discarded() {
             message_id: "stale-commit".into(),
             kind: MessageKind::Commit,
             reason: DroppedMessageReason::BeyondRollbackHorizon,
+            rejection_category: None,
         }]
     );
 }

@@ -852,6 +852,7 @@ fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Stale { .. } => "stale",
+        IngestOutcome::Rejected { .. } => "rejected",
     }
 }
 

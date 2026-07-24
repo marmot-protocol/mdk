@@ -15,12 +15,16 @@ use cgka_traits::app_components::{
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::ingest::ProposalRejectionCategory;
 use cgka_traits::types::{GroupId, MemberId};
 use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension, Extensions};
-use openmls::group::{GroupContext, MlsGroup, StagedCommit};
+use openmls::group::{
+    GroupContext, MlsGroup, ProcessMessageError, StageCommitError, StagedCommit, ValidationError,
+};
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
-    BasicCredential, ExtensionType, LeafNode, LeafNodeIndex, ProposalType, Sender,
+    BasicCredential, ContentType, ExtensionType, LeafNode, LeafNodeIndex, ProposalType,
+    ProposalValidationError, QueuedProposal, Sender,
 };
 use openmls::treesync::Node;
 use std::collections::{BTreeMap, BTreeSet};
@@ -249,6 +253,301 @@ pub(crate) fn require_admin_for_staged_commit(
         });
     };
     require_admin(mls_group, group_id, sender)
+}
+
+pub(crate) const fn proposal_rejection_category_tag(
+    category: ProposalRejectionCategory,
+) -> &'static str {
+    match category {
+        ProposalRejectionCategory::AuthorizationFailed => "authorization_failed",
+        ProposalRejectionCategory::UnsupportedProposal => "unsupported_proposal",
+        ProposalRejectionCategory::InvalidEncoding => "invalid_encoding",
+        ProposalRejectionCategory::InvalidSignature => "invalid_signature",
+        ProposalRejectionCategory::InvalidSelfRemove => "invalid_self_remove",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StandaloneProposalRejection {
+    pub(crate) category: ProposalRejectionCategory,
+}
+
+impl StandaloneProposalRejection {
+    const fn authorization(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::AuthorizationFailed,
+        }
+    }
+
+    const fn invalid_self_remove(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::InvalidSelfRemove,
+        }
+    }
+
+    const fn unsupported(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::UnsupportedProposal,
+        }
+    }
+
+    const fn invalid(_reason: &'static str) -> Self {
+        Self {
+            category: ProposalRejectionCategory::InvalidEncoding,
+        }
+    }
+}
+
+/// Membership-tag and sender-leaf authentication depend on the source-epoch
+/// group state. A same-epoch proposal can therefore fail against the live
+/// branch but authenticate against a retained parent branch.
+pub(crate) fn is_parent_dependent_process_message_error<StorageError>(
+    error: &ProcessMessageError<StorageError>,
+    content_type: ContentType,
+) -> bool {
+    matches!(
+        (content_type, error),
+        (
+            ContentType::Proposal,
+            ProcessMessageError::ValidationError(
+                ValidationError::UnknownMember | ValidationError::InvalidMembershipTag
+            )
+        )
+    )
+}
+
+/// Map only proposal-specific MLS processing failures into the stable,
+/// privacy-safe rejection taxonomy. Unrelated commit and local-state failures
+/// remain retryable and therefore return `None`.
+pub(crate) fn classify_process_message_rejection<StorageError>(
+    error: &ProcessMessageError<StorageError>,
+    content_type: ContentType,
+) -> Option<ProposalRejectionCategory> {
+    if is_parent_dependent_process_message_error(error, content_type) {
+        return None;
+    }
+    match (content_type, error) {
+        (ContentType::Proposal, ProcessMessageError::UnsupportedProposalType) => {
+            Some(ProposalRejectionCategory::UnsupportedProposal)
+        }
+        (ContentType::Proposal, ProcessMessageError::IncompatibleWireFormat) => {
+            Some(ProposalRejectionCategory::InvalidEncoding)
+        }
+        (ContentType::Proposal, ProcessMessageError::ValidationError(validation)) => {
+            match validation {
+                ValidationError::WrongEpoch => None,
+                ValidationError::MissingMembershipTag
+                | ValidationError::InvalidSignature
+                | ValidationError::UnauthorizedExternalSender
+                | ValidationError::NoExternalSendersExtension
+                | ValidationError::InvalidLeafNodeSignature
+                | ValidationError::InvalidSenderType => {
+                    Some(ProposalRejectionCategory::InvalidSignature)
+                }
+                _ => Some(ProposalRejectionCategory::InvalidEncoding),
+            }
+        }
+        (
+            ContentType::Commit,
+            ProcessMessageError::ValidationError(ValidationError::WrongWireFormat),
+        ) => Some(ProposalRejectionCategory::InvalidEncoding),
+        (
+            ContentType::Commit,
+            ProcessMessageError::InvalidCommit(StageCommitError::ProposalValidationError(
+                validation,
+            )),
+        ) => Some(match validation {
+            ProposalValidationError::InsufficientCapabilities
+            | ProposalValidationError::UnsupportedProposalType => {
+                ProposalRejectionCategory::UnsupportedProposal
+            }
+            ProposalValidationError::UnknownMember
+            | ProposalValidationError::UpdateFromNonMember => {
+                ProposalRejectionCategory::InvalidSignature
+            }
+            _ => ProposalRejectionCategory::InvalidEncoding,
+        }),
+        (
+            ContentType::Commit,
+            ProcessMessageError::InvalidCommit(
+                StageCommitError::AppDataUpdateValidationError(_)
+                | StageCommitError::ApplyAppDataUpdateError(_)
+                | StageCommitError::GroupContextExtensionsProposalValidationError(_)
+                | StageCommitError::LeafNodeValidation(_),
+            ),
+        ) => Some(ProposalRejectionCategory::InvalidEncoding),
+        _ => None,
+    }
+}
+
+/// Authorize one authenticated proposal against its source-epoch group state.
+///
+/// This is shared by direct ingest, convergence replay, delayed SelfRemove
+/// replay, and staged-Commit validation. OpenMLS has already authenticated the
+/// sender and parsed the proposal before this function runs; this layer owns
+/// Marmot roles, component semantics, profile rules, and capability checks.
+pub(crate) fn authorize_standalone_proposal(
+    mls_group: &MlsGroup,
+    proposal: &QueuedProposal,
+) -> Result<(), StandaloneProposalRejection> {
+    authorize_proposal(mls_group, proposal, true)
+}
+
+fn authorize_proposal(
+    mls_group: &MlsGroup,
+    proposal: &QueuedProposal,
+    validate_app_data_payload: bool,
+) -> Result<(), StandaloneProposalRejection> {
+    let Sender::Member(sender_index) = proposal.sender() else {
+        return Err(StandaloneProposalRejection::authorization(
+            "proposal_sender_not_member",
+        ));
+    };
+    let Some(sender_member) = mls_group.member_at(*sender_index) else {
+        return Err(StandaloneProposalRejection::authorization(
+            "proposal_sender_not_current_member",
+        ));
+    };
+    let sender_id = crate::identity::validated_member_id(&sender_member.credential)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_sender_identity_invalid"))?;
+    let profile = crate::account_identity_proof::protocol_profile_of_group(mls_group)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_group_profile_invalid"))?;
+    let admins = admins_of_group(mls_group)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_admin_policy_invalid"))?;
+    let sender_pubkey = admin_pubkey_from_member_id(&sender_id)
+        .map_err(|_| StandaloneProposalRejection::invalid("proposal_sender_identity_invalid"))?;
+    let sender_is_admin = admins.iter().any(|admin| admin == &sender_pubkey);
+
+    match proposal.proposal() {
+        Proposal::SelfRemove => {
+            if sender_is_admin {
+                return Err(StandaloneProposalRejection::invalid_self_remove(
+                    "self_remove_sender_is_active_admin",
+                ));
+            }
+        }
+        Proposal::AppDataUpdate(update) => {
+            if !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "app_data_update_sender_not_admin",
+                ));
+            }
+            if validate_app_data_payload {
+                validate_standalone_app_data_update(update).map_err(|_| {
+                    StandaloneProposalRejection::invalid("app_data_update_payload_invalid")
+                })?;
+            }
+        }
+        Proposal::GroupContextExtensions(update) => {
+            if !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "group_context_extensions_sender_not_admin",
+                ));
+            }
+            validate_group_context_extension_proposal(mls_group, profile, update.extensions())?;
+        }
+        Proposal::Add(_) | Proposal::Remove(_) => {
+            if !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "membership_proposal_sender_not_admin",
+                ));
+            }
+            validate_membership_proposal(mls_group, proposal)?;
+        }
+        Proposal::Update(_) => {
+            // The current profile's only non-admin standalone proposal is
+            // SelfRemove. Deployed legacy groups retain the ordinary MLS
+            // member self-update proposal flow.
+            if profile == ProtocolProfile::Current && !sender_is_admin {
+                return Err(StandaloneProposalRejection::authorization(
+                    "update_proposal_sender_not_admin",
+                ));
+            }
+            validate_membership_proposal(mls_group, proposal)?;
+        }
+        Proposal::PreSharedKey(_)
+        | Proposal::ReInit(_)
+        | Proposal::ExternalInit(_)
+        | Proposal::AppEphemeral(_)
+        | Proposal::Custom(_) => {
+            return Err(StandaloneProposalRejection::unsupported(
+                "standalone_proposal_type_unsupported",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-run proposal-sender authorization for every proposal carried by a
+/// staged Commit. By-reference proposals keep their original authenticated
+/// sender; by-value proposals are attributed to the committer by MLS.
+pub(crate) fn authorize_staged_commit_proposals(
+    mls_group: &MlsGroup,
+    staged: &StagedCommit,
+) -> Result<(), StandaloneProposalRejection> {
+    for proposal in staged.queued_proposals() {
+        authorize_proposal(mls_group, proposal, false)?;
+    }
+    validate_app_data_update_batch(
+        mls_group,
+        staged.queued_proposals().filter_map(|proposal| {
+            if let Proposal::AppDataUpdate(update) = proposal.proposal() {
+                Some(update.as_ref())
+            } else {
+                None
+            }
+        }),
+    )
+    .map_err(|_| StandaloneProposalRejection::invalid("app_data_update_payload_invalid"))?;
+    Ok(())
+}
+
+fn validate_membership_proposal(
+    mls_group: &MlsGroup,
+    proposal: &QueuedProposal,
+) -> Result<(), StandaloneProposalRejection> {
+    if let Proposal::Remove(remove) = proposal.proposal()
+        && mls_group.member_at(remove.removed()).is_none()
+    {
+        return Err(StandaloneProposalRejection::invalid(
+            "remove_target_not_current_member",
+        ));
+    }
+    crate::account_identity_proof::validate_standalone_proposal_account_identity_proof(
+        proposal,
+        mls_group,
+        mls_group.ciphersuite(),
+    )
+    .map_err(|_| StandaloneProposalRejection::invalid("proposal_account_proof_invalid"))
+}
+
+fn validate_group_context_extension_proposal(
+    mls_group: &MlsGroup,
+    profile: ProtocolProfile,
+    extensions: &Extensions<GroupContext>,
+) -> Result<(), StandaloneProposalRejection> {
+    let required_components = if profile == ProtocolProfile::Current {
+        validate_current_profile_group_context(extensions, "proposed group state").map_err(
+            |_| {
+                StandaloneProposalRejection::invalid(
+                    "group_context_extensions_current_profile_invalid",
+                )
+            },
+        )?
+    } else {
+        AppComponentSet::default()
+    };
+    let leaves = ratchet_tree_leaves(mls_group.export_ratchet_tree()).map_err(|_| {
+        StandaloneProposalRejection::invalid("group_context_extensions_tree_invalid")
+    })?;
+    validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components).map_err(
+        |_| {
+            StandaloneProposalRejection::unsupported(
+                "group_context_extensions_not_supported_by_all_members",
+            )
+        },
+    )
 }
 
 fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
@@ -1092,6 +1391,26 @@ pub(crate) fn validate_app_data_update_batch<'a>(
     validate_app_data_update_batch_against(required_app_components_of_group(mls_group)?, updates)
 }
 
+/// Validate the parts of an AppDataUpdate operation that are decidable before
+/// a Commit supplies the complete proposal batch.
+///
+/// A standalone removal can be valid only together with another proposal that
+/// un-requires the component in the same Commit. Therefore proposal admission
+/// checks the operation's intrinsic encoding/removability here and defers the
+/// resulting required-component rule to [`validate_app_data_update_batch`].
+fn validate_standalone_app_data_update(update: &AppDataUpdateProposal) -> Result<(), EngineError> {
+    match update.operation() {
+        AppDataUpdateOperation::Update(data) => validate_app_component_update(&AppComponentData {
+            component_id: update.component_id(),
+            data: data.as_slice().to_vec(),
+        }),
+        AppDataUpdateOperation::Remove => validate_app_component_remove_against(
+            &AppComponentSet::default(),
+            update.component_id(),
+        ),
+    }
+}
+
 fn validate_app_data_update_batch_against<'a>(
     mut resulting_required: AppComponentSet,
     updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
@@ -1524,6 +1843,17 @@ mod tests {
 
         validate_app_data_update_batch_against(initial, updates.iter())
             .expect("the component is optional in the resulting epoch");
+    }
+
+    #[test]
+    fn standalone_app_data_remove_defers_batch_dependent_requirement_check() {
+        let optional_remove = AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        validate_standalone_app_data_update(&optional_remove)
+            .expect("a later commit may atomically unrequire and remove the component");
+
+        let intrinsic_remove = AppDataUpdateProposal::remove(APP_COMPONENTS_COMPONENT_ID);
+        validate_standalone_app_data_update(&intrinsic_remove)
+            .expect_err("app_components can never be removed");
     }
 
     #[test]

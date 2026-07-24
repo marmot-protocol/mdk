@@ -205,8 +205,17 @@ impl ReplayBudget {
 #[derive(Clone, Debug)]
 enum CandidatePathProbeResult {
     Materialized(Option<OpenMlsMaterializedCandidate>),
-    UnauthorizedCommit { message_id: String },
-    InvalidCommit { message_id: String },
+    RejectedProposal {
+        message_id: String,
+        category: cgka_traits::ingest::ProposalRejectionCategory,
+    },
+    UnauthorizedCommit {
+        message_id: String,
+    },
+    InvalidCommit {
+        message_id: String,
+        rejection_category: Option<cgka_traits::ingest::ProposalRejectionCategory>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -274,8 +283,18 @@ pub enum OpenMlsProjectionError {
     MissingGroup,
     Snapshot(String),
     Replay(String),
-    UnauthorizedCommit { message_id: String },
-    InvalidCommit { message_id: String, reason: String },
+    RejectedProposal {
+        message_id: String,
+        category: cgka_traits::ingest::ProposalRejectionCategory,
+    },
+    UnauthorizedCommit {
+        message_id: String,
+    },
+    InvalidCommit {
+        message_id: String,
+        reason: String,
+        rejection_category: Option<cgka_traits::ingest::ProposalRejectionCategory>,
+    },
     Serialize(String),
     Storage(String),
     InvalidPolicy(String),
@@ -298,10 +317,22 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::MissingGroup => write!(f, "MLS group not found"),
             OpenMlsProjectionError::Snapshot(e) => write!(f, "snapshot failed: {e}"),
             OpenMlsProjectionError::Replay(e) => write!(f, "OpenMLS replay failed: {e}"),
+            OpenMlsProjectionError::RejectedProposal {
+                message_id,
+                category,
+            } => {
+                write!(
+                    f,
+                    "rejected proposal {message_id}: {}",
+                    crate::app_components::proposal_rejection_category_tag(*category)
+                )
+            }
             OpenMlsProjectionError::UnauthorizedCommit { message_id } => {
                 write!(f, "unauthorized admin-gated commit: {message_id}")
             }
-            OpenMlsProjectionError::InvalidCommit { message_id, reason } => {
+            OpenMlsProjectionError::InvalidCommit {
+                message_id, reason, ..
+            } => {
                 write!(f, "invalid commit {message_id}: {reason}")
             }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
@@ -747,6 +778,7 @@ pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: Storag
                             message_id: hex::encode(message.id.as_slice()),
                             kind: MessageKind::Commit,
                             reason: DroppedMessageReason::BeyondAnchor,
+                            rejection_category: None,
                         });
                     }
                     continue;
@@ -849,11 +881,22 @@ fn append_dropped_messages(
     dropped_messages: Vec<DroppedMessage>,
 ) {
     for dropped in dropped_messages {
-        if result
-            .dropped_messages
-            .iter()
-            .any(|existing| existing.message_id == dropped.message_id)
+        if dropped.kind == MessageKind::Proposal
+            && result
+                .accepted_proposals
+                .iter()
+                .any(|accepted| accepted == &dropped.message_id)
         {
+            continue;
+        }
+        if let Some(existing) = result
+            .dropped_messages
+            .iter_mut()
+            .find(|existing| existing.message_id == dropped.message_id)
+        {
+            if existing.rejection_category.is_none() {
+                existing.rejection_category = dropped.rejection_category;
+            }
             continue;
         }
         result.dropped_messages.push(dropped);
@@ -1116,19 +1159,42 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                         replay_rejected_commit_ids.insert(commit.message.id.to_string());
                         continue;
                     }
+                    CandidatePathProbeResult::RejectedProposal {
+                        message_id,
+                        category,
+                    } => {
+                        invalid_commit_drops.push(DroppedMessage {
+                            message_id,
+                            kind: MessageKind::Proposal,
+                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category: Some(category),
+                        });
+                        invalid_commit_drops.push(DroppedMessage {
+                            message_id: commit.message.id.to_string(),
+                            kind: MessageKind::Commit,
+                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category: None,
+                        });
+                        continue;
+                    }
                     CandidatePathProbeResult::UnauthorizedCommit { message_id } => {
                         invalid_commit_drops.push(DroppedMessage {
                             message_id,
                             kind: MessageKind::Commit,
                             reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category: None,
                         });
                         continue;
                     }
-                    CandidatePathProbeResult::InvalidCommit { message_id, .. } => {
+                    CandidatePathProbeResult::InvalidCommit {
+                        message_id,
+                        rejection_category,
+                    } => {
                         invalid_commit_drops.push(DroppedMessage {
                             message_id,
                             kind: MessageKind::Commit,
                             reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category,
                         });
                         continue;
                     }
@@ -1157,6 +1223,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
             message_id: message_id.clone(),
             kind: MessageKind::Commit,
             reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            rejection_category: None,
         });
     }
 
@@ -1233,13 +1300,24 @@ fn probe_candidate_path<S: StorageProvider>(
         profile_policy,
     ) {
         Ok(mut candidates) => Ok(CandidatePathProbeResult::Materialized(candidates.pop())),
+        Err(OpenMlsProjectionError::RejectedProposal {
+            message_id,
+            category,
+        }) => Ok(CandidatePathProbeResult::RejectedProposal {
+            message_id,
+            category,
+        }),
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
             Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
         }
         Err(OpenMlsProjectionError::InvalidCommit {
             message_id,
             reason: _,
-        }) => Ok(CandidatePathProbeResult::InvalidCommit { message_id }),
+            rejection_category,
+        }) => Ok(CandidatePathProbeResult::InvalidCommit {
+            message_id,
+            rejection_category,
+        }),
         Err(OpenMlsProjectionError::Replay(_)) => Ok(CandidatePathProbeResult::Materialized(None)),
         Err(err) => Err(err),
     }
@@ -2085,6 +2163,32 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             mls_group.process_message(&provider, protocol)
         } {
             Ok(processed) => processed,
+            Err(err) if projection.kind == OpenMlsContentKind::Commit => {
+                if let Some(category) = crate::app_components::classify_process_message_rejection(
+                    &err,
+                    ContentType::Commit,
+                ) {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: crate::app_components::proposal_rejection_category_tag(category)
+                            .to_string(),
+                        rejection_category: Some(category),
+                    });
+                }
+                return Err(replay_error("process_message", err));
+            }
+            Err(err) if projection.kind == OpenMlsContentKind::Proposal => {
+                if let Some(category) = crate::app_components::classify_process_message_rejection(
+                    &err,
+                    ContentType::Proposal,
+                ) {
+                    return Err(OpenMlsProjectionError::RejectedProposal {
+                        message_id,
+                        category,
+                    });
+                }
+                return Err(replay_error("process_message", err));
+            }
             Err(err) if projection.kind == OpenMlsContentKind::Application => {
                 // App-message replay against a candidate state is best-
                 // effort: an app message that doesn't apply on this branch is
@@ -2129,6 +2233,14 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     });
                     continue;
                 }
+                if let Err(rejection) =
+                    crate::app_components::authorize_standalone_proposal(&mls_group, &queued)
+                {
+                    return Err(OpenMlsProjectionError::RejectedProposal {
+                        message_id,
+                        category: rejection.category,
+                    });
+                }
                 let proposal_ref = tls_hex(queued.proposal_reference_ref())?;
                 mls_group
                     .store_pending_proposal(provider.storage(), *queued)
@@ -2147,6 +2259,19 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         message_id,
                         reason: "strict cutover freezes membership additions in legacy groups"
                             .into(),
+                        rejection_category: None,
+                    });
+                }
+                if let Err(rejection) =
+                    crate::app_components::authorize_staged_commit_proposals(&mls_group, &staged)
+                {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: crate::app_components::proposal_rejection_category_tag(
+                            rejection.category,
+                        )
+                        .to_string(),
+                        rejection_category: Some(rejection.category),
                     });
                 }
                 if let Err(err) = crate::app_components::require_admin_for_staged_commit(
@@ -2172,6 +2297,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("admin leaf coupling: {err}"),
+                        rejection_category: None,
                     });
                 }
                 if let Err(err) =
@@ -2182,6 +2308,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("app component integrity: {err}"),
+                        rejection_category: None,
                     });
                 }
                 if sender_id.is_none() {
@@ -2219,6 +2346,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("invalid credential identity or account proof: {err}"),
+                        rejection_category: None,
                     });
                 }
                 if let Err(err) =
@@ -2231,6 +2359,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("current-profile resulting state: {err}"),
+                        rejection_category: None,
                     });
                 }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
@@ -2256,6 +2385,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|error| OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("current-profile merged state: {error}"),
+                        rejection_category: None,
                     })?;
                 prefix_canonical =
                     prefix_canonical && own_commits.is_canonical(&projection.message_digest);
