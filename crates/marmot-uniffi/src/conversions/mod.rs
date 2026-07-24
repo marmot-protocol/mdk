@@ -179,10 +179,12 @@ mod tests {
     fn secure_delete_expired_result_ffi_preserves_count_and_hashes() {
         let ffi = SecureDeleteExpiredResultFfi::from(SecureDeleteExpiredResult {
             pruned_messages: 2,
+            secrets_deleted: 1,
             media_ciphertext_sha256: vec!["aa".repeat(32), "bb".repeat(32)],
         });
 
         assert_eq!(ffi.pruned_messages, 2);
+        assert_eq!(ffi.secrets_deleted, 1);
         assert_eq!(
             ffi.media_ciphertext_sha256,
             vec!["aa".repeat(32), "bb".repeat(32)]

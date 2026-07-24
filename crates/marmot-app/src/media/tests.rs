@@ -133,6 +133,18 @@ fn checked_v1_builder_rejects_noncanonical_media_type_while_ingest_stays_toleran
 }
 
 #[test]
+fn retained_media_version_selects_its_historical_component_cache() {
+    assert_eq!(
+        EncryptedMediaVersion::V1.component_id(),
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
+    );
+    assert_eq!(
+        EncryptedMediaVersion::V2.component_id(),
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+    );
+}
+
+#[test]
 fn checked_imeta_builder_preserves_version_and_present_empty_optional_fields() {
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
     let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();

@@ -1608,10 +1608,31 @@ impl AppClient {
                 .iter()
                 .map(|attachment| attachment.reference.clone())
                 .collect();
-            result.sent = Some(
-                self.send_media_attachments(group_id, attachments, caption)
-                    .await?,
-            );
+            let summary = self
+                .send_media_attachments(group_id, attachments, caption)
+                .await?;
+            // The post-publish projection now durably references this source
+            // epoch. Persist again so a prior final-reference retirement cannot
+            // suppress the secret needed by the newly retained message.
+            if self
+                .remember_encrypted_media_epoch_secret(
+                    group_id,
+                    source_epoch,
+                    media_secret.as_ref(),
+                )
+                .is_err()
+            {
+                // Publication already succeeded. Do not report a false send
+                // failure that could make the caller publish a duplicate; the
+                // normal current-epoch cache pass can retry this durable write.
+                tracing::warn!(
+                    target: "marmot_app::media",
+                    method = "upload_media",
+                    error_code = "encrypted_media_secret_cache_skipped",
+                    "failed to cache encrypted media source epoch secret after publish",
+                );
+            }
+            result.sent = Some(summary);
         }
         Ok(result)
     }
@@ -1624,14 +1645,16 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
-        if reference.version != policy.version.as_str() {
-            return Err(AppError::InvalidEncryptedMedia(format!(
-                "group requires {} references",
-                policy.version.as_str()
-            )));
-        }
-        let media_secret =
-            self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch)?;
+        // The current group policy governs fetch endpoints, but the retained
+        // attachment's own version governs KDF/AAD and which versioned cache
+        // row contains its source-epoch exporter. Adopted V1 -> V2 migration
+        // deliberately leaves historical V1 references as V1.
+        let reference_version = EncryptedMediaVersion::parse(&reference.version)?;
+        let media_secret = self.encrypted_media_secret_for_epoch(
+            group_id,
+            reference.source_epoch,
+            reference_version.component_id(),
+        )?;
         download_encrypted_media(
             reference,
             media_secret.as_ref(),
@@ -2063,8 +2086,21 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         source_epoch: u64,
+        component_id: u16,
     ) -> Result<SecretBytes, AppError> {
-        if let Some(secret) = self.cached_encrypted_media_epoch_secret(group_id, source_epoch)? {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if !self
+            .app
+            .account_storage(&self.state.label)?
+            .encrypted_media_epoch_secret_may_be_served(&group_id_hex, source_epoch)?
+        {
+            return Err(AppError::InvalidEncryptedMedia(format!(
+                "encrypted media secret retired for epoch {source_epoch}"
+            )));
+        }
+        if let Some(secret) =
+            self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+        {
             return Ok(SecretBytes::new(secret));
         }
         let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
@@ -2072,13 +2108,22 @@ impl AppClient {
             GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
             32,
         )?;
-        self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())?;
-        if epoch.0 != source_epoch {
-            return Err(AppError::InvalidEncryptedMedia(format!(
-                "missing encrypted media secret for epoch {source_epoch}"
-            )));
+        if epoch.0 == source_epoch {
+            self.remember_encrypted_media_epoch_secret_for_component(
+                group_id,
+                component_id,
+                epoch.0,
+                secret.as_ref(),
+            )?;
+            if let Some(secret) =
+                self.cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+            {
+                return Ok(SecretBytes::new(secret));
+            }
         }
-        Ok(secret)
+        Err(AppError::InvalidEncryptedMedia(format!(
+            "missing encrypted media secret for epoch {source_epoch}"
+        )))
     }
 
     fn remember_current_encrypted_media_secret(&self, group_id: &GroupId) -> Result<(), AppError> {
@@ -2128,6 +2173,21 @@ impl AppClient {
         let component_id = self
             .encrypted_media_policy_for_group(group_id)?
             .component_id;
+        self.remember_encrypted_media_epoch_secret_for_component(
+            group_id,
+            component_id,
+            source_epoch,
+            secret,
+        )
+    }
+
+    fn remember_encrypted_media_epoch_secret_for_component(
+        &self,
+        group_id: &GroupId,
+        component_id: u16,
+        source_epoch: u64,
+        secret: &[u8],
+    ) -> Result<(), AppError> {
         self.app
             .account_storage(&self.state.label)?
             .remember_encrypted_media_epoch_secret(
@@ -2142,11 +2202,9 @@ impl AppClient {
     fn cached_encrypted_media_epoch_secret(
         &self,
         group_id: &GroupId,
+        component_id: u16,
         source_epoch: u64,
     ) -> Result<Option<Vec<u8>>, AppError> {
-        let component_id = self
-            .encrypted_media_policy_for_group(group_id)?
-            .component_id;
         Ok(self
             .app
             .account_storage(&self.state.label)?
