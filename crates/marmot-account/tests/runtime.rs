@@ -18,20 +18,22 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::OutboundFanoutStorage;
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::{
-    EpochId, MemberId, MessageId, TransportAccountActivation, TransportAdapter,
-    TransportAdapterError, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
-    TransportEndpoint, TransportEndpointReceipt, TransportGroupSync, TransportPublishReport,
-    TransportPublishRequest,
+    EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId, OutboundFanout,
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointReceipt,
+    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
     KeyPackagePublisher, PendingResolution, PublishedApplicationMessage, StaticTransportRouting,
+    TransportRoutingError, TransportRoutingPolicy,
 };
-use storage_sqlite::SqlCipherKey;
+use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     deterministic_nostr_keys(name)
@@ -246,6 +248,7 @@ struct RecordingAdapterInner {
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
+    timeout_pattern: Mutex<VecDeque<bool>>,
 }
 
 impl RecordingAdapter {
@@ -267,6 +270,10 @@ impl RecordingAdapter {
             .lock()
             .unwrap()
             .push_back(message_id);
+    }
+
+    fn timeout_pattern(&self, pattern: impl IntoIterator<Item = bool>) {
+        self.inner.timeout_pattern.lock().unwrap().extend(pattern);
     }
 
     fn activations(&self) -> Vec<TransportAccountActivation> {
@@ -308,6 +315,16 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
+        if self
+            .inner
+            .timeout_pattern
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(false)
+        {
+            return Err(TransportAdapterError::Publish("simulated timeout".into()));
+        }
         let accepted_count = self
             .inner
             .accepted_counts
@@ -343,6 +360,49 @@ impl TransportAdapter for RecordingAdapter {
         Ok(None)
     }
 }
+
+#[derive(Clone)]
+struct MismatchedPendingGroupRouting {
+    wrong_group_id: GroupId,
+    endpoint: TransportEndpoint,
+}
+
+impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
+    fn local_inbox_endpoints(&self) -> Vec<TransportEndpoint> {
+        vec![self.endpoint.clone()]
+    }
+
+    fn key_package_endpoints(&self) -> Vec<TransportEndpoint> {
+        vec![self.endpoint.clone()]
+    }
+
+    fn group_subscriptions(&self) -> Vec<cgka_traits::TransportGroupSubscription> {
+        Vec::new()
+    }
+
+    fn publish_target(
+        &self,
+        message: &TransportMessage,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        let transport_group_id = match &message.envelope {
+            TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
+            TransportEnvelope::Welcome { .. } => {
+                return Err(TransportRoutingError::MissingInboxRoute);
+            }
+        };
+        Ok(TransportPublishTarget::Group {
+            group_id: self.wrong_group_id.clone(),
+            transport_group_id,
+            endpoints: vec![self.endpoint.clone()],
+        })
+    }
+
+    fn required_acks(&self, _target: &TransportPublishTarget) -> usize {
+        1
+    }
+}
+
+include!("runtime/frozen_fanout.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {
@@ -1278,6 +1338,7 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
 
     let adapter = RecordingAdapter::default();
     adapter.accept_next(1);
+    adapter.accept_next(0);
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
             .required_acks(2)
@@ -1334,13 +1395,17 @@ async fn group_evolution_confirms_pending_when_commit_was_partially_exposed() {
     );
 
     let publishes = adapter.publishes();
-    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes.len(), 3);
     assert!(matches!(
         publishes[0].message.envelope,
         TransportEnvelope::GroupMessage { .. }
     ));
     assert!(matches!(
         publishes[1].message.envelope,
+        TransportEnvelope::GroupMessage { .. }
+    ));
+    assert!(matches!(
+        publishes[2].message.envelope,
         TransportEnvelope::Welcome { .. }
     ));
 }
@@ -1504,6 +1569,7 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     // this back; the fix must confirm it.
     let adapter = RecordingAdapter::default();
     adapter.accept_only_next(1);
+    adapter.accept_next(0);
     let alice_id = alice.self_id();
     let policy =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
@@ -1688,4 +1754,83 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         proposal_effects.published_app_messages.is_empty(),
         "proposal reports must not be mislabeled as application publications"
     );
+}
+
+#[tokio::test]
+async fn fanout_staging_failure_rolls_back_pending_mls_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot fanout staging rollback key").unwrap();
+    let mut alice = session(
+        dir.path().join("alice-stage-rollback.sqlite"),
+        &key,
+        b"alice-stage-rollback",
+    );
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "before failed staging".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    let baseline_epoch = alice.epoch(&group_id).unwrap();
+
+    let adapter = RecordingAdapter::default();
+    let routing = MismatchedPendingGroupRouting {
+        wrong_group_id: GroupId::new(b"wrong-pending-group".to_vec()),
+        endpoint: TransportEndpoint("wss://stage-rollback.example".into()),
+    };
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    );
+
+    let error = runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("must roll back".into()),
+            description: None,
+        })
+        .await
+        .expect_err("mismatched pending group must fail fanout staging");
+    assert!(matches!(
+        error,
+        AccountError::Transport(TransportAdapterError::PublishTargetMismatch { .. })
+    ));
+    assert!(
+        adapter.publishes().is_empty(),
+        "staging failure happens before any transport side effect"
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), baseline_epoch);
+    assert_eq!(
+        runtime.session().group_record(&group_id).unwrap().name,
+        "before failed staging",
+        "failed pre-publish staging must roll back the projected group update"
+    );
+
+    // A second commit can stage and reaches the same routing validation,
+    // proving the first pending state did not wedge the group.
+    assert!(matches!(
+        runtime
+            .send(SendIntent::UpdateGroupData {
+                group_id,
+                name: Some("second attempt".into()),
+                description: None,
+            })
+            .await,
+        Err(AccountError::Transport(
+            TransportAdapterError::PublishTargetMismatch { .. }
+        ))
+    ));
 }
