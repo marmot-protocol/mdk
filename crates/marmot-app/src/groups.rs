@@ -34,6 +34,11 @@ use serde::{Deserialize, Serialize};
 use crate::media::{EncryptedMediaVersion, media_imeta_tags_preserve_message};
 use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary, SyncSummary};
 
+/// Operational backstop for malformed or permanently unsettled routing
+/// histories. Normal stable pruning is much tighter because it follows the
+/// protocol's retained-epoch windows.
+const MAX_PRIOR_NOSTR_ROUTES: usize = 32;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRecord {
     pub group_id_hex: String,
@@ -477,12 +482,22 @@ impl AppGroupRecord {
                 .then_with(|| left.nostr_group_id_hex.cmp(&right.nostr_group_id_hex))
                 .then_with(|| left.relays.cmp(&right.relays))
         });
+        let overflow = self
+            .prior_nostr_routes
+            .len()
+            .saturating_sub(MAX_PRIOR_NOSTR_ROUTES);
+        if overflow > 0 {
+            self.prior_nostr_routes.drain(..overflow);
+        }
     }
 
     /// Retire prior routes only after every protocol retention window has
     /// advanced beyond the route's last epoch. Returns whether anything was
     /// retired.
     pub(crate) fn prune_prior_nostr_routes(&mut self, current_epoch: u64) -> bool {
+        // MDK currently runs the protocol-pinned convergence and application
+        // history depths. The only runtime override is settlement timing, so
+        // deriving these two depths from the canonical default is intentional.
         let policy = CanonicalizationPolicy::default();
         let retained_depth = policy
             .convergence
@@ -501,7 +516,15 @@ impl AppGroupRecord {
     ) -> Result<Vec<TransportGroupSubscription>, AppError> {
         let mut subscriptions = vec![self.nostr_routing.subscription(group_id)?];
         for route in &self.prior_nostr_routes {
-            subscriptions.push(route.subscription(group_id)?);
+            match route.subscription(group_id) {
+                Ok(subscription) => subscriptions.push(subscription),
+                Err(_) => tracing::warn!(
+                    target: "marmot_app::groups",
+                    method = "transport_subscriptions",
+                    error_kind = "invalid_prior_nostr_route",
+                    "skipping invalid prior Nostr route",
+                ),
+            }
         }
         Ok(subscriptions)
     }
@@ -743,6 +766,71 @@ mod prior_nostr_route_tests {
         );
         assert_eq!(record.nostr_routing_last_epoch, 6);
     }
+
+    #[test]
+    fn malformed_prior_route_does_not_discard_current_or_valid_history() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://current.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        record.prior_nostr_routes = vec![
+            AppPriorNostrRoute {
+                nostr_group_id_hex: "not-hex".to_owned(),
+                relays: vec!["wss://invalid.example".to_owned()],
+                last_epoch: 1,
+            },
+            AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([2u8; 32]),
+                relays: vec!["wss://prior.example".to_owned()],
+                last_epoch: 1,
+            },
+        ];
+
+        let subscriptions = record
+            .transport_subscriptions(&GroupId::new(vec![1; 16]))
+            .expect("the valid current route remains usable");
+
+        assert_eq!(subscriptions.len(), 2);
+        assert_eq!(subscriptions[0].transport_group_id, vec![1u8; 32]);
+        assert_eq!(subscriptions[1].transport_group_id, vec![2u8; 32]);
+    }
+
+    #[test]
+    fn unsettled_prior_route_history_has_a_fixed_operational_bound() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://one.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+
+        for epoch in 2..=34 {
+            let next_group = group(epoch);
+            record.refresh_from_group(&projection(
+                routing(epoch as u8, "wss://next.example"),
+                &next_group,
+            ));
+        }
+
+        assert_eq!(record.prior_nostr_routes.len(), MAX_PRIOR_NOSTR_ROUTES);
+        assert_eq!(
+            record
+                .prior_nostr_routes
+                .first()
+                .expect("bounded history remains non-empty")
+                .last_epoch,
+            2,
+            "the oldest route is evicted first"
+        );
+    }
 }
 
 impl AppGroupProfileComponent {
@@ -937,9 +1025,20 @@ impl AppGroupNostrRoutingComponent {
         &self,
         group_id: &GroupId,
     ) -> Result<TransportGroupSubscription, AppError> {
+        let transport_group_id = hex::decode(&self.nostr_group_id_hex)?;
+        if transport_group_id.len() != 32 {
+            return Err(AppError::InvalidNostrRouting(
+                "Nostr group id must be 32 bytes".into(),
+            ));
+        }
+        if self.relays.is_empty() {
+            return Err(AppError::InvalidNostrRouting(
+                "Nostr routing relays must not be empty".into(),
+            ));
+        }
         Ok(TransportGroupSubscription {
             group_id: group_id.clone(),
-            transport_group_id: hex::decode(&self.nostr_group_id_hex)?,
+            transport_group_id,
             endpoints: self.relays.iter().cloned().map(TransportEndpoint).collect(),
         })
     }

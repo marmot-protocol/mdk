@@ -3118,3 +3118,43 @@ fn reopening_account_restores_current_and_prior_group_routes() {
         HashSet::from([vec![0x11; 32], vec![0x22; 32]])
     );
 }
+
+#[test]
+fn account_routing_skips_malformed_groups_without_discarding_valid_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    let valid = AppGroupRecord::new(
+        "aa".repeat(16),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0x22; 32], vec!["wss://valid.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "valid".to_owned(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+    let mut malformed_group_id = valid.clone();
+    malformed_group_id.group_id_hex = "not-hex".to_owned();
+    let mut malformed_current_route = valid.clone();
+    malformed_current_route.group_id_hex = "bb".repeat(16);
+    malformed_current_route.nostr_routing.nostr_group_id_hex = "not-hex".to_owned();
+
+    let routes = app
+        .routing_for(&AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![malformed_group_id, malformed_current_route, valid],
+        })
+        .expect("malformed group rows do not prevent account routing")
+        .snapshot()
+        .group_routes;
+
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].transport_group_id, vec![0x22; 32]);
+}

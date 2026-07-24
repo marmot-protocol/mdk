@@ -2253,8 +2253,25 @@ impl MarmotApp {
         let relay_lists = self.account_relay_list_status_for_account_id(&account.account_id_hex)?;
         let mut group_routes = Vec::new();
         for group in &state.groups {
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            group_routes.extend(group.transport_subscriptions(&group_id)?);
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "routing_for",
+                    error_kind = "invalid_persisted_group_id",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            match group.transport_subscriptions(&group_id) {
+                Ok(subscriptions) => group_routes.extend(subscriptions),
+                Err(_) => tracing::warn!(
+                    target: "marmot_app",
+                    method = "routing_for",
+                    error_kind = "invalid_persisted_group_route",
+                    "skipping malformed persisted group route",
+                ),
+            }
         }
 
         Ok(AppTransportRouting::new(AppRoutingState {

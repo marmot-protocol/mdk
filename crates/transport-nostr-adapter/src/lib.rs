@@ -544,9 +544,10 @@ impl TransportAdapter for NostrTransportAdapter {
             activation.inbox_endpoints.clone(),
             inbox_since(activation.since),
         ));
-        let full_backfill_groups = groups_requiring_full_backfill(&activation.group_subscriptions);
+        let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
         for group in &activation.group_subscriptions {
-            let since = if full_backfill_groups.contains(&group.group_id) {
+            let route_key = group_subscription(&account_id, group, None).route_key();
+            let since = if prior_route_keys.contains(&route_key) {
                 None
             } else {
                 activation.since
@@ -1244,11 +1245,13 @@ fn diff_group_subscriptions(
         .iter()
         .map(|group| group_subscription(account_id, group, None))
         .collect::<Vec<_>>();
-    let full_backfill_groups = groups_requiring_full_backfill(desired);
+    let current_prior_keys = prior_group_route_keys(account_id, current);
+    let desired_prior_keys = prior_group_route_keys(account_id, desired);
     let desired_subscriptions = desired
         .iter()
         .map(|group| {
-            let since = if full_backfill_groups.contains(&group.group_id) {
+            let route_key = group_subscription(account_id, group, None).route_key();
+            let since = if desired_prior_keys.contains(&route_key) {
                 None
             } else {
                 since
@@ -1267,7 +1270,12 @@ fn diff_group_subscriptions(
 
     let to_add = desired_subscriptions
         .into_iter()
-        .filter(|subscription| !current_keys.contains(&subscription.route_key()))
+        .filter(|subscription| {
+            let route_key = subscription.route_key();
+            !current_keys.contains(&route_key)
+                || (desired_prior_keys.contains(&route_key)
+                    && !current_prior_keys.contains(&route_key))
+        })
         .collect();
     let to_remove = current_subscriptions
         .into_iter()
@@ -1277,22 +1285,22 @@ fn diff_group_subscriptions(
     (to_add, to_remove)
 }
 
-/// More than one subscription for one MLS group means the caller retained at
-/// least one prior routing address alongside the current address. A global
-/// account cursor cannot safely bound those subscriptions: a delayed event at
-/// the prior address can have a `created_at` older than that cursor. Backfill
-/// every retained address for the group and rely on authenticated event-id
-/// deduplication and the engine's retained-epoch bounds to discard repeats or
-/// stale traffic.
-fn groups_requiring_full_backfill(groups: &[TransportGroupSubscription]) -> HashSet<GroupId> {
-    let mut seen = HashSet::new();
-    let mut repeated = HashSet::new();
+/// Return route keys for retained prior addresses. App routing orders each
+/// group's current signed route first and its retained historical routes
+/// immediately afterward. Only those historical routes need an unbounded
+/// backfill; the current route keeps the account cursor.
+fn prior_group_route_keys(
+    account_id: &MemberId,
+    groups: &[TransportGroupSubscription],
+) -> HashSet<NostrSubscriptionRouteKey> {
+    let mut seen_groups = HashSet::new();
+    let mut prior_route_keys = HashSet::new();
     for group in groups {
-        if !seen.insert(group.group_id.clone()) {
-            repeated.insert(group.group_id.clone());
+        if !seen_groups.insert(group.group_id.clone()) {
+            prior_route_keys.insert(group_subscription(account_id, group, None).route_key());
         }
     }
-    repeated
+    prior_route_keys
 }
 
 fn normalized_endpoints(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpoint> {

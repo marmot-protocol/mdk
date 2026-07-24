@@ -1100,7 +1100,8 @@ async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
 
     // A reopened account carries both the current and retained prior route.
     // The global cursor is deliberately newer than the delayed event below;
-    // retained routes therefore must be subscribed without that cursor.
+    // the retained route therefore must be subscribed without that cursor,
+    // while the already-current route keeps the bounded restart cursor.
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
@@ -1132,7 +1133,10 @@ async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
             NostrSubscription::AccountInbox { .. } => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(group_subscriptions, vec![None, None]);
+    assert_eq!(
+        group_subscriptions,
+        vec![Some(Timestamp(1_800_000_000)), None]
+    );
 
     let delayed = group_event("12", &prior_transport_group_id);
     assert!(
@@ -1156,6 +1160,87 @@ async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
             .expect("delivery is present")
             .group_id_hint,
         Some(group_id)
+    );
+}
+
+#[tokio::test]
+async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_once() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+    let route_a = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![0xC3; 32],
+        endpoints: vec![TransportEndpoint("wss://a.example".into())],
+    };
+    let route_b = TransportGroupSubscription {
+        group_id: group_id.clone(),
+        transport_group_id: vec![0xD4; 32],
+        endpoints: vec![TransportEndpoint("wss://b.example".into())],
+    };
+    let since = Some(Timestamp(1_800_000_000));
+
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![route_a.clone()],
+            since,
+        })
+        .await
+        .expect("initial activation succeeds");
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![route_b.clone(), route_a.clone()],
+            since,
+        })
+        .await
+        .expect("route rotation sync succeeds");
+
+    let issued_after_rotation = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        issued_after_rotation,
+        vec![
+            NostrSubscription::Group {
+                account_id: account_id.clone(),
+                group_id: group_id.clone(),
+                transport_group_id: route_b.transport_group_id.clone(),
+                endpoints: route_b.endpoints.clone(),
+                since,
+            },
+            NostrSubscription::Group {
+                account_id: account_id.clone(),
+                group_id: group_id.clone(),
+                transport_group_id: route_a.transport_group_id.clone(),
+                endpoints: route_a.endpoints.clone(),
+                since: None,
+            },
+        ],
+        "the new current route is bounded while the displaced route is reissued without a cursor"
+    );
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id,
+            group_subscriptions: vec![route_b, route_a],
+            since,
+        })
+        .await
+        .expect("unchanged retained-route sync succeeds");
+    assert_eq!(
+        relay.subscriptions.lock().unwrap().len(),
+        4,
+        "an already-retained route is not repeatedly reissued"
     );
 }
 

@@ -2144,7 +2144,16 @@ impl AppClient {
     pub(crate) fn refresh_group_routes(&mut self) -> Result<bool, AppError> {
         let mut changed = false;
         for group in &mut self.state.groups {
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "refresh_group_routes",
+                    error_kind = "invalid_persisted_group_id",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
             // Retention is epoch-derived, never process-uptime-derived. Do not
             // prune while convergence still has unresolved inputs: the
             // retained anchor is not settled yet, so conservatively keep every
@@ -2157,7 +2166,15 @@ impl AppClient {
             {
                 group.prune_prior_nostr_routes(group_record.epoch.0);
             }
-            let subscriptions = group.transport_subscriptions(&group_id)?;
+            let Ok(subscriptions) = group.transport_subscriptions(&group_id) else {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "refresh_group_routes",
+                    error_kind = "invalid_persisted_group_route",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
             if self.routing.replace_group_routes(&group_id, subscriptions) {
                 changed = true;
             }

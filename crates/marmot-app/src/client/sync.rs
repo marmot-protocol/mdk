@@ -251,8 +251,13 @@ impl AppClient {
     ) -> Result<SyncSummary, AppError> {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
-        self.ingest_delivery(delivery, &display_names, &mut summary)
+        let routes_dirty = self
+            .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.app.save_state(&self.state)?;
         Ok(summary)
     }
@@ -279,6 +284,7 @@ impl AppClient {
         let drain_started = std::time::Instant::now();
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut deliveries: u64 = 0;
+        let mut routes_dirty = false;
 
         loop {
             let wait = if first_wait {
@@ -302,11 +308,16 @@ impl AppClient {
                 continue;
             }
             remember_seen_event(&mut seen, &mut self.state, event_id);
-            self.ingest_delivery(delivery, &display_names, &mut summary)
+            routes_dirty |= self
+                .ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
             deliveries = deliveries.saturating_add(1);
         }
 
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
             deliveries,
@@ -322,7 +333,7 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
@@ -333,15 +344,16 @@ impl AppClient {
         self.remember_pending_convergence_effects(&effects.effects);
         self.remember_transport_cursor(outer_transport_at);
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
-        self.observe_account_device_effects(
-            &effects.effects,
-            display_names,
-            summary,
-            &source_message_id_hex,
-            source_received_at,
-            Some(outer_transport_at),
-        )
-        .await?;
+        let routes_dirty = self
+            .observe_account_device_effects(
+                &effects.effects,
+                display_names,
+                summary,
+                &source_message_id_hex,
+                source_received_at,
+                Some(outer_transport_at),
+            )
+            .await?;
 
         // Publishing here is incidental work triggered by the inbound
         // delivery. A hard publish failure may roll that pending commit back,
@@ -358,7 +370,7 @@ impl AppClient {
                 "incidental auto-publish failed after inbound effects were projected"
             );
         }
-        Ok(())
+        Ok(routes_dirty)
     }
 
     /// Feed an undecryptable group delivery to the epoch-stall detector, arming a
@@ -444,15 +456,20 @@ impl AppClient {
         summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
-        self.observe_account_device_effects(
-            &effects,
-            &display_names,
-            &mut summary,
-            &source_message_id_hex,
-            source_received_at,
-            None,
-        )
-        .await?;
+        let routes_dirty = self
+            .observe_account_device_effects(
+                &effects,
+                &display_names,
+                &mut summary,
+                &source_message_id_hex,
+                source_received_at,
+                None,
+            )
+            .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
         Ok(summary)
@@ -466,7 +483,7 @@ impl AppClient {
         source_message_id_hex: &str,
         source_received_at: u64,
         outer_transport_at: Option<u64>,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
         // the local account leaving / being removed (or, for joins, returning).
@@ -671,17 +688,11 @@ impl AppClient {
                 .messages
                 .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
         }
-        // Reconcile current and still-live prior routes once after the batch
-        // drains; a membership-count change also forces the same single resync.
-        let routes_changed = self.refresh_group_routes()?;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
-        }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
         let system_updates = self.project_group_system_rows(&effects.events, source_received_at);
         summary.projection_updates.extend(system_updates);
-        Ok(())
+        Ok(routes_dirty)
     }
 
     /// Advance the persisted transport cursor from an inbound message —
