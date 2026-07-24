@@ -8,6 +8,7 @@
 //! boundary and remains the source of truth for commit ordering, branch
 //! selection, and application-message validity.
 
+use crate::engine_state::PendingStateRef;
 use crate::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use crate::types::{GroupId, MemberId, MessageId};
 use async_trait::async_trait;
@@ -161,6 +162,312 @@ impl TransportPublishRequest {
             }),
         }
     }
+}
+
+/// Durable first-attempt state for one endpoint in a frozen publish fanout.
+///
+/// `Attempting` is written before the external send. A process that restarts
+/// with an `Attempting` target treats it as outstanding and safely repeats the
+/// same already-signed event bytes. Terminal callbacks are idempotent: once a
+/// target is `Accepted` or `Failed`, later duplicate or contradictory results
+/// do not change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FanoutTargetStatus {
+    NotAttempted,
+    Attempting,
+    Accepted,
+    Failed,
+}
+
+impl FanoutTargetStatus {
+    pub fn is_outstanding(self) -> bool {
+        matches!(self, Self::NotAttempted | Self::Attempting)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !self.is_outstanding()
+    }
+}
+
+/// MLS half of a durable publish obligation.
+///
+/// Standalone application messages/proposals use `NotApplicable`. A group
+/// evolution retains its opaque pending reference until the first endpoint
+/// accepts, then transitions once to `Confirmed`; an all-failed first-attempt
+/// fanout transitions once to `RolledBack`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "pending")]
+pub enum FanoutMlsState {
+    NotApplicable,
+    Pending(PendingStateRef),
+    Confirmed,
+    RolledBack,
+}
+
+/// One durable transport fanout frozen before its first external side effect.
+///
+/// The request owns the exact serialized transport message and original target
+/// set. `target_statuses` is positionally aligned with
+/// `request.target.endpoints()`; construction is centralized in [`stage`] so a
+/// valid record can never have a different status count.
+///
+/// [`stage`]: Self::stage
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundFanout {
+    request: TransportPublishRequest,
+    group_id: Option<GroupId>,
+    target_statuses: Vec<FanoutTargetStatus>,
+    mls_state: FanoutMlsState,
+    created_at_ms: u64,
+}
+
+impl OutboundFanout {
+    pub fn stage(
+        request: TransportPublishRequest,
+        pending: Option<PendingStateRef>,
+        pending_group_id: Option<GroupId>,
+        created_at_ms: u64,
+    ) -> Result<Self, TransportAdapterError> {
+        request.validate_envelope_matches_target()?;
+        let target_group_id = match &request.target {
+            TransportPublishTarget::Group { group_id, .. } => Some(group_id.clone()),
+            TransportPublishTarget::Inbox { .. } => None,
+        };
+        if let (Some(target_group_id), Some(pending_group_id)) =
+            (&target_group_id, &pending_group_id)
+            && target_group_id != pending_group_id
+        {
+            return Err(TransportAdapterError::PublishTargetMismatch {
+                envelope: "pending_group".into(),
+                target: "group".into(),
+            });
+        }
+        let target_count = request.target.endpoints().len();
+        Ok(Self {
+            request,
+            group_id: target_group_id.or(pending_group_id),
+            target_statuses: vec![FanoutTargetStatus::NotAttempted; target_count],
+            mls_state: pending.map_or(FanoutMlsState::NotApplicable, FanoutMlsState::Pending),
+            created_at_ms,
+        })
+    }
+
+    pub fn request(&self) -> &TransportPublishRequest {
+        &self.request
+    }
+
+    pub fn message_id(&self) -> &MessageId {
+        &self.request.message.id
+    }
+
+    pub fn group_id(&self) -> Option<&GroupId> {
+        self.group_id.as_ref()
+    }
+
+    pub fn created_at_ms(&self) -> u64 {
+        self.created_at_ms
+    }
+
+    pub fn target_statuses(&self) -> &[FanoutTargetStatus] {
+        &self.target_statuses
+    }
+
+    pub fn target_status(&self, index: usize) -> Option<FanoutTargetStatus> {
+        self.target_statuses.get(index).copied()
+    }
+
+    pub fn pending_ref(&self) -> Option<PendingStateRef> {
+        match self.mls_state {
+            FanoutMlsState::Pending(pending) => Some(pending),
+            FanoutMlsState::NotApplicable
+            | FanoutMlsState::Confirmed
+            | FanoutMlsState::RolledBack => None,
+        }
+    }
+
+    pub fn mls_state(&self) -> FanoutMlsState {
+        self.mls_state
+    }
+
+    pub fn outstanding_target_indexes(&self) -> Vec<usize> {
+        self.target_statuses
+            .iter()
+            .enumerate()
+            .filter_map(|(index, status)| status.is_outstanding().then_some(index))
+            .collect()
+    }
+
+    /// Persist the send-before-side-effect edge for one target.
+    ///
+    /// Returns `true` only for the first `NotAttempted -> Attempting`
+    /// transition. Re-marking an `Attempting` target after restart is harmless;
+    /// terminal targets remain unchanged.
+    pub fn mark_attempt_started(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
+        let status = self.target_status_mut(index)?;
+        match status {
+            FanoutTargetStatus::NotAttempted => {
+                *status = FanoutTargetStatus::Attempting;
+                Ok(true)
+            }
+            FanoutTargetStatus::Attempting
+            | FanoutTargetStatus::Accepted
+            | FanoutTargetStatus::Failed => Ok(false),
+        }
+    }
+
+    pub fn mark_target_accepted(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
+        self.mark_target_terminal(index, FanoutTargetStatus::Accepted)
+    }
+
+    pub fn mark_target_failed(&mut self, index: usize) -> Result<bool, TransportAdapterError> {
+        self.mark_target_terminal(index, FanoutTargetStatus::Failed)
+    }
+
+    pub fn mark_mls_confirmed(&mut self) -> Result<bool, TransportAdapterError> {
+        match self.mls_state {
+            FanoutMlsState::Pending(_) => {
+                self.mls_state = FanoutMlsState::Confirmed;
+                Ok(true)
+            }
+            FanoutMlsState::Confirmed => Ok(false),
+            FanoutMlsState::NotApplicable | FanoutMlsState::RolledBack => Err(
+                TransportAdapterError::Other("fanout has no confirmable pending MLS state".into()),
+            ),
+        }
+    }
+
+    pub fn mark_mls_rolled_back(&mut self) -> Result<bool, TransportAdapterError> {
+        match self.mls_state {
+            FanoutMlsState::Pending(_) => {
+                self.mls_state = FanoutMlsState::RolledBack;
+                Ok(true)
+            }
+            FanoutMlsState::RolledBack => Ok(false),
+            FanoutMlsState::NotApplicable | FanoutMlsState::Confirmed => Err(
+                TransportAdapterError::Other("fanout has no rollbackable pending MLS state".into()),
+            ),
+        }
+    }
+
+    pub fn outcome(&self) -> OutboundFanoutOutcome {
+        let accepted_targets = self
+            .target_statuses
+            .iter()
+            .filter(|status| **status == FanoutTargetStatus::Accepted)
+            .count();
+        let failed_targets = self
+            .target_statuses
+            .iter()
+            .filter(|status| **status == FanoutTargetStatus::Failed)
+            .count();
+        let outstanding_targets = self
+            .target_statuses
+            .iter()
+            .filter(|status| status.is_outstanding())
+            .count();
+        OutboundFanoutOutcome {
+            message_id: self.request.message.id.clone(),
+            mls_confirmation_required: accepted_targets > 0
+                && matches!(self.mls_state, FanoutMlsState::Pending(_)),
+            mls_confirmed: self.mls_state == FanoutMlsState::Confirmed,
+            fanout_complete: outstanding_targets == 0,
+            accepted_targets,
+            failed_targets,
+            outstanding_targets,
+        }
+    }
+
+    /// Verify that `self` is a monotonic update of an already-durable fanout.
+    ///
+    /// The signed bytes, message id, frozen target set, policy and creation
+    /// time are immutable. Per-target and MLS states may only advance. Storage
+    /// implementations use this guard before replacing the serialized record,
+    /// so a stale callback or regenerated request cannot reopen terminal state
+    /// or silently substitute a new route.
+    pub fn validate_successor_of(&self, previous: &Self) -> Result<(), TransportAdapterError> {
+        let immutable_matches = self.request == previous.request
+            && self.group_id == previous.group_id
+            && self.created_at_ms == previous.created_at_ms
+            && self.target_statuses.len() == previous.target_statuses.len();
+        let targets_advance = immutable_matches
+            && self
+                .target_statuses
+                .iter()
+                .zip(&previous.target_statuses)
+                .all(|(next, prior)| target_status_advances(*prior, *next));
+        let mls_advances = mls_state_advances(previous.mls_state, self.mls_state);
+        if targets_advance && mls_advances {
+            Ok(())
+        } else {
+            Err(TransportAdapterError::Other(
+                "outbound fanout update is not monotonic".into(),
+            ))
+        }
+    }
+
+    fn target_status_mut(
+        &mut self,
+        index: usize,
+    ) -> Result<&mut FanoutTargetStatus, TransportAdapterError> {
+        self.target_statuses.get_mut(index).ok_or_else(|| {
+            TransportAdapterError::Other("fanout target index is out of bounds".into())
+        })
+    }
+
+    fn mark_target_terminal(
+        &mut self,
+        index: usize,
+        terminal: FanoutTargetStatus,
+    ) -> Result<bool, TransportAdapterError> {
+        debug_assert!(terminal.is_terminal());
+        let status = self.target_status_mut(index)?;
+        if status.is_terminal() {
+            return Ok(false);
+        }
+        *status = terminal;
+        Ok(true)
+    }
+}
+
+fn target_status_advances(prior: FanoutTargetStatus, next: FanoutTargetStatus) -> bool {
+    prior == next
+        || matches!(
+            (prior, next),
+            (
+                FanoutTargetStatus::NotAttempted,
+                FanoutTargetStatus::Attempting
+            ) | (
+                FanoutTargetStatus::Attempting,
+                FanoutTargetStatus::Accepted | FanoutTargetStatus::Failed
+            )
+        )
+}
+
+fn mls_state_advances(prior: FanoutMlsState, next: FanoutMlsState) -> bool {
+    prior == next
+        || matches!(
+            (prior, next),
+            (
+                FanoutMlsState::Pending(_),
+                FanoutMlsState::Confirmed | FanoutMlsState::RolledBack
+            )
+        )
+}
+
+/// Privacy-safe caller/audit summary for one frozen fanout.
+///
+/// Counts and lifecycle booleans are exposed separately; relay endpoints are
+/// deliberately absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundFanoutOutcome {
+    pub message_id: MessageId,
+    pub mls_confirmation_required: bool,
+    pub mls_confirmed: bool,
+    pub fanout_complete: bool,
+    pub accepted_targets: usize,
+    pub failed_targets: usize,
+    pub outstanding_targets: usize,
 }
 
 /// Successful endpoint-level publish acknowledgement.
@@ -332,6 +639,123 @@ fn envelope_label(envelope: &TransportEnvelope) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fanout_request() -> TransportPublishRequest {
+        TransportPublishRequest {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            message: TransportMessage {
+                id: MessageId::new(vec![0xB2; 32]),
+                payload: b"exact signed event bytes".to_vec(),
+                timestamp: Timestamp(1_700_000_000),
+                causal_deps: Vec::new(),
+                source: TransportSource("marmot.transport.nostr".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: vec![0xC3; 32],
+                },
+            },
+            target: TransportPublishTarget::Group {
+                group_id: GroupId::new(vec![0xD4; 16]),
+                transport_group_id: vec![0xC3; 32],
+                endpoints: vec![
+                    TransportEndpoint("wss://one.example".into()),
+                    TransportEndpoint("wss://two.example".into()),
+                    TransportEndpoint("wss://three.example".into()),
+                ],
+            },
+            required_acks: 2,
+        }
+    }
+
+    #[test]
+    fn frozen_fanout_first_ack_releases_mls_before_fanout_completes() {
+        let pending = crate::engine_state::PendingStateRef::new(9);
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(pending),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+
+        fanout.mark_attempt_started(1).unwrap();
+        assert!(fanout.mark_target_accepted(1).unwrap());
+
+        let outcome = fanout.outcome();
+        assert!(outcome.mls_confirmation_required);
+        assert!(!outcome.mls_confirmed);
+        assert!(!outcome.fanout_complete);
+        assert_eq!(outcome.accepted_targets, 1);
+        assert_eq!(outcome.outstanding_targets, 2);
+        assert_eq!(fanout.pending_ref(), Some(pending));
+    }
+
+    #[test]
+    fn frozen_fanout_duplicate_and_late_callbacks_are_idempotent() {
+        let pending = crate::engine_state::PendingStateRef::new(9);
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(pending),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+
+        fanout.mark_attempt_started(0).unwrap();
+        assert!(fanout.mark_target_accepted(0).unwrap());
+        fanout.mark_mls_confirmed().unwrap();
+
+        assert!(!fanout.mark_target_accepted(0).unwrap());
+        assert!(!fanout.mark_target_failed(0).unwrap());
+        assert!(fanout.outcome().mls_confirmed);
+        assert_eq!(fanout.outcome().accepted_targets, 1);
+    }
+
+    #[test]
+    fn frozen_fanout_all_fail_is_complete_without_mls_confirmation() {
+        let pending = crate::engine_state::PendingStateRef::new(9);
+        let mut fanout = OutboundFanout::stage(
+            fanout_request(),
+            Some(pending),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+
+        for index in 0..3 {
+            fanout.mark_attempt_started(index).unwrap();
+            assert!(fanout.mark_target_failed(index).unwrap());
+        }
+
+        let outcome = fanout.outcome();
+        assert!(outcome.fanout_complete);
+        assert!(!outcome.mls_confirmation_required);
+        assert!(!outcome.mls_confirmed);
+        assert_eq!(outcome.failed_targets, 3);
+        assert_eq!(outcome.outstanding_targets, 0);
+    }
+
+    #[test]
+    fn frozen_fanout_round_trip_preserves_bytes_id_and_original_targets() {
+        let request = fanout_request();
+        let original_bytes = request.message.payload.clone();
+        let original_id = request.message.id.clone();
+        let original_targets = request.target.endpoints().to_vec();
+        let fanout = OutboundFanout::stage(
+            request,
+            Some(crate::engine_state::PendingStateRef::new(9)),
+            Some(GroupId::new(vec![0xD4; 16])),
+            55,
+        )
+        .unwrap();
+
+        let encoded = serde_json::to_vec(&fanout).unwrap();
+        let restored: OutboundFanout = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(restored.request().message.payload, original_bytes);
+        assert_eq!(restored.request().message.id, original_id);
+        assert_eq!(restored.request().target.endpoints(), original_targets);
+        assert_eq!(restored.outstanding_target_indexes(), vec![0, 1, 2]);
+    }
 
     fn report(accepted: usize, failed: usize, required_acks: usize) -> TransportPublishReport {
         TransportPublishReport {

@@ -25,7 +25,7 @@ use cgka_traits::storage::StorageError;
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{
-    SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
+    OutboundFanout, SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
 };
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportContext, AuditTransportWire, ForensicRecorder,
@@ -556,6 +556,22 @@ impl AccountDeviceSession {
         Ok(effects)
     }
 
+    pub async fn confirm_published_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> SessionResult<SessionEffects> {
+        let event = self
+            .engine
+            .confirm_published_fanout(pending, fanout)
+            .await?;
+        let mut effects = self.collect_effects(vec![]);
+        if !effects.events.contains(&event) {
+            effects.events.insert(0, event);
+        }
+        Ok(effects)
+    }
+
     pub async fn publish_failed(
         &mut self,
         pending: PendingStateRef,
@@ -574,6 +590,15 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![]))
     }
 
+    pub async fn publish_failed_fanout(
+        &mut self,
+        pending: PendingStateRef,
+        fanout: &mut OutboundFanout,
+    ) -> SessionResult<SessionEffects> {
+        self.engine.publish_failed_fanout(pending, fanout).await?;
+        Ok(self.collect_effects(vec![]))
+    }
+
     pub fn drain(&mut self) -> SessionEffects {
         tracing::trace!(
             target: TRACE_TARGET,
@@ -585,6 +610,19 @@ impl AccountDeviceSession {
 
     pub fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError> {
         self.engine.epoch(group_id)
+    }
+
+    pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> SessionResult<()> {
+        self.engine.put_outbound_fanout(fanout)?;
+        Ok(())
+    }
+
+    pub fn outbound_fanouts(&self) -> SessionResult<Vec<OutboundFanout>> {
+        Ok(self.engine.outbound_fanouts()?)
+    }
+
+    pub fn pending_group_id(&self, pending: PendingStateRef) -> SessionResult<GroupId> {
+        Ok(self.engine.pending_group_id(pending)?)
     }
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {

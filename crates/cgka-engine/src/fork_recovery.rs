@@ -91,7 +91,7 @@ impl ForkRecoveryManager {
         Ok(name)
     }
 
-    fn record_pending(
+    pub(crate) fn record_pending(
         &mut self,
         pending: PendingStateRef,
         group_id: GroupId,
@@ -100,6 +100,13 @@ impl ForkRecoveryManager {
         ordering_key: CommitOrderingKey,
         snapshot_name: String,
     ) {
+        if let Some(counter) = snapshot_name
+            .strip_prefix("fork-")
+            .and_then(|suffix| suffix.split('-').nth(1))
+            .and_then(|counter| counter.parse::<u64>().ok())
+        {
+            self.snapshot_counter = self.snapshot_counter.max(counter);
+        }
         self.pending.insert(
             pending,
             CommitRecoveryRecord {
