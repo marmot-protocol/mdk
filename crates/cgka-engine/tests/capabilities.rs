@@ -6,7 +6,8 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, default_group_components,
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    default_group_components,
 };
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel,
@@ -286,6 +287,46 @@ async fn group_creation_retains_non_negotiable_mandatory_components() {
             .required_capabilities
             .app_components
             .contains(TEST_APP_COMPONENT)
+    );
+}
+
+#[tokio::test]
+async fn optional_initial_component_state_is_not_a_membership_requirement() {
+    let mut alice_supported = default_group_components();
+    alice_supported.insert(TEST_APP_COMPONENT);
+    let mut alice = build_engine_with_components(b"alice", alice_supported);
+    let mut bob = build_engine_with_components(b"bob", default_group_components());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let state = vec![0x01, 0x02, 0x03];
+
+    let (group_id, _) = alice
+        .create_group_with_optional_app_components(
+            CreateGroupRequest {
+                name: "optional-state".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            vec![AppComponentData {
+                component_id: TEST_APP_COMPONENT,
+                data: state.clone(),
+            }],
+        )
+        .await
+        .expect("an invitee need not support optional initial state");
+
+    let group = alice.group_record(&group_id).unwrap();
+    assert!(
+        !group
+            .required_capabilities
+            .app_components
+            .contains(TEST_APP_COMPONENT)
+    );
+    assert_eq!(
+        alice.app_component(&group_id, TEST_APP_COMPONENT).unwrap(),
+        Some(state)
     );
 }
 

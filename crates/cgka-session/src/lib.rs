@@ -455,6 +455,13 @@ impl AccountDeviceSession {
             .current_safe_export_epoch(group_id, component_id)
     }
 
+    pub fn constructable_capabilities(
+        &self,
+        key_packages: &[KeyPackage],
+    ) -> Result<cgka_traits::capabilities::GroupCapabilities, EngineError> {
+        self.engine.constructable_capabilities(key_packages)
+    }
+
     pub async fn create_group(
         &mut self,
         req: CreateGroupRequest,
@@ -482,6 +489,16 @@ impl AccountDeviceSession {
         req: CreateGroupRequest,
         context: AuditEventContext,
     ) -> SessionResult<CreateGroupEffects> {
+        self.create_group_with_optional_app_components_and_audit_context(req, Vec::new(), context)
+            .await
+    }
+
+    pub async fn create_group_with_optional_app_components_and_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        context: AuditEventContext,
+    ) -> SessionResult<CreateGroupEffects> {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "create_group_with_audit_context",
@@ -492,7 +509,11 @@ impl AccountDeviceSession {
         );
         let (group_id, result) = self
             .engine
-            .create_group_with_audit_context(req, Some(context))
+            .create_group_with_optional_app_components_and_audit_context(
+                req,
+                optional_app_components,
+                Some(context),
+            )
             .await?;
         tracing::debug!(
             target: TRACE_TARGET,

@@ -50,6 +50,18 @@ impl AccountManager {
         members: &[String],
         description: Option<String>,
     ) -> Result<GroupId, AppError> {
+        self.create_group_with_initial_image(account_ref, name, members, description, None)
+            .await
+    }
+
+    pub async fn create_group_with_initial_image(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        initial_image: Option<crate::AppInitialGroupImage>,
+    ) -> Result<GroupId, AppError> {
         let command = self.worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
         command
@@ -57,6 +69,7 @@ impl AccountManager {
                 name: name.to_owned(),
                 members: members.to_vec(),
                 description,
+                initial_image,
                 respond,
             })
             .await

@@ -170,6 +170,7 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_create_group(
         &mut self,
         req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
     ) -> Result<(GroupId, SendResult), EngineError> {
         // 1. Validate invitees against required capabilities.
         let active_transports: [TransportKind; 0] = []; // engine-layer: no transports
@@ -202,6 +203,24 @@ impl<S: StorageProvider> Engine<S> {
             return Err(EngineError::MissingRequiredCapabilities {
                 required: Box::new(required_caps.clone()),
                 had: Box::new(had),
+            });
+        }
+        let optional_ids = AppComponentSet::new(
+            optional_app_components
+                .iter()
+                .map(|component| component.component_id),
+        );
+        let self_optional_missing = optional_ids.missing_from(&self_supported_components);
+        if !self_optional_missing.is_empty() {
+            return Err(EngineError::MissingRequiredCapabilities {
+                required: Box::new(GroupCapabilities {
+                    app_components: optional_ids,
+                    ..GroupCapabilities::default()
+                }),
+                had: Box::new(GroupCapabilities {
+                    app_components: self_supported_components.clone(),
+                    ..GroupCapabilities::default()
+                }),
             });
         }
 
@@ -322,6 +341,7 @@ impl<S: StorageProvider> Engine<S> {
                 description: req.description.clone(),
                 admins: admin_set,
                 app_components: req.app_components.clone(),
+                optional_app_components,
             },
         )?;
 
