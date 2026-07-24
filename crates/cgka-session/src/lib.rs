@@ -135,8 +135,8 @@ impl SessionConfig {
     }
 
     /// Open a legacy-profile session only to build compatibility fixtures.
-    /// Production account sessions must use the current default.
-    #[doc(hidden)]
+    /// This surface is absent from release builds.
+    #[cfg(debug_assertions)]
     pub fn legacy_compatibility_profile(mut self) -> Self {
         self.protocol_profile = ProtocolProfile::Legacy;
         self.allow_legacy_compatibility_profile = true;
@@ -241,7 +241,7 @@ impl AccountDeviceSession {
             &config.database_key,
             config.storage_options,
         )?;
-        let mut builder = EngineBuilder::new(storage)
+        let builder = EngineBuilder::new(storage)
             .identity(config.identity)
             .account_identity_proof_signer(config.account_identity_proof_signer.ok_or_else(
                 || EngineError::Other("account identity proof signer is required".into()),
@@ -249,9 +249,22 @@ impl AccountDeviceSession {
             .feature_registry(config.feature_registry)
             .supported_app_components(config.supported_app_components.ids)
             .protocol_profile(config.protocol_profile);
-        if config.allow_legacy_compatibility_profile {
-            builder = builder.legacy_compatibility_profile();
-        }
+        #[cfg(debug_assertions)]
+        let builder = if config.allow_legacy_compatibility_profile {
+            builder.legacy_compatibility_profile()
+        } else {
+            builder
+        };
+        #[cfg(not(debug_assertions))]
+        let builder = {
+            if config.allow_legacy_compatibility_profile {
+                return Err(EngineError::Other(
+                    "strict cutover forbids opening a legacy-profile session".into(),
+                )
+                .into());
+            }
+            builder
+        };
         let mut builder = builder.peeler(config.peeler);
         if let Some(recorder) = config.recorder {
             builder = builder.recorder(recorder);

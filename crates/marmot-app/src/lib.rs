@@ -2087,6 +2087,7 @@ impl MarmotApp {
         if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
             session_config = session_config.recorder(recorder);
         }
+        self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
         let session =
             AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
 
@@ -2645,17 +2646,52 @@ impl MarmotApp {
         Ok(key_package)
     }
 
+    fn validated_current_local_key_package(&self, label: &str) -> Option<KeyPackage> {
+        let account = self.account_home().account(label).ok()?;
+        let key_package = self.latest_key_package(label).ok()?;
+        let metadata = key_package_metadata(&key_package).ok()?;
+        (metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && metadata.credential_identity_hex == account.account_id_hex)
+            .then_some(key_package)
+    }
+
+    /// Persist strict-cutover replacement intent before the session layer can
+    /// delete unpublished non-current private bundles during open.
+    fn ensure_strict_cutover_replacement_intent_before_session_open(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        if self.validated_current_local_key_package(label).is_some()
+            || self.key_package_cutover_replacement_pending(label)
+        {
+            return Ok(());
+        }
+        if self.mark_key_package_cutover_replacement_pending(label) {
+            return Ok(());
+        }
+        Err(AppError::Io(std::io::Error::other(
+            "could not persist strict cutover replacement intent before session open",
+        )))
+    }
+
     async fn member_key_package(&self, member_ref: &str) -> Result<KeyPackage, AppError> {
         // Local accounts: cache files are keyed by the account's canonical
         // label, so resolve the ref (which may be an npub or hex pubkey)
         // before looking up the cached key package. Using the raw ref here
         // would miss the file when inviting a local account by npub.
-        if let Ok(account) = self.account_home().account(member_ref) {
-            return self.latest_key_package(&account.label);
+        let local_account = self.account_home().account(member_ref).ok();
+        if let Some(account) = &local_account
+            && let Some(key_package) = self.validated_current_local_key_package(&account.label)
+        {
+            return Ok(key_package);
         }
-        let account_id = PublicKey::parse(member_ref)
-            .map_err(|_| AppError::InvalidPublicKey)?
-            .to_hex();
+        let account_id = if let Some(account) = local_account {
+            account.account_id_hex
+        } else {
+            PublicKey::parse(member_ref)
+                .map_err(|_| AppError::InvalidPublicKey)?
+                .to_hex()
+        };
         if let Some(entry) = self.directory_entry_for_account_id(&account_id)? {
             if let Some(key_package) = entry.key_package {
                 return validated_cached_key_package(&account_id, &key_package);

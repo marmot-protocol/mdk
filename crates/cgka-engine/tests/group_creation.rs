@@ -1552,6 +1552,19 @@ fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam(
     assert!(legacy_error.to_string().contains("strict cutover"));
 }
 
+#[test]
+#[cfg(debug_assertions)]
+fn strict_cutover_compatibility_gate_enables_legacy_fixture_builds() {
+    let engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"fixture-legacy"))
+        .account_identity_proof_signer(proof_signer(b"fixture-legacy"))
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .expect("debug compatibility gate must build legacy fixtures");
+    assert_eq!(engine.new_protocol_profile(), ProtocolProfile::Legacy);
+}
+
 #[tokio::test]
 async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
     let storage = SqliteAccountStorage::in_memory().unwrap();

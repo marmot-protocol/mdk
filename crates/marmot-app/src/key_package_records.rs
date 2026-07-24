@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
 use cgka_traits::engine::KeyPackage;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::{MessageId, TransportEndpoint};
 use nostr::base64::Engine as _;
 use nostr::base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -201,14 +202,18 @@ pub(crate) fn key_package_from_hex_with_optional_source(
     key_package_hex: &str,
     event_id_hex: &str,
 ) -> Result<KeyPackage, AppError> {
+    // After the strict cutover, unannotated local/directory cache records are
+    // candidates only for the current profile. Mark them current before the
+    // decoded proof/profile consistency check; legacy bytes then fail closed
+    // and are replaced instead of being republished or selected for a join.
     let bytes = hex::decode(key_package_hex)?;
     if event_id_hex.is_empty() {
-        return Ok(KeyPackage::new(bytes));
+        return Ok(KeyPackage::new(bytes).with_protocol_profile(ProtocolProfile::Current));
     }
-    Ok(KeyPackage::with_source_event_id(
-        bytes,
-        key_package_event_id_from_hex(event_id_hex)?,
-    ))
+    Ok(
+        KeyPackage::with_source_event_id(bytes, key_package_event_id_from_hex(event_id_hex)?)
+            .with_protocol_profile(ProtocolProfile::Current),
+    )
 }
 
 fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppError> {

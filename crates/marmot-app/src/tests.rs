@@ -73,6 +73,182 @@ async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_re
     assert!(!reopened.key_package_cutover_replacement_pending(label));
 }
 
+#[tokio::test]
+async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    app.ensure_account_state(&account.label).unwrap();
+
+    let summary = app.account_home().account(&account.label).unwrap();
+    let signer = app.account_signer_for_summary(&summary).unwrap();
+    let session_path = app.account_dir(&account.label).join(SESSION_DB_FILE);
+    let keys = app
+        .account_home()
+        .load_signing_keys(&account.label)
+        .unwrap();
+    let session_key = app
+        .sqlcipher_key(
+            &account.label,
+            &keys,
+            &session_path,
+            SqlcipherDatabaseKind::Session,
+        )
+        .unwrap();
+    let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let nostr_signer = signer.as_nostr_signer();
+    let mut legacy_session = AccountDeviceSession::open(
+        SessionConfig::new(
+            &session_path,
+            session_key,
+            account_id.as_slice().to_vec(),
+            Box::new(NostrMlsPeeler::new().with_welcome_signer(nostr_signer)),
+        )
+        .legacy_compatibility_profile()
+        .account_identity_proof_signer(signer.as_proof_signer())
+        .feature_registry(app_feature_registry()),
+    )
+    .unwrap();
+    legacy_session.fresh_key_package().await.unwrap();
+    drop(legacy_session);
+
+    assert!(!app.key_package_record_path(&account.label).exists());
+
+    let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    app.open_account(&account.label, &relay_plane).unwrap();
+    assert!(app.key_package_cutover_replacement_pending(&account.label));
+
+    drop(app);
+    let reopened = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    assert!(
+        reopened.key_package_cutover_replacement_pending(&account.label),
+        "replacement intent must survive restart after session retirement"
+    );
+}
+
+async fn fresh_key_package_for_account(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    legacy: bool,
+) -> KeyPackage {
+    let signer = app.account_signer_for_summary(account).unwrap();
+    let session_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let keys = app
+        .account_home()
+        .load_signing_keys(&account.label)
+        .unwrap();
+    let session_key = app
+        .sqlcipher_key(
+            &account.label,
+            &keys,
+            session_path.as_ref(),
+            SqlcipherDatabaseKind::Session,
+        )
+        .unwrap();
+    let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let mut config = SessionConfig::new(
+        session_path.to_path_buf(),
+        session_key,
+        account_id.as_slice().to_vec(),
+        Box::new(NostrMlsPeeler::new().with_welcome_signer(signer.as_nostr_signer())),
+    )
+    .account_identity_proof_signer(signer.as_proof_signer())
+    .feature_registry(app_feature_registry());
+    if legacy {
+        config = config.legacy_compatibility_profile();
+    }
+    let mut session = AccountDeviceSession::open(config).unwrap();
+    session.fresh_key_package().await.unwrap()
+}
+
+#[tokio::test]
+async fn member_key_package_skips_local_legacy_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let legacy = fresh_key_package_for_account(&app, &account, true).await;
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex.clone(),
+            key_package_id: "legacy-local".into(),
+            key_package_ref_hex: String::new(),
+            key_package_event_id: String::new(),
+            published_at: 1,
+            key_package_hex: hex::encode(legacy.bytes()),
+        },
+    )
+    .unwrap();
+
+    let result = app.member_key_package(&account.label).await;
+    assert!(
+        matches!(
+            result,
+            Err(AppError::MissingKeyPackage(_) | AppError::MissingRelayLists(_))
+        ),
+        "legacy local cache must not be selected for invites; fallback must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn member_key_package_falls_back_to_current_directory_for_local_account() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let legacy = fresh_key_package_for_account(&app, &account, true).await;
+    let current = fresh_key_package_for_account(&app, &account, false).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&current).unwrap();
+    write_json(
+        app.key_package_record_path(&account.label),
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex.clone(),
+            key_package_id: "legacy-local".into(),
+            key_package_ref_hex: String::new(),
+            key_package_event_id: String::new(),
+            published_at: 1,
+            key_package_hex: hex::encode(legacy.bytes()),
+        },
+    )
+    .unwrap();
+    app.save_directory_entry(&UserDirectoryRecord {
+        account_id_hex: account.account_id_hex.clone(),
+        npub: npub_for_account_id_lossy(&account.account_id_hex),
+        local_account: Some(UserDirectoryLocalAccount {
+            label: account.label.clone(),
+            local_signing: true,
+        }),
+        profile: None,
+        follows: Vec::new(),
+        follow_source_relays: Vec::new(),
+        relay_lists: AccountRelayListStatus::empty(),
+        key_package: Some(DirectoryKeyPackage {
+            key_package_id: "current-directory".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex.clone(),
+            key_package_event_id: String::new(),
+            key_package_hex: hex::encode(current.bytes()),
+            created_at: 2,
+            source_relays: Vec::new(),
+        }),
+    })
+    .unwrap();
+
+    let selected = app.member_key_package(&account.label).await.unwrap();
+    let selected_metadata = cgka_engine::key_package::key_package_metadata(&selected).unwrap();
+    assert_eq!(
+        selected_metadata.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Current
+    );
+    assert_eq!(
+        selected_metadata.key_package_ref_hex,
+        metadata.key_package_ref_hex
+    );
+}
+
 #[derive(Clone, Debug)]
 struct TestExternalAccountSigner {
     keys: nostr::Keys,

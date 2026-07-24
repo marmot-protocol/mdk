@@ -317,8 +317,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
     }
 
     /// Construct legacy artifacts only for compatibility fixtures and
-    /// conformance coverage. Production clients must use the current default.
-    #[doc(hidden)]
+    /// conformance coverage. This surface is absent from release builds.
+    #[cfg(debug_assertions)]
     pub fn legacy_compatibility_profile(mut self) -> Self {
         self.new_protocol_profile = ProtocolProfile::Legacy;
         self.allow_legacy_compatibility_profile = true;
