@@ -479,9 +479,9 @@ impl SqliteAccountStorage {
                         image_hash_hex, image_key_hex, image_nonce_hex,
                         image_upload_key_hex, image_media_type, admin_keys_hex, archived,
                         pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
-                        updated_at
+                        conversation_created_at, updated_at
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
                      ON CONFLICT(group_id_hex) DO UPDATE SET
                         endpoint = excluded.endpoint,
                         profile_name = excluded.profile_name,

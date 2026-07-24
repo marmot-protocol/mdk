@@ -1308,6 +1308,8 @@ mod tests {
             "first_unread_message_id_hex": "m0",
             "last_read_message_id_hex": "r1",
             "last_read_timeline_at": 1_700_000_000_u64,
+            "conversation_created_at": 1_699_999_000_u64,
+            "activity_sort_at": 1_700_000_050_u64,
             "updated_at": 1_700_000_060_u64,
             "self_membership": "Member"
         }))
