@@ -2754,14 +2754,27 @@ fn keys_namespace_uses_account_resolution() {
 }
 
 #[test]
-fn keys_list_reports_no_key_packages_without_faking_a_fetch_error() {
+fn keys_list_reports_startup_published_key_package() {
     let home = tempfile::tempdir().expect("tempdir");
 
     let account_id = create_account(home.path());
 
     let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
     assert_eq!(listed["account_id"], account_id);
-    assert_eq!(listed["keys"], serde_json::json!([]));
+    let keys = listed["keys"].as_array().expect("keys array");
+    assert_eq!(
+        keys.len(),
+        1,
+        "expected the startup-published key package, got {keys:?}"
+    );
+    assert_eq!(keys[0]["account_id"], account_id);
+    assert!(
+        keys[0]["key_package_event_id"]
+            .as_str()
+            .is_some_and(|event_id| !event_id.is_empty())
+    );
+    assert_eq!(keys[0]["local"], true);
+    assert_eq!(keys[0]["relay"], true);
 }
 
 #[test]
@@ -5823,30 +5836,6 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
     assert!(
         saw_group,
         "daemon runtime subscriptions did not join Bob to the group"
-    );
-}
-
-#[test]
-fn missing_key_package_errors_include_repair_guidance() {
-    let home = tempfile::tempdir().expect("tempdir");
-
-    let alice = create_account(home.path());
-    let bob = create_account(home.path());
-
-    let error = run_json_error(
-        home.path(),
-        &["--account", &alice, "group", "create", "general", &bob],
-    );
-
-    assert_eq!(error["code"], "missing_key_package");
-    assert_eq!(error["account_id"], bob);
-    assert_eq!(
-        error["repair"]["local"],
-        format!("wn --account {bob} keys publish")
-    );
-    assert_eq!(
-        error["repair"]["remote"],
-        "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
     );
 }
 

@@ -637,3 +637,25 @@ fn engine_error_json(err: &EngineError) -> Value {
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_key_package_errors_include_repair_guidance() {
+        let account = "11".repeat(32);
+        let error = wn_error_json(&WnError::App(AppError::MissingKeyPackage(account.clone())));
+
+        assert_eq!(error["code"], "missing_key_package");
+        assert_eq!(error["account_id"], account);
+        assert_eq!(
+            error["repair"]["local"],
+            format!("wn --account {account} keys publish")
+        );
+        assert_eq!(
+            error["repair"]["remote"],
+            "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+        );
+    }
+}

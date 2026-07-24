@@ -2228,13 +2228,16 @@ impl MarmotApp {
                 return true;
             }
         };
-        let is_current = hex::decode(&record.key_package_hex)
-            .ok()
-            .map(KeyPackage::new)
-            .and_then(|key_package| key_package_metadata(&key_package).ok())
-            .is_some_and(|metadata| {
-                metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
-            });
+        let is_current = key_package_from_hex_with_optional_source(
+            &record.key_package_hex,
+            &record.key_package_event_id,
+        )
+        .ok()
+        .and_then(|key_package| key_package_metadata(&key_package).ok())
+        .is_some_and(|metadata| {
+            metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+                && metadata.credential_identity_hex == record.account_id_hex
+        });
         if is_current {
             return false;
         }

@@ -74,6 +74,38 @@ async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_re
 }
 
 #[tokio::test]
+async fn key_package_cutover_retains_current_cache_without_scheduling_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("current-cache").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let current = fresh_key_package_for_account(&app, &account, false).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&current).unwrap();
+    let record_path = app.key_package_record_path(&account.label);
+    write_json(
+        &record_path,
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "current-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: String::new(),
+            published_at: 1,
+            key_package_hex: hex::encode(current.bytes()),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !app.retire_cached_non_current_key_package(&account.label)
+            .await,
+        "current cache must not enter the strict cutover replacement path"
+    );
+    assert!(record_path.exists());
+    assert!(!app.key_package_cutover_replacement_pending(&account.label));
+}
+
+#[tokio::test]
 async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
