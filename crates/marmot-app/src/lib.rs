@@ -139,8 +139,7 @@ pub use groups::{
     AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
     AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
     AppGroupSystemEvent, AppInitialGroupImage, AppPriorNostrRoute, AppProtocolProfile,
-    AppQuarantinedGroup,
-    group_system_event_from_message,
+    AppQuarantinedGroup, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,

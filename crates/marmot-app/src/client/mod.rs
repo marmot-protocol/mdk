@@ -324,13 +324,7 @@ impl AppClient {
                 Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
                     let upload =
                         upload_group_image(&image.plaintext, &image.media_type, None).await?;
-                    let input = AppGroupImageInput {
-                        image_hash_hex: upload.image_hash_hex,
-                        image_key_hex: upload.image_key_hex,
-                        image_nonce_hex: upload.image_nonce_hex,
-                        image_upload_key_hex: upload.image_upload_key_hex,
-                        media_type: Some(upload.media_type),
-                    };
+                    let input = AppGroupImageInput::from(upload);
                     optional_app_components.push(AppComponentData {
                         component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
                         data: hex::decode(AppGroupImageComponent::new(input).data_hex)?,
@@ -1670,13 +1664,7 @@ impl AppClient {
             AppGroupImageInput::default()
         } else {
             let upload = upload_group_image(&plaintext, media_type, None).await?;
-            AppGroupImageInput {
-                image_hash_hex: upload.image_hash_hex,
-                image_key_hex: upload.image_key_hex,
-                image_nonce_hex: upload.image_nonce_hex,
-                image_upload_key_hex: upload.image_upload_key_hex,
-                media_type: Some(upload.media_type),
-            }
+            AppGroupImageInput::from(upload)
         };
         let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
         let effects = self
