@@ -79,10 +79,10 @@ impl GroupMessageMetadata {
         if *retention_seconds == 0 {
             return Ok(None);
         }
-        inner_created_at
-            .checked_add(*retention_seconds)
-            .map(Some)
-            .ok_or(GroupMessageMetadataError::ExpirationTimestampOverflow)
+        // Expiration is only a transport hint. If the sum is not
+        // representable, the hint is undefined and must be omitted without
+        // rejecting the otherwise-valid application message.
+        Ok(inner_created_at.checked_add(*retention_seconds))
     }
 }
 
