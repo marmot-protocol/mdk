@@ -40,6 +40,7 @@ pub(crate) fn sample_group(id: GroupId, epoch: u64, members: usize) -> Group {
         required_capabilities: GroupCapabilities::default(),
         protocol_profile: ProtocolProfile::Legacy,
         removed: false,
+        unrecoverable: false,
         join_epoch: EpochId(0),
     }
 }

@@ -1144,7 +1144,15 @@ impl<S: StorageProvider> Engine<S> {
         // hydration read and validation above has succeeded. If a later step
         // quarantines the group, neither runtime fanout resumption nor direct
         // pending access may observe a half-hydrated lifecycle.
-        if let Some((pending_ref, prior_epoch, message_id, ordering_key, snapshot_name)) =
+        // mdk#971: a durable Unrecoverable halt must survive process restart.
+        // Do not restore PendingPublish or silently `set_stable` over an
+        // unrepaired base — keep ingest/convergence blocked until a verified
+        // repair path clears the marker.
+        let (hydrate_state, hydrate_reason) = if group.unrecoverable {
+            self.epoch_manager
+                .restore_unrecoverable(group_id.clone(), group.epoch);
+            ("unrecoverable", "hydrate_unrecoverable_group")
+        } else if let Some((pending_ref, prior_epoch, message_id, ordering_key, snapshot_name)) =
             pending_recovery
         {
             self.epoch_manager
@@ -1165,10 +1173,11 @@ impl<S: StorageProvider> Engine<S> {
                 ordering_key,
                 snapshot_name,
             );
+            ("pending_publish", "hydrate_stable_group")
         } else {
             self.epoch_manager.set_stable(group_id.clone(), group.epoch);
-        }
-
+            ("stable", "hydrate_stable_group")
+        };
         if let Some(request) = leave_request {
             self.leave_requests.insert(group_id.clone(), request);
             self.leaving_groups.insert(group_id.clone());
@@ -1185,18 +1194,14 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 None,
-                if restored_pending {
-                    "pending_publish"
-                } else {
-                    "stable"
-                },
+                hydrate_state,
                 group.epoch,
-                "hydrate_stable_group",
+                hydrate_reason,
                 None,
                 None,
             ),
         );
-        self.audit_group_context(group_id, "hydrate_stable_group");
+        self.audit_group_context(group_id, hydrate_reason);
 
         if has_queued_intents || has_convergence_inputs {
             self.schedule_pending_convergence_group(group_id);
@@ -1293,6 +1298,31 @@ impl<S: StorageProvider> Engine<S> {
             Err(StorageError::NotFound) => Ok(false),
             Err(err) => Err(EngineError::Storage(err)),
         }
+    }
+
+    /// Ensure a durable `Unrecoverable` halt is reflected in the in-memory
+    /// epoch map (mdk#971). Returns `true` when the group is halted. Used as
+    /// defense-in-depth on paths that may run before or without session-open
+    /// hydration so a persisted marker cannot be skipped by a bare
+    /// `set_stable` overwrite.
+    pub(crate) fn sync_unrecoverable_halt_from_storage(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if self.epoch_manager.is_unrecoverable(group_id) {
+            return Ok(true);
+        }
+        let group = match self.storage.get_group(group_id) {
+            Ok(group) => group,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(err) => return Err(EngineError::Storage(err)),
+        };
+        if !group.unrecoverable {
+            return Ok(false);
+        }
+        self.epoch_manager
+            .restore_unrecoverable(group_id.clone(), group.epoch);
+        Ok(true)
     }
 
     /// Clear ONLY the live OpenMLS group state for `group_id`, leaving every

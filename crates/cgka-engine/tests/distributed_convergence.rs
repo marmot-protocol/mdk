@@ -2678,6 +2678,154 @@ async fn engine_reports_missing_retained_anchor_without_mutating_late_commit() {
 }
 
 #[tokio::test]
+async fn unrecoverable_halt_survives_engine_restart_until_verified_repair() {
+    // mdk#971: Unrecoverable must persist across restart; hydration must not
+    // silently set_stable over an unrepaired base.
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+    let (mut eve, _eve_storage) = build_client(b"eve");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "engine-unrecoverable-restart".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+    carol.set_convergence_policy(CanonicalizationPolicy {
+        convergence: ConvergencePolicy {
+            max_rewind_commits: 1,
+            ..ConvergencePolicy::default()
+        },
+        ..CanonicalizationPolicy::default()
+    });
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let alice_invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+        })
+        .await
+        .unwrap();
+    let (alice_commit, _alice_pending) = evolution(alice_invite);
+    let alice_commit = route(alice_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, alice_commit, 1_000)
+        .expect("alice commit buffered");
+    carol
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("alice branch applies and retains epoch 1 anchor");
+    carol_storage
+        .release_group_snapshot(&group_id, "openmls-retained-anchor-1")
+        .expect("test removes retained anchor");
+
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let bob_invite = bob
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![eve_kp],
+        })
+        .await
+        .unwrap();
+    let (bob_commit, _bob_pending) = evolution(bob_invite);
+    let bob_commit = route(bob_commit, &group_id);
+    carol
+        .buffer_openmls_convergence_message(&group_id, bob_commit.clone(), 2_000)
+        .expect("late bob commit buffered");
+
+    let result = carol
+        .converge_stored_openmls_messages(&group_id, 3_000_000)
+        .expect("missing retained anchor is reported as a local result");
+    assert_eq!(
+        result.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor]
+    );
+    assert!(
+        carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "MissingRetainedAnchor must persist Unrecoverable on the group record"
+    );
+    drop(carol);
+
+    let mut restarted = build_client_with_storage(b"carol", carol_storage.clone());
+    restarted
+        .hydrate_stable_groups_from_storage()
+        .expect("session-open hydration succeeds");
+    assert!(
+        carol_storage.get_group(&group_id).unwrap().unrecoverable,
+        "durable Unrecoverable marker must survive restart"
+    );
+
+    let after_restart = restarted
+        .converge_stored_openmls_messages(&group_id, 4_000_000)
+        .expect("convergence on a restarted unrecoverable group is a no-op result");
+    assert_eq!(
+        after_restart.errors,
+        vec![CanonicalizationError::MissingRetainedAnchor]
+    );
+    assert_eq!(after_restart.convergence_status, ConvergenceStatus::Blocked);
+    assert!(after_restart.selected_tip.is_none());
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&carol_storage, &bob_commit, MessageState::Created);
+    assert!(
+        !restarted
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == eve.self_id())
+    );
+
+    let outcome = restarted
+        .ingest(bob_commit.clone())
+        .await
+        .expect("ingest does not error on a restarted unrecoverable group");
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Buffered { .. } | IngestOutcome::Stale { .. }
+        ),
+        "inbound must stay halted after restart; got {outcome:?}"
+    );
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
+
+    let send_err = restarted
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&restarted, b"must not send while halted"),
+        })
+        .await
+        .expect_err("send must refuse Unrecoverable after restart");
+    assert!(
+        matches!(
+            send_err,
+            cgka_traits::error::EngineError::InvalidTransition(ref t)
+                if t.from == "Unrecoverable"
+        ),
+        "send must report Unrecoverable; got {send_err:?}"
+    );
+}
+
+#[tokio::test]
 async fn engine_prunes_retained_anchor_snapshots_to_rewind_horizon() {
     let (mut alice, _alice_storage) = build_client(b"alice");
     let (mut carol, carol_storage) = build_client(b"carol");

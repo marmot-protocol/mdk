@@ -221,6 +221,17 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
+        // mdk#971: durable Unrecoverable halt — sync into memory and refuse
+        // outbound work until a verified repair path clears the marker.
+        if self.sync_unrecoverable_halt_from_storage(&group_id)? {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "Unrecoverable",
+                    to: crate::audit_helpers::send_intent_kind_str(&intent),
+                    reason: "group is Unrecoverable pending verified repair",
+                },
+            ));
+        }
         if !matches!(intent, SendIntent::Leave { .. }) && self.has_leave_send_gate(&group_id)? {
             return Err(EngineError::InvalidTransition(
                 cgka_traits::engine_state::InvalidTransition {

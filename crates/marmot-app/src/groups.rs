@@ -676,6 +676,7 @@ mod prior_nostr_route_tests {
             required_capabilities: GroupCapabilities::default(),
             protocol_profile: ProtocolProfile::Current,
             removed: false,
+            unrecoverable: false,
             join_epoch: EpochId(0),
         }
     }
@@ -1514,6 +1515,7 @@ mod delete_moderation_grant_tests {
             required_capabilities: Default::default(),
             protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
             removed: false,
+            unrecoverable: false,
             join_epoch: EpochId(0),
         }
     }

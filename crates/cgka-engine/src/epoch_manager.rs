@@ -105,7 +105,18 @@ impl EpochManager {
 
     /// Set a group's state to `Stable { epoch }`. Used by the join-welcome
     /// path (no prior state) and by the merge-to-stable path post-confirm.
+    ///
+    /// Refuses to overwrite `Unrecoverable`: the only legal exit is
+    /// [`Self::repair_to_stable`] after a verified repair path (mdk#971).
     pub(crate) fn set_stable(&mut self, group_id: GroupId, epoch: EpochId) {
+        if self.is_unrecoverable(&group_id) {
+            tracing::warn!(
+                target: "cgka_engine::epoch_manager",
+                method = "set_stable",
+                "refusing set_stable while Unrecoverable; verified repair must use repair_to_stable"
+            );
+            return;
+        }
         self.states.insert(group_id, EpochState::stable(epoch));
     }
 
@@ -335,6 +346,37 @@ impl EpochManager {
             .insert(group_id.clone(), prev.to_unrecoverable());
     }
 
+    /// Restore `Unrecoverable` at a known frozen epoch (session-open hydration
+    /// of a durable halt marker). Overwrites any prior in-memory state for the
+    /// group — the persisted marker is authoritative across restart (mdk#971).
+    pub(crate) fn restore_unrecoverable(&mut self, group_id: GroupId, last_stable_epoch: EpochId) {
+        self.states.insert(
+            group_id,
+            EpochState::stable(last_stable_epoch).to_unrecoverable(),
+        );
+    }
+
+    /// `Unrecoverable → Stable` after a verified repair path (authenticated
+    /// re-join welcome). The only legal exit from `Unrecoverable`.
+    pub(crate) fn repair_to_stable(
+        &mut self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<(), EngineError> {
+        // Atomic in the state map (mirrors Sm1): fallible transition before
+        // mutating so a non-Unrecoverable prev cannot orphan the entry.
+        let prev = self
+            .states
+            .get(group_id)
+            .cloned()
+            .unwrap_or_else(|| EpochState::stable(EpochId(0)).to_unrecoverable());
+        let new = prev
+            .repair_to_stable(epoch)
+            .map_err(EngineError::InvalidTransition)?;
+        self.states.insert(group_id.clone(), new);
+        Ok(())
+    }
+
     /// Whether the named group is currently `Unrecoverable`.
     pub(crate) fn is_unrecoverable(&self, group_id: &GroupId) -> bool {
         self.states
@@ -507,5 +549,45 @@ mod tests {
             em.we_committed_from(&group_id, EpochId(7)),
             "rollback must not clear the confirmed incumbent's committed_from entry"
         );
+    }
+
+    /// mdk#971: `set_stable` must not silently clear Unrecoverable.
+    #[test]
+    fn set_stable_refuses_while_unrecoverable() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(4));
+        em.mark_unrecoverable(&group_id);
+        assert!(em.is_unrecoverable(&group_id));
+        em.set_stable(group_id.clone(), EpochId(9));
+        assert!(
+            em.is_unrecoverable(&group_id),
+            "set_stable must leave Unrecoverable intact"
+        );
+        assert_eq!(em.epoch(&group_id), Some(EpochId(4)));
+    }
+
+    /// mdk#971: verified repair is the only Unrecoverable exit.
+    #[test]
+    fn repair_to_stable_exits_unrecoverable() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.restore_unrecoverable(group_id.clone(), EpochId(4));
+        assert!(em.is_unrecoverable(&group_id));
+        em.repair_to_stable(&group_id, EpochId(5))
+            .expect("repair_to_stable from Unrecoverable");
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(5)));
+        assert!(!em.is_unrecoverable(&group_id));
+    }
+
+    #[test]
+    fn repair_to_stable_rejects_non_unrecoverable_without_orphaning() {
+        let mut em = EpochManager::new();
+        let group_id = gid();
+        em.set_stable(group_id.clone(), EpochId(3));
+        assert!(em.repair_to_stable(&group_id, EpochId(4)).is_err());
+        assert_eq!(em.state(&group_id).map(|s| s.name()), Some("Stable"));
+        assert_eq!(em.epoch(&group_id), Some(EpochId(3)));
     }
 }

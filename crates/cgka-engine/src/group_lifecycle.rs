@@ -467,6 +467,7 @@ impl<S: StorageProvider> Engine<S> {
             required_capabilities: required_caps,
             protocol_profile: self.new_protocol_profile,
             removed: false,
+            unrecoverable: false,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
         if self.new_protocol_profile == ProtocolProfile::Legacy {
@@ -1003,6 +1004,7 @@ impl<S: StorageProvider> Engine<S> {
                         crate::capability_manager::required_capabilities_from_group(&mls_group),
                     protocol_profile,
                     removed: false,
+                    unrecoverable: false,
                     join_epoch: EpochId(mls_group.epoch().as_u64()),
                 };
                 mirror_app_components_into_record(&mls_group, &mut group_record);
@@ -1043,21 +1045,32 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         // 7. State machine: Stable at the post-welcome epoch.
+        // An authenticated Welcome is a verified repair path: if the group was
+        // halted Unrecoverable, exit through `repair_to_stable` rather than a
+        // blind `set_stable` overwrite (mdk#971). The group record written
+        // above already clears the durable `unrecoverable` marker.
         let joined_epoch = EpochId(mls_group.epoch().as_u64());
-        self.epoch_manager
-            .set_stable(group_id.clone(), joined_epoch);
+        let join_reason = if self.epoch_manager.is_unrecoverable(&group_id) {
+            self.epoch_manager
+                .repair_to_stable(&group_id, joined_epoch)?;
+            "join_welcome_repair"
+        } else {
+            self.epoch_manager
+                .set_stable(group_id.clone(), joined_epoch);
+            "join_welcome"
+        };
         self.audit_group(
             &group_id,
             crate::audit_helpers::epoch_state_changed_event(
                 None,
                 "stable",
                 joined_epoch,
-                "join_welcome",
+                join_reason,
                 None,
                 None,
             ),
         );
-        self.audit_group_context(&group_id, "join_welcome");
+        self.audit_group_context(&group_id, join_reason);
 
         // 9. Emit event + register for in-process dedup.
         self.events_buf

@@ -498,6 +498,7 @@ mod tests {
                 required_capabilities: Default::default(),
                 protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
                 removed: false,
+                unrecoverable: false,
                 join_epoch: EpochId(0),
             })
             .unwrap();
