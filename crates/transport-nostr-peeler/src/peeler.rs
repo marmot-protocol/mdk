@@ -841,14 +841,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_wrap_rejects_overflowing_expiration_metadata() {
+    async fn group_wrap_omits_unrepresentable_expiration_metadata() {
         let ctx = GroupContextSnapshot::new(
             EpochId(9),
             HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
             Some(vec![0x99; 32]),
         );
 
-        let err = NostrMlsPeeler::default()
+        let wrapped = NostrMlsPeeler::default()
             .wrap_group_message_with_metadata(
                 &EncryptedPayload {
                     ciphertext: b"inner mls bytes".to_vec(),
@@ -858,9 +858,11 @@ mod tests {
                 &GroupMessageMetadata::application(u64::MAX, Some(1)),
             )
             .await
-            .expect_err("overflow should fail closed");
+            .expect("an optional expiration overflow does not reject the message");
 
-        assert!(matches!(err, PeelerError::WrapFailed(_)));
+        let event = NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+        assert_eq!(event.created_at, u64::MAX);
+        assert_eq!(event.tag_value(EXPIRATION_TAG), None);
     }
 
     #[tokio::test]
