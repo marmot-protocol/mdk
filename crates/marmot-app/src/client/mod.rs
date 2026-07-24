@@ -313,7 +313,20 @@ impl AppClient {
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
-        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
+        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen
+            || self.runtime.maintenance_is_paused()
+        {
+            let active = self
+                .post_join_maintenance_subscriptions
+                .iter()
+                .map(|(group_id, (_, route))| (group_id.clone(), route.clone()))
+                .collect::<Vec<_>>();
+            for (group_id, route) in active {
+                self.adapter
+                    .remove_group_maintenance_subscription(&route)
+                    .await?;
+                self.post_join_maintenance_subscriptions.remove(&group_id);
+            }
             return Ok(());
         }
         let routes = self.routing.snapshot().group_routes;
