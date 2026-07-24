@@ -21,11 +21,11 @@
 //! 4. Hand off to `EpochManager::rollback_publish` for the state-machine
 //!    bookkeeping.
 //!
-//! ### Solo `create_group`
-//! Solo create has no pending commit (no `add_members` was called). Both
-//! confirm + fail are state-machine-only — confirm transitions to Stable
-//! at epoch 0, fail rewinds to Stable at epoch 0 (no-op MLS-side, but the
-//! group record stays around).
+//! ### Founding `create_group`
+//! Current-profile founding creation is completed atomically in
+//! `group_lifecycle::do_create_group` and never enters these confirm/fail
+//! paths. The temporary explicit-legacy path still does: a solo legacy create
+//! has no pending commit, so confirm + fail are state-machine-only at epoch 0.
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;

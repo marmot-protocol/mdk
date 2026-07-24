@@ -182,15 +182,21 @@ pub enum SendResult {
         welcomes: Vec<TransportMessage>,
         pending: PendingStateRef,
     },
-    /// Initial group creation. Only `welcomes` need publishing — there's no
-    /// pre-existing member to consume a commit, so the founding client
-    /// doesn't emit one. The application calls
-    /// [`CgkaEngine::confirm_published`] once every welcome is handed off
-    /// to the transport.
+    /// Legacy-profile initial group creation. Only `welcomes` need publishing;
+    /// the founding commit is staged until the caller resolves `pending`.
+    /// Retained temporarily for explicit legacy-profile compatibility until
+    /// strict creation cutover removes this path.
     GroupCreated {
         welcomes: Vec<TransportMessage>,
         pending: PendingStateRef,
     },
+    /// Current-profile founding creation. The epoch-0 group and its optional
+    /// founding Add are already canonical when this result is returned. No
+    /// normal group message or pending publish handle exists; each Welcome is
+    /// an independent delivery obligation whose failure cannot roll back the
+    /// group. This result alone does not imply any Welcome was delivered:
+    /// callers must publish and acknowledge every entry independently.
+    FoundingGroupCreated { welcomes: Vec<TransportMessage> },
 }
 
 /// Group evolution produced as a side effect of inbound processing.
@@ -626,7 +632,7 @@ pub trait CgkaEngine: Send + Sync {
     /// endpoint. The durable intent remains intact until confirmation.
     fn retry_queued_outbound_intent(&mut self, group_id: &GroupId);
 
-    /// Confirm that a [`SendResult::GroupEvolution`] (or
+    /// Confirm that a [`SendResult::GroupEvolution`] (or legacy-profile
     /// [`SendResult::GroupCreated`]) was successfully published to the
     /// transport. The engine applies the staged commit to local MLS state,
     /// updates Marmot bookkeeping + capability cache, and emits
@@ -646,12 +652,12 @@ pub trait CgkaEngine: Send + Sync {
         pending: PendingStateRef,
     ) -> Result<GroupEvent, EngineError>;
 
-    /// Report that a [`SendResult::GroupEvolution`] (or
-    /// [`SendResult::GroupCreated`]) failed to publish. The engine
-    /// discards the staged commit (`MlsGroup::clear_pending_commit`),
-    /// rewinds Marmot/cache state to its pre-stage shape, and transitions
-    /// back to `Stable` at the prior epoch. The group is immediately
-    /// usable for a fresh `send`.
+    /// Report that a [`SendResult::GroupEvolution`] (or legacy-profile
+    /// [`SendResult::GroupCreated`]) failed to publish. The engine discards
+    /// the staged commit
+    /// (`MlsGroup::clear_pending_commit`), rewinds Marmot/cache state to its
+    /// pre-stage shape, and transitions back to `Stable` at the prior epoch.
+    /// The group is immediately usable for a fresh `send`.
     ///
     /// **Errors.** `UnknownPending` if the ref has already been confirmed,
     /// rolled back, or was never issued.
@@ -660,8 +666,13 @@ pub trait CgkaEngine: Send + Sync {
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     /// Create a new group with the named members (via their KeyPackages) and
-    /// the requested required features. Returns the new `GroupId` and a
-    /// `SendResult::GroupEvolution` carrying the initial welcomes.
+    /// the requested required features.
+    ///
+    /// Current-profile creation returns
+    /// [`SendResult::FoundingGroupCreated`]: the group is already canonical
+    /// locally and the result carries only independently deliverable
+    /// Welcomes. Explicit legacy-profile creation temporarily returns
+    /// [`SendResult::GroupCreated`] with its older pending lifecycle.
     ///
     /// **Validation.** Every invitee's KeyPackage must advertise the union of
     /// capabilities required by `required_features`. On mismatch, returns

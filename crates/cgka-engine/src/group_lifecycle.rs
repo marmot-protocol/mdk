@@ -1,14 +1,12 @@
 //! Group lifecycle — `create_group`, `join_welcome`, etc.
 //!
-//! `do_create_group` uses publish-before-apply: it stages an add-members
-//! commit, wraps welcomes from the staged group, enters `PendingPublish`,
-//! and returns. `Engine::do_confirm_published` merges the MLS commit and
-//! updates Marmot records after the application reports transport success.
-//! `publish_failed` clears the staged commit and rewinds to `Stable`.
-//!
-//! For SOLO create (no invitees) there is no pending commit — the engine
-//! still issues a `PendingStateRef` so the API shape is uniform, but
-//! confirm/fail are state-machine-only no-ops MLS-side.
+//! Current-profile `do_create_group` follows the founding exception to normal
+//! publish-before-apply: epoch 0 and its optional founding Add are made
+//! canonical locally, no ordinary group message is emitted, and the returned
+//! Welcomes are independent delivery obligations. Explicit legacy-profile
+//! creation retains the older staged/pending lifecycle until strict cutover.
+
+use std::collections::BTreeSet;
 
 use crate::capabilities::{
     capabilities_of_key_package, extension_from_group_capabilities, leaf_capabilities,
@@ -27,7 +25,7 @@ use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMet
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use marmot_forensics::AuditEventKind;
@@ -37,6 +35,7 @@ use openmls::prelude::{
     MlsMessageIn, WelcomeError,
 };
 use openmls::treesync::Node;
+use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::types::Ciphersuite;
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as _, Serialize as _};
@@ -99,6 +98,70 @@ pub(crate) const ENCRYPTED_MEDIA_EXPORTER_SNAPSHOT_KEY: &str =
     cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY;
 pub(crate) const AGENT_TEXT_STREAM_EXPORTER_SNAPSHOT_KEY: &str =
     cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
+
+/// Deletes a not-yet-canonical current-profile group if creation returns early
+/// or the async future is cancelled after OpenMLS first persists it.
+///
+/// The final creation transaction disarms this immediately after atomically
+/// merging the optional founding Add, writing the Marmot group record, and
+/// retaining every wrapped Welcome. Until then no caller has received the
+/// group id and no transport work has escaped.
+struct NewGroupCleanupGuard<S: StorageProvider> {
+    storage: *const S,
+    group_id: GroupId,
+    armed: bool,
+}
+
+// SAFETY: `S` is `Send + Sync`; the pointer is dereferenced only from Drop
+// while the guarded `&mut Engine` future (and therefore its storage) is alive.
+unsafe impl<S: StorageProvider> Send for NewGroupCleanupGuard<S> {}
+
+impl<S: StorageProvider> NewGroupCleanupGuard<S> {
+    fn arm(storage: &S, group_id: GroupId) -> Self {
+        Self {
+            storage: storage as *const S,
+            group_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: see the `Send` justification above.
+        let storage = unsafe { &*self.storage };
+        let mls_gid = openmls::group::GroupId::from_slice(self.group_id.as_slice());
+        let cleanup = storage.with_transaction(|storage| {
+            let crypto = openmls_rust_crypto::RustCrypto::default();
+            let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
+            if let Some(mut group) = MlsGroup::load(provider.storage(), &mls_gid)
+                .map_err(|error| StorageError::Backend(format!("load new group: {error:?}")))?
+            {
+                group.delete(provider.storage()).map_err(|error| {
+                    StorageError::Backend(format!("delete new group: {error:?}"))
+                })?;
+            }
+            match storage.delete_group(&self.group_id) {
+                Ok(()) | Err(StorageError::NotFound) => Ok(()),
+                Err(error) => Err(error),
+            }
+        });
+        if cleanup.is_err() {
+            tracing::warn!(
+                target: "cgka_engine::group_lifecycle",
+                method = "new_group_cleanup",
+                "could not remove incomplete current-profile group"
+            );
+        }
+    }
+}
 
 impl<S: StorageProvider> Engine<S> {
     /// Implementation of `CgkaEngine::create_group`.
@@ -294,6 +357,8 @@ impl<S: StorageProvider> Engine<S> {
         })?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let group_id = GroupId::new(mls_group.group_id().as_slice().to_vec());
+        let mut new_group_guard = (self.new_protocol_profile == ProtocolProfile::Current)
+            .then(|| NewGroupCleanupGuard::arm(&self.storage, group_id.clone()));
 
         // Admin-leaf coupling at creation (mdk#737): every admin key MUST
         // correspond to a member of the initial group (creator + invitees).
@@ -331,11 +396,13 @@ impl<S: StorageProvider> Engine<S> {
             let (_commit_out, welcome_out, _group_info) = mls_group
                 .add_members(&provider, &self.identity.signer, &parsed_kps)
                 .map_err(|e| EngineError::Backend(format!("add_members: {e:?}")))?;
-            pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
-                &self.storage,
-                &provider,
-                group_id.clone(),
-            ));
+            if self.new_protocol_profile == ProtocolProfile::Legacy {
+                pending_commit_guard = Some(PendingCommitCleanupGuard::arm(
+                    &self.storage,
+                    &provider,
+                    group_id.clone(),
+                ));
+            }
             let own_leaf_index = mls_group.own_leaf_index();
             let staged = mls_group.pending_commit().ok_or_else(|| {
                 EngineError::Backend("founding add produced no pending commit".into())
@@ -380,16 +447,17 @@ impl<S: StorageProvider> Engine<S> {
             removed: false,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
-        self.storage.put_group(&group_record)?;
-        // #740: index this group's transport routing id for O(1) inbound
-        // resolution (see `Engine::transport_group_id_index`). Best-effort: a
-        // routing-read failure only forfeits the fast path (inbound would fall
-        // through to the unknown-group disposition), never fails creation.
-        if let Ok(transport_group_id) =
-            crate::app_components::transport_group_id_of_group(&mls_group)
-        {
-            self.transport_group_id_index
-                .insert(transport_group_id, group_id.clone());
+        if self.new_protocol_profile == ProtocolProfile::Legacy {
+            self.storage.put_group(&group_record)?;
+            // #740: index this group's transport routing id for O(1) inbound
+            // resolution (see `Engine::transport_group_id_index`). Best-effort:
+            // a routing-read failure only forfeits the fast path.
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                self.transport_group_id_index
+                    .insert(transport_group_id, group_id.clone());
+            }
         }
 
         // 5. Wrap welcomes via the peeler.
@@ -425,9 +493,158 @@ impl<S: StorageProvider> Engine<S> {
                     self.peeler.wrap_welcome(&payload, &recipient).await
                 }
                 .map_err(EngineError::Peeler)?;
-                self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
+                if self.new_protocol_profile == ProtocolProfile::Legacy {
+                    self.record_sent_message(&wrapped, &group_id, EpochId(0))?;
+                }
                 welcomes.push(wrapped);
             }
+        }
+
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            let unique_welcome_ids = welcomes
+                .iter()
+                .map(|welcome| welcome.id.as_slice().to_vec())
+                .collect::<BTreeSet<_>>();
+            if welcomes.len() != parsed_kps.len() || unique_welcome_ids.len() != parsed_kps.len() {
+                return Err(EngineError::Backend(
+                    "founding creation did not produce one distinct Welcome per invitee".into(),
+                ));
+            }
+            // Founding creation has an empty group-message publication
+            // obligation. Atomically make the optional Add canonical together
+            // with the Marmot projection and durable Welcome artifacts before
+            // any caller can attempt transport delivery.
+            let canonical_epoch =
+                self.storage
+                    .with_transaction(|storage| -> Result<EpochId, EngineError> {
+                        if mls_group.pending_commit().is_some() {
+                            // The capability cache validates every added leaf
+                            // against the persisted group's protocol profile.
+                            // Seed the projected record inside this same
+                            // transaction before inspecting the staged Add;
+                            // it is overwritten with the canonical epoch and
+                            // roster after the merge below.
+                            storage.put_group(&group_record)?;
+                            {
+                                let staged = mls_group.pending_commit().ok_or_else(|| {
+                                    EngineError::Backend(
+                                        "founding add lost its pending commit".into(),
+                                    )
+                                })?;
+                                crate::capability_manager::cache_from_staged_commit(
+                                    storage, &group_id, staged,
+                                )?;
+                            }
+                            let tx_provider = EngineOpenMlsProvider::<S>::new(
+                                &self.crypto,
+                                storage.mls_storage(),
+                            );
+                            mls_group
+                                .merge_pending_commit(&tx_provider)
+                                .map_err(|error| {
+                                    EngineError::Backend(format!("merge founding add: {error:?}"))
+                                })?;
+                            crate::app_components::validate_current_profile_group_invariants(
+                                &mls_group,
+                            )?;
+                        }
+
+                        let canonical_epoch = EpochId(mls_group.epoch().as_u64());
+                        let mut canonical_record = group_record.clone();
+                        canonical_record.epoch = canonical_epoch;
+                        canonical_record.members = marmot_members(&mls_group);
+                        storage.put_group(&canonical_record)?;
+
+                        for welcome in &welcomes {
+                            let payload = StoredMessagePayload::outbound_welcome(welcome.clone())
+                                .encode()
+                                .map_err(|error| {
+                                    EngineError::Serialize(format!(
+                                        "encode founding Welcome: {error:?}"
+                                    ))
+                                })?;
+                            storage.put_message(&MessageRecord {
+                                id: welcome.id.clone(),
+                                group_id: group_id.clone(),
+                                epoch: canonical_epoch,
+                                state: MessageState::Sent,
+                                payload,
+                            })?;
+                        }
+                        crate::capability_manager::cache_from_key_packages(
+                            storage,
+                            &group_id,
+                            &parsed_kps,
+                        )?;
+                        crate::capability_manager::cache_self_capabilities(
+                            storage,
+                            &group_id,
+                            &mls_group,
+                            self.identity.self_id(),
+                            self.ciphersuite,
+                        )?;
+                        Ok(canonical_epoch)
+                    })?;
+
+            // The durable creation transaction is complete. From here on,
+            // failure must not delete or roll back the canonical group.
+            new_group_guard
+                .take()
+                .expect("current creation arms cleanup")
+                .disarm();
+            if let Some(guard) = pending_commit_guard.take() {
+                guard.disarm();
+            }
+
+            for welcome in &welcomes {
+                // `Sent` deliberately means "durable outbound obligation",
+                // not "transport delivery completed". Account orchestration
+                // moves an acknowledged Welcome to `Processed`; until then it
+                // remains discoverable after a crash for independent retry.
+                self.sent_message_ids.insert(welcome.id.clone());
+                self.audit_group(
+                    &group_id,
+                    crate::audit_helpers::message_state_transition_event(
+                        hex::encode(welcome.id.as_slice()),
+                        None,
+                        MessageState::Sent,
+                        Some(canonical_epoch),
+                        "founding_welcome_persisted",
+                    ),
+                );
+            }
+            if let Ok(transport_group_id) =
+                crate::app_components::transport_group_id_of_group(&mls_group)
+            {
+                self.transport_group_id_index
+                    .insert(transport_group_id, group_id.clone());
+            }
+            self.epoch_manager
+                .set_stable(group_id.clone(), canonical_epoch);
+            self.audit_group(
+                &group_id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    None,
+                    "stable",
+                    canonical_epoch,
+                    "founding_create",
+                    None,
+                    None,
+                ),
+            );
+            self.events_buf
+                .push_back(cgka_traits::engine::GroupEvent::GroupCreated {
+                    group_id: group_id.clone(),
+                });
+            if let Err(error) = self.retain_current_epoch_snapshot_for_group(&group_id) {
+                tracing::warn!(
+                    target: "cgka_engine::group_lifecycle",
+                    method = "do_create_group",
+                    transient = error.is_transient(),
+                    "deferred founding snapshot retention"
+                );
+            }
+            return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
 
         crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
@@ -654,10 +871,21 @@ impl<S: StorageProvider> Engine<S> {
                 );
 
                 let local_state_is_stale = match storage.get_group(&group_id) {
-                    Ok(group) => !group
-                        .members
-                        .iter()
-                        .any(|member| &member.id == self.identity.self_id()),
+                    Ok(group) => {
+                        if group
+                            .members
+                            .iter()
+                            .any(|member| &member.id == self.identity.self_id())
+                        {
+                            // A distinct transport/content id does not make a
+                            // second normal Welcome for an already-active group
+                            // a rejoin. Reject before OpenMLS staging and let
+                            // the surrounding transaction restore KeyPackage
+                            // consumption and every tentative write.
+                            return Err(EngineError::WelcomeAlreadyProcessed);
+                        }
+                        true
+                    }
                     Err(cgka_traits::storage::StorageError::NotFound) => false,
                     Err(error) => return Err(EngineError::Storage(error)),
                 };

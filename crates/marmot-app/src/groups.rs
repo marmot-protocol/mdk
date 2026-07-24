@@ -1226,6 +1226,10 @@ pub(crate) fn add_group(
 ///   operation is live at its new epoch; unreached endpoints are recoverable
 ///   "ghost member" conditions. Keep the local projection (caller still runs
 ///   `add_group` / `save_state`) and surface a soft warning only.
+/// - a canonical founding create has an immediate `GroupCreated` event and no
+///   pending resolution. If every flat publish failure is paired with a
+///   structured Welcome failure, the group itself succeeded and only its
+///   independently retryable Welcome deliveries remain outstanding.
 /// - failures with no pending resolution at all (e.g. a plain application
 ///   message or proposal publish that never landed): hard error, as before.
 pub(crate) fn fail_if_publish_failed(
@@ -1255,6 +1259,27 @@ pub(crate) fn fail_if_publish_failed(
             failures = effects.failures.len(),
             "publish reached insufficient endpoints but pending state confirmed; \
              treating unreached endpoints as recoverable and keeping local projection"
+        );
+        return Ok(());
+    }
+
+    let canonical_create_with_only_welcome_failures = effects
+        .events
+        .iter()
+        .any(|event| matches!(event, GroupEvent::GroupCreated { .. }))
+        && !effects.welcome_failures.is_empty()
+        && effects.failures.iter().all(|failure| {
+            effects
+                .welcome_failures
+                .iter()
+                .any(|welcome| welcome.message_id == failure.message_id)
+        });
+    if canonical_create_with_only_welcome_failures {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "fail_if_publish_failed",
+            failures = effects.failures.len(),
+            "founding group is canonical but one or more Welcome deliveries remain pending"
         );
         return Ok(());
     }
@@ -1531,9 +1556,11 @@ mod inner_tag_tests {
 #[cfg(test)]
 mod fail_if_publish_failed_tests {
     use super::*;
-    use cgka_traits::MessageId;
     use cgka_traits::engine_state::PendingStateRef;
-    use marmot_account::{AccountDeviceEffects, PendingResolution, PublishFailure};
+    use cgka_traits::{GroupId, MemberId, MessageId};
+    use marmot_account::{
+        AccountDeviceEffects, PendingResolution, PublishFailure, WelcomeDeliveryFailure,
+    };
 
     fn failure(reason: &str) -> PublishFailure {
         PublishFailure {
@@ -1594,6 +1621,47 @@ mod fail_if_publish_failed_tests {
         effects.failures.push(failure("relay rejected"));
         let err = fail_if_publish_failed(&effects).unwrap_err();
         assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    #[test]
+    fn canonical_founding_create_with_only_welcome_failures_is_soft_pass() {
+        let mut effects = AccountDeviceEffects::default();
+        let publish_failure = failure("welcome inbox unavailable");
+        effects.failures.push(publish_failure.clone());
+        effects.events.push(GroupEvent::GroupCreated {
+            group_id: GroupId::new(vec![0xcd; 16]),
+        });
+        effects.welcome_failures.push(WelcomeDeliveryFailure {
+            message_id: publish_failure.message_id,
+            recipient: MemberId::new(vec![0xef; 32]),
+            group_id: Some(GroupId::new(vec![0xcd; 16])),
+            reason: publish_failure.reason,
+        });
+
+        assert!(
+            fail_if_publish_failed(&effects).is_ok(),
+            "canonical group creation must not be reported as failed solely because a Welcome is pending"
+        );
+    }
+
+    #[test]
+    fn group_created_event_does_not_soften_an_unrelated_publish_failure() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("unrelated publish failed"));
+        effects.events.push(GroupEvent::GroupCreated {
+            group_id: GroupId::new(vec![0xcd; 16]),
+        });
+        effects.welcome_failures.push(WelcomeDeliveryFailure {
+            message_id: MessageId::new(vec![0x11; 32]),
+            recipient: MemberId::new(vec![0xef; 32]),
+            group_id: Some(GroupId::new(vec![0xcd; 16])),
+            reason: "different Welcome".into(),
+        });
+
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
     }
 
     // A mixed resolution where any pending rolled back must hard-fail even if

@@ -10,6 +10,7 @@ use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
@@ -135,8 +136,10 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let mut id_material = payload.ciphertext.clone();
+        id_material.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&id_material),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -154,6 +157,25 @@ fn session(
     identity: &[u8],
 ) -> AccountDeviceSession {
     session_with_registry(path, key, identity, FeatureRegistry::new())
+}
+
+fn current_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    identity: &[u8],
+) -> AccountDeviceSession {
+    let keys = deterministic_nostr_keys(identity);
+    AccountDeviceSession::open(
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(identity),
+            Box::new(MockPeeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+        .protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap()
 }
 
 fn session_with_registry(
@@ -780,6 +802,214 @@ async fn create_group_stops_welcome_publish_after_unexposed_failure() {
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 0);
     assert_eq!(runtime.session().members(&group_id).unwrap().len(), 1);
     assert_eq!(adapter.publishes().len(), 1);
+}
+
+#[tokio::test]
+async fn current_founding_welcomes_survive_restart_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot current founding prepare crash key").unwrap();
+    let mut bob_session =
+        current_session(dir.path().join("bob-prepare.sqlite"), &key, b"bob-prepare");
+    let mut carol_session = current_session(
+        dir.path().join("carol-prepare.sqlite"),
+        &key,
+        b"carol-prepare",
+    );
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let carol_kp = carol_session.fresh_key_package().await.unwrap();
+    let alice_path = dir.path().join("alice-prepare.sqlite");
+    let session = current_session(&alice_path, &key, b"alice-prepare");
+    let adapter = RecordingAdapter::default();
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter,
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    );
+
+    let prepared = runtime
+        .session_mut()
+        .create_group(CreateGroupRequest {
+            name: "prepared current founding".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let expected_ids = match &prepared.effects.publish[..] {
+        [PublishWork::FoundingGroupCreated { welcomes }] => welcomes
+            .iter()
+            .map(|welcome| welcome.id.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected founding Welcome work, got {other:?}"),
+    };
+    assert_eq!(expected_ids.len(), 2);
+    drop(runtime);
+
+    let restarted = AccountDeviceRuntime::new(
+        current_session(&alice_path, &key, b"alice-prepare"),
+        RecordingAdapter::default(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+    let mut recovered_ids = restarted
+        .outstanding_welcome_deliveries()
+        .unwrap()
+        .into_iter()
+        .map(|(_, welcome)| welcome.id)
+        .collect::<Vec<_>>();
+    recovered_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut expected_ids = expected_ids;
+    expected_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    assert_eq!(recovered_ids, expected_ids);
+    assert_eq!(
+        restarted.session().epoch(&prepared.group_id).unwrap().0,
+        1,
+        "recovery discovers delivery work without creating or merging the group again"
+    );
+}
+
+#[tokio::test]
+async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot current founding delivery key").unwrap();
+    let mut bob_session = current_session(dir.path().join("bob.sqlite"), &key, b"bob-current");
+    let mut carol_session =
+        current_session(dir.path().join("carol.sqlite"), &key, b"carol-current");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let carol_kp = carol_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+    let carol_id = carol_session.self_id();
+    let alice_path = dir.path().join("alice.sqlite");
+    let session = current_session(&alice_path, &key, b"alice-current");
+    let adapter = RecordingAdapter::default();
+    adapter.accept_next(0);
+    adapter.accept_next(0);
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(
+                bob_id.clone(),
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            )
+            .with_inbox_route(
+                carol_id.clone(),
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+
+    let (group_id, effects) = runtime
+        .create_group(CreateGroupRequest {
+            name: "canonical current founding".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        effects.pending.is_empty(),
+        "founding creation has no transport-gated pending commit"
+    );
+    assert!(matches!(
+        effects.events.as_slice(),
+        [GroupEvent::GroupCreated { group_id: created }] if created == &group_id
+    ));
+    assert_eq!(effects.reports.len(), 2);
+    assert_eq!(effects.failures.len(), 2);
+    assert_eq!(effects.welcome_failures.len(), 2);
+    assert_eq!(adapter.publishes().len(), 2);
+    assert!(
+        adapter
+            .publishes()
+            .iter()
+            .all(|request| matches!(request.message.envelope, TransportEnvelope::Welcome { .. })),
+        "founding creation must not publish an ordinary group commit"
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
+    assert_eq!(runtime.session().members(&group_id).unwrap().len(), 3);
+
+    let mut failed_recipients = effects
+        .welcome_failures
+        .iter()
+        .map(|failure| failure.recipient.clone())
+        .collect::<Vec<_>>();
+    failed_recipients.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut expected_recipients = vec![bob_id.clone(), carol_id.clone()];
+    expected_recipients.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    assert_eq!(failed_recipients, expected_recipients);
+    assert_ne!(
+        effects.welcome_failures[0].message_id, effects.welcome_failures[1].message_id,
+        "each invitee has an independent durable Welcome artifact"
+    );
+    for failure in &effects.welcome_failures {
+        assert_eq!(failure.group_id, Some(group_id.clone()));
+        let (stored_group, stored_welcome) = runtime
+            .session()
+            .stored_sent_welcome(&failure.message_id)
+            .unwrap();
+        assert_eq!(stored_group, group_id);
+        assert_eq!(stored_welcome.id, failure.message_id);
+    }
+    assert_eq!(
+        runtime.outstanding_welcome_deliveries().unwrap().len(),
+        2,
+        "both failed founding Welcomes remain discoverable without in-process failure handles"
+    );
+
+    // Restart before retrying exactly one stored Welcome. It succeeds without
+    // merging or publishing another commit, and leaves the other failed
+    // delivery independently addressable by its own message id.
+    drop(runtime);
+    let restarted_adapter = RecordingAdapter::default();
+    let restarted_policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(
+                bob_id,
+                vec![TransportEndpoint("wss://bob-inbox.example".into())],
+            )
+            .with_inbox_route(
+                carol_id,
+                vec![TransportEndpoint("wss://carol-inbox.example".into())],
+            );
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(&alice_path, &key, b"alice-current"),
+        restarted_adapter.clone(),
+        restarted_policy,
+        RecordingKeyPackages::default(),
+    );
+    let retried = runtime
+        .redeliver_welcome(&effects.welcome_failures[0].message_id)
+        .await
+        .unwrap();
+    assert!(retried.failures.is_empty());
+    assert!(retried.welcome_failures.is_empty());
+    assert_eq!(retried.reports.len(), 1);
+    assert_eq!(adapter.publishes().len(), 2);
+    assert_eq!(restarted_adapter.publishes().len(), 1);
+    assert_eq!(
+        restarted_adapter.publishes()[0].message.id,
+        effects.welcome_failures[0].message_id
+    );
+    let outstanding_after_retry = runtime.outstanding_welcome_deliveries().unwrap();
+    assert_eq!(outstanding_after_retry.len(), 1);
+    assert_eq!(
+        outstanding_after_retry[0].1.id,
+        effects.welcome_failures[1].message_id
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
 }
 
 #[tokio::test]

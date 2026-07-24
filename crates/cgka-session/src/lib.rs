@@ -180,6 +180,9 @@ pub enum PublishWork {
         welcomes: Vec<TransportMessage>,
         pending: PendingStateRef,
     },
+    FoundingGroupCreated {
+        welcomes: Vec<TransportMessage>,
+    },
     AutoPublish {
         msg: TransportMessage,
         pending: PendingStateRef,
@@ -294,6 +297,24 @@ impl AccountDeviceSession {
         id: &MessageId,
     ) -> SessionResult<(GroupId, TransportMessage)> {
         Ok(self.engine.stored_sent_welcome(id)?)
+    }
+
+    /// Retained outbound Welcomes that have not yet met their independent
+    /// delivery policy. This is derived from the engine's transactional
+    /// message store, so it survives a crash before app projection writes.
+    pub fn outstanding_sent_welcomes(&self) -> SessionResult<Vec<(GroupId, TransportMessage)>> {
+        Ok(self.engine.outstanding_sent_welcomes()?)
+    }
+
+    /// IDs of delivery-aware outbound Welcomes, including completed ones.
+    pub fn tracked_outbound_welcome_ids(&self) -> SessionResult<Vec<MessageId>> {
+        Ok(self.engine.tracked_outbound_welcome_ids()?)
+    }
+
+    /// Complete one retained outbound Welcome delivery obligation after the
+    /// transport reports the required acknowledgements.
+    pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.mark_sent_welcome_delivered(id)?)
     }
 
     /// Stored groups that failed session-open hydration and were skipped
@@ -710,6 +731,9 @@ impl AccountDeviceSession {
                 SendResult::GroupCreated { welcomes, pending } => effects
                     .publish
                     .push(PublishWork::GroupCreated { welcomes, pending }),
+                SendResult::FoundingGroupCreated { welcomes } => effects
+                    .publish
+                    .push(PublishWork::FoundingGroupCreated { welcomes }),
                 SendResult::Queued {
                     group_id,
                     intent_id,
@@ -764,7 +788,9 @@ fn send_result_kind(result: &SendResult) -> &'static str {
         SendResult::Queued { .. } => "queued",
         SendResult::Proposal { .. } => "proposal",
         SendResult::GroupEvolution { .. } => "group_evolution",
-        SendResult::GroupCreated { .. } => "group_created",
+        SendResult::GroupCreated { .. } | SendResult::FoundingGroupCreated { .. } => {
+            "group_created"
+        }
     }
 }
 

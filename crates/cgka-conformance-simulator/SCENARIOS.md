@@ -60,10 +60,12 @@ These are the scenarios another implementation should be able to load from JSON 
 ### `current-profile-required-set/v1`
 
 - File: `vectors/current-profile-required-set.v1.json`
-- Setup: Alice creates a current-profile group with Bob and Bob joins from the founding Welcome.
+- Setup: Alice creates a current-profile group with Bob, Bob joins from the founding Welcome, and Bob sends the
+  group’s first application message.
 - Contract: GroupContext requires extension `0x0006`, proposal `0x0008`, and application components `0x8003` and
   `0x8009`; `0x8003` has GroupContext state while `0x8009` is LeafNode-only.
-- Expected: both clients accept the profile, converge at epoch 1, and retain the two-member group.
+- Expected: creation is canonical at epoch 1 without publishing or confirming an ordinary founding commit; both
+  clients retain the two-member group, and Alice receives Bob’s first application message.
 
 ### `admin-policy-update/v1`
 

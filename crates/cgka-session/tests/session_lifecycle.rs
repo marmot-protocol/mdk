@@ -9,6 +9,7 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
 use cgka_traits::error::{EngineError, PeelerError};
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
@@ -120,8 +121,10 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let mut id_material = payload.ciphertext.clone();
+        id_material.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&id_material),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -248,6 +251,84 @@ async fn session_reopens_encrypted_sqlite_group_state() {
     assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
     assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
     assert_eq!(reopened.own_leaf_index(&created.group_id).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn current_founding_creation_is_immediately_stable_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_path = dir.path().join("alice-current.sqlite");
+    let bob_path = dir.path().join("bob-current.sqlite");
+    let key = SqlCipherKey::new("session current founding key").unwrap();
+    let mut alice = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    let mut bob = AccountDeviceSession::open(
+        config(&bob_path, &key, b"bob-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "current-founding".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created.effects.publish.as_slice() {
+        [PublishWork::FoundingGroupCreated { welcomes }] if welcomes.len() == 1 => {
+            welcomes[0].clone()
+        }
+        other => panic!("expected one founding Welcome and no pending commit, got {other:?}"),
+    };
+    assert_eq!(
+        created.effects.events,
+        vec![GroupEvent::GroupCreated {
+            group_id: created.group_id.clone()
+        }]
+    );
+    assert_eq!(alice.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(alice.members(&created.group_id).unwrap().len(), 2);
+    assert_eq!(
+        alice.stored_sent_welcome(&welcome.id).unwrap().0,
+        created.group_id
+    );
+
+    bob.ingest(welcome).await.unwrap();
+    let sent = bob
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&bob, b"invitee first message"),
+        })
+        .await
+        .unwrap();
+    let message = match sent.publish.as_slice() {
+        [PublishWork::ApplicationMessage { msg, .. }] => route(msg.clone(), &created.group_id),
+        other => panic!("expected invitee application publish work, got {other:?}"),
+    };
+    let received = alice.ingest(message).await.unwrap();
+    assert_eq!(
+        received.effects.events,
+        vec![GroupEvent::MessageReceived {
+            group_id: created.group_id.clone(),
+            epoch: EpochId(1),
+            sender: bob.self_id(),
+            payload: app_payload_for(&bob, b"invitee first message"),
+        }]
+    );
+
+    drop(alice);
+    let reopened = AccountDeviceSession::open(
+        config(&alice_path, &key, b"alice-current").protocol_profile(ProtocolProfile::Current),
+    )
+    .unwrap();
+    assert_eq!(reopened.epoch(&created.group_id).unwrap(), EpochId(1));
+    assert_eq!(reopened.members(&created.group_id).unwrap().len(), 2);
 }
 
 #[tokio::test]
