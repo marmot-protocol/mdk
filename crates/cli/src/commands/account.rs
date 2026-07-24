@@ -237,10 +237,14 @@ fn missing_relay_list_status(missing: Vec<MissingRelayListKind>) -> AccountRelay
         nip65: marmot_app::AccountRelayListState {
             kind: 10002,
             relays: Vec::new(),
+            read_relays: Vec::new(),
+            write_relays: Vec::new(),
         },
         inbox: marmot_app::AccountRelayListState {
             kind: 10050,
             relays: Vec::new(),
+            read_relays: Vec::new(),
+            write_relays: Vec::new(),
         },
     }
 }

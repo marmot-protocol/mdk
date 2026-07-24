@@ -21,7 +21,8 @@ use crate::directory::records::{
 };
 use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
-    relay_list_queries, require_key_package_tag, require_multi_value_key_package_tag_matches,
+    relay_list_queries, relay_list_status_from_records, require_key_package_tag,
+    require_multi_value_key_package_tag_matches,
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
@@ -305,6 +306,130 @@ fn nip65_relay_list_targets_only_include_write_capable_entries() {
         vec![
             "wss://both.example".to_owned(),
             "wss://write-only.example".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn newer_all_read_nip65_list_clears_stale_write_targets() {
+    let account_id = "11".repeat(32);
+    let mut older = NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec!["r".into(), "wss://stale-write.example".into()]],
+        String::new(),
+    );
+    older.created_at = 1;
+    older.id = "00".repeat(32);
+    let mut newer = NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec![
+            "r".into(),
+            "wss://read-only.example".into(),
+            "read".into(),
+        ]],
+        String::new(),
+    );
+    newer.created_at = 2;
+    newer.id = "11".repeat(32);
+
+    let status = relay_list_status_from_records(
+        &account_id,
+        vec![
+            crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://source.example".into())],
+                event: newer,
+            },
+            crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://source.example".into())],
+                event: older,
+            },
+        ],
+    );
+
+    assert!(status.nip65.relays.is_empty());
+    assert!(status.nip65.write_relays.is_empty());
+    assert_eq!(status.nip65.read_relays, vec!["wss://read-only.example"]);
+    assert_eq!(
+        status.missing,
+        vec![MissingRelayListKind::Nip65, MissingRelayListKind::Inbox]
+    );
+}
+
+#[test]
+fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_id = "22".repeat(32);
+    let record = |tags| crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://source.example".into())],
+        event: NostrTransportEvent::new_unsigned(
+            account_id.clone(),
+            KIND_NIP65_RELAY_LIST,
+            tags,
+            String::new(),
+        ),
+    };
+
+    app.ingest_directory_relay_event(record(vec![vec![
+        "r".into(),
+        "wss://stale-write.example".into(),
+    ]]))
+    .unwrap();
+    app.ingest_directory_relay_event(record(vec![vec![
+        "r".into(),
+        "wss://read-only.example".into(),
+        "read".into(),
+    ]]))
+    .unwrap();
+
+    let cached = app
+        .directory_entry_for_account_id(&account_id)
+        .unwrap()
+        .expect("cached relay list");
+    assert!(cached.relay_lists.nip65.relays.is_empty());
+    assert!(cached.relay_lists.nip65.write_relays.is_empty());
+    assert_eq!(
+        cached.relay_lists.nip65.read_relays,
+        vec!["wss://read-only.example"]
+    );
+}
+
+#[test]
+fn nip65_setter_round_trip_preserves_existing_roles() {
+    let current = AccountRelayListState {
+        kind: KIND_NIP65_RELAY_LIST,
+        relays: vec!["wss://both.example".into(), "wss://write.example".into()],
+        read_relays: vec!["wss://both.example".into(), "wss://read.example".into()],
+        write_relays: vec!["wss://both.example".into(), "wss://write.example".into()],
+    };
+    let requested = vec![
+        TransportEndpoint("wss://both.example".into()),
+        TransportEndpoint("wss://read.example".into()),
+        TransportEndpoint("wss://write.example".into()),
+        TransportEndpoint("wss://new.example".into()),
+    ];
+
+    let next = nip65_relay_set_preserving_roles(&current, requested);
+
+    assert_eq!(
+        next.read_relays,
+        vec![
+            TransportEndpoint("wss://both.example".into()),
+            TransportEndpoint("wss://read.example".into()),
+            TransportEndpoint("wss://new.example".into()),
+        ]
+    );
+    assert_eq!(
+        next.write_relays,
+        vec![
+            TransportEndpoint("wss://both.example".into()),
+            TransportEndpoint("wss://write.example".into()),
+            TransportEndpoint("wss://new.example".into()),
         ]
     );
 }
