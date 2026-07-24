@@ -238,11 +238,19 @@ fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
         payload: vec![0xAB, 0xCD],
         ..raw.clone()
     };
+    let outbound_welcome = TransportMessage {
+        envelope: TransportEnvelope::Welcome {
+            recipient: MemberId::new(vec![0xDD; 32]),
+        },
+        ..raw.clone()
+    };
 
     let raw_payload = StoredMessagePayload::raw_transport(raw.clone());
+    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome.clone());
     let openmls_payload = StoredMessagePayload::openmls_wire(openmls.clone());
 
     insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
+    insta::assert_json_snapshot!("stored_payload_outbound_welcome", outbound_welcome_payload);
     insta::assert_json_snapshot!("stored_payload_openmls_wire", openmls_payload);
 
     assert_eq!(
@@ -251,6 +259,18 @@ fn stored_message_payload_distinguishes_raw_and_openmls_wire() {
             .as_raw_transport()
             .unwrap()
             .payload,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        StoredMessagePayload::decode(
+            &StoredMessagePayload::outbound_welcome(outbound_welcome)
+                .encode()
+                .unwrap()
+        )
+        .unwrap()
+        .as_outbound_welcome()
+        .unwrap()
+        .payload,
         vec![1, 2, 3]
     );
     assert_eq!(

@@ -556,7 +556,7 @@ impl<S: StorageProvider> Engine<S> {
                         storage.put_group(&canonical_record)?;
 
                         for welcome in &welcomes {
-                            let payload = StoredMessagePayload::raw_transport(welcome.clone())
+                            let payload = StoredMessagePayload::outbound_welcome(welcome.clone())
                                 .encode()
                                 .map_err(|error| {
                                     EngineError::Serialize(format!(
@@ -597,6 +597,10 @@ impl<S: StorageProvider> Engine<S> {
             }
 
             for welcome in &welcomes {
+                // `Sent` deliberately means "durable outbound obligation",
+                // not "transport delivery completed". Account orchestration
+                // moves an acknowledged Welcome to `Processed`; until then it
+                // remains discoverable after a crash for independent retry.
                 self.sent_message_ids.insert(welcome.id.clone());
                 self.audit_group(
                     &group_id,
@@ -867,10 +871,21 @@ impl<S: StorageProvider> Engine<S> {
                 );
 
                 let local_state_is_stale = match storage.get_group(&group_id) {
-                    Ok(group) => !group
-                        .members
-                        .iter()
-                        .any(|member| &member.id == self.identity.self_id()),
+                    Ok(group) => {
+                        if group
+                            .members
+                            .iter()
+                            .any(|member| &member.id == self.identity.self_id())
+                        {
+                            // A distinct transport/content id does not make a
+                            // second normal Welcome for an already-active group
+                            // a rejoin. Reject before OpenMLS staging and let
+                            // the surrounding transaction restore KeyPackage
+                            // consumption and every tentative write.
+                            return Err(EngineError::WelcomeAlreadyProcessed);
+                        }
+                        true
+                    }
                     Err(cgka_traits::storage::StorageError::NotFound) => false,
                     Err(error) => return Err(EngineError::Storage(error)),
                 };

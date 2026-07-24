@@ -224,7 +224,21 @@ impl<S: StorageProvider> Engine<S> {
         state: MessageState,
     ) -> Result<(), EngineError> {
         match self.storage.get_group(group_id) {
-            Ok(_) => self.persist_transport_message(msg, group_id, epoch, state),
+            Ok(_) => {
+                // An own transport echo must not erase the delivery-aware
+                // payload flavor of a retained outbound Welcome. The row is
+                // already durable when its id enters `sent_message_ids`.
+                if self
+                    .storage
+                    .get_message(&msg.id)
+                    .ok()
+                    .and_then(|record| StoredMessagePayload::decode(&record.payload).ok())
+                    .is_some_and(|payload| payload.as_outbound_welcome().is_some())
+                {
+                    return Ok(());
+                }
+                self.persist_transport_message(msg, group_id, epoch, state)
+            }
             Err(StorageError::NotFound) => Ok(()),
             Err(e) => Err(EngineError::Storage(e)),
         }

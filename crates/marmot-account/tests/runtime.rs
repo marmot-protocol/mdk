@@ -805,6 +805,76 @@ async fn create_group_stops_welcome_publish_after_unexposed_failure() {
 }
 
 #[tokio::test]
+async fn current_founding_welcomes_survive_restart_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot current founding prepare crash key").unwrap();
+    let mut bob_session =
+        current_session(dir.path().join("bob-prepare.sqlite"), &key, b"bob-prepare");
+    let mut carol_session = current_session(
+        dir.path().join("carol-prepare.sqlite"),
+        &key,
+        b"carol-prepare",
+    );
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let carol_kp = carol_session.fresh_key_package().await.unwrap();
+    let alice_path = dir.path().join("alice-prepare.sqlite");
+    let session = current_session(&alice_path, &key, b"alice-prepare");
+    let adapter = RecordingAdapter::default();
+    let policy =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter,
+        policy.clone(),
+        RecordingKeyPackages::default(),
+    );
+
+    let prepared = runtime
+        .session_mut()
+        .create_group(CreateGroupRequest {
+            name: "prepared current founding".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let expected_ids = match &prepared.effects.publish[..] {
+        [PublishWork::FoundingGroupCreated { welcomes }] => welcomes
+            .iter()
+            .map(|welcome| welcome.id.clone())
+            .collect::<Vec<_>>(),
+        other => panic!("expected founding Welcome work, got {other:?}"),
+    };
+    assert_eq!(expected_ids.len(), 2);
+    drop(runtime);
+
+    let restarted = AccountDeviceRuntime::new(
+        current_session(&alice_path, &key, b"alice-prepare"),
+        RecordingAdapter::default(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+    let mut recovered_ids = restarted
+        .outstanding_welcome_deliveries()
+        .unwrap()
+        .into_iter()
+        .map(|(_, welcome)| welcome.id)
+        .collect::<Vec<_>>();
+    recovered_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let mut expected_ids = expected_ids;
+    expected_ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    assert_eq!(recovered_ids, expected_ids);
+    assert_eq!(
+        restarted.session().epoch(&prepared.group_id).unwrap().0,
+        1,
+        "recovery discovers delivery work without creating or merging the group again"
+    );
+}
+
+#[tokio::test]
 async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot current founding delivery key").unwrap();
@@ -893,6 +963,11 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
         assert_eq!(stored_group, group_id);
         assert_eq!(stored_welcome.id, failure.message_id);
     }
+    assert_eq!(
+        runtime.outstanding_welcome_deliveries().unwrap().len(),
+        2,
+        "both failed founding Welcomes remain discoverable without in-process failure handles"
+    );
 
     // Restart before retrying exactly one stored Welcome. It succeeds without
     // merging or publishing another commit, and leaves the other failed
@@ -927,6 +1002,12 @@ async fn current_founding_create_keeps_group_when_every_welcome_delivery_fails()
     assert_eq!(
         restarted_adapter.publishes()[0].message.id,
         effects.welcome_failures[0].message_id
+    );
+    let outstanding_after_retry = runtime.outstanding_welcome_deliveries().unwrap();
+    assert_eq!(outstanding_after_retry.len(), 1);
+    assert_eq!(
+        outstanding_after_retry[0].1.id,
+        effects.welcome_failures[1].message_id
     );
     assert_eq!(runtime.session().epoch(&group_id).unwrap().0, 1);
 }

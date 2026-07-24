@@ -227,6 +227,12 @@ impl AppClient {
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
 
+    /// Create a locally canonical group and attempt each founding Welcome.
+    ///
+    /// `Ok(group_id)` reports group creation, not blanket invitation success.
+    /// Any Welcome that misses its acknowledgement policy is reported through
+    /// `WelcomeDeliveryPending` and remains listed by
+    /// [`Self::pending_welcome_deliveries`] for explicit re-delivery.
     pub async fn create_group(
         &mut self,
         name: &str,
@@ -2166,6 +2172,60 @@ impl AppClient {
         Ok(())
     }
 
+    /// Reconcile the app-facing repair index from the engine's authoritative
+    /// retained Welcome obligations.
+    ///
+    /// The engine persists founding Welcomes in the same transaction that
+    /// makes the group canonical. This closes the crash window between
+    /// `prepare_create_group` returning and the app recording its convenience
+    /// index: a cold restart can rebuild missing rows without re-creating the
+    /// group or re-consuming KeyPackages.
+    fn reconcile_pending_welcome_delivery_index(&self) -> Result<(), AppError> {
+        let outstanding = self.runtime.outstanding_welcome_deliveries()?;
+        let tracked_ids = self
+            .runtime
+            .tracked_outbound_welcome_ids()?
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<HashSet<_>>();
+        let storage = self.app.account_storage(&self.state.label)?;
+        let existing = storage.list_pending_welcome_deliveries()?;
+        let outstanding_ids = outstanding
+            .iter()
+            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
+            .collect::<HashSet<_>>();
+
+        for record in &existing {
+            if tracked_ids.contains(&record.message_id_hex)
+                && !outstanding_ids.contains(&record.message_id_hex)
+            {
+                storage.clear_pending_welcome_delivery(&record.message_id_hex)?;
+            }
+        }
+
+        let existing_ids = existing
+            .into_iter()
+            .map(|record| record.message_id_hex)
+            .collect::<HashSet<_>>();
+        let recorded_at = unix_now_seconds();
+        for (group_id, welcome) in outstanding {
+            let TransportEnvelope::Welcome { recipient } = welcome.envelope else {
+                continue;
+            };
+            let message_id_hex = hex::encode(welcome.id.as_slice());
+            if existing_ids.contains(&message_id_hex) {
+                continue;
+            }
+            storage.record_pending_welcome_delivery(
+                &message_id_hex,
+                &hex::encode(group_id.as_slice()),
+                &hex::encode(recipient.as_slice()),
+                recorded_at,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Drain the welcomes queued for re-delivery during the last create/invite,
     /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
     /// (mdk#352).
@@ -2177,6 +2237,7 @@ impl AppClient {
     /// first. Each entry's `message_id_hex` is the handle for
     /// [`AppClient::redeliver_welcome`].
     pub fn pending_welcome_deliveries(&self) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
+        self.reconcile_pending_welcome_delivery_index()?;
         Ok(self
             .app
             .account_storage(&self.state.label)?

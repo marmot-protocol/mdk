@@ -16,7 +16,7 @@ between engine, peeler, storage, and caller imports from here.
 - `EpochState`, `WelcomeState`, `IngestOutcome`, `StaleReason`, `EngineError` — the typed state-machine + error
   vocabulary.
 - `MessageRecord`, `MessageState`, `StoredMessagePayload` — durable message state plus the typed envelope that
-  distinguishes raw transport bytes from peeled OpenMLS wire bytes.
+  distinguishes raw transport bytes, delivery-aware outbound Welcomes, and peeled OpenMLS wire bytes.
 - All cross-boundary value types: `TransportMessage`, `TransportEnvelope`, `TransportAccountActivation`,
   `TransportPublishRequest`, `TransportDelivery`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`,
   `AutoPublish`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
