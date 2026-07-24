@@ -60,7 +60,7 @@ impl Marmot {
             .runtime
             .upload_media(&account_ref, &group_id, request.into())
             .await?;
-        Ok(upload.into())
+        Ok(upload.try_into()?)
     }
 
     /// Fetch an encrypted media blob and decrypt it using the group's

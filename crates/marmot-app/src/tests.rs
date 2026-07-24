@@ -2152,10 +2152,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
     );
 }
 
-#[test]
-fn received_media_message_with_malformed_reference_keeps_the_message() {
-    // A structural malformation (here a bad ciphertext hash) invalidates only
-    // this attachment under the adopted V2 attachment-local rule.
+fn malformed_media_message(version: &str) -> Vec<u8> {
     let mut event = build(AppMessageIntent::Media {
         attachments: vec![MediaAttachmentReference {
             locators: vec![MediaLocator {
@@ -2167,7 +2164,7 @@ fn received_media_message_with_malformed_reference_keeps_the_message() {
             nonce_hex: hex::encode([0x22_u8; 12]),
             file_name: "a.png".to_owned(),
             media_type: "image/png".to_owned(),
-            version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+            version: version.to_owned(),
             source_epoch: 7,
             dim: None,
             thumbhash: None,
@@ -2192,14 +2189,36 @@ fn received_media_message_with_malformed_reference_keeps_the_message() {
         &event.tags,
         &event.content,
     );
-    let bytes = event.encode().unwrap();
+    event.encode().unwrap()
+}
+
+#[test]
+fn received_media_message_with_malformed_v1_reference_is_rejected() {
+    // Frozen V1 made a structurally malformed reference message-fatal. The V2
+    // attachment-local rule must not silently change legacy ingest behavior.
+    let bytes = malformed_media_message(ENCRYPTED_MEDIA_VERSION);
+    let group_id = GroupId::new(vec![0x01]);
+    assert!(
+        groups::decode_received_event(
+            &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+        )
+        .is_none(),
+        "a malformed V1 attachment must retain frozen message-fatal behavior",
+    );
+}
+
+#[test]
+fn received_media_message_with_malformed_v2_reference_keeps_the_message() {
+    // V2 rejects malformed references attachment-locally, preserving the
+    // caption, event, and any valid sibling attachments.
+    let bytes = malformed_media_message(cgka_traits::app_components::ENCRYPTED_MEDIA_FORMAT_V2);
     let group_id = GroupId::new(vec![0x01]);
     assert!(
         groups::decode_received_event(
             &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
         )
         .is_some(),
-        "a malformed attachment is omitted locally; it must not drop its carrying message",
+        "a malformed V2 attachment must not drop its carrying message",
     );
 }
 

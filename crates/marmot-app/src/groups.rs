@@ -19,20 +19,18 @@ use cgka_traits::app_components::{
     encode_encrypted_media_policy_v2, encode_group_avatar_url_v1, encode_nostr_routing_v1,
     encode_quic_varint,
 };
-#[cfg(test)]
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::app_event::{
     GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS,
     GROUP_SYSTEM_DATA_OLD_NAME, GROUP_SYSTEM_DATA_OLD_RETENTION_SECONDS, GROUP_SYSTEM_DATA_SUBJECT,
-    GROUP_SYSTEM_EVENT_VERSION, GroupSystemEvent, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MarmotAppEvent as MarmotInnerEvent,
+    GROUP_SYSTEM_EVENT_VERSION, GroupSystemEvent, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
 use serde::{Deserialize, Serialize};
 
-use crate::media::EncryptedMediaVersion;
+use crate::media::{EncryptedMediaVersion, media_imeta_tags_preserve_message};
 use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary, SyncSummary};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1109,7 +1107,7 @@ pub(crate) fn decode_received_event(
     source_message_id_hex: &str,
     source_received_at: u64,
     outer_transport_at: Option<u64>,
-    _allow_loopback_http: bool,
+    allow_loopback_http: bool,
 ) -> Option<ReceivedMessage> {
     let event = match MarmotInnerEvent::decode(payload) {
         Ok(event) => event,
@@ -1139,11 +1137,20 @@ pub(crate) fn decode_received_event(
             "outer transport timestamp differs materially from authenticated app timestamp",
         );
     }
-    // Inner tags are opaque application content. In particular, malformed
-    // `imeta` is attachment-local under encrypted-media-v2: projections omit
-    // that attachment while retaining the caption, event, and other valid
-    // attachments. Integrity failures for the app event itself were handled
-    // above.
+    // Inner tags are opaque application content except for the frozen
+    // encrypted-media validity rule. V1 made a malformed V1 reference fatal to
+    // its carrying message; V2 changed rejection to attachment-local. Preserve
+    // that version boundary instead of applying V2 behavior to legacy traffic.
+    if event.kind == MARMOT_APP_EVENT_KIND_CHAT
+        && !media_imeta_tags_preserve_message(&event.tags, allow_loopback_http)
+    {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "rejecting MLS application message: structurally invalid encrypted media V1 reference",
+        );
+        return None;
+    }
     Some(ReceivedMessage {
         message_id_hex: event.id,
         source_message_id_hex: source_message_id_hex.to_owned(),
@@ -1217,11 +1224,11 @@ pub(crate) fn observe_event(
             // The MLS layer authenticated `sender`; the inner Nostr-shaped event
             // must (1) carry a valid canonical id and (2) name `sender` as its
             // author. Reject anything that fails either check rather than
-            // rendering an unauthenticated or tampered payload. Media references
-            // are validated structurally only inside `decode_received_event`:
-            // locator-kind policy gates fetchability at download time, never
-            // delivery, so the group's `allowed_locator_kinds` is not consulted
-            // on the ingest path.
+            // rendering an unauthenticated or tampered payload. Media reference
+            // structure is checked inside `decode_received_event` only to retain
+            // frozen V1's message-fatal rule. V2 rejection is attachment-local,
+            // and locator-kind policy gates fetchability at download time rather
+            // than delivery.
             let Some(message) = decode_received_event(
                 payload,
                 &sender_hex,

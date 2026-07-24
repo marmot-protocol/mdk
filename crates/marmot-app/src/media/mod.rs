@@ -717,6 +717,27 @@ pub(crate) fn media_imeta_tags_are_valid(tags: &[Vec<String>], allow_loopback_ht
         .any(|tag| media_attachment_from_imeta_tag(tag, None, allow_loopback_http).is_ok())
 }
 
+/// Whether malformed encrypted-media references may preserve their carrying
+/// app message.
+///
+/// Frozen V1 made structural rejection message-fatal. V2 deliberately changed
+/// that rule to attachment-local rejection. Only tags that explicitly claim
+/// V1 select the legacy behavior; malformed, absent, and future version fields
+/// are invalid references but are not reinterpreted as V1.
+pub(crate) fn media_imeta_tags_preserve_message(
+    tags: &[Vec<String>],
+    allow_loopback_http: bool,
+) -> bool {
+    tags.iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .filter(|tag| {
+            tag.iter().skip(1).any(|field| {
+                field.strip_prefix("v ").map(str::trim) == Some(ENCRYPTED_MEDIA_FORMAT_V1)
+            })
+        })
+        .all(|tag| media_attachment_from_imeta_tag(tag, None, allow_loopback_http).is_ok())
+}
+
 /// Whether `kind` is allowed by the group's `allowed_locator_kinds`. When the
 /// group has no `marmot.group.encrypted-media.v1` component (empty set) the
 /// well-known default of `blossom-v1` applies, matching the policy default and

@@ -1,8 +1,9 @@
 //! Media locator, attachment, upload/download, and media-record FFI conversions.
 
 use marmot_app::{
-    AppMessageRecord, EncryptedMediaVersion, MediaAttachmentReference, MediaDownloadResult,
-    MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest, MediaUploadResult,
+    AppError, AppMessageRecord, EncryptedMediaVersion, MediaAttachmentReference,
+    MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
+    MediaUploadResult,
 };
 
 use super::account::SendSummaryFfi;
@@ -69,22 +70,22 @@ pub struct MediaAttachmentReferenceFfi {
     pub thumbhash: Option<String>,
 }
 
-impl From<MediaAttachmentReference> for MediaAttachmentReferenceFfi {
-    fn from(value: MediaAttachmentReference) -> Self {
-        Self {
+impl TryFrom<MediaAttachmentReference> for MediaAttachmentReferenceFfi {
+    type Error = AppError;
+
+    fn try_from(value: MediaAttachmentReference) -> Result<Self, Self::Error> {
+        Ok(Self {
             locators: value.locators.into_iter().map(Into::into).collect(),
             ciphertext_sha256: value.ciphertext_sha256,
             plaintext_sha256: value.plaintext_sha256,
             nonce_hex: value.nonce_hex,
             file_name: value.file_name,
             media_type: value.media_type,
-            version: EncryptedMediaVersion::parse(&value.version)
-                .expect("validated media reference carries a supported version")
-                .into(),
+            version: EncryptedMediaVersion::parse(&value.version)?.into(),
             source_epoch: value.source_epoch,
             dim: value.dim,
             thumbhash: value.thumbhash,
-        }
+        })
     }
 }
 
@@ -159,19 +160,23 @@ pub struct MediaUploadResultFfi {
     pub sent: Option<SendSummaryFfi>,
 }
 
-impl From<MediaUploadResult> for MediaUploadResultFfi {
-    fn from(value: MediaUploadResult) -> Self {
-        Self {
+impl TryFrom<MediaUploadResult> for MediaUploadResultFfi {
+    type Error = AppError;
+
+    fn try_from(value: MediaUploadResult) -> Result<Self, Self::Error> {
+        Ok(Self {
             attachments: value
                 .attachments
                 .into_iter()
-                .map(|attachment| MediaUploadAttachmentResultFfi {
-                    reference: attachment.reference.into(),
-                    encrypted_size_bytes: attachment.encrypted_size_bytes,
+                .map(|attachment| {
+                    Ok(MediaUploadAttachmentResultFfi {
+                        reference: attachment.reference.try_into()?,
+                        encrypted_size_bytes: attachment.encrypted_size_bytes,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, AppError>>()?,
             sent: value.sent.map(Into::into),
-        }
+        })
     }
 }
 
@@ -215,13 +220,21 @@ pub(crate) fn media_records_ffi(messages: Vec<AppMessageRecord>) -> Vec<MediaRec
             .into_iter()
             .enumerate()
         {
+            let Ok(reference) = MediaAttachmentReferenceFfi::try_from(reference) else {
+                tracing::warn!(
+                    target: "marmot_uniffi::conversions",
+                    method = "media_records_ffi",
+                    "dropping media reference with unsupported version at FFI boundary",
+                );
+                continue;
+            };
             records.push(MediaRecordFfi {
                 message_id_hex: message.message_id_hex.clone(),
                 attachment_index: attachment_index.try_into().unwrap_or(u32::MAX),
                 direction: message.direction.clone(),
                 group_id_hex: message.group_id_hex.clone(),
                 sender: message.sender.clone(),
-                reference: reference.into(),
+                reference,
                 caption: caption.clone(),
                 recorded_at: message.recorded_at,
                 received_at: message.received_at,
@@ -272,7 +285,17 @@ pub(crate) fn timeline_media_references_ffi(
             }
             media_attachment_from_imeta_tag(&tag, source_epoch)
         })
-        .map(Into::into)
+        .filter_map(|reference| {
+            MediaAttachmentReferenceFfi::try_from(reference)
+                .inspect_err(|_| {
+                    tracing::warn!(
+                        target: "marmot_uniffi::conversions",
+                        method = "timeline_media_references_ffi",
+                        "dropping media reference with unsupported version at FFI boundary",
+                    );
+                })
+                .ok()
+        })
         .collect()
 }
 
@@ -491,7 +514,7 @@ mod tests {
         };
 
         let app: MediaAttachmentReference = ffi.clone().into();
-        let round_trip: MediaAttachmentReferenceFfi = app.into();
+        let round_trip = MediaAttachmentReferenceFfi::try_from(app).unwrap();
 
         assert_eq!(round_trip.locators.len(), 1);
         assert_eq!(round_trip.locators[0].kind, "blossom-v1");
@@ -499,5 +522,28 @@ mod tests {
         assert_eq!(round_trip.file_name, "brief.pdf");
         assert_eq!(round_trip.version, EncryptedMediaVersionFfi::V2);
         assert_eq!(round_trip.source_epoch, 42);
+    }
+
+    #[test]
+    fn media_attachment_reference_ffi_rejects_unsupported_internal_version_without_panicking() {
+        let mut app: MediaAttachmentReference = MediaAttachmentReferenceFfi {
+            locators: vec![MediaLocatorFfi {
+                kind: "blossom-v1".to_owned(),
+                value: format!("https://media.example/{}.bin", hex::encode([0x44; 32])),
+            }],
+            ciphertext_sha256: hex::encode([0x44; 32]),
+            plaintext_sha256: hex::encode([0x45; 32]),
+            nonce_hex: hex::encode([0x46; 12]),
+            file_name: "brief.pdf".to_owned(),
+            media_type: "application/pdf".to_owned(),
+            version: EncryptedMediaVersionFfi::V2,
+            source_epoch: 42,
+            dim: None,
+            thumbhash: None,
+        }
+        .into();
+        app.version = "future-media-version".to_owned();
+
+        assert!(MediaAttachmentReferenceFfi::try_from(app).is_err());
     }
 }
