@@ -158,14 +158,15 @@ impl AppClient {
                 // resort.
                 continue;
             }
-            let event =
-                notifications::build_notification_gift_wrap(&server_pubkey_hex, &encrypted_tokens)
-                    .await?;
-            self.app
-                .relay_client_for_endpoints(nostr_signer.clone(), &endpoints)
-                .publish_event(&endpoints, &event, 1)
-                .await
-                .map_err(AppError::Transport)?;
+            for chunk in notifications::notification_trigger_chunks(&encrypted_tokens) {
+                let event =
+                    notifications::build_notification_gift_wrap(&server_pubkey_hex, chunk).await?;
+                self.app
+                    .relay_client_for_endpoints(nostr_signer.clone(), &endpoints)
+                    .publish_event(&endpoints, &event, 1)
+                    .await
+                    .map_err(AppError::Transport)?;
+            }
         }
         Ok(())
     }

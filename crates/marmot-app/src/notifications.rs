@@ -994,6 +994,10 @@ pub fn build_notification_rumor_content(tokens: &[Vec<u8>]) -> Result<String, Ap
     Ok(BASE64_STANDARD.encode(joined))
 }
 
+pub(crate) fn notification_trigger_chunks(tokens: &[Vec<u8>]) -> std::slice::Chunks<'_, Vec<u8>> {
+    tokens.chunks(PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS)
+}
+
 pub async fn build_notification_gift_wrap(
     server_pubkey_hex: &str,
     tokens: &[Vec<u8>],

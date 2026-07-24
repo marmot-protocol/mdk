@@ -254,6 +254,22 @@ fn kind_446_content_is_bounded_to_32_encrypted_tokens() {
     );
 }
 
+#[test]
+fn kind_446_trigger_chunks_split_33_encrypted_tokens() {
+    let tokens =
+        vec![vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN]; PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS + 1];
+    let chunks = notification_trigger_chunks(&tokens).collect::<Vec<_>>();
+    assert_eq!(
+        chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+        vec![PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS, 1]
+    );
+    assert!(
+        chunks
+            .into_iter()
+            .all(|chunk| build_notification_rumor_content(chunk).is_ok())
+    );
+}
+
 #[tokio::test]
 async fn kind_446_rumor_only_carries_version_tag_and_no_routing_metadata() {
     use nostr::nips::nip59::UnwrappedGift;
