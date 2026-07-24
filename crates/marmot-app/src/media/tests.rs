@@ -114,6 +114,25 @@ fn outbound_media_never_crosses_group_version() {
 }
 
 #[test]
+fn checked_v1_builder_rejects_noncanonical_media_type_while_ingest_stays_tolerant() {
+    let mut noncanonical = valid_imeta_tag();
+    noncanonical[6] = "m Image/JPG; charset=utf-8".to_owned();
+    let reference = media_attachment_from_imeta_tag(&noncanonical, Some(1), false)
+        .expect("legacy V1 ingest still accepts a noncanonical m field");
+    assert_eq!(reference.media_type, "Image/JPG; charset=utf-8");
+
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = reference
+        .build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+        .expect_err("checked outbound V1 builder must reject noncanonical m");
+    assert!(
+        err.to_string()
+            .contains("media type is not canonical for encrypted-media-v1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn checked_imeta_builder_preserves_version_and_present_empty_optional_fields() {
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
     let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
@@ -1168,4 +1187,141 @@ async fn limited_body_reader_rejects_chunked_body_over_cap() {
     let err = read_limited_blossom_body(response, 5).await.unwrap_err();
 
     assert!(err.to_string().contains("download exceeds 5 bytes"));
+}
+
+/// Load the shared golden imeta fixture file used by marmot-app, marmot-uniffi,
+/// and wn-cli agreement tests.
+fn shared_media_fixture_cases(file: &str) -> Vec<serde_json::Value> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/encrypted-media")
+        .join(file);
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read media fixture {}: {err}", path.display())),
+    )
+    .expect("media fixture file is valid JSON");
+    doc["cases"].as_array().expect("fixture cases").clone()
+}
+
+fn fixture_tag(case: &serde_json::Value) -> Vec<String> {
+    case["tag"]
+        .as_array()
+        .expect("fixture tag")
+        .iter()
+        .map(|field| field.as_str().expect("fixture tag field").to_owned())
+        .collect()
+}
+
+/// `null`/absent means the optional wire field is absent; `""` (or any string)
+/// means it is present with exactly that value. The distinction is part of the
+/// fixture contract because build -> parse must not collapse it.
+fn fixture_optional(value: &serde_json::Value, key: &str) -> Option<String> {
+    match &value[key] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => panic!("fixture optional field {key} must be null or string, got {other}"),
+    }
+}
+
+fn assert_shared_media_fixture_file(file: &str) {
+    let cases = shared_media_fixture_cases(file);
+    assert!(!cases.is_empty(), "{file} must contain cases");
+    for case in cases {
+        let name = case["name"].as_str().expect("fixture case name");
+        let tag = fixture_tag(&case);
+        let source_epoch = case["source_epoch"].as_u64().expect("fixture source_epoch");
+        let result = media_attachment_from_imeta_tag(&tag, Some(source_epoch), false);
+        if case["valid"].as_bool().expect("fixture valid flag") {
+            let reference = result
+                .unwrap_or_else(|err| panic!("{file}/{name} must parse as a valid tag: {err}"));
+            let expected = &case["expected"];
+            assert_eq!(
+                reference.version,
+                expected["version"].as_str().unwrap(),
+                "{file}/{name} version"
+            );
+            let expected_locators: Vec<MediaLocator> = expected["locators"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|locator| MediaLocator {
+                    kind: locator["kind"].as_str().unwrap().to_owned(),
+                    value: locator["value"].as_str().unwrap().to_owned(),
+                })
+                .collect();
+            assert_eq!(
+                reference.locators, expected_locators,
+                "{file}/{name} locators"
+            );
+            assert_eq!(
+                reference.ciphertext_sha256,
+                expected["ciphertext_sha256"].as_str().unwrap(),
+                "{file}/{name} ciphertext_sha256"
+            );
+            assert_eq!(
+                reference.plaintext_sha256,
+                expected["plaintext_sha256"].as_str().unwrap(),
+                "{file}/{name} plaintext_sha256"
+            );
+            assert_eq!(
+                reference.nonce_hex,
+                expected["nonce_hex"].as_str().unwrap(),
+                "{file}/{name} nonce_hex"
+            );
+            assert_eq!(
+                reference.media_type,
+                expected["media_type"].as_str().unwrap(),
+                "{file}/{name} media_type"
+            );
+            assert_eq!(
+                reference.file_name,
+                expected["file_name"].as_str().unwrap(),
+                "{file}/{name} file_name"
+            );
+            assert_eq!(
+                reference.source_epoch, source_epoch,
+                "{file}/{name} source_epoch"
+            );
+            assert_eq!(
+                reference.dim,
+                fixture_optional(expected, "dim"),
+                "{file}/{name} dim absent-vs-present-empty"
+            );
+            assert_eq!(
+                reference.thumbhash,
+                fixture_optional(expected, "thumbhash"),
+                "{file}/{name} thumbhash absent-vs-present-empty"
+            );
+            // Exact wire round-trip through the checked outbound builder: the
+            // group-version gate and locator policy accept the reference, and
+            // the rebuilt tag is byte-identical to the golden fixture.
+            let version = EncryptedMediaVersion::parse(&reference.version).unwrap();
+            let allowed: Vec<String> = reference
+                .locators
+                .iter()
+                .map(|locator| locator.kind.clone())
+                .collect();
+            let rebuilt = reference
+                .build_imeta_tag(version, &allowed, false)
+                .unwrap_or_else(|err| panic!("{file}/{name} must rebuild: {err}"));
+            assert_eq!(rebuilt, tag, "{file}/{name} exact round-trip");
+        } else {
+            let err = result.expect_err(&format!("{file}/{name} must be rejected"));
+            let needle = case["error_contains"].as_str().expect("error_contains");
+            assert!(
+                err.to_string().contains(needle),
+                "{file}/{name} error must mention {needle:?}, got: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_golden_v1_fixtures_parse_validate_and_round_trip_exactly() {
+    assert_shared_media_fixture_file("imeta-v1.json");
+}
+
+#[test]
+fn shared_golden_v2_fixtures_parse_validate_and_round_trip_exactly() {
+    assert_shared_media_fixture_file("imeta-v2.json");
 }
