@@ -61,12 +61,14 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
         msg_id: &MessageId,
-        raw_msg_id: &MessageId,
+        raw_msg_id: Option<&MessageId>,
         category: ProposalRejectionCategory,
     ) -> Result<IngestOutcome, EngineError> {
         let reason = crate::app_components::proposal_rejection_category_tag(category);
         self.update_stored_message_state(msg_id, MessageState::Failed)?;
-        self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
+        if let Some(raw_msg_id) = raw_msg_id {
+            self.mark_raw_transport_message_failed_if_awaiting_retry(raw_msg_id, reason)?;
+        }
         self.audit_group(
             group_id,
             marmot_forensics::AuditEventKind::Rejection {
@@ -861,7 +863,7 @@ impl<S: StorageProvider> Engine<S> {
                         return self.terminalize_rejected_proposal(
                             &group_id,
                             &msg.id,
-                            &raw_msg_id,
+                            Some(&raw_msg_id),
                             category,
                         );
                     }
@@ -987,7 +989,7 @@ impl<S: StorageProvider> Engine<S> {
                                 .terminalize_rejected_proposal(
                                     &group_id,
                                     &msg.id,
-                                    &raw_msg_id,
+                                    Some(&raw_msg_id),
                                     ProposalRejectionCategory::UnsupportedProposal,
                                 ),
                             error => Err(error),
@@ -999,7 +1001,7 @@ impl<S: StorageProvider> Engine<S> {
                         return self.terminalize_rejected_proposal(
                             &group_id,
                             &msg.id,
-                            &raw_msg_id,
+                            Some(&raw_msg_id),
                             rejection.category,
                         );
                     }
@@ -1346,7 +1348,7 @@ impl<S: StorageProvider> Engine<S> {
                                 .terminalize_rejected_proposal(
                                     &group_id,
                                     &msg.id,
-                                    &raw_msg_id,
+                                    Some(&raw_msg_id),
                                     ProposalRejectionCategory::UnsupportedProposal,
                                 ),
                             error => Err(error),
@@ -1358,7 +1360,7 @@ impl<S: StorageProvider> Engine<S> {
                         return self.terminalize_rejected_proposal(
                             &group_id,
                             &msg.id,
-                            &raw_msg_id,
+                            Some(&raw_msg_id),
                             rejection.category,
                         );
                     }
@@ -1400,7 +1402,7 @@ impl<S: StorageProvider> Engine<S> {
                     .terminalize_rejected_proposal(
                         &group_id,
                         &msg.id,
-                        &raw_msg_id,
+                        Some(&raw_msg_id),
                         ProposalRejectionCategory::UnsupportedProposal,
                     ),
                 ProcessedMessageContent::OwnPendingCommit
@@ -1567,17 +1569,12 @@ impl<S: StorageProvider> Engine<S> {
         if let Err(rejection) =
             crate::app_components::authorize_standalone_proposal(&mls_group, &queued)
         {
-            self.update_stored_message_state(&schedule.proposal_id, MessageState::Failed)?;
-            self.audit_group(
+            self.terminalize_rejected_proposal(
                 &schedule.group_id,
-                marmot_forensics::AuditEventKind::Rejection {
-                    msg_id: hex::encode(schedule.proposal_id.as_slice()),
-                    reason: crate::app_components::proposal_rejection_category_tag(
-                        rejection.category,
-                    )
-                    .to_string(),
-                },
-            );
+                &schedule.proposal_id,
+                None,
+                rejection.category,
+            )?;
             return Ok(ScheduledAutoCommitReplay::NotApplicable);
         }
 
@@ -2024,6 +2021,15 @@ impl<S: StorageProvider> Engine<S> {
             .ok_or(ForkProbeError::InvalidCandidate)?;
         let priority = match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
+                if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
+                    group_id,
+                    staged.add_proposals().next().is_some(),
+                ) {
+                    return match error {
+                        EngineError::InvalidTransition(_) => Err(ForkProbeError::InvalidCandidate),
+                        error => Err(ForkProbeError::Engine(error)),
+                    };
+                }
                 crate::app_components::authorize_staged_commit_proposals(
                     &probe_group,
                     staged.as_ref(),
