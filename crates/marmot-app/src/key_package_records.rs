@@ -6,10 +6,10 @@
 //! decoded metadata, reconcile fresh vs cached results, merge KeyPackage
 //! records, and pick publish endpoints. They hold no `MarmotApp` state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
+use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{MessageId, TransportEndpoint};
 use nostr::base64::Engine as _;
@@ -183,7 +183,10 @@ fn validated_cached_key_package_with_ref(
             "cached KeyPackage ref does not match decoded KeyPackageRef".into(),
         ));
     }
-    Ok((decoded, metadata.key_package_ref_hex))
+    Ok((
+        decoded.with_protocol_profile(metadata.protocol_profile),
+        metadata.key_package_ref_hex,
+    ))
 }
 
 pub(crate) fn key_package_from_hex_with_optional_source(
@@ -265,15 +268,6 @@ pub(crate) fn key_package_from_record(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing i tag".into()))?
         .to_owned();
-    require_key_package_tag(&event, "mls_ciphersuite", |value| !value.is_empty())?;
-    require_multi_value_key_package_tag(&event, "mls_extensions")?;
-    require_multi_value_key_package_tag_contains(
-        &event,
-        "mls_extensions",
-        &format!("0x{ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE:04x}"),
-    )?;
-    require_multi_value_key_package_tag(&event, "mls_proposals")?;
-    require_multi_value_key_package_tag(&event, "app_components")?;
     let key_package_bytes = BASE64_STANDARD
         .decode(event.content.as_bytes())
         .map_err(|e| AppError::InvalidKeyPackageEvent(format!("invalid base64 content: {e}")))?;
@@ -288,6 +282,29 @@ pub(crate) fn key_package_from_record(
     );
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    require_key_package_tag(&event, "mls_ciphersuite", |value| {
+        value == format!("0x{:04x}", metadata.ciphersuite)
+    })?;
+    require_multi_value_key_package_tag_matches(
+        &event,
+        "mls_extensions",
+        metadata.mls_extensions.iter().copied(),
+    )?;
+    require_multi_value_key_package_tag_matches(
+        &event,
+        "mls_proposals",
+        metadata.mls_proposals.iter().copied(),
+    )?;
+    require_multi_value_key_package_tag_matches(
+        &event,
+        "app_components",
+        metadata
+            .app_components
+            .iter()
+            .copied()
+            .filter(|id| *id >= PRIVATE_USE_APP_COMPONENT_ID_START),
+    )?;
+    let key_package = key_package.with_protocol_profile(metadata.protocol_profile);
     if metadata.credential_identity_hex != event.pubkey {
         return Err(AppError::InvalidKeyPackageEvent(
             "transport author does not match KeyPackage credential identity".into(),
@@ -423,9 +440,10 @@ pub(crate) fn require_key_package_tag(
     }
 }
 
-pub(crate) fn require_multi_value_key_package_tag(
+pub(crate) fn require_multi_value_key_package_tag_matches(
     event: &NostrTransportEvent,
     name: &str,
+    expected_ids: impl IntoIterator<Item = u16>,
 ) -> Result<(), AppError> {
     reject_duplicate_key_package_tag(event, name)?;
     let Some(tag) = event
@@ -437,41 +455,18 @@ pub(crate) fn require_multi_value_key_package_tag(
             "missing {name} tag"
         )));
     };
-    if tag.iter().skip(1).any(|value| !value.trim().is_empty()) {
-        Ok(())
-    } else {
-        Err(AppError::InvalidKeyPackageEvent(format!(
-            "empty {name} tag"
-        )))
-    }
-}
-
-pub(crate) fn require_multi_value_key_package_tag_contains(
-    event: &NostrTransportEvent,
-    name: &str,
-    required: &str,
-) -> Result<(), AppError> {
-    reject_duplicate_key_package_tag(event, name)?;
-    let Some(tag) = event
-        .tags
-        .iter()
-        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
-    else {
+    let values = tag.iter().skip(1).cloned().collect::<Vec<_>>();
+    let actual = values.iter().cloned().collect::<BTreeSet<_>>();
+    let expected = expected_ids
+        .into_iter()
+        .map(|id| format!("0x{id:04x}"))
+        .collect::<BTreeSet<_>>();
+    if values.len() != actual.len() || actual != expected {
         return Err(AppError::InvalidKeyPackageEvent(format!(
-            "missing {name} tag"
+            "{name} tag does not exactly match decoded KeyPackage metadata"
         )));
-    };
-    if tag
-        .iter()
-        .skip(1)
-        .any(|value| value.eq_ignore_ascii_case(required))
-    {
-        Ok(())
-    } else {
-        Err(AppError::InvalidKeyPackageEvent(format!(
-            "{name} tag missing required value {required}"
-        )))
     }
+    Ok(())
 }
 
 pub(crate) fn publish_endpoints_from_bootstrap(

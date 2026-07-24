@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use marmot_app::{
     AppBlobEndpoint, AppGroupAdminPolicyComponent, AppGroupEncryptedMediaComponent,
     AppGroupHydrationQuarantineReason, AppGroupMemberRecord, AppGroupMlsState,
-    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppQuarantinedGroup,
-    GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
+    AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord, AppProtocolProfile,
+    AppQuarantinedGroup, GroupInviteDeclineResult, account_id_hex_from_ref, npub_for_account_id,
 };
 
 use super::account::SendSummaryFfi;
@@ -16,6 +16,7 @@ use crate::errors::MarmotKitError;
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppGroupRecordFfi {
     pub group_id_hex: String,
+    pub protocol_profile: AppProtocolProfileFfi,
     pub endpoint: String,
     pub name: String,
     pub description: String,
@@ -59,6 +60,7 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
         let disappearing_message_secs = value.message_retention.disappearing_message_secs;
         Self {
             group_id_hex: value.group_id_hex,
+            protocol_profile: value.protocol_profile.into(),
             endpoint: value.endpoint,
             name,
             description,
@@ -77,6 +79,21 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             self_membership: value.self_membership.into(),
             welcomer_account_id_hex: value.welcomer_account_id_hex,
             via_welcome_message_id_hex: value.via_welcome_message_id_hex,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum AppProtocolProfileFfi {
+    Legacy,
+    Current,
+}
+
+impl From<AppProtocolProfile> for AppProtocolProfileFfi {
+    fn from(value: AppProtocolProfile) -> Self {
+        match value {
+            AppProtocolProfile::Legacy => Self::Legacy,
+            AppProtocolProfile::Current => Self::Current,
         }
     }
 }
@@ -329,6 +346,7 @@ pub(crate) fn group_management_state_ffi(
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppGroupMlsStateFfi {
     pub group_id_hex: String,
+    pub protocol_profile: AppProtocolProfileFfi,
     pub epoch: u64,
     pub member_count: u32,
     pub required_app_components: Vec<u16>,
@@ -338,6 +356,7 @@ impl From<AppGroupMlsState> for AppGroupMlsStateFfi {
     fn from(value: AppGroupMlsState) -> Self {
         Self {
             group_id_hex: value.group_id_hex,
+            protocol_profile: value.protocol_profile.into(),
             epoch: value.epoch,
             member_count: super::saturating_u32(value.member_count),
             required_app_components: value.required_app_components,

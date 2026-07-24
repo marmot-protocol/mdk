@@ -232,6 +232,15 @@ impl<S: StorageProvider> Engine<S> {
             proposals,
             "app_data_update",
         )?;
+        let staged_commit = mls_group.pending_commit().ok_or_else(|| {
+            EngineError::Backend("app data update produced no pending commit".into())
+        })?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
         let commit_bytes = commit_out
             .tls_serialize_detached()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;

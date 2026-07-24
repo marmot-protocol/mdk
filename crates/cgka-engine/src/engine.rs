@@ -20,7 +20,7 @@ use cgka_traits::engine::{
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::message::{MessageState, StoredMessagePayload};
@@ -92,6 +92,9 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
     pub(crate) supported_app_components: AppComponentSet,
+    /// Profile emitted by newly created KeyPackages and groups. Existing
+    /// groups retain their independently persisted/wire-classified profile.
+    pub(crate) new_protocol_profile: ProtocolProfile,
     pub(crate) peeler: Box<dyn TransportPeeler>,
     pub(crate) ciphersuite: Ciphersuite,
     pub(crate) max_past_epochs: usize,
@@ -252,6 +255,7 @@ pub struct EngineBuilder<S: StorageProvider> {
         Option<Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>>,
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
+    new_protocol_profile: ProtocolProfile,
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
@@ -266,6 +270,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
+            new_protocol_profile: ProtocolProfile::Legacy,
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
@@ -296,6 +301,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// Select the profile emitted by fresh KeyPackages and newly created
+    /// groups. Defaults to legacy until the coordinated strict cutover.
+    pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
+        self.new_protocol_profile = protocol_profile;
         self
     }
 
@@ -345,6 +357,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             self.ciphersuite,
             identity_bytes,
             &self.storage,
+            self.new_protocol_profile,
             proof_signer.as_ref(),
         )
         .map_err(EngineError::Other)?;
@@ -355,6 +368,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             identity,
             registry: self.registry,
             supported_app_components: self.supported_app_components,
+            new_protocol_profile: self.new_protocol_profile,
             peeler,
             ciphersuite: self.ciphersuite,
             max_past_epochs: self.max_past_epochs,
@@ -799,6 +813,9 @@ impl<S: StorageProvider> Engine<S> {
             self.transport_group_id_index
                 .insert(transport_group_id, group_id.clone());
         }
+        let wire_protocol_profile =
+            crate::account_identity_proof::protocol_profile_of_group(&mls_group)
+                .map_err(|_| GroupHydrationQuarantineReason::MemberValidationFailed)?;
 
         // Member-credential + account-identity-proof validation runs one
         // BIP-340 schnorr verification per leaf. All of this state was already
@@ -846,6 +863,9 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+        if group.protocol_profile != wire_protocol_profile {
+            return Err(GroupHydrationQuarantineReason::MemberValidationFailed);
+        }
 
         // A staged commit that survived process restart *may* mean the
         // application crashed mid-publish. Clear it (treat as

@@ -984,7 +984,6 @@ impl<S: StorageProvider> Engine<S> {
                         &self.storage,
                         &group_id,
                         &staged,
-                        self.ciphersuite,
                     )?;
                     self.storage.with_transaction(|storage| {
                         let tx_provider =

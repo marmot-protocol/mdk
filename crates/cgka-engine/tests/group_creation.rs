@@ -7,15 +7,17 @@
 
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::{
-    ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE, account_identity_proof_extension,
+    ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE, account_identity_proof_component,
+    account_identity_proof_extension,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::key_package::{is_last_resort_key_package, key_package_metadata};
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
-    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components, encode_nostr_routing_v1,
+    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, default_group_components, encode_components_list, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -147,6 +149,177 @@ fn key_package_with_account_identity_proof_and_lifetime(
         .unwrap();
     let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
     cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
+fn key_package_with_account_identity_proof_for_ciphersuite(
+    identity_seed: &[u8],
+    ciphersuite: Ciphersuite,
+) -> cgka_traits::engine::KeyPackage {
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential_with_key = CredentialWithKey {
+        credential: BasicCredential::new(credential_identity.clone()).into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_extension = account_identity_proof_extension(
+        &credential_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        proof_signer(identity_seed).as_ref(),
+    )
+    .unwrap();
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[ExtensionType::Unknown(
+                ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE,
+            )]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(proof_extension).unwrap())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
+fn mixed_profile_key_package(identity_seed: &[u8]) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential_with_key = CredentialWithKey {
+        credential: BasicCredential::new(credential_identity.clone()).into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_signer = proof_signer(identity_seed);
+    let legacy = account_identity_proof_extension(
+        &credential_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        proof_signer.as_ref(),
+    )
+    .unwrap();
+    let current = account_identity_proof_component(
+        &credential_identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        1_700_000_000,
+        proof_signer.as_ref(),
+    )
+    .unwrap();
+    let mut dictionary = AppDataDictionary::new();
+    dictionary.insert(
+        cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&[ACCOUNT_IDENTITY_PROOF_COMPONENT_ID].into_iter().collect()),
+    );
+    dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, current);
+    let current = Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary));
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[
+                ExtensionType::Unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE),
+                ExtensionType::AppDataDictionary,
+            ]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::from_vec(vec![legacy, current]).unwrap())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+}
+
+#[derive(Clone, Copy)]
+enum CurrentProofFault {
+    WrongLength,
+    TamperedSignature,
+    CredentialMismatch,
+    LeafKeyMismatch,
+    MissingSupportAdvertisement,
+}
+
+fn current_profile_key_package_with_fault(
+    identity_seed: &[u8],
+    fault: CurrentProofFault,
+) -> cgka_traits::engine::KeyPackage {
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let credential_identity = pad32(identity_seed);
+    let credential_with_key = CredentialWithKey {
+        credential: BasicCredential::new(credential_identity).into(),
+        signature_key: signer.public().into(),
+    };
+    let proof_identity_seed = if matches!(fault, CurrentProofFault::CredentialMismatch) {
+        b"different-proof-identity".as_slice()
+    } else {
+        identity_seed
+    };
+    let proof_leaf_key = if matches!(fault, CurrentProofFault::LeafKeyMismatch) {
+        vec![0x5a; signer.to_public_vec().len()]
+    } else {
+        signer.to_public_vec()
+    };
+    let mut proof = account_identity_proof_component(
+        &pad32(proof_identity_seed),
+        &proof_leaf_key,
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        1_700_000_000,
+        proof_signer(proof_identity_seed).as_ref(),
+    )
+    .unwrap();
+    match fault {
+        CurrentProofFault::WrongLength => {
+            proof.pop();
+        }
+        CurrentProofFault::TamperedSignature => proof[40] ^= 1,
+        CurrentProofFault::CredentialMismatch
+        | CurrentProofFault::LeafKeyMismatch
+        | CurrentProofFault::MissingSupportAdvertisement => {}
+    }
+
+    let advertised = if matches!(fault, CurrentProofFault::MissingSupportAdvertisement) {
+        [APP_COMPONENTS_COMPONENT_ID].into_iter().collect()
+    } else {
+        [
+            APP_COMPONENTS_COMPONENT_ID,
+            ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
+        ]
+        .into_iter()
+        .collect()
+    };
+    let mut dictionary = AppDataDictionary::new();
+    dictionary.insert(
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&advertised),
+    );
+    dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof);
+    let extension = Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary));
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[ExtensionType::AppDataDictionary]),
+            None,
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(extension).unwrap())
+        .build(ciphersuite, &provider, &signer, credential_with_key)
+        .unwrap();
+    let mls_msg: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(mls_msg.tls_serialize_detached().unwrap())
+        .with_protocol_profile(ProtocolProfile::Current)
 }
 
 fn key_package_with_malformed_last_resort_component(
@@ -370,6 +543,16 @@ fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
         .peeler(Box::new(MockPeeler::default()))
         .build()
         .expect("build engine")
+}
+
+fn build_current_client(identity: &[u8]) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .expect("build current-profile engine")
 }
 
 fn build_client_with_welcome_sender(
@@ -628,6 +811,335 @@ async fn directory_key_package_helpers_validate_against_own_ciphersuite() {
     let meta = key_package_metadata(&kp).expect("key_package_metadata validates the proof");
     assert!(!meta.credential_identity_hex.is_empty());
     assert!(is_last_resort_key_package(&kp).expect("last-resort check validates the proof"));
+}
+
+#[tokio::test]
+async fn invite_path_validates_proof_against_key_package_ciphersuite() {
+    let mut alice = build_client(b"alice-own-suite", selfremove_registry());
+    let alternate_suite = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
+    let kp =
+        key_package_with_account_identity_proof_for_ciphersuite(b"bob-own-suite", alternate_suite);
+
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "own-suite-proof".into(),
+            description: "".into(),
+            members: vec![kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("the engine does not negotiate the alternate ciphersuite yet");
+
+    assert!(
+        !matches!(error, EngineError::InvalidAccountIdentityProof(_)),
+        "the valid proof must be checked against the KeyPackage suite before later suite negotiation rejects it: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn current_key_package_uses_only_the_0x8009_proof_component() {
+    let mut alice = build_current_client(b"alice-current");
+    let kp = alice.fresh_key_package().await.unwrap();
+
+    assert_eq!(kp.protocol_profile, ProtocolProfile::Current);
+    let metadata = key_package_metadata(&kp).unwrap();
+    assert_eq!(metadata.protocol_profile, ProtocolProfile::Current);
+    assert!(
+        metadata
+            .app_components
+            .contains(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+    );
+    assert!(
+        !metadata
+            .mls_extensions
+            .contains(&ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)
+    );
+
+    let message = MlsMessageIn::tls_deserialize_exact(kp.bytes()).unwrap();
+    let key_package = match message.extract() {
+        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+        other => panic!("expected KeyPackage, got {other:?}"),
+    }
+    .validate(
+        &openmls_rust_crypto::RustCrypto::default(),
+        ProtocolVersion::Mls10,
+    )
+    .unwrap();
+    assert!(
+        key_package
+            .leaf_node()
+            .extensions()
+            .unknown(ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)
+            .is_none()
+    );
+    assert_eq!(
+        key_package
+            .leaf_node()
+            .extensions()
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .get(&ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+            .unwrap()
+            .len(),
+        104
+    );
+}
+
+#[test]
+fn mixed_profile_key_package_is_rejected() {
+    let key_package = mixed_profile_key_package(b"mixed-profile");
+    let error = key_package_metadata(&key_package)
+        .expect_err("a KeyPackage carrying both proof profiles must be rejected");
+    assert!(matches!(error, EngineError::InvalidAccountIdentityProof(_)));
+}
+
+fn assert_invalid_current_proof(fault: CurrentProofFault) {
+    let key_package = current_profile_key_package_with_fault(b"invalid-current-proof", fault);
+    let error =
+        key_package_metadata(&key_package).expect_err("invalid current proof must be rejected");
+    assert!(
+        matches!(error, EngineError::InvalidAccountIdentityProof(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn current_proof_rejects_non_104_byte_component() {
+    assert_invalid_current_proof(CurrentProofFault::WrongLength);
+}
+
+#[test]
+fn current_proof_rejects_tampered_signature() {
+    assert_invalid_current_proof(CurrentProofFault::TamperedSignature);
+}
+
+#[test]
+fn current_proof_rejects_signer_credential_mismatch() {
+    assert_invalid_current_proof(CurrentProofFault::CredentialMismatch);
+}
+
+#[test]
+fn current_proof_rejects_leaf_key_mismatch() {
+    assert_invalid_current_proof(CurrentProofFault::LeafKeyMismatch);
+}
+
+#[test]
+fn current_proof_rejects_missing_support_advertisement() {
+    assert_invalid_current_proof(CurrentProofFault::MissingSupportAdvertisement);
+}
+
+#[tokio::test]
+async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"alice-current-group"))
+        .account_identity_proof_signer(proof_signer(b"alice-current-group"))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    let mut bob = build_current_client(b"bob-current-group");
+    let mut legacy_carol = build_client(b"carol-legacy-group", FeatureRegistry::new());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "current".into(),
+            description: "strict profile".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome, pending) = match result {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => (welcomes.remove(0), pending),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let group = alice.group_record(&group_id).unwrap();
+    assert_eq!(group.protocol_profile, ProtocolProfile::Current);
+    assert!(
+        group
+            .required_capabilities
+            .app_components
+            .contains(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+    );
+    assert!(
+        !group
+            .required_capabilities
+            .extensions
+            .contains(&ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)
+    );
+    let joined = bob.join_welcome(welcome).await.unwrap();
+    assert_eq!(
+        bob.group_record(&joined).unwrap().protocol_profile,
+        ProtocolProfile::Current
+    );
+
+    let legacy_kp = legacy_carol.fresh_key_package().await.unwrap();
+    let error = alice
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![legacy_kp],
+        })
+        .await
+        .expect_err("current group must reject a legacy KeyPackage");
+    assert!(matches!(error, EngineError::InvalidAccountIdentityProof(_)));
+
+    drop(alice);
+    let mut reopened = EngineBuilder::new(storage)
+        .identity(pad32(b"alice-current-group"))
+        .account_identity_proof_signer(proof_signer(b"alice-current-group"))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    reopened.hydrate_stable_groups_from_storage().unwrap();
+    assert_eq!(
+        reopened.group_record(&group_id).unwrap().protocol_profile,
+        ProtocolProfile::Current
+    );
+}
+
+#[tokio::test]
+async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut legacy = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"legacy-reopen"))
+        .account_identity_proof_signer(proof_signer(b"legacy-reopen"))
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    let (group_id, result) = legacy
+        .create_group(CreateGroupRequest {
+            name: "legacy".into(),
+            description: "survives cutover".into(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    legacy.confirm_published(pending).await.unwrap();
+    drop(legacy);
+
+    let mut current = EngineBuilder::new(storage)
+        .identity(pad32(b"legacy-reopen"))
+        .account_identity_proof_signer(proof_signer(b"legacy-reopen"))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .unwrap();
+    current.hydrate_stable_groups_from_storage().unwrap();
+    assert_eq!(
+        current.group_record(&group_id).unwrap().protocol_profile,
+        ProtocolProfile::Legacy
+    );
+    current
+        .send(cgka_traits::engine::SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&current, "still usable"),
+        })
+        .await
+        .expect("legacy group remains usable by current-configured engine");
+
+    let mut invitee = build_client(b"legacy-reopen-invitee", selfremove_registry());
+    let invitee_key_package = invitee.fresh_key_package().await.unwrap();
+    let invite = current
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![invitee_key_package],
+        })
+        .await
+        .expect("current-configured engine can commit to its legacy group");
+    let pending = match invite {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    };
+    current.confirm_published(pending).await.unwrap();
+    assert_eq!(
+        current.group_record(&group_id).unwrap().protocol_profile,
+        ProtocolProfile::Legacy
+    );
+}
+
+#[tokio::test]
+async fn group_commit_cannot_change_or_mix_the_protocol_profile() {
+    let mut current = build_current_client(b"current-profile-lock");
+    let (current_group, result) = current
+        .create_group(CreateGroupRequest {
+            name: "current".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    current.confirm_published(pending).await.unwrap();
+    let drop_current_proof = AppComponentData {
+        component_id: cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
+        data: encode_components_list(&default_group_components()),
+    };
+    let error = current
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: current_group,
+            updates: vec![drop_current_proof],
+        })
+        .await
+        .expect_err("current group cannot drop its profile requirement");
+    assert!(matches!(error, EngineError::InvalidAccountIdentityProof(_)));
+
+    let mut legacy =
+        build_client_with_components(b"legacy-profile-lock", default_group_components());
+    let (legacy_group, result) = legacy
+        .create_group(CreateGroupRequest {
+            name: "legacy".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let pending = match result {
+        SendResult::GroupCreated { pending, .. } => pending,
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    legacy.confirm_published(pending).await.unwrap();
+    let mut hybrid_requirements = default_group_components();
+    hybrid_requirements.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+    let add_current_proof = AppComponentData {
+        component_id: cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
+        data: encode_components_list(&hybrid_requirements),
+    };
+    let error = legacy
+        .send(cgka_traits::engine::SendIntent::UpdateAppComponents {
+            group_id: legacy_group,
+            updates: vec![add_current_proof],
+        })
+        .await
+        .expect_err("legacy group cannot become hybrid");
+    assert!(matches!(error, EngineError::InvalidAccountIdentityProof(_)));
 }
 
 #[tokio::test]

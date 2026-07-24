@@ -62,6 +62,7 @@ mod tests {
     fn group(admins: Vec<&str>) -> AppGroupRecordFfi {
         AppGroupRecordFfi {
             group_id_hex: "01".repeat(32),
+            protocol_profile: AppProtocolProfileFfi::Legacy,
             endpoint: "marmot:group:01".into(),
             name: "Test".into(),
             description: String::new(),

@@ -49,6 +49,13 @@ pub use routing::{NostrRoutingV1, decode_nostr_routing_v1, encode_nostr_routing_
 /// MLS ComponentID.
 pub type AppComponentId = u16;
 
+/// First application-component id in the private-use range.
+///
+/// Kind-30443 KeyPackage events publish only private-use application
+/// components; upstream standardized component ids below this boundary remain
+/// discoverable from the decoded MLS capabilities.
+pub const PRIVATE_USE_APP_COMPONENT_ID_START: AppComponentId = 0x8000;
+
 /// Upstream MLS extensions draft component that carries supported/required
 /// application component ids in an `AppDataDictionary` entry.
 pub const APP_COMPONENTS_COMPONENT_ID: AppComponentId = 0x0001;
@@ -64,6 +71,11 @@ pub const GROUP_MESSAGE_RETENTION_COMPONENT_ID: AppComponentId = 0x8005;
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT_ID: AppComponentId = 0x8006;
 pub const GROUP_AVATAR_URL_COMPONENT_ID: AppComponentId = 0x8007;
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId = 0x8008;
+/// LeafNode-only account identity proof binding the Marmot account key to the
+/// MLS signature key. The proof bytes live in the LeafNode
+/// `app_data_dictionary`; GroupContext dictionaries only require the id via
+/// `app_components`.
+pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
 /// Lookup key for the encrypted-media secret in the
 /// [`crate::group_context::GroupContextSnapshot`] secrets map. This is an
 /// internal cache key, NOT the MLS exporter label/context: the secret is derived
@@ -79,6 +91,7 @@ pub const GROUP_MESSAGE_RETENTION_COMPONENT: &str = "marmot.group.message-retent
 pub const AGENT_TEXT_STREAM_QUIC_COMPONENT: &str = "marmot.group.agent-text-stream.quic.v1";
 pub const GROUP_AVATAR_URL_COMPONENT: &str = "marmot.group.avatar-url.v1";
 pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = "marmot.group.encrypted-media.v1";
+pub const ACCOUNT_IDENTITY_PROOF_COMPONENT: &str = "marmot.member.account-identity-proof.v2";
 pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
 pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";
 

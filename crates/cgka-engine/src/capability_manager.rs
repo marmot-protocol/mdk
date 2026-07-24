@@ -53,7 +53,14 @@ pub(crate) fn cache_self_capabilities<S: StorageProvider>(
     ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
     if let Some(leaf) = mls_group.own_leaf_node() {
-        crate::account_identity_proof::validate_leaf_account_identity_proof(leaf, ciphersuite)?;
+        let leaf_profile =
+            crate::account_identity_proof::validate_leaf_account_identity_proof(leaf, ciphersuite)?;
+        let group_profile = crate::account_identity_proof::protocol_profile_of_group(mls_group)?;
+        if leaf_profile != group_profile {
+            return Err(EngineError::InvalidAccountIdentityProof(
+                "own leaf proof profile does not match group profile".into(),
+            ));
+        }
         let caps = capabilities_of_leaf(leaf);
         let bc = BasicCredential::try_from(leaf.credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
@@ -78,13 +85,18 @@ pub(crate) fn cache_from_key_packages<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     kps: &[KeyPackage],
-    ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
+    let group_profile = storage.get_group(group_id)?.protocol_profile;
     for kp in kps {
-        crate::account_identity_proof::validate_leaf_account_identity_proof(
+        let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             kp.leaf_node(),
-            ciphersuite,
+            kp.ciphersuite(),
         )?;
+        if leaf_profile != group_profile {
+            return Err(EngineError::InvalidAccountIdentityProof(
+                "KeyPackage proof profile does not match group profile".into(),
+            ));
+        }
         let caps = capabilities_of_key_package(kp);
         let bc = BasicCredential::try_from(kp.leaf_node().credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
@@ -104,14 +116,19 @@ pub(crate) fn cache_from_staged_commit<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     staged: &StagedCommit,
-    ciphersuite: Ciphersuite,
 ) -> Result<(), EngineError> {
+    let group_profile = storage.get_group(group_id)?.protocol_profile;
     for add in staged.add_proposals() {
         let kp = add.add_proposal().key_package();
-        crate::account_identity_proof::validate_leaf_account_identity_proof(
+        let leaf_profile = crate::account_identity_proof::validate_leaf_account_identity_proof(
             kp.leaf_node(),
-            ciphersuite,
+            kp.ciphersuite(),
         )?;
+        if leaf_profile != group_profile {
+            return Err(EngineError::InvalidAccountIdentityProof(
+                "added leaf proof profile does not match group profile".into(),
+            ));
+        }
         let caps = capabilities_of_key_package(kp);
         let bc = BasicCredential::try_from(kp.leaf_node().credential().clone())
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;

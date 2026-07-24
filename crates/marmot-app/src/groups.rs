@@ -23,7 +23,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
-use cgka_traits::group::Group;
+use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,9 @@ use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRecord {
     pub group_id_hex: String,
+    /// Compatibility profile for all profile-gated behavior in this group.
+    #[serde(default)]
+    pub protocol_profile: AppProtocolProfile,
     pub endpoint: String,
     pub nostr_routing: AppGroupNostrRoutingComponent,
     pub profile: AppGroupProfileComponent,
@@ -62,6 +65,23 @@ pub struct AppGroupRecord {
     pub via_welcome_message_id_hex: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppProtocolProfile {
+    #[default]
+    Legacy,
+    Current,
+}
+
+impl From<ProtocolProfile> for AppProtocolProfile {
+    fn from(value: ProtocolProfile) -> Self {
+        match value {
+            ProtocolProfile::Legacy => Self::Legacy,
+            ProtocolProfile::Current => Self::Current,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupMemberRecord {
     pub member_id_hex: String,
@@ -72,6 +92,7 @@ pub struct AppGroupMemberRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupMlsState {
     pub group_id_hex: String,
+    pub protocol_profile: AppProtocolProfile,
     pub epoch: u64,
     pub member_count: usize,
     pub required_app_components: Vec<u16>,
@@ -315,6 +336,7 @@ impl AppGroupRecord {
         let endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         Self {
             group_id_hex,
+            protocol_profile: AppProtocolProfile::Legacy,
             endpoint,
             nostr_routing,
             profile: AppGroupProfileComponent::new(profile_name, profile_description),
@@ -359,6 +381,9 @@ impl AppGroupRecord {
         record.agent_text_stream = agent_text_stream;
         record.avatar_url = avatar_url;
         record.encrypted_media = encrypted_media;
+        if let Some(group) = group {
+            record.protocol_profile = group.protocol_profile.into();
+        }
         record
     }
 
@@ -373,6 +398,7 @@ impl AppGroupRecord {
         self.encrypted_media = projection.encrypted_media.clone();
         self.image = AppGroupImageComponent::new(projection.image.clone());
         if let Some(group) = projection.group_metadata {
+            self.protocol_profile = group.protocol_profile.into();
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
         }

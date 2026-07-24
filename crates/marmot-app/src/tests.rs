@@ -21,8 +21,7 @@ use crate::directory::records::{
 };
 use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
-    relay_list_queries, require_key_package_tag, require_multi_value_key_package_tag,
-    require_multi_value_key_package_tag_contains,
+    relay_list_queries, require_key_package_tag, require_multi_value_key_package_tag_matches,
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
@@ -189,15 +188,37 @@ fn key_package_id_list_tag_must_be_exactly_one() {
     };
     // A single id-list tag is accepted.
     let one = make(vec![vec!["mls_extensions".into(), "0x0006".into()]]);
-    assert!(require_multi_value_key_package_tag(&one, "mls_extensions").is_ok());
+    assert!(require_multi_value_key_package_tag_matches(&one, "mls_extensions", [0x0006]).is_ok());
+    assert!(require_multi_value_key_package_tag_matches(&one, "mls_extensions", [0x0007]).is_err());
     // Two tags with the same id-list name MUST be rejected, not first-match read.
     let two = make(vec![
         vec!["mls_extensions".into(), "0x0006".into()],
         vec!["mls_extensions".into(), "0xf2f1".into()],
     ]);
-    assert!(require_multi_value_key_package_tag(&two, "mls_extensions").is_err());
+    assert!(require_multi_value_key_package_tag_matches(&two, "mls_extensions", [0x0006]).is_err());
+    // Extra, duplicate, and non-canonical markers are rejected even when the
+    // expected marker is present.
+    let extra = make(vec![vec![
+        "app_components".into(),
+        "0x8009".into(),
+        "0x8008".into(),
+    ]]);
     assert!(
-        require_multi_value_key_package_tag_contains(&two, "mls_extensions", "0x0006").is_err()
+        require_multi_value_key_package_tag_matches(&extra, "app_components", [0x8009]).is_err()
+    );
+    let duplicate = make(vec![vec![
+        "app_components".into(),
+        "0x8009".into(),
+        "0x8009".into(),
+    ]]);
+    assert!(
+        require_multi_value_key_package_tag_matches(&duplicate, "app_components", [0x8009])
+            .is_err()
+    );
+    let uppercase = make(vec![vec!["app_components".into(), "0X8009".into()]]);
+    assert!(
+        require_multi_value_key_package_tag_matches(&uppercase, "app_components", [0x8009])
+            .is_err()
     );
     // The single-value consumer (mls_ciphersuite) also rejects a duplicate.
     let two_cs = make(vec![
