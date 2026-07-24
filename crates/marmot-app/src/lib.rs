@@ -1979,6 +1979,52 @@ impl MarmotApp {
             )?)
     }
 
+    pub(crate) fn queue_push_registration_removal_for_group(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .queue_push_registration_removal_for_group(
+                group_id_hex,
+                &account_push_registration_from_app(registration.clone()),
+                notifications::unix_now_ms(),
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn queue_push_registration_share_for_group(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .queue_push_registration_share_for_group(
+                group_id_hex,
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+                notifications::unix_now_ms(),
+            )?)
+    }
+
+    pub(crate) fn has_pending_push_registration_work(
+        &self,
+        account_ref: &str,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .has_pending_push_registration_work()?)
+    }
+
     pub(crate) fn pending_push_registration_removals(
         &self,
         account_ref: &str,

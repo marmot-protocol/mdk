@@ -968,16 +968,16 @@ mod tests {
                 "{table}.{column} should cascade when a group is deleted"
             );
         }
-        for table in [
-            "pending_push_registration_shares",
-            "pending_push_registration_removals",
-        ] {
-            assert_eq!(
-                foreign_key(&conn, table, "group_id_hex"),
-                Some(("account_groups".to_owned(), "CASCADE".to_owned())),
-                "{table}.group_id_hex should cascade when a projection group is deleted"
-            );
-        }
+        assert_eq!(
+            foreign_key(&conn, "pending_push_registration_shares", "group_id_hex"),
+            Some(("account_groups".to_owned(), "CASCADE".to_owned())),
+            "pending shares should cascade when a projection group is deleted"
+        );
+        assert_eq!(
+            foreign_key(&conn, "pending_push_registration_removals", "group_id_hex"),
+            None,
+            "durable removal intent must survive projection group deletion"
+        );
     }
 
     #[test]
@@ -1032,6 +1032,18 @@ mod tests {
                 token_bytes, server_pubkey_hex, created_at_ms, updated_at_ms,
                 last_shared_at_ms
              ) VALUES ('alice', 'aa', 1, 'fingerprint', X'01', 'bb', 10, 11, 12)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO push_registration (
+                account_label, account_id_hex, platform, token_fingerprint,
+                token_bytes, server_pubkey_hex, created_at_ms, updated_at_ms,
+                last_shared_at_ms
+             ) VALUES (
+                'stale-label', 'cc', 1, 'stale-fingerprint',
+                X'02', 'dd', 8, 9, 10
+             )",
             [],
         )
         .unwrap();
@@ -1095,7 +1107,7 @@ mod tests {
              ) VALUES ('orphan', 'fingerprint', 1, 1)",
             [],
         ));
-        assert_foreign_key_error(conn.execute(
+        conn.execute(
             "INSERT INTO pending_push_registration_removals (
                 group_id_hex, account_label, account_id_hex, platform,
                 token_fingerprint, server_pubkey_hex,
@@ -1103,7 +1115,8 @@ mod tests {
                 queued_at_ms
              ) VALUES ('orphan', 'alice', 'aa', 1, 'fingerprint', 'bb', 1, 1, 1)",
             [],
-        ));
+        )
+        .expect("removal intent must not depend on a projection group row");
         assert_foreign_key_error(conn.execute(
             "INSERT INTO cgka_queued_outbound (id, group_id, created_at_ms, record)
              VALUES (?1, ?2, 0, ?3)",

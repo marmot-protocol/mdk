@@ -662,7 +662,6 @@ impl SqliteAccountStorage {
                 "group_push_tokens",
                 "group_push_token_tombstones",
                 "pending_push_registration_shares",
-                "pending_push_registration_removals",
                 "chat_notification_settings",
                 "encrypted_media_epoch_secret_references",
                 "encrypted_media_epoch_secrets",
@@ -734,12 +733,6 @@ impl SqliteAccountStorage {
                 SelfMembership::Left | SelfMembership::Removed => {
                     conn.execute(
                         "DELETE FROM pending_push_registration_shares
-                         WHERE group_id_hex = ?1",
-                        params![group_id_hex],
-                    )
-                    .storage()?;
-                    conn.execute(
-                        "DELETE FROM pending_push_registration_removals
                          WHERE group_id_hex = ?1",
                         params![group_id_hex],
                     )
@@ -1449,6 +1442,93 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Queue one registration removal for one group without depending on the
+    /// app-local group projection surviving until publish.
+    pub fn queue_push_registration_removal_for_group(
+        &self,
+        group_id_hex: &str,
+        registration: &AccountPushRegistration,
+        queued_at_ms: i64,
+    ) -> StorageResult<()> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute(
+                "DELETE FROM pending_push_registration_shares
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex],
+            )
+            .storage()?;
+            insert_push_registration_removal_with_conn(
+                &conn,
+                group_id_hex,
+                registration,
+                queued_at_ms,
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Requeue the current registration for one still-joined group. This is the
+    /// compensation path when a departure fails after its removal published.
+    pub fn queue_push_registration_share_for_group(
+        &self,
+        group_id_hex: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+        queued_at_ms: i64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let inserted = conn
+                .execute(
+                    "INSERT INTO pending_push_registration_shares (
+                    group_id_hex, token_fingerprint, registration_updated_at_ms,
+                    queued_at_ms, last_attempted_at_ms
+                 )
+                 SELECT group_id_hex, ?2, ?3, ?4, NULL
+                 FROM account_groups
+                 WHERE group_id_hex = ?1 AND self_membership = 'member'
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    token_fingerprint = excluded.token_fingerprint,
+                    registration_updated_at_ms = excluded.registration_updated_at_ms,
+                    queued_at_ms = excluded.queued_at_ms,
+                    last_attempted_at_ms = NULL",
+                    params![
+                        group_id_hex,
+                        token_fingerprint,
+                        registration_updated_at_ms,
+                        queued_at_ms,
+                    ],
+                )
+                .storage()?
+                > 0;
+            if inserted {
+                conn.execute(
+                    "UPDATE push_registration
+                     SET last_shared_at_ms = NULL
+                     WHERE token_fingerprint = ?1 AND updated_at_ms = ?2",
+                    params![token_fingerprint, registration_updated_at_ms],
+                )
+                .storage()?;
+            }
+            Ok(inserted)
+        })
+    }
+
+    pub fn has_pending_push_registration_work(&self) -> StorageResult<bool> {
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pending_push_registration_shares
+                    UNION ALL
+                    SELECT 1 FROM pending_push_registration_removals
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     pub fn pending_push_registration_removals(
         &self,
     ) -> StorageResult<Vec<AccountPendingPushRegistrationRemoval>> {
@@ -1460,7 +1540,8 @@ impl SqliteAccountStorage {
                         registration_created_at_ms, registration_updated_at_ms,
                         last_attempted_at_ms
                  FROM pending_push_registration_removals
-                 ORDER BY queued_at_ms, group_id_hex, platform, server_pubkey_hex",
+                 ORDER BY queued_at_ms, group_id_hex, platform, server_pubkey_hex,
+                          token_fingerprint, registration_updated_at_ms",
             )
             .storage()?;
         statement
@@ -1860,14 +1941,6 @@ fn queue_push_registration_removals_with_conn(
     queued_at_ms: i64,
 ) -> StorageResult<usize> {
     conn.execute(
-        "DELETE FROM pending_push_registration_removals
-         WHERE group_id_hex NOT IN (
-            SELECT group_id_hex FROM account_groups WHERE self_membership = 'member'
-         )",
-        [],
-    )
-    .storage()?;
-    conn.execute(
         "INSERT INTO pending_push_registration_removals (
             group_id_hex, account_label, account_id_hex, platform,
             token_fingerprint, server_pubkey_hex, relay_hint,
@@ -1877,13 +1950,14 @@ fn queue_push_registration_removals_with_conn(
          SELECT group_id_hex, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL
          FROM account_groups
          WHERE self_membership = 'member'
-         ON CONFLICT(group_id_hex, platform, server_pubkey_hex) DO UPDATE SET
+         ON CONFLICT(
+            group_id_hex, platform, server_pubkey_hex,
+            token_fingerprint, registration_updated_at_ms
+         ) DO UPDATE SET
             account_label = excluded.account_label,
             account_id_hex = excluded.account_id_hex,
-            token_fingerprint = excluded.token_fingerprint,
             relay_hint = excluded.relay_hint,
             registration_created_at_ms = excluded.registration_created_at_ms,
-            registration_updated_at_ms = excluded.registration_updated_at_ms,
             queued_at_ms = excluded.queued_at_ms,
             last_attempted_at_ms = NULL",
         params![
@@ -1912,6 +1986,46 @@ fn queue_push_registration_removals_with_conn(
         |row| row.get(0),
     )
     .storage()
+}
+
+fn insert_push_registration_removal_with_conn(
+    conn: &Connection,
+    group_id_hex: &str,
+    registration: &AccountPushRegistration,
+    queued_at_ms: i64,
+) -> StorageResult<()> {
+    conn.execute(
+        "INSERT INTO pending_push_registration_removals (
+            group_id_hex, account_label, account_id_hex, platform,
+            token_fingerprint, server_pubkey_hex, relay_hint,
+            registration_created_at_ms, registration_updated_at_ms,
+            queued_at_ms, last_attempted_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
+         ON CONFLICT(
+            group_id_hex, platform, server_pubkey_hex,
+            token_fingerprint, registration_updated_at_ms
+         ) DO UPDATE SET
+            account_label = excluded.account_label,
+            account_id_hex = excluded.account_id_hex,
+            relay_hint = excluded.relay_hint,
+            registration_created_at_ms = excluded.registration_created_at_ms,
+            queued_at_ms = excluded.queued_at_ms,
+            last_attempted_at_ms = NULL",
+        params![
+            group_id_hex,
+            &registration.account_label,
+            &registration.account_id_hex,
+            i64::from(registration.platform),
+            &registration.token_fingerprint,
+            &registration.server_pubkey_hex,
+            &registration.relay_hint,
+            registration.created_at_ms,
+            registration.updated_at_ms,
+            queued_at_ms,
+        ],
+    )
+    .storage()?;
+    Ok(())
 }
 
 /// Clamp a cursor timestamp to `now + max_future_skew_secs`.

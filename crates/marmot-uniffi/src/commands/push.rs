@@ -27,6 +27,7 @@ impl Marmot {
         server_pubkey_hex: String,
         relay_hint: Option<String>,
     ) -> Result<PushRegistrationSyncResultFfi, MarmotKitError> {
+        let raw_token = zeroize::Zeroizing::new(raw_token);
         Ok(self
             .runtime
             .upsert_push_registration(

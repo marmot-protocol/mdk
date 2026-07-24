@@ -248,6 +248,269 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
 }
 
 #[tokio::test]
+async fn push_registration_idle_retry_drains_without_an_unrelated_lifecycle_event() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime
+        .create_group("alice", "alpha", &[], None)
+        .await
+        .unwrap();
+    runtime
+        .set_native_push_enabled("alice", true)
+        .await
+        .unwrap();
+
+    relay.script([false]);
+    let result = runtime
+        .upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "opaque-token",
+            &nostr::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.share.status, PushRegistrationShareStatus::Pending);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let registration = app.push_registration("alice").unwrap().unwrap();
+            if app
+                .pending_push_registration_shares(
+                    "alice",
+                    &registration.token_fingerprint,
+                    registration.updated_at_ms,
+                )
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bounded idle retry should drain pending gossip");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_registration_local_projection_advances_only_after_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
+    runtime.reconcile_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "alpha", &[], None)
+        .await
+        .unwrap();
+    runtime
+        .set_native_push_enabled("alice", true)
+        .await
+        .unwrap();
+
+    relay.block_next_publish();
+    let runtime_for_upsert = runtime.clone();
+    let server_pubkey_hex = nostr::Keys::generate().public_key().to_hex();
+    let upsert = tokio::spawn(async move {
+        runtime_for_upsert
+            .upsert_push_registration(
+                "alice",
+                PushPlatform::Fcm,
+                "opaque-token",
+                &server_pubkey_hex,
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_publish(),
+    )
+    .await
+    .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    assert!(
+        app.group_push_tokens("alice", &group_id_hex)
+            .unwrap()
+            .is_empty(),
+        "the local mirror must not advance ahead of relay publish"
+    );
+    relay.release_publish();
+    upsert.await.unwrap().unwrap();
+    assert_eq!(
+        app.group_push_tokens("alice", &group_id_hex).unwrap().len(),
+        1
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_group_wipe_keeps_and_drains_durable_push_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
+    runtime.reconcile_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "alpha", &[], None)
+        .await
+        .unwrap();
+    runtime
+        .set_native_push_enabled("alice", true)
+        .await
+        .unwrap();
+    runtime
+        .upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "opaque-token",
+            &nostr::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    app.clear_push_registration("alice").unwrap();
+    relay.block_next_publish();
+    let runtime_for_delete = runtime.clone();
+    let group_id_for_delete = group_id.clone();
+    let delete = tokio::spawn(async move {
+        runtime_for_delete
+            .delete_group_local("alice", &group_id)
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_publish(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .len(),
+        1,
+        "the outbox row must remain durable while publish is blocked"
+    );
+    assert_eq!(
+        app.group_push_tokens("alice", &hex::encode(group_id_for_delete.as_slice()))
+            .unwrap()
+            .len(),
+        1,
+        "the local projection must remain intact until removal publishes"
+    );
+    relay.release_publish();
+    assert!(delete.await.unwrap().unwrap());
+    assert!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_leave_restores_push_registration_after_removal_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
+    runtime.reconcile_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("alice", "alpha", &[], None)
+        .await
+        .unwrap();
+    runtime
+        .set_native_push_enabled("alice", true)
+        .await
+        .unwrap();
+    runtime
+        .upsert_push_registration(
+            "alice",
+            PushPlatform::Fcm,
+            "opaque-token",
+            &nostr::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    relay.block_next_publish();
+    let runtime_for_leave = runtime.clone();
+    let group_id_for_leave = group_id.clone();
+    let leave = tokio::spawn(async move {
+        runtime_for_leave
+            .leave_group("alice", &group_id_for_leave)
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        relay.wait_for_blocked_publish(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .len(),
+        1,
+        "the registration removal must be durable before the MLS leave starts"
+    );
+    assert_eq!(
+        app.group_push_tokens("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .len(),
+        1,
+        "the local projection must remain intact until removal publishes"
+    );
+
+    relay.release_publish();
+    assert!(matches!(
+        leave.await.unwrap(),
+        Err(AppError::Account(marmot_account::AccountError::Session(
+            cgka_session::SessionError::Engine(
+                cgka_traits::EngineError::AdminCannotSelfRemove { .. }
+            )
+        )))
+    ));
+    assert!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        app.group_push_tokens("alice", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .len(),
+        1,
+        "a failed leave must compensate by re-publishing the current registration"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn push_registration_removal_retry_survives_clear_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

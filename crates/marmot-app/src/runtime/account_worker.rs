@@ -371,6 +371,7 @@ async fn run_app_runtime_account_worker(
         }
     };
     let mut scheduled_convergence = ScheduledConvergence::new(convergence_settlement_delay(&app));
+    let mut scheduled_push_retry = ScheduledPushRegistrationRetry::new();
 
     // The session is hydrated. Capture a read snapshot and signal
     // command-readiness *now*, before the initial relay catch-up. "Ready" means
@@ -523,9 +524,10 @@ async fn run_app_runtime_account_worker(
     // Automatic gossip is best-effort network work. Run it only after startup
     // callers have received their deferred responses so a degraded relay cannot
     // extend account-open latency.
-    client
+    let push_work_pending = client
         .retry_pending_push_registration_shares_best_effort()
         .await;
+    scheduled_push_retry.schedule_after_attempt(push_work_pending);
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
     // / InviteMembers) can buffer convergence groups. The steady-state arms below
@@ -588,6 +590,13 @@ async fn run_app_runtime_account_worker(
                     }
                 }
             }
+            _ = scheduled_push_retry.timer.as_mut(), if scheduled_push_retry.armed => {
+                scheduled_push_retry.take_ready();
+                let pending = client
+                    .retry_pending_push_registration_shares_best_effort()
+                    .await;
+                scheduled_push_retry.schedule_after_attempt(pending);
+            }
             command = commands.recv() => {
                 match command {
                     Some(command) => {
@@ -601,6 +610,9 @@ async fn run_app_runtime_account_worker(
                         )
                         .await;
                         scheduled_convergence.schedule_groups(client.take_pending_convergence_groups());
+                        scheduled_push_retry.observe_pending(
+                            client.has_pending_push_registration_work(),
+                        );
                     }
                     None => return,
                 }
@@ -631,9 +643,10 @@ async fn run_app_runtime_account_worker(
                             shared.schedule_audit_log_tracker_update("receive");
                         }
                         if !summary.joined_groups.is_empty() {
-                            client
+                            let pending = client
                                 .retry_pending_push_registration_shares_best_effort()
                                 .await;
+                            scheduled_push_retry.schedule_after_attempt(pending);
                         }
                     }
                     Err(err) => {
@@ -660,9 +673,10 @@ async fn run_app_runtime_account_worker(
                                 // resumes the live `next_event` tail below — so it
                                 // does not reintroduce the catch-up blocking this
                                 // worker removed from startup.
-                                reopened
+                                let pending = reopened
                                     .retry_pending_push_registration_shares_best_effort()
                                     .await;
+                                scheduled_push_retry.schedule_after_attempt(pending);
                                 client = reopened;
                             }
                             Err(setup_err) => {
@@ -1405,6 +1419,90 @@ fn account_worker_reconnect_jitter() -> Duration {
     Duration::from_millis(jitter_ms)
 }
 
+const IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn push_registration_retry_base_delay() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(25)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
+fn push_registration_retry_max_delay() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(1_600)
+    } else {
+        Duration::from_secs(5 * 60)
+    }
+}
+
+fn push_registration_retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    let multiplier = 1u32 << shift;
+    push_registration_retry_base_delay()
+        .saturating_mul(multiplier)
+        .min(push_registration_retry_max_delay())
+}
+
+/// A bounded backoff timer that exists only while durable push outbox rows
+/// remain. This is not a periodic poll: successful drain disarms it completely.
+struct ScheduledPushRegistrationRetry {
+    attempts: u32,
+    armed: bool,
+    timer: Pin<Box<Sleep>>,
+}
+
+impl ScheduledPushRegistrationRetry {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            armed: false,
+            timer: Box::pin(sleep(IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY)),
+        }
+    }
+
+    fn observe_pending(&mut self, pending: bool) {
+        if !pending {
+            self.disarm();
+        } else if !self.armed {
+            self.attempts = 1;
+            self.arm();
+        }
+    }
+
+    fn schedule_after_attempt(&mut self, pending: bool) {
+        if !pending {
+            self.disarm();
+            return;
+        }
+        self.attempts = self.attempts.saturating_add(1).max(1);
+        self.arm();
+    }
+
+    fn take_ready(&mut self) {
+        self.armed = false;
+        self.timer
+            .as_mut()
+            .reset(TokioInstant::now() + IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY);
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+        self.timer
+            .as_mut()
+            .reset(TokioInstant::now() + push_registration_retry_delay(self.attempts));
+    }
+
+    fn disarm(&mut self) {
+        self.attempts = 0;
+        self.armed = false;
+        self.timer
+            .as_mut()
+            .reset(TokioInstant::now() + IDLE_PUSH_REGISTRATION_RETRY_TIMER_DELAY);
+    }
+}
+
 const DEFAULT_CONVERGENCE_SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 /// Extra delay beyond the engine quiescence window before the first scheduled
 /// convergence tick fires. Avoids off-by-one-ms races where the timer fires
@@ -1749,6 +1847,31 @@ mod tests {
             retry_delay_for_attempt(u32::MAX),
             CONVERGENCE_RETRY_MAX_DELAY
         );
+    }
+
+    #[tokio::test]
+    async fn push_registration_retry_is_bounded_and_disarms_when_drained() {
+        assert_eq!(
+            push_registration_retry_delay(1),
+            push_registration_retry_base_delay()
+        );
+        assert_eq!(
+            push_registration_retry_delay(u32::MAX),
+            push_registration_retry_max_delay()
+        );
+
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        scheduled.observe_pending(true);
+        assert!(scheduled.armed);
+        assert_eq!(scheduled.attempts, 1);
+        scheduled.take_ready();
+        assert!(!scheduled.armed);
+        scheduled.schedule_after_attempt(true);
+        assert!(scheduled.armed);
+        assert_eq!(scheduled.attempts, 2);
+        scheduled.schedule_after_attempt(false);
+        assert!(!scheduled.armed);
+        assert_eq!(scheduled.attempts, 0);
     }
 
     #[tokio::test]

@@ -1833,6 +1833,56 @@ fn push_registration_rotation_and_clear_queue_durable_removals() {
 }
 
 #[test]
+fn push_registration_removal_outbox_preserves_same_server_revisions() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    let mut registration = AccountPushRegistration {
+        account_label: "alice".to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: "token-a".to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: 10,
+        updated_at_ms: 10,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration.clone(), vec![1])
+        .unwrap();
+    store.clear_push_registration("alice").unwrap();
+
+    registration.token_fingerprint = "token-b".to_owned();
+    registration.created_at_ms = 20;
+    registration.updated_at_ms = 20;
+    store
+        .upsert_push_registration(registration, vec![2])
+        .unwrap();
+    store.clear_push_registration("alice").unwrap();
+
+    let removals = store.pending_push_registration_removals().unwrap();
+    assert_eq!(removals.len(), 2);
+    assert_eq!(
+        removals
+            .iter()
+            .map(|pending| pending.registration.token_fingerprint.as_str())
+            .collect::<Vec<_>>(),
+        vec!["token-a", "token-b"]
+    );
+}
+
+#[test]
 fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_state() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let state = StoredAccountState {
@@ -1928,7 +1978,6 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "group_push_token_tombstones",
         "encrypted_media_epoch_secret_references",
         "pending_push_registration_shares",
-        "pending_push_registration_removals",
         "encrypted_media_epoch_secrets",
     ] {
         assert_eq!(group_row_count(&store, table, "aa"), 0, "{table}");
@@ -1941,6 +1990,11 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         ),
         1,
         "the retirement barrier outlives the local group projection"
+    );
+    assert_eq!(
+        group_row_count(&store, "pending_push_registration_removals", "aa"),
+        1,
+        "removal intent must survive app-local projection deletion"
     );
     for table in [
         "account_groups",
