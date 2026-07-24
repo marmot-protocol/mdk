@@ -1,8 +1,8 @@
 //! Final-message sends, agent activity/operation/group-system events, and debug send recording.
 
 use agent_control::{
-    AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
-    AgentControlResponse,
+    AgentControlDebugFinalSend, AgentControlDeliveryStatus, AgentControlEvent,
+    AgentControlMediaRef, AgentControlMediaUpload, AgentControlResponse,
 };
 use cgka_traits::GroupId;
 use marmot_app::{
@@ -12,10 +12,12 @@ use marmot_app::{
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
+use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStatus};
 use crate::validation::normalize_hex;
 
 /// Current schema version for persisted `send_final` request fingerprints.
 pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
+pub(crate) const LOGICAL_FINAL_IDEMPOTENCY_PREFIX: &str = "marmot_logical_final_v1:";
 
 /// Server-derived fingerprint of a `send_final` request: a versioned SHA-256 digest
 /// over the destination (account + group), message text, and optional reply target.
@@ -91,6 +93,20 @@ pub(crate) fn media_ref_to_reference(media: AgentControlMediaRef) -> MediaAttach
 }
 
 impl AgentConnector {
+    pub(crate) fn delivery_status_response(&self, idempotency_key: &str) -> AgentControlResponse {
+        let (status, message_ids_hex) = match self.idempotency.status(idempotency_key.trim()) {
+            SendIdempotencyStatus::Unknown => (AgentControlDeliveryStatus::Unknown, Vec::new()),
+            SendIdempotencyStatus::Pending => (AgentControlDeliveryStatus::Pending, Vec::new()),
+            SendIdempotencyStatus::Committed(message_ids_hex) => {
+                (AgentControlDeliveryStatus::Committed, message_ids_hex)
+            }
+        };
+        AgentControlResponse::DeliveryStatus {
+            status,
+            message_ids_hex,
+        }
+    }
+
     pub(crate) async fn send_final_response(
         &self,
         account_id_hex: &str,
@@ -100,19 +116,9 @@ impl AgentConnector {
         idempotency_key: Option<String>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let group_id_hex = normalize_hex(group_id_hex)?;
-        if self.debug_controls {
-            return self.debug_record_final_send_response(
-                account_id_hex,
-                &group_id_hex,
-                text,
-                reply_to_message_id_hex,
-            );
-        }
-
-        // Server-derived request fingerprint: a reused idempotency key only short-
-        // circuits when the request it identifies is the same one. A reused key
-        // carrying a different request body is a cache miss, so dedup can never
-        // return ids belonging to an unrelated send.
+        // Server-derived request fingerprint: one idempotency key names exactly
+        // one logical final. Reusing it with different inputs is rejected before
+        // any send, so dedup cannot return unrelated ids or publish two bodies.
         let fingerprint = send_final_fingerprint(
             account_id_hex,
             &group_id_hex,
@@ -120,13 +126,33 @@ impl AgentConnector {
             reply_to_message_id_hex.as_deref(),
         );
 
-        // Idempotent durable send: if this key already committed a matching send,
-        // return the original message ids without re-sending so a retry after a
-        // post-write timeout cannot double-post an unrecallable message.
-        if let Some(key) = idempotency_key.as_deref()
-            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
-        {
-            return Ok(AgentControlResponse::FinalSent { message_ids_hex });
+        // Reserve before the first await. Same-key followers wait for the leader
+        // and return its committed ids; a failed/cancelled leader drops its guard,
+        // wakes followers, and leaves the key retryable.
+        let reservation = if let Some(key) = idempotency_key.as_deref() {
+            match self.idempotency.acquire(key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed(message_ids_hex) => {
+                    return Ok(AgentControlResponse::FinalSent { message_ids_hex });
+                }
+                SendIdempotencyAcquisition::Leader(guard) => Some(guard),
+            }
+        } else {
+            None
+        };
+
+        if self.debug_controls {
+            let response = self.debug_record_final_send_response(
+                account_id_hex,
+                &group_id_hex,
+                text,
+                reply_to_message_id_hex,
+            )?;
+            if let (Some(reservation), AgentControlResponse::FinalSent { message_ids_hex }) =
+                (reservation, &response)
+            {
+                reservation.complete(message_ids_hex.clone());
+            }
+            return Ok(response);
         }
 
         let account = self.local_account_for_account_id(account_id_hex)?;
@@ -140,12 +166,8 @@ impl AgentConnector {
                 .send_message(&account.label, &group_id, text.into_bytes())
                 .await?
         };
-        // Record only after a successful send so a failed send remains retryable.
-        // A key already bound to a different fingerprint is left untouched (first
-        // write wins), so this send simply proceeds without caching.
-        if let Some(key) = idempotency_key {
-            self.idempotency
-                .record(key, fingerprint, summary.message_ids.clone());
+        if let Some(reservation) = reservation {
+            reservation.complete(summary.message_ids.clone());
         }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,

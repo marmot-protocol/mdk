@@ -93,6 +93,54 @@ struct SendIdempotencyInner {
     order: std::collections::VecDeque<String>,
     seen: HashMap<String, (String, Vec<String>)>,
     recorded_at: HashMap<String, u64>,
+    in_flight: HashMap<String, InFlightSendIdempotency>,
+}
+
+struct InFlightSendIdempotency {
+    fingerprint: String,
+    completion: watch::Sender<bool>,
+}
+
+pub(crate) enum SendIdempotencyReservation {
+    Completed(Vec<String>),
+    Wait(watch::Receiver<bool>),
+    Leader(SendIdempotencyReservationGuard),
+}
+
+pub(crate) enum SendIdempotencyAcquisition {
+    Completed(Vec<String>),
+    Leader(SendIdempotencyReservationGuard),
+}
+
+pub(crate) enum SendIdempotencyStatus {
+    Unknown,
+    Pending,
+    Committed(Vec<String>),
+}
+
+pub(crate) struct SendIdempotencyReservationGuard {
+    store: SendIdempotencyStore,
+    key: String,
+    fingerprint: String,
+    active: bool,
+}
+
+impl SendIdempotencyReservationGuard {
+    pub(crate) fn complete(mut self, message_ids: Vec<String>) {
+        let completed = self
+            .store
+            .complete_reservation(&self.key, &self.fingerprint, message_ids);
+        debug_assert!(completed, "active send reservation must still exist");
+        self.active = !completed;
+    }
+}
+
+impl Drop for SendIdempotencyReservationGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.store.release_reservation(&self.key, &self.fingerprint);
+        }
+    }
 }
 
 impl SendIdempotencyStore {
@@ -109,6 +157,7 @@ impl SendIdempotencyStore {
     /// The message ids recorded for `key` by an earlier successful send, but only
     /// when the recorded request `fingerprint` matches. A key hit with a different
     /// fingerprint returns `None` (treated as a cache miss).
+    #[cfg(test)]
     pub(crate) fn get(&self, key: &str, fingerprint: &str) -> Option<Vec<String>> {
         crate::lock_recover(&self.inner)
             .seen
@@ -117,30 +166,140 @@ impl SendIdempotencyStore {
             .map(|(_, ids)| ids.clone())
     }
 
+    pub(crate) fn reserve(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<SendIdempotencyReservation, ConnectorError> {
+        let mut inner = crate::lock_recover(&self.inner);
+        if let Some((recorded, message_ids)) = inner.seen.get(key) {
+            if !constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()) {
+                return Err(ConnectorError::IdempotencyKeyConflict);
+            }
+            return Ok(SendIdempotencyReservation::Completed(message_ids.clone()));
+        }
+        if let Some(in_flight) = inner.in_flight.get(key) {
+            if !constant_time_eq(in_flight.fingerprint.as_bytes(), fingerprint.as_bytes()) {
+                return Err(ConnectorError::IdempotencyKeyConflict);
+            }
+            return Ok(SendIdempotencyReservation::Wait(
+                in_flight.completion.subscribe(),
+            ));
+        }
+
+        let (completion, _receiver) = watch::channel(false);
+        inner.in_flight.insert(
+            key.to_owned(),
+            InFlightSendIdempotency {
+                fingerprint: fingerprint.to_owned(),
+                completion,
+            },
+        );
+        Ok(SendIdempotencyReservation::Leader(
+            SendIdempotencyReservationGuard {
+                store: self.clone(),
+                key: key.to_owned(),
+                fingerprint: fingerprint.to_owned(),
+                active: true,
+            },
+        ))
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Result<SendIdempotencyAcquisition, ConnectorError> {
+        loop {
+            match self.reserve(key, fingerprint)? {
+                SendIdempotencyReservation::Completed(message_ids) => {
+                    return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+                }
+                SendIdempotencyReservation::Wait(mut completion) => {
+                    if !*completion.borrow() {
+                        let _ = completion.changed().await;
+                    }
+                }
+                SendIdempotencyReservation::Leader(guard) => {
+                    return Ok(SendIdempotencyAcquisition::Leader(guard));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn status(&self, key: &str) -> SendIdempotencyStatus {
+        let inner = crate::lock_recover(&self.inner);
+        if let Some((_, message_ids)) = inner.seen.get(key) {
+            return SendIdempotencyStatus::Committed(message_ids.clone());
+        }
+        if inner.in_flight.contains_key(key) {
+            return SendIdempotencyStatus::Pending;
+        }
+        SendIdempotencyStatus::Unknown
+    }
+
+    fn complete_reservation(&self, key: &str, fingerprint: &str, message_ids: Vec<String>) -> bool {
+        let completion = {
+            let mut inner = crate::lock_recover(&self.inner);
+            let matches = inner.in_flight.get(key).is_some_and(|in_flight| {
+                constant_time_eq(in_flight.fingerprint.as_bytes(), fingerprint.as_bytes())
+            });
+            if !matches {
+                return false;
+            }
+            let completion = inner
+                .in_flight
+                .remove(key)
+                .expect("checked in-flight reservation")
+                .completion;
+            insert_committed(
+                &mut inner,
+                key.to_owned(),
+                fingerprint.to_owned(),
+                message_ids,
+            );
+            completion
+        };
+        let _ = completion.send(true);
+        self.persist_off_hot_path();
+        true
+    }
+
+    fn release_reservation(&self, key: &str, fingerprint: &str) {
+        let completion = {
+            let mut inner = crate::lock_recover(&self.inner);
+            let matches = inner.in_flight.get(key).is_some_and(|in_flight| {
+                constant_time_eq(in_flight.fingerprint.as_bytes(), fingerprint.as_bytes())
+            });
+            if !matches {
+                return;
+            }
+            inner
+                .in_flight
+                .remove(key)
+                .expect("checked in-flight reservation")
+                .completion
+        };
+        let _ = completion.send(true);
+    }
+
     /// Record the request `fingerprint` and durable message ids produced for
     /// `key`. A repeat record for an existing key keeps the original entry (the
     /// first successful send wins); otherwise the key is appended and the oldest
     /// is evicted once at capacity.
+    #[cfg(test)]
     pub(crate) fn record(&self, key: String, fingerprint: String, message_ids: Vec<String>) {
         let should_persist = {
             let mut inner = crate::lock_recover(&self.inner);
-            if inner.seen.contains_key(&key) {
-                return;
-            }
-            if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
-                && let Some(evicted) = inner.order.pop_front()
-            {
-                inner.seen.remove(&evicted);
-                inner.recorded_at.remove(&evicted);
-            }
-            inner.seen.insert(key.clone(), (fingerprint, message_ids));
-            inner.recorded_at.insert(key.clone(), unix_timestamp_secs());
-            inner.order.push_back(key);
-            true
+            insert_committed(&mut inner, key, fingerprint, message_ids)
         };
         if !should_persist {
             return;
         }
+        self.persist_off_hot_path();
+    }
+
+    fn persist_off_hot_path(&self) {
         // #691: persist OFF the async send hot path. The in-memory entry recorded
         // above already enforces first-write-wins for the lifetime of this process,
         // so the (fs + double-fsync) disk write does not need to block the caller.
@@ -274,6 +433,27 @@ impl SendIdempotencyStore {
     }
 }
 
+fn insert_committed(
+    inner: &mut SendIdempotencyInner,
+    key: String,
+    fingerprint: String,
+    message_ids: Vec<String>,
+) -> bool {
+    if inner.seen.contains_key(&key) {
+        return false;
+    }
+    if inner.order.len() >= SEND_IDEMPOTENCY_CAPACITY
+        && let Some(evicted) = inner.order.pop_front()
+    {
+        inner.seen.remove(&evicted);
+        inner.recorded_at.remove(&evicted);
+    }
+    inner.seen.insert(key.clone(), (fingerprint, message_ids));
+    inner.recorded_at.insert(key.clone(), unix_timestamp_secs());
+    inner.order.push_back(key);
+    true
+}
+
 fn inner_from_persisted(entries: Vec<PersistedSendIdempotencyEntry>) -> SendIdempotencyInner {
     let mut inner = SendIdempotencyInner::default();
     for entry in entries {
@@ -387,6 +567,7 @@ impl Drop for StreamBeginReservationGuard {
 #[derive(Clone)]
 pub(crate) struct ActiveStreamSession {
     pub(crate) account_label: String,
+    pub(crate) account_id_hex: String,
     pub(crate) group_id: GroupId,
     pub(crate) stream_id: Vec<u8>,
     pub(crate) stream_capability: [u8; 32],
