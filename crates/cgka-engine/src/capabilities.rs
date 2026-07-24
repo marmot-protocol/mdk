@@ -19,6 +19,11 @@ use openmls_traits::types::Ciphersuite;
 /// Derive the per-leaf `Capabilities` this client advertises. Includes every
 /// feature in the registry regardless of level — that's what "I support this"
 /// means at the leaf.
+///
+/// Runtime support deliberately remains broader than the profile emitted for
+/// new KeyPackages: create/invite gates require candidates to match the target
+/// group profile, while join/reopen must continue accepting both profiles so
+/// existing legacy groups remain usable after the strict cutover.
 pub(crate) fn leaf_capabilities(
     registry: &FeatureRegistry,
     ciphersuite: Ciphersuite,

@@ -455,6 +455,9 @@ fn verify_proof_signature(
 }
 
 fn validate_current_timestamp(created_at: u64) -> Result<(), String> {
+    // The adopted account-identity-proof-v2 profile constrains the NIP-01
+    // integer range but explicitly gives proofs no receiver-side age limit.
+    // Do not add past-age or future-skew rejection here.
     if !(1..=MAX_NIP01_TIMESTAMP).contains(&created_at) {
         return Err(format!(
             "current proof timestamp must be in 1..={MAX_NIP01_TIMESTAMP}"

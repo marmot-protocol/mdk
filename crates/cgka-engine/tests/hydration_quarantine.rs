@@ -247,6 +247,38 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
 }
 
 #[tokio::test]
+async fn hydration_classifies_stored_wire_profile_mismatch_as_member_validation_failure() {
+    let storage = SqliteAccountStorage::in_memory().expect("storage");
+    let mut initial = build_engine(storage.clone());
+    let group_id = create_confirmed_group(&mut initial).await;
+    drop(initial);
+
+    let mut stored_group = storage.get_group(&group_id).expect("stored group");
+    assert_eq!(
+        stored_group.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy,
+        "test setup expects the legacy builder default"
+    );
+    stored_group.protocol_profile = cgka_traits::group::ProtocolProfile::Current;
+    storage
+        .put_group(&stored_group)
+        .expect("corrupt stored profile");
+
+    let mut reopened = build_engine(storage);
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("profile mismatch quarantines instead of aborting account open");
+
+    assert_eq!(
+        reopened.quarantined_groups(),
+        vec![(
+            group_id,
+            GroupHydrationQuarantineReason::MemberValidationFailed
+        )]
+    );
+}
+
+#[tokio::test]
 async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_group() {
     let storage = SqliteAccountStorage::in_memory().expect("storage");
     let broken_group = GroupId::new(vec![0]);

@@ -24,6 +24,12 @@ pub struct Identity {
     pub(crate) signer: SignatureKeyPair,
     pub(crate) credential_with_key: CredentialWithKey,
     pub(crate) self_id: MemberId,
+    /// Proof material minted for this engine session.
+    ///
+    /// Current-profile proofs bind a fresh `created_at`, so they are rebuilt
+    /// whenever an [`Identity`] is constructed even when the persisted MLS
+    /// signer is reused. Callers must not treat these bytes as durable across
+    /// account-device session restarts.
     pub(crate) account_identity_proof: crate::account_identity_proof::AccountIdentityProofMaterial,
 }
 

@@ -123,7 +123,8 @@ realises. Read those rustdocs as the source of truth — this table is just an i
   - **Owns:** `PURE_PLAINTEXT_WIRE_FORMAT_POLICY` + the `WIRE_FORMAT_POLICY_REVIEW_REQUIRED` grep marker
 
 - **Module:** `account_identity_proof.rs`
-  - **Owns:** the Marmot account identity-proof LeafNode extension binding the account key to the MLS signature key
+  - **Owns:** legacy account identity-proof LeafNode extension plus the current app-data component; proof
+    construction/validation and strict legacy/current profile classification (including mixed-profile rejection)
 
 - **Module:** `app_payload.rs`
   - **Owns:** `validate_app_payload_for_sender` — `MarmotAppEvent` sender validation for application messages

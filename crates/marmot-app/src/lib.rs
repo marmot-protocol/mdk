@@ -3386,7 +3386,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             key_package: publication.key_package.clone(),
             key_package_slot_id: key_package_id.clone(),
             key_package_ref: key_package_ref_hex.clone(),
-            mls_ciphersuite: "0x0001".into(),
+            mls_ciphersuite: format!("0x{:04x}", metadata.ciphersuite),
             mls_extensions: metadata
                 .mls_extensions
                 .iter()
@@ -3400,7 +3400,9 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             app_components: metadata
                 .app_components
                 .iter()
-                .filter(|id| **id >= 0x8000)
+                .filter(|id| {
+                    **id >= cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START
+                })
                 .map(|id| format!("0x{id:04x}"))
                 .collect(),
             publish_endpoints: publication.endpoints.clone(),

@@ -49,6 +49,13 @@ pub use routing::{NostrRoutingV1, decode_nostr_routing_v1, encode_nostr_routing_
 /// MLS ComponentID.
 pub type AppComponentId = u16;
 
+/// First application-component id in the private-use range.
+///
+/// Kind-30443 KeyPackage events publish only private-use application
+/// components; upstream standardized component ids below this boundary remain
+/// discoverable from the decoded MLS capabilities.
+pub const PRIVATE_USE_APP_COMPONENT_ID_START: AppComponentId = 0x8000;
+
 /// Upstream MLS extensions draft component that carries supported/required
 /// application component ids in an `AppDataDictionary` entry.
 pub const APP_COMPONENTS_COMPONENT_ID: AppComponentId = 0x0001;

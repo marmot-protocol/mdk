@@ -864,7 +864,7 @@ impl<S: StorageProvider> Engine<S> {
             .get_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
         if group.protocol_profile != wire_protocol_profile {
-            return Err(GroupHydrationQuarantineReason::GroupRecordLoadFailed);
+            return Err(GroupHydrationQuarantineReason::MemberValidationFailed);
         }
 
         // A staged commit that survived process restart *may* mean the
