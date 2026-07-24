@@ -1914,7 +1914,7 @@ impl MarmotApp {
     /// Ingest inbound push-token gossip (kinds 447/448/449) into
     /// `group_push_tokens`. `active_member_ids` is the carrying group's current
     /// MLS member set; entries are owner-authenticated and bound to it by
-    /// [`notifications::verify_push_gossip`] before the spec's
+    /// [`notifications::verify_push_gossip_for_profile`] before the spec's
     /// `(owner_ts, record_digest)` ordering primitive and tombstones (enforced by
     /// the storage `apply_*` calls) decide what mutates state. Because authority
     /// comes from each record's `owner_sig`, a kind 448 may carry — and apply —
@@ -1924,6 +1924,7 @@ impl MarmotApp {
         account_ref: &str,
         message: &ReceivedMessage,
         active_member_ids: &[String],
+        profile: cgka_traits::group::ProtocolProfile,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
@@ -1931,7 +1932,12 @@ impl MarmotApp {
         let storage = self.account_storage(&account.label)?;
         let action =
             notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)?;
-        let action = notifications::verify_push_gossip(action, &group_id_hex, active_member_ids);
+        let action = notifications::verify_push_gossip_for_profile(
+            action,
+            &group_id_hex,
+            active_member_ids,
+            profile,
+        );
         match action {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
