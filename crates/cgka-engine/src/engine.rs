@@ -547,6 +547,16 @@ impl<S: StorageProvider> Engine<S> {
         req: CreateGroupRequest,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
+        self.create_group_with_optional_app_components_and_audit_context(req, Vec::new(), context)
+            .await
+    }
+
+    pub async fn create_group_with_optional_app_components_and_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        context: Option<AuditEventContext>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
         let operation_id = self.next_audit_operation_id();
         let mut context = context.unwrap_or_default();
         context.operation_id = Some(operation_id);
@@ -557,12 +567,13 @@ impl<S: StorageProvider> Engine<S> {
             AuditEventKind::CreateGroupEntry {
                 member_count: req.members.len() as u64,
                 required_feature_count: req.required_features.len() as u64,
-                app_component_count: req.app_components.len() as u64,
+                app_component_count: (req.app_components.len() + optional_app_components.len())
+                    as u64,
                 initial_admin_count: req.initial_admins.len() as u64,
             },
         );
         self.current_audit_context = Some(context.clone());
-        let result = self.do_create_group(req).await;
+        let result = self.do_create_group(req, optional_app_components).await;
         match &result {
             Ok((group_id, send_result)) => {
                 let mut outcome_context = context.clone();
@@ -1850,6 +1861,19 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
         req: CreateGroupRequest,
     ) -> Result<(GroupId, SendResult), EngineError> {
         self.create_group_with_audit_context(req, None).await
+    }
+
+    async fn create_group_with_optional_app_components(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        self.create_group_with_optional_app_components_and_audit_context(
+            req,
+            optional_app_components,
+            None,
+        )
+        .await
     }
 
     async fn join_welcome(

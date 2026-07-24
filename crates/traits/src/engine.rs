@@ -698,6 +698,25 @@ pub trait CgkaEngine: Send + Sync {
         req: CreateGroupRequest,
     ) -> Result<(GroupId, SendResult), EngineError>;
 
+    /// Create a group with additional initial GroupContext component state
+    /// that is deliberately not added to the group's required-component list.
+    ///
+    /// Optional state is useful for progressive presentation features such as
+    /// group avatars: capable members can render it, while the state does not
+    /// become a permanent membership gate.
+    async fn create_group_with_optional_app_components(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<AppComponentData>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        if optional_app_components.is_empty() {
+            return self.create_group(req).await;
+        }
+        Err(EngineError::Other(
+            "this engine does not support optional initial app-component state".into(),
+        ))
+    }
+
     /// Accept a welcome addressed to the local identity.
     ///
     /// **Errors.** Returns `Peeler(...)` if the welcome was not addressed to

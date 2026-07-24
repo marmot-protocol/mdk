@@ -39,6 +39,33 @@ use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary
 /// protocol's retained-epoch windows.
 const MAX_PRIOR_NOSTR_ROUTES: usize = 32;
 
+/// Initial group-image input for encrypted-Blossom-first creation.
+///
+/// The host owns discovery and download. MDK receives the decoded image bytes,
+/// prefers encrypting and uploading them to Blossom, and uses `source_url`
+/// only as a negotiated fallback when a founding member does not advertise the
+/// encrypted Blossom image component.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AppInitialGroupImage {
+    pub plaintext: Vec<u8>,
+    pub media_type: String,
+    pub source_url: Option<String>,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+impl std::fmt::Debug for AppInitialGroupImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppInitialGroupImage")
+            .field("plaintext_len", &self.plaintext.len())
+            .field("media_type", &self.media_type)
+            .field("has_source_url", &self.source_url.is_some())
+            .field("dim", &self.dim)
+            .field("thumbhash", &self.thumbhash)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupRecord {
     pub group_id_hex: String,
