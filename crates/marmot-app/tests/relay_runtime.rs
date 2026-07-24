@@ -31,7 +31,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, Instant, sleep, timeout};
-use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, NostrRelayClient, NostrSdkRelayClient};
+use transport_nostr_adapter::{
+    KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST, NostrRelayClient, NostrSdkRelayClient,
+};
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
 const AUDIT_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -4518,6 +4520,50 @@ async fn relay_app_public_methods_read_and_update_each_account_relay_list() {
 }
 
 #[tokio::test]
+async fn relay_app_nip65_getter_setter_round_trip_preserves_roles() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let (_seed, app, seed_url) = mock_app(&dir).await;
+    let read_only_url = "wss://read-only.example".to_owned();
+
+    let status = app
+        .publish_account_nip65_relay_set(
+            "alice",
+            vec![endpoint(&seed_url), endpoint(&read_only_url)],
+            vec![endpoint(&seed_url)],
+            vec![endpoint(&seed_url)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status.nip65.read_relays,
+        vec![seed_url.clone(), read_only_url.clone()]
+    );
+    assert_eq!(status.nip65.write_relays, vec![seed_url.clone()]);
+
+    let editable_relays = app.account_nip65_relays("alice").unwrap();
+    assert_eq!(
+        editable_relays,
+        vec![seed_url.clone(), read_only_url.clone()]
+    );
+    let status = app
+        .set_account_nip65_relays(
+            "alice",
+            editable_relays.into_iter().map(TransportEndpoint).collect(),
+            vec![endpoint(&seed_url)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status.nip65.read_relays,
+        vec![seed_url.clone(), read_only_url]
+    );
+    assert_eq!(status.nip65.write_relays, vec![seed_url]);
+}
+
+#[tokio::test]
 async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -4583,6 +4629,50 @@ async fn relay_list_empty_fetch_keeps_cached_lists() {
         .unwrap()
         .expect("cached directory entry");
     assert_eq!(directory_entry.relay_lists, cached);
+}
+
+#[tokio::test]
+async fn relay_list_all_read_fetch_clears_cached_write_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let (_seed, app, seed_url) = mock_app(&dir).await;
+
+    let cached = app
+        .publish_account_relay_lists(
+            "alice",
+            AccountRelayListBootstrap::new(vec![endpoint(&seed_url)], vec![endpoint(&seed_url)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.nip65.relays, vec![seed_url.clone()]);
+
+    publish_nostr_event_at(
+        &home,
+        "alice",
+        &seed_url,
+        KIND_NIP65_RELAY_LIST,
+        vec![vec![
+            "r".to_owned(),
+            "wss://read-only.example".to_owned(),
+            "read".to_owned(),
+        ]],
+        String::new(),
+        test_unix_now_seconds() + 1,
+    )
+    .await;
+
+    let account_id = home.account("alice").unwrap().account_id_hex;
+    let fetched = app
+        .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_url)])
+        .await
+        .unwrap();
+
+    assert!(fetched.nip65.relays.is_empty());
+    assert!(fetched.nip65.write_relays.is_empty());
+    assert_eq!(fetched.nip65.read_relays, vec!["wss://read-only.example"]);
+    assert_eq!(fetched.inbox, cached.inbox);
+    assert_eq!(fetched.missing, vec![MissingRelayListKind::Nip65]);
 }
 
 #[tokio::test]

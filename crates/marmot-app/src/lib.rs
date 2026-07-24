@@ -58,7 +58,8 @@ use storage_sqlite::{
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrKeyPackagePublication,
-    NostrKeyPackagePublisher, NostrRelayClient, NostrSdkRelayClient, parse_nip65_relay_set,
+    NostrKeyPackagePublisher, NostrNip65RelayListPublication, NostrNip65RelaySet, NostrRelayClient,
+    NostrSdkRelayClient, parse_nip65_relay_set,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
@@ -512,6 +513,18 @@ pub struct AccountRelayListState {
     /// unmarked and `write` entries, excluding `read`-only entries. For the
     /// Marmot inbox list this is the declared inbox relay set.
     pub relays: Vec<String>,
+    /// NIP-65 read-capable relays, including unmarked entries.
+    ///
+    /// Empty for non-NIP-65 lists and for cache records written before
+    /// directional roles were persisted.
+    #[serde(default)]
+    pub read_relays: Vec<String>,
+    /// NIP-65 write-capable relays, including unmarked entries.
+    ///
+    /// This is the explicit directional counterpart of the compatibility
+    /// `relays` field. Empty for non-NIP-65 lists and for legacy cache records.
+    #[serde(default)]
+    pub write_relays: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,10 +560,14 @@ impl AccountRelayListStatus {
             nip65: AccountRelayListState {
                 kind: KIND_NIP65_RELAY_LIST,
                 relays: Vec::new(),
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
             },
             inbox: AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
                 relays: Vec::new(),
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
             },
         };
         status.refresh();
@@ -1231,8 +1248,27 @@ impl MarmotApp {
         .await
     }
 
+    /// Return every declared NIP-65 relay for backward-compatible list editing.
+    ///
+    /// Routing code must use `AccountRelayListStatus::nip65.relays`, which is
+    /// the write-capable subset. Returning the union here keeps the established
+    /// getter -> edit -> setter flow from deleting read-only entries.
     pub fn account_nip65_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
-        Ok(self.account_relay_list_status(label)?.nip65.relays)
+        let state = self.account_relay_list_status(label)?.nip65;
+        let relay_set = nip65_relay_set_from_state(&state);
+        let mut relays = relay_set
+            .read_relays
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect::<Vec<_>>();
+        push_unique_strings(
+            &mut relays,
+            relay_set
+                .write_relays
+                .into_iter()
+                .map(|endpoint| endpoint.0),
+        );
+        Ok(relays)
     }
 
     pub fn account_inbox_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
@@ -1245,11 +1281,35 @@ impl MarmotApp {
         relays: Vec<TransportEndpoint>,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<AccountRelayListStatus, AppError> {
-        self.set_account_relay_list_kind(
+        let current = self.account_relay_list_status(label)?.nip65;
+        let relay_set = nip65_relay_set_preserving_roles(&current, relays);
+        self.publish_account_nip65_relay_set(
             label,
-            NostrAccountRelayListKind::Nip65,
-            relays,
+            relay_set.read_relays,
+            relay_set.write_relays,
             bootstrap_relays,
+        )
+        .await
+    }
+
+    /// Replace the account's NIP-65 list while preserving explicit relay
+    /// directions in the published kind-10002 event.
+    pub async fn publish_account_nip65_relay_set(
+        &self,
+        label: &str,
+        read_relays: Vec<TransportEndpoint>,
+        write_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let relay_set = NostrNip65RelaySet {
+            read_relays: unique_transport_endpoints(read_relays),
+            write_relays: unique_transport_endpoints(write_relays),
+        };
+        self.publish_selected_account_relay_lists_with_nip65(
+            label,
+            AccountRelayListBootstrap::new(relay_set.write_relays.clone(), bootstrap_relays),
+            &[NostrAccountRelayListKind::Nip65],
+            Some(&relay_set),
         )
         .await
     }
@@ -1290,7 +1350,21 @@ impl MarmotApp {
         bootstrap: AccountRelayListBootstrap,
         list_kinds: &[NostrAccountRelayListKind],
     ) -> Result<AccountRelayListStatus, AppError> {
-        if bootstrap.default_relays.is_empty() {
+        self.publish_selected_account_relay_lists_with_nip65(label, bootstrap, list_kinds, None)
+            .await
+    }
+
+    async fn publish_selected_account_relay_lists_with_nip65(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        list_kinds: &[NostrAccountRelayListKind],
+        nip65_relay_set: Option<&NostrNip65RelaySet>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let has_directional_nip65_relays = nip65_relay_set.is_some_and(|relays| {
+            !relays.read_relays.is_empty() || !relays.write_relays.is_empty()
+        });
+        if bootstrap.default_relays.is_empty() && !has_directional_nip65_relays {
             return Err(AppError::MissingDefaultRelays);
         }
         let account = self.account_home().account(label)?;
@@ -1319,13 +1393,24 @@ impl MarmotApp {
         }
         let relay_client = self.relay_client_for_endpoints(signer.as_nostr_signer(), &endpoints);
         for list_kind in list_kinds {
-            let publication = NostrAccountRelayListPublication {
-                account_id: account_id.clone(),
-                list_kind: *list_kind,
-                relays: bootstrap.default_relays.clone(),
-                publish_endpoints: endpoints.clone(),
+            let event = if *list_kind == NostrAccountRelayListKind::Nip65
+                && let Some(relays) = nip65_relay_set
+            {
+                NostrNip65RelayListPublication {
+                    account_id: account_id.clone(),
+                    relays: relays.clone(),
+                    publish_endpoints: endpoints.clone(),
+                }
+                .to_event()?
+            } else {
+                NostrAccountRelayListPublication {
+                    account_id: account_id.clone(),
+                    list_kind: *list_kind,
+                    relays: bootstrap.default_relays.clone(),
+                    publish_endpoints: endpoints.clone(),
+                }
+                .to_event()?
             };
-            let event = publication.to_event()?;
             relay_client.publish_event(&endpoints, &event, 1).await?;
         }
         self.fetch_account_relay_list_status_for_account_id(&account_id_hex, endpoints)
@@ -3524,28 +3609,117 @@ fn sqlite_file_requires_key(path: &Path) -> bool {
         .is_err()
 }
 
+#[cfg(test)]
 fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
-    if event.kind == KIND_NIP65_RELAY_LIST {
-        return parse_nip65_relay_set(event)
-            .write_relays
-            .into_iter()
-            .map(|endpoint| endpoint.0)
-            .collect();
-    }
+    relay_list_state_from_event(event)
+        .map(|state| state.relays)
+        .unwrap_or_default()
+}
 
-    let tag_name = match event.kind {
-        KIND_MARMOT_INBOX_RELAY_LIST => "relay",
-        _ => return Vec::new(),
-    };
-    let mut relays = Vec::new();
-    for tag in &event.tags {
-        if tag.first().is_some_and(|name| name == tag_name)
-            && let Some(value) = tag.get(1).filter(|value| !value.trim().is_empty())
-        {
-            push_unique_strings(&mut relays, [value.clone()]);
+fn relay_list_state_from_event(event: &NostrTransportEvent) -> Option<AccountRelayListState> {
+    match event.kind {
+        KIND_NIP65_RELAY_LIST => {
+            let relay_set = parse_nip65_relay_set(event);
+            let read_relays = relay_set
+                .read_relays
+                .into_iter()
+                .map(|endpoint| endpoint.0)
+                .collect::<Vec<_>>();
+            let write_relays = relay_set
+                .write_relays
+                .into_iter()
+                .map(|endpoint| endpoint.0)
+                .collect::<Vec<_>>();
+            Some(AccountRelayListState {
+                kind: KIND_NIP65_RELAY_LIST,
+                relays: write_relays.clone(),
+                read_relays,
+                write_relays,
+            })
+        }
+        KIND_MARMOT_INBOX_RELAY_LIST => {
+            let mut relays = Vec::new();
+            for tag in &event.tags {
+                if tag.first().is_some_and(|name| name == "relay")
+                    && let Some(value) = tag.get(1).filter(|value| !value.trim().is_empty())
+                {
+                    push_unique_strings(&mut relays, [value.clone()]);
+                }
+            }
+            Some(AccountRelayListState {
+                kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                relays,
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn nip65_relay_set_from_state(state: &AccountRelayListState) -> NostrNip65RelaySet {
+    if state.read_relays.is_empty() && state.write_relays.is_empty() {
+        let legacy_relays = state
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        return NostrNip65RelaySet {
+            read_relays: legacy_relays.clone(),
+            write_relays: legacy_relays,
+        };
+    }
+    NostrNip65RelaySet {
+        read_relays: state
+            .read_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect(),
+        write_relays: state
+            .write_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect(),
+    }
+}
+
+fn nip65_relay_set_preserving_roles(
+    current: &AccountRelayListState,
+    requested_relays: Vec<TransportEndpoint>,
+) -> NostrNip65RelaySet {
+    let current = nip65_relay_set_from_state(current);
+    let mut next = NostrNip65RelaySet::default();
+    for endpoint in unique_transport_endpoints(requested_relays) {
+        let was_read = current.read_relays.contains(&endpoint);
+        let was_write = current.write_relays.contains(&endpoint);
+        if !was_read && !was_write {
+            next.read_relays.push(endpoint.clone());
+            next.write_relays.push(endpoint);
+            continue;
+        }
+        if was_read {
+            next.read_relays.push(endpoint.clone());
+        }
+        if was_write {
+            next.write_relays.push(endpoint);
         }
     }
-    relays
+    next
+}
+
+fn unique_transport_endpoints(
+    endpoints: impl IntoIterator<Item = TransportEndpoint>,
+) -> Vec<TransportEndpoint> {
+    let mut unique = Vec::new();
+    for endpoint in endpoints {
+        if !unique.contains(&endpoint) {
+            unique.push(endpoint);
+        }
+    }
+    unique
 }
 
 fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {

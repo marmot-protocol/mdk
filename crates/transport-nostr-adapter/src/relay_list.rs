@@ -24,8 +24,9 @@ pub struct NostrNip65RelaySet {
 ///
 /// This is intentionally a tolerant list parser: a hostile or future
 /// extension tag must not turn a different valid `r` entry into a relay
-/// target. Exact two-element tags are unmarked (read and write); exact
-/// three-element tags accept only the NIP-65 `read` and `write` markers.
+/// target. Two-element tags are unmarked (read and write); longer tags accept
+/// only the NIP-65 `read` and `write` markers in the third position and ignore
+/// trailing extension values.
 pub fn parse_nip65_relay_set(event: &NostrTransportEvent) -> NostrNip65RelaySet {
     if event.kind != KIND_NIP65_RELAY_LIST {
         return NostrNip65RelaySet::default();
@@ -34,18 +35,19 @@ pub fn parse_nip65_relay_set(event: &NostrTransportEvent) -> NostrNip65RelaySet 
     let mut relays = NostrNip65RelaySet::default();
     for tag in &event.tags {
         let (relay, read, write) = match tag.as_slice() {
-            [name, relay] if name == NIP65_RELAY_TAG && !relay.trim().is_empty() => {
-                (relay, true, true)
-            }
-            [name, relay, marker]
-                if name == NIP65_RELAY_TAG && !relay.trim().is_empty() && marker == "read" =>
+            [name, relay, marker_and_extensions @ ..]
+                if name == NIP65_RELAY_TAG && !relay.trim().is_empty() =>
             {
-                (relay, true, false)
-            }
-            [name, relay, marker]
-                if name == NIP65_RELAY_TAG && !relay.trim().is_empty() && marker == "write" =>
-            {
-                (relay, false, true)
+                match marker_and_extensions.first().map(String::as_str) {
+                    None => (relay.trim(), true, true),
+                    Some(marker) if marker.eq_ignore_ascii_case("read") => {
+                        (relay.trim(), true, false)
+                    }
+                    Some(marker) if marker.eq_ignore_ascii_case("write") => {
+                        (relay.trim(), false, true)
+                    }
+                    Some(_) => continue,
+                }
             }
             _ => continue,
         };
@@ -61,6 +63,7 @@ pub fn parse_nip65_relay_set(event: &NostrTransportEvent) -> NostrNip65RelaySet 
 }
 
 fn push_unique_endpoint(endpoints: &mut Vec<TransportEndpoint>, relay: &str) {
+    let relay = relay.trim();
     if !endpoints.iter().any(|endpoint| endpoint.0 == relay) {
         endpoints.push(TransportEndpoint(relay.to_owned()));
     }
@@ -136,6 +139,69 @@ impl NostrAccountRelayListPublication {
     }
 }
 
+/// A role-preserving NIP-65 kind-10002 publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrNip65RelayListPublication {
+    pub account_id: MemberId,
+    pub relays: NostrNip65RelaySet,
+    pub publish_endpoints: Vec<TransportEndpoint>,
+}
+
+impl NostrNip65RelayListPublication {
+    pub fn to_event(&self) -> Result<NostrTransportEvent, TransportAdapterError> {
+        if self.account_id.as_slice().len() != 32 {
+            return Err(TransportAdapterError::Publish(
+                "account relay-list author must be a 32-byte Nostr pubkey".into(),
+            ));
+        }
+        if self.relays.read_relays.is_empty() && self.relays.write_relays.is_empty() {
+            return Err(TransportAdapterError::Publish(
+                "account relay-list relays must not be empty".into(),
+            ));
+        }
+        if self.publish_endpoints.is_empty() {
+            return Err(TransportAdapterError::Publish(
+                "account relay-list publish endpoints must not be empty".into(),
+            ));
+        }
+
+        let mut tags = Vec::new();
+        for endpoint in &self.relays.read_relays {
+            let write = self
+                .relays
+                .write_relays
+                .iter()
+                .any(|candidate| candidate == endpoint);
+            let mut tag = vec![NIP65_RELAY_TAG.into(), endpoint.0.clone()];
+            if !write {
+                tag.push("read".into());
+            }
+            tags.push(tag);
+        }
+        for endpoint in &self.relays.write_relays {
+            if self
+                .relays
+                .read_relays
+                .iter()
+                .any(|candidate| candidate == endpoint)
+            {
+                continue;
+            }
+            tags.push(vec![
+                NIP65_RELAY_TAG.into(),
+                endpoint.0.clone(),
+                "write".into(),
+            ]);
+        }
+        Ok(NostrTransportEvent::new_unsigned(
+            hex::encode(self.account_id.as_slice()),
+            KIND_NIP65_RELAY_LIST,
+            tags,
+            String::new(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +255,9 @@ mod tests {
                     "write".into(),
                     "extra".into(),
                 ],
+                vec!["r".into(), "wss://uppercase.example".into(), "READ".into()],
+                vec!["r".into(), " wss://trimmed.example ".into()],
+                vec!["r".into(), "wss://trimmed.example".into()],
                 vec!["r".into(), "".into()],
                 vec!["not-r".into(), "wss://wrong-tag.example".into()],
             ],
@@ -203,6 +272,8 @@ mod tests {
                 TransportEndpoint("wss://both.example".into()),
                 TransportEndpoint("wss://read.example".into()),
                 TransportEndpoint("wss://split.example".into()),
+                TransportEndpoint("wss://uppercase.example".into()),
+                TransportEndpoint("wss://trimmed.example".into()),
             ]
         );
         assert_eq!(
@@ -211,6 +282,8 @@ mod tests {
                 TransportEndpoint("wss://both.example".into()),
                 TransportEndpoint("wss://write.example".into()),
                 TransportEndpoint("wss://split.example".into()),
+                TransportEndpoint("wss://extra-field.example".into()),
+                TransportEndpoint("wss://trimmed.example".into()),
             ]
         );
     }
@@ -225,6 +298,36 @@ mod tests {
         );
 
         assert_eq!(parse_nip65_relay_set(&event), NostrNip65RelaySet::default());
+    }
+
+    #[test]
+    fn nip65_publication_preserves_directional_roles() {
+        let publication = NostrNip65RelayListPublication {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            relays: NostrNip65RelaySet {
+                read_relays: vec![
+                    TransportEndpoint("wss://both.example".into()),
+                    TransportEndpoint("wss://read.example".into()),
+                ],
+                write_relays: vec![
+                    TransportEndpoint("wss://both.example".into()),
+                    TransportEndpoint("wss://write.example".into()),
+                ],
+            },
+            publish_endpoints: vec![TransportEndpoint("wss://seed.example".into())],
+        };
+
+        let event = publication.to_event().unwrap();
+
+        assert_eq!(
+            event.tags,
+            vec![
+                vec!["r", "wss://both.example"],
+                vec!["r", "wss://read.example", "read"],
+                vec!["r", "wss://write.example", "write"],
+            ]
+        );
+        assert_eq!(parse_nip65_relay_set(&event), publication.relays);
     }
 
     fn sample_publication(
