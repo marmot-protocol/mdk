@@ -56,6 +56,8 @@ mod migration_0027_app_event_moderation_grant;
 mod migration_0028_ingress_dedup;
 #[path = "migrations/0029_app_event_retention_decision.rs"]
 mod migration_0029_app_event_retention_decision;
+#[path = "migrations/0030_prior_nostr_routes.rs"]
+mod migration_0030_prior_nostr_routes;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -212,6 +214,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 29,
         name: "0029_app_event_retention_decision",
         apply: migration_0029_app_event_retention_decision::apply,
+    },
+    Migration {
+        version: 30,
+        name: "0030_prior_nostr_routes",
+        apply: migration_0030_prior_nostr_routes::apply,
     },
 ];
 
@@ -581,6 +588,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_membership, "member");
+    }
+
+    #[test]
+    fn prior_nostr_routes_migration_defaults_existing_groups_to_empty_history() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..29]).unwrap();
+        conn.execute(
+            "INSERT INTO account_groups (group_id_hex, endpoint, updated_at)
+             VALUES ('11', 'relay', 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        assert_eq!(
+            column_default(&conn, "account_groups", "prior_nostr_routes_json").as_deref(),
+            Some("'[]'")
+        );
+        assert_eq!(
+            column_default(&conn, "account_groups", "nostr_routing_last_epoch").as_deref(),
+            Some("0")
+        );
+        let history: String = conn
+            .query_row(
+                "SELECT prior_nostr_routes_json FROM account_groups WHERE group_id_hex = '11'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history, "[]");
     }
 
     #[test]

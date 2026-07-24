@@ -21,7 +21,8 @@ use crate::directory::records::{
 };
 use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
-    relay_list_queries, require_key_package_tag, require_multi_value_key_package_tag_matches,
+    relay_list_queries, relay_list_status_from_records, require_key_package_tag,
+    require_multi_value_key_package_tag_matches,
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
@@ -278,6 +279,158 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
     assert_eq!(
         selected_metadata.key_package_ref_hex,
         metadata.key_package_ref_hex
+    );
+}
+
+#[test]
+fn nip65_relay_list_targets_only_include_write_capable_entries() {
+    let event = NostrTransportEvent::new_unsigned(
+        "11".repeat(32),
+        KIND_NIP65_RELAY_LIST,
+        vec![
+            vec!["r".into(), "wss://both.example".into()],
+            vec!["r".into(), "wss://read-only.example".into(), "read".into()],
+            vec![
+                "r".into(),
+                "wss://write-only.example".into(),
+                "write".into(),
+            ],
+            vec!["r".into(), "wss://unknown.example".into(), "future".into()],
+            vec!["r".into(), "wss://both.example".into()],
+        ],
+        String::new(),
+    );
+
+    assert_eq!(
+        relays_from_relay_list_event(&event),
+        vec![
+            "wss://both.example".to_owned(),
+            "wss://write-only.example".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn newer_all_read_nip65_list_clears_stale_write_targets() {
+    let account_id = "11".repeat(32);
+    let mut older = NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec!["r".into(), "wss://stale-write.example".into()]],
+        String::new(),
+    );
+    older.created_at = 1;
+    older.id = "00".repeat(32);
+    let mut newer = NostrTransportEvent::new_unsigned(
+        account_id.clone(),
+        KIND_NIP65_RELAY_LIST,
+        vec![vec![
+            "r".into(),
+            "wss://read-only.example".into(),
+            "read".into(),
+        ]],
+        String::new(),
+    );
+    newer.created_at = 2;
+    newer.id = "11".repeat(32);
+
+    let status = relay_list_status_from_records(
+        &account_id,
+        vec![
+            crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://source.example".into())],
+                event: newer,
+            },
+            crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://source.example".into())],
+                event: older,
+            },
+        ],
+    );
+
+    assert!(status.nip65.relays.is_empty());
+    assert!(status.nip65.write_relays.is_empty());
+    assert_eq!(status.nip65.read_relays, vec!["wss://read-only.example"]);
+    assert_eq!(
+        status.missing,
+        vec![MissingRelayListKind::Nip65, MissingRelayListKind::Inbox]
+    );
+}
+
+#[test]
+fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account_id = "22".repeat(32);
+    let record = |tags| crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://source.example".into())],
+        event: NostrTransportEvent::new_unsigned(
+            account_id.clone(),
+            KIND_NIP65_RELAY_LIST,
+            tags,
+            String::new(),
+        ),
+    };
+
+    app.ingest_directory_relay_event(record(vec![vec![
+        "r".into(),
+        "wss://stale-write.example".into(),
+    ]]))
+    .unwrap();
+    app.ingest_directory_relay_event(record(vec![vec![
+        "r".into(),
+        "wss://read-only.example".into(),
+        "read".into(),
+    ]]))
+    .unwrap();
+
+    let cached = app
+        .directory_entry_for_account_id(&account_id)
+        .unwrap()
+        .expect("cached relay list");
+    assert!(cached.relay_lists.nip65.relays.is_empty());
+    assert!(cached.relay_lists.nip65.write_relays.is_empty());
+    assert_eq!(
+        cached.relay_lists.nip65.read_relays,
+        vec!["wss://read-only.example"]
+    );
+}
+
+#[test]
+fn nip65_setter_round_trip_preserves_existing_roles() {
+    let current = AccountRelayListState {
+        kind: KIND_NIP65_RELAY_LIST,
+        relays: vec!["wss://both.example".into(), "wss://write.example".into()],
+        read_relays: vec!["wss://both.example".into(), "wss://read.example".into()],
+        write_relays: vec!["wss://both.example".into(), "wss://write.example".into()],
+    };
+    let requested = vec![
+        TransportEndpoint("wss://both.example".into()),
+        TransportEndpoint("wss://read.example".into()),
+        TransportEndpoint("wss://write.example".into()),
+        TransportEndpoint("wss://new.example".into()),
+    ];
+
+    let next = nip65_relay_set_preserving_roles(&current, requested);
+
+    assert_eq!(
+        next.read_relays,
+        vec![
+            TransportEndpoint("wss://both.example".into()),
+            TransportEndpoint("wss://read.example".into()),
+            TransportEndpoint("wss://new.example".into()),
+        ]
+    );
+    assert_eq!(
+        next.write_relays,
+        vec![
+            TransportEndpoint("wss://both.example".into()),
+            TransportEndpoint("wss://write.example".into()),
+            TransportEndpoint("wss://new.example".into()),
+        ]
     );
 }
 
@@ -2876,12 +3029,8 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
     );
 }
 
-// Finding 2: an in-place nostr_group_id / relay rotation on an existing group
-// must switch the transport subscription. `add_group` previously early-returned
-// on a duplicate group_id, so a rotated route never took effect; it now replaces
-// by group_id and reports whether the route set changed.
 #[test]
-fn transport_add_group_replaces_route_for_same_group_on_rotation() {
+fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {
         local_inbox_endpoints: Vec::new(),
         key_package_endpoints: Vec::new(),
@@ -2895,19 +3044,15 @@ fn transport_add_group_replaces_route_for_same_group_on_rotation() {
         transport_group_id: vec![0x41; 32],
         endpoints: vec![TransportEndpoint("wss://x.example".to_owned())],
     };
-    // First insert of a new group route reports a change.
-    assert!(routing.add_group(sub_x.clone()));
-    // Re-adding the identical subscription is a no-op.
-    assert!(!routing.add_group(sub_x.clone()));
+    assert!(routing.replace_group_routes(&group_id, vec![sub_x.clone()]));
+    assert!(!routing.replace_group_routes(&group_id, vec![sub_x.clone()]));
 
-    // Rotation: same group_id, new transport_group_id + relay. Must replace the
-    // existing route, report a change, and NOT leave a duplicate for the group.
     let sub_y = TransportGroupSubscription {
         group_id: group_id.clone(),
         transport_group_id: vec![0x59; 32],
         endpoints: vec![TransportEndpoint("wss://y.example".to_owned())],
     };
-    assert!(routing.add_group(sub_y.clone()));
+    assert!(routing.replace_group_routes(&group_id, vec![sub_y.clone(), sub_x.clone()]));
 
     let snapshot = routing.snapshot();
     let routes: Vec<_> = snapshot
@@ -2915,6 +3060,101 @@ fn transport_add_group_replaces_route_for_same_group_on_rotation() {
         .iter()
         .filter(|route| route.group_id == group_id)
         .collect();
-    assert_eq!(routes.len(), 1, "rotation must replace, not duplicate");
-    assert_eq!(routes[0], &sub_y);
+    assert_eq!(routes.len(), 2);
+    assert!(routes.contains(&&sub_x));
+    assert!(routes.contains(&&sub_y));
+}
+
+#[test]
+fn reopening_account_restores_current_and_prior_group_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    let group_id_hex = "aa".repeat(16);
+    let mut group = AppGroupRecord::new(
+        group_id_hex.clone(),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0x22; 32], vec!["wss://current.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "routed".to_owned(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+    group.prior_nostr_routes = vec![AppPriorNostrRoute {
+        nostr_group_id_hex: hex::encode([0x11; 32]),
+        relays: vec!["wss://prior.example".to_owned()],
+        last_epoch: 7,
+    }];
+    group.nostr_routing_last_epoch = 8;
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: Some(1_800_000_000),
+        groups: vec![group],
+    })
+    .unwrap();
+    drop(app);
+
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    let state = reopened.load_state("alice").unwrap();
+    assert_eq!(state.groups[0].prior_nostr_routes[0].last_epoch, 7);
+    assert_eq!(state.groups[0].nostr_routing_last_epoch, 8);
+    let routes = reopened
+        .routing_for(&state)
+        .unwrap()
+        .snapshot()
+        .group_routes;
+    assert_eq!(routes.len(), 2);
+    assert_eq!(
+        routes
+            .iter()
+            .map(|route| route.transport_group_id.clone())
+            .collect::<HashSet<_>>(),
+        HashSet::from([vec![0x11; 32], vec![0x22; 32]])
+    );
+}
+
+#[test]
+fn account_routing_skips_malformed_groups_without_discarding_valid_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    let valid = AppGroupRecord::new(
+        "aa".repeat(16),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0x22; 32], vec!["wss://valid.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "valid".to_owned(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+    let mut malformed_group_id = valid.clone();
+    malformed_group_id.group_id_hex = "not-hex".to_owned();
+    let mut malformed_current_route = valid.clone();
+    malformed_current_route.group_id_hex = "bb".repeat(16);
+    malformed_current_route.nostr_routing.nostr_group_id_hex = "not-hex".to_owned();
+
+    let routes = app
+        .routing_for(&AccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![malformed_group_id, malformed_current_route, valid],
+        })
+        .expect("malformed group rows do not prevent account routing")
+        .snapshot()
+        .group_routes;
+
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].transport_group_id, vec![0x22; 32]);
 }

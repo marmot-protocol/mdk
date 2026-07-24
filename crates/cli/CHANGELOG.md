@@ -174,6 +174,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn relays add/remove --type nip65` now round-trips the complete directional NIP-65 list instead of deleting
+  read-only relays or flattening existing role markers. Relay-list JSON adds `read_relays` and `write_relays` alongside
+  the existing write-target `relays` view.
 - Release builds now fail app startup with a clear error when `WN_DEV_SETTLEMENT_QUIESCENCE_MS` is set instead of
   allowing it to override the protocol-pinned convergence window. Debug builds retain the override for local
   development and integration tests.

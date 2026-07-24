@@ -2353,6 +2353,25 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn publish_account_nip65_relay_set(
+        &self,
+        account_ref: &str,
+        read_relays: Vec<TransportEndpoint>,
+        write_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .publish_account_nip65_relay_set(
+                &account.label,
+                read_relays,
+                write_relays,
+                bootstrap_relays,
+            )
+            .await
+    }
+
     pub fn account_nip65_relays(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         self.accounts.app.account_nip65_relays(&account.label)

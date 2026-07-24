@@ -148,7 +148,6 @@ impl AppClient {
     pub(crate) fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
         let group_metadata = self.runtime.group_record(group_id).ok();
         let nostr_routing = self.nostr_routing_for_group(group_id)?;
-        let subscription = nostr_routing.subscription(group_id)?;
         let projection = EventGroupProjection {
             nostr_routing,
             group_metadata: group_metadata.as_ref(),
@@ -165,7 +164,15 @@ impl AppClient {
             &projection,
             GroupConfirmationProjection::Accepted,
         );
-        self.routing.add_group(subscription);
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let subscriptions = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?
+            .transport_subscriptions(group_id)?;
+        self.routing.replace_group_routes(group_id, subscriptions);
         Ok(())
     }
 

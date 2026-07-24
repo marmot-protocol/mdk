@@ -23,7 +23,7 @@ use storage_sqlite::{
     AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
     AccountPushRegistration, AccountStoredPushRegistration, StoredAccountGroup,
     StoredAccountGroupComponent, StoredAccountState, StoredAppEvent, StoredAppMessageRecord,
-    StoredAuditLogSettings, StoredRelayTelemetrySettings,
+    StoredAuditLogSettings, StoredNostrRoute, StoredRelayTelemetrySettings,
 };
 
 pub(crate) fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
@@ -73,6 +73,16 @@ pub(crate) fn stored_group_from_app_group(group: &AppGroupRecord) -> StoredAccou
         self_membership: group.self_membership,
         welcomer_account_id_hex: group.welcomer_account_id_hex.clone(),
         via_welcome_message_id_hex: group.via_welcome_message_id_hex.clone(),
+        nostr_routing_last_epoch: group.nostr_routing_last_epoch,
+        prior_nostr_routes: group
+            .prior_nostr_routes
+            .iter()
+            .map(|route| StoredNostrRoute {
+                nostr_group_id_hex: route.nostr_group_id_hex.clone(),
+                relays: route.relays.clone(),
+                last_epoch: route.last_epoch,
+            })
+            .collect(),
         components: stored_components_from_app_group(group),
     }
 }
@@ -197,6 +207,16 @@ pub(crate) fn app_group_from_stored_group(
     group.self_membership = stored.self_membership;
     group.welcomer_account_id_hex = stored.welcomer_account_id_hex;
     group.via_welcome_message_id_hex = stored.via_welcome_message_id_hex;
+    group.nostr_routing_last_epoch = stored.nostr_routing_last_epoch;
+    group.prior_nostr_routes = stored
+        .prior_nostr_routes
+        .into_iter()
+        .map(|route| crate::AppPriorNostrRoute {
+            nostr_group_id_hex: route.nostr_group_id_hex,
+            relays: route.relays,
+            last_epoch: route.last_epoch,
+        })
+        .collect();
     Ok(group)
 }
 

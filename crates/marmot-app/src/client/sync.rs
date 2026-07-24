@@ -55,6 +55,12 @@ impl AppClient {
     }
 
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+        // Reconcile epoch-bounded prior routes before issuing the first relay
+        // subscriptions. This makes retirement deterministic even for a quiet
+        // group that has no new inbound events after restart.
+        if self.refresh_group_routes()? {
+            self.app.save_state(&self.state)?;
+        }
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
@@ -118,8 +124,11 @@ impl AppClient {
             // Best-effort projection: a quarantined group is not live, so its
             // routing/metadata components may be unavailable. Skip projection
             // rather than propagate — the event must still reach subscribers.
-            let group_projection = event_group_id(event)
-                .and_then(|group_id| self.event_group_projection_best_effort(group_id));
+            let group_metadata =
+                event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
+            let group_projection = event_group_id(event).and_then(|group_id| {
+                self.event_group_projection_best_effort(group_id, group_metadata.as_ref())
+            });
             observe_event(
                 &mut self.state,
                 &display_names,
@@ -143,12 +152,9 @@ impl AppClient {
                 routes_dirty = true;
             }
         }
-        // #695 + rotation: reconcile transport routes once after the batch drains
-        // instead of per membership-changing event. refresh_group_routes upserts
-        // every group's current subscription — picking up a join's new route AND
-        // an in-place nostr_group_id / relay rotation on an existing group
-        // (Finding 2) — and reports whether anything changed; a membership count
-        // change (join/leave) also forces the single resync.
+        // Reconcile transport routes once after the batch drains instead of per
+        // membership-changing event. This installs a join's current route and
+        // retains any still-live address displaced by a routing rotation.
         let routes_changed = self.refresh_group_routes()?;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
@@ -161,14 +167,15 @@ impl AppClient {
     /// component lookup fails (e.g. the group is quarantined and not live).
     /// Used by the no-inbound drain path where a missing projection must not
     /// abort processing.
-    fn event_group_projection_best_effort(
+    fn event_group_projection_best_effort<'a>(
         &self,
         group_id: &cgka_traits::GroupId,
-    ) -> Option<EventGroupProjection<'static>> {
+        group_metadata: Option<&'a cgka_traits::group::Group>,
+    ) -> Option<EventGroupProjection<'a>> {
         let nostr_routing = self.nostr_routing_for_group(group_id).ok()?;
         Some(EventGroupProjection {
             nostr_routing,
-            group_metadata: None,
+            group_metadata,
             admin_policy: self
                 .runtime
                 .admin_pubkeys(group_id)
@@ -244,8 +251,13 @@ impl AppClient {
     ) -> Result<SyncSummary, AppError> {
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
-        self.ingest_delivery(delivery, &display_names, &mut summary)
+        let routes_dirty = self
+            .ingest_delivery(delivery, &display_names, &mut summary)
             .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.app.save_state(&self.state)?;
         Ok(summary)
     }
@@ -272,6 +284,7 @@ impl AppClient {
         let drain_started = std::time::Instant::now();
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut deliveries: u64 = 0;
+        let mut routes_dirty = false;
 
         loop {
             let wait = if first_wait {
@@ -295,11 +308,16 @@ impl AppClient {
                 continue;
             }
             remember_seen_event(&mut seen, &mut self.state, event_id);
-            self.ingest_delivery(delivery, &display_names, &mut summary)
+            routes_dirty |= self
+                .ingest_delivery(delivery, &display_names, &mut summary)
                 .await?;
             deliveries = deliveries.saturating_add(1);
         }
 
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
             deliveries,
@@ -315,7 +333,7 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
         display_names: &HashMap<String, String>,
         summary: &mut SyncSummary,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let source_message_id_hex = hex::encode(delivery.message.id.as_slice());
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
@@ -326,15 +344,16 @@ impl AppClient {
         self.remember_pending_convergence_effects(&effects.effects);
         self.remember_transport_cursor(outer_transport_at);
         self.detect_epoch_stall(group_id_hint, &source_message_id_hex, &effects.outcome);
-        self.observe_account_device_effects(
-            &effects.effects,
-            display_names,
-            summary,
-            &source_message_id_hex,
-            source_received_at,
-            Some(outer_transport_at),
-        )
-        .await?;
+        let routes_dirty = self
+            .observe_account_device_effects(
+                &effects.effects,
+                display_names,
+                summary,
+                &source_message_id_hex,
+                source_received_at,
+                Some(outer_transport_at),
+            )
+            .await?;
 
         // Publishing here is incidental work triggered by the inbound
         // delivery. A hard publish failure may roll that pending commit back,
@@ -351,7 +370,7 @@ impl AppClient {
                 "incidental auto-publish failed after inbound effects were projected"
             );
         }
-        Ok(())
+        Ok(routes_dirty)
     }
 
     /// Feed an undecryptable group delivery to the epoch-stall detector, arming a
@@ -437,15 +456,20 @@ impl AppClient {
         summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
-        self.observe_account_device_effects(
-            &effects,
-            &display_names,
-            &mut summary,
-            &source_message_id_hex,
-            source_received_at,
-            None,
-        )
-        .await?;
+        let routes_dirty = self
+            .observe_account_device_effects(
+                &effects,
+                &display_names,
+                &mut summary,
+                &source_message_id_hex,
+                source_received_at,
+                None,
+            )
+            .await?;
+        let routes_changed = self.refresh_group_routes()?;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;
         Ok(summary)
@@ -459,7 +483,7 @@ impl AppClient {
         source_message_id_hex: &str,
         source_received_at: u64,
         outer_transport_at: Option<u64>,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         // MLS member ids in this design are the Nostr account pubkey hex, so a
         // membership change whose subject matches the local account id hex is
         // the local account leaving / being removed (or, for joins, returning).
@@ -664,20 +688,11 @@ impl AppClient {
                 .messages
                 .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
         }
-        // #695 + rotation: reconcile transport routes once after the batch drains.
-        // refresh_group_routes upserts every group's current subscription (a
-        // join's new route AND an in-place nostr_group_id / relay rotation on an
-        // existing group, Finding 2) and reports whether anything changed; a
-        // membership count change (join/leave) also forces the single resync.
-        let routes_changed = self.refresh_group_routes()?;
-        if routes_dirty || routes_changed {
-            self.sync_runtime_groups().await?;
-        }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
         let system_updates = self.project_group_system_rows(&effects.events, source_received_at);
         summary.projection_updates.extend(system_updates);
-        Ok(())
+        Ok(routes_dirty)
     }
 
     /// Advance the persisted transport cursor from an inbound message —

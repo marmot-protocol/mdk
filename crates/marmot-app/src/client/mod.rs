@@ -2139,20 +2139,43 @@ impl AppClient {
         }
     }
 
-    /// Upsert every group's current transport subscription into the routing
-    /// state, returning whether any route was added or modified. A modified
-    /// route means an in-place `nostr_group_id` / relay rotation on an existing
-    /// group (Finding 2) — `add_group` now replaces by `group_id` instead of
-    /// early-returning — so callers can trigger a single resync when routes
-    /// actually change rather than only on a membership-count change.
+    /// Reconcile every group's current and still-live prior transport
+    /// subscriptions, returning whether any installed route changed.
     pub(crate) fn refresh_group_routes(&mut self) -> Result<bool, AppError> {
         let mut changed = false;
-        for group in &self.state.groups {
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            if self
-                .routing
-                .add_group(group.nostr_routing.subscription(&group_id)?)
+        for group in &mut self.state.groups {
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "refresh_group_routes",
+                    error_kind = "invalid_persisted_route_identifier",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            // Retention is epoch-derived, never process-uptime-derived. Do not
+            // prune while convergence still has unresolved inputs: the
+            // retained anchor is not settled yet, so conservatively keep every
+            // prior address until the next stable reconciliation.
+            if !self
+                .runtime
+                .has_pending_convergence_inputs(&group_id)
+                .unwrap_or(true)
+                && let Ok(group_record) = self.runtime.group_record(&group_id)
             {
+                group.prune_prior_nostr_routes(group_record.epoch.0);
+            }
+            let Ok(subscriptions) = group.transport_subscriptions(&group_id) else {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "refresh_group_routes",
+                    error_kind = "invalid_persisted_group_route",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
+            if self.routing.replace_group_routes(&group_id, subscriptions) {
                 changed = true;
             }
         }

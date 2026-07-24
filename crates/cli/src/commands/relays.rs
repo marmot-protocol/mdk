@@ -101,30 +101,40 @@ async fn update_relay_list(
                 &source_relays,
             )
         })?;
-    let mut relays = relays_for_type(&status, Some(&relay_type))?;
-    if add {
-        if !relays.contains(&url) {
-            relays.push(url.clone());
-        }
-    } else {
-        relays.retain(|relay| relay != &url);
-    }
-    relays.sort();
-    relays.dedup();
-    let publish_relays = relay_endpoints(relays.clone())?;
     let bootstrap = explicit_bootstrap
         .or_else(|| source_relays.first().map(|endpoint| endpoint.0.clone()))
-        .or_else(|| relays.first().cloned())
+        .or_else(|| {
+            relays_for_type(&status, Some(&relay_type))
+                .ok()
+                .and_then(|relays| relays.first().cloned())
+        })
         .ok_or(WnError::MissingRelay)?;
     let bootstrap_relays = vec![TransportEndpoint(bootstrap)];
-    let status = runtime
-        .publish_account_relay_list_kind(
-            &account.label,
-            &relay_type,
-            publish_relays,
-            bootstrap_relays,
-        )
-        .await?;
+    let status = if relay_type == "nip65" {
+        let (mut read_relays, mut write_relays) = nip65_relay_roles(&status.nip65);
+        update_relay_values(&mut read_relays, &url, add);
+        update_relay_values(&mut write_relays, &url, add);
+        runtime
+            .publish_account_nip65_relay_set(
+                &account.label,
+                relay_endpoints(read_relays)?,
+                relay_endpoints(write_relays)?,
+                bootstrap_relays,
+            )
+            .await?
+    } else {
+        let mut relays = relays_for_type(&status, Some(&relay_type))?;
+        update_relay_values(&mut relays, &url, add);
+        runtime
+            .publish_account_relay_list_kind(
+                &account.label,
+                &relay_type,
+                relay_endpoints(relays)?,
+                bootstrap_relays,
+            )
+            .await?
+    };
+    let relays = relays_for_type(&status, Some(&relay_type))?;
     Ok(CommandOutput {
         plain: relays.join("\n"),
         json: json!({
@@ -135,6 +145,25 @@ async fn update_relay_list(
             "relay_lists": relay_lists_json(status),
         }),
     })
+}
+
+fn nip65_relay_roles(state: &marmot_app::AccountRelayListState) -> (Vec<String>, Vec<String>) {
+    if state.read_relays.is_empty() && state.write_relays.is_empty() {
+        return (state.relays.clone(), state.relays.clone());
+    }
+    (state.read_relays.clone(), state.write_relays.clone())
+}
+
+fn update_relay_values(relays: &mut Vec<String>, url: &str, add: bool) {
+    if add {
+        if !relays.iter().any(|relay| relay == url) {
+            relays.push(url.to_owned());
+        }
+    } else {
+        relays.retain(|relay| relay != url);
+    }
+    relays.sort();
+    relays.dedup();
 }
 
 fn relays_for_type(
@@ -160,5 +189,42 @@ fn normalize_relay_type(value: &str) -> Result<String, WnError> {
         "nip65" => Ok("nip65".to_owned()),
         "inbox" => Ok("inbox".to_owned()),
         _ => Err(WnError::InvalidRelayType(value.to_owned())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use marmot_app::AccountRelayListState;
+
+    #[test]
+    fn nip65_update_preserves_unmodified_directional_relays() {
+        let state = AccountRelayListState {
+            kind: 10_002,
+            relays: vec!["wss://both.example".into(), "wss://write.example".into()],
+            read_relays: vec!["wss://both.example".into(), "wss://read.example".into()],
+            write_relays: vec!["wss://both.example".into(), "wss://write.example".into()],
+        };
+
+        let (mut read_relays, mut write_relays) = nip65_relay_roles(&state);
+        update_relay_values(&mut read_relays, "wss://new.example", true);
+        update_relay_values(&mut write_relays, "wss://new.example", true);
+
+        assert_eq!(
+            read_relays,
+            vec![
+                "wss://both.example",
+                "wss://new.example",
+                "wss://read.example",
+            ]
+        );
+        assert_eq!(
+            write_relays,
+            vec![
+                "wss://both.example",
+                "wss://new.example",
+                "wss://write.example",
+            ]
+        );
     }
 }
