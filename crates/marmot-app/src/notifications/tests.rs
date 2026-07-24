@@ -375,8 +375,9 @@ fn maliciously_large_arrays_stop_at_the_bounded_preflight() {
     let removal_error = serde_json::from_str::<PushTokenRemovalShape>(&remove)
         .err()
         .expect("oversized removal array must stop at entry 33");
-    assert!(add_error.to_string().contains("exceeds 32 entries"));
-    assert!(removal_error.to_string().contains("exceeds 32 entries"));
+    let expected = format!("exceeds {PUSH_MAX_GOSSIP_ENTRIES} entries");
+    assert!(add_error.to_string().contains(&expected));
+    assert!(removal_error.to_string().contains(&expected));
 }
 
 #[test]

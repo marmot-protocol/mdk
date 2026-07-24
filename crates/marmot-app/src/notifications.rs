@@ -352,7 +352,9 @@ impl<'de> Deserialize<'de> for BoundedPushGossipEntries {
                 while entries.next_element::<IgnoredAny>()?.is_some() {
                     count += 1;
                     if count > PUSH_MAX_GOSSIP_ENTRIES {
-                        return Err(A::Error::custom("push gossip array exceeds 32 entries"));
+                        return Err(A::Error::custom(format!(
+                            "push gossip array exceeds {PUSH_MAX_GOSSIP_ENTRIES} entries"
+                        )));
                     }
                 }
                 Ok(BoundedPushGossipEntries)
