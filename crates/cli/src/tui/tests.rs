@@ -873,7 +873,6 @@ fn logout_token_mismatch_is_a_noop_that_keeps_the_popup_open() {
 #[cfg(unix)]
 #[test]
 fn logout_success_then_refresh_failure_reports_logout_not_error() {
-    use std::os::unix::fs::PermissionsExt;
     // The wipe is irreversible and succeeds; only the follow-up account-list
     // reload fails. The status must report the logout as done and point at
     // `/refresh`, never masking a completed wipe behind `error:` while the
@@ -882,12 +881,7 @@ fn logout_success_then_refresh_failure_reports_logout_not_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let exe = dir.path().join("wn-json");
     let script = "#!/bin/sh\ncase \" $* \" in\n  *\" account list \"*)\ncat <<'JSON'\n{\"ok\":false,\"error\":{\"message\":\"relays unreachable\"}}\nJSON\n    ;;\n  *)\ncat <<'JSON'\n{\"ok\":true,\"result\":{}}\nJSON\n    ;;\nesac\n";
-    std::fs::write(&exe, script).expect("write fake wn");
-    let mut perms = std::fs::metadata(&exe)
-        .expect("fake wn metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&exe, perms).expect("chmod fake wn");
+    write_fake_wn(&exe, script);
     let client = WnClient {
         exe,
         ..test_unused_client()
@@ -2398,6 +2392,49 @@ fn test_unused_client() -> WnClient {
     }
 }
 
+/// Write an executable fake `wn` script to `exe` without this process ever
+/// holding a write handle to the file it will later exec.
+///
+/// The test harness runs many write-then-exec fakes across threads at once. On
+/// Linux, if any thread has a file open for writing when another thread forks
+/// (which every subprocess spawn does under the hood), the forked child
+/// inherits that writable descriptor; an `execve` of the same file then fails
+/// with `ETXTBSY` ("text file busy") until the descriptor closes. Writing the
+/// body from a short-lived child shell keeps the writable descriptor out of
+/// this process's table entirely, so no spawn here can inherit it and the race
+/// cannot occur. `chmod` is path-based and opens nothing, so it stays in-process.
+#[cfg(unix)]
+fn write_fake_wn(exe: &std::path::Path, script: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    // `cat > "$1"` opens `exe` for writing inside the child shell, never here.
+    let mut writer = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"cat > "$1""#)
+        .arg("write_fake_wn") // $0: a label for diagnostics only
+        .arg(exe) // $1: the destination path
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fake wn writer");
+    writer
+        .stdin
+        .take()
+        .expect("fake wn writer stdin")
+        .write_all(script.as_bytes())
+        .expect("write fake wn body");
+    assert!(
+        writer.wait().expect("await fake wn writer").success(),
+        "fake wn writer exited non-zero"
+    );
+
+    let mut permissions = std::fs::metadata(exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(exe, permissions).expect("chmod fake wn");
+}
+
 fn test_json_client(response: &str) -> (tempfile::TempDir, WnClient) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let exe = test_json_executable(tempdir.path(), response);
@@ -2420,8 +2457,6 @@ fn test_json_client(response: &str) -> (tempfile::TempDir, WnClient) {
 /// refreshed list shrinks (the fixed-response fake cannot model that).
 #[cfg(unix)]
 fn test_invites_seq_client(first: &str, rest: &str) -> (tempfile::TempDir, WnClient) {
-    use std::os::unix::fs::PermissionsExt;
-
     let tempdir = tempfile::tempdir().expect("tempdir");
     let counter = tempdir.path().join("invites-seen");
     let exe = tempdir.path().join("wn-json");
@@ -2429,12 +2464,7 @@ fn test_invites_seq_client(first: &str, rest: &str) -> (tempfile::TempDir, WnCli
         "#!/bin/sh\ncase \" $* \" in\n  *\" invites \"*)\n    if [ -f '{counter}' ]; then\ncat <<'JSON'\n{rest}\nJSON\n    else\n      : > '{counter}'\ncat <<'JSON'\n{first}\nJSON\n    fi\n    ;;\n  *)\ncat <<'JSON'\n{{\"ok\":true,\"result\":{{}}}}\nJSON\n    ;;\nesac\n",
         counter = counter.display(),
     );
-    std::fs::write(&exe, script).expect("write fake wn");
-    let mut permissions = std::fs::metadata(&exe)
-        .expect("fake wn metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    write_fake_wn(&exe, &script);
     let client = WnClient {
         exe,
         home: None,
@@ -2450,16 +2480,11 @@ fn test_invites_seq_client(first: &str, rest: &str) -> (tempfile::TempDir, WnCli
 
 #[cfg(unix)]
 fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let exe = dir.join("wn-json");
-    std::fs::write(&exe, format!("#!/bin/sh\ncat <<'JSON'\n{response}\nJSON\n"))
-        .expect("write fake wn");
-    let mut permissions = std::fs::metadata(&exe)
-        .expect("fake wn metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    write_fake_wn(
+        &exe,
+        &format!("#!/bin/sh\ncat <<'JSON'\n{response}\nJSON\n"),
+    );
     exe
 }
 
@@ -2468,23 +2493,15 @@ fn test_json_executable(dir: &std::path::Path, response: &str) -> PathBuf {
 /// Returns the executable path and the args-file path.
 #[cfg(unix)]
 fn test_arg_recording_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
-
     let exe = dir.join("wn-json");
     let args_file = dir.join("recorded-args");
-    std::fs::write(
+    write_fake_wn(
         &exe,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat <<'JSON'\n{response}\nJSON\n",
             args_file.display()
         ),
-    )
-    .expect("write fake wn");
-    let mut permissions = std::fs::metadata(&exe)
-        .expect("fake wn metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    );
     (exe, args_file)
 }
 
@@ -2494,16 +2511,9 @@ fn test_arg_recording_executable(dir: &std::path::Path, response: &str) -> (Path
 /// pointed at the script.
 #[cfg(unix)]
 fn test_scripted_client(body: &str) -> (tempfile::TempDir, WnClient) {
-    use std::os::unix::fs::PermissionsExt;
-
     let tempdir = tempfile::tempdir().expect("tempdir");
     let exe = tempdir.path().join("wn-json");
-    std::fs::write(&exe, format!("#!/bin/sh\n{body}")).expect("write fake wn");
-    let mut permissions = std::fs::metadata(&exe)
-        .expect("fake wn metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    write_fake_wn(&exe, &format!("#!/bin/sh\n{body}"));
     let client = WnClient {
         exe,
         ..test_unused_client()
@@ -9527,23 +9537,15 @@ fn composer_min_and_max_height_coexist_with_the_diagnostics_panel() {
 /// call) to a sidecar file, so a test can assert a multi-call flow's commands.
 #[cfg(unix)]
 fn test_appending_arg_executable(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
-
     let exe = dir.join("wn-json");
     let args_file = dir.join("recorded-args");
-    std::fs::write(
+    write_fake_wn(
         &exe,
-        format!(
+        &format!(
             "#!/bin/sh\necho \"$*\" >> '{}'\ncat <<'JSON'\n{response}\nJSON\n",
             args_file.display()
         ),
-    )
-    .expect("write fake wn");
-    let mut permissions = std::fs::metadata(&exe)
-        .expect("fake wn metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    );
     (exe, args_file)
 }
 
