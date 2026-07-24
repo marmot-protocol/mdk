@@ -1129,7 +1129,7 @@ async fn drive_intents(
                 app_event_seq = app_event_seq
                     .checked_add(1)
                     .expect("app event sequence exhausted");
-                if let Ok(cgka_traits::engine::SendResult::ApplicationMessage { msg }) = res {
+                if let Ok(cgka_traits::engine::SendResult::ApplicationMessage { msg, .. }) = res {
                     own_sent_payloads[idx].push(payload.clone());
                     bus.send(bus_ids[idx], reroute(msg, &gid));
                 }
@@ -1361,6 +1361,7 @@ fn stored_convergence_restart_equivalence(name: String, committer_idx: usize) {
         let restarted_identity = restarted_keys.public_key().to_bytes().to_vec();
         let restarted_storage = clients[2].storage().clone();
         let mut restarted = EngineBuilder::new(restarted_storage.clone())
+            .legacy_compatibility_profile()
             .identity(restarted_identity.clone())
             .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
                 keys: restarted_keys,

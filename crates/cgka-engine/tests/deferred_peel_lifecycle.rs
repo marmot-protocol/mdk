@@ -166,6 +166,7 @@ impl TransportPeeler for CountingEpochGatePeeler {
 fn build_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(CountingEpochGatePeeler::new()))
@@ -184,6 +185,7 @@ fn build_counting_client(
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let peeler = CountingEpochGatePeeler::new();
     let mut engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(peeler.clone()))
@@ -251,7 +253,7 @@ async fn send_app(
         .await
         .expect("send app");
     match result {
-        SendResult::ApplicationMessage { msg } => route(msg, group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg, group_id),
         other => panic!("expected app message, got {other:?}"),
     }
 }

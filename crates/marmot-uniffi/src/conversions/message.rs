@@ -20,6 +20,11 @@ pub struct AppMessageRecordFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    pub source_epoch: Option<u64>,
+    /// `None` means no recoverable source-epoch decision (legacy/safe retain).
+    /// `Some(0)` means retention was explicitly disabled.
+    pub retention_seconds: Option<u64>,
+    pub retention_expires_at: Option<u64>,
     /// Sender-authenticated inner app-event timestamp.
     pub recorded_at: u64,
     /// Local wall-clock time when this device observed the delivery.
@@ -38,6 +43,9 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
+            source_epoch: value.source_epoch,
+            retention_seconds: value.retention.map(|decision| decision.retention_seconds),
+            retention_expires_at: value.retention.and_then(|decision| decision.expires_at),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }
@@ -71,6 +79,10 @@ pub struct ReceivedMessageFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    pub source_epoch: u64,
+    /// `None` means the engine could not recover the historical source policy.
+    pub retention_seconds: Option<u64>,
+    pub retention_expires_at: Option<u64>,
     /// Sender-authenticated inner app-event timestamp (seconds since epoch).
     pub recorded_at: u64,
     /// Local wall-clock time when this device observed the delivery.
@@ -88,6 +100,9 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
+            source_epoch: value.source_epoch,
+            retention_seconds: value.retention.map(|decision| decision.retention_seconds),
+            retention_expires_at: value.retention.and_then(|decision| decision.expires_at),
             recorded_at: value.recorded_at,
             received_at: value.received_at,
         }

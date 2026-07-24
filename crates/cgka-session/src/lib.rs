@@ -67,6 +67,7 @@ pub struct SessionConfig {
     feature_registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
     protocol_profile: ProtocolProfile,
+    allow_legacy_compatibility_profile: bool,
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
@@ -87,7 +88,8 @@ impl SessionConfig {
             account_identity_proof_signer: None,
             feature_registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
-            protocol_profile: ProtocolProfile::Legacy,
+            protocol_profile: ProtocolProfile::Current,
+            allow_legacy_compatibility_profile: false,
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
             recorder: None,
@@ -123,9 +125,21 @@ impl SessionConfig {
     }
 
     /// Select the profile emitted by fresh KeyPackages and newly created
-    /// groups. Existing groups keep their persisted profile.
+    /// groups. Defaults to current. Existing groups keep their persisted
+    /// profile. Passing legacy is rejected by [`AccountDeviceSession::open`];
+    /// only the explicitly named compatibility-fixture seam can open it.
     pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
         self.protocol_profile = protocol_profile;
+        self.allow_legacy_compatibility_profile = false;
+        self
+    }
+
+    /// Open a legacy-profile session only to build compatibility fixtures.
+    /// This surface is absent from release builds.
+    #[cfg(debug_assertions)]
+    pub fn legacy_compatibility_profile(mut self) -> Self {
+        self.protocol_profile = ProtocolProfile::Legacy;
+        self.allow_legacy_compatibility_profile = true;
         self
     }
 
@@ -166,6 +180,10 @@ pub enum PublishWork {
     ApplicationMessage {
         msg: TransportMessage,
         queued_intent: Option<QueuedIntentRef>,
+        group_id: GroupId,
+        app_event_id: String,
+        source_epoch: EpochId,
+        retention: cgka_traits::app_event::AppMessageRetentionDecision,
     },
     Proposal {
         msg: TransportMessage,
@@ -209,6 +227,14 @@ pub struct IngestEffects {
 
 impl AccountDeviceSession {
     pub fn open(config: SessionConfig) -> SessionResult<Self> {
+        if config.protocol_profile == ProtocolProfile::Legacy
+            && !config.allow_legacy_compatibility_profile
+        {
+            return Err(EngineError::Other(
+                "strict cutover forbids opening a legacy-profile session".into(),
+            )
+            .into());
+        }
         tracing::debug!(
             target: TRACE_TARGET,
             method = "open",
@@ -219,19 +245,46 @@ impl AccountDeviceSession {
             &config.database_key,
             config.storage_options,
         )?;
-        let mut builder = EngineBuilder::new(storage)
+        let builder = EngineBuilder::new(storage)
             .identity(config.identity)
             .account_identity_proof_signer(config.account_identity_proof_signer.ok_or_else(
                 || EngineError::Other("account identity proof signer is required".into()),
             )?)
             .feature_registry(config.feature_registry)
             .supported_app_components(config.supported_app_components.ids)
-            .protocol_profile(config.protocol_profile)
-            .peeler(config.peeler);
+            .protocol_profile(config.protocol_profile);
+        #[cfg(debug_assertions)]
+        let builder = if config.allow_legacy_compatibility_profile {
+            builder.legacy_compatibility_profile()
+        } else {
+            builder
+        };
+        #[cfg(not(debug_assertions))]
+        let builder = {
+            if config.allow_legacy_compatibility_profile {
+                return Err(EngineError::Other(
+                    "strict cutover forbids opening a legacy-profile session".into(),
+                )
+                .into());
+            }
+            builder
+        };
+        let mut builder = builder.peeler(config.peeler);
         if let Some(recorder) = config.recorder {
             builder = builder.recorder(recorder);
         }
         let mut engine = builder.build()?;
+        if config.protocol_profile == ProtocolProfile::Current {
+            let retirement = engine.retire_non_current_key_packages()?;
+            tracing::info!(
+                target: TRACE_TARGET,
+                method = "open",
+                legacy_key_packages_retired = retirement.legacy_retired,
+                invalid_key_packages_retired = retirement.invalid_retired,
+                current_key_packages_retained = retirement.current_retained,
+                "completed strict-cutover local key package retirement"
+            );
+        }
         engine.hydrate_stable_groups_from_storage()?;
         engine.set_convergence_policy(config.convergence_policy);
         engine.audit_recorder_health();
@@ -699,7 +752,13 @@ impl AccountDeviceSession {
         };
         for result in results {
             match result {
-                SendResult::ApplicationMessage { msg } => {
+                SendResult::ApplicationMessage {
+                    msg,
+                    group_id,
+                    app_event_id,
+                    source_epoch,
+                    retention,
+                } => {
                     let queued_intent = self
                         .engine
                         .take_regenerated_queued_intent_for_message(&msg.id)
@@ -707,9 +766,14 @@ impl AccountDeviceSession {
                             group_id,
                             intent_id,
                         });
-                    effects
-                        .publish
-                        .push(PublishWork::ApplicationMessage { msg, queued_intent });
+                    effects.publish.push(PublishWork::ApplicationMessage {
+                        msg,
+                        queued_intent,
+                        group_id,
+                        app_event_id,
+                        source_epoch,
+                        retention,
+                    });
                 }
                 SendResult::Proposal { msg } => {
                     let queued_intent = self
@@ -803,6 +867,7 @@ fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Stale { .. } => "stale",
+        IngestOutcome::Rejected { .. } => "rejected",
     }
 }
 

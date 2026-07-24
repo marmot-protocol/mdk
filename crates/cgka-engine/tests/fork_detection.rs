@@ -19,11 +19,14 @@ use cgka_traits::engine::{
     SendIntent, SendResult,
 };
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{AccountDeviceSignerStorage, MessageStorage, StorageProvider};
+use cgka_traits::storage::{
+    AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -152,6 +155,7 @@ fn build_client(id: &[u8]) -> impl CgkaEngine {
 fn build_client_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -159,6 +163,19 @@ fn build_client_with_storage(id: &[u8]) -> (Engine<SqliteAccountStorage>, Sqlite
         .build()
         .unwrap();
     (engine, storage)
+}
+
+fn reopen_current_client(id: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
+    let mut engine = EngineBuilder::new(storage)
+        .identity(pad32(id))
+        .account_identity_proof_signer(proof_signer(id))
+        .protocol_profile(ProtocolProfile::Current)
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    engine.hydrate_stable_groups_from_storage().unwrap();
+    engine
 }
 
 fn raw_self_update_commit(
@@ -372,6 +389,157 @@ async fn concurrent_invites_recover_to_deterministic_winner() {
             reason: StaleReason::AlreadyAtEpoch { .. }
         }
     ));
+}
+
+#[tokio::test]
+async fn strict_cutover_legacy_add_cannot_displace_valid_fork_incumbent() {
+    use cgka_traits::ingest::{IngestOutcome, StaleReason};
+    use sha2::{Digest, Sha256};
+
+    // Both commits below are privileged, so choose identities that make the
+    // forbidden Add sort before the valid incumbent. This pins the exact
+    // failure mode: without the probe-time strict-cutover gate, fork recovery
+    // rolls back the incumbent before normal ingest rejects the Add.
+    let first = b"strict-fork-first".as_slice();
+    let second = b"strict-fork-second".as_slice();
+    let (incumbent_id, candidate_id) = if pad32(first) > pad32(second) {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    let (mut incumbent, incumbent_storage) = build_client_with_storage(incumbent_id);
+    let mut candidate = build_client(candidate_id);
+    let mut invitee = build_client(b"strict-fork-invitee");
+
+    let candidate_kp = candidate.fresh_key_package().await.unwrap();
+    let (group_id, create) = incumbent
+        .create_group(CreateGroupRequest {
+            name: "strict fork incumbent".into(),
+            description: String::new(),
+            members: vec![candidate_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![candidate.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            incumbent.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected legacy GroupCreated, got {other:?}"),
+    };
+    candidate.join_welcome(welcome).await.unwrap();
+
+    // Candidate branches from epoch 1 with a legacy Add while legacy fixture
+    // generation is still active on its copy.
+    let invitee_kp = invitee.fresh_key_package().await.unwrap();
+    let legacy_add = match candidate
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![invitee_kp],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, .. } => msg,
+        other => panic!("expected legacy Add GroupEvolution, got {other:?}"),
+    };
+
+    // Reopen the incumbent under the strict current profile, then publish a
+    // valid privileged group-data commit from the same source epoch.
+    drop(incumbent);
+    let mut incumbent = reopen_current_client(incumbent_id, incumbent_storage.clone());
+    let (incumbent_commit, incumbent_pending) = match incumbent
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("valid incumbent".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected incumbent GroupEvolution, got {other:?}"),
+    };
+
+    let candidate_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        candidate.self_id(),
+        &legacy_add.payload,
+    );
+    let incumbent_key = CommitOrderingKey::from_commit_bytes(
+        EpochId(1),
+        CommitOrderingPriority::Privileged,
+        incumbent.self_id(),
+        &incumbent_commit.payload,
+    );
+    assert!(
+        candidate_key < incumbent_key,
+        "fixture must make the forbidden Add win ordering if it reaches selection"
+    );
+
+    incumbent
+        .confirm_published(incumbent_pending)
+        .await
+        .unwrap();
+    assert_eq!(incumbent.epoch(&group_id).unwrap(), EpochId(2));
+    assert_eq!(
+        incumbent_storage.get_group(&group_id).unwrap().name,
+        "valid incumbent"
+    );
+
+    let content_id = MessageId::new(Sha256::digest(&legacy_add.payload).to_vec());
+    let routed_add = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..legacy_add
+    };
+    let outcome = incumbent.ingest(routed_add).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            IngestOutcome::Stale {
+                reason: StaleReason::PeelFailed
+            }
+        ),
+        "probe-time strict cutover must reject the candidate before selection, got {outcome:?}"
+    );
+
+    assert_eq!(
+        incumbent.epoch(&group_id).unwrap(),
+        EpochId(2),
+        "forbidden candidate must not roll back the valid incumbent"
+    );
+    assert_eq!(
+        incumbent_storage.get_group(&group_id).unwrap().name,
+        "valid incumbent",
+        "incumbent group projection must survive the rejected fork candidate"
+    );
+    assert_eq!(
+        incumbent.members(&group_id).unwrap().len(),
+        2,
+        "the forbidden legacy Add invitee must not join"
+    );
+    assert_eq!(
+        incumbent_storage.get_message(&content_id).unwrap().state,
+        MessageState::Failed,
+        "the forbidden candidate must be retired terminally"
+    );
+    assert!(
+        incumbent
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event, GroupEvent::ForkRecovered { .. })),
+        "a candidate rejected by the probe must never emit ForkRecovered"
+    );
 }
 
 #[tokio::test]

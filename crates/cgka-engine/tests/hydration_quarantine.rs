@@ -13,9 +13,10 @@ use cgka_traits::message::{MessageRecord, MessageState};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
-    ConvergencePolicyStorage, GroupStorage, LeaveRequest, LeaveRequestStorage,
-    MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
+    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, StoredKeyPackageBundle,
+    WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -136,6 +137,7 @@ impl TransportPeeler for MockPeeler {
 
 fn build_engine(storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-hydration"))
         .account_identity_proof_signer(proof_signer(b"alice-hydration"))
         .peeler(Box::new(MockPeeler))
@@ -199,6 +201,7 @@ async fn hydration_quarantines_bad_group_and_keeps_healthy_groups_available() {
     let audit_path = dir.path().join("audit.jsonl");
     let recorder = JsonlRecorder::open(&audit_path, "hydration-test-engine".to_string()).unwrap();
     let mut reopened = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-hydration"))
         .account_identity_proof_signer(proof_signer(b"alice-hydration"))
         .peeler(Box::new(MockPeeler))
@@ -500,6 +503,16 @@ impl AccountDeviceSignerStorage for FlakyGroupRecordStorage {
     }
 }
 
+impl KeyPackageBundleStorage for FlakyGroupRecordStorage {
+    fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        self.inner.stored_key_package_bundles()
+    }
+
+    fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
+        self.inner.delete_stored_key_package_bundle(storage_key)
+    }
+}
+
 impl StorageProvider for FlakyGroupRecordStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 
@@ -514,6 +527,7 @@ impl StorageProvider for FlakyGroupRecordStorage {
 
 fn build_flaky_engine(storage: FlakyGroupRecordStorage) -> Engine<FlakyGroupRecordStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-hydration"))
         .account_identity_proof_signer(proof_signer(b"alice-hydration"))
         .peeler(Box::new(MockPeeler))
@@ -728,6 +742,7 @@ async fn retry_for_unknown_group_errors() {
 fn build_named_client(name: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().expect("storage");
     let engine = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(name))
         .account_identity_proof_signer(proof_signer(name))
         .peeler(Box::new(MockPeeler))
@@ -1049,6 +1064,7 @@ async fn rejoin_welcome_clears_quarantine() {
 
     let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
     let mut alice = EngineBuilder::new(alice_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-rejoin"))
         .account_identity_proof_signer(proof_signer(b"alice-rejoin"))
         .peeler(Box::new(MockPeeler))
@@ -1129,6 +1145,7 @@ async fn rejoin_welcome_replays_and_retires_quarantine_retained_input() {
 
     let alice_storage = SqliteAccountStorage::in_memory().expect("storage");
     let mut alice = EngineBuilder::new(alice_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice-replay"))
         .account_identity_proof_signer(proof_signer(b"alice-replay"))
         .peeler(Box::new(MockPeeler))

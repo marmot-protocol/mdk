@@ -30,7 +30,9 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{MessageStorage, StorageProvider};
+use cgka_traits::storage::{
+    GroupStorage, KeyPackageBundleStorage, MessageStorage, StorageProvider,
+};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -524,6 +526,7 @@ fn build_client_with_components(
     components: impl IntoIterator<Item = u16>,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .supported_app_components(components)
@@ -547,6 +550,7 @@ fn selfremove_registry() -> FeatureRegistry {
 
 fn build_client(identity: &[u8], registry: FeatureRegistry) -> impl CgkaEngine {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
@@ -565,12 +569,31 @@ fn build_current_client(identity: &[u8]) -> Engine<SqliteAccountStorage> {
         .expect("build current-profile engine")
 }
 
+fn build_profile_client_on_storage(
+    identity: &[u8],
+    storage: SqliteAccountStorage,
+    profile: ProtocolProfile,
+) -> Engine<SqliteAccountStorage> {
+    let builder = EngineBuilder::new(storage)
+        .identity(pad32(identity))
+        .account_identity_proof_signer(proof_signer(identity))
+        .protocol_profile(profile)
+        .peeler(Box::new(MockPeeler::default()));
+    let builder = if profile == ProtocolProfile::Legacy {
+        builder.legacy_compatibility_profile()
+    } else {
+        builder
+    };
+    builder.build().expect("build profile engine")
+}
+
 fn build_client_with_welcome_sender(
     identity: &[u8],
     registry: FeatureRegistry,
     welcome_sender: MemberId,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
@@ -588,6 +611,7 @@ fn build_client_on_storage(
     storage: SqliteAccountStorage,
 ) -> impl CgkaEngine {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .feature_registry(registry)
@@ -1183,6 +1207,7 @@ async fn current_solo_group_is_canonical_at_epoch_zero_without_confirmation() {
 async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let mut legacy = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"legacy-reopen"))
         .account_identity_proof_signer(proof_signer(b"legacy-reopen"))
         .peeler(Box::new(MockPeeler::default()))
@@ -1226,23 +1251,40 @@ async fn current_configured_engine_reopens_and_uses_a_legacy_group() {
         .await
         .expect("legacy group remains usable by current-configured engine");
 
-    let mut invitee = build_client(b"legacy-reopen-invitee", selfremove_registry());
-    let invitee_key_package = invitee.fresh_key_package().await.unwrap();
-    let invite = current
-        .send(cgka_traits::engine::SendIntent::Invite {
+    let updated = current
+        .send(cgka_traits::engine::SendIntent::UpdateGroupData {
             group_id: group_id.clone(),
-            key_packages: vec![invitee_key_package],
+            name: Some("legacy renamed".into()),
+            description: None,
         })
         .await
-        .expect("current-configured engine can commit to its legacy group");
-    let pending = match invite {
+        .expect("legacy group state changes remain usable");
+    let pending = match updated {
         SendResult::GroupEvolution { pending, .. } => pending,
         other => panic!("expected GroupEvolution, got {other:?}"),
     };
     current.confirm_published(pending).await.unwrap();
     assert_eq!(
+        current.group_record(&group_id).unwrap().name,
+        "legacy renamed"
+    );
+    assert_eq!(
         current.group_record(&group_id).unwrap().protocol_profile,
         ProtocolProfile::Legacy
+    );
+
+    let mut current_invitee = build_current_client(b"legacy-reopen-invitee");
+    let invitee_key_package = current_invitee.fresh_key_package().await.unwrap();
+    let invite_error = current
+        .send(cgka_traits::engine::SendIntent::Invite {
+            group_id,
+            key_packages: vec![invitee_key_package],
+        })
+        .await
+        .expect_err("strict cutover must freeze legacy-group membership");
+    assert!(
+        matches!(invite_error, EngineError::InvalidTransition(ref transition)
+            if transition.reason.contains("strict cutover"))
     );
 }
 
@@ -1370,7 +1412,7 @@ async fn nostr_routing_component_drives_group_message_route() {
         .await
         .unwrap();
     let msg = match sent {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         other => panic!("expected app message, got {other:?}"),
     };
     assert_eq!(
@@ -1563,6 +1605,138 @@ async fn fresh_key_package_roundtrips_bytes() {
         !kp.bytes().is_empty(),
         "key package bytes should be non-empty"
     );
+}
+
+#[test]
+fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam() {
+    let current = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"default-current"))
+        .account_identity_proof_signer(proof_signer(b"default-current"))
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .expect("default engine builds");
+    assert_eq!(current.new_protocol_profile(), ProtocolProfile::Current);
+
+    let legacy_result = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"implicit-legacy"))
+        .account_identity_proof_signer(proof_signer(b"implicit-legacy"))
+        .protocol_profile(ProtocolProfile::Legacy)
+        .peeler(Box::new(MockPeeler::default()))
+        .build();
+    let legacy_error = match legacy_result {
+        Ok(_) => panic!("ordinary builder must refuse the legacy profile"),
+        Err(error) => error,
+    };
+    assert!(legacy_error.to_string().contains("strict cutover"));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn strict_cutover_compatibility_gate_enables_legacy_fixture_builds() {
+    let engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"fixture-legacy"))
+        .account_identity_proof_signer(proof_signer(b"fixture-legacy"))
+        .peeler(Box::new(MockPeeler::default()))
+        .build()
+        .expect("debug compatibility gate must build legacy fixtures");
+    assert_eq!(engine.new_protocol_profile(), ProtocolProfile::Legacy);
+}
+
+#[tokio::test]
+async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut legacy =
+        build_profile_client_on_storage(b"retirement", storage.clone(), ProtocolProfile::Legacy);
+    legacy.fresh_key_package().await.unwrap();
+    legacy.fresh_key_package().await.unwrap();
+    drop(legacy);
+
+    let mut current =
+        build_profile_client_on_storage(b"retirement", storage.clone(), ProtocolProfile::Current);
+    current.fresh_key_package().await.unwrap();
+    assert_eq!(storage.stored_key_package_bundles().unwrap().len(), 3);
+
+    let first = current.retire_non_current_key_packages().unwrap();
+    assert_eq!(first.legacy_retired, 2);
+    assert_eq!(first.invalid_retired, 0);
+    assert_eq!(first.current_retained, 1);
+    assert_eq!(storage.stored_key_package_bundles().unwrap().len(), 1);
+
+    let second = current.retire_non_current_key_packages().unwrap();
+    assert_eq!(second.legacy_retired, 0);
+    assert_eq!(second.invalid_retired, 0);
+    assert_eq!(second.current_retained, 1);
+    assert_eq!(storage.stored_key_package_bundles().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn strict_cutover_rejects_new_and_replayed_legacy_welcomes_without_group_state() {
+    let bob_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut legacy_bob = build_profile_client_on_storage(
+        b"legacy-welcome-bob",
+        bob_storage.clone(),
+        ProtocolProfile::Legacy,
+    );
+    let bob_key_package = legacy_bob.fresh_key_package().await.unwrap();
+    drop(legacy_bob);
+
+    let mut legacy_alice = build_profile_client_on_storage(
+        b"legacy-welcome-alice",
+        SqliteAccountStorage::in_memory().unwrap(),
+        ProtocolProfile::Legacy,
+    );
+    let (group_id, created) = legacy_alice
+        .create_group(CreateGroupRequest {
+            name: "legacy welcome".into(),
+            description: String::new(),
+            members: vec![bob_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome, pending) = match created {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => (welcomes.remove(0), pending),
+        other => panic!("expected legacy GroupCreated, got {other:?}"),
+    };
+    legacy_alice.confirm_published(pending).await.unwrap();
+
+    let mut current_bob = build_profile_client_on_storage(
+        b"legacy-welcome-bob",
+        bob_storage.clone(),
+        ProtocolProfile::Current,
+    );
+    let replay = welcome.clone();
+    let profile_error = current_bob
+        .join_welcome(welcome)
+        .await
+        .expect_err("current client must reject a legacy Welcome even before retirement");
+    assert!(matches!(profile_error, EngineError::InvalidWelcome));
+    assert_eq!(
+        bob_storage.stored_key_package_bundles().unwrap().len(),
+        1,
+        "profile rejection must roll back OpenMLS KeyPackage consumption"
+    );
+    assert!(matches!(
+        bob_storage.get_group(&group_id),
+        Err(cgka_traits::storage::StorageError::NotFound)
+    ));
+
+    let retirement = current_bob.retire_non_current_key_packages().unwrap();
+    assert_eq!(retirement.legacy_retired, 1);
+    assert!(bob_storage.stored_key_package_bundles().unwrap().is_empty());
+
+    let replay_error = current_bob
+        .join_welcome(replay)
+        .await
+        .expect_err("cached/replayed legacy Welcome must remain terminal");
+    assert!(matches!(replay_error, EngineError::WelcomeAlreadyProcessed));
+    assert!(bob_storage.list_groups().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1890,6 +2064,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
     let mut alice = build_client_with_components(b"alice", components.clone());
     let carol_storage = SqliteAccountStorage::in_memory().unwrap();
     let capable_carol = EngineBuilder::new(carol_storage.clone())
+        .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .supported_app_components(components)
@@ -1924,6 +2099,7 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
 
     // Downgraded carol supports no app components.
     let mut downgraded_carol = EngineBuilder::new(carol_storage)
+        .legacy_compatibility_profile()
         .identity(pad32(b"carol"))
         .account_identity_proof_signer(proof_signer(b"carol"))
         .peeler(Box::new(MockPeeler::default()))
@@ -2114,6 +2290,7 @@ async fn audit_log_records_welcome_recipient_expectation() {
         marmot_forensics::JsonlRecorder::open(&path, "test-engine-recip".to_string()).unwrap();
 
     let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
         .account_identity_proof_signer(proof_signer(b"alice"))
         .peeler(Box::new(MockPeeler::default()))

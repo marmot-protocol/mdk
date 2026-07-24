@@ -256,6 +256,7 @@ pub struct EngineBuilder<S: StorageProvider> {
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
     new_protocol_profile: ProtocolProfile,
+    allow_legacy_compatibility_profile: bool,
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
@@ -270,7 +271,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
-            new_protocol_profile: ProtocolProfile::Legacy,
+            new_protocol_profile: ProtocolProfile::Current,
+            allow_legacy_compatibility_profile: false,
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
@@ -305,9 +307,21 @@ impl<S: StorageProvider> EngineBuilder<S> {
     }
 
     /// Select the profile emitted by fresh KeyPackages and newly created
-    /// groups. Defaults to legacy until the coordinated strict cutover.
+    /// groups. Defaults to current after the coordinated strict cutover.
+    /// Passing legacy is rejected by [`Self::build`]; only the explicitly
+    /// named compatibility-fixture seam can construct legacy artifacts.
     pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
         self.new_protocol_profile = protocol_profile;
+        self.allow_legacy_compatibility_profile = false;
+        self
+    }
+
+    /// Construct legacy artifacts only for compatibility fixtures and
+    /// conformance coverage. This surface is absent from release builds.
+    #[cfg(debug_assertions)]
+    pub fn legacy_compatibility_profile(mut self) -> Self {
+        self.new_protocol_profile = ProtocolProfile::Legacy;
+        self.allow_legacy_compatibility_profile = true;
         self
     }
 
@@ -334,6 +348,13 @@ impl<S: StorageProvider> EngineBuilder<S> {
     }
 
     pub fn build(self) -> Result<Engine<S>, EngineError> {
+        if self.new_protocol_profile == ProtocolProfile::Legacy
+            && !self.allow_legacy_compatibility_profile
+        {
+            return Err(EngineError::Other(
+                "strict cutover forbids creating a legacy-profile engine".into(),
+            ));
+        }
         // spec/foundation/mls-protocol.md:11-15 — Marmot has a single
         // mandatory-to-implement ciphersuite. Reject any other ciphersuite at
         // construction so no group can ever be created off-spec.
@@ -604,7 +625,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut rows = Vec::new();
 
         let main = match result {
-            SendResult::ApplicationMessage { msg } => {
+            SendResult::ApplicationMessage { msg, .. } => {
                 Some((msg, MessageArtifactKind::ApplicationMessage))
             }
             SendResult::Proposal { msg } => Some((msg, MessageArtifactKind::Proposal)),
@@ -1181,6 +1202,7 @@ impl<S: StorageProvider> Engine<S> {
             };
             if let ProcessedMessageContent::ProposalMessage(queued) = processed.into_content()
                 && matches!(queued.proposal(), Proposal::SelfRemove)
+                && crate::app_components::authorize_standalone_proposal(mls_group, &queued).is_ok()
             {
                 return Ok(true);
             }

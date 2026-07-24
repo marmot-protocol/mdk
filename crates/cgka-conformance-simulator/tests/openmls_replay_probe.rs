@@ -16,17 +16,32 @@ use cgka_conformance_simulator::openmls_projection::{
 use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
+use cgka_engine::{DEFAULT_CIPHERSUITE, openmls_projection::OpenMlsProjectionError};
+use cgka_traits::app_components::{GROUP_PROFILE_COMPONENT_ID, encode_component_vectors};
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
 };
+use cgka_traits::engine::CgkaEngine;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group::{Group, Member};
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::{IngestOutcome, ProposalRejectionCategory};
 use cgka_traits::message::{MessageRecord, MessageState};
-use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
-use cgka_traits::transport::TransportMessage;
+use cgka_traits::peeler::TransportPeeler;
+use cgka_traits::storage::{
+    AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+};
+use cgka_traits::transport::{
+    EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
+use openmls::messages::proposals::AppDataUpdateOperation;
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
+use sha2::{Digest, Sha256};
+use tls_codec::Serialize;
 
 fn pad32(name: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 32];
@@ -96,6 +111,182 @@ async fn queued_commit_messages(
                 .is_ok_and(|projection| projection.kind == OpenMlsContentKind::Commit)
         })
         .collect()
+}
+
+fn raw_group_profile_update_proposal(
+    client: &HarnessClient,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        client.storage().mls_storage(),
+    );
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut group = MlsGroup::load(provider.storage(), &mls_group_id)
+        .expect("load MLS group")
+        .expect("MLS group exists");
+    let binding = client
+        .storage()
+        .account_device_signer(&client.member_id())
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        client.storage().mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("load MLS signer");
+    let (proposal, _) = group
+        .propose_app_data_update(
+            &provider,
+            &signer,
+            GROUP_PROFILE_COMPONENT_ID,
+            AppDataUpdateOperation::Update(
+                encode_component_vectors(&[b"renamed", b"description"]).into(),
+            ),
+        )
+        .expect("build valid group-profile proposal");
+    let payload = proposal
+        .tls_serialize_detached()
+        .expect("serialize proposal");
+    TransportMessage {
+        id: MessageId::new(Sha256::digest(&payload).to_vec()),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("openmls-proposal-vector".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+fn stored_pending_proposal_count(client: &HarnessClient, group_id: &GroupId) -> usize {
+    let crypto = RustCrypto::default();
+    let provider = EngineOpenMlsProvider::<storage_sqlite::SqliteAccountStorage>::new(
+        &crypto,
+        client.storage().mls_storage(),
+    );
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    MlsGroup::load(provider.storage(), &mls_group_id)
+        .expect("load MLS group")
+        .expect("MLS group exists")
+        .pending_proposals()
+        .count()
+}
+
+#[tokio::test]
+async fn proposal_authorization_vector_rejects_direct_and_nostr_wrapped_input() {
+    let bus = TransportBus::ordered();
+    let mut alice = ClientBuilder::new(pad32(b"alice"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+    let mut bob = ClientBuilder::new(pad32(b"bob"))
+        .registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .attach(&bus);
+
+    let bob_kp = bob.fresh_key_package().await;
+    let (group_id, pending) = alice
+        .create_group_with_admins_maybe_pending(
+            "proposal-authorization-vector",
+            vec![bob_kp],
+            vec![],
+            vec![],
+        )
+        .await;
+    assert!(
+        pending.is_none(),
+        "current-profile founding creation is immediately stable"
+    );
+    bus.deliver_all();
+    let join_outcomes = bob.tick().await;
+    assert!(
+        join_outcomes.iter().all(Result::is_ok),
+        "bob joins current-profile group: {join_outcomes:?}"
+    );
+
+    // Bob is a member but not an admin. The proposal is MLS-valid and its
+    // component payload is well-formed, so authorization is the only reason it
+    // must be rejected.
+    let stable_epoch = alice.epoch();
+    let direct = raw_group_profile_update_proposal(&bob, &group_id);
+    let direct_rejection =
+        replay_openmls_messages(alice.storage(), &group_id, std::slice::from_ref(&direct))
+            .expect_err("direct OpenMLS replay rejects unauthorized proposal");
+    assert!(matches!(
+        direct_rejection,
+        OpenMlsProjectionError::RejectedProposal {
+            category: ProposalRejectionCategory::AuthorizationFailed,
+            ..
+        }
+    ));
+    assert_eq!(
+        alice.epoch(),
+        stable_epoch,
+        "direct replay rolls back without changing the live group"
+    );
+    assert_eq!(
+        stored_pending_proposal_count(&alice, &group_id),
+        0,
+        "direct replay cannot leave the rejected proposal pending"
+    );
+
+    // Exercise the production-shaped Nostr kind-445 seam with the same inner
+    // MLS proposal. It must terminate as Failed before pending storage or
+    // auto-commit scheduling.
+    let snapshot = {
+        let context = alice
+            .engine
+            .group_context(&group_id)
+            .expect("load group context");
+        GroupContextSnapshot::from_context(
+            context.as_ref(),
+            &[transport_nostr_peeler::DEFAULT_EXPORTER_LABEL],
+        )
+    };
+    let wrapped = transport_nostr_peeler::NostrMlsPeeler::default()
+        .wrap_group_message(
+            &EncryptedPayload {
+                ciphertext: direct.payload,
+                aad: vec![],
+            },
+            &snapshot,
+        )
+        .await
+        .expect("wrap proposal as Nostr group event");
+    bus.inject(alice.bus_id, wrapped.clone());
+    let outcomes = alice.tick_ingest_only().await;
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [Ok(IngestOutcome::Rejected {
+                category: ProposalRejectionCategory::AuthorizationFailed
+            })]
+        ),
+        "wrapped unauthorized proposal is terminal: {outcomes:?}"
+    );
+    assert!(
+        alice
+            .storage()
+            .list_messages(&group_id, EpochId(0))
+            .expect("list durable group messages")
+            .iter()
+            .any(|record| record.state == MessageState::Failed),
+        "wrapped rejection leaves a terminal failed content record"
+    );
+    assert!(
+        alice.engine.drain_auto_publish().is_empty(),
+        "rejected proposal cannot schedule an auto-commit"
+    );
+    assert_eq!(
+        stored_pending_proposal_count(&alice, &group_id),
+        0,
+        "wrapped ingest cannot leave the rejected proposal pending"
+    );
+    assert_eq!(alice.epoch(), stable_epoch);
 }
 
 #[tokio::test]
@@ -1343,11 +1534,13 @@ fn openmls_disposition_persistence_maps_all_canonicalization_states() {
                 message_id: hex::encode(losing_commit_id.as_slice()),
                 kind: MessageKind::Commit,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             },
             DroppedMessage {
                 message_id: hex::encode(malformed_proposal_id.as_slice()),
                 kind: MessageKind::Proposal,
                 reason: DroppedMessageReason::Malformed,
+                rejection_category: None,
             },
         ],
         already_seen: vec![],

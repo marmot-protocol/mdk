@@ -5,6 +5,7 @@ use std::sync::Arc;
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::TransportEndpoint;
+use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID;
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
     STREAM_TAG,
@@ -3889,7 +3890,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 nonce_hex: hex::encode([0x24_u8; 12]),
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
-                version: "encrypted-media-v1".to_owned(),
+                version: "encrypted-media-v2".to_owned(),
                 source_epoch: 0,
                 dim: Some("800x600".to_owned()),
                 thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
@@ -3904,7 +3905,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 nonce_hex: hex::encode([0x25_u8; 12]),
                 file_name: "audio.ogg".to_owned(),
                 media_type: "audio/ogg".to_owned(),
-                version: "encrypted-media-v1".to_owned(),
+                version: "encrypted-media-v2".to_owned(),
                 source_epoch: 0,
                 dim: None,
                 thumbhash: None,
@@ -3937,7 +3938,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             .iter()
             .any(|field| field == "nonce 242424242424242424242424")
     );
-    assert!(imeta.iter().any(|field| field == "v encrypted-media-v1"));
+    assert!(imeta.iter().any(|field| field == "v encrypted-media-v2"));
     assert!(imeta.iter().any(|field| field.starts_with("thumbhash ")));
     assert!(imeta.iter().all(|field| !field.starts_with("blurhash ")));
     assert!(
@@ -3959,7 +3960,7 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
                 nonce_hex: hex::encode([0x24_u8; 12]),
                 file_name: "diagram.png".to_owned(),
                 media_type: "image/png".to_owned(),
-                version: "encrypted-media-v1".to_owned(),
+                version: "encrypted-media-v2".to_owned(),
                 source_epoch: 0,
                 dim: None,
                 thumbhash: None,
@@ -4046,8 +4047,10 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     bob.sync().await.unwrap();
     let group_state = alice.group_mls_state(&group_id).unwrap();
     assert!(
-        group_state.required_app_components.contains(&0x8008),
-        "encrypted media v1 is a required app component"
+        group_state
+            .required_app_components
+            .contains(&GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID),
+        "encrypted media v2 is a required app component"
     );
 
     let plaintext = b"marmot encrypted media tracer bullet".to_vec();
@@ -4085,7 +4088,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     let second_reference = upload.attachments[1].reference.clone();
     assert_eq!(reference.file_name, "note.txt");
     assert_eq!(reference.media_type, "text/plain");
-    assert_eq!(reference.version, "encrypted-media-v1");
+    assert_eq!(reference.version, "encrypted-media-v2");
     assert_eq!(
         reference.plaintext_sha256,
         hex::encode(Sha256::digest(&plaintext))
@@ -4103,19 +4106,19 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     let optimistic_tag = alice
         .build_media_imeta_tag(&group_id, &reference)
         .await
-        .expect("legacy group accepts its V1 upload reference");
+        .expect("current group accepts its V2 upload reference");
     assert!(
         optimistic_tag
             .iter()
-            .any(|field| field == "v encrypted-media-v1")
+            .any(|field| field == "v encrypted-media-v2")
     );
     let mut wrong_version = reference.clone();
-    wrong_version.version = "encrypted-media-v2".to_owned();
+    wrong_version.version = "encrypted-media-v1".to_owned();
     let mismatch = alice
         .build_media_imeta_tag(&group_id, &wrong_version)
         .await
-        .expect_err("legacy group must reject a V2 optimistic reference");
-    assert!(mismatch.to_string().contains("requires encrypted-media-v1"));
+        .expect_err("current group must reject a V1 optimistic reference");
+    assert!(mismatch.to_string().contains("requires encrypted-media-v2"));
 
     let stored = blossom
         .blob(&reference.ciphertext_sha256)
@@ -4149,7 +4152,7 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     );
     assert!(imeta.iter().any(|field| field == "m text/plain"));
     assert!(imeta.iter().any(|field| field == "filename note.txt"));
-    assert!(imeta.iter().any(|field| field == "v encrypted-media-v1"));
+    assert!(imeta.iter().any(|field| field == "v encrypted-media-v2"));
     assert!(imeta.iter().any(|field| field.starts_with("thumbhash ")));
     assert!(imeta.iter().all(|field| !field.starts_with("blurhash ")));
     assert!(second_imeta.iter().any(

@@ -2754,14 +2754,27 @@ fn keys_namespace_uses_account_resolution() {
 }
 
 #[test]
-fn keys_list_reports_no_key_packages_without_faking_a_fetch_error() {
+fn keys_list_reports_startup_published_key_package() {
     let home = tempfile::tempdir().expect("tempdir");
 
     let account_id = create_account(home.path());
 
     let listed = run_json(home.path(), &["--account", &account_id, "keys", "list"]);
     assert_eq!(listed["account_id"], account_id);
-    assert_eq!(listed["keys"], serde_json::json!([]));
+    let keys = listed["keys"].as_array().expect("keys array");
+    assert_eq!(
+        keys.len(),
+        1,
+        "expected the startup-published key package, got {keys:?}"
+    );
+    assert_eq!(keys[0]["account_id"], account_id);
+    assert!(
+        keys[0]["key_package_event_id"]
+            .as_str()
+            .is_some_and(|event_id| !event_id.is_empty())
+    );
+    assert_eq!(keys[0]["local"], true);
+    assert_eq!(keys[0]["relay"], true);
 }
 
 #[test]
@@ -5827,30 +5840,6 @@ fn daemon_runtime_subscriptions_update_local_accounts_without_manual_sync() {
 }
 
 #[test]
-fn missing_key_package_errors_include_repair_guidance() {
-    let home = tempfile::tempdir().expect("tempdir");
-
-    let alice = create_account(home.path());
-    let bob = create_account(home.path());
-
-    let error = run_json_error(
-        home.path(),
-        &["--account", &alice, "group", "create", "general", &bob],
-    );
-
-    assert_eq!(error["code"], "missing_key_package");
-    assert_eq!(error["account_id"], bob);
-    assert_eq!(
-        error["repair"]["local"],
-        format!("wn --account {bob} keys publish")
-    );
-    assert_eq!(
-        error["repair"]["remote"],
-        "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
-    );
-}
-
-#[test]
 fn group_create_can_invite_a_member_by_fetched_pubkey() {
     let home = tempfile::tempdir().expect("tempdir");
     let relay = test_relay_url();
@@ -5914,6 +5903,49 @@ fn group_create_fetches_missing_key_package_for_pubkey_members() {
 
     let bob_join = sync_until_joined(home.path(), test_relay_url(), bob_account_id, group_id);
     assert_eq!(bob_join["joined_groups"][0], group_id);
+}
+
+#[test]
+fn missing_key_package_errors_include_repair_guidance() {
+    let alice_home = tempfile::tempdir().expect("alice tempdir");
+    let bob_home = tempfile::tempdir().expect("bob tempdir");
+    let relay = TestRelay::new();
+    let relay_url = relay.url();
+
+    let bob = create_account_with_real_relay(bob_home.path(), relay_url);
+    let listed = run_json_with_relay(
+        bob_home.path(),
+        relay_url,
+        &["--account", &bob, "keys", "list"],
+    );
+    let event_id = listed["keys"][0]["key_package_event_id"]
+        .as_str()
+        .expect("Bob's published KeyPackage event id")
+        .to_owned();
+    let deleted = run_json_with_relay(
+        bob_home.path(),
+        relay_url,
+        &["--account", &bob, "keys", "delete", &event_id],
+    );
+    assert_eq!(deleted["deleted"], true);
+
+    let alice = create_account_with_real_relay(alice_home.path(), relay_url);
+    let error = run_json_error_with_relay(
+        alice_home.path(),
+        relay_url,
+        &["--account", &alice, "group", "create", "general", &bob],
+    );
+
+    assert_eq!(error["code"], "missing_key_package");
+    assert_eq!(error["account_id"], bob);
+    assert_eq!(
+        error["repair"]["local"],
+        format!("wn --account {bob} keys publish")
+    );
+    assert_eq!(
+        error["repair"]["remote"],
+        "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+    );
 }
 
 #[test]

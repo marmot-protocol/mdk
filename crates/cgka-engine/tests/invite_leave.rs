@@ -11,12 +11,14 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+use cgka_traits::message::MessageState;
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, OutboundIntentStorage,
-    StorageProvider,
+    AccountDeviceSignerStorage, GroupStorage, LeaveRequestStorage, MessageStorage,
+    OutboundIntentStorage, StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -107,6 +109,12 @@ fn hash_id(bytes: &[u8]) -> MessageId {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
     MessageId::new(h.finish().to_be_bytes().to_vec())
+}
+
+fn content_id(msg: &TransportMessage) -> MessageId {
+    use sha2::{Digest, Sha256};
+
+    MessageId::new(Sha256::digest(&msg.payload).to_vec())
 }
 
 /// Encode a `marmot.group.admin-policy.v1` state from raw 32-byte account keys,
@@ -215,6 +223,7 @@ fn build_client_on_storage(
     storage: SqliteAccountStorage,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
+        .legacy_compatibility_profile()
         .identity(pad32(id))
         .account_identity_proof_signer(proof_signer(id))
         .feature_registry(selfremove_registry())
@@ -283,6 +292,48 @@ fn welcome_from_existing_non_admin(
         source: TransportSource("malicious-openmls".into()),
         envelope: TransportEnvelope::Welcome {
             recipient: MemberId::new(recipient.identity().to_vec()),
+        },
+    }
+}
+
+fn add_proposal_from_member(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    invitee_key_package: &KeyPackage,
+) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
+        .expect("load proposal sender's MLS group")
+        .expect("proposal sender joined group");
+    let binding = storage
+        .account_device_signer(sender)
+        .expect("load signer binding")
+        .expect("signer binding exists");
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .expect("MLS signer exists");
+    let invitee = clone_key_package_for_invite(invitee_key_package);
+    let (proposal, _) = mls_group
+        .propose_add_member(&provider, &signer, &invitee)
+        .expect("member can build a standalone Add proposal");
+    let payload = proposal
+        .tls_serialize_detached()
+        .expect("serialize standalone Add proposal");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("standalone-add".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
         },
     }
 }
@@ -385,6 +436,7 @@ fn app_payload_for(engine: &Engine<SqliteAccountStorage>, payload: impl AsRef<[u
 
 fn try_build_raw_identity_client(id: &[u8]) -> Result<Engine<SqliteAccountStorage>, EngineError> {
     EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(id.to_vec())
         .account_identity_proof_signer(proof_signer(b"raw-identity"))
         .feature_registry(selfremove_registry())
@@ -494,10 +546,204 @@ async fn invite_adds_third_member_and_advances_epoch() {
 }
 
 #[tokio::test]
+async fn strict_cutover_rejects_inbound_adds_to_legacy_groups_during_convergence() {
+    let mut alice = build_client(b"strict-inbound-alice");
+    let (mut bob, bob_storage) = build_with_storage(b"strict-inbound-bob");
+    let mut carol = build_client(b"strict-inbound-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "frozen legacy membership".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (welcome, pending) = match created {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => (welcomes.remove(0), pending),
+        other => panic!("expected legacy GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+    drop(bob);
+
+    let mut bob = EngineBuilder::new(bob_storage)
+        .identity(pad32(b"strict-inbound-bob"))
+        .account_identity_proof_signer(proof_signer(b"strict-inbound-bob"))
+        .feature_registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    bob.hydrate_stable_groups_from_storage().unwrap();
+    assert_eq!(
+        bob.group_record(&group_id).unwrap().protocol_profile,
+        ProtocolProfile::Legacy
+    );
+    let frozen_epoch = bob.epoch(&group_id).unwrap();
+    let frozen_members = bob.members(&group_id).unwrap();
+    let precursor = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("legacy update before Add".into()),
+            description: None,
+        })
+        .await
+        .expect("non-membership changes remain allowed in a legacy group");
+    let (precursor_commit, precursor_pending) = match precursor {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected precursor GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(precursor_pending).await.unwrap();
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invited = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol_kp],
+        })
+        .await
+        .unwrap();
+    let (commit, pending) = match invited {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected legacy GroupEvolution, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let routed_commit = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..commit
+    };
+    let outcome = bob.ingest(routed_commit).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "expected buffered legacy Add commit, got {outcome:?}"
+    );
+    let routed_precursor = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..precursor_commit
+    };
+    let outcome = bob.ingest(routed_precursor).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
+
+    let convergence = bob
+        .converge_stored_openmls_messages(&group_id, 1_000_000)
+        .expect("strict cutover should reject the branch without failing convergence");
+    assert_eq!(convergence.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        bob.epoch(&group_id).unwrap().0,
+        frozen_epoch.0.saturating_add(1)
+    );
+    assert_eq!(bob.members(&group_id).unwrap(), frozen_members);
+    assert!(
+        convergence
+            .dropped_messages
+            .iter()
+            .any(|drop| {
+                drop.kind == cgka_engine::canonicalization::MessageKind::Commit
+                    && drop.reason
+                        == cgka_engine::canonicalization::DroppedMessageReason::InvalidAgainstCandidateState
+            }),
+        "legacy Add commit must be terminally rejected: {convergence:?}"
+    );
+}
+
+#[tokio::test]
+async fn strict_cutover_add_replay_retires_raw_and_content_rows() {
+    let (mut alice, alice_storage) = build_with_storage(b"strict-replay-alice");
+    let (mut bob, bob_storage) = build_with_storage(b"strict-replay-bob");
+    let mut carol = build_client(b"strict-replay-carol");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "frozen replay membership".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id().clone()],
+        })
+        .await
+        .unwrap();
+    let (welcome, create_pending) = match created {
+        SendResult::GroupCreated {
+            mut welcomes,
+            pending,
+        } => (welcomes.remove(0), pending),
+        other => panic!("expected legacy GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    bob.join_welcome(welcome).await.unwrap();
+    drop(bob);
+
+    let mut bob = EngineBuilder::new(bob_storage.clone())
+        .identity(pad32(b"strict-replay-bob"))
+        .account_identity_proof_signer(proof_signer(b"strict-replay-bob"))
+        .feature_registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    bob.hydrate_stable_groups_from_storage().unwrap();
+
+    let local_pending = match bob
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending local change".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { pending, .. } => pending,
+        other => panic!("expected pending non-membership update, got {other:?}"),
+    };
+
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let add_proposal =
+        add_proposal_from_member(&alice_storage, &alice.self_id(), &group_id, &carol_kp);
+    let raw_id = add_proposal.id.clone();
+    let content_id = content_id(&add_proposal);
+
+    let buffered = bob.ingest(add_proposal).await.unwrap();
+    assert!(matches!(buffered, IngestOutcome::Buffered { .. }));
+    assert_eq!(
+        bob_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Retryable
+    );
+
+    bob.publish_failed(local_pending).await.unwrap();
+    assert_eq!(
+        bob_storage.get_message(&raw_id).unwrap().state,
+        MessageState::Failed,
+        "strict-cutover replay must retire the raw transport row"
+    );
+    assert_eq!(
+        bob_storage.get_message(&content_id).unwrap().state,
+        MessageState::Failed,
+        "strict-cutover replay must terminalize the content-derived row"
+    );
+    assert_eq!(bob.members(&group_id).unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn invite_rejects_invitee_missing_required_capability() {
     let mut alice = build_client(b"alice");
     let mut bob = build_client(b"bob");
     let mut stripped = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(pad32(b"stripped"))
         .account_identity_proof_signer(proof_signer(b"stripped"))
         .feature_registry(FeatureRegistry::new())
@@ -697,7 +943,7 @@ async fn post_eviction_app_message(
         .await
         .unwrap();
     let msg = match sent {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     TransportMessage {

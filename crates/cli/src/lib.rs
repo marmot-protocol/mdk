@@ -1933,6 +1933,7 @@ mod tests {
                 kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
                 tags: Vec::new(),
                 source_epoch: None,
+                retention: None,
                 recorded_at: 100 + u64::try_from(index / 2).unwrap(),
                 received_at: 100 + u64::try_from(index / 2).unwrap(),
                 insert_order: i64::try_from(index).unwrap(),

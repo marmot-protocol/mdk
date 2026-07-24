@@ -455,6 +455,16 @@ impl MarmotApp {
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
     ) -> Result<Vec<RelayEventRecord>, AppError> {
+        self.fetch_key_package_events_for_account_id_with_limit(account_id_hex, source_relays, 12)
+            .await
+    }
+
+    pub(crate) async fn fetch_key_package_events_for_account_id_with_limit(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+        limit: usize,
+    ) -> Result<Vec<RelayEventRecord>, AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let source_relays = self.directory_source_relays(source_relays);
@@ -464,7 +474,7 @@ impl MarmotApp {
                 vec![DirectoryEventQuery::new(
                     KIND_MARMOT_KEY_PACKAGE,
                     vec![public_key.to_hex()],
-                    12,
+                    limit,
                 )],
             )
             .await

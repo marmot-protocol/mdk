@@ -66,6 +66,7 @@ pub(crate) fn ingest_outcome_kind_str(outcome: &IngestOutcome) -> &'static str {
         IngestOutcome::Processed => "processed",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Stale { .. } => "stale",
+        IngestOutcome::Rejected { .. } => "rejected",
     }
 }
 
@@ -436,6 +437,9 @@ pub(crate) fn ingest_outcome_event(
         outcome_kind: ingest_outcome_kind_str(outcome).to_string(),
         stale_reason: match outcome {
             IngestOutcome::Stale { reason } => Some(stale_reason_str(reason).to_string()),
+            IngestOutcome::Rejected { category } => {
+                Some(crate::app_components::proposal_rejection_category_tag(*category).to_string())
+            }
             _ => None,
         },
         epoch: ingest_outcome_epoch(outcome),
@@ -519,7 +523,7 @@ pub(crate) fn send_outbound_messages(result: &SendResult) -> Vec<OutboundMessage
     }
     let mut messages = Vec::new();
     match result {
-        SendResult::ApplicationMessage { msg } => {
+        SendResult::ApplicationMessage { msg, .. } => {
             messages.push(outbound(msg, MessageArtifactKind::ApplicationMessage));
         }
         SendResult::Proposal { msg } => {

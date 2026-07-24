@@ -917,6 +917,11 @@ impl<S: StorageProvider> Engine<S> {
                 // joining.md:65).
                 let protocol_profile =
                     validate_member_credentials_and_account_proofs(&mls_group, self.ciphersuite)?;
+                if self.new_protocol_profile == ProtocolProfile::Current
+                    && protocol_profile != ProtocolProfile::Current
+                {
+                    return Err(EngineError::InvalidWelcome);
+                }
                 crate::app_components::validate_current_profile_group_invariants(&mls_group)
                     .map_err(|_| EngineError::InvalidWelcome)?;
 

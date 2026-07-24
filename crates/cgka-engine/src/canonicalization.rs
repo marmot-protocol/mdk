@@ -182,6 +182,7 @@ pub struct DroppedMessage {
     pub message_id: String,
     pub kind: MessageKind,
     pub reason: DroppedMessageReason,
+    pub rejection_category: Option<cgka_traits::ingest::ProposalRejectionCategory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -831,6 +832,7 @@ fn drop_losing_materialized_candidate_commits(
                 message_id: message_id.clone(),
                 kind: MessageKind::Commit,
                 reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                rejection_category: None,
             });
         }
     }
@@ -922,6 +924,7 @@ fn dropped(message: &PeeledMessage, reason: DroppedMessageReason) -> DroppedMess
         message_id: message.message_id.clone(),
         kind: message.kind_name(),
         reason,
+        rejection_category: None,
     }
 }
 

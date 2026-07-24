@@ -29,9 +29,10 @@ use crate::canonicalization::{
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
-    OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation,
-    apply_openmls_canonicalization_result, canonicalize_stored_openmls_messages,
-    project_mls_message, retain_current_group_epoch_snapshot,
+    OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation, ReplayProfilePolicy,
+    apply_openmls_canonicalization_result_with_profile_policy,
+    canonicalize_stored_openmls_messages_with_profile_policy, project_mls_message,
+    retain_current_group_epoch_snapshot,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -325,13 +326,18 @@ impl<S: StorageProvider> Engine<S> {
                 error_kind: None,
             },
         );
-        let result = canonicalize_stored_openmls_messages(
+        let replay_profile_policy = ReplayProfilePolicy {
+            reject_legacy_group_additions: self.new_protocol_profile
+                == cgka_traits::group::ProtocolProfile::Current,
+        };
+        let result = canonicalize_stored_openmls_messages_with_profile_policy(
             &self.storage,
             group_id,
             state,
             vec![],
             policy,
             now_ms,
+            replay_profile_policy,
         )?;
         let error_kinds: Vec<String> = result
             .errors
@@ -429,11 +435,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(result);
         }
 
-        let observations = apply_openmls_canonicalization_result(
+        let observations = apply_openmls_canonicalization_result_with_profile_policy(
             &self.storage,
             group_id,
             &result,
             max_retained_anchor_rewind,
+            replay_profile_policy,
         )?;
         // #740 rotation: a routing-component update commit applied through
         // convergence may have changed this group's nostr_group_id; additively
@@ -479,6 +486,7 @@ impl<S: StorageProvider> Engine<S> {
         }
         self.emit_application_replay_events(group_id, &observations);
         self.emit_invalidated_app_events(group_id, &result)?;
+        self.emit_rejected_proposal_convergence_audits(group_id, &result);
         self.emit_rolled_back_commits(group_id, &result)?;
         self.emit_superseded_processed_commits(group_id, &result)?;
 
@@ -768,6 +776,7 @@ impl<S: StorageProvider> Engine<S> {
                 source_epoch,
                 sender,
                 payload,
+                retention,
                 ..
             } = observation
             else {
@@ -790,6 +799,7 @@ impl<S: StorageProvider> Engine<S> {
                 epoch: cgka_traits::EpochId(*source_epoch),
                 sender: MemberId::new(sender.clone()),
                 payload: payload.clone(),
+                retention: Some(*retention),
             });
         }
     }
@@ -816,6 +826,26 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         Ok(())
+    }
+
+    fn emit_rejected_proposal_convergence_audits(
+        &mut self,
+        group_id: &GroupId,
+        result: &CanonicalizationResult,
+    ) {
+        for dropped in &result.dropped_messages {
+            let Some(category) = dropped.rejection_category else {
+                continue;
+            };
+            self.audit_group(
+                group_id,
+                marmot_forensics::AuditEventKind::Rejection {
+                    msg_id: dropped.message_id.clone(),
+                    reason: crate::app_components::proposal_rejection_category_tag(category)
+                        .to_string(),
+                },
+            );
+        }
     }
 
     /// Emit a [`GroupEvent::CommitRolledBack`] for every commit that this

@@ -51,7 +51,7 @@ pub use app_components::{
 };
 pub use app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
-    AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
+    AGENT_OPERATION_TYPE_TAG, AppMessageRetentionDecision, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
@@ -76,7 +76,9 @@ pub use engine_state::{
 pub use error::{EngineError, PeelerError};
 pub use group::{Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
-pub use ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
+pub use ingest::{
+    IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
+};
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
 pub use peeler::{GroupMessageMetadata, GroupMessageMetadataError, TransportPeeler};
 pub use storage::{

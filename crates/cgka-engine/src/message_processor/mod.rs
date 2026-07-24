@@ -106,6 +106,27 @@ struct DeferredPeelAttempts {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    pub(crate) fn strict_cutover_rejects_legacy_group_addition(
+        &self,
+        group_id: &GroupId,
+        has_addition: bool,
+    ) -> Result<(), EngineError> {
+        if has_addition
+            && self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && self.storage.get_group(group_id)?.protocol_profile
+                == cgka_traits::group::ProtocolProfile::Legacy
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "LegacyProfile",
+                    to: "AddMember",
+                    reason: "strict cutover forbids adding members to legacy groups",
+                },
+            ));
+        }
+        Ok(())
+    }
+
     /// Inbound pipeline. Never panics; every classifiable stale case returns
     /// a typed `StaleReason` inside `Ok(IngestOutcome::Stale { .. })`.
     pub(crate) async fn do_ingest(
@@ -171,6 +192,22 @@ impl<S: StorageProvider> Engine<S> {
         // stage, queue, or publish anything — a confirm would set_stable and
         // silently un-quarantine it out of band (mdk#364).
         self.ensure_group_live(&group_id)?;
+        // Strict cutover freezes membership growth in legacy groups. Existing
+        // members may continue messaging and applying other group changes, but
+        // no add (including a re-add) may be staged or queued.
+        if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && matches!(intent, SendIntent::Invite { .. })
+            && self.storage.get_group(&group_id)?.protocol_profile
+                == cgka_traits::group::ProtocolProfile::Legacy
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "LegacyProfile",
+                    to: "Invite",
+                    reason: "strict cutover forbids adding members to legacy groups",
+                },
+            ));
+        }
         // Terminal gate before queueing: a local copy marked removed (realized
         // self-eviction) must never accept or queue outbound work. Checked
         // again in `do_send_ready` so queued-intent drains for a copy removed
@@ -265,7 +302,7 @@ impl<S: StorageProvider> Engine<S> {
             let result = self.do_send_ready(record.intent.clone()).await?;
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
             match &result {
-                SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
+                SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
                     self.queued_intent_by_message
                         .insert(msg.id.clone(), (record.group_id.clone(), record.id.clone()));
                 }
@@ -659,7 +696,7 @@ impl<S: StorageProvider> Engine<S> {
                     self.note_peel_deferred_row_retired(group_id, &record.id);
                     progressed += 1;
                 }
-                Ok(IngestOutcome::Stale { .. }) => {
+                Ok(IngestOutcome::Stale { .. } | IngestOutcome::Rejected { .. }) => {
                     // Terminal stale classifications are still successful
                     // reclassifications of this raw deferred row. Retire it only
                     // while it is still awaiting retry: the reachable case is

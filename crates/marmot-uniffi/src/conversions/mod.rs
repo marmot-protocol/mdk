@@ -389,7 +389,8 @@ mod tests {
             plaintext: "reaction".to_owned(),
             kind: 7,
             tags: vec![vec!["e".to_owned(), "target".to_owned()]],
-            source_epoch: None,
+            source_epoch: Some(4),
+            retention: Some(marmot_app::AppMessageRetentionDecision::new(10, 5)),
             recorded_at: 10,
             received_at: 11,
             insert_order: 0,
@@ -399,6 +400,9 @@ mod tests {
 
         assert_eq!(ffi.kind, 7);
         assert_eq!(ffi.content_tokens, MarkdownDocumentFfi::default());
+        assert_eq!(ffi.source_epoch, Some(4));
+        assert_eq!(ffi.retention_seconds, Some(5));
+        assert_eq!(ffi.retention_expires_at, Some(15));
     }
 
     #[test]

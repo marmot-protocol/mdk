@@ -99,6 +99,7 @@ async fn audit_log_records_ingest_entry_and_outcome_via_jsonl() {
 
     let identity = valid_identity(b"self");
     let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
         .peeler(Box::new(StubPeeler))
@@ -197,6 +198,7 @@ async fn epoch_confirmed_inherits_operation_human_action() {
 
     let identity = valid_identity(b"self");
     let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
         .peeler(Box::new(StubPeeler))
@@ -297,6 +299,7 @@ async fn engine_without_recorder_is_silent_and_does_not_crash() {
     // and emit zero side effects.
     let identity = valid_identity(b"self");
     let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
         .peeler(Box::new(StubPeeler))
@@ -325,6 +328,7 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
 
     let identity = valid_identity(b"self");
     let mut engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
         .identity(identity)
         .account_identity_proof_signer(proof_signer(b"self"))
         .peeler(Box::new(StubPeeler))

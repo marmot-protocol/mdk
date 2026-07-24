@@ -429,10 +429,12 @@ impl AppClient {
         fail_if_publish_failed(&effects)?;
         self.remember_pending_convergence_effects(&effects);
         self.remember_published_reports(&effects);
+        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         self.refresh_group(group_id);
 
         let display_names = self.app.display_names_by_id()?;
         let mut summary = SyncSummary::default();
+        summary.projection_updates.extend(finalize_updates);
         let source_message_id_hex = String::new();
         let source_received_at = unix_now_seconds();
         self.observe_account_device_effects(
@@ -571,6 +573,7 @@ impl AppClient {
                     kind: message.kind,
                     tags: message.tags.clone(),
                     source_epoch: Some(message.source_epoch),
+                    retention: message.retention,
                     recorded_at: Some(message.recorded_at),
                     // Received app messages are not synthesized system rows.
                     origin_commit_id: None,

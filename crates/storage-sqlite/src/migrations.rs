@@ -54,6 +54,8 @@ mod migration_0026_message_drafts;
 mod migration_0027_app_event_moderation_grant;
 #[path = "migrations/0028_ingress_dedup.rs"]
 mod migration_0028_ingress_dedup;
+#[path = "migrations/0029_app_event_retention_decision.rs"]
+mod migration_0029_app_event_retention_decision;
 
 use crate::SqliteResultExt;
 use cgka_traits::storage::{StorageError, StorageResult};
@@ -205,6 +207,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 28,
         name: "0028_ingress_dedup",
         apply: migration_0028_ingress_dedup::apply,
+    },
+    Migration {
+        version: 29,
+        name: "0029_app_event_retention_decision",
+        apply: migration_0029_app_event_retention_decision::apply,
     },
 ];
 
@@ -844,6 +851,39 @@ mod tests {
                 "{table}.{column} should cascade when a group is deleted"
             );
         }
+    }
+
+    #[test]
+    fn retention_migration_keeps_legacy_app_events_unknown_and_safe() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..28]).unwrap();
+        conn.execute(
+            "INSERT INTO app_events (
+                group_id_hex, message_id_hex, direction, sender, plaintext,
+                kind, tags_json, recorded_at, received_at
+             ) VALUES ('aa', 'legacy', 'received', 'sender', 'plaintext',
+                       9, '[]', 10, 11)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS).unwrap();
+
+        let decision = conn
+            .query_row(
+                "SELECT retention_seconds, retention_expires_at
+                 FROM app_events
+                 WHERE group_id_hex = 'aa' AND message_id_hex = 'legacy'",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(decision, (None, None));
+        assert!(connection_has_index(
+            &conn,
+            "app_events",
+            "idx_app_events_group_retention_expiry"
+        ));
     }
 
     #[test]

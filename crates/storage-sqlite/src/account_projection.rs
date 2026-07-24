@@ -92,6 +92,21 @@ pub struct StoredAppMessageQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SecurePruneAppEventsMode {
+    RecordedBefore(u64),
+    ExpiredAt(u64),
+}
+
+impl SecurePruneAppEventsMode {
+    fn trace_method(self) -> &'static str {
+        match self {
+            Self::RecordedBefore(_) => "secure_prune_app_events_before",
+            Self::ExpiredAt(_) => "secure_prune_expired_app_events",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppMessageRecord {
     pub message_id_hex: String,
@@ -102,6 +117,7 @@ pub struct StoredAppMessageRecord {
     pub kind: u64,
     pub tags: Vec<Vec<String>>,
     pub source_epoch: Option<u64>,
+    pub retention: Option<cgka_traits::app_event::AppMessageRetentionDecision>,
     pub recorded_at: u64,
     pub received_at: u64,
     /// Local `app_events` insert order (rowid). The final, LOCAL tiebreak of the
@@ -122,9 +138,10 @@ impl StoredAppMessageRecord {
 }
 
 /// Column list for [`SqliteAccountStorage::app_messages`], ending in
-/// `insert_order` (column index 10, read by `app_message_from_row`).
+/// `insert_order` (column index 12, read by `app_message_from_row`).
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
-     kind, tags_json, source_epoch, recorded_at, received_at, insert_order";
+     kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
+     received_at, insert_order";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
 /// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
@@ -704,6 +721,27 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         cutoff_recorded_at: u64,
     ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
+        self.secure_prune_app_events(
+            group_id_hex,
+            SecurePruneAppEventsMode::RecordedBefore(cutoff_recorded_at),
+        )
+    }
+
+    /// Delete only app events whose durable source-epoch retention decision
+    /// has expired at or before `now`.
+    pub fn secure_prune_expired_app_events(
+        &self,
+        group_id_hex: &str,
+        now: u64,
+    ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
+        self.secure_prune_app_events(group_id_hex, SecurePruneAppEventsMode::ExpiredAt(now))
+    }
+
+    fn secure_prune_app_events(
+        &self,
+        group_id_hex: &str,
+        mode: SecurePruneAppEventsMode,
+    ) -> StorageResult<crate::timeline::SecurePruneAppEventsResult> {
         // `secure_delete` must be ON *before* the prune transaction begins:
         // SQLite does not guarantee zero-on-free for pages freed in the same
         // transaction that toggles the pragma, so setting it inside the
@@ -723,11 +761,18 @@ impl SqliteAccountStorage {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .storage()?;
-                let outcome = crate::timeline::secure_prune_app_events_before_tx(
-                    &tx,
-                    group_id_hex,
-                    cutoff_recorded_at,
-                )?;
+                let outcome = match mode {
+                    SecurePruneAppEventsMode::RecordedBefore(cutoff) => {
+                        crate::timeline::secure_prune_app_events_before_tx(
+                            &tx,
+                            group_id_hex,
+                            cutoff,
+                        )?
+                    }
+                    SecurePruneAppEventsMode::ExpiredAt(now) => {
+                        crate::timeline::secure_prune_expired_app_events_tx(&tx, group_id_hex, now)?
+                    }
+                };
                 tx.commit().storage()?;
                 Ok(outcome)
             })();
@@ -749,7 +794,7 @@ impl SqliteAccountStorage {
                 // embed SQL text or file paths.
                 tracing::warn!(
                     target: "storage_sqlite::retention",
-                    method = "secure_prune_app_events_before",
+                    method = mode.trace_method(),
                     pruned_messages = outcome.pruned_messages,
                     error_kind = match &error {
                         StorageError::NotFound => "not_found",
@@ -1512,6 +1557,12 @@ fn upsert_group_component(
 }
 
 fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMessageRecord> {
+    let retention_seconds = row
+        .get::<_, Option<i64>>(8)?
+        .and_then(|seconds| seconds.try_into().ok());
+    let retention_expires_at = row
+        .get::<_, Option<i64>>(9)?
+        .and_then(|expires_at| expires_at.try_into().ok());
     Ok(StoredAppMessageRecord {
         message_id_hex: row.get(0)?,
         direction: row.get(1)?,
@@ -1525,9 +1576,15 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
         source_epoch: row
             .get::<_, Option<i64>>(7)?
             .and_then(|value| value.try_into().ok()),
-        recorded_at: row.get::<_, i64>(8)?.try_into().unwrap_or_default(),
-        received_at: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
-        insert_order: row.get::<_, i64>(10)?,
+        retention: retention_seconds.map(|retention_seconds| {
+            cgka_traits::app_event::AppMessageRetentionDecision {
+                retention_seconds,
+                expires_at: retention_expires_at,
+            }
+        }),
+        recorded_at: row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
+        received_at: row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
+        insert_order: row.get::<_, i64>(12)?,
     })
 }
 

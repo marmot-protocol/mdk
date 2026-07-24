@@ -3,6 +3,7 @@ use marmot_app::{
     AuditLogSettings, AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp, MarmotAppConfig,
     MarmotAppRuntime, MarmotServiceEndpoints,
 };
+use nostr_relay_builder::MockRelay;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -554,7 +555,13 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
     let account = home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay_and_config(
+        tmp.path(),
+        relay_url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
     app.set_audit_log_settings(AuditLogSettings {
         enabled: true,
         ..Default::default()
@@ -563,9 +570,10 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
 
     let mut client = app.client(&account.label).await.unwrap();
     let group_id = client.create_group("audit actions", &[]).await.unwrap();
-    // The fake relay never acks, so the publish step may fail — but the engine
-    // emits the send's audit rows locally before that, which is what we assert.
-    let _ = client.send(&group_id, b"hello marmots").await;
+    client
+        .send(&group_id, b"hello marmots")
+        .await
+        .expect("mock relay should accept the audited send");
 
     let files = app.audit_log_files().unwrap();
     let body = std::fs::read_to_string(&files[0].path).unwrap();

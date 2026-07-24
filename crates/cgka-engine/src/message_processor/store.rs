@@ -480,6 +480,7 @@ mod tests {
         let signing_key = test_signing_key();
         let identity = signing_key.verifying_key().to_bytes().to_vec();
         let engine = EngineBuilder::new(storage.clone())
+            .legacy_compatibility_profile()
             .identity(identity)
             .account_identity_proof_signer(Arc::new(TestProofSigner(signing_key)))
             .peeler(Box::new(UnreachablePeeler))

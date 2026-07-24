@@ -9,8 +9,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::provider::EngineOpenMlsProvider;
+use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::engine::CommitOrderingPriority;
-use cgka_traits::group::Member;
+use cgka_traits::group::{Member, ProtocolProfile};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -22,7 +23,7 @@ use openmls::group::{
 use openmls::messages::proposals::AppDataUpdateOperation;
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
-    ProcessedMessageContent, ProtocolMessage, Sender,
+    ProcessedMessageContent, Proposal, ProtocolMessage, Sender,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider;
@@ -205,8 +206,22 @@ impl ReplayBudget {
 #[derive(Clone, Debug)]
 enum CandidatePathProbeResult {
     Materialized(Option<OpenMlsMaterializedCandidate>),
-    UnauthorizedCommit { message_id: String },
-    InvalidCommit { message_id: String },
+    RejectedProposal {
+        message_id: String,
+        category: cgka_traits::ingest::ProposalRejectionCategory,
+    },
+    UnauthorizedCommit {
+        message_id: String,
+    },
+    InvalidCommit {
+        message_id: String,
+        rejection_category: Option<cgka_traits::ingest::ProposalRejectionCategory>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReplayProfilePolicy {
+    pub(crate) reject_legacy_group_additions: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +237,7 @@ struct StoredOpenMlsCanonicalizationWork {
     now_ms: u64,
     replay_start_epoch: u64,
     own_commits: PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,6 +260,7 @@ pub enum OpenMlsReplayObservation {
         source_epoch: u64,
         sender: Vec<u8>,
         payload: Vec<u8>,
+        retention: AppMessageRetentionDecision,
         decrypted_payload_ref: String,
     },
     Ignored {
@@ -268,8 +285,18 @@ pub enum OpenMlsProjectionError {
     MissingGroup,
     Snapshot(String),
     Replay(String),
-    UnauthorizedCommit { message_id: String },
-    InvalidCommit { message_id: String, reason: String },
+    RejectedProposal {
+        message_id: String,
+        category: cgka_traits::ingest::ProposalRejectionCategory,
+    },
+    UnauthorizedCommit {
+        message_id: String,
+    },
+    InvalidCommit {
+        message_id: String,
+        reason: String,
+        rejection_category: Option<cgka_traits::ingest::ProposalRejectionCategory>,
+    },
     Serialize(String),
     Storage(String),
     InvalidPolicy(String),
@@ -292,10 +319,22 @@ impl std::fmt::Display for OpenMlsProjectionError {
             OpenMlsProjectionError::MissingGroup => write!(f, "MLS group not found"),
             OpenMlsProjectionError::Snapshot(e) => write!(f, "snapshot failed: {e}"),
             OpenMlsProjectionError::Replay(e) => write!(f, "OpenMLS replay failed: {e}"),
+            OpenMlsProjectionError::RejectedProposal {
+                message_id,
+                category,
+            } => {
+                write!(
+                    f,
+                    "rejected proposal {message_id}: {}",
+                    crate::app_components::proposal_rejection_category_tag(*category)
+                )
+            }
             OpenMlsProjectionError::UnauthorizedCommit { message_id } => {
                 write!(f, "unauthorized admin-gated commit: {message_id}")
             }
-            OpenMlsProjectionError::InvalidCommit { message_id, reason } => {
+            OpenMlsProjectionError::InvalidCommit {
+                message_id, reason, ..
+            } => {
                 write!(f, "invalid commit {message_id}: {reason}")
             }
             OpenMlsProjectionError::Serialize(e) => write!(f, "serialize failed: {e}"),
@@ -467,6 +506,7 @@ pub fn replay_openmls_messages<S: StorageProvider>(
         group_id,
         messages,
         &PrevalidatedOwnCommits::default(),
+        ReplayProfilePolicy::default(),
     )
 }
 
@@ -475,6 +515,7 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     use crate::snapshot_guard::SnapshotRollbackGuard;
     let snapshot = replay_snapshot_name(group_id, messages);
@@ -486,8 +527,9 @@ fn replay_openmls_messages_prevalidated<S: StorageProvider>(
     let guard = SnapshotRollbackGuard::create(storage, group_id.clone(), snapshot)
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
-    let result = process_openmls_messages_inner(storage, group_id, messages, own_commits)
-        .map(|out| out.observations);
+    let result =
+        process_openmls_messages_inner(storage, group_id, messages, own_commits, profile_policy)
+            .map(|out| out.observations);
     guard
         .commit()
         .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
@@ -505,6 +547,7 @@ pub fn materialize_openmls_candidate_paths<S: StorageProvider>(
         paths,
         &PrevalidatedOwnCommits::default(),
         &mut ReplayBudget::unlimited(),
+        ReplayProfilePolicy::default(),
     )
 }
 
@@ -514,6 +557,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
     paths: &[OpenMlsCandidatePath],
     own_commits: &PrevalidatedOwnCommits,
     budget: &mut ReplayBudget,
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<Vec<OpenMlsMaterializedCandidate>, OpenMlsProjectionError> {
     let mut candidates = Vec::with_capacity(paths.len());
     for path in paths {
@@ -523,8 +567,13 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
             ));
         }
         budget.consume()?;
-        let observations =
-            replay_openmls_messages_prevalidated(storage, group_id, &path.messages, own_commits)?;
+        let observations = replay_openmls_messages_prevalidated(
+            storage,
+            group_id,
+            &path.messages,
+            own_commits,
+            profile_policy,
+        )?;
         let mut fork_epoch: Option<u64> = None;
         let mut tip_epoch: Option<u64> = None;
         let mut tip_digest: Option<[u8; 32]> = None;
@@ -596,6 +645,7 @@ pub fn canonicalize_openmls_batch<S: StorageProvider>(
         group_id,
         batch,
         &PrevalidatedOwnCommits::default(),
+        ReplayProfilePolicy::default(),
     )
 }
 
@@ -604,6 +654,7 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
     group_id: &GroupId,
     batch: OpenMlsCanonicalizationBatch,
     own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let candidate_paths = candidate_paths_with_pending_replay_messages(
         &batch.candidate_paths,
@@ -615,6 +666,7 @@ fn canonicalize_openmls_batch_prevalidated<S: StorageProvider>(
         &candidate_paths,
         own_commits,
         &mut ReplayBudget::unlimited(),
+        profile_policy,
     )?;
     canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)
 }
@@ -668,6 +720,26 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
     policy: CanonicalizationPolicy,
     now_ms: u64,
 ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+    canonicalize_stored_openmls_messages_with_profile_policy(
+        storage,
+        group_id,
+        state,
+        outbound_intents,
+        policy,
+        now_ms,
+        ReplayProfilePolicy::default(),
+    )
+}
+
+pub(crate) fn canonicalize_stored_openmls_messages_with_profile_policy<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    state: CanonicalizationState,
+    outbound_intents: Vec<OutboundIntent>,
+    policy: CanonicalizationPolicy,
+    now_ms: u64,
+    profile_policy: ReplayProfilePolicy,
+) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
     let current_epoch = storage
         .get_group(group_id)
         .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
@@ -708,6 +780,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                             message_id: hex::encode(message.id.as_slice()),
                             kind: MessageKind::Commit,
                             reason: DroppedMessageReason::BeyondAnchor,
+                            rejection_category: None,
                         });
                     }
                     continue;
@@ -778,6 +851,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
                 now_ms,
                 replay_start_epoch,
                 own_commits,
+                profile_policy,
             },
         )?;
         append_dropped_messages(&mut result, stale_commit_drops);
@@ -797,6 +871,7 @@ pub fn canonicalize_stored_openmls_messages<S: StorageProvider>(
             now_ms,
             replay_start_epoch,
             own_commits,
+            profile_policy,
         },
     )?;
     append_dropped_messages(&mut result, stale_commit_drops);
@@ -808,11 +883,22 @@ fn append_dropped_messages(
     dropped_messages: Vec<DroppedMessage>,
 ) {
     for dropped in dropped_messages {
-        if result
-            .dropped_messages
-            .iter()
-            .any(|existing| existing.message_id == dropped.message_id)
+        if dropped.kind == MessageKind::Proposal
+            && result
+                .accepted_proposals
+                .iter()
+                .any(|accepted| accepted == &dropped.message_id)
         {
+            continue;
+        }
+        if let Some(existing) = result
+            .dropped_messages
+            .iter_mut()
+            .find(|existing| existing.message_id == dropped.message_id)
+        {
+            if existing.rejection_category.is_none() {
+                existing.rejection_category = dropped.rejection_category;
+            }
             continue;
         }
         result.dropped_messages.push(dropped);
@@ -919,6 +1005,7 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         work.replay_start_epoch,
         work.policy.convergence.max_rewind_commits,
         &work.own_commits,
+        work.profile_policy,
     )?;
 
     let has_pending_apps = pending_messages_contain_application(&work.pending_messages)?;
@@ -942,7 +1029,13 @@ fn canonicalize_stored_openmls_messages_from_current<S: StorageProvider>(
         materialized.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
         canonicalize_openmls_batch_with_materialized(group_id, batch, materialized)?
     } else {
-        canonicalize_openmls_batch_prevalidated(storage, group_id, batch, &work.own_commits)?
+        canonicalize_openmls_batch_prevalidated(
+            storage,
+            group_id,
+            batch,
+            &work.own_commits,
+            work.profile_policy,
+        )?
     };
     append_dropped_messages(&mut result, path_result.invalid_commit_drops);
     Ok(result)
@@ -1005,6 +1098,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
     starting_epoch: u64,
     max_rewind_commits: u64,
     own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<StoredOpenMlsCandidatePathResult, OpenMlsProjectionError> {
     commits.sort_by(|a, b| {
         a.source_epoch
@@ -1057,6 +1151,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                     &pending_proposals,
                     own_commits,
                     &mut budget,
+                    profile_policy,
                 )? {
                     CandidatePathProbeResult::Materialized(Some(candidate)) => {
                         materialized_commit_ids.insert(commit.message.id.to_string());
@@ -1066,19 +1161,42 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
                         replay_rejected_commit_ids.insert(commit.message.id.to_string());
                         continue;
                     }
+                    CandidatePathProbeResult::RejectedProposal {
+                        message_id,
+                        category,
+                    } => {
+                        invalid_commit_drops.push(DroppedMessage {
+                            message_id,
+                            kind: MessageKind::Proposal,
+                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category: Some(category),
+                        });
+                        invalid_commit_drops.push(DroppedMessage {
+                            message_id: commit.message.id.to_string(),
+                            kind: MessageKind::Commit,
+                            reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category: None,
+                        });
+                        continue;
+                    }
                     CandidatePathProbeResult::UnauthorizedCommit { message_id } => {
                         invalid_commit_drops.push(DroppedMessage {
                             message_id,
                             kind: MessageKind::Commit,
                             reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category: None,
                         });
                         continue;
                     }
-                    CandidatePathProbeResult::InvalidCommit { message_id, .. } => {
+                    CandidatePathProbeResult::InvalidCommit {
+                        message_id,
+                        rejection_category,
+                    } => {
                         invalid_commit_drops.push(DroppedMessage {
                             message_id,
                             kind: MessageKind::Commit,
                             reason: DroppedMessageReason::InvalidAgainstCandidateState,
+                            rejection_category,
                         });
                         continue;
                     }
@@ -1107,6 +1225,7 @@ fn build_stored_openmls_candidate_paths<S: StorageProvider>(
             message_id: message_id.clone(),
             kind: MessageKind::Commit,
             reason: DroppedMessageReason::InvalidAgainstCandidateState,
+            rejection_category: None,
         });
     }
 
@@ -1167,6 +1286,7 @@ fn probe_candidate_path<S: StorageProvider>(
     pending_proposals: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
     budget: &mut ReplayBudget,
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<CandidatePathProbeResult, OpenMlsProjectionError> {
     let path = OpenMlsCandidatePath {
         branch_id: branch_id_for_path_digests(digests),
@@ -1179,15 +1299,27 @@ fn probe_candidate_path<S: StorageProvider>(
         &replay_paths,
         own_commits,
         budget,
+        profile_policy,
     ) {
         Ok(mut candidates) => Ok(CandidatePathProbeResult::Materialized(candidates.pop())),
+        Err(OpenMlsProjectionError::RejectedProposal {
+            message_id,
+            category,
+        }) => Ok(CandidatePathProbeResult::RejectedProposal {
+            message_id,
+            category,
+        }),
         Err(OpenMlsProjectionError::UnauthorizedCommit { message_id }) => {
             Ok(CandidatePathProbeResult::UnauthorizedCommit { message_id })
         }
         Err(OpenMlsProjectionError::InvalidCommit {
             message_id,
             reason: _,
-        }) => Ok(CandidatePathProbeResult::InvalidCommit { message_id }),
+            rejection_category,
+        }) => Ok(CandidatePathProbeResult::InvalidCommit {
+            message_id,
+            rejection_category,
+        }),
         Err(OpenMlsProjectionError::Replay(_)) => Ok(CandidatePathProbeResult::Materialized(None)),
         Err(err) => Err(err),
     }
@@ -1198,6 +1330,22 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     group_id: &GroupId,
     result: &CanonicalizationResult,
     max_retained_anchor_rewind: u64,
+) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
+    apply_openmls_canonicalization_result_with_profile_policy(
+        storage,
+        group_id,
+        result,
+        max_retained_anchor_rewind,
+        ReplayProfilePolicy::default(),
+    )
+}
+
+pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    result: &CanonicalizationResult,
+    max_retained_anchor_rewind: u64,
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     let current_epoch = storage
         .get_group(group_id)
@@ -1265,6 +1413,7 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
             group_id,
             result,
             &replay_messages,
+            profile_policy,
         )?;
         storage
             .release_group_snapshot(group_id, &snapshot)
@@ -1487,6 +1636,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     group_id: &GroupId,
     result: &CanonicalizationResult,
     replay_messages: &[TransportMessage],
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<Vec<OpenMlsReplayObservation>, OpenMlsProjectionError> {
     // #157/#424: the convergence-apply multi-write durable sequence
     // (merge_staged_commit's 7+ provider writes, the Marmot group-record
@@ -1510,6 +1660,7 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
             group_id,
             replay_messages,
             &PrevalidatedOwnCommits::default(),
+            profile_policy,
         )?;
         update_group_record_from_replay(storage, group_id, &output)?;
         persist_openmls_canonicalization_dispositions(storage, result)?;
@@ -1923,7 +2074,14 @@ fn process_openmls_messages_inner<S: StorageProvider>(
     group_id: &GroupId,
     messages: &[TransportMessage],
     own_commits: &PrevalidatedOwnCommits,
+    profile_policy: ReplayProfilePolicy,
 ) -> Result<OpenMlsReplayOutput, OpenMlsProjectionError> {
+    let reject_legacy_group_additions = profile_policy.reject_legacy_group_additions
+        && storage
+            .get_group(group_id)
+            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
+            .protocol_profile
+            == ProtocolProfile::Legacy;
     let crypto = RustCrypto::default();
     let provider = EngineOpenMlsProvider::<S>::new(&crypto, storage.mls_storage());
     let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
@@ -2007,6 +2165,32 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             mls_group.process_message(&provider, protocol)
         } {
             Ok(processed) => processed,
+            Err(err) if projection.kind == OpenMlsContentKind::Commit => {
+                if let Some(category) = crate::app_components::classify_process_message_rejection(
+                    &err,
+                    ContentType::Commit,
+                ) {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: crate::app_components::proposal_rejection_category_tag(category)
+                            .to_string(),
+                        rejection_category: Some(category),
+                    });
+                }
+                return Err(replay_error("process_message", err));
+            }
+            Err(err) if projection.kind == OpenMlsContentKind::Proposal => {
+                if let Some(category) = crate::app_components::classify_process_message_rejection(
+                    &err,
+                    ContentType::Proposal,
+                ) {
+                    return Err(OpenMlsProjectionError::RejectedProposal {
+                        message_id,
+                        category,
+                    });
+                }
+                return Err(replay_error("process_message", err));
+            }
             Err(err) if projection.kind == OpenMlsContentKind::Application => {
                 // App-message replay against a candidate state is best-
                 // effort: an app message that doesn't apply on this branch is
@@ -2044,6 +2228,21 @@ fn process_openmls_messages_inner<S: StorageProvider>(
 
         match processed.into_content() {
             ProcessedMessageContent::ProposalMessage(queued) => {
+                if reject_legacy_group_additions && matches!(queued.proposal(), Proposal::Add(_)) {
+                    observations.push(OpenMlsReplayObservation::Ignored {
+                        message_id,
+                        kind: projection.kind,
+                    });
+                    continue;
+                }
+                if let Err(rejection) =
+                    crate::app_components::authorize_standalone_proposal(&mls_group, &queued)
+                {
+                    return Err(OpenMlsProjectionError::RejectedProposal {
+                        message_id,
+                        category: rejection.category,
+                    });
+                }
                 let proposal_ref = tls_hex(queued.proposal_reference_ref())?;
                 mls_group
                     .store_pending_proposal(provider.storage(), *queued)
@@ -2057,6 +2256,26 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 });
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
+                if reject_legacy_group_additions && staged.add_proposals().next().is_some() {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: "strict cutover freezes membership additions in legacy groups"
+                            .into(),
+                        rejection_category: None,
+                    });
+                }
+                if let Err(rejection) =
+                    crate::app_components::authorize_staged_commit_proposals(&mls_group, &staged)
+                {
+                    return Err(OpenMlsProjectionError::InvalidCommit {
+                        message_id,
+                        reason: crate::app_components::proposal_rejection_category_tag(
+                            rejection.category,
+                        )
+                        .to_string(),
+                        rejection_category: Some(rejection.category),
+                    });
+                }
                 if let Err(err) = crate::app_components::require_admin_for_staged_commit(
                     &mls_group,
                     group_id,
@@ -2080,6 +2299,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("admin leaf coupling: {err}"),
+                        rejection_category: None,
                     });
                 }
                 if let Err(err) =
@@ -2090,6 +2310,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("app component integrity: {err}"),
+                        rejection_category: None,
                     });
                 }
                 if sender_id.is_none() {
@@ -2127,6 +2348,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("invalid credential identity or account proof: {err}"),
+                        rejection_category: None,
                     });
                 }
                 if let Err(err) =
@@ -2139,6 +2361,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     return Err(OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("current-profile resulting state: {err}"),
+                        rejection_category: None,
                     });
                 }
                 let resulting_epoch = mls_group.epoch().as_u64().saturating_add(1);
@@ -2164,6 +2387,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|error| OpenMlsProjectionError::InvalidCommit {
                         message_id,
                         reason: format!("current-profile merged state: {error}"),
+                        rejection_category: None,
                     })?;
                 prefix_canonical =
                     prefix_canonical && own_commits.is_canonical(&projection.message_digest);
@@ -2182,15 +2406,29 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 // retryable until the tip passes it — indistinguishable from
                 // a legitimate future message at this point, and it converts
                 // to terminal as the tip advances.
-                let validated_sender = sender_id.as_ref().filter(|sender| {
-                    crate::app_payload::validate_app_payload_for_sender(&payload, sender).is_ok()
+                let validated = sender_id.as_ref().and_then(|sender| {
+                    crate::app_payload::validate_app_payload_for_sender(&payload, sender)
+                        .ok()
+                        .map(|event| (sender, event))
                 });
-                if let Some(sender) = validated_sender {
+                if let Some((sender, app_event)) = validated {
+                    let retention_seconds =
+                        crate::app_components::message_retention_seconds_of_group(&mls_group)
+                            .map_err(|error| {
+                                OpenMlsProjectionError::Replay(format!(
+                                    "decode source-epoch message retention: {error}"
+                                ))
+                            })?
+                            .unwrap_or(0);
                     observations.push(OpenMlsReplayObservation::ApplicationProcessed {
                         message_id,
                         source_epoch,
                         sender: sender.as_slice().to_vec(),
                         payload: payload.clone(),
+                        retention: AppMessageRetentionDecision::new(
+                            app_event.created_at,
+                            retention_seconds,
+                        ),
                         decrypted_payload_ref: format!(
                             "sha256:{}",
                             hex::encode(message_digest(payload.as_slice()))

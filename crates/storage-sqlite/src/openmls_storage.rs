@@ -3,7 +3,7 @@ mod provider;
 mod value_store;
 
 use crate::connection::SharedConnection;
-use cgka_traits::storage::{StorageError, StorageResult};
+use cgka_traits::storage::{StorageError, StorageResult, StoredKeyPackageBundle};
 use cgka_traits::types::GroupId as MarmotGroupId;
 use serde::Serialize;
 
@@ -29,6 +29,46 @@ impl SqliteOpenMlsStorage {
         self.connection
             .lock()
             .map_err(|e| SqliteOpenMlsStorageError::Lock(e.to_string()))
+    }
+
+    pub(crate) fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        use openmls_traits::storage::CURRENT_VERSION;
+        use rusqlite::params;
+
+        let connection = self.connection.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT storage_key, value
+                 FROM openmls_values
+                 WHERE provider_version = ?1 AND label = ?2
+                 ORDER BY storage_key",
+            )
+            .map_err(crate::codec::map_sqlite_error)?;
+        let rows = statement
+            .query_map(params![CURRENT_VERSION, labels::KEY_PACKAGE_LABEL], |row| {
+                Ok(StoredKeyPackageBundle {
+                    storage_key: row.get(0)?,
+                    value: row.get(1)?,
+                })
+            })
+            .map_err(crate::codec::map_sqlite_error)?;
+        rows.collect::<Result<Vec<StoredKeyPackageBundle>, _>>()
+            .map_err(crate::codec::map_sqlite_error)
+    }
+
+    pub(crate) fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
+        use openmls_traits::storage::CURRENT_VERSION;
+        use rusqlite::params;
+
+        let connection = self.connection.lock()?;
+        connection
+            .execute(
+                "DELETE FROM openmls_values
+                 WHERE provider_version = ?1 AND label = ?2 AND storage_key = ?3",
+                params![CURRENT_VERSION, labels::KEY_PACKAGE_LABEL, storage_key],
+            )
+            .map_err(crate::codec::map_sqlite_error)?;
+        Ok(())
     }
 }
 

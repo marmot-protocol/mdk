@@ -411,6 +411,36 @@ fn snapshot_ingest_outcomes() {
             reason: StaleReason::Quarantined
         }
     );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_authorization_failed",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::AuthorizationFailed
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_unsupported_proposal",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::UnsupportedProposal
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_encoding",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidEncoding
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_signature",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidSignature
+        }
+    );
+    insta::assert_json_snapshot!(
+        "ingest_outcome_rejected_invalid_self_remove",
+        IngestOutcome::Rejected {
+            category: cgka_traits::ingest::ProposalRejectionCategory::InvalidSelfRemove
+        }
+    );
 }
 
 #[test]
@@ -483,6 +513,10 @@ fn snapshot_send_results() {
                 transport_group_id: vec![],
             },
         },
+        group_id: gid(),
+        app_event_id: "app-event-id".into(),
+        source_epoch: EpochId(1),
+        retention: cgka_traits::AppMessageRetentionDecision::new(10, 60),
     };
     insta::assert_json_snapshot!("result_application_message", app);
     insta::assert_json_snapshot!(
@@ -530,6 +564,7 @@ fn snapshot_group_events() {
             epoch: EpochId(7),
             sender: mem_id(),
             payload: b"hi".to_vec(),
+            retention: None,
         }
     );
     insta::assert_json_snapshot!(
