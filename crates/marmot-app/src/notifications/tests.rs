@@ -189,6 +189,43 @@ fn empty_malformed_or_too_long_tokens_are_rejected_without_secret_material() {
     assert!(!err.to_string().contains(&too_long));
 }
 
+#[tokio::test]
+async fn local_token_gossip_normalizes_relay_hint_before_signing_and_storage() {
+    let owner = Keys::generate();
+    let token_bytes = b"provider-token".to_vec();
+    let registration = StoredPushRegistration {
+        registration: PushRegistration {
+            account_ref: "alice".to_owned(),
+            account_id_hex: owner.public_key().to_hex(),
+            platform: PushPlatform::Fcm,
+            token_fingerprint: push_token_fingerprint(PushPlatform::Fcm, &token_bytes),
+            server_pubkey_hex: Keys::generate().public_key().to_hex(),
+            relay_hint: Some(" \twss://relay.example\n".to_owned()),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_shared_at_ms: None,
+        },
+        token_bytes,
+    };
+
+    let (payload, record) = local_token_gossip_payload(
+        "ef".repeat(16),
+        owner.public_key().to_hex(),
+        1,
+        &registration,
+        &owner,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(record.relay_hint.as_deref(), Some("wss://relay.example"));
+    assert_eq!(
+        payload.tokens[0].relay_hint.as_deref(),
+        Some("wss://relay.example")
+    );
+    assert!(record.verify_owner_sig());
+}
+
 #[test]
 fn kind_446_content_is_base64_concatenated_tokens_with_version_tag() {
     let token = vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN];
@@ -269,6 +306,404 @@ fn unsupported_push_gossip_kind_returns_error_not_panic() {
     let err = parse_push_gossip(99_999, "00".repeat(32).as_str(), "{}")
         .expect_err("unsupported kind must error cleanly");
     assert!(matches!(err, AppError::InvalidPushGossip(_)));
+}
+
+fn valid_push_entry_json() -> serde_json::Value {
+    serde_json::json!({
+        "member_id_hex": "ab".repeat(32),
+        "leaf_index": 1,
+        "platform": "apns",
+        "token_fingerprint": "sha256:0123456789abcdef01234567",
+        "server_pubkey_hex": "cd".repeat(32),
+        "relay_hint": "wss://relay.example",
+        "encrypted_token": BASE64_STANDARD.encode(vec![0_u8; PUSH_ENCRYPTED_TOKEN_LEN]),
+        "owner_ts": 1,
+        "owner_sig": "00".repeat(64),
+    })
+}
+
+fn valid_push_removal_json() -> serde_json::Value {
+    let mut entry = valid_push_entry_json();
+    let object = entry.as_object_mut().expect("entry is an object");
+    object.remove("relay_hint");
+    object.remove("encrypted_token");
+    entry
+}
+
+#[test]
+fn push_gossip_array_boundaries_accept_0_1_31_and_32_entries() {
+    let group_id_hex = "ef".repeat(32);
+    for len in [0, 1, 31, PUSH_MAX_GOSSIP_ENTRIES] {
+        let add = serde_json::json!({
+            "v": PUSH_VERSION,
+            "tokens": vec![valid_push_entry_json(); len],
+        })
+        .to_string();
+        let remove = serde_json::json!({
+            "v": PUSH_VERSION,
+            "removals": vec![valid_push_removal_json(); len],
+        })
+        .to_string();
+
+        assert!(
+            parse_push_gossip(MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, &group_id_hex, &add).is_ok(),
+            "add length {len} must be accepted"
+        );
+        assert!(
+            parse_push_gossip(
+                MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+                &group_id_hex,
+                &remove,
+            )
+            .is_ok(),
+            "removal length {len} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn maliciously_large_arrays_stop_at_the_bounded_preflight() {
+    let entries = std::iter::repeat_n("{}", 100_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    let add = format!(r#"{{"v":"{PUSH_VERSION}","tokens":[{entries}]}}"#);
+    let remove = format!(r#"{{"v":"{PUSH_VERSION}","removals":[{entries}]}}"#);
+
+    let add_error = serde_json::from_str::<PushTokenGossipShape>(&add)
+        .err()
+        .expect("oversized add array must stop at entry 33");
+    let removal_error = serde_json::from_str::<PushTokenRemovalShape>(&remove)
+        .err()
+        .expect("oversized removal array must stop at entry 33");
+    let expected = format!("exceeds {PUSH_MAX_GOSSIP_ENTRIES} entries");
+    assert!(add_error.to_string().contains(&expected));
+    assert!(removal_error.to_string().contains(&expected));
+}
+
+#[test]
+fn oversized_arrays_do_zero_signature_verifications_and_yield_zero_records() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id_hex = "ef".repeat(32);
+    let server = "cd".repeat(32);
+    let record = signed_token_record(&owner, &group_id_hex, 1, &server, 100);
+    let removal = signed_removal_record(&owner, &group_id_hex, 1, &server, 101);
+    let add_entry = serde_json::to_value(PushTokenGossipEntry::from_record(&record)).unwrap();
+    let removal_entry = serde_json::json!({
+        "member_id_hex": removal.member_id_hex,
+        "leaf_index": removal.leaf_index,
+        "platform": removal.platform.as_str(),
+        "token_fingerprint": removal.token_fingerprint,
+        "server_pubkey_hex": removal.server_pubkey_hex,
+        "owner_ts": removal.owner_ts,
+        "owner_sig": removal.owner_sig,
+    });
+
+    let single = serde_json::json!({"v": PUSH_VERSION, "tokens": [add_entry.clone()]}).to_string();
+    reset_owner_signature_verification_count();
+    let verified = verify_push_gossip(
+        parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+            &group_id_hex,
+            &single,
+        )
+        .unwrap(),
+        &group_id_hex,
+        std::slice::from_ref(&owner_id),
+    );
+    assert!(matches!(verified, PushGossipAction::Upsert(records) if records.len() == 1));
+    assert_eq!(
+        owner_signature_verification_count(),
+        1,
+        "positive control: the counter observes real owner-proof verification"
+    );
+
+    for (kind, content) in [
+        (
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+            serde_json::json!({
+                "v": PUSH_VERSION,
+                "tokens": vec![add_entry; 33],
+            })
+            .to_string(),
+        ),
+        (
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            serde_json::json!({
+                "v": PUSH_VERSION,
+                "removals": vec![removal_entry; 33],
+            })
+            .to_string(),
+        ),
+    ] {
+        reset_owner_signature_verification_count();
+        let mut yielded_records = 0_usize;
+        let result = parse_push_gossip(kind, &group_id_hex, &content)
+            .map(|action| {
+                verify_push_gossip(action, &group_id_hex, std::slice::from_ref(&owner_id))
+            })
+            .map(|action| match action {
+                PushGossipAction::Upsert(records) => yielded_records += records.len(),
+                PushGossipAction::Remove(removals) => yielded_records += removals.len(),
+            });
+
+        assert!(matches!(result, Err(AppError::InvalidPushGossip(_))));
+        assert_eq!(owner_signature_verification_count(), 0);
+        assert_eq!(yielded_records, 0);
+    }
+}
+
+#[test]
+fn malformed_push_gossip_entries_do_not_poison_valid_siblings() {
+    let group_id_hex = "ef".repeat(32);
+    let malformed = serde_json::json!({"platform": "bogus"});
+
+    let mut second_add = valid_push_entry_json();
+    second_add["leaf_index"] = serde_json::json!(2);
+    let add = serde_json::json!({
+        "v": PUSH_VERSION,
+        "tokens": [valid_push_entry_json(), malformed.clone(), second_add],
+    })
+    .to_string();
+    match parse_push_gossip(MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, &group_id_hex, &add)
+        .expect("the bounded array itself is structurally valid")
+    {
+        PushGossipAction::Upsert(records) => {
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.leaf_index)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+        other => panic!("expected upsert action, got {other:?}"),
+    }
+
+    let mut second_removal = valid_push_removal_json();
+    second_removal["leaf_index"] = serde_json::json!(2);
+    let remove = serde_json::json!({
+        "v": PUSH_VERSION,
+        "removals": [valid_push_removal_json(), malformed, second_removal],
+    })
+    .to_string();
+    match parse_push_gossip(
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        &group_id_hex,
+        &remove,
+    )
+    .expect("the bounded array itself is structurally valid")
+    {
+        PushGossipAction::Remove(removals) => {
+            assert_eq!(
+                removals
+                    .iter()
+                    .map(|removal| removal.leaf_index)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+        other => panic!("expected removal action, got {other:?}"),
+    }
+}
+
+#[test]
+fn identical_push_gossip_entries_are_deduplicated_before_verification() {
+    let group_id_hex = "ef".repeat(32);
+    let add = serde_json::json!({
+        "v": PUSH_VERSION,
+        "tokens": vec![valid_push_entry_json(); PUSH_MAX_GOSSIP_ENTRIES],
+    })
+    .to_string();
+    let remove = serde_json::json!({
+        "v": PUSH_VERSION,
+        "removals": vec![valid_push_removal_json(); PUSH_MAX_GOSSIP_ENTRIES],
+    })
+    .to_string();
+
+    match parse_push_gossip(MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, &group_id_hex, &add)
+        .expect("32 entries are within the message bound")
+    {
+        PushGossipAction::Upsert(records) => assert_eq!(records.len(), 1),
+        other => panic!("expected upsert action, got {other:?}"),
+    }
+    match parse_push_gossip(
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        &group_id_hex,
+        &remove,
+    )
+    .expect("32 removals are within the message bound")
+    {
+        PushGossipAction::Remove(removals) => assert_eq!(removals.len(), 1),
+        other => panic!("expected removal action, got {other:?}"),
+    }
+}
+
+#[test]
+fn normalized_relay_hint_duplicates_are_deduplicated_before_verification_and_apply() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id = cgka_traits::GroupId::new(vec![0xEF; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let server = "cd".repeat(32);
+    let mut record = signed_token_record(&owner, &group_id_hex, 1, &server, 100);
+    record.relay_hint = None;
+    record.sign_owner(&owner).unwrap();
+
+    let omitted_hint = serde_json::to_value(PushTokenGossipEntry::from_record(&record)).unwrap();
+    let mut blank_hint = omitted_hint.clone();
+    blank_hint["relay_hint"] = serde_json::json!(" \t");
+    let payload = serde_json::json!({
+        "v": PUSH_VERSION,
+        "tokens": [omitted_hint, blank_hint],
+    })
+    .to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let message = ReceivedMessage {
+        message_id_hex: "11".repeat(32),
+        source_message_id_hex: "22".repeat(32),
+        sender: owner_id.clone(),
+        sender_display_name: None,
+        group_id,
+        source_epoch: 1,
+        retention: None,
+        plaintext: payload,
+        kind: MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        tags: vec![vec!["v".to_owned(), PUSH_VERSION.to_owned()]],
+        recorded_at: 1,
+        received_at: 1,
+    };
+
+    reset_owner_signature_verification_count();
+    app.ingest_push_gossip_message("alice", &message, std::slice::from_ref(&owner_id))
+        .unwrap();
+
+    assert_eq!(
+        owner_signature_verification_count(),
+        1,
+        "wire variants of one canonical record must verify only once"
+    );
+    let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
+    assert_eq!(stored.len(), 1, "the canonical record applies only once");
+    assert_eq!(stored[0].relay_hint, None);
+}
+
+#[test]
+fn surrounding_relay_hint_whitespace_is_deduplicated_before_verification() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let record = signed_token_record(&owner, &group_id_hex, 1, &"cd".repeat(32), 100);
+    let canonical = serde_json::to_value(PushTokenGossipEntry::from_record(&record)).unwrap();
+    let mut padded = canonical.clone();
+    padded["relay_hint"] = serde_json::json!(" \twss://relay.example\n");
+    let payload = serde_json::json!({
+        "v": PUSH_VERSION,
+        "tokens": [canonical, padded],
+    })
+    .to_string();
+
+    reset_owner_signature_verification_count();
+    let action = verify_push_gossip(
+        parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+            &group_id_hex,
+            &payload,
+        )
+        .unwrap(),
+        &group_id_hex,
+        std::slice::from_ref(&owner_id),
+    );
+
+    assert_eq!(
+        owner_signature_verification_count(),
+        1,
+        "signed-record-equivalent relay hints must verify only once"
+    );
+    match action {
+        PushGossipAction::Upsert(records) => {
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].relay_hint.as_deref(),
+                Some("wss://relay.example")
+            );
+        }
+        other => panic!("expected upsert action, got {other:?}"),
+    }
+}
+
+#[test]
+fn mixed_entry_permutations_apply_the_same_valid_winner() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id = cgka_traits::GroupId::new(vec![0xEF; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let server = "cd".repeat(32);
+    let older = signed_token_record(&owner, &group_id_hex, 1, &server, 100);
+    let newer = signed_token_record(&owner, &group_id_hex, 1, &server, 200);
+    let older_entry = serde_json::to_value(PushTokenGossipEntry::from_record(&older)).unwrap();
+    let newer_entry = serde_json::to_value(PushTokenGossipEntry::from_record(&newer)).unwrap();
+    let malformed = serde_json::json!({"platform": "bogus"});
+    let payloads = [
+        serde_json::json!({
+            "v": PUSH_VERSION,
+            "tokens": [
+                older_entry.clone(),
+                malformed.clone(),
+                newer_entry.clone(),
+                older_entry.clone(),
+            ],
+        })
+        .to_string(),
+        serde_json::json!({
+            "v": PUSH_VERSION,
+            "tokens": [newer_entry, older_entry.clone(), malformed, older_entry],
+        })
+        .to_string(),
+    ];
+
+    let mut winner_digests = Vec::new();
+    for payload in payloads {
+        let dir = tempfile::tempdir().unwrap();
+        marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let message = ReceivedMessage {
+            message_id_hex: "11".repeat(32),
+            source_message_id_hex: "22".repeat(32),
+            sender: owner_id.clone(),
+            sender_display_name: None,
+            group_id: group_id.clone(),
+            source_epoch: 1,
+            retention: None,
+            plaintext: payload,
+            kind: MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+            tags: vec![vec!["v".to_owned(), PUSH_VERSION.to_owned()]],
+            recorded_at: 1,
+            received_at: 1,
+        };
+
+        reset_owner_signature_verification_count();
+        app.ingest_push_gossip_message("alice", &message, std::slice::from_ref(&owner_id))
+            .unwrap();
+        assert_eq!(
+            owner_signature_verification_count(),
+            2,
+            "two distinct valid records verify once each; malformed and duplicate entries do not"
+        );
+        let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].owner_ts, 200);
+        winner_digests.push(stored[0].record_digest().unwrap());
+    }
+
+    assert_eq!(winner_digests[0], winner_digests[1]);
 }
 
 #[test]

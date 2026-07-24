@@ -17,7 +17,10 @@ use nostr::{
     },
 };
 use rand::{RngCore, rngs::OsRng};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error as _, IgnoredAny, SeqAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -40,6 +43,7 @@ pub const KIND_MARMOT_NOTIFICATION_RUMOR: u64 = 446;
 pub const KIND_MARMOT_NOTIFICATION_SERVER_RELAYS: u64 = 10050;
 pub const PUSH_VERSION: &str = "marmot-push-v1";
 pub const PUSH_ENCRYPTED_TOKEN_LEN: usize = 1084;
+const PUSH_MAX_GOSSIP_ENTRIES: usize = 32;
 const PUSH_TOKEN_PLAINTEXT_LEN: usize = 1024;
 const PUSH_MAX_PROVIDER_TOKEN_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN - 3;
 const PUSH_CIPHERTEXT_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN + 16;
@@ -54,6 +58,28 @@ const PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
 const PUSH_RECORD_DOMAIN: &str = "marmot-push-token-record-v1";
 const PUSH_REMOVAL_DOMAIN: &str = "marmot-push-token-removal-v1";
 const NOTIFICATION_VERSION_TAG: &str = "v";
+
+#[cfg(test)]
+std::thread_local! {
+    static OWNER_SIGNATURE_VERIFICATION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_owner_signature_verification_count() {
+    OWNER_SIGNATURE_VERIFICATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn owner_signature_verification_count() -> usize {
+    OWNER_SIGNATURE_VERIFICATION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_owner_signature_verification() {
+    OWNER_SIGNATURE_VERIFICATION_COUNT.with(|count| count.set(count.get() + 1));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PushPlatform {
@@ -274,7 +300,7 @@ pub(crate) struct PushTokenGossipPayload {
     pub tokens: Vec<PushTokenGossipEntry>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct PushTokenGossipEntry {
     pub member_id_hex: String,
     pub leaf_index: u32,
@@ -295,7 +321,77 @@ pub(crate) struct PushTokenRemovalPayload {
     pub removals: Vec<PushTokenRemovalEntry>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// First-pass array decoder that counts entries without allocating a `Vec` or
+/// decoding entry fields. Returning as soon as entry 33 is observed keeps
+/// oversized advisory arrays from reaching record parsing or signature work.
+#[derive(Default)]
+struct BoundedPushGossipEntries;
+
+impl<'de> Deserialize<'de> for BoundedPushGossipEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedEntriesVisitor;
+
+        impl<'de> Visitor<'de> for BoundedEntriesVisitor {
+            type Value = BoundedPushGossipEntries;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "an array of at most {PUSH_MAX_GOSSIP_ENTRIES} push gossip entries"
+                )
+            }
+
+            fn visit_seq<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut count = 0_usize;
+                while entries.next_element::<IgnoredAny>()?.is_some() {
+                    count += 1;
+                    if count > PUSH_MAX_GOSSIP_ENTRIES {
+                        return Err(A::Error::custom(format!(
+                            "push gossip array exceeds {PUSH_MAX_GOSSIP_ENTRIES} entries"
+                        )));
+                    }
+                }
+                Ok(BoundedPushGossipEntries)
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedEntriesVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct PushTokenGossipShape {
+    #[serde(default, rename = "tokens")]
+    _tokens: BoundedPushGossipEntries,
+}
+
+#[derive(Deserialize)]
+struct PushTokenRemovalShape {
+    #[serde(default, rename = "removals")]
+    _removals: BoundedPushGossipEntries,
+}
+
+#[derive(Deserialize)]
+struct InboundPushTokenGossipPayload {
+    v: String,
+    #[serde(default)]
+    tokens: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct InboundPushTokenRemovalPayload {
+    v: String,
+    #[serde(default)]
+    removals: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct PushTokenRemovalEntry {
     pub member_id_hex: String,
     pub leaf_index: u32,
@@ -487,6 +583,10 @@ fn decode_hex_32(value: &str, name: &str) -> Result<[u8; 32], AppError> {
         .map_err(|_| AppError::InvalidPushGossip(format!("{name} must be 32-byte hex")))
 }
 
+fn normalized_relay_hint(relay_hint: Option<&str>) -> Option<&str> {
+    relay_hint.map(str::trim).filter(|hint| !hint.is_empty())
+}
+
 /// Canonical `SignedRecord` bytes from the spec's "Owner authentication" section.
 /// `encrypted_token` is `Some` for token entries (kinds 447/448, `PUSH_RECORD_DOMAIN`)
 /// and `None` for removals (kind 449, `PUSH_REMOVAL_DOMAIN`), which omit the field.
@@ -515,10 +615,7 @@ fn push_signed_record_bytes(
     let group_id_len = u16::try_from(group_id.len())
         .map_err(|_| AppError::InvalidPushGossip("group id too long".into()))?;
     // Blank/whitespace-only hints sign as absent so signer and verifier agree.
-    let relay = relay_hint
-        .map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .unwrap_or("");
+    let relay = normalized_relay_hint(relay_hint).unwrap_or("");
     let relay_bytes = relay.as_bytes();
     let relay_len = u16::try_from(relay_bytes.len())
         .map_err(|_| AppError::InvalidPushGossip("relay hint too long".into()))?;
@@ -568,11 +665,7 @@ struct PushOwnerProofEvent<'a> {
 fn push_owner_proof_event(input: PushOwnerProofEvent<'_>) -> Result<UnsignedEvent, AppError> {
     let member_pubkey = PublicKey::parse(input.member_id_hex)
         .map_err(|_| AppError::InvalidPushGossip("member id must be a Nostr pubkey".into()))?;
-    let relay = input
-        .relay_hint
-        .map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .unwrap_or("");
+    let relay = normalized_relay_hint(input.relay_hint).unwrap_or("");
     let mut tags = vec![
         Tag::custom(TagKind::custom("d"), [input.domain.to_owned()]),
         Tag::custom(TagKind::custom("group_id"), [input.group_id_hex.to_owned()]),
@@ -645,6 +738,8 @@ fn verify_push_owner_sig(proof_event: UnsignedEvent, owner_sig_hex: &str) -> boo
     let Ok(sig) = SchnorrSignature::from_slice(&sig_bytes) else {
         return false;
     };
+    #[cfg(test)]
+    note_owner_signature_verification();
     proof_event.add_signature(sig).is_ok()
 }
 
@@ -672,6 +767,8 @@ fn verify_push_owner_sig_legacy(
         return false;
     };
     let message = Message::from_digest(digest);
+    #[cfg(test)]
+    note_owner_signature_verification();
     SECP256K1
         .verify_schnorr(&sig, &message, &member_pubkey)
         .is_ok()
@@ -896,11 +993,8 @@ pub(crate) async fn local_token_gossip_payload(
         platform: registration.registration.platform,
         token_fingerprint: registration.registration.token_fingerprint.clone(),
         server_pubkey_hex: registration.registration.server_pubkey_hex.clone(),
-        relay_hint: registration
-            .registration
-            .relay_hint
-            .clone()
-            .filter(|relay| !relay.trim().is_empty()),
+        relay_hint: normalized_relay_hint(registration.registration.relay_hint.as_deref())
+            .map(str::to_owned),
         encrypted_token,
         owner_ts: now,
         owner_sig: String::new(),
@@ -953,39 +1047,63 @@ pub(crate) fn parse_push_gossip(
 ) -> Result<PushGossipAction, AppError> {
     match kind {
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE | MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST => {
-            let payload: PushTokenGossipPayload = serde_json::from_str(content)
+            preflight_push_gossip_array::<PushTokenGossipShape>(
+                content,
+                "malformed push token gossip",
+            )?;
+            let payload: InboundPushTokenGossipPayload = serde_json::from_str(content)
                 .map_err(|_| AppError::InvalidPushGossip("malformed push token gossip".into()))?;
             if payload.v != PUSH_VERSION {
                 return Err(AppError::InvalidPushGossip(
                     "unsupported push token gossip version".into(),
                 ));
             }
+            let mut seen = HashSet::new();
             let records = payload
                 .tokens
                 .into_iter()
-                .map(|entry| entry.into_record(group_id_hex))
-                .collect::<Result<Vec<_>, _>>()?;
+                .filter_map(|entry| serde_json::from_value::<PushTokenGossipEntry>(entry).ok())
+                .map(PushTokenGossipEntry::normalize_relay_hint)
+                .filter(|entry| seen.insert(entry.clone()))
+                .filter_map(|entry| entry.into_record(group_id_hex).ok())
+                .collect();
             Ok(PushGossipAction::Upsert(records))
         }
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL => {
-            let payload: PushTokenRemovalPayload = serde_json::from_str(content)
+            preflight_push_gossip_array::<PushTokenRemovalShape>(
+                content,
+                "malformed push token removal",
+            )?;
+            let payload: InboundPushTokenRemovalPayload = serde_json::from_str(content)
                 .map_err(|_| AppError::InvalidPushGossip("malformed push token removal".into()))?;
             if payload.v != PUSH_VERSION {
                 return Err(AppError::InvalidPushGossip(
                     "unsupported push token removal version".into(),
                 ));
             }
+            let mut seen = HashSet::new();
             let removals = payload
                 .removals
                 .into_iter()
-                .map(PushTokenRemovalEntry::into_record)
-                .collect::<Result<Vec<_>, _>>()?;
+                .filter_map(|entry| serde_json::from_value::<PushTokenRemovalEntry>(entry).ok())
+                .filter(|entry| seen.insert(entry.clone()))
+                .filter_map(|entry| entry.into_record().ok())
+                .collect();
             Ok(PushGossipAction::Remove(removals))
         }
         _ => Err(AppError::InvalidPushGossip(
             "unsupported push token gossip kind".into(),
         )),
     }
+}
+
+fn preflight_push_gossip_array<T>(content: &str, malformed: &'static str) -> Result<(), AppError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str::<T>(content)
+        .map(|_| ())
+        .map_err(|_| AppError::InvalidPushGossip(malformed.into()))
 }
 
 /// Drop push-gossip entries that are not owner-authenticated. Each surviving
@@ -1022,6 +1140,11 @@ pub(crate) fn verify_push_gossip(
 }
 
 impl PushTokenGossipEntry {
+    fn normalize_relay_hint(mut self) -> Self {
+        self.relay_hint = normalized_relay_hint(self.relay_hint.as_deref()).map(str::to_owned);
+        self
+    }
+
     fn from_record(record: &GroupPushTokenRecord) -> Self {
         Self {
             member_id_hex: record.member_id_hex.clone(),
@@ -1057,7 +1180,7 @@ impl PushTokenGossipEntry {
             platform,
             token_fingerprint: self.token_fingerprint,
             server_pubkey_hex: self.server_pubkey_hex,
-            relay_hint: self.relay_hint.filter(|relay| !relay.trim().is_empty()),
+            relay_hint: self.relay_hint,
             encrypted_token,
             owner_ts: self.owner_ts,
             owner_sig: self.owner_sig,
