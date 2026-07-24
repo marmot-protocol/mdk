@@ -1,9 +1,9 @@
 use crate::error::to_peeler_error;
 use crate::event::decode_hex_exact;
 use crate::{
-    DEFAULT_EXPORTER_LABEL, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_MARMOT_WELCOME_RUMOR,
-    KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN, NOSTR_GROUP_KEY_LEN, NostrTransportEvent,
-    RECIPIENT_TAG,
+    DEFAULT_EXPORTER_LABEL, EXPIRATION_TAG, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE,
+    KIND_MARMOT_WELCOME_RUMOR, KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN,
+    NOSTR_GROUP_KEY_LEN, NostrTransportEvent, RECIPIENT_TAG,
 };
 use async_trait::async_trait;
 use cgka_traits::engine::WelcomeMetadata;
@@ -24,7 +24,6 @@ use std::sync::Arc;
 const NONCE_LEN: usize = 12;
 const WELCOME_SIGNER_CONTEXT: &str = "nostr_welcome_signer";
 const KEY_PACKAGE_EVENT_TAG: &str = "e";
-const EXPIRATION_TAG: &str = "expiration";
 const WELCOME_RELAYS_TAG: &str = "relays";
 /// Bound on the welcome rumor `relays` tag value count (#392). Parity with
 /// `MAX_RELAY_ENDPOINTS_PER_ROUTE` in `marmot-app`'s relay safety policy.
@@ -462,18 +461,15 @@ fn ensure_group_routing_matches(
     msg: &TransportMessage,
 ) -> Result<(), PeelerError> {
     let event_group_id = event
-        .single_tag_value(GROUP_TAG)
-        .map_err(to_peeler_error)
-        .and_then(|h| decode_hex_exact("group h tag", h, 32).map_err(to_peeler_error))?;
+        .kind_445_transport_group_id()
+        .map_err(to_peeler_error)?;
     match &msg.envelope {
         TransportEnvelope::GroupMessage { transport_group_id }
             if *transport_group_id == event_group_id =>
         {
             Ok(())
         }
-        TransportEnvelope::GroupMessage { .. } => Err(PeelerError::Malformed(
-            "event h tag does not match transport envelope".into(),
-        )),
+        TransportEnvelope::GroupMessage { .. } => Err(PeelerError::WrongRecipient),
         TransportEnvelope::Welcome { .. } => Err(PeelerError::Malformed(
             "group peeler received welcome envelope".into(),
         )),
@@ -492,9 +488,7 @@ fn ensure_welcome_routing_matches(
         TransportEnvelope::Welcome { recipient } if recipient.as_slice() == event_recipient => {
             Ok(())
         }
-        TransportEnvelope::Welcome { .. } => Err(PeelerError::Malformed(
-            "event p tag does not match transport envelope".into(),
-        )),
+        TransportEnvelope::Welcome { .. } => Err(PeelerError::WrongRecipient),
         TransportEnvelope::GroupMessage { .. } => Err(PeelerError::Malformed(
             "welcome peeler received group envelope".into(),
         )),
@@ -605,8 +599,106 @@ mod tests {
 
         assert!(matches!(
             peeler.peel_group_message(&unsigned_msg, &ctx).await,
-            Err(PeelerError::Malformed(_))
+            Err(PeelerError::InvalidSignature)
         ));
+    }
+
+    #[tokio::test]
+    async fn group_peel_rejects_tampered_signature_before_decryption() {
+        let group_id = vec![0x99; 32];
+        let wrap_ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(
+                DEFAULT_EXPORTER_LABEL.to_string(),
+                vec![0x7a; NOSTR_GROUP_KEY_LEN],
+            )]),
+            Some(group_id.clone()),
+        );
+        let wrong_secret_ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(
+                DEFAULT_EXPORTER_LABEL.to_string(),
+                vec![0x7b; NOSTR_GROUP_KEY_LEN],
+            )]),
+            Some(group_id.clone()),
+        );
+        let peeler = NostrMlsPeeler::default();
+        let wrapped = peeler
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: b"inner mls bytes".to_vec(),
+                    aad: vec![],
+                },
+                &wrap_ctx,
+            )
+            .await
+            .expect("wrap succeeds");
+        let unrelated = peeler
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: b"unrelated inner bytes".to_vec(),
+                    aad: vec![],
+                },
+                &wrap_ctx,
+            )
+            .await
+            .expect("second wrap succeeds");
+        let mut tampered_event =
+            NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+        tampered_event.sig = NostrTransportEvent::from_transport_message(&unrelated)
+            .expect("unrelated payload parses")
+            .sig;
+        let tampered = tampered_event
+            .to_transport_message()
+            .expect("id and outer route still map");
+
+        let err = peeler
+            .peel_group_message(&tampered, &wrong_secret_ctx)
+            .await
+            .expect_err("tampered signature must fail before decryption");
+
+        assert!(matches!(err, PeelerError::InvalidSignature));
+    }
+
+    #[tokio::test]
+    async fn group_peel_rejects_extra_tag_before_decryption() {
+        let group_id = vec![0x99; 32];
+        let signed = EventBuilder::new(
+            Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
+            BASE64_STANDARD.encode([0u8; NOSTR_GROUP_CONTENT_MIN_LEN]),
+        )
+        .tags([
+            Tag::custom(nostr::TagKind::custom(GROUP_TAG), [hex::encode(&group_id)]),
+            Tag::custom(nostr::TagKind::custom("e"), ["11".repeat(32)]),
+        ])
+        .sign_with_keys(&Keys::generate())
+        .expect("sign structurally invalid kind-445");
+        let event = NostrTransportEvent::from_nostr_event(&signed).expect("map signed event");
+        let msg = TransportMessage {
+            id: cgka_traits::types::MessageId::new(hex::decode(&event.id).expect("event id hex")),
+            payload: serde_json::to_vec(&event).expect("serialize event"),
+            timestamp: cgka_traits::transport::Timestamp(event.created_at),
+            causal_deps: vec![],
+            source: cgka_traits::transport::TransportSource(crate::NOSTR_SOURCE.into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.clone(),
+            },
+        };
+        let wrong_secret_ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(
+                DEFAULT_EXPORTER_LABEL.to_string(),
+                vec![0x7b; NOSTR_GROUP_KEY_LEN],
+            )]),
+            Some(group_id),
+        );
+
+        let err = NostrMlsPeeler::default()
+            .peel_group_message(&msg, &wrong_secret_ctx)
+            .await
+            .expect_err("extra tag must fail before ciphertext decryption");
+
+        assert!(matches!(err, PeelerError::Malformed(_)));
     }
 
     #[tokio::test]
@@ -654,6 +746,41 @@ mod tests {
         assert_eq!(event.tag_value("h"), Some(expected_group_id.as_str()));
         assert_eq!(event.tag_value(EXPIRATION_TAG), Some("1700000060"));
         assert_eq!(event.tag_values(EXPIRATION_TAG).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_peel_accepts_valid_events_before_and_after_expiration() {
+        let group_id = vec![0x99; 32];
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
+            Some(group_id),
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for (label, created_at, retention_seconds) in
+            [("already expired", 1, 1), ("not yet expired", now, 3_600)]
+        {
+            let wrapped = NostrMlsPeeler::default()
+                .wrap_group_message_with_metadata(
+                    &EncryptedPayload {
+                        ciphertext: b"inner mls bytes".to_vec(),
+                        aad: vec![],
+                    },
+                    &ctx,
+                    &GroupMessageMetadata::application(created_at, Some(retention_seconds)),
+                )
+                .await
+                .expect("wrap succeeds");
+
+            NostrMlsPeeler::default()
+                .peel_group_message(&wrapped, &ctx)
+                .await
+                .unwrap_or_else(|err| panic!("{label} event should peel: {err}"));
+        }
     }
 
     #[tokio::test]
@@ -865,7 +992,7 @@ mod tests {
             .await
             .expect_err("mismatched route should not peel");
 
-        assert!(matches!(err, PeelerError::Malformed(_)));
+        assert!(matches!(err, PeelerError::WrongRecipient));
     }
 
     #[tokio::test]
@@ -975,7 +1102,7 @@ mod tests {
             .await
             .expect_err("mismatched route should not peel");
 
-        assert!(matches!(err, PeelerError::Malformed(_)));
+        assert!(matches!(err, PeelerError::WrongRecipient));
     }
 
     #[tokio::test]
@@ -1035,7 +1162,7 @@ mod tests {
             .await
             .expect_err("peeling verifies the signed gift wrap");
 
-        assert!(matches!(err, PeelerError::Malformed(_)));
+        assert!(matches!(err, PeelerError::InvalidSignature));
     }
 
     #[tokio::test]

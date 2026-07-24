@@ -891,7 +891,7 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
     let mut forged = group_event("11", &transport_group_id);
     forged.id = "77".repeat(32);
 
-    adapter
+    let error = adapter
         .handle_relay_event(NostrRelayEvent {
             endpoint: endpoint.clone(),
             subscription_id: Some("group-sub".into()),
@@ -899,6 +899,10 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
         })
         .await
         .expect_err("forged id must not map to a delivery");
+    assert!(matches!(
+        error,
+        cgka_traits::TransportAdapterError::InvalidInboundSignature
+    ));
 
     adapter
         .observe_relay_event(NostrRelayEvent {
@@ -911,6 +915,39 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
     let spread = adapter.delivery_spread().await;
     assert_eq!(spread.observed, 0, "forged id must not enter telemetry");
     assert_eq!(spread.spread.sample_count(), 0);
+    assert_eq!(spread.per_relay.len(), 0);
+}
+
+#[tokio::test]
+async fn non_exact_kind_445_shape_is_typed_invalid_encoding() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay);
+    let mut event = group_event("extra-tag", &[0xC3; 32]);
+    event.tags.push(vec!["e".into(), "11".repeat(32)]);
+    event.id = event.computed_id();
+
+    let error = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://group.example".into()),
+            subscription_id: Some("group-sub".into()),
+            event: event.clone(),
+        })
+        .await
+        .expect_err("extra kind-445 tag must fail before routing");
+    assert!(matches!(
+        error,
+        cgka_traits::TransportAdapterError::InvalidInboundEncoding
+    ));
+
+    adapter
+        .observe_relay_event(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://group.example".into()),
+            subscription_id: Some("group-sub".into()),
+            event,
+        })
+        .await;
+    let spread = adapter.delivery_spread().await;
+    assert_eq!(spread.observed, 0);
     assert_eq!(spread.per_relay.len(), 0);
 }
 

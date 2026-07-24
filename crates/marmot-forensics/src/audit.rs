@@ -1108,6 +1108,8 @@ pub enum PeelerOutcomeKind {
     DecryptFailed,
     StaleEpoch,
     Malformed,
+    InvalidSignature,
+    WrongRecipient,
     Other,
 }
 

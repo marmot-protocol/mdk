@@ -596,6 +596,8 @@ pub(crate) fn engine_error_detail(err: &EngineError) -> Option<String> {
 pub(crate) fn peeler_error_kind(err: &PeelerError) -> &'static str {
     match err {
         PeelerError::Malformed(_) => "malformed",
+        PeelerError::InvalidSignature => "invalid_signature",
+        PeelerError::WrongRecipient => "wrong_recipient",
         PeelerError::DecryptFailed => "decrypt_failed",
         PeelerError::StaleEpoch { .. } => "stale_epoch",
         PeelerError::MissingContext { .. } => "missing_context",

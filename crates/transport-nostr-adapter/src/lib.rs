@@ -27,7 +27,18 @@ use nostr::RelayUrl;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinSet;
-use transport_nostr_peeler::{KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrTransportEvent};
+use transport_nostr_peeler::{
+    KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrPeelerError, NostrTransportEvent,
+};
+
+fn map_inbound_event_error(error: NostrPeelerError) -> TransportAdapterError {
+    match error {
+        NostrPeelerError::InvalidSignature => TransportAdapterError::InvalidInboundSignature,
+        NostrPeelerError::Malformed(_)
+        | NostrPeelerError::UnsupportedKind(_)
+        | NostrPeelerError::MissingTag(_) => TransportAdapterError::InvalidInboundEncoding,
+    }
+}
 
 /// Build forensic wire metadata for an inbound relay event. The
 /// `transport_group_id` is read from the peeler-mapped envelope (the canonical
@@ -417,7 +428,7 @@ impl NostrTransportAdapter {
         let message = relay_event
             .event
             .to_transport_message()
-            .map_err(|e| TransportAdapterError::Backend(format!("Nostr event mapping: {e}")))?;
+            .map_err(map_inbound_event_error)?;
         let received_at = Timestamp(unix_now_seconds());
         let routes = {
             let state = self.state.read().await;

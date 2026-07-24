@@ -8,7 +8,7 @@ use cgka_traits::{
 };
 use tokio::sync::Notify;
 use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
-use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE};
+use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE, NostrPeelerError};
 
 use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
 
@@ -773,6 +773,35 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
     assert_eq!(bob_delivery.group_id_hint, Some(group_id));
     assert_eq!(alice_delivery.source.plane, TransportDeliveryPlane::Group);
     assert_eq!(bob_delivery.source.plane, TransportDeliveryPlane::Group);
+}
+
+#[tokio::test]
+async fn direct_and_runtime_kind_445_shape_rejection_are_both_malformed() {
+    let transport_group_id = vec![0xD4; 32];
+    let mut event = group_event("extra-tag", &transport_group_id);
+    event.tags.push(vec!["e".into(), "11".repeat(32)]);
+    event.id = event.computed_id();
+
+    assert!(matches!(
+        event.to_transport_message(),
+        Err(NostrPeelerError::Malformed(_))
+    ));
+
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
+    let runtime_error = relay_plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://relay.example".into()),
+            subscription_id: Some("group-sub".into()),
+            event,
+        })
+        .await
+        .expect_err("runtime seam must reject the same malformed fixture");
+
+    assert!(
+        matches!(runtime_error, TransportAdapterError::InvalidInboundEncoding),
+        "runtime rejection must preserve the malformed classification"
+    );
 }
 
 #[tokio::test]

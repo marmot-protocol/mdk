@@ -693,7 +693,15 @@
       }
     },
     "peelerOutcomeKind": {
-      "enum": ["success", "decrypt_failed", "stale_epoch", "malformed", "other"]
+      "enum": [
+        "success",
+        "decrypt_failed",
+        "stale_epoch",
+        "malformed",
+        "invalid_signature",
+        "wrong_recipient",
+        "other"
+      ]
     },
     "jsonScalar": {
       "type": ["string", "number", "integer", "boolean", "null"]
