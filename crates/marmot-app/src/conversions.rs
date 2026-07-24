@@ -12,9 +12,12 @@ use crate::{
     AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent,
     AppGroupImageInput, AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent,
     AppGroupRecord, AppMessageProjection, AppMessageRecord, AuditLogSettings,
-    ChatNotificationSettings, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID,
-    NotificationSettings, PushPlatform, PushRegistration, RelayTelemetrySettings,
+    ChatNotificationSettings, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GroupPushTokenRecord, NOSTR_ROUTING_COMPONENT_ID, NotificationSettings, PushPlatform,
+    PushRegistration, RelayTelemetrySettings,
+};
+use cgka_traits::app_components::{
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
 };
 use storage_sqlite::{
     AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
@@ -171,12 +174,23 @@ pub(crate) fn app_group_from_stored_group(
         let avatar_bytes = hex::decode(avatar_hex)?;
         group.avatar_url = AppGroupAvatarUrlComponent::from_bytes(&avatar_bytes);
     }
-    if let Some(media_hex) =
-        account_component_data_hex(&stored.components, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID)
-        && !media_hex.is_empty()
-    {
+    let stored_media = [
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    ]
+    .into_iter()
+    .find_map(|component_id| {
+        account_component_data_hex(&stored.components, component_id)
+            .filter(|data_hex| !data_hex.is_empty())
+            .map(|data_hex| (component_id, data_hex))
+    });
+    if let Some((component_id, media_hex)) = stored_media {
         let media_bytes = hex::decode(media_hex)?;
-        group.encrypted_media = AppGroupEncryptedMediaComponent::from_bytes(&media_bytes);
+        group.encrypted_media =
+            AppGroupEncryptedMediaComponent::from_bytes(component_id, &media_bytes);
+        if component_id == GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID {
+            group.protocol_profile = crate::AppProtocolProfile::Current;
+        }
     }
     group.archived = stored.archived;
     group.pending_confirmation = stored.pending_confirmation;

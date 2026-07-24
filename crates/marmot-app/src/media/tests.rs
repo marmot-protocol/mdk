@@ -38,6 +38,153 @@ fn encrypted_media_integrity_accepts_uppercase_hex() {
     assert!(encrypted_media_hash_matches(encrypted, &uppercase_hash));
 }
 
+fn valid_v2_imeta_tag() -> Vec<String> {
+    let mut tag = valid_imeta_tag();
+    tag[1] = "v encrypted-media-v2".to_owned();
+    tag
+}
+
+#[test]
+fn encrypted_media_v2_media_type_profile_is_exact() {
+    assert_eq!(
+        canonical_media_type_v2("\t\n\u{000c}\r IMAGE/JPG ; charset=utf-8 ")
+            .expect("the exact V2 trim set and alias are valid"),
+        "image/jpeg"
+    );
+    assert!(canonical_media_type_v2("\u{000b}image/png").is_err());
+    assert!(canonical_media_type_v2("\u{00a0}image/png").is_err());
+    assert!(canonical_media_type_v2("image/png/extra").is_err());
+    assert!(canonical_media_type_v2("image").is_err());
+    assert!(canonical_media_type_v2(&format!("{}/{}", "a".repeat(64), "b".repeat(64))).is_err());
+    assert_eq!(
+        canonical_media_type_v2("application/vnd.test+json").unwrap(),
+        "application/vnd.test+json"
+    );
+}
+
+#[test]
+fn encrypted_media_v2_reference_validation_is_version_specific() {
+    let mut v2 = valid_v2_imeta_tag();
+    v2[2] = "locator blossom-v1 http://10.0.0.1/blob".to_owned();
+    media_attachment_from_imeta_tag(&v2, Some(7), false)
+        .expect("V2 locator validity is independent of local destination policy");
+
+    let mut noncanonical_m = v2.clone();
+    noncanonical_m[6] = "m Image/JPG".to_owned();
+    assert!(media_attachment_from_imeta_tag(&noncanonical_m, Some(7), false).is_err());
+
+    let mut exact_filename = v2.clone();
+    exact_filename[7] = "filename  ".to_owned();
+    assert_eq!(
+        media_attachment_from_imeta_tag(&exact_filename, Some(7), false)
+            .expect("a nonempty V2 filename is preserved exactly")
+            .file_name,
+        " "
+    );
+
+    let mut too_long = v2.clone();
+    too_long[7] = format!("filename {}", "a".repeat(256));
+    assert!(media_attachment_from_imeta_tag(&too_long, Some(7), false).is_err());
+    let mut nul = v2;
+    nul[7] = "filename bad\0name".to_owned();
+    assert!(media_attachment_from_imeta_tag(&nul, Some(7), false).is_err());
+}
+
+#[test]
+fn outbound_media_never_crosses_group_version() {
+    let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
+    let v2 = media_attachment_from_imeta_tag(&valid_v2_imeta_tag(), Some(1), false).unwrap();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    assert!(
+        v1.validate_outbound(EncryptedMediaVersion::V2, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v2.validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v1.build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v2.build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err()
+    );
+}
+
+#[test]
+fn checked_imeta_builder_preserves_version_and_present_empty_optional_fields() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
+    let v1_tag = v1
+        .build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+        .unwrap();
+    assert!(v1_tag.iter().any(|field| field == "v encrypted-media-v1"));
+
+    let mut v2 = media_attachment_from_imeta_tag(&valid_v2_imeta_tag(), Some(2), false).unwrap();
+    v2.dim = Some(String::new());
+    v2.thumbhash = Some(" ".to_owned());
+    let v2_tag = v2
+        .build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+        .unwrap();
+    assert!(v2_tag.iter().any(|field| field == "v encrypted-media-v2"));
+    assert!(v2_tag.iter().any(|field| field == "dim "));
+    assert!(v2_tag.iter().any(|field| field == "thumbhash  "));
+
+    let round_trip = media_attachment_from_imeta_tag(&v2_tag, Some(2), false).unwrap();
+    assert_eq!(round_trip.version, ENCRYPTED_MEDIA_FORMAT_V2);
+    assert_eq!(round_trip.dim.as_deref(), Some(""));
+    assert_eq!(round_trip.thumbhash.as_deref(), Some(" "));
+}
+
+#[test]
+fn encrypted_media_v2_kdf_and_aad_are_independent_from_v1() {
+    let secret = [7_u8; 32];
+    let hash = [0x22_u8; 32];
+    let v1_key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::V1,
+        &hash,
+        "image/jpeg",
+        " Photo.JPG ",
+    )
+    .unwrap();
+    let v2_key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::V2,
+        &hash,
+        "image/jpeg",
+        " Photo.JPG ",
+    )
+    .unwrap();
+    assert_ne!(v1_key, v2_key);
+    assert_eq!(
+        hex::encode(v2_key),
+        "5fcb5672b9cb2b3ac7915fd9c97697877837f7fb1312034486f400f601cd16b5"
+    );
+    assert_eq!(
+        hex::encode(media_aad(
+            EncryptedMediaVersion::V2,
+            &hash,
+            "image/jpeg",
+            " Photo.JPG "
+        )),
+        "656e637279707465642d6d656469612d763200222222222222222222222222222222222222222222222222222222222222222200696d6167652f6a706567002050686f746f2e4a504720"
+    );
+}
+
+#[test]
+fn invalid_media_attachment_is_local_to_that_attachment() {
+    let mut invalid = valid_v2_imeta_tag();
+    invalid.retain(|field| !field.starts_with("nonce "));
+    assert!(media_attachment_from_imeta_tag(&invalid, None, false).is_err());
+    assert!(media_imeta_tags_are_valid(
+        &[invalid, valid_v2_imeta_tag()],
+        false
+    ));
+}
+
 fn tag_with_locator(locator: String) -> Vec<String> {
     let mut tag = valid_imeta_tag();
     tag[2] = format!("locator blossom-v1 {locator}");
@@ -135,10 +282,24 @@ fn http_error_response(status: u16, reason: &str, headers: &[(&str, &str)], body
     .into_bytes()
 }
 
-fn blossom_endpoint(base_url: String) -> BlobStoreEndpointV1 {
-    BlobStoreEndpointV1 {
+fn blossom_endpoint(base_url: String) -> crate::AppBlobEndpoint {
+    crate::AppBlobEndpoint {
         locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
         base_url,
+    }
+}
+
+fn operation_policy<'a>(
+    version: EncryptedMediaVersion,
+    endpoints: &'a [crate::AppBlobEndpoint],
+    allowed_locator_kinds: &'a [String],
+    allow_loopback_http: bool,
+) -> MediaOperationPolicy<'a> {
+    MediaOperationPolicy {
+        version,
+        default_endpoints: endpoints,
+        allowed_locator_kinds,
+        allow_loopback_http,
     }
 }
 
@@ -186,9 +347,7 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &allowed,
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
     )
     .await
     .expect("second Blossom endpoint should absorb first endpoint failure");
@@ -204,6 +363,44 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
         !locator.value.starts_with(&failing),
         "upload must not use the failed server locator"
     );
+}
+
+#[tokio::test]
+async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
+    let server = spawn_http_responses(vec![http_json_response("{}"), http_json_response("{}")]);
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+    let mut request = media_upload_request(None);
+    request.attachments[0].file_name = " Diagram.PNG ".to_owned();
+    request.attachments[0].media_type = " IMAGE/JPG ; charset=utf-8".to_owned();
+
+    let first = upload_encrypted_media(
+        request.clone(),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .unwrap();
+    let second = upload_encrypted_media(
+        request,
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+    )
+    .await
+    .unwrap();
+    let first = &first.attachments[0].reference;
+    let second = &second.attachments[0].reference;
+    assert_eq!(first.version, ENCRYPTED_MEDIA_FORMAT_V2);
+    assert_eq!(first.media_type, "image/jpeg");
+    assert_eq!(first.file_name, " Diagram.PNG ");
+    assert_ne!(first.nonce_hex, second.nonce_hex);
+    assert_ne!(first.ciphertext_sha256, second.ciphertext_sha256);
 }
 
 #[tokio::test]
@@ -242,9 +439,7 @@ async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("all failing endpoints should aggregate their failures");
@@ -281,9 +476,7 @@ async fn upload_encrypted_media_preserves_privacy_safe_blossom_rejection_reason(
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -315,9 +508,7 @@ async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -349,9 +540,7 @@ async fn upload_encrypted_media_drops_punctuated_hash_rejection_reason() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -381,9 +570,7 @@ async fn upload_encrypted_media_drops_uuid_rejection_reason() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -410,9 +597,7 @@ async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("the server rejection should fail the upload");
@@ -449,9 +634,7 @@ async fn explicit_blossom_server_override_skips_default_endpoint_failover() {
         42,
         &secret,
         &keys,
-        &endpoints,
-        &[],
-        true,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
     )
     .await
     .expect_err("explicit override must remain a single-server bypass");
@@ -566,7 +749,7 @@ fn media_fetch_candidates_deduplicate_non_adjacent_fallback_urls() {
         kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
         value: format!("https://other.example/{}.bin", reference.ciphertext_sha256),
     });
-    let fallback = [BlobStoreEndpointV1 {
+    let fallback = [crate::AppBlobEndpoint {
         locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
         base_url: "https://media.example".to_owned(),
     }];
@@ -586,13 +769,15 @@ fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom()
     let reference = blossom_reference();
     let allowed = vec!["ipfs-v1".to_owned()];
     assert!(
-        reference.validate_outbound(&allowed, false).is_err(),
+        reference
+            .validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err(),
         "a blossom reference must be rejected when the policy omits blossom-v1"
     );
     // The same reference is valid against a policy that does allow blossom-v1.
     let allowed = vec![BLOSSOM_LOCATOR_KIND_V1.to_owned()];
     reference
-        .validate_outbound(&allowed, false)
+        .validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
         .expect("a blossom reference is valid when the policy allows blossom-v1");
 }
 
@@ -713,7 +898,7 @@ async fn loopback_fallback_endpoint_is_skipped_in_production() {
         kind: "ipfs-v1".to_owned(),
         value: "ipfs://bafyexample".to_owned(),
     });
-    let fallback = [BlobStoreEndpointV1 {
+    let fallback = [crate::AppBlobEndpoint {
         locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
         base_url: "http://127.0.0.1:8080".to_owned(),
     }];

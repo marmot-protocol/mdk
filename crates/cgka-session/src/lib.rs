@@ -285,6 +285,10 @@ impl AccountDeviceSession {
         Ok(self.engine.group_record(group_id)?)
     }
 
+    pub fn new_protocol_profile(&self) -> ProtocolProfile {
+        self.engine.new_protocol_profile()
+    }
+
     pub fn live_group_ids(&self) -> SessionResult<Vec<GroupId>> {
         Ok(self.engine.live_group_ids()?)
     }

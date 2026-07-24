@@ -6,15 +6,18 @@ use cgka_traits::agent_text_stream::{
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
-    EncryptedMediaPolicyV1, GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT, GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT,
-    GROUP_ENCRYPTED_MEDIA_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID,
-    GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    decode_encrypted_media_policy_v1, decode_group_avatar_url_v1, decode_nostr_routing_v1,
+    BlobStoreEndpointV2, EncryptedMediaPolicyV1, EncryptedMediaPolicyV2,
+    GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, NOSTR_ROUTING_COMPONENT,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_encrypted_media_policy_v1,
+    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_nostr_routing_v1,
     decode_quic_varint, encode_component_vectors, encode_encrypted_media_policy_v1,
-    encode_group_avatar_url_v1, encode_nostr_routing_v1, encode_quic_varint,
+    encode_encrypted_media_policy_v2, encode_group_avatar_url_v1, encode_nostr_routing_v1,
+    encode_quic_varint,
 };
 use cgka_traits::app_event::{
     GROUP_SYSTEM_DATA_ACTOR, GROUP_SYSTEM_DATA_NAME, GROUP_SYSTEM_DATA_NEW_RETENTION_SECONDS,
@@ -27,7 +30,7 @@ use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::{GroupId, TransportEndpoint, TransportGroupSubscription};
 use serde::{Deserialize, Serialize};
 
-use crate::media::media_imeta_tags_are_valid;
+use crate::media::{EncryptedMediaVersion, media_imeta_tags_preserve_message};
 use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary, SyncSummary};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -303,6 +306,14 @@ pub struct AppGroupEncryptedMediaComponent {
     pub allowed_locator_kinds: Vec<String>,
     pub default_blob_endpoints: Vec<AppBlobEndpoint>,
     pub data_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppEncryptedMediaPolicy {
+    pub(crate) component_id: u16,
+    pub(crate) version: EncryptedMediaVersion,
+    pub(crate) allowed_locator_kinds: Vec<String>,
+    pub(crate) default_blob_endpoints: Vec<AppBlobEndpoint>,
 }
 
 impl Default for AppAgentTextStreamComponent {
@@ -685,33 +696,60 @@ impl AppAgentTextStreamComponent {
 }
 
 impl AppGroupEncryptedMediaComponent {
-    pub(crate) fn new(policy: EncryptedMediaPolicyV1) -> Result<Self, AppError> {
+    pub(crate) fn new_v1(policy: EncryptedMediaPolicyV1) -> Result<Self, AppError> {
         let data =
             encode_encrypted_media_policy_v1(&policy).map_err(AppError::InvalidEncryptedMedia)?;
         let decoded =
             decode_encrypted_media_policy_v1(&data).map_err(AppError::InvalidEncryptedMedia)?;
-        Ok(Self::from_policy(decoded, data))
+        Ok(Self::from_policy_v1(decoded, data))
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
-        match decode_encrypted_media_policy_v1(bytes) {
-            Ok(policy) => Self::from_policy(policy, bytes.to_vec()),
-            Err(_) => Self {
-                component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-                component: GROUP_ENCRYPTED_MEDIA_COMPONENT.to_owned(),
-                required: true,
-                media_format: String::new(),
-                allowed_locator_kinds: Vec::new(),
-                default_blob_endpoints: Vec::new(),
-                data_hex: hex::encode(bytes),
-            },
+    pub(crate) fn new_v2(policy: EncryptedMediaPolicyV2) -> Result<Self, AppError> {
+        let data =
+            encode_encrypted_media_policy_v2(&policy).map_err(AppError::InvalidEncryptedMedia)?;
+        let decoded =
+            decode_encrypted_media_policy_v2(&data).map_err(AppError::InvalidEncryptedMedia)?;
+        Ok(Self::from_policy_v2(decoded, data))
+    }
+
+    pub(crate) fn from_bytes(component_id: u16, bytes: &[u8]) -> Self {
+        match component_id {
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+                match decode_encrypted_media_policy_v1(bytes) {
+                    Ok(policy) => Self::from_policy_v1(policy, bytes.to_vec()),
+                    Err(_) => Self::invalid(component_id, bytes),
+                }
+            }
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+                match decode_encrypted_media_policy_v2(bytes) {
+                    Ok(policy) => Self::from_policy_v2(policy, bytes.to_vec()),
+                    Err(_) => Self::invalid(component_id, bytes),
+                }
+            }
+            _ => Self::invalid(component_id, bytes),
         }
     }
 
-    fn from_policy(policy: EncryptedMediaPolicyV1, data: Vec<u8>) -> Self {
+    fn invalid(component_id: u16, bytes: &[u8]) -> Self {
+        let component = match component_id {
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT,
+            _ => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT,
+        };
         Self {
-            component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-            component: GROUP_ENCRYPTED_MEDIA_COMPONENT.to_owned(),
+            component_id,
+            component: component.to_owned(),
+            required: true,
+            media_format: String::new(),
+            allowed_locator_kinds: Vec::new(),
+            default_blob_endpoints: Vec::new(),
+            data_hex: hex::encode(bytes),
+        }
+    }
+
+    fn from_policy_v1(policy: EncryptedMediaPolicyV1, data: Vec<u8>) -> Self {
+        Self {
+            component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            component: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT.to_owned(),
             required: true,
             media_format: policy.media_format,
             allowed_locator_kinds: policy.allowed_locator_kinds,
@@ -727,10 +765,39 @@ impl AppGroupEncryptedMediaComponent {
         }
     }
 
-    pub(crate) fn disabled() -> Self {
+    fn from_policy_v2(policy: EncryptedMediaPolicyV2, data: Vec<u8>) -> Self {
         Self {
-            component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-            component: GROUP_ENCRYPTED_MEDIA_COMPONENT.to_owned(),
+            component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            component: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT.to_owned(),
+            required: true,
+            media_format: policy.media_format,
+            allowed_locator_kinds: policy.allowed_locator_kinds,
+            default_blob_endpoints: policy
+                .default_blob_endpoints
+                .into_iter()
+                .map(|endpoint| AppBlobEndpoint {
+                    locator_kind: endpoint.locator_kind,
+                    base_url: endpoint.base_url,
+                })
+                .collect(),
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn disabled_for_profile(profile: AppProtocolProfile) -> Self {
+        let (component_id, component) = match profile {
+            AppProtocolProfile::Legacy => (
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT,
+            ),
+            AppProtocolProfile::Current => (
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT,
+            ),
+        };
+        Self {
+            component_id,
+            component: component.to_owned(),
             required: false,
             media_format: String::new(),
             allowed_locator_kinds: Vec::new(),
@@ -739,31 +806,81 @@ impl AppGroupEncryptedMediaComponent {
         }
     }
 
+    pub(crate) fn disabled() -> Self {
+        Self::disabled_for_profile(AppProtocolProfile::Legacy)
+    }
+
     pub(crate) fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
         Ok(AppComponentData {
-            component_id: GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+            component_id: self.component_id,
             data: hex::decode(&self.data_hex)?,
         })
     }
 
-    pub(crate) fn endpoint_policy(&self) -> Result<EncryptedMediaPolicyV1, AppError> {
+    pub(crate) fn endpoint_policy(&self) -> Result<AppEncryptedMediaPolicy, AppError> {
         if !self.required {
             return Err(AppError::InvalidEncryptedMedia(
                 "group does not require encrypted media".into(),
             ));
         }
-        EncryptedMediaPolicyV1::new(
-            self.media_format.clone(),
-            self.allowed_locator_kinds.clone(),
-            self.default_blob_endpoints
-                .iter()
-                .map(|endpoint| BlobStoreEndpointV1 {
-                    locator_kind: endpoint.locator_kind.clone(),
-                    base_url: endpoint.base_url.clone(),
-                }),
-            true,
-        )
-        .map_err(AppError::InvalidEncryptedMedia)
+        match self.component_id {
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+                let policy = EncryptedMediaPolicyV1::new(
+                    self.media_format.clone(),
+                    self.allowed_locator_kinds.clone(),
+                    self.default_blob_endpoints
+                        .iter()
+                        .map(|endpoint| BlobStoreEndpointV1 {
+                            locator_kind: endpoint.locator_kind.clone(),
+                            base_url: endpoint.base_url.clone(),
+                        }),
+                    true,
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?;
+                Ok(AppEncryptedMediaPolicy {
+                    component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                    version: EncryptedMediaVersion::V1,
+                    allowed_locator_kinds: policy.allowed_locator_kinds,
+                    default_blob_endpoints: policy
+                        .default_blob_endpoints
+                        .into_iter()
+                        .map(|endpoint| AppBlobEndpoint {
+                            locator_kind: endpoint.locator_kind,
+                            base_url: endpoint.base_url,
+                        })
+                        .collect(),
+                })
+            }
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+                let policy = EncryptedMediaPolicyV2::new(
+                    self.media_format.clone(),
+                    self.allowed_locator_kinds.clone(),
+                    self.default_blob_endpoints
+                        .iter()
+                        .map(|endpoint| BlobStoreEndpointV2 {
+                            locator_kind: endpoint.locator_kind.clone(),
+                            base_url: endpoint.base_url.clone(),
+                        }),
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?;
+                Ok(AppEncryptedMediaPolicy {
+                    component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    version: EncryptedMediaVersion::V2,
+                    allowed_locator_kinds: policy.allowed_locator_kinds,
+                    default_blob_endpoints: policy
+                        .default_blob_endpoints
+                        .into_iter()
+                        .map(|endpoint| AppBlobEndpoint {
+                            locator_kind: endpoint.locator_kind,
+                            base_url: endpoint.base_url,
+                        })
+                        .collect(),
+                })
+            }
+            _ => Err(AppError::InvalidEncryptedMedia(
+                "group has an unsupported encrypted media component".into(),
+            )),
+        }
     }
 }
 
@@ -1020,29 +1137,17 @@ pub(crate) fn decode_received_event(
             "outer transport timestamp differs materially from authenticated app timestamp",
         );
     }
-    // The decoder does not police inner tag names — they are opaque application
-    // content (e.g. a `p` reaction/mention target or an `e` reference). Routing
-    // lives only on the transport's outer envelope, built from group state, never
-    // from inner tags; the media check below is structural validation, not tag
-    // policing. See spec/protocol-core/group-messaging.md ("App payloads").
+    // Inner tags are opaque application content except for the frozen
+    // encrypted-media validity rule. V1 made a malformed V1 reference fatal to
+    // its carrying message; V2 changed rejection to attachment-local. Preserve
+    // that version boundary instead of applying V2 behavior to legacy traffic.
     if event.kind == MARMOT_APP_EVENT_KIND_CHAT
-        && event
-            .tags
-            .iter()
-            .any(|tag| tag.first().map(String::as_str) == Some("imeta"))
-        && !media_imeta_tags_are_valid(&event.tags, allow_loopback_http)
+        && !media_imeta_tags_preserve_message(&event.tags, allow_loopback_http)
     {
-        // Ingest is purely STRUCTURAL: a media reference drops the message only
-        // when a locator is structurally malformed (empty kind/value, unparseable
-        // URL) or another required field is missing/invalid. A well-formed locator
-        // whose kind is out of the group policy or unsupported by this client is
-        // UNFETCHABLE, never invalid (media is authenticated by its hashes + AEAD
-        // independent of the locator), so it MUST NOT drop the message. Policy is
-        // applied at fetch time, not here.
         tracing::warn!(
             target: "marmot_app::ingest",
             method = "decode_received_event",
-            "rejecting MLS application message: structurally invalid encrypted media reference",
+            "rejecting MLS application message: structurally invalid encrypted media V1 reference",
         );
         return None;
     }
@@ -1119,11 +1224,11 @@ pub(crate) fn observe_event(
             // The MLS layer authenticated `sender`; the inner Nostr-shaped event
             // must (1) carry a valid canonical id and (2) name `sender` as its
             // author. Reject anything that fails either check rather than
-            // rendering an unauthenticated or tampered payload. Media references
-            // are validated structurally only inside `decode_received_event`:
-            // locator-kind policy gates fetchability at download time, never
-            // delivery, so the group's `allowed_locator_kinds` is not consulted
-            // on the ingest path.
+            // rendering an unauthenticated or tampered payload. Media reference
+            // structure is checked inside `decode_received_event` only to retain
+            // frozen V1's message-fatal rule. V2 rejection is attachment-local,
+            // and locator-kind policy gates fetchability at download time rather
+            // than delivery.
             let Some(message) = decode_received_event(
                 payload,
                 &sender_hex,

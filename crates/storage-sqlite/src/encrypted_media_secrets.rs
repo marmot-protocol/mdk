@@ -108,4 +108,29 @@ mod tests {
             Some(vec![4, 5, 6])
         );
     }
+
+    #[test]
+    fn encrypted_media_v1_and_v2_epoch_secrets_are_isolated() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id_hex = "cd".repeat(32);
+        store
+            .remember_encrypted_media_epoch_secret(&group_id_hex, 0x8008, 7, &[1; 32])
+            .unwrap();
+        store
+            .remember_encrypted_media_epoch_secret(&group_id_hex, 0x800b, 7, &[2; 32])
+            .unwrap();
+
+        assert_eq!(
+            store
+                .encrypted_media_epoch_secret(&group_id_hex, 0x8008, 7)
+                .unwrap(),
+            Some(vec![1; 32])
+        );
+        assert_eq!(
+            store
+                .encrypted_media_epoch_secret(&group_id_hex, 0x800b, 7)
+                .unwrap(),
+            Some(vec![2; 32])
+        );
+    }
 }

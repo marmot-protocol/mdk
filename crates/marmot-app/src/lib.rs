@@ -20,12 +20,15 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
     AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
 };
+#[allow(deprecated)]
 pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID as AGENT_TEXT_STREAM_COMPONENT_ID,
     GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_COMPONENT, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
     NOSTR_ROUTING_COMPONENT_ID,
@@ -143,9 +146,9 @@ pub use ids::{
 pub use marmot_forensics::AuditDataMode;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
-    MediaAttachmentReference, MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest,
-    MediaUploadAttachmentResult, MediaUploadRequest, MediaUploadResult,
-    media_attachment_from_imeta_tag,
+    EncryptedMediaVersion, MediaAttachmentReference, MediaDownloadResult, MediaLocator,
+    MediaUploadAttachmentRequest, MediaUploadAttachmentResult, MediaUploadRequest,
+    MediaUploadResult, media_attachment_from_imeta_tag,
 };
 pub use messages::{is_stream_final_event, tag_value, tag_values};
 pub use notifications::{
@@ -885,7 +888,13 @@ impl MarmotApp {
     /// Whether this build may act on loopback-HTTP blob endpoints (dev/test
     /// only). Production builds return `false` and skip such endpoints in the
     /// upload/download act paths.
-    pub(crate) fn allow_loopback_blob_endpoints(&self) -> bool {
+    /// Whether this runtime was explicitly configured to act on cleartext
+    /// loopback blob endpoints for development or testing.
+    ///
+    /// Consumers that parse stored V1 media references outside the account
+    /// worker must pass this same policy to the shared media parser so
+    /// reference validation and the eventual fetch path cannot disagree.
+    pub fn allow_loopback_blob_endpoints(&self) -> bool {
         self.config.allow_loopback_blob_endpoints
     }
 
@@ -3146,7 +3155,11 @@ impl MarmotApp {
         let mut components = default_group_components();
         components.insert(NOSTR_ROUTING_COMPONENT_ID);
         components.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
-        components.insert(GROUP_ENCRYPTED_MEDIA_COMPONENT_ID);
+        // Existing legacy groups continue to require V1, while fresh
+        // current-profile groups require V2. Advertising both is support, not
+        // negotiation: each group's required component id selects exactly one.
+        components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
+        components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
         components.into_iter().collect()
     }
 

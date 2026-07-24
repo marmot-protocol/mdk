@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-07-04
+updated: 2026-07-23
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -31,7 +31,7 @@ CGKA engine/convergence workspace here is being shaped into spec text.
 - **MIP-01** — Group Construction
 - **MIP-02** — Welcomes
 - **MIP-03** — Group Messages and SelfRemove
-- **Encrypted Media V1** — `marmot.group.encrypted-media.v1`
+- **Encrypted Media V2** — `marmot.group.encrypted-media.v2`, with frozen V1 support for already-joined legacy groups
 - **MIP-05** — Push Notifications
 
 **In PR / design:**

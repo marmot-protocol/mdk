@@ -1,8 +1,8 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{
     GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
-    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID,
 };
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditHumanActionContext, RelayRegistration,
@@ -450,7 +450,7 @@ impl AppClient {
                 ObservedHumanActionAudit::source(
                     "replace_encrypted_media_blob_endpoints",
                     vec!["encrypted_media"],
-                    vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
+                    vec![updated.encrypted_media.component_id],
                     source_message_id_hex,
                 )
                 .with_target_count(updated.encrypted_media.default_blob_endpoints.len() as u64)

@@ -11,6 +11,7 @@ use marmot_app::{
 
 use super::account::SendSummaryFfi;
 use super::common::SelfMembershipFfi;
+use super::media::EncryptedMediaVersionFfi;
 use crate::errors::MarmotKitError;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -127,6 +128,7 @@ pub struct AppGroupEncryptedMediaComponentFfi {
     pub component_id: u32,
     pub component: String,
     pub required: bool,
+    pub version: Option<EncryptedMediaVersionFfi>,
     pub media_format: String,
     pub allowed_locator_kinds: Vec<String>,
     pub default_blob_endpoints: Vec<AppBlobEndpointFfi>,
@@ -134,10 +136,24 @@ pub struct AppGroupEncryptedMediaComponentFfi {
 
 impl From<AppGroupEncryptedMediaComponent> for AppGroupEncryptedMediaComponentFfi {
     fn from(value: AppGroupEncryptedMediaComponent) -> Self {
+        let version = if !value.required {
+            None
+        } else {
+            match value.component_id {
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+                    Some(EncryptedMediaVersionFfi::V1)
+                }
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+                    Some(EncryptedMediaVersionFfi::V2)
+                }
+                _ => None,
+            }
+        };
         Self {
             component_id: u32::from(value.component_id),
             component: value.component,
             required: value.required,
+            version,
             media_format: value.media_format,
             allowed_locator_kinds: value.allowed_locator_kinds,
             default_blob_endpoints: value

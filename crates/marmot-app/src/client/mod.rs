@@ -8,9 +8,9 @@ use cgka_traits::agent_text_stream::{
 };
 use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BLOSSOM_LOCATOR_KIND_V1,
-    BlobStoreEndpointV1, ENCRYPTED_MEDIA_FORMAT_V1, EncryptedMediaPolicyV1,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
-    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    BlobStoreEndpointV1, BlobStoreEndpointV2, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
+    EncryptedMediaPolicyV1, EncryptedMediaPolicyV2, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, encode_nostr_routing_v1,
 };
@@ -18,6 +18,7 @@ use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
 use cgka_traits::{GroupId, SecretBytes};
 use marmot_forensics::AuditEventContext;
@@ -29,8 +30,9 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    DEFAULT_BLOSSOM_SERVER_URLS, download_encrypted_media, fetch_group_image,
-    is_loopback_http_endpoint, upload_encrypted_media, upload_group_image,
+    DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
+    download_encrypted_media, fetch_group_image, is_loopback_http_endpoint, upload_encrypted_media,
+    upload_group_image,
 };
 use crate::messages::{AppMessageIntent, build_inner_event, encode_inner_event, tag_value};
 use crate::notifications;
@@ -99,7 +101,7 @@ fn recover_post_canonical_result<T: Default>(
         Err(error) => {
             tracing::warn!(
                 target: "marmot_app::client",
-                method,
+                method = method,
                 error_kind = error.privacy_safe_kind(),
                 "canonical group creation outpaced repairable follow-up work"
             );
@@ -280,14 +282,16 @@ impl AppClient {
                 .to_app_component_data()
                 .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
         );
-        app_components.push(self.encrypted_media_component_for_new_group()?);
+        let encrypted_media = self.encrypted_media_component_for_new_group()?;
+        let encrypted_media_component_id = encrypted_media.component_id;
+        app_components.push(encrypted_media);
         let audit_context = Self::local_human_action_context(
             "create_group",
             vec!["name", "members"],
             vec![
                 NOSTR_ROUTING_COMPONENT_ID,
                 AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                encrypted_media_component_id,
             ],
             Some(member_refs.len() as u64),
         );
@@ -1038,21 +1042,37 @@ impl AppClient {
                 allowed_locator_kinds.push(endpoint.locator_kind.clone());
             }
         }
-        let policy = EncryptedMediaPolicyV1::new(
-            ENCRYPTED_MEDIA_FORMAT_V1.to_owned(),
-            allowed_locator_kinds,
-            endpoints.into_iter().map(|endpoint| BlobStoreEndpointV1 {
-                locator_kind: endpoint.locator_kind,
-                base_url: endpoint.base_url,
-            }),
-            true,
-        )
-        .map_err(AppError::InvalidEncryptedMedia)?;
-        let component = AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()?;
+        let existing = self.encrypted_media_policy_for_group(group_id)?;
+        let component = match existing.version {
+            EncryptedMediaVersion::V1 => AppGroupEncryptedMediaComponent::new_v1(
+                EncryptedMediaPolicyV1::new(
+                    ENCRYPTED_MEDIA_FORMAT_V1.to_owned(),
+                    allowed_locator_kinds,
+                    endpoints.into_iter().map(|endpoint| BlobStoreEndpointV1 {
+                        locator_kind: endpoint.locator_kind,
+                        base_url: endpoint.base_url,
+                    }),
+                    true,
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?,
+            )?,
+            EncryptedMediaVersion::V2 => AppGroupEncryptedMediaComponent::new_v2(
+                EncryptedMediaPolicyV2::new(
+                    ENCRYPTED_MEDIA_FORMAT_V2.to_owned(),
+                    allowed_locator_kinds,
+                    endpoints.into_iter().map(|endpoint| BlobStoreEndpointV2 {
+                        locator_kind: endpoint.locator_kind,
+                        base_url: endpoint.base_url,
+                    }),
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?,
+            )?,
+        }
+        .to_app_component_data()?;
         let audit_context = Self::local_human_action_context(
             "replace_encrypted_media_blob_endpoints",
             vec!["encrypted_media"],
-            vec![GROUP_ENCRYPTED_MEDIA_COMPONENT_ID],
+            vec![existing.component_id],
             Some(endpoint_count),
         );
 
@@ -1412,16 +1432,13 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
-        // Validate every outbound attachment against the group's ACTUAL
-        // `marmot.group.encrypted-media.v1` policy before sending: a reference
-        // whose locator kind the group does not allow would be rejected by
-        // receivers, so fail the send early rather than emit it.
-        let allowed_locator_kinds = self
-            .encrypted_media_policy_for_group(group_id)?
-            .allowed_locator_kinds;
+        // Validate every outbound attachment against the group's exact,
+        // profile-selected media version and locator policy.
+        let policy = self.encrypted_media_policy_for_group(group_id)?;
         for attachment in &attachments {
             attachment.validate_outbound(
-                &allowed_locator_kinds,
+                policy.version,
+                &policy.allowed_locator_kinds,
                 self.app.allow_loopback_blob_endpoints(),
             )?;
         }
@@ -1435,6 +1452,26 @@ impl AppClient {
             )
             .await?;
         Ok(summary)
+    }
+
+    /// Build one outbound encrypted-media `imeta` tag using the target
+    /// group's actual profile-selected media version and locator policy.
+    ///
+    /// This is the checked bridge used by host apps for optimistic message
+    /// records. It deliberately performs no publish.
+    pub async fn build_media_imeta_tag(
+        &mut self,
+        group_id: &GroupId,
+        reference: &MediaAttachmentReference,
+    ) -> Result<Vec<String>, AppError> {
+        self.ensure_group(group_id)?;
+        self.sync_runtime_groups().await?;
+        let policy = self.encrypted_media_policy_for_group(group_id)?;
+        reference.build_imeta_tag(
+            policy.version,
+            &policy.allowed_locator_kinds,
+            self.app.allow_loopback_blob_endpoints(),
+        )
     }
 
     pub async fn upload_media(
@@ -1497,9 +1534,12 @@ impl AppClient {
             source_epoch,
             media_secret.as_ref(),
             nostr_signer.as_ref(),
-            &default_endpoints,
-            &policy.allowed_locator_kinds,
-            allow_loopback,
+            MediaOperationPolicy {
+                version: policy.version,
+                default_endpoints: &default_endpoints,
+                allowed_locator_kinds: &policy.allowed_locator_kinds,
+                allow_loopback_http: allow_loopback,
+            },
         )
         .await?;
         if should_send {
@@ -1524,6 +1564,12 @@ impl AppClient {
         self.ensure_group(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
+        if reference.version != policy.version.as_str() {
+            return Err(AppError::InvalidEncryptedMedia(format!(
+                "group requires {} references",
+                policy.version.as_str()
+            )));
+        }
         let media_secret =
             self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch)?;
         download_encrypted_media(
@@ -1940,7 +1986,7 @@ impl AppClient {
     fn encrypted_media_policy_for_group(
         &self,
         group_id: &GroupId,
-    ) -> Result<EncryptedMediaPolicyV1, AppError> {
+    ) -> Result<crate::groups::AppEncryptedMediaPolicy, AppError> {
         self.encrypted_media_for_group(group_id).endpoint_policy()
     }
 
@@ -2023,11 +2069,14 @@ impl AppClient {
         source_epoch: u64,
         secret: &[u8],
     ) -> Result<(), AppError> {
+        let component_id = self
+            .encrypted_media_policy_for_group(group_id)?
+            .component_id;
         self.app
             .account_storage(&self.state.label)?
             .remember_encrypted_media_epoch_secret(
                 &hex::encode(group_id.as_slice()),
-                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                component_id,
                 source_epoch,
                 secret,
             )?;
@@ -2039,12 +2088,15 @@ impl AppClient {
         group_id: &GroupId,
         source_epoch: u64,
     ) -> Result<Option<Vec<u8>>, AppError> {
+        let component_id = self
+            .encrypted_media_policy_for_group(group_id)?
+            .component_id;
         Ok(self
             .app
             .account_storage(&self.state.label)?
             .encrypted_media_epoch_secret(
                 &hex::encode(group_id.as_slice()),
-                GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+                component_id,
                 source_epoch,
             )?)
     }
@@ -2066,9 +2118,18 @@ impl AppClient {
                 .encrypted_media_blob_endpoints
                 .clone()
         };
-        let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)
-            .map_err(AppError::InvalidEncryptedMedia)?;
-        AppGroupEncryptedMediaComponent::new(policy)?.to_app_component_data()
+        match self.runtime.new_protocol_profile() {
+            ProtocolProfile::Legacy => {
+                let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)
+                    .map_err(AppError::InvalidEncryptedMedia)?;
+                AppGroupEncryptedMediaComponent::new_v1(policy)?.to_app_component_data()
+            }
+            ProtocolProfile::Current => {
+                let policy = EncryptedMediaPolicyV2::blossom_default(endpoints)
+                    .map_err(AppError::InvalidEncryptedMedia)?;
+                AppGroupEncryptedMediaComponent::new_v2(policy)?.to_app_component_data()
+            }
+        }
     }
 
     /// Upsert every group's current transport subscription into the routing

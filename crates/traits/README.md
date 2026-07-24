@@ -21,7 +21,8 @@ between engine, peeler, storage, and caller imports from here.
   `TransportPublishRequest`, `TransportDelivery`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`,
   `AutoPublish`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
 - App-component value types: `AppComponentSet`, `AppComponentData`, and the typed component states
-  (`NostrRoutingV1`, `BlobStoreEndpointV1`, `EncryptedMediaPolicyV1`, `GroupAvatarUrlV1`).
+  (`NostrRoutingV1`, frozen `BlobStoreEndpointV1` / `EncryptedMediaPolicyV1`,
+  current `BlobStoreEndpointV2` / `EncryptedMediaPolicyV2`, `GroupAvatarUrlV1`).
 - `MarmotAppEvent` — the typed application-message event (in `app_event.rs`).
 - Capability negotiation types: `Capability`, `Feature`, `RequirementLevel`, `CapabilityRequirement`,
   `GroupCapabilities`, `FeatureStatus`.
