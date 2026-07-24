@@ -728,6 +728,9 @@ pub struct PendingWelcomeDelivery {
 pub struct SecureDeleteExpiredResult {
     /// Number of expired raw app-event rows securely scrubbed and pruned.
     pub pruned_messages: u64,
+    /// Number of encrypted-media epoch-secret rows securely scrubbed and
+    /// deleted after their final retained source-message reference expired.
+    pub secrets_deleted: u64,
     /// Ciphertext hashes for encrypted-media attachments referenced by the
     /// pruned rows. Host apps can use these opaque blob ids to purge their own
     /// decrypted-media disk caches alongside the engine plaintext wipe. The
@@ -740,6 +743,7 @@ impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
     fn from(value: SecurePruneAppEventsResult) -> Self {
         Self {
             pruned_messages: value.pruned_messages as u64,
+            secrets_deleted: value.pruned_media_epoch_secrets as u64,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
         }
     }

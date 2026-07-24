@@ -55,6 +55,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct SecureDeleteExpiredResultFfi {
     pub pruned_messages: u64,
+    pub secrets_deleted: u64,
     pub media_ciphertext_sha256: Vec<String>,
 }
 
@@ -62,6 +63,7 @@ impl From<SecureDeleteExpiredResult> for SecureDeleteExpiredResultFfi {
     fn from(value: SecureDeleteExpiredResult) -> Self {
         Self {
             pruned_messages: value.pruned_messages,
+            secrets_deleted: value.secrets_deleted,
             media_ciphertext_sha256: value.media_ciphertext_sha256,
         }
     }

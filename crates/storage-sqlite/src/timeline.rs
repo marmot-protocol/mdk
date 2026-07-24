@@ -1,8 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, optional_u64_to_i64, tags_from_json, u64_to_i64,
-    unix_now_seconds,
+    SqliteAccountStorage, SqliteResultExt,
+    encrypted_media_secrets::{
+        encrypted_media_component_ids, replace_encrypted_media_secret_references_for_parts_tx,
+        replace_encrypted_media_secret_references_tx,
+        retire_unreferenced_encrypted_media_secret_epochs_tx,
+    },
+    optional_u64_to_i64, tags_from_json, u64_to_i64, unix_now_seconds,
 };
 use cgka_traits::app_event::{
     AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
@@ -185,6 +190,9 @@ pub struct TimelineProjectionUpdate {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecurePruneAppEventsResult {
     pub pruned_messages: usize,
+    /// Number of versioned encrypted-media epoch secrets whose final retained
+    /// source-message reference was removed in this transaction.
+    pub pruned_media_epoch_secrets: usize,
     /// Sorted set of encrypted-media blob ids referenced by pruned messages.
     /// Callers should treat this as an unordered purge set.
     pub media_ciphertext_sha256: Vec<String>,
@@ -250,6 +258,7 @@ struct RawAppEvent {
 struct PrunedAppEvent {
     message_id_hex: String,
     kind: u64,
+    source_epoch: Option<u64>,
     tags: Vec<Vec<String>>,
 }
 
@@ -402,6 +411,14 @@ impl SqliteAccountStorage {
                 .ok_or_else(|| {
                     StorageError::Backend("finalized app event row missing after update".to_owned())
                 })?;
+            replace_encrypted_media_secret_references_for_parts_tx(
+                &conn,
+                group_id_hex,
+                message_id_hex,
+                kind,
+                Some(source_epoch),
+                &tags,
+            )?;
             let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
                 &conn,
                 group_id_hex,
@@ -519,6 +536,7 @@ impl SqliteAccountStorage {
                 ],
             )
             .storage()?;
+            replace_encrypted_media_secret_references_tx(&conn, event)?;
             upsert_message_modifier_edges_tx(&conn, event)?;
             if can_incrementally_project {
                 for message_id in &affected_message_ids {
@@ -922,9 +940,16 @@ fn secure_prune_selected_app_events_tx(
     let mut pruned_message_ids = BTreeSet::new();
     let mut affected_message_ids = BTreeSet::new();
     let mut media_ciphertext_sha256 = BTreeSet::new();
+    let mut retiring_media_epochs = BTreeSet::new();
     for event in &pruned_events {
         pruned_message_ids.insert(event.message_id_hex.clone());
         collect_media_ciphertext_hashes(&event.tags, &mut media_ciphertext_sha256);
+        if event.kind == MARMOT_APP_EVENT_KIND_CHAT
+            && !encrypted_media_component_ids(&event.tags).is_empty()
+            && let Some(source_epoch) = event.source_epoch
+        {
+            retiring_media_epochs.insert(u64_to_i64(source_epoch)?);
+        }
         affected_message_ids.extend(affected_timeline_message_ids_for_pruned_event_tx(
             tx,
             group_id_hex,
@@ -940,8 +965,14 @@ fn secure_prune_selected_app_events_tx(
     scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
 
     // Deleting the owning app_events rows cascades to message_modifier_edges
-    // via its ON DELETE CASCADE foreign key.
+    // and encrypted-media secret references via their ON DELETE CASCADE
+    // foreign keys.
     let pruned = delete_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
+    let pruned_media_epoch_secrets = retire_unreferenced_encrypted_media_secret_epochs_tx(
+        tx,
+        group_id_hex,
+        &retiring_media_epochs,
+    )?;
 
     delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
@@ -952,6 +983,7 @@ fn secure_prune_selected_app_events_tx(
 
     Ok(SecurePruneAppEventsResult {
         pruned_messages: pruned,
+        pruned_media_epoch_secrets,
         media_ciphertext_sha256: media_ciphertext_sha256.into_iter().collect(),
     })
 }
@@ -1472,7 +1504,7 @@ fn app_events_before_cutoff_tx(
 ) -> StorageResult<Vec<PrunedAppEvent>> {
     let mut stmt = tx
         .prepare(
-            "SELECT message_id_hex, kind, tags_json
+            "SELECT message_id_hex, kind, source_epoch, tags_json
              FROM app_events
              WHERE group_id_hex = ?1
                AND recorded_at < ?2
@@ -1482,9 +1514,9 @@ fn app_events_before_cutoff_tx(
     stmt.query_map(
         params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
         |row| {
-            let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
+            let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    2,
+                    3,
                     rusqlite::types::Type::Text,
                     Box::new(err),
                 )
@@ -1492,6 +1524,9 @@ fn app_events_before_cutoff_tx(
             Ok(PrunedAppEvent {
                 message_id_hex: row.get(0)?,
                 kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+                source_epoch: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|value| value.try_into().ok()),
                 tags,
             })
         },
@@ -1508,7 +1543,7 @@ fn expired_app_events_tx(
 ) -> StorageResult<Vec<PrunedAppEvent>> {
     let mut stmt = tx
         .prepare(
-            "SELECT message_id_hex, kind, tags_json
+            "SELECT message_id_hex, kind, source_epoch, tags_json
              FROM app_events
              WHERE group_id_hex = ?1
                AND retention_expires_at IS NOT NULL
@@ -1517,12 +1552,15 @@ fn expired_app_events_tx(
         )
         .storage()?;
     stmt.query_map(params![group_id_hex, u64_to_i64(now)?], |row| {
-        let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+        let tags = tags_from_json(row.get::<_, String>(3)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
         })?;
         Ok(PrunedAppEvent {
             message_id_hex: row.get(0)?,
             kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+            source_epoch: row
+                .get::<_, Option<i64>>(2)?
+                .and_then(|value| value.try_into().ok()),
             tags,
         })
     })

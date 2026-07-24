@@ -1,5 +1,6 @@
 use cgka_traits::app_components::{
     BLOSSOM_LOCATOR_KIND_V1, ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
 };
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -55,6 +56,13 @@ impl EncryptedMediaVersion {
         match self {
             Self::V1 => ENCRYPTED_MEDIA_FORMAT_V1,
             Self::V2 => ENCRYPTED_MEDIA_FORMAT_V2,
+        }
+    }
+
+    pub(crate) const fn component_id(self) -> u16 {
+        match self {
+            Self::V1 => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            Self::V2 => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
         }
     }
 
