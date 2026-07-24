@@ -311,9 +311,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   its reserved block and can never overdraw a neighboring message or leave a terminal-side artifact behind on scroll.
   Placeholders walk `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or
   `[name failed: err]`, and stay `[img name]` on a terminal with no image capability. `o` opens the selected message's
-  image full-size (same cell-exact rendering) in a dismiss-on-any-key viewer. Decrypted files cache under the TUI home
-  in `tui-media-cache/`. No JSON response shapes changed (the existing `media download --json` `output_path` is passed
-  via `--output`).
+  image full-size in a dismiss-on-any-key viewer, drawn with the terminal's native pixel protocol when it has one and
+  the same cell-exact rendering otherwise. Decrypted media is held in memory only; the downloaded artifact is removed
+  right after decode rather than cached on disk. No JSON response shapes changed (the existing `media download --json`
+  `output_path` is passed via `--output`).
 - TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
   `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
   accelerators `r` (prefills `/react` followed by a space), `u` (removes your reaction immediately), and `d`
