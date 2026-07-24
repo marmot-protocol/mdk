@@ -53,6 +53,8 @@ TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 SEND_FINAL_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_BEGIN_RETRY_BACKOFF_S = (0.1, 0.3)
 STREAM_FINALIZE_RETRY_BACKOFF_S = (0.1, 0.3)
+LOGICAL_FINAL_IDEMPOTENCY_PREFIX = "marmot_logical_final_v1:"
+STREAM_BEGIN_REQUEST_PREFIX = "marmot_stream_begin_v1:"
 DEFAULT_STREAMING_CURSOR = "\u2589"
 _DEFAULT_READ_TIMEOUT = object()
 MAX_TOOL_PROGRESS_MESSAGES = 512
@@ -251,6 +253,78 @@ class _RecentKeys:
         self._keys[key] = None
         while len(self._keys) > self.max_size:
             self._keys.popitem(last=False)
+
+
+def _logical_delivery_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return Hermes' stable per-delivery identity, when the gateway supplied it."""
+    if not isinstance(metadata, dict):
+        return None
+    value = str(metadata.get("logical_delivery_id") or "").strip()
+    return value or None
+
+
+def _opaque_delivery_key(prefix: str, *parts: Optional[str]) -> str:
+    """Derive a deterministic, log-safe transport key without exposing Hermes ids."""
+    preimage = json.dumps(
+        [prefix, *[str(part or "") for part in parts]],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return f"{prefix}{hashlib.sha256(preimage).hexdigest()}"
+
+
+def _redaction_safe_ref(value: Optional[str]) -> str:
+    if not value:
+        return "none"
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _log_delivery_attempt(
+    *,
+    logical_delivery_key: Optional[str],
+    stream_id_hex: Optional[str],
+    operation_role: str,
+    attempt: int,
+    outcome: str,
+) -> None:
+    logger.info(
+        "Marmot delivery attempt",
+        extra={
+            "logical_delivery_ref": _redaction_safe_ref(logical_delivery_key),
+            "stream_ref": _redaction_safe_ref(stream_id_hex),
+            "operation_role": operation_role,
+            "attempt": attempt,
+            "outcome": outcome,
+        },
+    )
+
+
+def _logical_final_idempotency_key(
+    logical_delivery_id: str,
+    account_id_hex: str,
+    group_id_hex: str,
+) -> str:
+    return _opaque_delivery_key(
+        LOGICAL_FINAL_IDEMPOTENCY_PREFIX,
+        logical_delivery_id,
+        account_id_hex,
+        group_id_hex,
+    )
+
+
+def _stream_begin_request_id(
+    logical_delivery_id: str,
+    account_id_hex: str,
+    group_id_hex: str,
+    parent_message_id_hex: Optional[str],
+) -> str:
+    return _opaque_delivery_key(
+        STREAM_BEGIN_REQUEST_PREFIX,
+        logical_delivery_id,
+        account_id_hex,
+        group_id_hex,
+        parent_message_id_hex,
+    )
 
 
 class SentMessageTargetCache:
@@ -1062,6 +1136,14 @@ class MarmotAgentControlClient:
             }
         )
 
+    async def delivery_status(self, idempotency_key: str) -> Dict[str, Any]:
+        return await self.request(
+            {
+                "type": "delivery_status",
+                "idempotency_key": str(idempotency_key or "").strip(),
+            }
+        )
+
     async def stream_cancel(
         self,
         stream_id_hex: str,
@@ -1269,6 +1351,7 @@ class MarmotLiveStream:
         stream_capability: str,
         start_message_id_hex: str,
         chunk_bytes: int,
+        finalize_idempotency_key: Optional[str] = None,
     ):
         self.client = client
         self.account_id_hex = account_id_hex
@@ -1282,7 +1365,13 @@ class MarmotLiveStream:
             start_message_id_hex,
             chunk_bytes=chunk_bytes,
         )
-        self.finalize_idempotency_key = uuid.uuid4().hex
+        self.finalize_idempotency_key = finalize_idempotency_key or _logical_final_idempotency_key(
+            uuid.uuid4().hex,
+            account_id_hex,
+            group_id_hex,
+        )
+        self.logical_delivery_ref = _redaction_safe_ref(self.finalize_idempotency_key)
+        self.stream_ref = _redaction_safe_ref(stream_id_hex)
         self.finalized = False
 
     @classmethod
@@ -1296,6 +1385,7 @@ class MarmotLiveStream:
         chunk_bytes: int,
         stream_id_hex: Optional[str] = None,
         parent_message_id_hex: Optional[str] = None,
+        logical_delivery_id: Optional[str] = None,
     ) -> "MarmotLiveStream":
         begin_options: Dict[str, Any] = {
             "stream_id_hex": stream_id_hex,
@@ -1303,9 +1393,27 @@ class MarmotLiveStream:
         }
         if parent_message_id_hex is not None:
             begin_options["parent_message_id_hex"] = parent_message_id_hex
-        begin_request_id = uuid.uuid4().hex
+        delivery_id = str(logical_delivery_id or uuid.uuid4().hex)
+        begin_request_id = _stream_begin_request_id(
+            delivery_id,
+            account_id_hex,
+            group_id_hex,
+            parent_message_id_hex,
+        )
+        finalize_idempotency_key = _logical_final_idempotency_key(
+            delivery_id,
+            account_id_hex,
+            group_id_hex,
+        )
         response: Optional[Dict[str, Any]] = None
         for attempt in range(len(STREAM_BEGIN_RETRY_BACKOFF_S) + 1):
+            _log_delivery_attempt(
+                logical_delivery_key=finalize_idempotency_key,
+                stream_id_hex=stream_id_hex,
+                operation_role="stream_begin",
+                attempt=attempt + 1,
+                outcome="started",
+            )
             try:
                 response = await client.stream_begin(
                     account_id_hex,
@@ -1313,9 +1421,24 @@ class MarmotLiveStream:
                     request_id=begin_request_id,
                     **begin_options,
                 )
+                _log_delivery_attempt(
+                    logical_delivery_key=finalize_idempotency_key,
+                    stream_id_hex=str(response.get("stream_id_hex") or stream_id_hex or ""),
+                    operation_role="stream_begin",
+                    attempt=attempt + 1,
+                    outcome="committed",
+                )
                 break
             except Exception as exc:
-                if attempt < len(STREAM_BEGIN_RETRY_BACKOFF_S) and is_retryable(exc):
+                retryable = is_retryable(exc)
+                _log_delivery_attempt(
+                    logical_delivery_key=finalize_idempotency_key,
+                    stream_id_hex=stream_id_hex,
+                    operation_role="stream_begin",
+                    attempt=attempt + 1,
+                    outcome="retryable_failure" if retryable else "rejected",
+                )
+                if attempt < len(STREAM_BEGIN_RETRY_BACKOFF_S) and retryable:
                     await asyncio.sleep(STREAM_BEGIN_RETRY_BACKOFF_S[attempt])
                     continue
                 raise
@@ -1336,6 +1459,7 @@ class MarmotLiveStream:
                 chunk_bytes,
                 response.get("policy_max_plaintext_frame_len"),
             ),
+            finalize_idempotency_key=finalize_idempotency_key,
         )
 
     async def append_replacement(self, next_text: str) -> None:
@@ -1358,6 +1482,13 @@ class MarmotLiveStream:
         await self.append_replacement(final_text)
         response: Optional[Dict[str, Any]] = None
         for attempt in range(len(STREAM_FINALIZE_RETRY_BACKOFF_S) + 1):
+            _log_delivery_attempt(
+                logical_delivery_key=self.finalize_idempotency_key,
+                stream_id_hex=self.stream_id_hex,
+                operation_role="stream_finalize",
+                attempt=attempt + 1,
+                outcome="started",
+            )
             try:
                 response = await self.client.stream_finalize(
                     self.stream_id_hex,
@@ -1367,9 +1498,24 @@ class MarmotLiveStream:
                     self.transcript.chunk_count,
                     idempotency_key=self.finalize_idempotency_key,
                 )
+                _log_delivery_attempt(
+                    logical_delivery_key=self.finalize_idempotency_key,
+                    stream_id_hex=self.stream_id_hex,
+                    operation_role="stream_finalize",
+                    attempt=attempt + 1,
+                    outcome="committed",
+                )
                 break
             except Exception as exc:
-                if attempt < len(STREAM_FINALIZE_RETRY_BACKOFF_S) and is_retryable(exc):
+                retryable = is_retryable(exc)
+                _log_delivery_attempt(
+                    logical_delivery_key=self.finalize_idempotency_key,
+                    stream_id_hex=self.stream_id_hex,
+                    operation_role="stream_finalize",
+                    attempt=attempt + 1,
+                    outcome="retryable_failure" if retryable else "rejected",
+                )
+                if attempt < len(STREAM_FINALIZE_RETRY_BACKOFF_S) and retryable:
                     logger.debug(
                         "Marmot stream_finalize failed; retrying (attempt %d): %s",
                         attempt + 1,
@@ -1536,6 +1682,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._capture_loop()
         chat_id = _normalize_hex(chat_id, "chat_id")
         visible_content = self._strip_streaming_cursor(content)
+        logical_delivery_id = _logical_delivery_id(metadata)
 
         tool_events = _tool_events_from_progress_text(visible_content)
         if tool_events:
@@ -1553,6 +1700,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 stream = await self._begin_live_stream(
                     chat_id,
                     parent_message_id_hex=_optional_hex(reply_to),
+                    logical_delivery_id=logical_delivery_id,
                 )
                 await stream.append_replacement(visible_content)
                 message_id = _stream_message_id(stream.stream_id_hex)
@@ -1566,6 +1714,26 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         stream = self._last_chat_stream.get(chat_id)
         if stream is not None and not stream.finalized:
             message_id = _stream_message_id(stream.stream_id_hex)
+            if logical_delivery_id is not None:
+                account_id = await self._ensure_account_id()
+                expected_key = _logical_final_idempotency_key(
+                    logical_delivery_id,
+                    account_id,
+                    chat_id,
+                )
+                if expected_key != stream.finalize_idempotency_key:
+                    await self._cancel_stream(
+                        chat_id,
+                        message_id,
+                        stream,
+                        "logical delivery was superseded",
+                    )
+                    return await self._send_final_direct(
+                        chat_id,
+                        visible_content,
+                        reply_to_message_id_hex=_optional_hex(reply_to),
+                        logical_delivery_id=logical_delivery_id,
+                    )
             try:
                 # The final text is authoritative. Finalize the live preview only
                 # when the final is an exact append-only extension of the streamed
@@ -1587,6 +1755,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 logger.debug("Marmot live-preview finalize failed: %s", exc)
+                if is_retryable(exc):
+                    return await self._reconcile_ambiguous_stream_final(
+                        chat_id,
+                        stream,
+                        visible_content,
+                        message_id=message_id,
+                    )
                 return await self._abandon_preview_and_send_final(
                     chat_id,
                     stream,
@@ -1600,6 +1775,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             chat_id,
             visible_content,
             reply_to_message_id_hex=_optional_hex(reply_to),
+            logical_delivery_id=logical_delivery_id,
         )
 
     async def edit_message(
@@ -1654,6 +1830,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("Marmot live-preview edit failed: %s", exc)
             if finalize:
+                if is_retryable(exc):
+                    return await self._reconcile_ambiguous_stream_final(
+                        chat_id,
+                        stream,
+                        visible_content,
+                        message_id=message_id,
+                    )
                 return await self._abandon_preview_and_send_final(
                     chat_id,
                     stream,
@@ -1774,6 +1957,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                         or metadata.get("reply_to_message_id_hex")
                         or _TURN_PARENT_MESSAGE_ID_HEX.get()
                     ),
+                    logical_delivery_id=_logical_delivery_id(metadata),
                 )
                 self._draft_streams[key] = stream
                 self._last_chat_stream[chat_id] = stream
@@ -1797,15 +1981,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         message_id: Optional[str] = None,
     ) -> SendResult:
         response = await stream.finalize(final_text)
-        if message_id:
-            self._active_streams.pop(message_id, None)
-        self._forget_stream(chat_id, stream)
         try:
             result = self._result_from_stream_finalize(response)
         except Exception as exc:
             logger.debug("Marmot stream finalize response rejected: %s", exc)
-            await self._cancel_stream(chat_id, message_id, stream, "finalize rejected")
-            return await self._send_final_direct(chat_id, final_text)
+            return await self._reconcile_ambiguous_stream_final(
+                chat_id,
+                stream,
+                final_text,
+                message_id=message_id,
+            )
+        if message_id:
+            self._active_streams.pop(message_id, None)
+        self._forget_stream(chat_id, stream)
         account_id = await self._ensure_account_id()
         self._sent_targets.record_all(
             tuple(response.get("message_ids_hex") or ()),
@@ -1813,6 +2001,88 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             group_id_hex=chat_id,
         )
         return result
+
+    async def _reconcile_ambiguous_stream_final(
+        self,
+        chat_id: str,
+        stream: MarmotLiveStream,
+        final_text: str,
+        *,
+        message_id: Optional[str],
+    ) -> SendResult:
+        """Resolve an outcome-unknown finalize before any direct fallback."""
+        _log_delivery_attempt(
+            logical_delivery_key=stream.finalize_idempotency_key,
+            stream_id_hex=stream.stream_id_hex,
+            operation_role="delivery_status",
+            attempt=1,
+            outcome="started",
+        )
+        try:
+            response = await self.client.delivery_status(stream.finalize_idempotency_key)
+        except Exception as exc:
+            _log_delivery_attempt(
+                logical_delivery_key=stream.finalize_idempotency_key,
+                stream_id_hex=stream.stream_id_hex,
+                operation_role="delivery_status",
+                attempt=1,
+                outcome="failed",
+            )
+            logger.debug("Marmot final-delivery reconciliation failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+        if response.get("type") != "delivery_status":
+            return SendResult(
+                success=False,
+                error="Marmot final-delivery reconciliation returned an unexpected response",
+                retryable=True,
+            )
+        status = str(response.get("status") or "")
+        _log_delivery_attempt(
+            logical_delivery_key=stream.finalize_idempotency_key,
+            stream_id_hex=stream.stream_id_hex,
+            operation_role="delivery_status",
+            attempt=1,
+            outcome=status or "invalid",
+        )
+        if status == "committed":
+            message_ids = tuple(response.get("message_ids_hex") or ())
+            if not message_ids:
+                return SendResult(
+                    success=False,
+                    error="Marmot committed delivery status returned no message ids",
+                    retryable=True,
+                )
+            if message_id:
+                self._active_streams.pop(message_id, None)
+            self._forget_stream(chat_id, stream)
+            account_id = await self._ensure_account_id()
+            self._sent_targets.record_all(
+                message_ids,
+                account_id_hex=account_id,
+                group_id_hex=chat_id,
+            )
+            return SendResult(
+                success=True,
+                message_id=message_ids[-1],
+                raw_response=response,
+                continuation_message_ids=message_ids[:-1],
+            )
+        if status == "unknown":
+            return await self._abandon_preview_and_send_final(
+                chat_id,
+                stream,
+                final_text,
+                message_id=message_id,
+                reason="finalize_outcome_reconciled_unknown",
+            )
+        # A pending leader may still commit. Keep the preview/session handle and
+        # let Hermes retry this logical delivery with the same stable identity.
+        return SendResult(
+            success=False,
+            error="Marmot final delivery is still pending",
+            retryable=True,
+        )
 
     @staticmethod
     def _result_from_stream_finalize(response: Dict[str, Any]) -> SendResult:
@@ -1845,7 +2115,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         return await self._send_final_direct(
             chat_id,
             final_text,
-            reply_to_message_id_hex=reply_to_message_id_hex,
+            # A direct fallback is still the final node of the same causal
+            # stream chain. The stream-start already points at the prompt, so
+            # the fallback must point at the start rather than skipping it.
+            reply_to_message_id_hex=stream.start_message_id_hex,
+            idempotency_key=stream.finalize_idempotency_key,
+            stream_id_hex=stream.stream_id_hex,
         )
 
     async def _send_final_direct(
@@ -1854,17 +2129,32 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         content: str,
         *,
         reply_to_message_id_hex: Optional[str] = None,
+        logical_delivery_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        stream_id_hex: Optional[str] = None,
     ) -> SendResult:
         # One idempotency key for every attempt of THIS durable reply: a retry
         # after a post-write timeout reuses the key so the connector dedups
         # instead of double-posting an unrecallable encrypted message. Bounded
         # retries with a tiny backoff cover the transient/timeout window;
         # non-retryable errors fail fast. Mirrors OpenClaw dispatch.ts.
-        idempotency_key = uuid.uuid4().hex
+        account_id = await self._ensure_account_id()
+        if idempotency_key is None:
+            idempotency_key = _logical_final_idempotency_key(
+                logical_delivery_id or uuid.uuid4().hex,
+                account_id,
+                chat_id,
+            )
         last_exc: BaseException | None = None
         for attempt in range(len(SEND_FINAL_RETRY_BACKOFF_S) + 1):
+            _log_delivery_attempt(
+                logical_delivery_key=idempotency_key,
+                stream_id_hex=stream_id_hex,
+                operation_role="direct_final",
+                attempt=attempt + 1,
+                outcome="started",
+            )
             try:
-                account_id = await self._ensure_account_id()
                 response = await self.client.send_final(
                     account_id,
                     chat_id,
@@ -1879,6 +2169,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     account_id_hex=account_id,
                     group_id_hex=chat_id,
                 )
+                _log_delivery_attempt(
+                    logical_delivery_key=idempotency_key,
+                    stream_id_hex=stream_id_hex,
+                    operation_role="direct_final",
+                    attempt=attempt + 1,
+                    outcome="committed",
+                )
                 return SendResult(
                     success=True,
                     message_id=message_id,
@@ -1887,7 +2184,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 last_exc = exc
-                if attempt < len(SEND_FINAL_RETRY_BACKOFF_S) and is_retryable(exc):
+                retryable = is_retryable(exc)
+                _log_delivery_attempt(
+                    logical_delivery_key=idempotency_key,
+                    stream_id_hex=stream_id_hex,
+                    operation_role="direct_final",
+                    attempt=attempt + 1,
+                    outcome="retryable_failure" if retryable else "rejected",
+                )
+                if attempt < len(SEND_FINAL_RETRY_BACKOFF_S) and retryable:
                     logger.debug(
                         "Marmot send_final failed; retrying (attempt %d): %s",
                         attempt + 1,
@@ -2138,6 +2443,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         chat_id: str,
         *,
         parent_message_id_hex: Optional[str] = None,
+        logical_delivery_id: Optional[str] = None,
     ) -> MarmotLiveStream:
         account_id = await self._ensure_account_id()
         return await MarmotLiveStream.begin(
@@ -2145,6 +2451,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             account_id_hex=account_id,
             group_id_hex=chat_id,
             parent_message_id_hex=parent_message_id_hex,
+            logical_delivery_id=logical_delivery_id,
             quic_candidates=self.quic_candidates,
             chunk_bytes=self.stream_chunk_bytes,
         )

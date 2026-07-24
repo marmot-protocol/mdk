@@ -222,6 +222,9 @@ impl AgentConnector {
                 )
                 .await
             }
+            AgentControlRequest::DeliveryStatus { idempotency_key } => {
+                Ok(self.delivery_status_response(&idempotency_key))
+            }
             AgentControlRequest::DeleteMessage {
                 account_id_hex,
                 group_id_hex,

@@ -14,13 +14,15 @@ use tokio::sync::{mpsc, oneshot};
 use transport_quic_broker::OpenBrokerTextPublisher;
 
 use crate::error::ConnectorError;
+use crate::messaging::{LOGICAL_FINAL_IDEMPOTENCY_PREFIX, send_final_fingerprint};
 use crate::quic::{
     broker_trust_for_candidate, first_quic_candidate, parse_quic_candidate,
     resolve_quic_candidate_addr,
 };
 use crate::stream_session::{
-    ActiveStreamSession, FinalizedStream, StreamBeginReceipt, StreamBeginReservation,
-    normalize_stream_capability,
+    ActiveStreamSession, FinalizedStream, SendIdempotencyAcquisition,
+    SendIdempotencyReservationGuard, SendIdempotencyStatus, StreamBeginReceipt,
+    StreamBeginReservation, normalize_stream_capability,
 };
 use crate::validation::{normalize_hex, transcript_hash_from_hex, unix_now_seconds};
 use crate::{
@@ -90,11 +92,6 @@ fn begun_response(receipt: StreamBeginReceipt) -> AgentControlResponse {
 
 fn stream_finalize_idempotency_key(key: &str) -> String {
     format!("stream_finalize_v2:{key}")
-}
-
-struct StreamFinalizeIdempotency {
-    key: String,
-    fingerprint: String,
 }
 
 impl AgentConnector {
@@ -248,6 +245,7 @@ impl AgentConnector {
             stream_id_hex.clone(),
             ActiveStreamSession {
                 account_label: account.label,
+                account_id_hex: account.account_id_hex,
                 group_id,
                 stream_id,
                 stream_capability,
@@ -352,26 +350,45 @@ impl AgentConnector {
         let stream_id_hex = normalize_hex(stream_id_hex)?;
         let stream_capability = normalize_stream_capability(stream_capability)?;
         let transcript_hash = transcript_hash_from_hex(transcript_hash_hex)?;
-        let fingerprint = stream_finalize_fingerprint(
-            &stream_id_hex,
-            &stream_capability,
-            &final_text,
-            &transcript_hash,
-            chunk_count,
-        );
         let idempotency_key = idempotency_key
             .as_deref()
             .map(str::trim)
             .filter(|key| !key.is_empty())
-            .map(stream_finalize_idempotency_key);
-        if let Some(key) = idempotency_key.as_deref()
-            && let Some(message_ids_hex) = self.idempotency.get(key, &fingerprint)
+            .map(str::to_owned);
+        if let Some(key) = idempotency_key
+            .as_deref()
+            .filter(|key| key.starts_with(LOGICAL_FINAL_IDEMPOTENCY_PREFIX))
+            && let SendIdempotencyStatus::Committed(message_ids_hex) = self.idempotency.status(key)
         {
             return Ok(AgentControlResponse::StreamFinalized {
                 stream_id_hex,
                 message_ids_hex,
             });
         }
+        let legacy_idempotency = if let Some(client_key) = idempotency_key
+            .as_deref()
+            .filter(|key| !key.starts_with(LOGICAL_FINAL_IDEMPOTENCY_PREFIX))
+        {
+            let key = stream_finalize_idempotency_key(client_key);
+            let fingerprint = stream_finalize_fingerprint(
+                &stream_id_hex,
+                &stream_capability,
+                &final_text,
+                &transcript_hash,
+                chunk_count,
+            );
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed(message_ids_hex) => {
+                    return Ok(AgentControlResponse::StreamFinalized {
+                        stream_id_hex,
+                        message_ids_hex,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => Some(reservation),
+            }
+        } else {
+            None
+        };
         // Clone (not remove) the session: the final text/hash/chunk-count
         // expectation is validated inside the compose task, atomically with
         // its teardown. On mismatch the session stays registered and the
@@ -379,6 +396,27 @@ impl AgentConnector {
         let session = self
             .streams
             .get_authorized(&stream_id_hex, &stream_capability)?;
+        let idempotency = if let Some(client_key) =
+            idempotency_key.filter(|key| key.starts_with(LOGICAL_FINAL_IDEMPOTENCY_PREFIX))
+        {
+            let fingerprint = send_final_fingerprint(
+                &session.account_id_hex,
+                &hex::encode(session.group_id.as_slice()),
+                &final_text,
+                Some(&session.start_message_id_hex),
+            );
+            match self.idempotency.acquire(&client_key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed(message_ids_hex) => {
+                    return Ok(AgentControlResponse::StreamFinalized {
+                        stream_id_hex,
+                        message_ids_hex,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => Some(reservation),
+            }
+        } else {
+            legacy_idempotency
+        };
 
         // Retry fast-path: a prior finalize already validated the transcript and
         // the compose task exited, but the durable finish below failed. The
@@ -401,7 +439,7 @@ impl AgentConnector {
                     final_text,
                     transcript_hash,
                     chunk_count,
-                    idempotency_key.map(|key| StreamFinalizeIdempotency { key, fingerprint }),
+                    idempotency,
                 )
                 .await;
         }
@@ -470,7 +508,7 @@ impl AgentConnector {
             final_text,
             transcript_hash,
             chunk_count,
-            idempotency_key.map(|key| StreamFinalizeIdempotency { key, fingerprint }),
+            idempotency,
         )
         .await
     }
@@ -486,7 +524,7 @@ impl AgentConnector {
         final_text: String,
         transcript_hash: [u8; 32],
         chunk_count: u64,
-        idempotency: Option<StreamFinalizeIdempotency>,
+        idempotency: Option<SendIdempotencyReservationGuard>,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let (_payload, summary) = self
             .runtime
@@ -504,11 +542,7 @@ impl AgentConnector {
             )
             .await?;
         if let Some(idempotency) = idempotency {
-            self.idempotency.record(
-                idempotency.key,
-                idempotency.fingerprint,
-                summary.message_ids.clone(),
-            );
+            idempotency.complete(summary.message_ids.clone());
         }
         // Durable final published: it is now safe to drop the session.
         let _ = self.streams.remove_if_same(stream_id_hex, session);

@@ -495,6 +495,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
         "aa".to_owned(),
         ActiveStreamSession {
             account_label: "agent".to_owned(),
+            account_id_hex: "11".repeat(32),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
             stream_capability: [0x77; 32],
@@ -515,6 +516,7 @@ async fn stream_session_sweeper_aborts_idle_session_and_keeps_active_one() {
         "bb".to_owned(),
         ActiveStreamSession {
             account_label: "agent".to_owned(),
+            account_id_hex: "11".repeat(32),
             group_id: GroupId::new(vec![2]),
             stream_id: vec![0xbb],
             stream_capability: [0x77; 32],
@@ -570,6 +572,7 @@ async fn stream_session_sweep_spares_finalized_session_despite_idle() {
         "aa".to_owned(),
         ActiveStreamSession {
             account_label: "agent".to_owned(),
+            account_id_hex: "11".repeat(32),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
             stream_capability: [0x77; 32],
@@ -1445,6 +1448,7 @@ async fn stream_session_store_resolves_non_canonical_stream_id() {
         canonical_stream_id_hex.clone(),
         ActiveStreamSession {
             account_label: "agent".to_owned(),
+            account_id_hex: "11".repeat(32),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa, 0xbb],
             stream_capability: [0x77; 32],
@@ -1604,6 +1608,7 @@ async fn stream_session_sweep_does_not_force_abort_when_cancel_already_queued() 
         "aa".to_owned(),
         ActiveStreamSession {
             account_label: "agent".to_owned(),
+            account_id_hex: "11".repeat(32),
             group_id: GroupId::new(vec![1]),
             stream_id: vec![0xaa],
             stream_capability: [0x77; 32],
@@ -2398,6 +2403,27 @@ async fn connector_socket_composes_and_finalizes_stream() {
             (AGENT_TEXT_STREAM_RECORD_STATUS, "thinking"),
         ],
     );
+    let logical_final_key = format!(
+        "{}test-delivery",
+        crate::messaging::LOGICAL_FINAL_IDEMPOTENCY_PREFIX
+    );
+    let unknown = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-delivery-status-unknown",
+        AgentControlRequest::DeliveryStatus {
+            idempotency_key: logical_final_key.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        unknown.payload,
+        AgentControlResponse::DeliveryStatus {
+            status: agent_control::AgentControlDeliveryStatus::Unknown,
+            message_ids_hex: Vec::new(),
+        }
+    );
     let finalized = serve_control_request_once(
         &connector,
         &listener,
@@ -2409,7 +2435,7 @@ async fn connector_socket_composes_and_finalizes_stream() {
             final_text: "hello stream".to_owned(),
             transcript_hash_hex,
             chunk_count: 2,
-            idempotency_key: None,
+            idempotency_key: Some(logical_final_key.clone()),
         },
     )
     .await;
@@ -2423,6 +2449,44 @@ async fn connector_socket_composes_and_finalizes_stream() {
     assert_eq!(finalized_stream_id_hex, stream_id_hex);
     assert_eq!(message_ids_hex.len(), 1);
     assert!(!message_ids_hex[0].is_empty());
+
+    let committed = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-delivery-status-committed",
+        AgentControlRequest::DeliveryStatus {
+            idempotency_key: logical_final_key.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        committed.payload,
+        AgentControlResponse::DeliveryStatus {
+            status: agent_control::AgentControlDeliveryStatus::Committed,
+            message_ids_hex: message_ids_hex.clone(),
+        }
+    );
+
+    let direct_retry = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-direct-final-retry",
+        AgentControlRequest::SendFinal {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "hello stream".to_owned(),
+            reply_to_message_id_hex: Some(start_message_id_hex),
+            idempotency_key: Some(logical_final_key),
+        },
+    )
+    .await;
+    assert_eq!(
+        direct_retry.payload,
+        AgentControlResponse::FinalSent { message_ids_hex },
+        "direct fallback must reuse the committed stream-final result"
+    );
 }
 
 /// Regression for #366: a finalize whose expectation does not match the
@@ -3825,6 +3889,155 @@ async fn send_final_with_repeated_idempotency_key_dedups_without_second_send() {
         .filter(|m| m.plaintext == "idempotent reply")
         .count();
     assert_eq!(copies, 1, "a deduped retry must not re-post the message");
+}
+
+#[tokio::test]
+async fn concurrent_send_final_with_same_key_awaits_one_committed_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime.create_identity(setup.clone()).await.unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent concurrent idempotent send",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.runtime.catch_up_accounts().await.unwrap();
+
+    let key = "concurrent-retry-key".to_owned();
+    let first = connector.send_final_response(
+        &agent.account.account_id_hex,
+        &group_id_hex,
+        "one logical reply".to_owned(),
+        None,
+        Some(key.clone()),
+    );
+    let second = connector.send_final_response(
+        &agent.account.account_id_hex,
+        &group_id_hex,
+        "one logical reply".to_owned(),
+        None,
+        Some(key),
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: first_ids,
+    } = first.unwrap()
+    else {
+        panic!("expected first concurrent send to return FinalSent");
+    };
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: second_ids,
+    } = second.unwrap()
+    else {
+        panic!("expected second concurrent send to return FinalSent");
+    };
+    assert_eq!(
+        second_ids, first_ids,
+        "same-key followers return the leader ids"
+    );
+
+    let stored = connector
+        .runtime
+        .messages_with_query(
+            &agent.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex),
+                limit: None,
+            },
+        )
+        .unwrap();
+    let copies = stored
+        .iter()
+        .filter(|message| message.plaintext == "one logical reply")
+        .count();
+    assert_eq!(
+        copies, 1,
+        "concurrent same-key requests must produce one durable message"
+    );
+}
+
+#[tokio::test]
+async fn send_idempotency_store_same_key_follower_waits_for_leader_result() {
+    use crate::stream_session::{
+        SendIdempotencyReservation, SendIdempotencyStatus, SendIdempotencyStore,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    assert!(matches!(
+        store.status("logical-key"),
+        SendIdempotencyStatus::Unknown
+    ));
+    let leader = match store.reserve("logical-key", "fingerprint").unwrap() {
+        SendIdempotencyReservation::Leader(leader) => leader,
+        _ => panic!("first caller must lead the send"),
+    };
+    let mut completion = match store.reserve("logical-key", "fingerprint").unwrap() {
+        SendIdempotencyReservation::Wait(completion) => completion,
+        _ => panic!("same-key concurrent caller must wait"),
+    };
+    assert!(matches!(
+        store.status("logical-key"),
+        SendIdempotencyStatus::Pending
+    ));
+
+    let ids = vec!["aa".repeat(32)];
+    leader.complete(ids.clone());
+    if !*completion.borrow() {
+        completion.changed().await.unwrap();
+    }
+
+    match store.reserve("logical-key", "fingerprint").unwrap() {
+        SendIdempotencyReservation::Completed(recorded) => assert_eq!(recorded, ids),
+        _ => panic!("follower retry must receive the leader result"),
+    }
+    assert!(matches!(
+        store.status("logical-key"),
+        SendIdempotencyStatus::Committed(recorded) if recorded == ids
+    ));
+
+    let failed_leader = match store.reserve("retryable-key", "fingerprint").unwrap() {
+        SendIdempotencyReservation::Leader(leader) => leader,
+        _ => panic!("new key must elect a leader"),
+    };
+    let mut failed_follower = match store.reserve("retryable-key", "fingerprint").unwrap() {
+        SendIdempotencyReservation::Wait(completion) => completion,
+        _ => panic!("same-key caller must wait while the leader is active"),
+    };
+    drop(failed_leader);
+    if !*failed_follower.borrow() {
+        failed_follower.changed().await.unwrap();
+    }
+    assert!(matches!(
+        store.reserve("retryable-key", "fingerprint").unwrap(),
+        SendIdempotencyReservation::Leader(_)
+    ));
 }
 
 #[test]

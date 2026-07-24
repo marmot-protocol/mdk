@@ -467,6 +467,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::KeyPackagePublished { .. } => "key_package_published",
         AgentControlResponse::ProfilePublished { .. } => "profile_published",
         AgentControlResponse::FinalSent { .. } => "final_sent",
+        AgentControlResponse::DeliveryStatus { .. } => "delivery_status",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
         AgentControlResponse::GroupInfo { .. } => "group_info",

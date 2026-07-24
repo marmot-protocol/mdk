@@ -345,6 +345,13 @@ directory with `--media-allowed-root`; without one, path sends fail closed.
   the Marmot group id and `user_id` set to the sender account id.
 - Hermes progressive edits open at most one live preview per chat at a time. A
   newer preview cancels the previous stream for that chat.
+- Hermes supplies `metadata.logical_delivery_id` for every progressive preview
+  and final-send attempt. The value is stable when the same logical delivery is
+  reconstructed or retried, and unique for separate turns even when their text
+  is identical. Message text is never a delivery identity.
+- The adapter hashes that identity with the destination into opaque, stable
+  stream-begin and final idempotency keys. A stream finalize and its direct-send
+  fallback deliberately share one final key and the stream-start parent.
 - Durable message text is exactly what Hermes hands the adapter. The adapter
   never merges, splices, or reconstructs text across sends; fragmented or
   duplicated finals must be fixed in Hermes message segmentation.
@@ -352,7 +359,9 @@ directory with `--media-allowed-root`; without one, path sends fail closed.
   stream-final `kind: 9` when the final text is an append-only extension of the
   streamed text. There is no duplicate plain `send_final` for the same text.
 - Otherwise the preview is cancelled and the final goes out verbatim as one
-  plain `send_final`.
+  plain `send_final`. After an outcome-unknown finalize, the adapter first asks
+  `delivery_status` whether that logical final is pending or already committed;
+  it only falls back when the connector reports `unknown`.
 - Status records are included in the stream transcript hash and chunk count.
 
 Run the shim tests with:

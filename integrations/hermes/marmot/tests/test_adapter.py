@@ -232,6 +232,35 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
 
+    async def test_delivery_status_queries_the_logical_idempotency_key(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "delivery_status",
+                    "status": "committed",
+                    "message_ids_hex": ["aa"],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.delivery_status("marmot_logical_final_v1:abc")
+
+        self.assertEqual(response["status"], "committed")
+        self.assertEqual(requests[0]["type"], "delivery_status")
+        self.assertEqual(
+            requests[0]["idempotency_key"],
+            "marmot_logical_final_v1:abc",
+        )
+
     async def test_stream_begin_includes_parent_message_id_only_when_supplied(self):
         requests = []
 
@@ -2099,7 +2128,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.stream_cancels, [("55" * 32, "final text was not append-only")])
         self.assertEqual(
             fake_client.final_sends,
-            [("11" * 32, "22" * 32, "Based on my search", None)],
+            [("11" * 32, "22" * 32, "Based on my search", "66" * 32)],
         )
 
 
@@ -2798,6 +2827,27 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module = load_adapter_module()
         self.config_cls = sys.modules["gateway.config"].PlatformConfig
 
+    def test_delivery_attempt_log_fields_are_redaction_safe(self):
+        logical_id = "private-logical-delivery-id"
+        stream_id = "ab" * 32
+        with unittest.mock.patch.object(self.adapter_module.logger, "info") as info:
+            self.adapter_module._log_delivery_attempt(
+                logical_delivery_key=logical_id,
+                stream_id_hex=stream_id,
+                operation_role="stream_finalize",
+                attempt=2,
+                outcome="committed",
+            )
+
+        extra = info.call_args.kwargs["extra"]
+        self.assertEqual(extra["operation_role"], "stream_finalize")
+        self.assertEqual(extra["attempt"], 2)
+        self.assertEqual(extra["outcome"], "committed")
+        self.assertEqual(len(extra["logical_delivery_ref"]), 12)
+        self.assertEqual(len(extra["stream_ref"]), 12)
+        self.assertNotIn(logical_id, str(extra))
+        self.assertNotIn(stream_id, str(extra))
+
     async def test_stream_begin_retries_with_the_same_request_id(self):
         adapter_module = self.adapter_module
 
@@ -2965,6 +3015,304 @@ class FinalizeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_client.final_sends), 1)
         self.assertEqual(fake_client.final_sends[0][2], "hello world")
         self.assertTrue(fake_client.stream_cancels)
+
+    async def test_logical_delivery_id_is_stable_across_reconstruction_but_not_same_text_turns(self):
+        calls = []
+
+        class FakeClient:
+            async def send_final(
+                self,
+                account_id_hex,
+                group_id_hex,
+                text,
+                reply_to_message_id_hex=None,
+                idempotency_key=None,
+            ):
+                calls.append((text, idempotency_key))
+                return {
+                    "type": "final_sent",
+                    "message_ids_hex": [f"{len(calls):064x}"],
+                }
+
+        for logical_delivery_id in ("delivery-a", "delivery-a", "delivery-b"):
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(extra={"account_id_hex": "11" * 32}),
+                client=FakeClient(),
+            )
+            result = await adapter.send(
+                "22" * 32,
+                "same text",
+                metadata={"logical_delivery_id": logical_delivery_id},
+            )
+            self.assertTrue(result.success)
+
+        first_key = calls[0][1]
+        self.assertEqual(calls[1][1], first_key)
+        self.assertNotEqual(calls[2][1], first_key)
+        self.assertTrue(first_key.startswith("marmot_logical_final_v1:"))
+        self.assertNotIn("delivery-a", first_key)
+
+    async def test_reconstructed_preview_reuses_logical_stream_begin_request_id(self):
+        request_ids = []
+
+        class FakeClient:
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                request_ids.append(request_id)
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+                return {"type": "ack"}
+
+        for _ in range(2):
+            adapter = self.adapter_module.MarmotPlatformAdapter(
+                self.config_cls(
+                    extra={
+                        "account_id_hex": "11" * 32,
+                        "quic_candidates": ["quic://127.0.0.1:4433"],
+                    }
+                ),
+                client=FakeClient(),
+            )
+            preview = await adapter.send(
+                "22" * 32,
+                "hello\u2589",
+                reply_to="44" * 32,
+                metadata={"logical_delivery_id": "delivery-a"},
+            )
+            self.assertTrue(preview.success)
+
+        self.assertEqual(len(request_ids), 2)
+        self.assertEqual(request_ids[1], request_ids[0])
+        self.assertTrue(request_ids[0].startswith("marmot_stream_begin_v1:"))
+
+    async def test_ambiguous_finalize_fallback_reuses_logical_key_and_stream_parent(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.finalize_keys = []
+                self.final_sends = []
+                self.stream_cancels = []
+                self.status_keys = []
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+                return {"type": "ack"}
+
+            async def stream_finalize(
+                self,
+                stream_id_hex,
+                stream_capability,
+                final_text,
+                transcript_hash_hex,
+                chunk_count,
+                idempotency_key=None,
+            ):
+                self.finalize_keys.append(idempotency_key)
+                raise adapter_module.AgentControlError(
+                    "response acknowledgement was lost",
+                    code="timeout",
+                    retryable=True,
+                )
+
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
+                self.stream_cancels.append((stream_id_hex, reason))
+                return {"type": "ack"}
+
+            async def delivery_status(self, idempotency_key):
+                self.status_keys.append(idempotency_key)
+                return {
+                    "type": "delivery_status",
+                    "status": "unknown",
+                    "message_ids_hex": [],
+                }
+
+            async def send_final(
+                self,
+                account_id_hex,
+                group_id_hex,
+                text,
+                reply_to_message_id_hex=None,
+                idempotency_key=None,
+            ):
+                self.final_sends.append(
+                    (text, reply_to_message_id_hex, idempotency_key)
+                )
+                return {"type": "final_sent", "message_ids_hex": ["77" * 32]}
+
+        fake_client = FakeClient()
+        adapter = adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+        metadata = {"logical_delivery_id": "delivery-a"}
+
+        preview = await adapter.send(
+            "22" * 32,
+            "hello\u2589",
+            reply_to="44" * 32,
+            metadata=metadata,
+        )
+        with unittest.mock.patch.object(adapter_module, "STREAM_FINALIZE_RETRY_BACKOFF_S", ()):
+            final = await adapter.send(
+                "22" * 32,
+                "hello world",
+                reply_to="44" * 32,
+                metadata=metadata,
+            )
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(len(fake_client.finalize_keys), 1)
+        self.assertEqual(fake_client.status_keys, fake_client.finalize_keys)
+        self.assertEqual(len(fake_client.final_sends), 1)
+        self.assertEqual(fake_client.final_sends[0][2], fake_client.finalize_keys[0])
+        self.assertEqual(
+            fake_client.final_sends[0][1],
+            "66" * 32,
+            "fallback final must remain causally after the stream start",
+        )
+        self.assertTrue(fake_client.stream_cancels)
+
+    async def test_lost_finalize_ack_reconciles_committed_delivery_without_direct_fallback(self):
+        adapter_module = self.adapter_module
+
+        class FakeClient:
+            def __init__(self):
+                self.finalize_keys = []
+                self.final_sends = []
+                self.stream_cancels = []
+                self.status_key = None
+
+            async def stream_begin(
+                self,
+                account_id_hex,
+                group_id_hex,
+                *,
+                stream_id_hex=None,
+                parent_message_id_hex=None,
+                quic_candidates=(),
+                request_id=None,
+            ):
+                return {
+                    "type": "stream_begun",
+                    "stream_id_hex": "55" * 32,
+                    "stream_capability": "33" * 32,
+                    "start_message_id_hex": "66" * 32,
+                    "quic_candidates": list(quic_candidates),
+                }
+
+            async def stream_append(self, stream_id_hex, stream_capability, append_text):
+                return {"type": "ack"}
+
+            async def stream_finalize(
+                self,
+                stream_id_hex,
+                stream_capability,
+                final_text,
+                transcript_hash_hex,
+                chunk_count,
+                idempotency_key=None,
+            ):
+                self.finalize_keys.append(idempotency_key)
+                raise adapter_module.AgentControlError(
+                    "response acknowledgement was lost",
+                    code="timeout",
+                    retryable=True,
+                )
+
+            async def delivery_status(self, idempotency_key):
+                self.status_key = idempotency_key
+                return {
+                    "type": "delivery_status",
+                    "status": "committed",
+                    "message_ids_hex": ["77" * 32],
+                }
+
+            async def stream_cancel(self, stream_id_hex, stream_capability, reason=None):
+                self.stream_cancels.append((stream_id_hex, reason))
+                return {"type": "ack"}
+
+            async def send_final(
+                self,
+                account_id_hex,
+                group_id_hex,
+                text,
+                reply_to_message_id_hex=None,
+                idempotency_key=None,
+            ):
+                self.final_sends.append(idempotency_key)
+                return {"type": "final_sent", "message_ids_hex": ["88" * 32]}
+
+        fake_client = FakeClient()
+        adapter = adapter_module.MarmotPlatformAdapter(
+            self.config_cls(
+                extra={
+                    "account_id_hex": "11" * 32,
+                    "quic_candidates": ["quic://127.0.0.1:4433"],
+                }
+            ),
+            client=fake_client,
+        )
+        metadata = {"logical_delivery_id": "delivery-a"}
+
+        preview = await adapter.send(
+            "22" * 32,
+            "hello\u2589",
+            reply_to="44" * 32,
+            metadata=metadata,
+        )
+        with unittest.mock.patch.object(adapter_module, "STREAM_FINALIZE_RETRY_BACKOFF_S", ()):
+            final = await adapter.send(
+                "22" * 32,
+                "hello world",
+                reply_to="44" * 32,
+                metadata=metadata,
+            )
+
+        self.assertTrue(preview.success)
+        self.assertTrue(final.success)
+        self.assertEqual(final.message_id, "77" * 32)
+        self.assertEqual(fake_client.status_key, fake_client.finalize_keys[0])
+        self.assertEqual(fake_client.final_sends, [])
+        self.assertEqual(fake_client.stream_cancels, [])
 
 
 class MediaSupportTests(unittest.IsolatedAsyncioTestCase):
