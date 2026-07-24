@@ -2428,7 +2428,7 @@ fn received_media_message_with_malformed_v1_reference_is_rejected() {
     let group_id = GroupId::new(vec![0x01]);
     assert!(
         groups::decode_received_event(
-            &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+            &bytes, SENDER_HEX, None, &group_id, 7, None, "msg1", 0, None, false,
         )
         .is_none(),
         "a malformed V1 attachment must retain frozen message-fatal behavior",
