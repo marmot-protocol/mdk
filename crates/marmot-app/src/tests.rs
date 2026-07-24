@@ -427,8 +427,26 @@ async fn local_group_wipe_keeps_and_drains_durable_push_removal() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn failed_leave_restores_push_registration_after_removal_publishes() {
+#[test]
+fn failed_leave_restores_push_registration_after_removal_publishes() {
+    // This integration path composes the app runtime, account worker, push
+    // outbox, and MLS leave/compensation futures. Debug builds need more than
+    // libtest's default 2 MiB stack while polling that full chain.
+    let test_thread = std::thread::Builder::new()
+        .name("failed-leave-push-compensation".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let test_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            test_runtime.block_on(failed_leave_push_compensation_body());
+        })
+        .unwrap();
+    test_thread.join().unwrap();
+}
+
+async fn failed_leave_push_compensation_body() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
