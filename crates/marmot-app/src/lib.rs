@@ -2629,7 +2629,19 @@ impl MarmotApp {
             return None;
         }
         let bytes = hex::decode(&record.key_package_hex).ok()?;
-        let metadata = key_package_metadata(&KeyPackage::new(bytes)).ok()?;
+        // This helper only preserves the replaceable-event `d` slot. Classify
+        // either deployed legacy bytes or current bytes so a strict-cutover
+        // replacement can supersede the same slot; the publication boundary
+        // below still rejects anything except a current KeyPackage.
+        let key_package = KeyPackage::new(bytes);
+        let metadata = [
+            cgka_traits::group::ProtocolProfile::Current,
+            cgka_traits::group::ProtocolProfile::Legacy,
+        ]
+        .into_iter()
+        .find_map(|profile| {
+            key_package_metadata(&key_package.clone().with_protocol_profile(profile)).ok()
+        })?;
         (metadata.credential_identity_hex == account_id_hex).then_some(record.key_package_id)
     }
 

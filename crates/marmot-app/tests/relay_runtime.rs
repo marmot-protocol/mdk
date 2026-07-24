@@ -4106,19 +4106,19 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     let optimistic_tag = alice
         .build_media_imeta_tag(&group_id, &reference)
         .await
-        .expect("legacy group accepts its V1 upload reference");
+        .expect("current group accepts its V2 upload reference");
     assert!(
         optimistic_tag
             .iter()
-            .any(|field| field == "v encrypted-media-v1")
+            .any(|field| field == "v encrypted-media-v2")
     );
     let mut wrong_version = reference.clone();
-    wrong_version.version = "encrypted-media-v2".to_owned();
+    wrong_version.version = "encrypted-media-v1".to_owned();
     let mismatch = alice
         .build_media_imeta_tag(&group_id, &wrong_version)
         .await
-        .expect_err("legacy group must reject a V2 optimistic reference");
-    assert!(mismatch.to_string().contains("requires encrypted-media-v1"));
+        .expect_err("current group must reject a V1 optimistic reference");
+    assert!(mismatch.to_string().contains("requires encrypted-media-v2"));
 
     let stored = blossom
         .blob(&reference.ciphertext_sha256)

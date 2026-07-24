@@ -289,10 +289,16 @@ pub(crate) fn key_package_from_record(
             "empty key package content".into(),
         ));
     }
+    // Strict cutover only permits relay-fetched KeyPackages for new joins to
+    // use the current profile. Annotate the transport DTO before decoding its
+    // proof/profile metadata; the raw-byte constructor defaults to Legacy for
+    // backward-compatible callers and would otherwise misclassify every
+    // freshly published current KeyPackage.
     let key_package = KeyPackage::with_source_event_id(
         key_package_bytes,
         key_package_event_id_from_hex(&event.id)?,
-    );
+    )
+    .with_protocol_profile(ProtocolProfile::Current);
     let metadata = key_package_metadata(&key_package)
         .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
     require_key_package_tag(&event, "mls_ciphersuite", |value| {
