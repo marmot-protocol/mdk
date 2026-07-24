@@ -144,10 +144,13 @@ impl NostrKeyPackagePublisher {
         publication: &NostrKeyPackagePublication,
         event: &NostrTransportEvent,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        let expected = publication.to_event_at(event.created_at)?;
         if event.sig.is_none()
-            || event.kind != KIND_MARMOT_KEY_PACKAGE
-            || event.pubkey != hex::encode(publication.account_id.as_slice())
-            || event.tag_value(D_TAG) != Some(publication.key_package_slot_id.as_str())
+            || event.pubkey != expected.pubkey
+            || event.kind != expected.kind
+            || event.tags != expected.tags
+            || event.content != expected.content
+            || event.created_at != expected.created_at
         {
             return Err(TransportAdapterError::Publish(
                 "prepared KeyPackage event does not match publication".into(),

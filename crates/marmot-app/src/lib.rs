@@ -40,6 +40,7 @@ pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{GroupEvent, KeyPackage};
+use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     GroupId, MemberId, TransportEndpoint, TransportGroupSubscription, TransportPublishTarget,
@@ -718,6 +719,15 @@ pub struct SendSummary {
     pub maintenance_disposition: cgka_traits::SendMaintenanceDisposition,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceRunSummary {
+    pub published: u32,
+    pub message_ids: Vec<String>,
+    pub deferred: u32,
+    pub ambiguous_exposure: u32,
+    pub failures: u32,
+}
+
 /// A welcome that a confirmed group create/invite could not deliver to its
 /// recipient (mdk#352). The commit is already durable, so the member is added
 /// but unjoinable until the welcome reaches them. Persisted so the repair
@@ -1179,7 +1189,8 @@ impl MarmotApp {
             let lifecycle_current = client
                 .runtime
                 .key_package_maintenance_status()
-                .map_err(AppError::from)?
+                .ok()
+                .flatten()
                 .and_then(|lifecycle| lifecycle.current_key_package)
                 .and_then(|key_package| key_package_metadata(&key_package).ok())
                 .is_some_and(|metadata| {
@@ -1208,7 +1219,8 @@ impl MarmotApp {
                 if client
                     .runtime
                     .key_package_maintenance_status()
-                    .map_err(AppError::from)?
+                    .ok()
+                    .flatten()
                     .and_then(|lifecycle| lifecycle.current_key_package)
                     .and_then(|key_package| key_package_metadata(&key_package).ok())
                     .is_some_and(|metadata| {
@@ -2940,12 +2952,31 @@ impl MarmotApp {
             .join(format!("{label}.json"))
     }
 
-    fn reusable_key_package_slot_id(&self, label: &str, account_id_hex: &str) -> Option<String> {
-        let record: KeyPackageRecord = read_json(self.key_package_record_path(label)).ok()?;
+    fn reusable_key_package_slot_id(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> Result<Option<String>, AppError> {
+        let path = self.key_package_record_path(label);
+        let record: KeyPackageRecord = match read_json(&path) {
+            Ok(record) => record,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.key_package_cutover_replacement_pending(label) {
+                    return Err(AppError::Publish(
+                        "legacy key package replacement is pending but its stable slot is unavailable"
+                            .into(),
+                    ));
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if record.account_id_hex != account_id_hex || record.key_package_id.is_empty() {
-            return None;
+            return Err(AppError::Publish(
+                "legacy key package slot record does not match the local account".into(),
+            ));
         }
-        let bytes = hex::decode(&record.key_package_hex).ok()?;
+        let bytes = hex::decode(&record.key_package_hex)?;
         // This helper only preserves the replaceable-event `d` slot. Classify
         // either deployed legacy bytes or current bytes so a strict-cutover
         // replacement can supersede the same slot; the publication boundary
@@ -2958,8 +2989,14 @@ impl MarmotApp {
         .into_iter()
         .find_map(|profile| {
             key_package_metadata(&key_package.clone().with_protocol_profile(profile)).ok()
-        })?;
-        (metadata.credential_identity_hex == account_id_hex).then_some(record.key_package_id)
+        })
+        .ok_or_else(|| AppError::Publish("legacy key package record is invalid".into()))?;
+        if metadata.credential_identity_hex != account_id_hex {
+            return Err(AppError::Publish(
+                "legacy key package credential does not match the local account".into(),
+            ));
+        }
+        Ok(Some(record.key_package_id))
     }
 
     fn validated_current_local_key_package(&self, label: &str) -> Option<KeyPackage> {
@@ -2977,12 +3014,49 @@ impl MarmotApp {
         &self,
         label: &str,
     ) -> Result<(), AppError> {
-        if self.validated_current_local_key_package(label).is_some()
-            || self.key_package_cutover_replacement_pending(label)
-        {
+        let account_storage_preexisted = self.account_storage_path(label).exists();
+        let storage = self.account_storage(label)?;
+        if storage.key_package_lifecycle()?.is_some() {
             return Ok(());
         }
-        if self.mark_key_package_cutover_replacement_pending(label) {
+        let current_cache = self.validated_current_local_key_package(label).is_some();
+        match self.reusable_key_package_slot_id(
+            label,
+            &self.account_home().account(label)?.account_id_hex,
+        ) {
+            Ok(Some(stable_slot_id)) => {
+                storage.put_key_package_lifecycle(&empty_key_package_lifecycle(stable_slot_id))?;
+                if current_cache || self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+            Ok(None)
+                if !account_storage_preexisted
+                    && storage.stored_key_package_bundles()?.is_empty() =>
+            {
+                // Only a newly-created account database can mint the first
+                // slot without migration evidence. An existing database with
+                // missing cache authority fails closed even when no private
+                // bundles remain: it may previously have published under a
+                // now-unrecoverable `d` slot.
+                let mut slot = [0u8; 32];
+                OsRng.fill_bytes(&mut slot);
+                storage
+                    .put_key_package_lifecycle(&empty_key_package_lifecycle(hex::encode(slot)))?;
+                if self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+            Ok(None) | Err(_) => {
+                // Preserve an explicit fail-closed marker. The publisher will
+                // refuse to mint a second slot until migration can recover the
+                // original `d` value.
+                if self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+        }
+        if self.key_package_cutover_replacement_pending(label) {
             return Ok(());
         }
         Err(AppError::Io(std::io::Error::other(
@@ -3261,6 +3335,11 @@ impl MarmotApp {
         if ready.contains(label) {
             return Ok(());
         }
+        // Run KeyPackage cutover before any other account-storage access. The
+        // cutover uses pre-existence of the encrypted account database as the
+        // durable distinction between a fresh local account and an upgraded
+        // device whose missing JSON slot must fail closed.
+        self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
         self.migrate_legacy_account_projection_if_needed(label)?;
         self.account_storage(label)?
             .ensure_account_projection(label)?;
@@ -4161,9 +4240,13 @@ impl AppKeyPackagePublisher {
 
 #[async_trait]
 impl KeyPackagePublisher for AppKeyPackagePublisher {
-    fn legacy_slot_id(&self, account_id: &MemberId) -> Option<String> {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
         self.app
             .reusable_key_package_slot_id(&self.account_label, &hex::encode(account_id.as_slice()))
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))
     }
 
     async fn prepare_key_package(
@@ -4228,7 +4311,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         let outcome = NostrKeyPackagePublisher::new(relay_client)
             .publish_prepared_key_package(&nostr_publication, &event)
             .await
-            .map_err(|e| KeyPackagePublishError::unexposed(e.to_string()))?;
+            .map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
         let accepted = outcome
             .accepted
             .into_iter()
@@ -4281,6 +4364,10 @@ fn display_name_for_profile(profile: Option<&UserProfileMetadata>) -> Option<Str
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {
+    cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
 }
 
 fn default_profile_pseudonym(account_id_hex: &str) -> String {

@@ -613,6 +613,7 @@ pub(crate) async fn groups_command_with_runtime(
         GroupsCommand::PauseMaintenance => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             runtime.pause_maintenance(&account.label).await?;
             Ok(CommandOutput {
                 plain: "maintenance paused".to_owned(),
@@ -626,6 +627,7 @@ pub(crate) async fn groups_command_with_runtime(
         GroupsCommand::ResumeMaintenance => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             runtime.resume_maintenance(&account.label).await?;
             Ok(CommandOutput {
                 plain: "maintenance resumed".to_owned(),
@@ -639,6 +641,7 @@ pub(crate) async fn groups_command_with_runtime(
         GroupsCommand::RunMaintenance => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let summary = runtime.run_due_maintenance(&account.label).await?;
             Ok(CommandOutput {
                 plain: format!("maintenance published={}", summary.published),
@@ -647,7 +650,9 @@ pub(crate) async fn groups_command_with_runtime(
                     "npub": npub_for_account_id(&account.account_id_hex)?,
                     "published": summary.published,
                     "message_ids": summary.message_ids,
-                    "maintenance_disposition": summary.maintenance_disposition,
+                    "deferred": summary.deferred,
+                    "ambiguous_exposure": summary.ambiguous_exposure,
+                    "failures": summary.failures,
                 }),
             })
         }

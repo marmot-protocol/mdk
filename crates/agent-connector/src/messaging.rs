@@ -131,10 +131,13 @@ impl AgentConnector {
         // same-key retries cannot both miss the cache and both durably send.
         let idempotency = if let Some(key) = idempotency_key {
             match self.idempotency.acquire(&key, &fingerprint).await? {
-                SendIdempotencyAcquisition::Completed(message_ids_hex) => {
+                SendIdempotencyAcquisition::Completed((
+                    message_ids_hex,
+                    maintenance_disposition,
+                )) => {
                     return Ok(AgentControlResponse::FinalSent {
                         message_ids_hex,
-                        maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                        maintenance_disposition,
                     });
                 }
                 SendIdempotencyAcquisition::Leader(reservation) => Some((key, reservation)),
@@ -157,9 +160,15 @@ impl AgentConnector {
         // write wins), so this send simply proceeds without caching.
         if let Some((key, reservation)) = idempotency {
             let message_ids = summary.message_ids.clone();
-            self.idempotency
-                .record(key, fingerprint, message_ids.clone());
-            reservation.complete(message_ids);
+            let maintenance_disposition =
+                agent_maintenance_disposition(summary.maintenance_disposition);
+            self.idempotency.record_with_disposition(
+                key,
+                fingerprint,
+                message_ids.clone(),
+                maintenance_disposition,
+            );
+            reservation.complete(message_ids, maintenance_disposition);
         }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,

@@ -285,18 +285,18 @@ impl AppClient {
         self.runtime.resume_maintenance();
     }
 
-    pub async fn run_due_maintenance(&mut self) -> Result<SendSummary, AppError> {
+    pub async fn run_due_maintenance(&mut self) -> Result<crate::MaintenanceRunSummary, AppError> {
         if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
             self.runtime.sweep_expired_key_package_private_material()?;
-            return Ok(SendSummary {
-                published: 0,
-                message_ids: Vec::new(),
-                maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
-            });
+            let summary = self
+                .runtime
+                .maintenance_run_summary(&marmot_account::AccountDeviceEffects::default())?;
+            return Ok(maintenance_run_summary_from_account(summary));
         }
         let effects = self.runtime.run_due_maintenance().await?;
         self.queue_own_group_system_projection_updates(&effects);
-        Ok(send_summary_from_effects(&effects))
+        let summary = self.runtime.maintenance_run_summary(&effects)?;
+        Ok(maintenance_run_summary_from_account(summary))
     }
 
     pub(crate) fn key_package_maintenance_requires_catch_up(&self) -> bool {
@@ -322,9 +322,19 @@ impl AppClient {
                 .map(|(group_id, (_, route))| (group_id.clone(), route.clone()))
                 .collect::<Vec<_>>();
             for (group_id, route) in active {
-                self.adapter
+                if let Err(_error) = self
+                    .adapter
                     .remove_group_maintenance_subscription(&route)
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "subscription_remove_failed",
+                        "could not remove paused post-join maintenance subscription"
+                    );
+                    continue;
+                }
                 self.post_join_maintenance_subscriptions.remove(&group_id);
             }
             return Ok(());
@@ -332,9 +342,31 @@ impl AppClient {
         let routes = self.routing.snapshot().group_routes;
         let mut waiting = HashSet::new();
 
-        for group in &self.state.groups {
-            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            let status = self.runtime.maintenance_status(&group_id)?;
+        for group in self.state.groups.clone() {
+            let group_id = match hex::decode(&group.group_id_hex) {
+                Ok(bytes) => GroupId::new(bytes),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "invalid_group_id",
+                        "skipping malformed post-join maintenance group"
+                    );
+                    continue;
+                }
+            };
+            let status = match self.runtime.maintenance_status(&group_id) {
+                Ok(status) => status,
+                Err(_error) => {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "maintenance_status_unavailable",
+                        "skipping unavailable post-join maintenance group"
+                    );
+                    continue;
+                }
+            };
             let needs_subscription = status.obligations.iter().any(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
@@ -353,17 +385,51 @@ impl AppClient {
                 .post_join_maintenance_subscriptions
                 .contains_key(&group_id)
             {
-                let route = routes
+                let Some(route) = routes
                     .iter()
                     .find(|route| route.group_id == group_id)
                     .cloned()
-                    .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?;
-                let subscription_id = self
+                else {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "missing_route",
+                        "skipping post-join maintenance group without a route"
+                    );
+                    continue;
+                };
+                let subscription_id = match self
                     .adapter
                     .install_group_maintenance_subscription(route.clone())
-                    .await?;
-                self.runtime
-                    .mark_post_join_subscription_installed(&group_id)?;
+                    .await
+                {
+                    Ok(subscription_id) => subscription_id,
+                    Err(_error) => {
+                        tracing::warn!(
+                            target: "marmot_app::maintenance",
+                            method = "advance_post_join_maintenance_subscriptions",
+                            error_kind = "subscription_install_failed",
+                            "post-join maintenance subscription installation failed"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(_error) = self
+                    .runtime
+                    .mark_post_join_subscription_installed(&group_id)
+                {
+                    let _ = self
+                        .adapter
+                        .remove_group_maintenance_subscription(&route)
+                        .await;
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "state_update_failed",
+                        "compensated post-join subscription after state update failure"
+                    );
+                    continue;
+                }
                 self.post_join_maintenance_subscriptions
                     .insert(group_id.clone(), (subscription_id, route));
             }
@@ -378,8 +444,14 @@ impl AppClient {
             } else {
                 false
             };
-            if first_eose {
-                self.runtime.mark_post_join_eose(&group_id)?;
+            if first_eose && let Err(_error) = self.runtime.mark_post_join_eose(&group_id) {
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "eose_state_update_failed",
+                    "could not advance post-join maintenance after EOSE"
+                );
+                continue;
             }
         }
 
@@ -390,22 +462,30 @@ impl AppClient {
             .cloned()
             .collect::<Vec<_>>();
         for group_id in stale {
-            if let Some((_, route)) = self.post_join_maintenance_subscriptions.remove(&group_id) {
-                self.adapter
+            if let Some((_, route)) = self
+                .post_join_maintenance_subscriptions
+                .get(&group_id)
+                .cloned()
+                && let Err(_error) = self
+                    .adapter
                     .remove_group_maintenance_subscription(&route)
-                    .await?;
+                    .await
+            {
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "subscription_remove_failed",
+                    "could not remove stale post-join maintenance subscription"
+                );
+                continue;
             }
+            self.post_join_maintenance_subscriptions.remove(&group_id);
         }
         Ok(())
     }
 
     pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
-        self.app
-            .ensure_local_account_relay_lists(&self.state.label)
-            .await?;
-        self.refresh_routing()?;
-        self.runtime.activate_transport(None).await?;
-        Ok(self.runtime.publish_fresh_key_package().await?)
+        self.publish_key_package().await
     }
 
     /// Create a locally canonical group and attempt each founding Welcome.
@@ -2688,6 +2768,22 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .clear_pending_welcome_delivery(message_id_hex)?;
         Ok(send_summary_from_effects(&effects))
+    }
+}
+
+fn maintenance_run_summary_from_account(
+    summary: cgka_traits::MaintenanceRunSummary,
+) -> crate::MaintenanceRunSummary {
+    crate::MaintenanceRunSummary {
+        published: summary.published,
+        message_ids: summary
+            .message_ids
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect(),
+        deferred: summary.deferred,
+        ambiguous_exposure: summary.ambiguous_exposure,
+        failures: summary.failures,
     }
 }
 

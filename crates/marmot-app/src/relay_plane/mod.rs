@@ -834,15 +834,30 @@ impl MarmotRelayPlaneAccountAdapter {
         &self,
         group: &TransportGroupSubscription,
     ) -> Result<(), TransportAdapterError> {
+        let sync = self
+            .relay_plane
+            .inner
+            .relay_safety
+            .sanitize_group_sync(TransportGroupSync {
+                account_id: self.account_id.clone(),
+                group_subscriptions: vec![group.clone()],
+                since: None,
+            })
+            .map_err(TransportAdapterError::Subscription)?;
+        let group = sync.group_subscriptions.into_iter().next().ok_or_else(|| {
+            TransportAdapterError::Subscription(
+                "maintenance group subscription was empty".to_owned(),
+            )
+        })?;
         self.relay_plane
             .inner
             .transport
             .adapter
             .remove_group_maintenance_subscription(NostrSubscription::GroupMaintenance {
                 account_id: self.account_id.clone(),
-                group_id: group.group_id.clone(),
-                transport_group_id: group.transport_group_id.clone(),
-                endpoints: group.endpoints.clone(),
+                group_id: group.group_id,
+                transport_group_id: group.transport_group_id,
+                endpoints: group.endpoints,
             })
             .await
     }

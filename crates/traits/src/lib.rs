@@ -83,9 +83,10 @@ pub use ingest::{
 pub use maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
     GroupMaintenanceState, GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation,
-    MaintenancePhase, MaintenanceRandom, MaintenanceTrigger, MonotonicClock,
-    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, SendMaintenanceDisposition,
-    SignedPublicationArtifact, TransportFanoutAttemptState, TransportFanoutTarget, WallClock,
+    MaintenancePhase, MaintenanceRandom, MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock,
+    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial,
+    SendMaintenanceDisposition, SignedPublicationArtifact, TransportFanoutAttemptState,
+    TransportFanoutTarget, WallClock,
 };
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
 pub use peeler::{GroupMessageMetadata, TransportPeeler};

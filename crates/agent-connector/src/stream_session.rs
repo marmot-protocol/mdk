@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent_control::AgentControlDebugFinalSend;
+use agent_control::{AgentControlDebugFinalSend, AgentControlSendMaintenanceDisposition};
 use agent_stream_compose::StreamComposeCommand;
 use cgka_traits::GroupId;
 use serde::{Deserialize, Serialize};
@@ -54,10 +54,11 @@ const SEND_IDEMPOTENCY_FILE_VERSION: u8 = 1;
 
 type SendIdempotencyGateKey = (String, String);
 type SendIdempotencyGates = Arc<Mutex<HashMap<SendIdempotencyGateKey, Weak<SendIdempotencyGate>>>>;
+type SendIdempotencyResult = (Vec<String>, AgentControlSendMaintenanceDisposition);
 
 struct SendIdempotencyGate {
     lock: Arc<tokio::sync::Mutex<()>>,
-    completed: Mutex<Option<Vec<String>>>,
+    completed: Mutex<Option<SendIdempotencyResult>>,
 }
 
 /// Bounded FIFO map from a client-supplied idempotency key to a server-derived
@@ -84,7 +85,7 @@ pub(crate) struct SendIdempotencyStore {
 }
 
 pub(crate) enum SendIdempotencyAcquisition {
-    Completed(Vec<String>),
+    Completed(SendIdempotencyResult),
     Leader(SendIdempotencyLeader),
 }
 
@@ -98,8 +99,12 @@ impl SendIdempotencyLeader {
     /// waiting on this in-process gate. This remains transient so a sequential
     /// reuse of a key with a different fingerprint keeps its legacy cache-miss
     /// behavior.
-    pub(crate) fn complete(&self, message_ids: Vec<String>) {
-        *crate::lock_recover(&self.gate.completed) = Some(message_ids);
+    pub(crate) fn complete(
+        &self,
+        message_ids: Vec<String>,
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
+    ) {
+        *crate::lock_recover(&self.gate.completed) = Some((message_ids, maintenance_disposition));
     }
 }
 
@@ -108,6 +113,8 @@ struct PersistedSendIdempotencyEntry {
     key: String,
     fingerprint: String,
     message_ids_hex: Vec<String>,
+    #[serde(default)]
+    maintenance_disposition: AgentControlSendMaintenanceDisposition,
     recorded_at: u64,
 }
 
@@ -120,7 +127,7 @@ struct PersistedSendIdempotencyFile {
 #[derive(Default)]
 struct SendIdempotencyInner {
     order: std::collections::VecDeque<String>,
-    seen: HashMap<String, (String, Vec<String>)>,
+    seen: HashMap<String, (String, Vec<String>, AgentControlSendMaintenanceDisposition)>,
     recorded_at: HashMap<String, u64>,
 }
 
@@ -140,11 +147,22 @@ impl SendIdempotencyStore {
     /// when the recorded request `fingerprint` matches. A key hit with a different
     /// fingerprint returns `None` (treated as a cache miss).
     pub(crate) fn get(&self, key: &str, fingerprint: &str) -> Option<Vec<String>> {
+        self.get_with_disposition(key, fingerprint)
+            .map(|(ids, _)| ids)
+    }
+
+    pub(crate) fn get_with_disposition(
+        &self,
+        key: &str,
+        fingerprint: &str,
+    ) -> Option<(Vec<String>, AgentControlSendMaintenanceDisposition)> {
         crate::lock_recover(&self.inner)
             .seen
             .get(key)
-            .filter(|(recorded, _)| constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes()))
-            .map(|(_, ids)| ids.clone())
+            .filter(|(recorded, _, _)| {
+                constant_time_eq(recorded.as_bytes(), fingerprint.as_bytes())
+            })
+            .map(|(_, ids, disposition)| (ids.clone(), *disposition))
     }
 
     #[cfg(test)]
@@ -171,8 +189,8 @@ impl SendIdempotencyStore {
         key: &str,
         fingerprint: &str,
     ) -> Result<SendIdempotencyAcquisition, ConnectorError> {
-        if let Some(message_ids) = self.get(key, fingerprint) {
-            return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+        if let Some(result) = self.get_with_disposition(key, fingerprint) {
+            return Ok(SendIdempotencyAcquisition::Completed(result));
         }
 
         let gate_key = (key.to_owned(), fingerprint.to_owned());
@@ -197,11 +215,11 @@ impl SendIdempotencyStore {
         .await
         .map_err(|_| ConnectorError::SendInProgress)?;
 
-        if let Some(message_ids) = self.get(key, fingerprint) {
-            return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+        if let Some(result) = self.get_with_disposition(key, fingerprint) {
+            return Ok(SendIdempotencyAcquisition::Completed(result));
         }
-        if let Some(message_ids) = crate::lock_recover(&gate.completed).clone() {
-            return Ok(SendIdempotencyAcquisition::Completed(message_ids));
+        if let Some(result) = crate::lock_recover(&gate.completed).clone() {
+            return Ok(SendIdempotencyAcquisition::Completed(result));
         }
         Ok(SendIdempotencyAcquisition::Leader(SendIdempotencyLeader {
             _guard: guard,
@@ -214,6 +232,21 @@ impl SendIdempotencyStore {
     /// first successful send wins); otherwise the key is appended and the oldest
     /// is evicted once at capacity.
     pub(crate) fn record(&self, key: String, fingerprint: String, message_ids: Vec<String>) {
+        self.record_with_disposition(
+            key,
+            fingerprint,
+            message_ids,
+            AgentControlSendMaintenanceDisposition::Ready,
+        );
+    }
+
+    pub(crate) fn record_with_disposition(
+        &self,
+        key: String,
+        fingerprint: String,
+        message_ids: Vec<String>,
+        maintenance_disposition: AgentControlSendMaintenanceDisposition,
+    ) {
         let should_persist = {
             let mut inner = crate::lock_recover(&self.inner);
             if inner.seen.contains_key(&key) {
@@ -225,7 +258,10 @@ impl SendIdempotencyStore {
                 inner.seen.remove(&evicted);
                 inner.recorded_at.remove(&evicted);
             }
-            inner.seen.insert(key.clone(), (fingerprint, message_ids));
+            inner.seen.insert(
+                key.clone(),
+                (fingerprint, message_ids, maintenance_disposition),
+            );
             inner.recorded_at.insert(key.clone(), unix_timestamp_secs());
             inner.order.push_back(key);
             true
@@ -310,11 +346,13 @@ impl SendIdempotencyStore {
             .order
             .iter()
             .filter_map(|key| {
-                let (fingerprint, message_ids_hex) = inner.seen.get(key)?;
+                let (fingerprint, message_ids_hex, maintenance_disposition) =
+                    inner.seen.get(key)?;
                 Some(PersistedSendIdempotencyEntry {
                     key: key.clone(),
                     fingerprint: fingerprint.clone(),
                     message_ids_hex: message_ids_hex.clone(),
+                    maintenance_disposition: *maintenance_disposition,
                     recorded_at: *inner.recorded_at.get(key).unwrap_or(&0),
                 })
             })
@@ -380,7 +418,11 @@ fn inner_from_persisted(entries: Vec<PersistedSendIdempotencyEntry>) -> SendIdem
         }
         inner.seen.insert(
             entry.key.clone(),
-            (entry.fingerprint, entry.message_ids_hex),
+            (
+                entry.fingerprint,
+                entry.message_ids_hex,
+                entry.maintenance_disposition,
+            ),
         );
         inner
             .recorded_at

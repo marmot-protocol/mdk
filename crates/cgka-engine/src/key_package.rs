@@ -156,11 +156,19 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Build + persist a fresh KeyPackage, returning its wire bytes.
     pub(crate) fn do_fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
+        self.build_fresh_key_package(&self.storage)
+    }
+
+    /// Build + persist a fresh KeyPackage using the supplied storage view.
+    ///
+    /// Maintenance uses this inside `StorageProvider::with_transaction` so the
+    /// OpenMLS private bundle and the lifecycle record become durable together.
+    pub(crate) fn build_fresh_key_package(&self, storage: &S) -> Result<KeyPackage, EngineError> {
         let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
         let leaf_extensions = self
             .identity
             .leaf_extensions(&self.supported_app_components)?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
 
         let bundle = MlsKeyPackage::builder()
             .leaf_node_capabilities(caps)

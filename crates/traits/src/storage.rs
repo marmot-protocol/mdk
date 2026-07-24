@@ -308,11 +308,19 @@ pub trait MaintenanceStorage {
         id: &MessageId,
     ) -> StorageResult<Option<MaintenanceObligation>>;
     fn list_maintenance_obligations(&self) -> StorageResult<Vec<MaintenanceObligation>>;
+    fn list_maintenance_obligations_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<MaintenanceObligation>>;
     fn delete_maintenance_obligation(&self, id: &MessageId) -> StorageResult<()>;
 
     fn put_group_evolution(&self, record: &DurableGroupEvolution) -> StorageResult<()>;
     fn group_evolution(&self, id: &MessageId) -> StorageResult<Option<DurableGroupEvolution>>;
     fn list_group_evolutions(&self) -> StorageResult<Vec<DurableGroupEvolution>>;
+    fn list_group_evolutions_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DurableGroupEvolution>>;
     fn delete_group_evolution(&self, id: &MessageId) -> StorageResult<()>;
 
     fn put_transport_fanout(&self, record: &DurableTransportFanout) -> StorageResult<()>;

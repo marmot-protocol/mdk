@@ -464,6 +464,7 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         group: &TransportGroupSubscription,
     ) -> Result<String, TransportAdapterError> {
+        let _subscription_guard = self.subscription_lock.lock().await;
         let subscription = NostrSubscription::GroupMaintenance {
             account_id: account_id.clone(),
             group_id: group.group_id.clone(),
@@ -471,12 +472,18 @@ impl NostrTransportAdapter {
             endpoints: group.endpoints.clone(),
         };
         let subscription_id = subscription.subscription_id();
-        self.relay_client.subscribe(subscription.clone()).await?;
         let now_ms = self.now_ms();
         self.state
             .write()
             .await
             .record_subscription_starts(std::slice::from_ref(&subscription), now_ms);
+        if let Err(error) = self.relay_client.subscribe(subscription.clone()).await {
+            self.state
+                .write()
+                .await
+                .forget_subscription_starts(std::slice::from_ref(&subscription));
+            return Err(error);
+        }
         Ok(subscription_id)
     }
 
@@ -485,6 +492,7 @@ impl NostrTransportAdapter {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        let _subscription_guard = self.subscription_lock.lock().await;
         self.relay_client.unsubscribe(subscription.clone()).await?;
         self.state
             .write()

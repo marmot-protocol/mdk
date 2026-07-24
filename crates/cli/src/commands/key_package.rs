@@ -107,12 +107,13 @@ pub(crate) async fn key_package_command_with_runtime(
         KeyPackageCommand::MaintenanceStatus => {
             let account = resolve_account(account_home, account_flag)?;
             ensure_local_signing(&account)?;
+            app.status(&account.label)?;
             let status = runtime
                 .key_package_maintenance_status(&account.label)
                 .await?;
             let phase = status
                 .as_ref()
-                .map(|status| format!("{:?}", status.phase).to_ascii_lowercase())
+                .map(|status| status.phase.as_str().to_owned())
                 .unwrap_or_else(|| "uninitialized".to_owned());
             Ok(CommandOutput {
                 plain: format!("key package maintenance {phase}"),

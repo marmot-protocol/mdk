@@ -107,7 +107,7 @@ versioning through the workspace version in the root `Cargo.toml`.
   `schedule-self-update`, `maintenance-policy`, `pause-maintenance`, `resume-maintenance`, and `run-maintenance`
   commands expose the lifecycle. New groups are periodically enrolled by default; existing groups remain manual-only.
   Successful application-send JSON now includes `maintenance_disposition` without blocking sends while post-join
-  rotation is pending.
+  rotation is pending. ([#1103](https://github.com/marmot-protocol/mdk/pull/1103))
 - TUI: `/logout` removes the currently selected account. `wn logout` is destructive — it permanently erases the
   account's local data (messages, group membership, and MLS state) from this device and, for a local-signing account,
   deletes its signing key too — so the confirmation scales to the consequence. A local-signing logout is irreversible,

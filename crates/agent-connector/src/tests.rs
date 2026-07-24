@@ -2,7 +2,8 @@
 
 use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlEnvelope, AgentControlEvent,
-    AgentControlRequest, AgentControlResponse, read_envelope, write_frame,
+    AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
+    read_envelope, write_frame,
 };
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
@@ -3922,6 +3923,22 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
         None,
         "an unrelated key stays absent"
     );
+
+    let pending_ids = vec!["cc".repeat(32)];
+    store.record_with_disposition(
+        "k-pending".to_owned(),
+        "fp-pending".to_owned(),
+        pending_ids.clone(),
+        AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+    );
+    assert_eq!(
+        store.get_with_disposition("k-pending", "fp-pending"),
+        Some((
+            pending_ids,
+            AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+        )),
+        "a retry must preserve the original machine-readable send disposition"
+    );
 }
 
 async fn wait_for_idempotency_follower(
@@ -3965,11 +3982,14 @@ async fn send_idempotency_store_same_request_waits_for_leader_result() {
         "same-fingerprint".to_owned(),
         ids.clone(),
     );
-    leader.complete(ids.clone());
+    leader.complete(ids.clone(), AgentControlSendMaintenanceDisposition::Ready);
     drop(leader);
 
     match follower.await.unwrap() {
-        SendIdempotencyAcquisition::Completed(recorded) => assert_eq!(recorded, ids),
+        SendIdempotencyAcquisition::Completed((recorded, disposition)) => {
+            assert_eq!(recorded, ids);
+            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
+        }
         SendIdempotencyAcquisition::Leader(_) => {
             panic!("a follower must reuse the leader's committed result")
         }
@@ -4053,11 +4073,20 @@ async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
         None,
         "the original durable key binding remains first-write-wins"
     );
-    leader.complete(ids.clone());
+    leader.complete(
+        ids.clone(),
+        AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+    );
     drop(leader);
 
     match follower.await.unwrap() {
-        SendIdempotencyAcquisition::Completed(recorded) => assert_eq!(recorded, ids),
+        SendIdempotencyAcquisition::Completed((recorded, disposition)) => {
+            assert_eq!(recorded, ids);
+            assert_eq!(
+                disposition,
+                AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable
+            );
+        }
         SendIdempotencyAcquisition::Leader(_) => {
             panic!("a concurrent follower must reuse the transient leader result")
         }

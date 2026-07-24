@@ -349,7 +349,9 @@ pub enum AgentControlResponse {
     MaintenanceRun {
         published: u32,
         message_ids_hex: Vec<String>,
-        maintenance_disposition: AgentControlSendMaintenanceDisposition,
+        deferred: u32,
+        ambiguous_exposure: u32,
+        failures: u32,
     },
     StreamBegun {
         stream_id_hex: String,

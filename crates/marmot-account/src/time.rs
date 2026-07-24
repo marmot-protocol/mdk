@@ -7,7 +7,6 @@
 use cgka_traits::Timestamp;
 pub use cgka_traits::maintenance::{MaintenanceRandom, MonotonicClock, WallClock};
 use rand::RngCore;
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,15 +43,10 @@ impl MonotonicClock for SystemMonotonicClock {
 }
 
 #[derive(Debug, Default)]
-pub struct OsMaintenanceRandom {
-    rng: Mutex<rand::rngs::OsRng>,
-}
+pub struct OsMaintenanceRandom;
 
 impl MaintenanceRandom for OsMaintenanceRandom {
     fn next_u64(&self) -> u64 {
-        self.rng
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .next_u64()
+        rand::rngs::OsRng.next_u64()
     }
 }

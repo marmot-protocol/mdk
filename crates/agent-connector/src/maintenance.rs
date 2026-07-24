@@ -5,7 +5,7 @@ use agent_control::{
     AgentControlMaintenanceStatus, AgentControlResponse, AgentControlSendMaintenanceDisposition,
 };
 use cgka_traits::{
-    GroupEvolutionPhase, GroupId, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
+    GroupEvolutionPhase, GroupId, MaintenanceObligation, MaintenanceTrigger,
     PeriodicMaintenancePolicy, SendMaintenanceDisposition, TransportFanoutAttemptState,
 };
 
@@ -91,7 +91,7 @@ impl AgentConnector {
                 let pending = status.pending_replacement.as_ref();
                 AgentControlKeyPackageMaintenanceStatus {
                     stable_slot_id: status.stable_slot_id,
-                    phase: phase_name(status.phase).to_owned(),
+                    phase: status.phase.as_str().to_owned(),
                     current_key_package_ref_hex: status.current_key_package_ref.map(hex::encode),
                     current_not_after: status.current_not_after.map(|value| value.0),
                     refresh_at: status.refresh_at.map(|value| value.0),
@@ -207,9 +207,11 @@ impl AgentConnector {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let summary = self.runtime.run_due_maintenance(&account.label).await?;
         Ok(AgentControlResponse::MaintenanceRun {
-            published: summary.published as u32,
+            published: summary.published,
             message_ids_hex: summary.message_ids,
-            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+            deferred: summary.deferred,
+            ambiguous_exposure: summary.ambiguous_exposure,
+            failures: summary.failures,
         })
     }
 }
@@ -234,7 +236,7 @@ fn agent_obligation(value: MaintenanceObligation) -> AgentControlMaintenanceObli
             MaintenanceTrigger::Manual => "manual",
         }
         .to_owned(),
-        phase: phase_name(value.phase).to_owned(),
+        phase: value.phase.as_str().to_owned(),
         created_at: value.created_at.0,
         operational_target_at: value.operational_target_at.map(|value| value.0),
         overdue: value.overdue,
@@ -246,24 +248,5 @@ fn agent_obligation(value: MaintenanceObligation) -> AgentControlMaintenanceObli
         attempt_count: value.attempt_count,
         semantic_rearm_count: value.semantic_rearm_count,
         last_failure_code: value.last_failure_code,
-    }
-}
-
-fn phase_name(phase: MaintenancePhase) -> &'static str {
-    match phase {
-        MaintenancePhase::CatchUp => "catch_up",
-        MaintenancePhase::EoseTimeout => "eose_timeout",
-        MaintenancePhase::Grace => "grace",
-        MaintenancePhase::Quiet => "quiet",
-        MaintenancePhase::Jitter => "jitter",
-        MaintenancePhase::Overdue => "overdue",
-        MaintenancePhase::Paused => "paused",
-        MaintenancePhase::ClockSkewBlocked => "clock_skew_blocked",
-        MaintenancePhase::PendingPublication => "pending_publication",
-        MaintenancePhase::Fanout => "fanout",
-        MaintenancePhase::Retry => "retry",
-        MaintenancePhase::SupersededByConvergence => "superseded_by_convergence",
-        MaintenancePhase::Complete => "complete",
-        MaintenancePhase::Failed => "failed",
     }
 }

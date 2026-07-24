@@ -58,6 +58,13 @@ impl MaintenanceStorage for SqliteAccountStorage {
         list_ordered_records(self, "cgka_maintenance_obligations")
     }
 
+    fn list_maintenance_obligations_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<MaintenanceObligation>> {
+        list_ordered_records_for_group(self, "cgka_maintenance_obligations", group_id)
+    }
+
     fn delete_maintenance_obligation(&self, id: &MessageId) -> StorageResult<()> {
         delete_by_id(self, "cgka_maintenance_obligations", "id", id.as_slice())
     }
@@ -78,6 +85,13 @@ impl MaintenanceStorage for SqliteAccountStorage {
 
     fn list_group_evolutions(&self) -> StorageResult<Vec<DurableGroupEvolution>> {
         list_ordered_records(self, "cgka_group_evolutions")
+    }
+
+    fn list_group_evolutions_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DurableGroupEvolution>> {
+        list_ordered_records_for_group(self, "cgka_group_evolutions", group_id)
     }
 
     fn delete_group_evolution(&self, id: &MessageId) -> StorageResult<()> {
@@ -221,14 +235,6 @@ fn write_group_record<T: serde::Serialize>(
     })
 }
 
-fn next_insert_order(store: &SqliteAccountStorage, table: &str) -> StorageResult<i64> {
-    let sql = format!("SELECT COALESCE(MAX(insert_order), 0) + 1 FROM {table}");
-    store
-        .lock()?
-        .query_row(&sql, [], |row| row.get(0))
-        .storage()
-}
-
 fn write_ordered_record<T: serde::Serialize>(
     store: &SqliteAccountStorage,
     table: &str,
@@ -239,23 +245,22 @@ fn write_ordered_record<T: serde::Serialize>(
     let serialized = serialize(record)?;
     let sql = format!(
         "INSERT INTO {table} (id, group_id, insert_order, record)
-         VALUES (?1, ?2, ?3, ?4)
+         VALUES (
+            ?1,
+            ?2,
+            (SELECT COALESCE(MAX(insert_order), 0) + 1 FROM {table}),
+            ?3
+         )
          ON CONFLICT(id) DO UPDATE SET
             group_id = excluded.group_id,
             record = excluded.record"
     );
     write(store, || {
-        let order = next_insert_order(store, table)?;
         store
             .lock()?
             .execute(
                 &sql,
-                params![
-                    id.as_slice(),
-                    group_id.map(GroupId::as_slice),
-                    order,
-                    serialized
-                ],
+                params![id.as_slice(), group_id.map(GroupId::as_slice), serialized],
             )
             .storage()?;
         Ok(())
@@ -286,6 +291,22 @@ fn list_ordered_records<T: serde::de::DeserializeOwned>(
     let mut statement = connection.prepare(&sql).storage()?;
     let records = statement
         .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    records.iter().map(|bytes| deserialize(bytes)).collect()
+}
+
+fn list_ordered_records_for_group<T: serde::de::DeserializeOwned>(
+    store: &SqliteAccountStorage,
+    table: &str,
+    group_id: &GroupId,
+) -> StorageResult<Vec<T>> {
+    let sql = format!("SELECT record FROM {table} WHERE group_id = ?1 ORDER BY insert_order");
+    let connection = store.lock()?;
+    let mut statement = connection.prepare(&sql).storage()?;
+    let records = statement
+        .query_map(params![group_id.as_slice()], |row| row.get::<_, Vec<u8>>(0))
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
@@ -349,12 +370,73 @@ mod tests {
         assert_eq!(store.group_maintenance(&gid(1)).unwrap(), Some(state));
         assert_eq!(
             store.list_maintenance_obligations().unwrap(),
-            vec![obligation]
+            vec![obligation.clone()]
+        );
+        assert_eq!(
+            store
+                .list_maintenance_obligations_for_group(&gid(1))
+                .unwrap(),
+            vec![obligation.clone()]
         );
 
         store.delete_group(&gid(1)).unwrap();
         assert_eq!(store.group_maintenance(&gid(1)).unwrap(), None);
         assert!(store.list_maintenance_obligations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordered_record_allocation_is_atomic_across_concurrent_writers() {
+        use std::sync::{Arc, Barrier};
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        let writers = 16u8;
+        let barrier = Arc::new(Barrier::new(usize::from(writers)));
+        let handles = (0..writers)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .put_maintenance_obligation(&MaintenanceObligation {
+                            id: mid(index.saturating_add(1)),
+                            group_id: gid(1),
+                            trigger: MaintenanceTrigger::Manual,
+                            phase: MaintenancePhase::Quiet,
+                            created_at: Timestamp(u64::from(index)),
+                            operational_target_at: None,
+                            overdue: false,
+                            eose_deadline_at: None,
+                            grace_until: None,
+                            quiet_since: None,
+                            own_leaf_baseline_hash: None,
+                            sampled_jitter_ms: 0,
+                            not_before: None,
+                            attempt_count: 0,
+                            semantic_rearm_count: 0,
+                            last_failure_code: None,
+                        })
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let (rows, distinct_orders): (i64, i64) = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT insert_order)
+                 FROM cgka_maintenance_obligations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, i64::from(writers));
+        assert_eq!(distinct_orders, rows);
     }
 
     #[test]

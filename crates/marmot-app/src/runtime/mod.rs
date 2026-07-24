@@ -2014,7 +2014,10 @@ impl MarmotAppRuntime {
         self.accounts.resume_maintenance(account_ref).await
     }
 
-    pub async fn run_due_maintenance(&self, account_ref: &str) -> Result<SendSummary, AppError> {
+    pub async fn run_due_maintenance(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::MaintenanceRunSummary, AppError> {
         self.accounts.run_due_maintenance(account_ref).await
     }
 

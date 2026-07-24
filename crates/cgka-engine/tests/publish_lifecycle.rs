@@ -26,6 +26,10 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::maintenance::{
+    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupMaintenanceState,
+    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, PeriodicMaintenancePolicy,
+};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
@@ -323,9 +327,49 @@ async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() 
     let evolutions = storage.list_group_evolutions().unwrap();
     assert_eq!(evolutions.len(), 1);
     assert_eq!(evolutions[0].signed_message_id.as_ref(), Some(&message.id));
+    assert_eq!(evolutions[0].phase, GroupEvolutionPhase::Prepared);
 
     alice.confirm_published(pending).await.unwrap();
     assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        storage.list_group_evolutions().unwrap()[0].phase,
+        GroupEvolutionPhase::Confirmed
+    );
+}
+
+#[tokio::test]
+async fn current_group_creation_persists_automatic_maintenance_enrollment() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = EngineBuilder::new(storage.clone())
+        .identity(pad32(b"current-alice"))
+        .account_identity_proof_signer(proof_signer(b"current-alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "current-maintenance".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    let state = storage
+        .group_maintenance(&group_id)
+        .unwrap()
+        .expect("current group creation must enroll maintenance");
+    assert!(state.periodic_enrolled);
+    assert!(state.enrolled_at.is_some());
+    assert!(state.last_own_leaf_rotation_at.is_some());
 }
 
 #[tokio::test]
@@ -904,6 +948,7 @@ impl ProcessedFault {
 struct FaultStorage {
     inner: SqliteAccountStorage,
     fault: ProcessedFault,
+    lifecycle_fault: ProcessedFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -1092,11 +1137,121 @@ impl KeyPackageBundleStorage for FaultStorage {
     }
 }
 
+impl MaintenanceStorage for FaultStorage {
+    fn key_package_lifecycle(&self) -> StorageResult<Option<KeyPackageLifecycleState>> {
+        self.inner.key_package_lifecycle()
+    }
+
+    fn put_key_package_lifecycle(&self, state: &KeyPackageLifecycleState) -> StorageResult<()> {
+        if self.lifecycle_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected lifecycle-intent write failure".into(),
+            ));
+        }
+        self.inner.put_key_package_lifecycle(state)
+    }
+
+    fn group_maintenance(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Option<GroupMaintenanceState>> {
+        self.inner.group_maintenance(group_id)
+    }
+
+    fn put_group_maintenance(&self, state: &GroupMaintenanceState) -> StorageResult<()> {
+        self.inner.put_group_maintenance(state)
+    }
+
+    fn delete_group_maintenance(&self, group_id: &GroupId) -> StorageResult<()> {
+        self.inner.delete_group_maintenance(group_id)
+    }
+
+    fn put_maintenance_obligation(&self, record: &MaintenanceObligation) -> StorageResult<()> {
+        self.inner.put_maintenance_obligation(record)
+    }
+
+    fn maintenance_obligation(
+        &self,
+        id: &MessageId,
+    ) -> StorageResult<Option<MaintenanceObligation>> {
+        self.inner.maintenance_obligation(id)
+    }
+
+    fn list_maintenance_obligations(&self) -> StorageResult<Vec<MaintenanceObligation>> {
+        self.inner.list_maintenance_obligations()
+    }
+
+    fn list_maintenance_obligations_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<MaintenanceObligation>> {
+        self.inner.list_maintenance_obligations_for_group(group_id)
+    }
+
+    fn delete_maintenance_obligation(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_maintenance_obligation(id)
+    }
+
+    fn put_group_evolution(&self, record: &DurableGroupEvolution) -> StorageResult<()> {
+        self.inner.put_group_evolution(record)
+    }
+
+    fn group_evolution(&self, id: &MessageId) -> StorageResult<Option<DurableGroupEvolution>> {
+        self.inner.group_evolution(id)
+    }
+
+    fn list_group_evolutions(&self) -> StorageResult<Vec<DurableGroupEvolution>> {
+        self.inner.list_group_evolutions()
+    }
+
+    fn list_group_evolutions_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> StorageResult<Vec<DurableGroupEvolution>> {
+        self.inner.list_group_evolutions_for_group(group_id)
+    }
+
+    fn delete_group_evolution(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_group_evolution(id)
+    }
+
+    fn put_transport_fanout(&self, record: &DurableTransportFanout) -> StorageResult<()> {
+        self.inner.put_transport_fanout(record)
+    }
+
+    fn transport_fanout(&self, id: &MessageId) -> StorageResult<Option<DurableTransportFanout>> {
+        self.inner.transport_fanout(id)
+    }
+
+    fn list_transport_fanouts(&self) -> StorageResult<Vec<DurableTransportFanout>> {
+        self.inner.list_transport_fanouts()
+    }
+
+    fn delete_transport_fanout(&self, id: &MessageId) -> StorageResult<()> {
+        self.inner.delete_transport_fanout(id)
+    }
+
+    fn periodic_maintenance_policy(&self) -> StorageResult<PeriodicMaintenancePolicy> {
+        self.inner.periodic_maintenance_policy()
+    }
+
+    fn put_periodic_maintenance_policy(
+        &self,
+        policy: PeriodicMaintenancePolicy,
+    ) -> StorageResult<()> {
+        self.inner.put_periodic_maintenance_policy(policy)
+    }
+}
+
 impl StorageProvider for FaultStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 
     fn mls_storage(&self) -> &Self::Mls {
         self.inner.mls_storage()
+    }
+
+    fn maintenance_storage(&self) -> Option<&dyn MaintenanceStorage> {
+        Some(self)
     }
 
     fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
@@ -1125,15 +1280,67 @@ fn build_fault_engine(
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
     let inner = SqliteAccountStorage::in_memory().unwrap();
     let handle = inner.clone();
-    let engine = EngineBuilder::new(FaultStorage { inner, fault })
-        .legacy_compatibility_profile()
-        .identity(pad32(id))
-        .account_identity_proof_signer(proof_signer(id))
-        .feature_registry(registry_with_reactions())
-        .peeler(Box::new(MockPeeler))
-        .build()
-        .unwrap();
+    let engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault,
+        lifecycle_fault: ProcessedFault::default(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(id))
+    .account_identity_proof_signer(proof_signer(id))
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
     (engine, handle)
+}
+
+#[test]
+fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let lifecycle_fault = ProcessedFault::default();
+    let mut engine = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: ProcessedFault::default(),
+        lifecycle_fault: lifecycle_fault.clone(),
+    })
+    .identity(pad32(b"alice-maintenance"))
+    .account_identity_proof_signer(proof_signer(b"alice-maintenance"))
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let mut state = KeyPackageLifecycleState {
+        stable_slot_id: "stable-slot".into(),
+        phase: MaintenancePhase::Complete,
+        current_key_package: None,
+        current_key_package_ref: None,
+        current_not_before: None,
+        current_not_after: None,
+        authored_event_id: None,
+        authored_event_created_at: None,
+        authored_signed_event: None,
+        publication_targets: Vec::new(),
+        refresh_at: None,
+        upgrade_rotation_recorded: false,
+        last_consumed_key_package_ref: None,
+        last_consumed_at: None,
+        retained_private_material: Vec::new(),
+        pending_replacement: None,
+    };
+
+    lifecycle_fault.arm(1);
+    engine
+        .stage_key_package_replacement(&mut state, Timestamp(10_000), 60, Vec::new())
+        .expect_err("the injected lifecycle write must abort the transaction");
+
+    assert!(
+        handle.stored_key_package_bundles().unwrap().is_empty(),
+        "a failed lifecycle-intent write must not orphan private init-key material"
+    );
+    assert!(handle.key_package_lifecycle().unwrap().is_none());
+    assert!(state.pending_replacement.is_none());
 }
 
 #[tokio::test]

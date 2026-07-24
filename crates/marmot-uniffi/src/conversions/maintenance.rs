@@ -5,6 +5,28 @@ use cgka_traits::{
     KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
     PeriodicMaintenancePolicy, TransportFanoutAttemptState,
 };
+use marmot_app::MaintenanceRunSummary;
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MaintenanceRunSummaryFfi {
+    pub published: u32,
+    pub message_ids: Vec<String>,
+    pub deferred: u32,
+    pub ambiguous_exposure: u32,
+    pub failures: u32,
+}
+
+impl From<MaintenanceRunSummary> for MaintenanceRunSummaryFfi {
+    fn from(value: MaintenanceRunSummary) -> Self {
+        Self {
+            published: value.published,
+            message_ids: value.message_ids,
+            deferred: value.deferred,
+            ambiguous_exposure: value.ambiguous_exposure,
+            failures: value.failures,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum MaintenancePhaseFfi {
@@ -128,24 +150,38 @@ impl From<MaintenanceObligation> for MaintenanceObligationFfi {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct GroupEvolutionStatusFfi {
     pub id_hex: String,
-    pub phase: String,
+    pub phase: GroupEvolutionPhaseFfi,
     pub source_epoch: u64,
     pub target_epoch: u64,
     pub signed_message_id_hex: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupEvolutionPhaseFfi {
+    Preparing,
+    Prepared,
+    Attempting,
+    Confirmed,
+    SupersededByConvergence,
+}
+
+impl From<GroupEvolutionPhase> for GroupEvolutionPhaseFfi {
+    fn from(value: GroupEvolutionPhase) -> Self {
+        match value {
+            GroupEvolutionPhase::Preparing => Self::Preparing,
+            GroupEvolutionPhase::Prepared => Self::Prepared,
+            GroupEvolutionPhase::Attempting => Self::Attempting,
+            GroupEvolutionPhase::Confirmed => Self::Confirmed,
+            GroupEvolutionPhase::SupersededByConvergence => Self::SupersededByConvergence,
+        }
+    }
+}
+
 impl From<DurableGroupEvolution> for GroupEvolutionStatusFfi {
     fn from(value: DurableGroupEvolution) -> Self {
-        let phase = match value.phase {
-            GroupEvolutionPhase::Preparing => "preparing",
-            GroupEvolutionPhase::Prepared => "prepared",
-            GroupEvolutionPhase::Attempting => "attempting",
-            GroupEvolutionPhase::Confirmed => "confirmed",
-            GroupEvolutionPhase::SupersededByConvergence => "superseded_by_convergence",
-        };
         Self {
             id_hex: hex::encode(value.id.as_slice()),
-            phase: phase.to_owned(),
+            phase: value.phase.into(),
             source_epoch: value.source_epoch.0,
             target_epoch: value.target_epoch.0,
             signed_message_id_hex: value

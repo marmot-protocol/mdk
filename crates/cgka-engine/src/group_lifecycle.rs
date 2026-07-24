@@ -25,8 +25,8 @@ use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMet
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::maintenance::{
-    GroupMaintenanceState, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
-    PeriodicMaintenancePolicy,
+    GroupMaintenanceState, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
+    MaintenanceTrigger, PeriodicMaintenancePolicy,
 };
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
@@ -936,19 +936,16 @@ impl<S: StorageProvider> Engine<S> {
         // still an active member of.
         let join_config = join_config(self.max_past_epochs);
         let joined_at = self.wall_clock.now();
-        let sampled_jitter_ms = self.maintenance_random.sample_inclusive(0, 30_000);
+        let sampled_jitter_ms = self.maintenance_random.sample_inclusive(
+            0,
+            cgka_traits::maintenance::POST_JOIN_CONTENTION_JITTER_MAX_MS,
+        );
         // Building a group from a staged Welcome performs the same multi-row
         // OpenMLS store as group creation. Keep KeyPackage consumption, stale
         // live-state clearing, that store, every Marmot post-check, the
         // discoverable group record, capability cache, and both durable
         // Welcome dispositions in one transaction.
-        let (
-            group_id,
-            mls_group,
-            welcome_sender_id,
-            repaired_unrecoverable,
-            consumed_key_package_ref,
-        ) =
+        let (group_id, mls_group, welcome_sender_id, repaired_unrecoverable) =
             self.storage.with_transaction(|storage| {
                 let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
                 // Match in the same order OpenMLS uses: the first Welcome
@@ -958,15 +955,19 @@ impl<S: StorageProvider> Engine<S> {
                 let local_bundle_keys = storage
                     .stored_key_package_bundles()?
                     .into_iter()
-                    .filter_map(|stored| {
-                        serde_json::from_slice::<KeyPackageBundle>(&stored.value)
-                            .ok()
-                            .and_then(|bundle| {
-                                bundle.key_package().hash_ref(provider.crypto()).ok()
-                            })
-                            .map(|reference| reference.as_slice().to_vec())
+                    .map(|stored| {
+                        let bundle = serde_json::from_slice::<KeyPackageBundle>(&stored.value)
+                            .map_err(|error| EngineError::Serialize(error.to_string()))?;
+                        let reference =
+                            bundle
+                                .key_package()
+                                .hash_ref(provider.crypto())
+                                .map_err(|error| {
+                                    EngineError::Backend(format!("key_package ref: {error:?}"))
+                                })?;
+                        Ok::<_, EngineError>(reference.as_slice().to_vec())
                     })
-                    .collect::<BTreeSet<_>>();
+                    .collect::<Result<BTreeSet<_>, _>>()?;
                 let consumed_key_package_ref = welcome
                     .secrets()
                     .iter()
@@ -1147,9 +1148,10 @@ impl<S: StorageProvider> Engine<S> {
                     Some((&welcome_id, sampled_jitter_ms)),
                     Some(own_leaf_baseline_hash),
                 )?;
-                if let Some(maintenance) = storage.maintenance_storage()
-                    && let Some(mut lifecycle) = maintenance.key_package_lifecycle()?
-                {
+                if let Some(maintenance) = storage.maintenance_storage() {
+                    let mut lifecycle = maintenance
+                        .key_package_lifecycle()?
+                        .unwrap_or_else(|| KeyPackageLifecycleState::slot_only(String::new()));
                     lifecycle.last_consumed_key_package_ref =
                         Some(consumed_key_package_ref.clone());
                     lifecycle.last_consumed_at = Some(joined_at);
@@ -1161,7 +1163,6 @@ impl<S: StorageProvider> Engine<S> {
                     mls_group,
                     welcome_sender_id,
                     repaired_unrecoverable,
-                    consumed_key_package_ref,
                 ))
             })?;
 
@@ -1232,8 +1233,6 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         self.seen_message_ids.insert(welcome_id);
-        let _ = consumed_key_package_ref;
-
         // An authenticated welcome re-validated every leaf and wrote fresh
         // group state — strictly stronger evidence of health than
         // `retry_hydrate_quarantined_group` re-reading stored state. Clear a

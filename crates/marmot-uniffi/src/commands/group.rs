@@ -13,7 +13,7 @@ use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
     AppQuarantinedGroupFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
     GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
-    GroupMutationResultFfi, KeyPackageMaintenanceStatusFfi, MemberRefFfi,
+    GroupMutationResultFfi, KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
     PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_details_ffi, group_id_from_hex,
     group_management_state_ffi, normalize_member_ref_ffi,
 };
@@ -809,7 +809,7 @@ impl Marmot {
     pub async fn run_due_maintenance(
         &self,
         account_ref: String,
-    ) -> Result<SendSummaryFfi, MarmotKitError> {
+    ) -> Result<MaintenanceRunSummaryFfi, MarmotKitError> {
         Ok(self.runtime.run_due_maintenance(&account_ref).await?.into())
     }
 }

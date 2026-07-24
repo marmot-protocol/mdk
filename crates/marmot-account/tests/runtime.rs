@@ -20,7 +20,7 @@ use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::OutboundFanoutStorage;
+use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage, OutboundFanoutStorage};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -33,8 +33,8 @@ use cgka_traits::{
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
     KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceRandom, MonotonicClock,
-    PendingResolution, PublishedApplicationMessage, StaticTransportRouting, TransportRoutingError,
-    TransportRoutingPolicy, WallClock,
+    NoopKeyPackagePublisher, PendingResolution, PublishedApplicationMessage,
+    StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy, WallClock,
 };
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
@@ -517,6 +517,13 @@ struct RecordingKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for RecordingKeyPackages {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        Ok(Some(test_key_package_slot(account_id)))
+    }
+
     async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
@@ -568,6 +575,13 @@ impl PartialFanoutKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for PartialFanoutKeyPackages {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        Ok(Some(test_key_package_slot(account_id)))
+    }
+
     async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
@@ -612,6 +626,13 @@ impl PrepareFailsKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for PrepareFailsKeyPackages {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        Ok(Some(test_key_package_slot(account_id)))
+    }
+
     async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
@@ -654,6 +675,13 @@ impl FlakyKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for FlakyKeyPackages {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        Ok(Some(test_key_package_slot(account_id)))
+    }
+
     async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
@@ -699,6 +727,13 @@ impl ExposedThenFailsKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for ExposedThenFailsKeyPackages {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        Ok(Some(test_key_package_slot(account_id)))
+    }
+
     async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
@@ -732,6 +767,14 @@ fn test_key_package_artifact(
         created_at: publication.created_at,
         bytes,
     }
+}
+
+fn test_key_package_slot(account_id: &MemberId) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-account-test-key-package-slot-v1");
+    hasher.update(account_id.as_slice());
+    hex::encode(hasher.finalize())
 }
 
 #[tokio::test]
@@ -789,6 +832,33 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
         publications[0].endpoints,
         vec![TransportEndpoint("wss://keys.example".into())]
     );
+}
+
+#[tokio::test]
+async fn publication_without_durable_slot_authority_fails_before_bundle_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot missing slot key").unwrap();
+    let session = session(database.clone(), &key, b"alice");
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        RecordingAdapter::default(),
+        policy,
+        NoopKeyPackagePublisher,
+    );
+
+    let error = runtime.publish_fresh_key_package().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("provision a durable slot before publication")
+    );
+    drop(runtime);
+
+    let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    assert!(storage.stored_key_package_bundles().unwrap().is_empty());
+    assert!(storage.key_package_lifecycle().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1524,6 +1594,30 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
     );
 
     let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    assert_eq!(
+        runtime.schedule_manual_self_update(&group_id).unwrap(),
+        obligation_id,
+        "an active semantic leaf-rotation obligation must coalesce manual requests"
+    );
+    assert_eq!(
+        runtime
+            .maintenance_status(&group_id)
+            .unwrap()
+            .obligations
+            .len(),
+        1
+    );
+    runtime.pause_maintenance();
+    assert_eq!(
+        runtime.maintenance_status(&group_id).unwrap().obligations[0].phase,
+        cgka_traits::MaintenancePhase::Paused
+    );
+    runtime.resume_maintenance();
+    assert_eq!(
+        runtime.maintenance_status(&group_id).unwrap().obligations[0].phase,
+        cgka_traits::MaintenancePhase::Quiet,
+        "pause projection must not overwrite the durable resumable phase"
+    );
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
 
@@ -1614,11 +1708,13 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
 
     let adapter = RecordingAdapter::default();
     adapter.error_next();
-    let routing = StaticTransportRouting::new(vec![]).with_group_route(
-        group_id.clone(),
-        group_id.as_slice().to_vec(),
-        vec![TransportEndpoint("wss://group.example".into())],
-    );
+    let routing =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![TransportEndpoint("wss://group.example".into())],
+            );
     let wall = Arc::new(TestWallClock::new(120_000));
     let monotonic = Arc::new(TestMonotonicClock::default());
     let mut runtime = AccountDeviceRuntime::new(
@@ -1644,7 +1740,7 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
         .unwrap()
         .unwrap();
     wall.set(jittered.not_before.unwrap().0);
-    runtime.run_due_maintenance().await.unwrap();
+    let effects = runtime.run_due_maintenance().await.unwrap();
 
     assert_eq!(adapter.publishes().len(), 1);
     let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
@@ -1662,6 +1758,20 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
             .unwrap()
             .phase,
         cgka_traits::MaintenancePhase::PendingPublication
+    );
+    let summary = runtime.maintenance_run_summary(&effects).unwrap();
+    assert_eq!(summary.deferred, 1);
+    assert_eq!(summary.ambiguous_exposure, 1);
+    runtime.note_valid_state_bearing_input(&group_id).unwrap();
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::PendingPublication,
+        "valid inbound state must not demote exact-event recovery to a fresh quiet window"
     );
     drop(runtime);
 

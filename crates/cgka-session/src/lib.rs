@@ -22,7 +22,8 @@ use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
-    MaintenanceObligation, MaintenanceRandom, PeriodicMaintenancePolicy, WallClock,
+    MaintenanceObligation, MaintenanceRandom, PeriodicMaintenancePolicy, TransportFanoutTarget,
+    WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::StorageError;
@@ -370,6 +371,21 @@ impl AccountDeviceSession {
         Ok(self.engine.put_key_package_lifecycle(state)?)
     }
 
+    pub fn stage_key_package_replacement(
+        &mut self,
+        state: &mut KeyPackageLifecycleState,
+        authored_created_at: cgka_traits::Timestamp,
+        refresh_lead_secs: u64,
+        targets: Vec<TransportFanoutTarget>,
+    ) -> SessionResult<KeyPackage> {
+        Ok(self.engine.stage_key_package_replacement(
+            state,
+            authored_created_at,
+            refresh_lead_secs,
+            targets,
+        )?)
+    }
+
     pub fn promote_key_package_lifecycle(
         &mut self,
         retired: &[KeyPackage],
@@ -404,12 +420,28 @@ impl AccountDeviceSession {
         Ok(self.engine.list_maintenance_obligations()?)
     }
 
+    pub fn maintenance_obligations_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<MaintenanceObligation>> {
+        Ok(self
+            .engine
+            .list_maintenance_obligations_for_group(group_id)?)
+    }
+
     pub fn delete_maintenance_obligation(&self, id: &MessageId) -> SessionResult<()> {
         Ok(self.engine.delete_maintenance_obligation(id)?)
     }
 
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {
         Ok(self.engine.list_group_evolutions()?)
+    }
+
+    pub fn group_evolutions_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<DurableGroupEvolution>> {
+        Ok(self.engine.list_group_evolutions_for_group(group_id)?)
     }
 
     pub fn put_group_evolution(&self, record: &DurableGroupEvolution) -> SessionResult<()> {

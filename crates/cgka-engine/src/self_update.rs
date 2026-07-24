@@ -97,14 +97,10 @@ impl<S: StorageProvider> Engine<S> {
         semantic_hasher.update(source_epoch.0.to_be_bytes());
         semantic_hasher.update(&own_leaf_before_hash);
         let evolution_id = MessageId::new(semantic_hasher.finalize().to_vec());
-        let maintenance_storage = self
-            .storage
-            .maintenance_storage()
-            .ok_or_else(|| EngineError::Backend("maintenance storage is unavailable".into()))?;
+        let maintenance_storage = self.maintenance_storage()?;
         let active_obligation = maintenance_storage
-            .list_maintenance_obligations()?
+            .list_maintenance_obligations_for_group(&group_id)?
             .into_iter()
-            .filter(|obligation| obligation.group_id == group_id)
             .filter(|obligation| {
                 !matches!(
                     obligation.phase,
@@ -120,11 +116,11 @@ impl<S: StorageProvider> Engine<S> {
         let semantic = active_obligation
             .map(|obligation| GroupEvolutionSemantic::SelfUpdate {
                 trigger: obligation.trigger,
-                obligation_id: obligation.id,
+                obligation_id: Some(obligation.id),
             })
             .unwrap_or_else(|| GroupEvolutionSemantic::SelfUpdate {
                 trigger: MaintenanceTrigger::Manual,
-                obligation_id: evolution_id.clone(),
+                obligation_id: None,
             });
         let mut evolution = DurableGroupEvolution {
             id: evolution_id.clone(),
@@ -150,9 +146,7 @@ impl<S: StorageProvider> Engine<S> {
                 .create_snapshot(&self.storage, &group_id, source_epoch)?;
         pending_commit_guard.set_snapshot(recovery_snapshot.clone());
         evolution.recovery_snapshot = Some(recovery_snapshot.clone());
-        self.storage
-            .maintenance_storage()
-            .ok_or_else(|| EngineError::Backend("maintenance storage is unavailable".into()))?
+        self.maintenance_storage()?
             .put_group_evolution(&evolution)?;
         self.audit_snapshot_created(
             &group_id,
@@ -219,6 +213,9 @@ impl<S: StorageProvider> Engine<S> {
         evolution.signed_message_id = Some(wrapped.id.clone());
 
         let pending_ref = self.epoch_manager.next_pending_ref();
+        evolution.pending_ref = Some(pending_ref);
+        self.maintenance_storage()?
+            .put_group_evolution(&evolution)?;
         self.epoch_manager.begin_pending(
             group_id.clone(),
             source_epoch,
@@ -228,11 +225,6 @@ impl<S: StorageProvider> Engine<S> {
             crate::epoch_manager::PendingKind::GroupEvolution,
             self.current_audit_context.clone(),
         )?;
-        evolution.pending_ref = Some(pending_ref);
-        self.storage
-            .maintenance_storage()
-            .ok_or_else(|| EngineError::Backend("maintenance storage is unavailable".into()))?
-            .put_group_evolution(&evolution)?;
         self.track_pending_commit_for_recovery(
             pending_ref,
             group_id.clone(),

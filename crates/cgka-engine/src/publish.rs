@@ -367,25 +367,23 @@ impl<S: StorageProvider> Engine<S> {
                 if let Some(fanout) = rolled_back_fanout.as_ref() {
                     storage.put_outbound_fanout(fanout)?;
                 }
+                if let Some(message_id) = origin_commit_id.as_ref()
+                    && let Some(maintenance) = storage.maintenance_storage()
+                    && let Some(evolution) = maintenance
+                        .list_group_evolutions_for_group(&group_id)?
+                        .into_iter()
+                        .find(|evolution| evolution.signed_message_id.as_ref() == Some(message_id))
+                {
+                    // No relay accepted the event, so compensate the staged
+                    // evolution in the same transaction as the MLS clear.
+                    maintenance.delete_group_evolution(&evolution.id)?;
+                }
                 Ok(())
             })?;
 
         if let (Some(fanout), Some(rolled_back)) = (fanout.take(), rolled_back_fanout) {
             *fanout = rolled_back;
         }
-        if let Some(message_id) = origin_commit_id.as_ref()
-            && let Some(maintenance) = self.storage.maintenance_storage()
-            && let Some(evolution) = maintenance
-                .list_group_evolutions()?
-                .into_iter()
-                .find(|evolution| evolution.signed_message_id.as_ref() == Some(message_id))
-        {
-            // No relay accepted the event, so the staged evolution can be
-            // compensated and regenerated from the still-live semantic
-            // obligation.
-            maintenance.delete_group_evolution(&evolution.id)?;
-        }
-
         let kind = self
             .epoch_manager
             .kind_for_pending(pending)

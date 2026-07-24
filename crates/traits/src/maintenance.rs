@@ -13,6 +13,8 @@ use crate::types::{EpochId, GroupId, MessageId};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub const POST_JOIN_CONTENTION_JITTER_MAX_MS: u64 = 30_000;
+
 /// Injectable wall clock for persisted maintenance deadlines.
 pub trait WallClock: Send + Sync {
     fn now(&self) -> Timestamp;
@@ -64,6 +66,27 @@ pub enum MaintenancePhase {
     #[default]
     Complete,
     Failed,
+}
+
+impl MaintenancePhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CatchUp => "catch_up",
+            Self::EoseTimeout => "eose_timeout",
+            Self::Grace => "grace",
+            Self::Quiet => "quiet",
+            Self::Jitter => "jitter",
+            Self::Overdue => "overdue",
+            Self::Paused => "paused",
+            Self::ClockSkewBlocked => "clock_skew_blocked",
+            Self::PendingPublication => "pending_publication",
+            Self::Fanout => "fanout",
+            Self::Retry => "retry",
+            Self::SupersededByConvergence => "superseded_by_convergence",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Durable per-group enrollment and own-leaf rotation history.
@@ -123,7 +146,7 @@ pub enum GroupEvolutionPhase {
 pub enum GroupEvolutionSemantic {
     SelfUpdate {
         trigger: MaintenanceTrigger,
-        obligation_id: MessageId,
+        obligation_id: Option<MessageId>,
     },
     Invite,
     RemoveMembers,
@@ -204,9 +227,9 @@ pub struct SignedPublicationArtifact {
 pub struct PendingKeyPackageReplacement {
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
-    /// Transport authoring time selected before signing. This makes a crash
-    /// between private-bundle generation and event signing restart-safe while
-    /// still allowing regeneration before any possible network exposure.
+    /// Transport authoring time selected before signing. The private bundle
+    /// and this enclosing lifecycle intent are persisted atomically; signing
+    /// may therefore resume safely after a crash.
     pub authored_created_at: Timestamp,
     pub not_before: Timestamp,
     pub not_after: Timestamp,
@@ -261,6 +284,32 @@ pub struct KeyPackageLifecycleState {
     pub pending_replacement: Option<PendingKeyPackageReplacement>,
 }
 
+impl KeyPackageLifecycleState {
+    /// Create lifecycle authority before a current package has been promoted.
+    /// An empty slot is a fail-closed migration sentinel and must never be
+    /// published.
+    pub fn slot_only(stable_slot_id: String) -> Self {
+        Self {
+            stable_slot_id,
+            phase: MaintenancePhase::Complete,
+            current_key_package: None,
+            current_key_package_ref: None,
+            current_not_before: None,
+            current_not_after: None,
+            authored_event_id: None,
+            authored_event_created_at: None,
+            authored_signed_event: None,
+            publication_targets: Vec::new(),
+            refresh_at: None,
+            upgrade_rotation_recorded: false,
+            last_consumed_key_package_ref: None,
+            last_consumed_at: None,
+            retained_private_material: Vec::new(),
+            pending_replacement: None,
+        }
+    }
+}
+
 /// Runtime-level policy is persisted; pause/resume remains intentionally
 /// process-local.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +328,20 @@ pub enum SendMaintenanceDisposition {
     PostJoinRotationPendingRetryable,
 }
 
+/// Result of actively advancing maintenance work.
+///
+/// This is deliberately separate from `SendMaintenanceDisposition`: a user
+/// send reports whether background maintenance remains pending, while a
+/// maintenance run reports what maintenance itself published or deferred.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceRunSummary {
+    pub published: u32,
+    pub message_ids: Vec<MessageId>,
+    pub deferred: u32,
+    pub ambiguous_exposure: u32,
+    pub failures: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupMaintenanceStatus {
     pub group_id: GroupId,
@@ -287,4 +350,25 @@ pub struct GroupMaintenanceStatus {
     pub evolutions: Vec<DurableGroupEvolution>,
     pub fanouts: Vec<DurableTransportFanout>,
     pub paused: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MaintenancePhase;
+
+    #[test]
+    fn maintenance_phase_names_are_stable_snake_case() {
+        assert_eq!(
+            MaintenancePhase::PendingPublication.as_str(),
+            "pending_publication"
+        );
+        assert_eq!(
+            MaintenancePhase::SupersededByConvergence.as_str(),
+            "superseded_by_convergence"
+        );
+        assert_eq!(
+            MaintenancePhase::ClockSkewBlocked.as_str(),
+            "clock_skew_blocked"
+        );
+    }
 }

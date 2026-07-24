@@ -43,9 +43,9 @@ pub use openmls_traits::types::Ciphersuite;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tls_codec::Deserialize as _;
+use tls_codec::{Deserialize as _, Serialize as _};
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -66,14 +66,11 @@ impl WallClock for SystemWallClock {
 }
 
 #[derive(Debug, Default)]
-struct OsMaintenanceRandom(Mutex<rand::rngs::OsRng>);
+struct OsMaintenanceRandom;
 
 impl MaintenanceRandom for OsMaintenanceRandom {
     fn next_u64(&self) -> u64 {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .next_u64()
+        rand::rngs::OsRng.next_u64()
     }
 }
 
@@ -169,7 +166,7 @@ pub struct Engine<S: StorageProvider> {
     /// Authenticated standalone proposals accepted during ingest. This
     /// internal signal lets the account scheduler reset its quiet window
     /// without exposing proposals as user-visible group events.
-    pub(crate) valid_proposal_groups: VecDeque<GroupId>,
+    pub(crate) valid_proposal_groups: HashSet<GroupId>,
     /// Group-state changes effected by a locally staged commit, with the actor
     /// to attribute each to. Buffered here because publish-before-apply defers
     /// the OpenMLS merge: the `GroupEvent::GroupStateChanged` events are emitted
@@ -338,7 +335,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
             wall_clock: Arc::new(SystemWallClock),
-            maintenance_random: Arc::new(OsMaintenanceRandom::default()),
+            maintenance_random: Arc::new(OsMaintenanceRandom),
             recorder: None,
         }
     }
@@ -473,7 +470,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             events_buf: VecDeque::new(),
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
-            valid_proposal_groups: VecDeque::new(),
+            valid_proposal_groups: HashSet::new(),
             pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             retryable_unpersisted_ingest_id: None,
@@ -580,7 +577,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     pub fn drain_valid_proposal_groups(&mut self) -> Vec<GroupId> {
-        self.valid_proposal_groups.drain(..).collect()
+        self.valid_proposal_groups.drain().collect()
     }
 
     pub async fn ingest_with_audit_context(
@@ -1308,14 +1305,18 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(false);
         };
         let source_epoch = EpochId(mls_group.epoch().as_u64());
+        let own_leaf_hash = mls_group
+            .own_leaf_node()
+            .and_then(|leaf| leaf.tls_serialize_detached().ok())
+            .map(|leaf| Sha256::digest(leaf).to_vec());
         let evolution = maintenance
-            .list_group_evolutions()
+            .list_group_evolutions_for_group(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
             .into_iter()
             .rev()
             .find(|evolution| {
-                evolution.group_id == *group_id
-                    && evolution.source_epoch == source_epoch
+                evolution.source_epoch == source_epoch
+                    && evolution.own_leaf_before_hash == own_leaf_hash
                     && matches!(
                         evolution.phase,
                         GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
@@ -1327,33 +1328,47 @@ impl<S: StorageProvider> Engine<S> {
         let Some(message_id) = evolution.signed_message_id.clone() else {
             return Ok(false);
         };
-        let record = self
-            .storage
-            .get_message(&message_id)
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-        let payload = StoredMessagePayload::decode(&record.payload)
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-        let exact_message = payload
-            .as_exact_transport()
-            .cloned()
-            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-        let openmls_message = payload
-            .as_openmls_wire()
-            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-        let staged_commit = mls_group
-            .pending_commit()
-            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let recovery_failed = || {
+            tracing::warn!(
+                target: "cgka_engine::maintenance",
+                method = "restore_durable_group_evolution_on_hydrate",
+                "durable evolution was incomplete; using compatibility recovery"
+            );
+            Ok(false)
+        };
+        let record = match self.storage.get_message(&message_id) {
+            Ok(record) => record,
+            Err(_) => return recovery_failed(),
+        };
+        let payload = match StoredMessagePayload::decode(&record.payload) {
+            Ok(payload) => payload,
+            Err(_) => return recovery_failed(),
+        };
+        let Some(exact_message) = payload.as_exact_transport().cloned() else {
+            return recovery_failed();
+        };
+        let Some(openmls_message) = payload.as_openmls_wire() else {
+            return recovery_failed();
+        };
+        let Some(staged_commit) = mls_group.pending_commit() else {
+            return recovery_failed();
+        };
         let commit_priority =
             crate::app_components::commit_ordering_priority_for_staged(staged_commit);
-        let snapshot = evolution
-            .recovery_snapshot
-            .clone()
-            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let Some(snapshot) = evolution.recovery_snapshot.clone() else {
+            return recovery_failed();
+        };
 
         self.epoch_manager
             .set_stable(group_id.clone(), source_epoch);
         let pending = self.epoch_manager.next_pending_ref();
-        self.epoch_manager
+        let mut evolution = evolution;
+        evolution.pending_ref = Some(pending);
+        if maintenance.put_group_evolution(&evolution).is_err() {
+            return recovery_failed();
+        }
+        if self
+            .epoch_manager
             .begin_pending(
                 group_id.clone(),
                 source_epoch,
@@ -1365,12 +1380,12 @@ impl<S: StorageProvider> Engine<S> {
                 crate::epoch_manager::PendingKind::GroupEvolution,
                 None,
             )
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-        let mut evolution = evolution;
-        evolution.pending_ref = Some(pending);
-        maintenance
-            .put_group_evolution(&evolution)
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            .is_err()
+        {
+            evolution.pending_ref = None;
+            let _ = maintenance.put_group_evolution(&evolution);
+            return recovery_failed();
+        }
         self.track_pending_commit_for_recovery(
             pending,
             group_id.clone(),
