@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use cgka_engine::{Engine, EngineBuilder};
-use cgka_traits::Backend;
-use cgka_traits::OutboundFanout;
 use cgka_traits::capabilities::{CapabilityRequirement, Feature, GroupCapabilities};
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendResult,
+    CgkaEngine, CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, SendIntent,
+    SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::group::{Group, Member};
@@ -24,6 +23,9 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::welcome::PendingWelcome;
+use cgka_traits::{
+    Backend, OutboundFanout, TransportEndpoint, TransportPublishRequest, TransportPublishTarget,
+};
 use marmot_forensics::{AuditEvent, AuditEventKind, JsonlRecorder};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -337,6 +339,7 @@ async fn hydration_quarantines_first_bad_group_and_continues_to_later_healthy_gr
 struct FlakyGroupRecordStorage {
     inner: SqliteAccountStorage,
     fail_get_group: Arc<AtomicBool>,
+    fail_list_queued_outbound_intents: Arc<AtomicBool>,
 }
 
 impl FlakyGroupRecordStorage {
@@ -344,11 +347,17 @@ impl FlakyGroupRecordStorage {
         Self {
             inner,
             fail_get_group: Arc::new(AtomicBool::new(false)),
+            fail_list_queued_outbound_intents: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn set_fail_get_group(&self, fail: bool) {
         self.fail_get_group.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_list_queued_outbound_intents(&self, fail: bool) {
+        self.fail_list_queued_outbound_intents
+            .store(fail, Ordering::SeqCst);
     }
 }
 
@@ -415,6 +424,14 @@ impl OutboundIntentStorage for FlakyGroupRecordStorage {
         &self,
         group_id: &GroupId,
     ) -> StorageResult<Vec<QueuedOutboundIntent>> {
+        if self
+            .fail_list_queued_outbound_intents
+            .load(Ordering::SeqCst)
+        {
+            return Err(StorageError::Backend(
+                "injected queued-outbound-intent list failure".into(),
+            ));
+        }
         self.inner.list_queued_outbound_intents(group_id)
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
@@ -712,6 +729,128 @@ async fn retry_recovers_a_transiently_quarantined_group() {
         )),
         "recovery event missing or carried the wrong epoch (expected {group_epoch:?}): {events:?}"
     );
+}
+
+#[tokio::test]
+async fn pending_fanout_is_not_exposed_until_hydration_fully_succeeds() {
+    let storage = FlakyGroupRecordStorage::new(SqliteAccountStorage::in_memory().expect("storage"));
+    let mut initial = build_flaky_engine(storage.clone());
+    let group_id = create_confirmed_group_flaky(&mut initial).await;
+    let baseline_epoch = initial.epoch(&group_id).unwrap();
+    let staged = initial
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("pending fanout".into()),
+            description: None,
+        })
+        .await
+        .expect("stage update");
+    let (message, pending) = match staged {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected group evolution, got {other:?}"),
+    };
+    let transport_group_id = match &message.envelope {
+        TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
+        other => panic!("expected group message, got {other:?}"),
+    };
+    let fanout = OutboundFanout::stage(
+        TransportPublishRequest {
+            account_id: initial.self_id(),
+            message,
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id,
+                endpoints: vec![TransportEndpoint("wss://hydrate.example".into())],
+            },
+            required_acks: 1,
+        },
+        Some(pending),
+        Some(group_id.clone()),
+        0,
+    )
+    .expect("stage frozen fanout");
+    initial
+        .put_outbound_fanout(&fanout)
+        .expect("persist frozen fanout");
+    drop(initial);
+
+    // Fail after the durable pending candidate has been fully validated. The
+    // group is quarantined, but no pending lifecycle may escape into memory.
+    storage.set_fail_list_queued_outbound_intents(true);
+    let mut reopened = build_flaky_engine(storage.clone());
+    reopened
+        .hydrate_stable_groups_from_storage()
+        .expect("per-group failure is quarantined");
+    assert!(matches!(
+        reopened.quarantined_groups().as_slice(),
+        [(id, GroupHydrationQuarantineReason::GroupRecordLoadFailed)] if id == &group_id
+    ));
+    assert!(
+        reopened.outbound_fanouts().unwrap().is_empty(),
+        "runtime fanout resumption must hide quarantined groups"
+    );
+    assert_eq!(
+        storage.list_outbound_fanouts().unwrap().len(),
+        1,
+        "quarantine must retain the durable fanout for a later retry"
+    );
+    assert!(matches!(
+        reopened.put_outbound_fanout(&fanout),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    assert!(matches!(
+        reopened.delete_outbound_fanout(fanout.message_id()),
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    let mut confirm_candidate = fanout.clone();
+    assert!(matches!(
+        reopened
+            .confirm_published_fanout(pending, &mut confirm_candidate)
+            .await,
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+    let mut rollback_candidate = fanout.clone();
+    assert!(matches!(
+        reopened
+            .publish_failed_fanout(pending, &mut rollback_candidate)
+            .await,
+        Err(EngineError::UnknownGroup(id)) if id == group_id
+    ));
+
+    // A clean retry restores the pending lifecycle exactly once. This would
+    // fail if the first hydration had already registered it before the later
+    // storage read failed.
+    storage.set_fail_list_queued_outbound_intents(false);
+    assert!(
+        reopened
+            .retry_hydrate_quarantined_group(&group_id)
+            .expect("retry hydration"),
+        "healthy retry must recover the quarantined group"
+    );
+    assert_eq!(reopened.pending_group_id(pending).unwrap(), group_id);
+    let mut recovered_fanout = reopened
+        .outbound_fanouts()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("recovered durable fanout");
+    recovered_fanout
+        .mark_attempt_started(0)
+        .expect("start recovered attempt");
+    reopened
+        .put_outbound_fanout(&recovered_fanout)
+        .expect("persist recovered attempt");
+    recovered_fanout
+        .mark_target_failed(0)
+        .expect("fail recovered attempt");
+    reopened
+        .put_outbound_fanout(&recovered_fanout)
+        .expect("persist recovered failure");
+    reopened
+        .publish_failed_fanout(pending, &mut recovered_fanout)
+        .await
+        .expect("recovered pending can roll back");
+    assert_eq!(reopened.epoch(&group_id).unwrap(), baseline_epoch);
 }
 
 #[tokio::test]

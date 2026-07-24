@@ -893,21 +893,24 @@ where
                         message_id: message.id,
                         reason: error.to_string(),
                     });
-                    if let Some(pending) = pending {
-                        let effects = self.session.publish_failed(pending).await?;
-                        output
-                            .pending
-                            .push(PendingResolution::RolledBack { pending });
-                        output.absorb_session_effects(effects, queue);
-                    }
+                    self.rollback_unstaged_pending(pending, output, queue)
+                        .await?;
                     return Ok(PublishStatus::default());
                 }
             };
             let required_acks = self.routing.required_acks(&target);
-            let pending_group_id = pending
+            let pending_group_id = match pending
                 .map(|pending| self.session.pending_group_id(pending))
-                .transpose()?;
-            let fanout = OutboundFanout::stage(
+                .transpose()
+            {
+                Ok(group_id) => group_id,
+                Err(error) => {
+                    self.rollback_unstaged_pending(pending, output, queue)
+                        .await?;
+                    return Err(error.into());
+                }
+            };
+            let fanout = match OutboundFanout::stage(
                 TransportPublishRequest {
                     account_id: self.session.self_id(),
                     message,
@@ -917,12 +920,39 @@ where
                 pending,
                 pending_group_id,
                 0,
-            )?;
-            self.session.put_outbound_fanout(&fanout)?;
+            ) {
+                Ok(fanout) => fanout,
+                Err(error) => {
+                    self.rollback_unstaged_pending(pending, output, queue)
+                        .await?;
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = self.session.put_outbound_fanout(&fanout) {
+                self.rollback_unstaged_pending(pending, output, queue)
+                    .await?;
+                return Err(error.into());
+            }
             Box::pin(self.drive_outbound_fanout(fanout, output, queue, context)).await
         } else {
             self.publish_legacy_one(message, output, context).await
         }
+    }
+
+    async fn rollback_unstaged_pending(
+        &mut self,
+        pending: Option<PendingStateRef>,
+        output: &mut AccountDeviceEffects,
+        queue: &mut VecDeque<PublishWork>,
+    ) -> AccountResult<()> {
+        if let Some(pending) = pending {
+            let effects = self.session.publish_failed(pending).await?;
+            output
+                .pending
+                .push(PendingResolution::RolledBack { pending });
+            output.absorb_session_effects(effects, queue);
+        }
+        Ok(())
     }
 
     async fn drive_outbound_fanout(
@@ -1337,6 +1367,8 @@ impl AccountDeviceEffects {
         self.reports.extend(other.reports);
         self.fanout.extend(other.fanout);
         self.failures.extend(other.failures);
+        self.published_app_messages
+            .extend(other.published_app_messages);
         self.welcome_failures.extend(other.welcome_failures);
         self.pending.extend(other.pending);
     }
@@ -1385,4 +1417,35 @@ pub struct WelcomeDeliveryFailure {
 pub enum PendingResolution {
     Confirmed { pending: PendingStateRef },
     RolledBack { pending: PendingStateRef },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn published_message(id: u8) -> PublishedApplicationMessage {
+        PublishedApplicationMessage {
+            group_id: GroupId::new(vec![id]),
+            app_event_id: format!("event-{id}"),
+            message_id: cgka_traits::MessageId::new(vec![id]),
+            source_epoch: EpochId(u64::from(id)),
+            retention: cgka_traits::app_event::AppMessageRetentionDecision::new(10, 0),
+        }
+    }
+
+    #[test]
+    fn extending_effects_preserves_published_application_messages() {
+        let first = published_message(1);
+        let second = published_message(2);
+        let mut combined = AccountDeviceEffects {
+            published_app_messages: vec![first.clone()],
+            ..AccountDeviceEffects::default()
+        };
+        combined.extend(AccountDeviceEffects {
+            published_app_messages: vec![second.clone()],
+            ..AccountDeviceEffects::default()
+        });
+
+        assert_eq!(combined.published_app_messages, vec![first, second]);
+    }
 }

@@ -23,7 +23,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::{
-    EpochId, FanoutMlsState, FanoutTargetStatus, MemberId, MessageId, OutboundFanout,
+    EpochId, FanoutMlsState, FanoutTargetStatus, GroupId, MemberId, MessageId, OutboundFanout,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
     TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint, TransportEndpointReceipt,
     TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
@@ -31,6 +31,7 @@ use cgka_traits::{
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
     KeyPackagePublisher, PendingResolution, PublishedApplicationMessage, StaticTransportRouting,
+    TransportRoutingError, TransportRoutingPolicy,
 };
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
@@ -357,6 +358,47 @@ impl TransportAdapter for RecordingAdapter {
 
     async fn receive(&self) -> Result<Option<TransportDelivery>, TransportAdapterError> {
         Ok(None)
+    }
+}
+
+#[derive(Clone)]
+struct MismatchedPendingGroupRouting {
+    wrong_group_id: GroupId,
+    endpoint: TransportEndpoint,
+}
+
+impl TransportRoutingPolicy for MismatchedPendingGroupRouting {
+    fn local_inbox_endpoints(&self) -> Vec<TransportEndpoint> {
+        vec![self.endpoint.clone()]
+    }
+
+    fn key_package_endpoints(&self) -> Vec<TransportEndpoint> {
+        vec![self.endpoint.clone()]
+    }
+
+    fn group_subscriptions(&self) -> Vec<cgka_traits::TransportGroupSubscription> {
+        Vec::new()
+    }
+
+    fn publish_target(
+        &self,
+        message: &TransportMessage,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        let transport_group_id = match &message.envelope {
+            TransportEnvelope::GroupMessage { transport_group_id } => transport_group_id.clone(),
+            TransportEnvelope::Welcome { .. } => {
+                return Err(TransportRoutingError::MissingInboxRoute);
+            }
+        };
+        Ok(TransportPublishTarget::Group {
+            group_id: self.wrong_group_id.clone(),
+            transport_group_id,
+            endpoints: vec![self.endpoint.clone()],
+        })
+    }
+
+    fn required_acks(&self, _target: &TransportPublishTarget) -> usize {
+        1
     }
 }
 
@@ -1712,4 +1754,83 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         proposal_effects.published_app_messages.is_empty(),
         "proposal reports must not be mislabeled as application publications"
     );
+}
+
+#[tokio::test]
+async fn fanout_staging_failure_rolls_back_pending_mls_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot fanout staging rollback key").unwrap();
+    let mut alice = session(
+        dir.path().join("alice-stage-rollback.sqlite"),
+        &key,
+        b"alice-stage-rollback",
+    );
+    let created = alice
+        .create_group(CreateGroupRequest {
+            name: "before failed staging".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let create_pending = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { pending, .. } => *pending,
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.confirm_published(create_pending).await.unwrap();
+    let baseline_epoch = alice.epoch(&group_id).unwrap();
+
+    let adapter = RecordingAdapter::default();
+    let routing = MismatchedPendingGroupRouting {
+        wrong_group_id: GroupId::new(b"wrong-pending-group".to_vec()),
+        endpoint: TransportEndpoint("wss://stage-rollback.example".into()),
+    };
+    let mut runtime = AccountDeviceRuntime::new(
+        alice,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    );
+
+    let error = runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("must roll back".into()),
+            description: None,
+        })
+        .await
+        .expect_err("mismatched pending group must fail fanout staging");
+    assert!(matches!(
+        error,
+        AccountError::Transport(TransportAdapterError::PublishTargetMismatch { .. })
+    ));
+    assert!(
+        adapter.publishes().is_empty(),
+        "staging failure happens before any transport side effect"
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), baseline_epoch);
+    assert_eq!(
+        runtime.session().group_record(&group_id).unwrap().name,
+        "before failed staging",
+        "failed pre-publish staging must roll back the projected group update"
+    );
+
+    // A second commit can stage and reaches the same routing validation,
+    // proving the first pending state did not wedge the group.
+    assert!(matches!(
+        runtime
+            .send(SendIntent::UpdateGroupData {
+                group_id,
+                name: Some("second attempt".into()),
+                description: None,
+            })
+            .await,
+        Err(AccountError::Transport(
+            TransportAdapterError::PublishTargetMismatch { .. }
+        ))
+    ));
 }

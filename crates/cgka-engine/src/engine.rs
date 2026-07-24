@@ -452,17 +452,37 @@ impl<S: StorageProvider> EngineBuilder<S> {
 impl<S: StorageProvider> Engine<S> {
     /// Persist a frozen transport fanout before or after one lifecycle edge.
     pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> Result<(), EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
         self.storage.put_outbound_fanout(fanout)?;
         Ok(())
     }
 
     /// Read all frozen fanouts in original staging order.
     pub fn outbound_fanouts(&self) -> Result<Vec<OutboundFanout>, EngineError> {
-        Ok(self.storage.list_outbound_fanouts()?)
+        Ok(self
+            .storage
+            .list_outbound_fanouts()?
+            .into_iter()
+            .filter(|fanout| {
+                fanout
+                    .group_id()
+                    .is_none_or(|group_id| !self.quarantined_groups.contains_key(group_id))
+            })
+            .collect())
     }
 
     /// Delete a terminal fanout after its outcome has been returned.
     pub fn delete_outbound_fanout(&self, message_id: &MessageId) -> Result<(), EngineError> {
+        if let Some(group_id) = self
+            .storage
+            .outbound_fanout(message_id)?
+            .as_ref()
+            .and_then(OutboundFanout::group_id)
+        {
+            self.ensure_group_live(group_id)?;
+        }
         self.storage.delete_outbound_fanout(message_id)?;
         Ok(())
     }
@@ -470,9 +490,12 @@ impl<S: StorageProvider> Engine<S> {
     /// Resolve the group owning a live pending reference without exposing
     /// epoch-manager internals across the session/runtime boundary.
     pub fn pending_group_id(&self, pending: PendingStateRef) -> Result<GroupId, EngineError> {
-        self.epoch_manager
+        let group_id = self
+            .epoch_manager
             .group_for_pending(pending)
-            .ok_or(EngineError::UnknownPending)
+            .ok_or(EngineError::UnknownPending)?;
+        self.ensure_group_live(&group_id)?;
+        Ok(group_id)
     }
 
     /// Confirm MLS and persist the matching fanout's terminal MLS edge in the
@@ -482,6 +505,10 @@ impl<S: StorageProvider> Engine<S> {
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
     ) -> Result<GroupEvent, EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
+        self.pending_group_id(pending)?;
         self.do_confirm_published_with_fanout(pending, Some(fanout))
             .await
     }
@@ -493,6 +520,10 @@ impl<S: StorageProvider> Engine<S> {
         pending: PendingStateRef,
         fanout: &mut OutboundFanout,
     ) -> Result<(), EngineError> {
+        if let Some(group_id) = fanout.group_id() {
+            self.ensure_group_live(group_id)?;
+        }
+        self.pending_group_id(pending)?;
         self.do_publish_failed_with_fanout(pending, Some(fanout))
             .await
     }
@@ -985,25 +1016,13 @@ impl<S: StorageProvider> Engine<S> {
                 fanout.group_id() == Some(group_id)
                     && matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
             });
-        let mut restored_pending = false;
-        if mls_group.pending_commit().is_some()
+        let pending_recovery = if mls_group.pending_commit().is_some()
             && let Some(fanout) = durable_pending_fanout.as_ref()
         {
             let pending_ref = fanout
                 .pending_ref()
                 .expect("pending fanout state retains its pending ref");
             let prior_epoch = EpochId(mls_group.epoch().as_u64());
-            self.epoch_manager
-                .restore_pending(
-                    group_id.clone(),
-                    prior_epoch,
-                    EpochId(prior_epoch.0.saturating_add(1)),
-                    StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
-                    pending_ref,
-                    crate::epoch_manager::PendingKind::GroupEvolution,
-                )
-                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-
             let stored = self
                 .storage
                 .get_message(fanout.message_id())
@@ -1027,9 +1046,8 @@ impl<S: StorageProvider> Engine<S> {
             let snapshot_name = newest_fork_snapshot(snapshots, &snapshot_prefix)
                 .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
                 .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
-            self.fork_recovery.record_pending(
+            Some((
                 pending_ref,
-                group_id.clone(),
                 prior_epoch,
                 fanout.message_id().clone(),
                 CommitOrderingKey::from_commit_bytes(
@@ -1039,9 +1057,11 @@ impl<S: StorageProvider> Engine<S> {
                     commit_bytes,
                 ),
                 snapshot_name,
-            );
-            restored_pending = true;
-        }
+            ))
+        } else {
+            None
+        };
+        let restored_pending = pending_recovery.is_some();
 
         // A staged commit that survived process restart *may* mean the
         // application crashed mid-publish. Clear it (treat as
@@ -1103,36 +1123,9 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
 
-        if let Some(request) = self
+        let leave_request = self
             .leave_request_to_restore_on_hydrate(group_id, &mut mls_group, &group, &provider)
-            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?
-        {
-            self.leave_requests.insert(group_id.clone(), request);
-            self.leaving_groups.insert(group_id.clone());
-        } else {
-            self.leave_requests.remove(group_id);
-            self.leaving_groups.remove(group_id);
-        }
-
-        // #740: the transport routing id was already indexed right after the
-        // MLS load above (kept pre-validation so quarantined groups resolve
-        // too); nothing on this path changes it.
-
-        if !restored_pending {
-            self.epoch_manager.set_stable(group_id.clone(), group.epoch);
-        }
-        self.audit_group(
-            group_id,
-            crate::audit_helpers::epoch_state_changed_event(
-                None,
-                "stable",
-                group.epoch,
-                "hydrate_stable_group",
-                None,
-                None,
-            ),
-        );
-        self.audit_group_context(group_id, "hydrate_stable_group");
+            .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
         // Startup must recreate the in-memory scheduling edge for durable
         // convergence work. Otherwise queued user sends and stored branch
@@ -1146,6 +1139,65 @@ impl<S: StorageProvider> Engine<S> {
         let has_convergence_inputs = self
             .has_pending_convergence_inputs(group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
+
+        // Do not expose any recovered pending state until every fallible
+        // hydration read and validation above has succeeded. If a later step
+        // quarantines the group, neither runtime fanout resumption nor direct
+        // pending access may observe a half-hydrated lifecycle.
+        if let Some((pending_ref, prior_epoch, message_id, ordering_key, snapshot_name)) =
+            pending_recovery
+        {
+            self.epoch_manager
+                .restore_pending(
+                    group_id.clone(),
+                    prior_epoch,
+                    EpochId(prior_epoch.0.saturating_add(1)),
+                    StagedCommitHandle::from_bytes(group_id.as_slice().to_vec()),
+                    pending_ref,
+                    crate::epoch_manager::PendingKind::GroupEvolution,
+                )
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            self.fork_recovery.record_pending(
+                pending_ref,
+                group_id.clone(),
+                prior_epoch,
+                message_id,
+                ordering_key,
+                snapshot_name,
+            );
+        } else {
+            self.epoch_manager.set_stable(group_id.clone(), group.epoch);
+        }
+
+        if let Some(request) = leave_request {
+            self.leave_requests.insert(group_id.clone(), request);
+            self.leaving_groups.insert(group_id.clone());
+        } else {
+            self.leave_requests.remove(group_id);
+            self.leaving_groups.remove(group_id);
+        }
+
+        // #740: the transport routing id was already indexed right after the
+        // MLS load above (kept pre-validation so quarantined groups resolve
+        // too); nothing on this path changes it.
+
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                None,
+                if restored_pending {
+                    "pending_publish"
+                } else {
+                    "stable"
+                },
+                group.epoch,
+                "hydrate_stable_group",
+                None,
+                None,
+            ),
+        );
+        self.audit_group_context(group_id, "hydrate_stable_group");
+
         if has_queued_intents || has_convergence_inputs {
             self.schedule_pending_convergence_group(group_id);
         }
