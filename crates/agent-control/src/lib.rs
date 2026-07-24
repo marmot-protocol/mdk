@@ -83,6 +83,12 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
+    /// Query the connector-local result of an idempotent logical final send.
+    /// Used after timeout/connection loss to distinguish committed, pending,
+    /// and safe-to-fallback unknown outcomes.
+    DeliveryStatus {
+        idempotency_key: String,
+    },
     DeleteMessage {
         account_id_hex: String,
         group_id_hex: String,
@@ -260,6 +266,14 @@ pub struct AgentControlMediaRef {
     pub thumbhash: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlDeliveryStatus {
+    Unknown,
+    Pending,
+    Committed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlResponse {
@@ -284,6 +298,10 @@ pub enum AgentControlResponse {
         display_name: Option<String>,
     },
     FinalSent {
+        message_ids_hex: Vec<String>,
+    },
+    DeliveryStatus {
+        status: AgentControlDeliveryStatus,
         message_ids_hex: Vec<String>,
     },
     AppEventSent {
@@ -512,9 +530,9 @@ mod tests {
     use tokio::io::BufReader;
 
     use crate::{
-        AgentControlEnvelope, AgentControlError, AgentControlEvent, AgentControlRequest,
-        AgentControlResponse, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope, encode_frame,
-        read_envelope, read_frame, write_frame,
+        AgentControlDeliveryStatus, AgentControlEnvelope, AgentControlError, AgentControlEvent,
+        AgentControlRequest, AgentControlResponse, MAX_AGENT_CONTROL_FRAME_BYTES, decode_envelope,
+        encode_frame, read_envelope, read_frame, write_frame,
     };
 
     #[test]
@@ -619,6 +637,23 @@ mod tests {
         assert_eq!(value["idempotency_key"], "key-1");
         let round_tripped: AgentControlRequest = serde_json::from_value(value).unwrap();
         assert_eq!(round_tripped, with);
+    }
+
+    #[test]
+    fn delivery_status_response_uses_stable_status_strings() {
+        for (status, expected) in [
+            (AgentControlDeliveryStatus::Unknown, "unknown"),
+            (AgentControlDeliveryStatus::Pending, "pending"),
+            (AgentControlDeliveryStatus::Committed, "committed"),
+        ] {
+            let value = serde_json::to_value(AgentControlResponse::DeliveryStatus {
+                status,
+                message_ids_hex: Vec::new(),
+            })
+            .unwrap();
+            assert_eq!(value["type"], "delivery_status");
+            assert_eq!(value["status"], expected);
+        }
     }
 
     #[test]
@@ -839,6 +874,12 @@ mod tests {
                     idempotency_key: None,
                 },
                 "send_final",
+            ),
+            (
+                AgentControlRequest::DeliveryStatus {
+                    idempotency_key: "logical-final-1".to_owned(),
+                },
+                "delivery_status",
             ),
             (
                 AgentControlRequest::DeleteMessage {

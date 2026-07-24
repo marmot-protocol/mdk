@@ -103,6 +103,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
     match request {
         AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
         AgentControlRequest::SendFinal { .. } => "send_final",
+        AgentControlRequest::DeliveryStatus { .. } => "delivery_status",
         AgentControlRequest::DeleteMessage { .. } => "delete_message",
         AgentControlRequest::StreamBegin { .. } => "stream_begin",
         AgentControlRequest::StreamAppend { .. } => "stream_append",
