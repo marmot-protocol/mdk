@@ -71,20 +71,17 @@ impl MediaState {
 
     /// Detect the terminal's image capability once, querying stdio. Called after
     /// raw-mode init and before the event loop owns stdin. A non-tty query fails
-    /// fast; the shorter timeout bounds a tty that never answers. iTerm2 answers
-    /// the Kitty query and is misdetected, so `ITERM_SESSION_ID` forces iTerm2.
-    /// On any query failure the picker stays `None` (placeholders only).
+    /// fast; the shorter timeout bounds a tty that never answers. On any query
+    /// failure the picker stays `None` (placeholders only). The query is kept only
+    /// as the "is this an image-capable terminal" gate: the reported protocol is
+    /// discarded and replaced with the cell-exact halfblocks protocol by
+    /// `adopt_picker`, so the earlier iTerm2/Kitty misdetection no longer matters.
     pub(crate) fn detect_capability(&mut self) {
         let mut options = QueryStdioOptions::default();
         options.timeout = Duration::from_millis(500);
-        self.picker = Picker::from_query_stdio_with_options(options)
-            .ok()
-            .map(|mut picker| {
-                if std::env::var_os("ITERM_SESSION_ID").is_some() {
-                    picker.set_protocol_type(ProtocolType::Iterm2);
-                }
-                picker
-            });
+        if let Ok(picker) = Picker::from_query_stdio_with_options(options) {
+            self.adopt_picker(picker);
+        }
     }
 
     /// Whether the terminal has a usable image protocol.
@@ -188,12 +185,15 @@ impl MediaState {
         }
     }
 
-    /// Inject a picker for headless tests (`Picker::halfblocks()`), so the
-    /// `Decoded` reducer path and the renderer run without a real terminal.
+    /// Inject a picker for headless tests, so the `Decoded` reducer path and the
+    /// renderer run without a real terminal. Routes through the same `adopt_picker`
+    /// chokepoint the runtime uses, so a test picker forced to a pixel protocol is
+    /// still normalized to cell-exact halfblocks (proving the invariant holds
+    /// whatever the terminal reports).
     #[cfg(test)]
     pub(crate) fn with_test_picker(picker: Picker) -> Self {
         let mut state = Self::new();
-        state.picker = Some(picker);
+        state.adopt_picker(picker);
         state
     }
 
@@ -201,6 +201,42 @@ impl MediaState {
     #[cfg(test)]
     pub(crate) fn apply_for_test(&mut self, load: MediaLoad) {
         self.apply(load);
+    }
+
+    /// Adopt `picker` as the terminal image picker, normalizing it to the
+    /// cell-exact halfblocks protocol whatever the terminal reported. This is the
+    /// single chokepoint through which any picker enters `MediaState` — both the
+    /// runtime capability query and the test hook store their picker here — so no
+    /// caller can install an un-normalized (pixel-protocol) picker.
+    ///
+    /// The protocol chosen here governs *every* image render path: the inline
+    /// timeline blocks and the full-screen image viewer popup (`o`) both draw the
+    /// one shared `StatefulProtocol` built per hash from this picker. It must be
+    /// cell-exact for both:
+    ///
+    /// - Inline, images occupy a reserved block of cells *inside a scrolling
+    ///   message list*. Halfblocks draws ordinary colored cells (`▀` with fg/bg),
+    ///   bounded strictly to the reserved rect, so it never spills past the block
+    ///   and is erased and redrawn correctly on scroll through ratatui's normal
+    ///   cell diff.
+    /// - The popup has no full clear on close: ratatui erases it by diffing cells.
+    ///   A pixel protocol stores its image terminal-side, out of that diff's reach,
+    ///   so it cannot be reliably erased and would linger after the popup is
+    ///   dismissed.
+    ///
+    /// The pixel protocols (iTerm2/Kitty/Sixel) map the cell rect to pixels via the
+    /// terminal's detected font size and store the image terminal-side behind
+    /// `set_skip` cells. When font-size detection falls back to the arbitrary
+    /// `(10, 20)` default (`ratatui-image` first tries a `TIOCGWINSZ` ioctl for the
+    /// window pixel size and only reaches `(10, 20)` when both the escape-sequence
+    /// cell-size query and that ioctl fail), the pixels overflow the reserved block
+    /// and occlude the next message, and the terminal-side image is left as an
+    /// artifact a partial redraw cannot erase on scroll. Halfblocks depends on no
+    /// font size for containment (the font size only tunes intermediate sampling
+    /// detail), so it is robust in every terminal.
+    fn adopt_picker(&mut self, mut picker: Picker) {
+        picker.set_protocol_type(ProtocolType::Halfblocks);
+        self.picker = Some(picker);
     }
 }
 
@@ -223,7 +259,13 @@ pub(crate) fn spawn_media_download(
             Ok(_) => {
                 // Advance to the decoding ladder step, then decode off-loop.
                 let _ = tx.send(MediaLoad::Downloaded { hash: hash.clone() });
-                match decode_image(&output_path) {
+                let decoded = decode_image(&output_path);
+                // Whether decode produced an in-memory image or an error, the file
+                // has no remaining reader; remove the decrypted plaintext artifact
+                // before signalling completion so it never lingers at rest.
+                // Best-effort: it may already be gone.
+                let _ = std::fs::remove_file(&output_path);
+                match decoded {
                     Ok(image) => {
                         let _ = tx.send(MediaLoad::Decoded {
                             hash,
@@ -236,6 +278,8 @@ pub(crate) fn spawn_media_download(
                 }
             }
             Err(err) => {
+                // A failed download may still have written a partial file (e.g.
+                // ENOSPC mid-write); the startup sweep clears it next session.
                 let _ = tx.send(MediaLoad::Failed {
                     hash,
                     error: shorten(&err.to_string(), 60),
@@ -243,6 +287,35 @@ pub(crate) fn spawn_media_download(
             }
         }
     });
+}
+
+/// Best-effort sweep of the flat media-cache directory: remove every entry it
+/// holds, keeping the directory itself. Decrypted-media artifacts are deleted
+/// right after decode, so anything still here is litter from a crashed session —
+/// decrypted plaintext at rest — swept at startup so it never lingers.
+///
+/// A missing directory and per-entry errors are ignored (the sweep is advisory).
+/// Only the directory's own entries are touched — the layout is flat, so no
+/// recursion is needed — and `remove_file` unlinks a symlink rather than
+/// following it, so nothing outside the directory is ever removed. The root
+/// itself must be a real directory: `read_dir` follows a symlink at the path,
+/// and the no-home fallback lives under the shared temp dir where a symlinked
+/// `tui-media-cache` could be pre-planted to redirect the unlinks. The check
+/// races `read_dir` in principle; the sweep is best-effort startup cleanup,
+/// not a security boundary for an already-writable directory.
+pub(crate) fn sweep_media_cache_dir(dir: &Path) {
+    let is_real_dir = dir
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_dir());
+    if !is_real_dir {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let _ = std::fs::remove_file(entry.path());
+    }
 }
 
 /// Decode a downloaded file with `image`, guessing the format from content (the

@@ -490,9 +490,9 @@ real time.
 
 `wn tui` is a Ratatui interface over the real `wn --json` command surface. It opens on a login screen when it has
 no single obvious account, then drops into a chat-first main view: the chat list on the left, the materialized
-message timeline on the right (with reactions, reply context, deletion tombstones, and inline images on graphics-capable
-terminals with `[img name]`/`[file name]` placeholders otherwise), the composer below them, and a one-line hints bar
-plus a one-line status bar at the bottom.
+message timeline on the right (with reactions, reply context, deletion tombstones, and inline images as cell-exact
+half-blocks on image-capable terminals, with `[img name]`/`[file name]` placeholders otherwise), the composer below
+them, and a one-line hints bar plus a one-line status bar at the bottom.
 
 ```sh
 wn tui
@@ -554,25 +554,42 @@ Main view controls:
   shows the reply target on the status line, so you type the reply and `Enter` sends it). Counts update live in both
   directions from the timeline projection; the list is not reloaded, and a sent reply upserts optimistically the same
   way a plain send does. The `r`, `d`, and `R` prefills are skipped when the composer already holds a draft, so an
-  in-progress message is never clobbered (a status-line notice explains the skip). These also work as the `/react`,
+  in-progress message is never clobbered (a status-line notice explains the skip). While the composer holds one of
+  these prefills, the hints line shows a persistent reminder of what `Enter` will do and to which message (for
+  example `reacting to <sender>: <preview> — Enter sends the reaction, Esc clears`), recomputed each frame so it stays
+  visible until you send or clear; `Esc` clears the armed prefill (pristine or after you have typed into it) as that
+  escape hatch, while a hand-typed draft is left intact (use `Ctrl-U` to clear a hand-typed draft). `/react` accepts
+  only one emoji — exactly one grapheme cluster carrying a non-ASCII scalar (real emoji, including ZWJ families, skin
+  tones, flags, and keycaps), or the NIP-25 `+`/`-` sentinels. Anything else — multi-word prose, plain-ASCII tokens,
+  and non-Latin or accented words like `café`, `你好吗`, or `привет` — is refused with a status-line error that names
+  the contract and the escape hatch (`reactions are a single emoji (Enter sends the default +); Esc clears`), so typed
+  prose is never published as a reaction. These also work as the `/react`,
   `/unreact`, `/delete`, and `/reply <text>` slash commands, which resolve the target at submit and error to the
   status line when no message is selected (and `/delete` when the message is not yours). `/reply` sends
   `messages send --group <loaded-group> --reply-to <selected-message-id> <text>`, keeping `--reply-to` before the
   text as the guard requires. `o` opens the selected message's downloaded image full-size in a dismiss-on-any-key
   viewer (see "Inbound media" below).
-- Inbound media: an image attachment renders inline in the message pane on terminals with a graphics protocol
-  (Kitty, iTerm2, or Sixel; iTerm2 is detected via `ITERM_SESSION_ID`). Each image is downloaded and decoded in the
-  background — never blocking the event loop — and its placeholder walks `[img name]` -> `[downloading name...]` ->
-  `[loading name...]` -> the inline image, or `[name failed: err]` on error. Terminals without an image protocol keep
-  the `[img name]` placeholder (and non-image attachments always show `[file name]`). Downloaded files are cached
-  under the TUI home in `tui-media-cache/` (a private directory), so passing `--home` keeps the cache with the
-  account data.
+- Inbound media: an image attachment renders inline in the message pane as cell-exact half-block glyphs (`▀` colored
+  cells) on any image-capable terminal. The rendering is deliberately cell-exact rather than a native pixel image
+  (iTerm2/Kitty/Sixel): half-blocks are ordinary colored cells bounded strictly to the reserved block, so an image can
+  never overdraw a neighboring message or leave a terminal-side artifact behind when you scroll. Each image is
+  downloaded and decoded in the background — never blocking the event loop — and its placeholder walks `[img name]` ->
+  `[downloading name...]` -> `[loading name...]` -> the inline image, or `[name failed: err]` on error. A terminal
+  with no image capability keeps the `[img name]` placeholder (and non-image attachments always show `[file name]`).
+  The `o` full-size viewer uses the same cell-exact rendering. Each image is decrypted to a private
+  `tui-media-cache/` directory under the TUI home, decoded into memory, and the decrypted file is then removed right
+  away — the viewer draws the in-memory image, so nothing reads the file again and no decrypted media is left at rest.
+  Any files a prior crashed session left behind are swept from that directory at startup.
 - Composer: full cursor editing — `Left`/`Right`/`Home`/`End` move the cursor, `Backspace`/`Delete` remove a
-  character, and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard newline, so
-  multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8 rows), taking
-  the space from the messages pane.
+  character, `Ctrl-U` clears the whole composer (a readline kill-line that empties it whatever it holds — armed prefill
+  or hand-typed draft), and mid-string edits keep multi-byte characters intact. `Enter` submits; there is no keyboard
+  newline, so multi-line content only arrives by paste. The composer auto-grows with its wrapped content (up to 8
+  rows), taking the space from the messages pane.
 - `?`: open the help popup.
-- `Esc`: clear the composer input (or, with a popup open, close it).
+- `Esc`: clear an armed message-interaction prefill (`/react`, `/reply`, or `/delete`, whether untouched or after you
+  have typed into it); a hand-typed draft is left intact so `Esc` never destroys text you wrote — use `Ctrl-U` to
+  clear a hand-typed draft. With a popup open, `Esc` closes it.
+- `Ctrl-U`: clear the whole composer (readline kill-line), whatever it holds. Also clears the masked nsec-entry field.
 - `Ctrl-C`: quit.
 
 Popups are modal: while one is open it captures every key and the screen behind it is inert. A text-entry popup
@@ -599,9 +616,11 @@ User search (`s` from the chat list, or `/users [query]`) is a one-shot search o
 (`users search`, default radius `0..2`). The screen has two regions and a two-state focus: in query focus you type the
 query (so `j`/`k` are literal text) and `Enter` runs the search; once there are results, focus moves to the list where
 `j`/`k` (or arrows) navigate, `Enter` opens the selected user's profile card (`users show`, dismiss-on-any-key), `c`
-starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to the open chat (a confirm
-popup, guarded so it only offers this when a chat is loaded). `i` returns to the query, and `Esc` returns to the main
-view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
+starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to an existing chat: a
+group picker lists your chats (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), preselecting the open
+chat when one is loaded, and `Enter` opens the confirm popup that guards the add (`groups add-members`), naming both
+the user and the chosen chat. With no chats a status notice explains and points at `c`. `i` returns to the query, and
+`Esc` returns to the main view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
 attribution the search returns.
 
 Profile (`p` from the chat list) shows your own profile — name, display name, about, picture URL (as literal text; no
@@ -631,6 +650,7 @@ Composer slash commands:
 /account <npub-or-hex>
 /create-identity
 /login <nsec-or-npub>
+/logout
 /daemon status
 /daemon start
 /daemon stop
@@ -648,6 +668,7 @@ Composer slash commands:
 /react [emoji]
 /unreact
 /delete
+/reply <text>
 /retry <event-id>
 /image <file-path> [caption]
 /keys fetch <npub-or-hex>
@@ -666,12 +687,25 @@ Composer slash commands:
 
 `/stream` uses `quic://quic-broker.ipf.dev:4450` when no candidate is supplied.
 
+`/logout` acts on the currently selected account and is always confirmed first. `wn logout` is destructive: it
+permanently removes that account's local data (messages, group membership, and MLS state) from this device, and for a
+local-signing account it deletes the signing key too, so the confirmation says so plainly, never softens the wording,
+and always shows the account npub so it is unambiguous which account is destroyed. A local-signing logout is
+irreversible, so its confirmation requires typing the literal word `logout` and pressing `Enter`; an empty or
+mismatched entry keeps the popup open (so the wipe is never reachable by a stray Enter-then-Enter) and `Esc` cancels. A
+public-only account is re-addable, so it keeps the lighter `y`/`Enter` confirm (`n` or `Esc` cancels). On confirmation
+the account list reloads; if the removed account was the last one, the TUI returns to the login menu rather than
+pointing at a removed account.
+
 `/login <nsec>` redacts the secret in the composer and pipes it to the child `wn` process over stdin instead of argv.
 `/chat archived` shows archived chats so they can be selected and unarchived; `/chat archived off` returns to the
 visible-chat list. Member commands operate on the selected chat and call the same group membership commands exposed by
 the CLI.
 `/react`, `/unreact`, and `/delete` operate on the selected message in the messages pane and call the real
-`messages react|unreact|delete` commands; `/react` defaults to the `+` emoji. On success they only update the status
+`messages react|unreact|delete` commands; `/react` defaults to the `+` emoji. `/react` also guards its content: it is a
+single emoji or the `+` default, so content with whitespace, plain ASCII text, or too long for one emoji is rejected
+with a status-line error rather than published as a reaction (the guard lives in the TUI; the `messages react` CLI
+command stays protocol-faithful). On success they only update the status
 line — the timeline projection folds the reaction or tombstone into the existing row, so the list is not reloaded.
 `/retry <event-id>` retries a failed outbound event by id; it takes the id as an argument rather than acting on the
 selected message, because timeline rows do not carry per-message failed-send state to target from.

@@ -9,6 +9,25 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: `a` on a user-search result now picks which chat the found user is added to. It opens a group picker over the
+  loaded chats list (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), one row per chat in the list's
+  order with the open chat preselected when one is loaded; `Enter` then opens the same confirm popup that guards the
+  add (`groups add-members`), naming both the user and the chosen chat. With no chats a status notice explains and
+  points at `c` (start a new chat with the found user). Previously the action targeted only the open chat and errored
+  without one. No JSON response shapes changed.
+- TUI: made the armed message-interaction state durable and guarded reaction content, fixing a field report where a
+  user armed `/react` (via `r`), did not register the prefill, typed a whole message, and published his prose as a
+  reaction. While the composer begins with `/react`, `/reply`, or `/delete`, the hints line now shows a persistent
+  hint recomputed each frame from the composer text and the selected row — `reacting to <sender>: <preview> — Enter
+  sends the reaction, Esc clears` — instead of a one-shot status a later event could overwrite. `Esc` clears an armed
+  interaction prefill (pristine or edited) as that escape hatch, while leaving a hand-typed draft intact; `Ctrl-U` is
+  the readline kill-line that clears the whole composer whatever it holds (armed prefill or hand-typed draft) and also
+  clears the masked nsec-entry field, so the idle composer hint reads `Enter send  Ctrl-U clear`. `/react` accepts
+  only one emoji — exactly one grapheme cluster carrying a non-ASCII scalar (real emoji, including ZWJ families, skin
+  tones, flags, and keycaps), or the NIP-25 `+`/`-` sentinels — and refuses anything else (multi-word prose,
+  plain-ASCII tokens, and non-Latin or accented words like `café`, `你好吗`, and `привет`) with `reactions are a single
+  emoji (Enter sends the default +); Esc clears`. The `messages react` CLI command stays protocol-faithful and is
+  unchanged. No JSON response shapes changed.
 - TUI: `R` on the selected message replies to it. It prefills `/reply` followed by a space in the composer
   (draft-protected like the `r`
   and `d` accelerators) and names the reply target on the status line; you type the reply and `Enter` sends it. Also
@@ -20,8 +39,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   profile (`p`), and relay health (`h`) — each a one-shot load that returns to the main view on `Esc`. User search runs
   `users search` (default radius `0..2`) over the cached follow graph; its two-region screen types the query in query
   focus (`Enter` runs it) and navigates results in results focus, where `Enter` opens a profile card (`users show`),
-  `c` starts a new chat, and `a` adds the user to the open chat (guarded to when a chat is loaded) — both return to
-  the main view on the affected chat on success. Profile shows your
+  `c` starts a new chat, and `a` adds the user to an existing chat (via the group picker described above) — both
+  return to the main view on the affected chat on success. Profile shows your
   `profile show` fields (picture URL as literal text — no avatar fetch) and `follows list`; editing a field publishes
   only that field via `profile update --<field>`, `f` follows (`follows add`) and `x` unfollows (`follows remove`), and
   there is no nsec export. Relay health renders the redacted `relay-stats` snapshot — health summary, counters,
@@ -82,14 +101,28 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- TUI: `/logout` removes the currently selected account. `wn logout` is destructive — it permanently erases the
+  account's local data (messages, group membership, and MLS state) from this device and, for a local-signing account,
+  deletes its signing key too — so the confirmation scales to the consequence. A local-signing logout is irreversible,
+  so it requires typing the literal word `logout` and pressing `Enter`; an empty or mismatched entry keeps the popup
+  open (so the wipe is never reachable by a stray Enter-then-Enter) and `Esc` cancels. A public-only account is
+  re-addable and keeps the lighter `y`/`Enter` confirm (`n` or `Esc` cancels). The confirmation body states the
+  consequences plainly, never softens the wording, tailors the irreversibility line to the account type (a public-only
+  account has no key to erase), and always shows the account npub so it is unambiguous which account is destroyed. On
+  confirmation the command runs, the account list reloads, and the TUI lands on a remaining account or drops back to the
+  login menu when the last account is removed — never left pointing at a removed account or a stale subscription. Listed
+  in the in-app help card and slash-command suggestions. No JSON response shapes changed.
 - TUI: inbound media renders inline in the message pane. Image attachments are downloaded and decoded off the event
   loop (a worker thread runs `wn media download <group> <plaintext-hash> --output <cache path>` and the `image`
-  decode, delivering the result over an `mpsc` channel drained on tick) and drawn inline via `ratatui-image` on
-  terminals with a graphics protocol (Kitty/iTerm2/Sixel; iTerm2 forced via `ITERM_SESSION_ID`). Placeholders walk
-  `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or `[name failed: err]`, and stay
-  `[img name]` where no image protocol exists. `o` opens the selected message's image full-size in a dismiss-on-any-key
-  viewer. Decrypted files cache under the TUI home in `tui-media-cache/`. No JSON response shapes changed (the
-  existing `media download --json` `output_path` is passed via `--output`).
+  decode, delivering the result over an `mpsc` channel drained on tick) and drawn via `ratatui-image` as cell-exact
+  half-block glyphs (`▀` colored cells) on any image-capable terminal. The fidelity choice is deliberate: half-blocks
+  are ordinary colored cells rather than a native pixel image (iTerm2/Kitty/Sixel), so an image is bounded strictly to
+  its reserved block and can never overdraw a neighboring message or leave a terminal-side artifact behind on scroll.
+  Placeholders walk `[img name]` -> `[downloading name...]` -> `[loading name...]` -> the image, or
+  `[name failed: err]`, and stay `[img name]` on a terminal with no image capability. `o` opens the selected message's
+  image full-size (same cell-exact rendering) in a dismiss-on-any-key viewer. Decrypted files cache under the TUI home
+  in `tui-media-cache/`. No JSON response shapes changed (the existing `media download --json` `output_path` is passed
+  via `--output`).
 - TUI: message interactions on the selected message. New `/react [emoji]` (default `+`), `/unreact`, `/delete`, and
   `/retry <event-id>` slash commands call the real `messages react|unreact|delete|retry` commands; keyboard
   accelerators `r` (prefills `/react` followed by a space), `u` (removes your reaction immediately), and `d`
@@ -176,6 +209,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   server rejection reasons for actionable diagnostics. Group images store no endpoint in group state, so clients
   compiled with different defaults resolve them against different endpoints until the group image is re-set on a
   current build.
+
+### Security
+
+- TUI: inline media no longer leaves decrypted image files in the home directory. The decrypted download artifact is
+  removed immediately after it is decoded (on both the success and decode-failure paths) instead of accumulating under
+  `tui-media-cache/`, and any files a prior crashed session left behind are swept from that directory at startup. The
+  files had no reuse value — the viewer draws the in-memory image and a new session never reads them — so they were
+  decrypted plaintext at rest, outliving message deletion, with nothing to gain by keeping them.
 
 ## [0.9.3] - 2026-07-07
 

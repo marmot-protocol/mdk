@@ -348,6 +348,529 @@ fn slash_command_parser_handles_account_onboarding_commands() {
 }
 
 #[test]
+fn slash_command_parser_handles_logout() {
+    // `/logout` acts on the currently selected account and takes no arguments, so
+    // a stray argument is a parse error rather than a silently ignored token.
+    assert_eq!(parse_slash_command("/logout"), Ok(SlashCommand::Logout));
+    assert!(parse_slash_command("/logout npub1bob").is_err());
+}
+
+#[test]
+fn logout_local_signing_account_arms_typed_token_popup() {
+    // A local-signing logout is irreversible (the signing key is destroyed with
+    // the local data), so `/logout` arms a typed-token confirmation for the
+    // selected account rather than a one-key confirm. The body must state
+    // honestly that the wipe is permanent, deletes the signing key, and cannot be
+    // undone, and must instruct the user to type the token — a destructive
+    // action's description is never softened.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+
+    match &app.popup {
+        Some(Popup::Text {
+            purpose:
+                TextPurpose::ConfirmLogout {
+                    account_id: target,
+                    npub,
+                },
+            title,
+            body,
+            input,
+        }) => {
+            assert_eq!(target, &account_id, "popup targets the selected account");
+            assert_eq!(npub, "npub1alice");
+            assert_eq!(title, "Log Out");
+            assert!(input.value().is_empty(), "the token field starts empty");
+            let text = body.join(" ");
+            assert!(
+                text.contains("permanently"),
+                "wording must be honest about permanence: {text:?}"
+            );
+            assert!(
+                text.contains("signing key"),
+                "a local-signing account is told its key is deleted: {text:?}"
+            );
+            assert!(
+                text.contains("device"),
+                "wording must scope the wipe to this device: {text:?}"
+            );
+            assert!(
+                text.contains(&format!("Type {LOGOUT_CONFIRMATION_TOKEN}")),
+                "the body instructs the user to type the token: {text:?}"
+            );
+        }
+        other => panic!("expected a typed-token logout popup, got {other:?}"),
+    }
+}
+
+#[test]
+fn logout_confirm_body_omits_signing_key_line_for_public_only_accounts() {
+    // A public-only account has no signing key to erase, so the honest wording
+    // must not claim one is deleted; it warns about the unrecoverable local data
+    // instead.
+    let account_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.accounts[0].local_signing = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+
+    match &app.popup {
+        Some(Popup::Confirm { body, .. }) => {
+            let text = body.join(" ");
+            assert!(
+                !text.contains("signing key"),
+                "public-only account has no signing key to mention: {text:?}"
+            );
+            assert!(
+                text.contains("recover"),
+                "public-only wording still warns the local data is unrecoverable: {text:?}"
+            );
+        }
+        other => panic!("expected a logout confirm popup, got {other:?}"),
+    }
+}
+
+#[test]
+fn logout_popup_shows_the_npub_even_with_a_display_name() {
+    // The npub is the unambiguous identifier for which account is about to be
+    // destroyed. A display name must not hide it: the body shows the npub for
+    // both account types even when a display name is set.
+    for local_signing in [true, false] {
+        let account_id = "aa".repeat(32);
+        let mut app = test_tui_app(test_unused_client(), &account_id);
+        app.accounts[0].display_name = Some("Alice".to_owned());
+        app.accounts[0].local_signing = local_signing;
+
+        app.run_slash_command(SlashCommand::Logout)
+            .expect("/logout arms the popup");
+
+        let body = match &app.popup {
+            Some(Popup::Text { body, .. } | Popup::Confirm { body, .. }) => body.join(" "),
+            other => panic!("expected a logout popup, got {other:?}"),
+        };
+        assert!(
+            body.contains("Alice"),
+            "the display name still labels the account: {body:?}"
+        );
+        assert!(
+            body.contains("npub1alice"),
+            "the npub is shown regardless of the display name: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn logout_popup_sanitizes_a_hostile_display_name() {
+    // A hostile display name (ANSI/control/format characters) must be
+    // terminal-safe in the logout popup body specifically: the dangerous bytes
+    // are stripped, the visible text survives, and the npub still identifies the
+    // account.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.accounts[0].display_name = Some("Al\u{1b}\u{7}ice\u{202e}".to_owned());
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+
+    let body = match &app.popup {
+        Some(Popup::Text { body, .. }) => body.join(" "),
+        other => panic!("expected a typed-token logout popup, got {other:?}"),
+    };
+    assert!(
+        !body.contains('\u{1b}'),
+        "the ANSI escape is stripped: {body:?}"
+    );
+    assert!(
+        !body.contains('\u{7}'),
+        "the BEL control byte is stripped: {body:?}"
+    );
+    assert!(
+        !body.contains('\u{202e}'),
+        "the BiDi override is stripped: {body:?}"
+    );
+    assert!(
+        body.contains("Alice"),
+        "the visible display-name text survives sanitization: {body:?}"
+    );
+    assert!(
+        body.contains("npub1alice"),
+        "the npub identifies the account: {body:?}"
+    );
+}
+
+#[test]
+fn logout_slash_command_without_a_selected_account_reports_instead_of_arming() {
+    // With no account loaded there is nothing to log out; the command reports on
+    // the status line rather than opening a popup with an empty target.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.accounts.clear();
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout with no account is not an error");
+
+    assert!(app.popup.is_none(), "no popup without an account to target");
+    assert_eq!(app.status, "no account selected");
+}
+
+#[cfg(unix)]
+#[test]
+fn typing_the_logout_token_runs_wn_logout_and_refreshes() {
+    // The whole point of the typed-token confirm: typing the token and pressing
+    // Enter runs the real `wn logout <pubkey>` for the selected account, then
+    // reloads accounts so the TUI lands on a remaining account rather than the
+    // removed one.
+    let removed = "aa".repeat(32);
+    let remaining = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(
+        dir.path(),
+        r#"{"ok":true,"result":{"accounts":[{"account_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","npub":"npub1bob","local_signing":true}]}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &removed);
+    // No daemon so the refresh does not spawn subscription subprocesses; the flow
+    // under test is the command dispatch and account reload.
+    app.daemon.running = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    type_logout_token(&mut app);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on the exact token confirms logout");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line == format!("--json logout {removed}")),
+        "confirming runs `wn logout <selected-account>`; recorded: {recorded:?}"
+    );
+    assert!(app.popup.is_none(), "the popup closes after submit");
+    assert_eq!(
+        app.accounts.len(),
+        1,
+        "accounts reloaded after the wipe: {:?}",
+        app.accounts
+    );
+    assert_eq!(
+        app.accounts[0].account_id, remaining,
+        "the TUI lands on the remaining account, not the removed one"
+    );
+    assert!(
+        app.status.starts_with("logged out"),
+        "status: {}",
+        app.status
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_subprocess_failure_surfaces_on_status_without_clobbering_accounts() {
+    // A failed `wn logout` must be non-destructive to the TUI's view: the error
+    // surfaces on the status line, the popup closes, and the account list is left
+    // intact (the account still appears) rather than being cleared as if the wipe
+    // had succeeded.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(
+        dir.path(),
+        r#"{"ok":false,"error":{"message":"keychain locked"}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    type_logout_token(&mut app);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on the exact token confirms logout");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line == format!("--json logout {account_id}")),
+        "the wipe was attempted; recorded: {recorded:?}"
+    );
+    assert!(
+        app.popup.is_none(),
+        "the popup closes even when the wipe fails"
+    );
+    assert!(
+        app.status.starts_with("error:"),
+        "the failure surfaces on the status line: {}",
+        app.status
+    );
+    assert_eq!(
+        app.accounts.len(),
+        1,
+        "a failed wipe does not clobber the account list"
+    );
+    assert_eq!(
+        app.accounts[0].account_id, account_id,
+        "the account still appears after a failed wipe"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn canceling_the_typed_token_logout_with_esc_runs_nothing() {
+    // Esc cancels the typed-token confirm with no side effect — even after part
+    // of the token was typed: no `wn` process is spawned and the account list is
+    // unchanged.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    for character in "log".chars() {
+        app.handle_key(char_key(character))
+            .expect("partial token typed");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("Esc cancels the typed-token popup");
+
+    assert!(app.popup.is_none(), "Esc dismisses the typed-token popup");
+    assert!(!args_file.exists(), "canceling never spawns a `wn` process");
+    assert_eq!(app.accounts.len(), 1, "the account list is untouched");
+    assert_eq!(app.accounts[0].account_id, account_id);
+}
+
+#[cfg(unix)]
+#[test]
+fn public_only_logout_confirms_with_y_enter_and_runs_wn_logout() {
+    // A public-only account is re-addable, so it keeps the lighter y/Enter
+    // confirm (medium-tier friction is proportional there): `y` runs the real
+    // `wn logout <pubkey>`.
+    let account_id = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.accounts[0].local_signing = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    assert!(
+        matches!(app.popup, Some(Popup::Confirm { .. })),
+        "a public-only account keeps the y/Enter confirm"
+    );
+    app.handle_key(char_key('y')).expect("y confirms logout");
+
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line == format!("--json logout {account_id}")),
+        "y runs `wn logout <account>`; recorded: {recorded:?}"
+    );
+    assert!(app.popup.is_none(), "the confirm closes after submit");
+}
+
+#[cfg(unix)]
+#[test]
+fn canceling_public_only_logout_with_n_or_esc_runs_nothing() {
+    // The public-only confirm keeps its two cancel keys: both `n` and `Esc`
+    // dismiss it with no `wn` process spawned and the account list unchanged.
+    let account_id = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.accounts[0].local_signing = false;
+
+    for cancel in [
+        char_key('n'),
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    ] {
+        app.run_slash_command(SlashCommand::Logout)
+            .expect("/logout arms the popup");
+        app.handle_key(cancel).expect("cancel key handled");
+        assert!(app.popup.is_none(), "cancel dismisses the confirm");
+    }
+
+    assert!(!args_file.exists(), "canceling never spawns a `wn` process");
+    assert_eq!(app.accounts.len(), 1, "the account list is untouched");
+    assert_eq!(app.accounts[0].account_id, account_id);
+}
+
+#[test]
+fn logout_popup_captures_keys_without_leaking_to_the_composer() {
+    // The typed-token popup is modal: characters land in its own token field and
+    // never reach the composer draft hidden behind it.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.focus = Focus::Composer;
+    app.input.set_value("draft");
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    app.handle_key(char_key('x')).expect("stray key handled");
+
+    match &app.popup {
+        Some(Popup::Text { input, .. }) => {
+            assert_eq!(
+                input.value(),
+                "x",
+                "the key lands in the popup's own token field"
+            );
+        }
+        other => panic!("expected the typed-token popup to stay open, got {other:?}"),
+    }
+    assert_eq!(
+        app.input.value(),
+        "draft",
+        "the key does not leak into the composer behind the popup"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn logging_out_the_last_account_returns_to_the_login_menu_and_clears_state() {
+    // When the removed account was the only one, the TUI must not be left pointed
+    // at nothing: it clears chat/subscription state and drops to the login menu.
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, _args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    }];
+    app.chat_subscription = Some(test_chat_subscription(&account_id, false));
+    app.notification_subscription = Some(test_notification_subscription(&account_id));
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    type_logout_token(&mut app);
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on the exact token confirms logout");
+
+    assert!(app.accounts.is_empty(), "the last account is gone");
+    assert!(app.chats.is_empty(), "chats cleared");
+    assert!(
+        app.chat_subscription.is_none(),
+        "chat subscription torn down"
+    );
+    assert!(
+        app.notification_subscription.is_none(),
+        "notification subscription torn down"
+    );
+    assert_eq!(
+        app.screen,
+        Screen::Login(LoginMode::Menu),
+        "the TUI drops back to the login menu"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn double_enter_after_slash_logout_does_not_wipe_a_local_signing_account() {
+    // The fixed footgun: `/logout` submitted from the composer used to arm a
+    // y/Enter confirm, so Enter-then-Enter (slash submit, then confirm accept)
+    // instantly ran the destructive wipe — the identity-destroying action was
+    // uniquely reachable by two Enters. For a local-signing account the second
+    // Enter must be a no-op that keeps the popup open and spawns no `wn` process.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Composer;
+    app.input.set_value("/logout");
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("first Enter submits /logout and arms the popup");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("second Enter is handled");
+
+    assert!(
+        app.popup.is_some(),
+        "the logout popup stays open after the second Enter"
+    );
+    assert!(
+        !args_file.exists(),
+        "Enter-then-Enter never spawns a `wn` process"
+    );
+    assert_eq!(app.accounts.len(), 1, "the account is untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_token_mismatch_is_a_noop_that_keeps_the_popup_open() {
+    // A local-signing logout requires typing the exact token `logout`. Anything
+    // else — a near miss included — keeps the popup open and spawns no `wn`
+    // process, so a fat-fingered confirmation never destroys the identity.
+    let account_id = "aa".repeat(32);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(dir.path(), r#"{"ok":true,"result":{"accounts":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+
+    app.run_slash_command(SlashCommand::Logout)
+        .expect("/logout arms the popup");
+    for character in "logoutt".chars() {
+        app.handle_key(char_key(character))
+            .expect("typing the wrong token");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter on a mismatched token is handled");
+
+    assert!(
+        app.popup.is_some(),
+        "a mismatched token keeps the popup open"
+    );
+    assert!(
+        !args_file.exists(),
+        "a mismatched token spawns no `wn` process"
+    );
+    assert_eq!(app.accounts.len(), 1, "the account is untouched");
+}
+
+#[test]
 fn slash_command_parser_handles_daemon_commands() {
     assert_eq!(
         parse_slash_command("/daemon status"),
@@ -628,10 +1151,81 @@ fn chat_row_line_shows_unread_count_in_bold() {
 }
 
 #[test]
+fn chat_row_line_renders_the_unread_badge_yellow_and_bold() {
+    let chat = ChatRow {
+        group_id: "group-a".to_owned(),
+        name: "Project Room".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+
+    let line = chat_row_line(&chat, false, 3);
+
+    // The name keeps its own style while the `(N)` badge is a separate yellow
+    // bold span (the wn-tui look the spec pins).
+    assert_eq!(line_text(&line), "  Project Room (3)");
+    let name = &line.spans[1];
+    assert_eq!(name.content.as_ref(), "Project Room");
+    assert_eq!(name.style.fg, Some(Color::Green));
+    assert!(name.style.add_modifier.contains(Modifier::BOLD));
+    let badge = &line.spans[2];
+    assert_eq!(badge.content.as_ref(), " (3)");
+    assert_eq!(badge.style.fg, Some(Color::Yellow));
+    assert!(badge.style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn chat_row_line_selected_badge_takes_the_row_fg_bump() {
+    let chat = ChatRow {
+        group_id: "group-a".to_owned(),
+        name: "Project Room".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+
+    let line = chat_row_line(&chat, true, 3);
+
+    // The selected row renders black-on-white; the badge takes the same fg bump
+    // as the name (`row_label_style`) so it stays readable on the white bg.
+    let badge = &line.spans[2];
+    assert_eq!(badge.content.as_ref(), " (3)");
+    assert_eq!(badge.style.fg, Some(Color::Black));
+    assert!(badge.style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn chat_row_line_read_chat_has_no_badge_span() {
+    let chat = ChatRow {
+        group_id: "group-a".to_owned(),
+        name: "Project Room".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    };
+
+    let line = chat_row_line(&chat, false, 0);
+
+    assert_eq!(line_text(&line), "  Project Room");
+    assert!(
+        !line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::Yellow)),
+        "a read chat renders no badge span"
+    );
+}
+
+#[test]
 fn chat_label_keeps_unread_count_when_truncated() {
+    // The name is truncated to leave room for the whole badge within `max_len`,
+    // so the badge always survives truncation intact.
     assert_eq!(
         chat_label("A very long group display name", 12, 18),
-        "A very ...ame (12)"
+        ("A ver... name".to_owned(), Some(" (12)".to_owned()))
+    );
+    assert_eq!(
+        chat_label("ops", 0, 18),
+        ("ops".to_owned(), None),
+        "a read chat has no badge part"
     );
 }
 
@@ -1596,6 +2190,15 @@ fn move_index_clamps_at_list_edges() {
 
 fn char_key(character: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+}
+
+/// Type the exact logout confirmation token into an open typed-token popup,
+/// keyed off the shared constant so the tests track its value.
+fn type_logout_token(app: &mut TuiApp) {
+    for character in LOGOUT_CONFIRMATION_TOKEN.chars() {
+        app.handle_key(char_key(character))
+            .expect("typing the logout token");
+    }
 }
 
 #[test]
@@ -3731,7 +4334,14 @@ fn image_attachment(hash: &str) -> TimelineAttachment {
 /// A media state with an image-capable (halfblocks) picker and one decoded,
 /// ready image, built without a terminal or network via the test hooks.
 fn media_with_ready_image(hash: &str) -> MediaState {
-    let mut media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    media_ready_image_with_picker(ratatui_image::picker::Picker::halfblocks(), hash)
+}
+
+/// As `media_with_ready_image`, but adopting a specific `picker`. Used to prove
+/// the inline renderer stays cell-exact even when the terminal reports (or is
+/// mis-detected as) a pixel protocol such as iTerm2/Kitty/Sixel.
+fn media_ready_image_with_picker(picker: ratatui_image::picker::Picker, hash: &str) -> MediaState {
+    let mut media = MediaState::with_test_picker(picker);
     // Larger than the halfblocks font cell (10x20) so it occupies cells, and
     // vertically varied so the encoder emits half-block glyphs (a uniform image
     // collapses each cell to a space).
@@ -3744,6 +4354,25 @@ fn media_with_ready_image(hash: &str) -> MediaState {
         image: Box::new(image::DynamicImage::ImageRgb8(buffer)),
     });
     media
+}
+
+/// Each terminal row of a full frame render, top to bottom, as a string. Unlike
+/// `rendered_buffer` (which flattens the whole grid) this keeps row boundaries so
+/// a test can assert *where* content lands — e.g. that an image block never draws
+/// onto the following message's row.
+fn rendered_rows(app: &mut TuiApp) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    let buffer = terminal.backend().buffer().clone();
+    let area = buffer.area;
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
 }
 
 #[test]
@@ -3941,6 +4570,336 @@ fn ready_image_renders_over_its_placeholder_in_the_message_pane() {
     assert!(
         !rendered.contains("pixel.png"),
         "the placeholder should be replaced by the image"
+    );
+}
+
+/// Row index of the first rendered row containing `needle`, or `None`.
+fn row_index_containing(rows: &[String], needle: &str) -> Option<usize> {
+    rows.iter().position(|row| row.contains(needle))
+}
+
+/// Render `app` and return the row index where the second timeline message
+/// ("SENTINELREPLY") lands. Used to observe how far the first message's image
+/// slot pushes it down — measure (row height) must equal draw (rendered rows).
+fn second_message_row(app: &mut TuiApp) -> usize {
+    let rows = rendered_rows(app);
+    row_index_containing(&rows, "SENTINELREPLY")
+        .unwrap_or_else(|| panic!("second message not rendered:\n{}", rows.join("\n")))
+}
+
+fn image_row_pair() -> Vec<TimelineRow> {
+    let mut first = timeline_row("m0", 0);
+    first.from_display_name = Some("Al".to_owned());
+    first.display_text = "look".to_owned();
+    first.attachments = vec![image_attachment("cafebabe")];
+    let mut second = timeline_row("m1", 1);
+    second.from_display_name = Some("Bo".to_owned());
+    second.display_text = "SENTINELREPLY".to_owned();
+    vec![first, second]
+}
+
+#[test]
+fn ready_image_reserves_exactly_its_block_and_placeholders_reserve_one_row() {
+    // measure==draw: the rows a message occupies in the height model must equal
+    // the rows it draws. Observe it through where the *next* message lands. Every
+    // placeholder ladder state is one row, so the second message sits at the same
+    // row; a ready image reserves MEDIA_IMAGE_ROWS, pushing it down by exactly the
+    // difference. A block that drew more (or fewer) rows than it measured would
+    // move the next message and occlude/leave a gap — the reported symptom.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    app.timeline = image_row_pair();
+
+    // `[img ...]` placeholder: capable terminal, image not yet requested.
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    let img_row = second_message_row(&mut app);
+
+    // `[downloading ...]`
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    app.media.begin_download("cafebabe".to_owned());
+    assert_eq!(
+        second_message_row(&mut app),
+        img_row,
+        "the downloading placeholder is one row, like [img ...]"
+    );
+
+    // `[loading ...]`
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    app.media.begin_download("cafebabe".to_owned());
+    app.media.apply_for_test(MediaLoad::Downloaded {
+        hash: "cafebabe".to_owned(),
+    });
+    assert_eq!(
+        second_message_row(&mut app),
+        img_row,
+        "the loading placeholder is one row, like [img ...]"
+    );
+
+    // `[... failed: ...]`
+    app.media = MediaState::with_test_picker(ratatui_image::picker::Picker::halfblocks());
+    app.media.apply_for_test(MediaLoad::Failed {
+        hash: "cafebabe".to_owned(),
+        error: "boom".to_owned(),
+    });
+    assert_eq!(
+        second_message_row(&mut app),
+        img_row,
+        "the failed placeholder is one row, like [img ...]"
+    );
+
+    // Ready image: reserves MEDIA_IMAGE_ROWS rows where the placeholder used one.
+    app.media = media_with_ready_image("cafebabe");
+    let ready_row = second_message_row(&mut app);
+    assert_eq!(
+        ready_row - img_row,
+        usize::from(MEDIA_IMAGE_ROWS) - 1,
+        "a ready image reserves exactly MEDIA_IMAGE_ROWS rows, pushing the next \
+         message down by the block minus the one placeholder row it replaced"
+    );
+}
+
+#[test]
+fn ready_image_never_draws_onto_the_next_message_row() {
+    // Symptom 1, cell-exact form: the image must stay inside its reserved block
+    // and never draw onto (occlude) the following message's row.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    app.timeline = image_row_pair();
+    app.media = media_with_ready_image("cafebabe");
+
+    let rows = rendered_rows(&mut app);
+    let sentinel_row = row_index_containing(&rows, "SENTINELREPLY")
+        .expect("second message must remain visible below the image");
+    let last_glyph_row = rows
+        .iter()
+        .rposition(|row| row.contains('▀') || row.contains('▄'))
+        .expect("the ready image must draw halfblock glyphs");
+    assert!(
+        last_glyph_row < sentinel_row,
+        "image glyphs (last at row {last_glyph_row}) must stay above the next \
+         message (row {sentinel_row}); an image drawn onto it is the occlusion bug"
+    );
+}
+
+#[test]
+fn inline_images_render_cell_exact_not_a_pixel_protocol() {
+    // A terminal that reports (or is mis-detected as) a pixel protocol must not
+    // make the inline timeline draw a pixel-protocol image. In a scrolling message
+    // list a pixel image (iTerm2/Kitty/Sixel) maps its reserved cell block to
+    // pixels via a font size and stores image bytes terminal-side; if the detected
+    // font is off it overflows the block (occluding the next message) and cannot be
+    // erased on scroll. The renderer must adopt the cell-exact halfblocks protocol
+    // regardless of what the terminal reported.
+    //
+    // Structural guard: the picker here is force-set to a pixel protocol and then
+    // handed to `MediaState` through the *same* `adopt_picker` chokepoint the
+    // runtime's `detect_capability` uses (via the `with_test_picker` hook, which
+    // now just delegates to it). This test therefore fails if anyone removes or
+    // bypasses the chokepoint's cell-exact normalization — not merely if a
+    // test-only normalization is dropped.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::Main;
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m", 0);
+    row.display_text = "look".to_owned();
+    row.attachments = vec![image_attachment("cafebabe")];
+    app.timeline = vec![row];
+
+    // Build the media state the way a pixel-protocol terminal (iTerm2 answers the
+    // Kitty query and would be force-set to iTerm2) hands the picker over.
+    let mut picker = ratatui_image::picker::Picker::halfblocks();
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
+    app.media = media_ready_image_with_picker(picker, "cafebabe");
+
+    let rendered = rendered_buffer(&mut app);
+    // No raw pixel-protocol control sequence may be emitted into a cell: the iTerm2
+    // inline-image marker (OSC 1337) is the mechanism that overflows the block.
+    assert!(
+        !rendered.contains("1337"),
+        "an iTerm2 pixel escape must never be drawn inline in the scrolling timeline"
+    );
+    // The reserved block is filled by cell-exact halfblock glyphs instead.
+    assert!(
+        rendered.contains('▀') || rendered.contains('▄'),
+        "expected a cell-exact halfblock image in the reserved block"
+    );
+}
+
+#[test]
+fn startup_media_sweep_removes_leftover_cache_files_but_keeps_the_dir() {
+    // Decrypted-media artifacts are deleted right after decode, so any file still
+    // in the cache dir is litter left by a crashed session — decrypted plaintext
+    // at rest. The startup sweep must clear those files while leaving the
+    // directory itself in place for this session's downloads.
+    let home = tempfile::tempdir().expect("tempdir");
+    let cache_dir = home.path().join("tui-media-cache");
+    std::fs::create_dir_all(&cache_dir).expect("seed cache dir");
+    for name in ["deadbeef", "cafebabe", "f00dface"] {
+        std::fs::write(cache_dir.join(name), b"decrypted-plaintext").expect("seed leftover");
+    }
+
+    let client = WnClient {
+        home: Some(home.path().to_path_buf()),
+        ..test_unused_client()
+    };
+    let app = test_tui_app(client, &"aa".repeat(32));
+    app.sweep_media_cache();
+
+    assert!(cache_dir.is_dir(), "the sweep keeps the cache directory");
+    let remaining: Vec<_> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "the sweep removes every leftover decrypted file; remaining: {remaining:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_media_sweep_unlinks_symlinks_without_following_them() {
+    // The sweep's security contract: a symlink inside the cache dir is removed
+    // as a link, and the file it points to — outside the directory — survives.
+    let home = tempfile::tempdir().expect("tempdir");
+    let cache_dir = home.path().join("tui-media-cache");
+    std::fs::create_dir_all(&cache_dir).expect("seed cache dir");
+    let sentinel = home.path().join("sentinel-outside-cache");
+    std::fs::write(&sentinel, b"must survive").expect("seed sentinel");
+    std::os::unix::fs::symlink(&sentinel, cache_dir.join("deadbeef")).expect("seed symlink");
+
+    let client = WnClient {
+        home: Some(home.path().to_path_buf()),
+        ..test_unused_client()
+    };
+    let app = test_tui_app(client, &"aa".repeat(32));
+    app.sweep_media_cache();
+
+    assert!(
+        cache_dir.join("deadbeef").symlink_metadata().is_err(),
+        "the sweep unlinks the symlink itself"
+    );
+    assert!(
+        sentinel.exists(),
+        "the sweep never follows a link out of the cache dir"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_media_sweep_refuses_a_symlinked_cache_root() {
+    // `read_dir` follows a symlink at the path itself, so a cache root replaced
+    // by a symlink would redirect the sweep's unlinks into the target directory
+    // (the no-home fallback lives under the shared temp dir, where such a root
+    // can be pre-planted). The sweep must refuse a root that is not a real
+    // directory.
+    let home = tempfile::tempdir().expect("tempdir");
+    let target = home.path().join("victim-dir");
+    std::fs::create_dir_all(&target).expect("seed target dir");
+    std::fs::write(target.join("precious"), b"must survive").expect("seed victim file");
+    std::os::unix::fs::symlink(&target, home.path().join("tui-media-cache"))
+        .expect("seed symlinked cache root");
+
+    let client = WnClient {
+        home: Some(home.path().to_path_buf()),
+        ..test_unused_client()
+    };
+    let app = test_tui_app(client, &"aa".repeat(32));
+    app.sweep_media_cache();
+
+    assert!(
+        target.join("precious").exists(),
+        "a symlinked cache root must never redirect the sweep's unlinks"
+    );
+}
+
+/// Drive the download worker to completion and return its terminal result,
+/// skipping the intermediate `Downloaded` ladder step. The worker removes the
+/// on-disk artifact before sending the terminal result, so once this returns the
+/// file state is settled and race-free to assert on.
+#[cfg(unix)]
+fn run_media_worker(exe: &std::path::Path, output_path: PathBuf) -> MediaLoad {
+    let (tx, rx) = mpsc::channel();
+    spawn_media_download(StdCommand::new(exe), output_path, "deadbeef".to_owned(), tx);
+    loop {
+        match rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker result")
+        {
+            MediaLoad::Downloaded { .. } => continue,
+            terminal => return terminal,
+        }
+    }
+}
+
+/// A real, decodable PNG on disk, standing in for the CLI's decrypted write that
+/// the worker sees at `--output` after a successful `media download`.
+#[cfg(unix)]
+fn seed_decodable_image(path: &std::path::Path) {
+    let mut buffer = image::RgbImage::new(4, 4);
+    for (_, _, pixel) in buffer.enumerate_pixels_mut() {
+        *pixel = image::Rgb([10, 20, 30]);
+    }
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(buffer)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("encode png");
+    std::fs::write(path, encoded.into_inner()).expect("seed decrypted file");
+}
+
+#[cfg(unix)]
+#[test]
+fn media_worker_removes_the_decrypted_file_after_a_successful_decode() {
+    // The decrypted image is decoded into memory and never read from disk again,
+    // so the worker must remove the plaintext artifact once decode succeeds —
+    // decrypted media must not linger at rest.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
+    let output_path = dir.path().join("deadbeef");
+    seed_decodable_image(&output_path);
+    assert!(
+        output_path.exists(),
+        "the artifact exists before the worker runs"
+    );
+
+    let result = run_media_worker(&wn, output_path.clone());
+
+    assert!(
+        matches!(result, MediaLoad::Decoded { .. }),
+        "a valid image decodes"
+    );
+    assert!(
+        !output_path.exists(),
+        "the worker removes the decrypted artifact after a successful decode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn media_worker_removes_the_decrypted_file_after_a_failed_decode() {
+    // A download that succeeds but yields undecodable bytes still wrote decrypted
+    // plaintext to disk; the worker must remove it on the decode-failure path too,
+    // not only when decode succeeds.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wn = test_json_executable(dir.path(), r#"{"ok":true}"#);
+    let output_path = dir.path().join("deadbeef");
+    std::fs::write(&output_path, b"decrypted-but-not-an-image").expect("seed decrypted file");
+
+    let result = run_media_worker(&wn, output_path.clone());
+
+    assert!(
+        matches!(result, MediaLoad::Failed { .. }),
+        "undecodable bytes fail to decode"
+    );
+    assert!(
+        !output_path.exists(),
+        "the worker removes the decrypted artifact after a failed decode"
     );
 }
 
@@ -4784,7 +5743,7 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Composer, true),
-        "Enter send  Esc clear"
+        "Enter send  Ctrl-U clear"
     );
     assert_eq!(
         hints_line(Screen::Login(LoginMode::Menu), Focus::Chats, false),
@@ -4815,6 +5774,7 @@ fn popup_key_text_entry_submits_purpose_and_cancels() {
             group_id: "g1".to_owned(),
         },
         title: "Rename Group".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     };
     for character in "ops".chars() {
@@ -4836,6 +5796,7 @@ fn popup_key_text_entry_submits_purpose_and_cancels() {
             group_id: "g1".to_owned(),
         },
         title: "Add Member".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     };
     // An empty submit is a no-op; Esc cancels with no side effect.
@@ -4855,8 +5816,54 @@ fn popup_key_text_entry_submits_purpose_and_cancels() {
             group_id: "g1".to_owned(),
         },
         title: "Add Member".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     };
+    assert_eq!(popup_key(&mut cancel, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
+fn popup_key_confirm_logout_requires_the_exact_token() {
+    // The typed-token confirm submits only when the input is exactly the token.
+    // Both an empty submit (the double-Enter case) and any mismatch are no-ops
+    // that keep the popup open; Esc always cancels. This is the reducer-level
+    // guard behind the local-signing logout.
+    let logout = || Popup::Text {
+        purpose: TextPurpose::ConfirmLogout {
+            account_id: "aa".repeat(32),
+            npub: "npub1alice".to_owned(),
+        },
+        title: "Log Out".to_owned(),
+        body: vec!["Log out npub1alice?".to_owned()],
+        input: Input::default(),
+    };
+
+    // Empty submit: no-op, popup stays open.
+    let mut empty = logout();
+    assert_eq!(popup_key(&mut empty, KeyCode::Enter), PopupAction::None);
+
+    // A near-miss token: no-op, popup stays open.
+    let mut mismatch = logout();
+    for character in "logoutt".chars() {
+        popup_key(&mut mismatch, KeyCode::Char(character));
+    }
+    assert_eq!(popup_key(&mut mismatch, KeyCode::Enter), PopupAction::None);
+
+    // The exact token submits the wipe.
+    let mut exact = logout();
+    for character in LOGOUT_CONFIRMATION_TOKEN.chars() {
+        popup_key(&mut exact, KeyCode::Char(character));
+    }
+    assert_eq!(
+        popup_key(&mut exact, KeyCode::Enter),
+        PopupAction::Submit(PopupSubmit::Logout {
+            account_id: "aa".repeat(32),
+            npub: "npub1alice".to_owned(),
+        })
+    );
+
+    // Esc cancels regardless of typed content.
+    let mut cancel = logout();
     assert_eq!(popup_key(&mut cancel, KeyCode::Esc), PopupAction::Dismiss);
 }
 
@@ -4932,6 +5939,60 @@ fn popup_key_invites_picker_navigates_accepts_and_declines() {
         })
     );
     assert_eq!(popup_key(&mut decline, KeyCode::Esc), PopupAction::Dismiss);
+}
+
+#[test]
+fn popup_key_group_picker_navigates_and_chains_into_the_add_confirm() {
+    let items = vec![
+        PickerItem {
+            id: "g1".to_owned(),
+            label: "Room A".to_owned(),
+        },
+        PickerItem {
+            id: "g2".to_owned(),
+            label: "Room B".to_owned(),
+        },
+    ];
+    let picker =
+        || Popup::add_user_group_picker("pk".to_owned(), "Alice".to_owned(), items.clone(), 0);
+
+    // j then Enter chains into the add-user confirm for the highlighted chat —
+    // the picker chooses the target, the confirm still guards the action.
+    let mut choose = picker();
+    assert_eq!(
+        popup_key(&mut choose, KeyCode::Char('j')),
+        PopupAction::None
+    );
+    let action = popup_key(&mut choose, KeyCode::Enter);
+    let PopupAction::Open(Popup::Confirm {
+        purpose,
+        title,
+        body,
+    }) = action
+    else {
+        panic!("Enter must open the add-user confirm, got {action:?}");
+    };
+    assert_eq!(
+        purpose,
+        ConfirmPurpose::AddUserToChat {
+            group_id: "g2".to_owned(),
+            pubkey: "pk".to_owned(),
+        }
+    );
+    assert_eq!(title, "Add to Chat");
+    assert_eq!(body, vec!["Add Alice to Room B?".to_owned()]);
+
+    // The invites action keys mean nothing here, and Esc closes the picker.
+    let mut dismiss = picker();
+    assert_eq!(
+        popup_key(&mut dismiss, KeyCode::Char('a')),
+        PopupAction::None
+    );
+    assert_eq!(
+        popup_key(&mut dismiss, KeyCode::Char('d')),
+        PopupAction::None
+    );
+    assert_eq!(popup_key(&mut dismiss, KeyCode::Esc), PopupAction::Dismiss);
 }
 
 #[test]
@@ -6182,6 +7243,106 @@ fn slash_command_parser_handles_message_interactions() {
 }
 
 #[test]
+fn react_content_guard_rejects_typed_prose() {
+    // The field defect: `/react ` was prefilled, the user typed a whole message,
+    // and the prose published as a NIP-25 reaction. The guard now refuses content
+    // that is not a single emoji cluster and teaches the escape hatch on the way
+    // out. Prose spans more than one grapheme cluster, or is an all-ASCII token.
+    let hint = "reactions are a single emoji (Enter sends the default +); Esc clears";
+    for prose in [
+        "/react hello world",                              // whitespace between words
+        "/react \"hello world\"",                          // quoted -> one whitespaced arg
+        "/react hello",                                    // a plain-ASCII word is not an emoji
+        "/react 👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍", // a wall of emoji is not one reaction
+    ] {
+        assert_eq!(
+            parse_slash_command(prose),
+            Err(hint.to_owned()),
+            "{prose:?} must be refused with the teaching hint"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_accepts_the_default_and_real_emoji() {
+    // The guard must never break the sanctioned reactions: the `+` default and a
+    // single emoji, including multi-scalar ZWJ families, skin tones, and flags.
+    for (input, emoji) in [
+        ("/react", "+"),     // bare -> default +
+        ("/react +", "+"),   // the explicit + sentinel
+        ("/react 👍", "👍"), // single-scalar emoji
+        ("/react 👍🏾", "👍🏾"), // emoji + skin-tone modifier
+        ("/react 👨‍👩‍👧‍👦", "👨‍👩‍👧‍👦"), // ZWJ family: many scalars, one emoji
+        ("/react 🏳️‍🌈", "🏳️‍🌈"), // rainbow flag: base + VS16 + ZWJ + rainbow
+    ] {
+        assert_eq!(
+            parse_slash_command(input),
+            Ok(SlashCommand::React {
+                emoji: emoji.to_owned()
+            }),
+            "{input:?} must be accepted unchanged"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_accepts_counterintuitive_single_graphemes() {
+    // Regression pins for the accepted survivors that look like edge cases but are
+    // each exactly one non-ASCII grapheme cluster: the NIP-25 `-` downvote, the
+    // keycap and copyright emoji (base + variation/keycap scalars), and a lone CJK
+    // character (the documented, acceptable ceiling — one cluster, non-ASCII).
+    for (input, emoji) in [
+        ("/react -", "-"),   // NIP-25 dislike sentinel
+        ("/react 1️⃣", "1️⃣"), // keycap: '1' + VS16 + combining enclosing keycap
+        ("/react ©️", "©️"), // copyright + VS16
+        ("/react 你", "你"), // a single CJK character is one non-ASCII cluster
+    ] {
+        assert_eq!(
+            parse_slash_command(input),
+            Ok(SlashCommand::React {
+                emoji: emoji.to_owned()
+            }),
+            "{input:?} is one non-ASCII grapheme cluster and must be accepted"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_rejects_non_latin_and_accented_prose() {
+    // The length/ASCII heuristic let short non-Latin and accented prose through:
+    // `café`, `你好吗`, and `привет` all published. Real reactions are a single
+    // grapheme cluster, so multi-character words are refused whatever their
+    // script. `你好吗` is frozen here so this intent cannot silently regress.
+    let hint = "reactions are a single emoji (Enter sends the default +); Esc clears";
+    for prose in [
+        "/react café",   // Latin-1 accented word (4 clusters)
+        "/react 你好吗", // CJK prose (3 clusters)
+        "/react привет", // Cyrillic word (6 clusters)
+        "/react 👍👍",   // a run of emoji is not one reaction
+    ] {
+        assert_eq!(
+            parse_slash_command(prose),
+            Err(hint.to_owned()),
+            "{prose:?} must be refused: a reaction is one grapheme cluster"
+        );
+    }
+}
+
+#[test]
+fn react_content_guard_accepts_the_nip25_downvote_sentinel() {
+    // NIP-25 defines `-` as the dislike sentinel, and `messages react` already
+    // accepts it. A lone `-` is a single unambiguous token with no typed-prose
+    // risk, so the TUI guard must let it through alongside the `+` default.
+    assert_eq!(
+        parse_slash_command("/react -"),
+        Ok(SlashCommand::React {
+            emoji: "-".to_owned()
+        }),
+        "the NIP-25 - downvote sentinel must be accepted"
+    );
+}
+
+#[test]
 fn messages_r_prefills_the_react_command_in_the_composer() {
     let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
     app.focus = Focus::Messages;
@@ -6251,6 +7412,200 @@ fn messages_d_preserves_a_composer_draft_and_warns_instead_of_clobbering_it() {
         app.status.contains("draft"),
         "the status line explains why r/d was suppressed, got {}",
         app.status
+    );
+}
+
+#[test]
+fn armed_interaction_hint_names_the_action_and_target() {
+    // While the composer holds an interaction command, the hint tells the user
+    // what Enter will do and to which message — the durable signal the field
+    // report was missing. Recomputed from the composer text and selected row.
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Alice".to_owned());
+    row.display_text = "hello world".to_owned();
+
+    assert_eq!(
+        armed_interaction_hint("/react ", Some(&row)).as_deref(),
+        Some("reacting to Alice: \"hello world\" — Enter sends the reaction, Esc clears")
+    );
+    assert_eq!(
+        armed_interaction_hint("/reply ", Some(&row)).as_deref(),
+        Some("replying to Alice: \"hello world\" — Enter sends the reply, Esc clears")
+    );
+    assert_eq!(
+        armed_interaction_hint("/delete", Some(&row)).as_deref(),
+        Some("deleting Alice: \"hello world\" — Enter deletes, Esc clears")
+    );
+    // An edited prefill (the trapped scenario: `/react ` then typed prose) stays
+    // armed, so the escape-hatch hint persists.
+    assert_eq!(
+        armed_interaction_hint("/react this is not an emoji", Some(&row)).as_deref(),
+        Some("reacting to Alice: \"hello world\" — Enter sends the reaction, Esc clears")
+    );
+}
+
+#[test]
+fn armed_interaction_hint_is_none_for_drafts_and_unrelated_commands() {
+    let row = timeline_row("m0", 0);
+    // A hand-typed chat draft is not an armed interaction.
+    assert_eq!(armed_interaction_hint("hello everyone", Some(&row)), None);
+    // An unrelated slash command that merely shares a prefix must not match.
+    assert_eq!(armed_interaction_hint("/refresh", Some(&row)), None);
+    assert_eq!(armed_interaction_hint("/chat new ops", Some(&row)), None);
+    // A word that only starts like a command (no boundary) must not match.
+    assert_eq!(armed_interaction_hint("/reactor", Some(&row)), None);
+}
+
+#[test]
+fn render_hints_shows_the_persistent_armed_interaction_hint() {
+    // The armed hint replaces the static keymap in the hints bar while the
+    // composer holds an interaction command, so the pending action stays visible
+    // even if a later status event fires. Clearing the composer restores the
+    // normal keymap.
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut app = test_tui_app(test_unused_client(), account_id);
+    app.focus = Focus::Messages;
+    let mut row = timeline_row("m0", 0);
+    row.from_display_name = Some("Alice".to_owned());
+    row.display_text = "hello world".to_owned();
+    app.timeline = vec![row];
+    app.input.set_value("/react ");
+
+    let armed = rendered_buffer(&mut app);
+    assert!(
+        armed.contains("reacting to Alice") && armed.contains("Esc clears"),
+        "armed hint must name the action and target, got: {armed:?}"
+    );
+    assert!(
+        !armed.contains("r react  u unreact"),
+        "the static messages keymap must be replaced while armed, got: {armed:?}"
+    );
+
+    app.input.clear();
+    let idle = rendered_buffer(&mut app);
+    assert!(
+        idle.contains("r react  u unreact"),
+        "the static keymap returns once the composer is cleared, got: {idle:?}"
+    );
+}
+
+#[test]
+fn armed_interaction_hint_handles_an_empty_timeline() {
+    // Armed with nothing selected (empty timeline): the hint still shows so the
+    // escape hatch is visible; the submit path reports "no message selected".
+    assert_eq!(
+        armed_interaction_hint("/react ", None).as_deref(),
+        Some("reacting to the selected message — Enter sends the reaction, Esc clears")
+    );
+}
+
+#[test]
+fn esc_clears_an_armed_interaction_prefill() {
+    // Esc is the escape hatch the armed hint advertises. It clears an interaction
+    // prefill — pristine or edited — so a user who armed a reaction by accident
+    // (the field defect) can back out instead of publishing prose as a reaction.
+    for armed in [
+        "/react ",
+        "/react this is not an emoji",
+        "/reply hi",
+        "/delete",
+    ] {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.focus = Focus::Composer;
+        app.input.set_value(armed);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc");
+
+        assert!(
+            app.input.is_empty(),
+            "Esc must clear the armed interaction {armed:?}, left {:?}",
+            app.input.value()
+        );
+    }
+}
+
+#[test]
+fn esc_preserves_a_hand_typed_draft() {
+    // Esc must not silently destroy text the user wrote by hand: a chat draft (or
+    // any non-interaction slash command) survives Esc, matching the draft
+    // protection that keeps r/d/R from clobbering it.
+    for draft in ["hello everyone", "/chat new ops"] {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.focus = Focus::Composer;
+        app.input.set_value(draft);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc");
+
+        assert_eq!(
+            app.input.value(),
+            draft,
+            "Esc must preserve a hand-typed draft, not destroy it"
+        );
+    }
+}
+
+#[test]
+fn ctrl_u_clears_the_composer_regardless_of_state() {
+    // Ctrl-U is the readline kill-line: it empties the composer whatever it holds
+    // — a hand-typed draft (which Esc deliberately preserves) or an armed
+    // interaction prefill — so the composer hint can honestly name a key that
+    // always clears the field.
+    for content in ["a half-typed draft", "/chat new ops", "/react ", "/delete"] {
+        let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+        app.focus = Focus::Composer;
+        app.input.set_value(content);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .expect("ctrl-u");
+
+        assert!(
+            app.input.is_empty(),
+            "Ctrl-U must clear the composer holding {content:?}, left {:?}",
+            app.input.value()
+        );
+    }
+}
+
+#[test]
+fn armed_hint_and_send_target_resolve_to_the_same_selected_row() {
+    // The armed hint names a row and Enter sends to a row: both must be the same
+    // row. Arm /react, move the selection off the default newest row, and pin that
+    // the hint names the NEW row's sender while the send target
+    // (`selected_timeline_message_id`, the resolution the Enter path uses) points
+    // at that same row — so the hint can never advertise a different message than
+    // the one that gets reacted to.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    let mut oldest = timeline_row("m0", 0);
+    oldest.from_display_name = Some("Oldest".to_owned());
+    let mut middle = timeline_row("m1", 1);
+    middle.from_display_name = Some("Middle".to_owned());
+    let mut newest = timeline_row("m2", 2);
+    newest.from_display_name = Some("Newest".to_owned());
+    app.timeline = vec![oldest, middle, newest];
+
+    // Move the selection off the default newest row, then arm /react via `r`.
+    app.focus = Focus::Messages;
+    app.handle_key(char_key('k')).expect("select up");
+    app.handle_key(char_key('r')).expect("arm react");
+
+    let target = app
+        .selected_timeline_message_id()
+        .expect("a row is selected");
+    assert_eq!(target, "m1", "the send target follows the moved selection");
+
+    let selected = app.selected_timeline_row().expect("a row is selected");
+    assert_eq!(
+        selected.message_id, target,
+        "the hint row and the send target are the same resolution"
+    );
+
+    let hint = armed_interaction_hint(app.input.value(), Some(selected))
+        .expect("an armed /react shows a hint");
+    assert!(
+        hint.contains("reacting to Middle") && !hint.contains("Newest"),
+        "the armed hint names the selected row's sender, got: {hint:?}"
     );
 }
 
@@ -6667,6 +8022,7 @@ fn handle_paste_into_a_text_popup_lands_in_its_input_not_the_composer() {
             group_id: "g1".to_owned(),
         },
         title: "Add Member".to_owned(),
+        body: Vec::new(),
         input: Input::default(),
     });
 
@@ -6897,43 +8253,43 @@ fn slash_users_query_runs_the_search_immediately() {
 }
 
 #[test]
-fn user_search_add_to_chat_is_guarded_on_no_loaded_chat() {
-    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
-    let view = UserSearchView {
-        results: vec![UserSearchResultRow {
-            pubkey: "aa".to_owned(),
-            npub: "npubaa".to_owned(),
-            display_name: Some("Alice".to_owned()),
-            matched_field: "name".to_owned(),
-            match_quality: "exact".to_owned(),
-            radius: 0,
-        }],
-        focus: UserSearchFocus::Results,
-        ..UserSearchView::default()
-    };
-    app.user_search = Some(view);
-    app.screen = Screen::UserSearch;
-    app.messages_group_id = None;
+fn user_search_add_is_guarded_when_there_are_no_chats() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    assert!(app.chats.is_empty());
 
-    // No loaded chat: the add action is guarded to a status notice, no popup.
+    // No chats at all: the add action is guarded to a status notice, no popup.
     app.handle_key(char_key('a')).expect("a guarded");
-    assert!(app.popup.is_none(), "no popup without a loaded chat");
+    assert!(app.popup.is_none(), "no popup without any chat");
     assert!(
-        app.status.contains("open a chat"),
+        app.status.contains("no chats"),
         "status explains the guard: {}",
         app.status
     );
+}
 
-    // With a loaded chat: a confirm popup targets the open chat.
-    app.messages_group_id = Some("g1".to_owned());
-    app.handle_key(char_key('a')).expect("a add");
-    assert!(matches!(
-        app.popup,
-        Some(Popup::Confirm {
-            purpose: ConfirmPurpose::AddUserToChat { .. },
-            ..
-        })
-    ));
+#[test]
+fn user_search_add_preselects_the_open_chat_in_the_picker() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    app.chats = vec![
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Room One".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g2".to_owned(),
+            name: "Room Two".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+    app.messages_group_id = Some("g2".to_owned());
+
+    app.handle_key(char_key('a')).expect("a opens the picker");
+
+    let Some(Popup::Picker { selected, .. }) = &app.popup else {
+        panic!("a must open the group picker, got {:?}", app.popup);
+    };
+    assert_eq!(*selected, 1, "the open chat is preselected");
 }
 
 #[test]
@@ -7192,6 +8548,18 @@ fn help_card_documents_the_new_screens() {
     assert!(help.contains("/users"), "help mentions the /users command");
 }
 
+#[test]
+fn logout_is_discoverable_in_help_and_suggestions() {
+    let help = help_card_lines().join("\n");
+    assert!(help.contains("/logout"), "help card lists /logout");
+    assert!(
+        slash_command_suggestions("/logout")
+            .iter()
+            .any(|suggestion| suggestion.usage == "/logout"),
+        "slash suggestions offer /logout"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn follows_child_invocation_borrows_the_setup_relay_only_without_a_global_relay() {
@@ -7288,6 +8656,46 @@ fn user_search_app_with_selected_result(client: WnClient) -> TuiApp {
 }
 
 #[test]
+fn user_search_add_opens_the_group_picker_over_the_chats_list() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    app.chats = vec![
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Room One".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g2".to_owned(),
+            name: "Room Two".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+
+    app.handle_key(char_key('a')).expect("a opens the picker");
+
+    let Some(Popup::Picker {
+        purpose: PickerPurpose::Groups { pubkey, label },
+        items,
+        selected,
+        ..
+    }) = &app.popup
+    else {
+        panic!("a must open the group picker, got {:?}", app.popup);
+    };
+    assert_eq!(pubkey, "bb", "the picker carries the found user");
+    assert_eq!(label, "Bob");
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| (item.id.as_str(), item.label.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("g1", "Room One"), ("g2", "Room Two")],
+        "one row per chat, in the chats-list order already in state"
+    );
+    assert_eq!(*selected, 0, "no open chat: the first row is preselected");
+}
+
+#[test]
 fn new_chat_from_search_navigates_into_the_created_chat() {
     let (_dir, client) = test_json_client(
         r#"{"ok":true,"result":{"group_id":"abcd","chats":[{"group_id":"abcd","profile":{"name":"New Room"}}]}}"#,
@@ -7323,8 +8731,9 @@ fn add_to_open_chat_from_search_navigates_into_that_chat() {
         },
     ];
     app.messages_group_id = Some("g1".to_owned());
-    app.handle_key(char_key('a'))
-        .expect("a opens add-to-chat popup");
+    app.handle_key(char_key('a')).expect("a opens the picker");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter picks the preselected open chat");
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .expect("confirm add to chat");
     assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
@@ -7334,4 +8743,101 @@ fn add_to_open_chat_from_search_navigates_into_that_chat() {
         Some("g1"),
         "the affected chat is selected"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn add_to_a_picker_chosen_chat_from_search_confirms_and_navigates_into_it() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        home: None,
+        socket: None,
+        relay: None,
+        discovery_relays: Vec::new(),
+        default_account_relays: Vec::new(),
+        secret_store: None,
+        keychain_service: None,
+    };
+    let mut app = user_search_app_with_selected_result(client);
+    app.chats = vec![
+        ChatRow {
+            group_id: "other".to_owned(),
+            name: "Other".to_owned(),
+            ..ChatRow::default()
+        },
+        ChatRow {
+            group_id: "g1".to_owned(),
+            name: "Open Room".to_owned(),
+            ..ChatRow::default()
+        },
+    ];
+    app.messages_group_id = Some("g1".to_owned());
+
+    // k moves off the preselected open chat; Enter reaches the confirm for the
+    // chosen group, not the open one.
+    app.handle_key(char_key('a')).expect("a opens the picker");
+    app.handle_key(char_key('k')).expect("k moves up");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("Enter picks the highlighted chat");
+    let Some(Popup::Confirm {
+        purpose: ConfirmPurpose::AddUserToChat { group_id, pubkey },
+        ..
+    }) = &app.popup
+    else {
+        panic!("Enter must open the add-user confirm, got {:?}", app.popup);
+    };
+    assert_eq!(group_id, "other", "the confirm targets the chosen group");
+    assert_eq!(pubkey, "bb");
+
+    // The confirm still guards the action; y runs the real add and navigates.
+    app.handle_key(char_key('y')).expect("y confirms the add");
+    assert_eq!(app.screen, Screen::Main, "leaves search for the main view");
+    assert!(app.user_search.is_none(), "the search view is cleared");
+    assert_eq!(
+        app.selected_chat_row().map(|chat| chat.group_id.as_str()),
+        Some("other"),
+        "the chosen chat is selected"
+    );
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(
+        recorded.contains("groups add-members other bb"),
+        "the confirm submit runs the real add against the chosen group: {recorded}"
+    );
+}
+
+#[test]
+fn group_picker_esc_closes_with_zero_side_effects() {
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    app.chats = vec![ChatRow {
+        group_id: "g1".to_owned(),
+        name: "Room One".to_owned(),
+        ..ChatRow::default()
+    }];
+    app.status = "before".to_owned();
+
+    // One consistent rule: the picker opens whenever any chat exists, even for
+    // a single chat (no direct-to-confirm special case).
+    app.handle_key(char_key('a')).expect("a opens the picker");
+    assert!(
+        matches!(
+            app.popup,
+            Some(Popup::Picker {
+                purpose: PickerPurpose::Groups { .. },
+                ..
+            })
+        ),
+        "a single chat still goes through the picker"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .expect("Esc closes the picker");
+
+    assert!(app.popup.is_none(), "the picker is closed");
+    assert_eq!(app.status, "before", "no status change");
+    assert_eq!(app.screen, Screen::UserSearch, "still on the search screen");
+    assert!(app.user_search.is_some(), "the search view is intact");
+    assert_eq!(app.chats.len(), 1, "chats untouched");
+    assert_eq!(app.selected_chat, 0, "selection untouched");
 }

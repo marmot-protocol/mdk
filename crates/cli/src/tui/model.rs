@@ -283,10 +283,14 @@ pub(crate) enum Screen {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Popup {
     /// Text entry. `Enter` submits when non-empty, `Esc` cancels. Reuses the
-    /// composer's `Input` so cursor editing and masking behave identically.
+    /// composer's `Input` so cursor editing and masking behave identically. The
+    /// optional `body` renders explanatory lines above the input (empty for the
+    /// plain prompts); a typed-token confirmation uses it to carry the honest
+    /// consequence wording plus the instruction on what to type.
     Text {
         purpose: TextPurpose,
         title: String,
+        body: Vec<String>,
         input: Input,
     },
     /// Confirm. `y`/`Enter` confirms, `n`/`Esc` cancels.
@@ -332,17 +336,72 @@ pub(crate) enum TextPurpose {
     NewChatWithUser {
         pubkey: String,
     },
+    /// Typed-token confirmation for logging out (permanently removing) a
+    /// local-signing account. Unlike the free-form purposes, this does not
+    /// capture arbitrary input: the user must type the literal
+    /// [`LOGOUT_CONFIRMATION_TOKEN`] to submit the irreversible wipe (the
+    /// signing key is destroyed with the local data). `account_id` is the
+    /// `wn logout` target; `npub` identifies it in the post-logout status once
+    /// the account row is gone.
+    ConfirmLogout {
+        account_id: String,
+        npub: String,
+    },
+}
+
+/// The literal word a user must type to confirm the irreversible logout of a
+/// local-signing account (see [`TextPurpose::ConfirmLogout`]). Defined once so
+/// the reducer's exact-match check, the popup's instruction line, and the tests
+/// all share a single source of truth.
+pub(crate) const LOGOUT_CONFIRMATION_TOKEN: &str = "logout";
+
+impl TextPurpose {
+    /// The literal token that must be typed before `Enter` submits a typed-token
+    /// confirmation. Free-form entry purposes return `None` (any non-empty value
+    /// submits); a confirmation purpose returns the exact word the user must
+    /// type, so the reducer submits only on an exact match and treats an empty or
+    /// mismatched value as a no-op that keeps the popup open.
+    fn confirmation_token(&self) -> Option<&'static str> {
+        match self {
+            TextPurpose::ConfirmLogout { .. } => Some(LOGOUT_CONFIRMATION_TOKEN),
+            TextPurpose::RenameGroup { .. }
+            | TextPurpose::AddMemberByPubkey { .. }
+            | TextPurpose::EditProfileField { .. }
+            | TextPurpose::FollowByPubkey
+            | TextPurpose::NewChatWithUser { .. } => None,
+        }
+    }
 }
 
 /// What a confirm popup does on `y`/`Enter`. 5b adds unfollow and
 /// add-found-user-to-the-current-chat here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConfirmPurpose {
-    RemoveMember { group_id: String, pubkey: String },
-    PromoteMember { group_id: String, pubkey: String },
-    LeaveGroup { group_id: String },
-    Unfollow { pubkey: String },
-    AddUserToChat { group_id: String, pubkey: String },
+    RemoveMember {
+        group_id: String,
+        pubkey: String,
+    },
+    PromoteMember {
+        group_id: String,
+        pubkey: String,
+    },
+    LeaveGroup {
+        group_id: String,
+    },
+    Unfollow {
+        pubkey: String,
+    },
+    AddUserToChat {
+        group_id: String,
+        pubkey: String,
+    },
+    /// Log out (permanently remove) an account. `account_id` is the `wn logout`
+    /// target; `npub` identifies it in the post-logout status once the account
+    /// row is gone.
+    Logout {
+        account_id: String,
+        npub: String,
+    },
 }
 
 /// An editable own-profile field. Each maps to exactly one `profile update`
@@ -394,10 +453,17 @@ impl ProfileField {
     }
 }
 
-/// What a list picker acts on. Extends for 5b (group picker for user search).
+/// What a list picker acts on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PickerPurpose {
     Invites,
+    /// Choose which existing chat to add a found user to (user-search `a`).
+    /// Carries the found user's pubkey and display label so `Enter` can chain
+    /// into the add-user confirm for the highlighted chat.
+    Groups {
+        pubkey: String,
+        label: String,
+    },
 }
 
 /// One row of a list-picker popup: an opaque id the action targets plus a
@@ -411,12 +477,14 @@ pub(crate) struct PickerItem {
 /// The outcome of routing one key into an open popup. `None` means the popup
 /// handled the key internally (edit/navigate) and stays open; `Dismiss` closes
 /// it with no side effect; `Submit` closes it and asks the app to run one CLI
-/// call.
+/// call; `Open` replaces it with the next popup of a multi-step flow (the
+/// group picker's `Enter` opens the add-user confirm) with no CLI call yet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PopupAction {
     None,
     Dismiss,
     Submit(PopupSubmit),
+    Open(Popup),
 }
 
 /// A resolved popup submission: exactly one CLI call, chosen by mapping the
@@ -436,6 +504,7 @@ pub(crate) enum PopupSubmit {
     Unfollow { pubkey: String },
     NewChat { name: String, pubkey: String },
     AddUserToChat { group_id: String, pubkey: String },
+    Logout { account_id: String, npub: String },
 }
 
 impl Popup {
@@ -467,6 +536,46 @@ impl Popup {
         }
     }
 
+    /// The group picker for adding a found user to an existing chat
+    /// (user-search `a`): one row per loaded chat, `Enter` chains into the
+    /// add-user confirm for the highlighted chat.
+    pub(crate) fn add_user_group_picker(
+        pubkey: String,
+        label: String,
+        items: Vec<PickerItem>,
+        selected: usize,
+    ) -> Self {
+        Popup::Picker {
+            purpose: PickerPurpose::Groups { pubkey, label },
+            title: "Add to Chat".to_owned(),
+            items,
+            selected,
+        }
+    }
+
+    /// The add-user-to-chat confirm. Built by the group picker's `Enter` (which
+    /// chose the target chat), so the guarding step and its wording live in one
+    /// place.
+    pub(crate) fn confirm_add_user_to_chat(
+        group_id: &str,
+        chat_label: &str,
+        pubkey: &str,
+        user_label: &str,
+    ) -> Self {
+        Popup::Confirm {
+            purpose: ConfirmPurpose::AddUserToChat {
+                group_id: group_id.to_owned(),
+                pubkey: pubkey.to_owned(),
+            },
+            title: "Add to Chat".to_owned(),
+            body: vec![format!(
+                "Add {} to {}?",
+                shorten(&terminal_safe_text(user_label), 24),
+                shorten(&terminal_safe_text(chat_label), 24),
+            )],
+        }
+    }
+
     /// The card/confirm title (only these variants carry a shown title).
     pub(crate) fn title(&self) -> &str {
         match self {
@@ -490,10 +599,18 @@ pub(crate) fn popup_key(popup: &mut Popup, key: KeyCode) -> PopupAction {
         Popup::Text { purpose, input, .. } => match key {
             KeyCode::Enter => {
                 let value = input.value().trim().to_owned();
-                if value.is_empty() {
-                    PopupAction::None
-                } else {
+                let ready = match purpose.confirmation_token() {
+                    // Typed-token confirmation: submit only on an exact match.
+                    // Empty (the double-Enter case) or any mismatch is a no-op
+                    // that keeps the popup open.
+                    Some(token) => value == token,
+                    // Free-form entry: submit any non-empty value.
+                    None => !value.is_empty(),
+                };
+                if ready {
                     PopupAction::Submit(text_purpose_submit(purpose, value))
+                } else {
+                    PopupAction::None
                 }
             }
             KeyCode::Esc => PopupAction::Dismiss,
@@ -575,6 +692,12 @@ fn text_purpose_submit(purpose: &TextPurpose, value: String) -> PopupSubmit {
             name: value,
             pubkey: pubkey.clone(),
         },
+        // The typed token was already matched by the reducer; it is a fixed
+        // confirmation word, not user data, so it is discarded here.
+        TextPurpose::ConfirmLogout { account_id, npub } => PopupSubmit::Logout {
+            account_id: account_id.clone(),
+            npub: npub.clone(),
+        },
     }
 }
 
@@ -598,6 +721,10 @@ fn confirm_purpose_submit(purpose: &ConfirmPurpose) -> PopupSubmit {
             group_id: group_id.clone(),
             pubkey: pubkey.clone(),
         },
+        ConfirmPurpose::Logout { account_id, npub } => PopupSubmit::Logout {
+            account_id: account_id.clone(),
+            npub: npub.clone(),
+        },
     }
 }
 
@@ -619,6 +746,17 @@ fn picker_purpose_action(
             }),
             _ => PopupAction::None,
         },
+        PickerPurpose::Groups { pubkey, label } => match key {
+            // The picker only chooses the target chat; the confirm it opens
+            // still guards the actual add.
+            KeyCode::Enter => PopupAction::Open(Popup::confirm_add_user_to_chat(
+                &item.id,
+                &item.label,
+                pubkey,
+                label,
+            )),
+            _ => PopupAction::None,
+        },
     }
 }
 
@@ -632,6 +770,10 @@ pub(crate) fn popup_hint(popup: &Popup) -> &'static str {
             purpose: PickerPurpose::Invites,
             ..
         } => "[a] accept  [d] decline  [j/k] move  [Esc] close",
+        Popup::Picker {
+            purpose: PickerPurpose::Groups { .. },
+            ..
+        } => "[Enter] select  [j/k] move  [Esc] close",
         Popup::Card { .. } | Popup::Image { .. } => "[any key] dismiss",
     }
 }
@@ -646,12 +788,12 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "On the selected message: r react (Enter sends +), u unreact, d delete, R reply.",
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
         "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
-        "User search: type + Enter searches; Enter opens a card; c chat; a add to open chat.",
+        "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat.",
         "Profile: j/k move; Enter edits a field; f follow; x unfollow. Relay health: r refresh.",
         "Popups capture every key; Esc or the shown key closes them.",
         "",
         "/refresh   /diagnostics   /account <npub-or-hex>   /create-identity",
-        "/login <nsec-or-npub>   /daemon status|start|stop   /users [query]",
+        "/login <nsec-or-npub>   /logout   /daemon status|start|stop   /users [query]",
         "/chat new|rename|describe|archive|unarchive|archived",
         "/members add|remove|list   /react [emoji]   /unreact   /delete   /reply <text>   /retry <id>",
         "/keys fetch|rotate   /profile name <display-name>   /quit",
@@ -1514,9 +1656,73 @@ pub(crate) fn hints_line(screen: Screen, focus: Focus, entered_main: bool) -> &'
             Focus::Messages => {
                 "j/k select  G/g ends  r react  u unreact  d delete  R reply  i compose"
             }
-            Focus::Composer => "Enter send  Esc clear",
+            Focus::Composer => "Enter send  Ctrl-U clear",
         },
     }
+}
+
+/// A composer prefix that arms a selected-message interaction, paired with the
+/// verb and the Enter action the persistent hint advertises. When the composer
+/// begins with one of these, Enter acts on the selected message instead of
+/// sending a chat message, so the armed state must stay visible until resolved.
+struct ArmedInteraction {
+    command: &'static str,
+    verb: &'static str,
+    action: &'static str,
+}
+
+const ARMED_INTERACTIONS: &[ArmedInteraction] = &[
+    ArmedInteraction {
+        command: "/react",
+        verb: "reacting to",
+        action: "Enter sends the reaction",
+    },
+    ArmedInteraction {
+        command: "/reply",
+        verb: "replying to",
+        action: "Enter sends the reply",
+    },
+    ArmedInteraction {
+        command: "/delete",
+        verb: "deleting",
+        action: "Enter deletes",
+    },
+];
+
+/// The armed interaction the composer text begins with, if any: `input` is the
+/// command exactly (`/delete`) or the command followed by whitespace (`/react `,
+/// `/reply hello`). Matching on the whole command word (not a bare prefix) keeps
+/// `/refresh` and `/reactor` from counting. Shared by the persistent armed hint
+/// and the `Esc` escape hatch so they agree on what "armed" means.
+fn armed_interaction(input: &str) -> Option<&'static ArmedInteraction> {
+    ARMED_INTERACTIONS.iter().find(|armed| {
+        input
+            .strip_prefix(armed.command)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(|ch: char| ch.is_whitespace()))
+    })
+}
+
+/// True when the composer holds an armed selected-message interaction, so `Esc`
+/// should clear it as the escape hatch rather than leaving the user trapped.
+pub(crate) fn is_armed_interaction(input: &str) -> bool {
+    armed_interaction(input).is_some()
+}
+
+/// The persistent hint shown while the composer holds an armed interaction: what
+/// Enter will do and to which message, plus the `Esc` escape hatch. Recomputed
+/// from the composer text and the selected row at render time (not stored as a
+/// one-shot status a later event would overwrite), so the armed state stays
+/// visible until the command is sent or cleared. `None` when not armed.
+pub(crate) fn armed_interaction_hint(input: &str, row: Option<&TimelineRow>) -> Option<String> {
+    let armed = armed_interaction(input)?;
+    let target = match row {
+        Some(row) => timeline_target_label(row),
+        None => "the selected message".to_owned(),
+    };
+    Some(format!(
+        "{} {target} — {}, Esc clears",
+        armed.verb, armed.action
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1528,6 +1734,10 @@ pub(crate) enum SlashCommand {
     AccountCreate,
     AccountAddPublic(String),
     AccountImportSecret(String),
+    /// Log out the currently selected account. Always routed through a confirm
+    /// popup because `wn logout` permanently removes the account's local data and
+    /// signing key from this device.
+    Logout,
     DaemonStatus,
     DaemonStart,
     DaemonStop,
@@ -1633,6 +1843,10 @@ pub(crate) const SLASH_COMMAND_SUGGESTIONS: &[SlashCommandSuggestion] = &[
     SlashCommandSuggestion {
         usage: "/login <nsec-or-npub>",
         description: "import or add an identity",
+    },
+    SlashCommandSuggestion {
+        usage: "/logout",
+        description: "remove the selected account from this device",
     },
     SlashCommandSuggestion {
         usage: "/daemon status",
@@ -3091,11 +3305,11 @@ mod timeline {
         ])
     }
 
-    /// The `R`-accelerator status line naming the reply target:
-    /// `replying to <name>: "<first 30 chars>"`. Mirrors `timeline_reply_line`'s
-    /// clip and terminal-control stripping; the author falls back to a shortened
-    /// sender id when the row carries no display name.
-    pub(crate) fn reply_target_status(row: &TimelineRow) -> String {
+    /// `<name>: "<first 30 chars>"` for a timeline row: the sender's display name
+    /// (falling back to a shortened id) and a clipped, terminal-control-stripped
+    /// body preview. Shared by the reply status line and the armed-interaction
+    /// hint so they name the target identically.
+    pub(crate) fn timeline_target_label(row: &TimelineRow) -> String {
         let name = match row.from_display_name.as_deref() {
             Some(name) if !name.is_empty() => terminal_safe_text(name),
             _ => terminal_safe_text(&shorten(&row.from, 12)),
@@ -3107,10 +3321,18 @@ mod timeline {
         };
         let clipped = body.chars().take(30).collect::<String>();
         if body.chars().count() > 30 {
-            format!("replying to {name}: \"{clipped}...\"")
+            format!("{name}: \"{clipped}...\"")
         } else {
-            format!("replying to {name}: \"{clipped}\"")
+            format!("{name}: \"{clipped}\"")
         }
+    }
+
+    /// The `R`-accelerator status line naming the reply target:
+    /// `replying to <name>: "<first 30 chars>"`. Mirrors `timeline_reply_line`'s
+    /// clip and terminal-control stripping; the author falls back to a shortened
+    /// sender id when the row carries no display name.
+    pub(crate) fn reply_target_status(row: &TimelineRow) -> String {
+        format!("replying to {}", timeline_target_label(row))
     }
 
     /// The reactions line rendered below a message: yellow `<emoji> <count>` pairs

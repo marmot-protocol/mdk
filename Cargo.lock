@@ -7166,6 +7166,7 @@ dependencies = [
  "transport-quic-broker",
  "transport-quic-stream",
  "unicode-properties",
+ "unicode-segmentation",
  "url",
 ]
 

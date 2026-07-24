@@ -70,6 +70,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # General-category lookups for the terminal untrusted-text sanitizer (drop the
 # whole Cf format class instead of a drifting hardcoded denylist).
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+# Extended grapheme-cluster segmentation for the TUI /react guard (one cluster ==
+# one emoji). Already in the tree via ratatui; declared here so wn-cli can depend
+# on it directly at the workspace-consistent version.
+unicode-segmentation = "1"
 unicode-normalization = "0.1"
 rand = "0.8"
 sha2 = "0.10"

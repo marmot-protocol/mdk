@@ -138,6 +138,9 @@ impl TuiApp {
         // before the event loop starts reading stdin. Detection failure leaves
         // media placeholders in place (no image protocol).
         self.media.detect_capability();
+        // Sweep any decrypted-media artifacts a prior crashed session left in the
+        // cache dir before this session starts writing its own downloads.
+        self.sweep_media_cache();
         // Bracketed paste delivers a paste as one `Event::Paste(text)` instead of a
         // burst of key events, so a multi-line paste keeps its newlines instead of
         // firing Enter (send) on every line. Best-effort chrome: ignore failures
@@ -393,7 +396,13 @@ impl TuiApp {
             }
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.previous(),
-            KeyCode::Esc => {
+            // Esc is the escape hatch the armed-interaction hint advertises: it
+            // clears an armed `/react`/`/reply`/`/delete` prefill (pristine or
+            // edited) so a user who armed a reaction by accident can back out. A
+            // hand-typed draft is never an armed command, so Esc leaves it intact
+            // — Esc must not silently destroy text the user wrote by hand, the
+            // same reason r/d/R refuse to clobber a draft.
+            KeyCode::Esc if is_armed_interaction(self.input.value()) => {
                 self.input.clear();
             }
             KeyCode::Char('/') if self.focus != Focus::Composer => {
@@ -496,6 +505,17 @@ impl TuiApp {
             KeyCode::Backspace if self.focus == Focus::Composer => {
                 self.input.backspace();
             }
+            // Ctrl-U is the readline kill-line: an unconditional composer clear
+            // whatever the field holds — an armed interaction prefill or a
+            // hand-typed draft — so the composer hint can name a key that always
+            // clears. It precedes the plain-Char insert so Ctrl-U is never typed
+            // as a literal `u`.
+            KeyCode::Char('u')
+                if self.focus == Focus::Composer
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.input.clear();
+            }
             KeyCode::Char(character) if self.focus == Focus::Composer => {
                 self.input.insert(character);
             }
@@ -555,19 +575,33 @@ impl TuiApp {
         started
     }
 
+    /// The directory holding decrypted-media download artifacts, under the TUI
+    /// home when one is set (else a private temp dir).
+    fn media_cache_dir(&self) -> PathBuf {
+        self.client
+            .home
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("tui-media-cache")
+    }
+
     /// The per-hash cache path for a decrypted download, under the TUI home when
     /// one is set (else a private temp dir). Passed as `--output` so the CLI does
     /// not write the file's basename into the current directory. The directory is
     /// created restrictive-by-construction; the CLI writes the file privately.
     fn media_cache_path(&self, hash: &str) -> TuiResult<PathBuf> {
-        let cache_dir = self
-            .client
-            .home
-            .clone()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("tui-media-cache");
+        let cache_dir = self.media_cache_dir();
         fs_private::create_dir_all_private(&cache_dir)?;
         Ok(cache_dir.join(hash))
+    }
+
+    /// Sweep decrypted-media artifacts left by a prior (possibly crashed) session
+    /// at startup. Each artifact is removed right after decode, so anything still
+    /// on disk is decrypted plaintext with no reader; clearing it keeps decrypted
+    /// media from lingering at rest. Best-effort and non-recursive; see
+    /// `sweep_media_cache_dir`.
+    pub(crate) fn sweep_media_cache(&self) {
+        sweep_media_cache_dir(&self.media_cache_dir());
     }
 
     /// Open the selected message's downloaded image full-size, or explain on the
@@ -807,6 +841,12 @@ impl TuiApp {
             KeyCode::End => self.input.end(),
             KeyCode::Delete => self.input.delete(),
             KeyCode::Backspace => self.input.backspace(),
+            // Ctrl-U kill-line, shared with the composer: the nsec field reuses the
+            // same `Input`, so the readline convention carries over and clearing
+            // key material promptly is safety-positive. Nothing else binds it here.
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.clear();
+            }
             KeyCode::Char(character) => self.input.insert(character),
             _ => {}
         }
@@ -873,6 +913,10 @@ impl TuiApp {
             }
             SlashCommand::AccountImportSecret(secret) => {
                 self.create_or_import_account(Some(secret), "logged in identity")
+            }
+            SlashCommand::Logout => {
+                self.open_logout_popup();
+                Ok(())
             }
             SlashCommand::DaemonStatus => {
                 self.refresh_daemon_status()?;
@@ -1049,6 +1093,9 @@ impl TuiApp {
         match popup_key(popup, key.code) {
             PopupAction::None => {}
             PopupAction::Dismiss => self.popup = None,
+            // A multi-step flow: the reducer resolved the next popup (the group
+            // picker's Enter opens the add-user confirm). No CLI call yet.
+            PopupAction::Open(next) => self.popup = Some(next),
             PopupAction::Submit(submit) => {
                 // The invites picker stays open across actions so one
                 // accept/decline does not lose the user's place: capture the
@@ -1106,10 +1153,11 @@ impl TuiApp {
                 self.reveal_chat_from_search();
                 Ok(())
             }
+            PopupSubmit::Logout { account_id, npub } => self.logout_account(&account_id, &npub),
         }
     }
 
-    /// After a user-search action opens a new chat or adds someone to the open one,
+    /// After a user-search action opens a new chat or adds someone to a picked chat,
     /// leave the search screen for the main view so the freshly selected chat is
     /// visible. Mirrors the invite-accept return: the search screen would otherwise
     /// hide the chat the action just targeted. A no-op off the search screen, so the
@@ -1167,6 +1215,7 @@ impl TuiApp {
                     group_id: view.group_id.clone(),
                 },
                 title: "Add Member".to_owned(),
+                body: Vec::new(),
                 input: Input::default(),
             });
         }
@@ -1181,6 +1230,7 @@ impl TuiApp {
                     group_id: view.group_id.clone(),
                 },
                 title: "Rename Group".to_owned(),
+                body: Vec::new(),
                 input,
             });
         }
@@ -1261,6 +1311,66 @@ impl TuiApp {
         );
     }
 
+    /// Arm the logout popup for the currently selected account, scaling the guard
+    /// to the consequence. `wn logout` is a destructive wipe
+    /// (`AccountHome::remove_account`): it erases the account's local data from
+    /// this device, and for a local-signing account it also deletes the signing
+    /// key. That irreversible case is gated behind a typed-token confirmation —
+    /// the user must type `logout` — so the TUI's only identity-destroying action
+    /// is never reachable by a stray Enter-then-Enter. A public-only account is
+    /// re-addable, so it keeps the lighter `y`/`Enter` confirm. Both bodies state
+    /// plainly what is erased and never soften the wording.
+    fn open_logout_popup(&mut self) {
+        let Some(account) = self.selected_account_row() else {
+            self.status = "no account selected".to_owned();
+            return;
+        };
+        let label = shorten(&terminal_safe_text(&account_display_label(account)), 24);
+        let account_id = account.account_id.clone();
+        let npub = account.npub.clone();
+        let local_signing = account.local_signing;
+        // The npub is the unambiguous identifier for which account is about to be
+        // destroyed. Always surface it: when a display name labels the account the
+        // first line would otherwise hide the npub, so add an explicit line; with
+        // no display name the label already is the npub.
+        let mut body = vec![format!("Log out {label}?")];
+        if account.display_name.is_some() {
+            body.push(format!("npub {}", shorten(&npub, 24)));
+        }
+        body.push(
+            "This permanently erases this account's local data — messages, group membership, \
+             and MLS state — from this device."
+                .to_owned(),
+        );
+        if local_signing {
+            body.push(
+                "Its signing key is deleted too. Unless your nsec is backed up elsewhere, this \
+                 cannot be undone."
+                    .to_owned(),
+            );
+            body.push(format!(
+                "Type {LOGOUT_CONFIRMATION_TOKEN} to confirm; Esc cancels."
+            ));
+            self.popup = Some(Popup::Text {
+                purpose: TextPurpose::ConfirmLogout { account_id, npub },
+                title: "Log Out".to_owned(),
+                body,
+                input: Input::default(),
+            });
+        } else {
+            body.push(
+                "Local data cannot be recovered; the account would have to be added again from \
+                 scratch."
+                    .to_owned(),
+            );
+            self.popup = Some(Popup::Confirm {
+                purpose: ConfirmPurpose::Logout { account_id, npub },
+                title: "Log Out".to_owned(),
+                body,
+            });
+        }
+    }
+
     /// Drop any Phase 5b full-view state and return to the main view. Shared by
     /// the search/profile/relay-health `Esc` handlers (their data is a one-shot
     /// load with no per-view subscription to tear down).
@@ -1325,8 +1435,8 @@ impl TuiApp {
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
-    /// query), `Enter` opens the profile card, `c` starts a chat, `a` adds to the
-    /// open chat, and `i`/`/` return to the query.
+    /// query), `Enter` opens the profile card, `c` starts a chat, `a` picks a chat
+    /// to add the user to, and `i`/`/` return to the query.
     fn handle_user_search_results_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1374,12 +1484,16 @@ impl TuiApp {
         self.popup = Some(Popup::Text {
             purpose: TextPurpose::NewChatWithUser { pubkey },
             title: "New Chat".to_owned(),
+            body: Vec::new(),
             input,
         });
     }
 
-    /// Add the selected found user to the open chat. Guarded: only when a chat is
-    /// loaded (the open conversation); otherwise a status-line notice explains.
+    /// Add the selected found user to an existing chat: opens a group picker
+    /// over the loaded chats list (one row per chat, in the list's order),
+    /// preselecting the open chat when one is loaded. `Enter` chains into the
+    /// add-user confirm for the highlighted chat; `Esc` closes with no side
+    /// effects. With no chats a status-line notice explains.
     fn open_add_user_to_chat_popup(&mut self) {
         let Some(result) = self
             .user_search
@@ -1390,18 +1504,24 @@ impl TuiApp {
         };
         let pubkey = result.pubkey.clone();
         let label = result.display_label();
-        let Some(group_id) = self.messages_group_id.clone() else {
-            self.status = "open a chat first to add a user to it".to_owned();
+        if self.chats.is_empty() {
+            self.status = "no chats to add a user to; c starts a new chat".to_owned();
             return;
-        };
-        self.popup = Some(Popup::Confirm {
-            purpose: ConfirmPurpose::AddUserToChat { group_id, pubkey },
-            title: "Add to Chat".to_owned(),
-            body: vec![format!(
-                "Add {} to the open chat?",
-                shorten(&terminal_safe_text(&label), 24)
-            )],
-        });
+        }
+        let items = self
+            .chats
+            .iter()
+            .map(|chat| PickerItem {
+                id: chat.group_id.clone(),
+                label: chat.name.clone(),
+            })
+            .collect();
+        let selected = self
+            .messages_group_id
+            .as_deref()
+            .and_then(|group_id| self.chats.iter().position(|chat| chat.group_id == group_id))
+            .unwrap_or(0);
+        self.popup = Some(Popup::add_user_group_picker(pubkey, label, items, selected));
     }
 
     /// Profile-screen keys: `j`/`k` move the field/follow cursor, `Enter` edits
@@ -1424,6 +1544,7 @@ impl TuiApp {
                 self.popup = Some(Popup::Text {
                     purpose: TextPurpose::FollowByPubkey,
                     title: "Follow User".to_owned(),
+                    body: Vec::new(),
                     input: Input::default(),
                 });
             }
@@ -1451,6 +1572,7 @@ impl TuiApp {
         self.popup = Some(Popup::Text {
             purpose: TextPurpose::EditProfileField { field },
             title: format!("Edit {}", field.label()),
+            body: Vec::new(),
             input,
         });
     }
