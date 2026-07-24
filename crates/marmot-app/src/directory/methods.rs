@@ -33,10 +33,8 @@ use crate::ids::{
     normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
 };
 use crate::key_package_records::{
-    fill_missing_relay_lists_from_cached, fresh_or_cached_key_package,
-    fresh_relay_list_status_from_records, key_package_from_record,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
     latest_fresh_key_package_from_records, publish_endpoints_from_bootstrap, relay_list_queries,
-    relay_lists_have_any_relays,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
@@ -44,7 +42,7 @@ use crate::{
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, ReceivedMessage,
     SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
-    push_unique_strings, relays_from_relay_list_event, remove_sqlite_file_set,
+    push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
 };
 
 impl MarmotApp {
@@ -92,18 +90,28 @@ impl MarmotApp {
             )
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch relay lists: {e}")))?;
+        let observed_nip65 = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_NIP65_RELAY_LIST
+                && freshness.accepts(record)
+        });
+        let observed_inbox = records.iter().any(|record| {
+            record.event.pubkey == account_id_hex
+                && record.event.kind == KIND_MARMOT_INBOX_RELAY_LIST
+                && freshness.accepts(record)
+        });
         let selection = fresh_relay_list_status_from_records(&account_id_hex, records, freshness);
         let mut status = selection.value;
-        if selection.rejected_future || !relay_lists_have_any_relays(&status) {
+        if !observed_nip65 || !observed_inbox {
             let cached = self.account_relay_list_status_for_account_id(&account_id_hex)?;
-            if relay_lists_have_any_relays(&cached) {
-                if !relay_lists_have_any_relays(&status) {
-                    return Ok(cached);
-                }
-                if selection.rejected_future {
-                    fill_missing_relay_lists_from_cached(&mut status, &cached);
-                }
+            if !observed_nip65 {
+                status.nip65 = cached.nip65;
             }
+            if !observed_inbox {
+                status.inbox = cached.inbox;
+            }
+            push_unique_strings(&mut status.bootstrap_relays, cached.bootstrap_relays);
+            status.refresh();
         }
         if status.bootstrap_relays.is_empty() {
             status.bootstrap_relays = bootstrap_relays
@@ -870,16 +878,15 @@ impl MarmotApp {
         account_id_hex: &str,
         record: &RelayEventRecord,
     ) -> Result<(), AppError> {
-        let relays = relays_from_relay_list_event(&record.event);
-        if relays.is_empty() {
+        let Some(state) = relay_list_state_from_event(&record.event) else {
             return Ok(());
-        }
+        };
         let mut entry = self
             .directory_entry_for_account_id(account_id_hex)?
             .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
         match record.event.kind {
-            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65.relays = relays,
-            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox.relays = relays,
+            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65 = state,
+            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox = state,
             _ => return Ok(()),
         }
         push_unique_strings(

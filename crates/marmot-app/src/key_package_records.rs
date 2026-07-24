@@ -24,7 +24,7 @@ use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as Relay
 use crate::{
     AccountKeyPackageRecord, AccountRelayListBootstrap, AccountRelayListStatus, DirectoryFreshness,
     DirectoryKeyPackage, DirectorySelection, FetchedKeyPackage, UserDirectoryRecord,
-    push_unique_strings, relays_from_relay_list_event, sort_directory_records,
+    push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
 
 pub(crate) fn relay_list_status_from_records(
@@ -37,13 +37,12 @@ pub(crate) fn relay_list_status_from_records(
         if record.event.pubkey != account_id_hex {
             continue;
         }
-        let relays = relays_from_relay_list_event(&record.event);
-        if relays.is_empty() {
+        let Some(state) = relay_list_state_from_event(&record.event) else {
             continue;
-        }
+        };
         match record.event.kind {
-            KIND_NIP65_RELAY_LIST => status.nip65.relays = relays,
-            KIND_MARMOT_INBOX_RELAY_LIST => status.inbox.relays = relays,
+            KIND_NIP65_RELAY_LIST => status.nip65 = state,
+            KIND_MARMOT_INBOX_RELAY_LIST => status.inbox = state,
             _ => continue,
         }
         push_unique_strings(
@@ -209,26 +208,6 @@ fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppErr
         )));
     }
     Ok(MessageId::new(bytes))
-}
-
-pub(crate) fn relay_lists_have_any_relays(status: &AccountRelayListStatus) -> bool {
-    !status.nip65.relays.is_empty() || !status.inbox.relays.is_empty()
-}
-
-pub(crate) fn fill_missing_relay_lists_from_cached(
-    status: &mut AccountRelayListStatus,
-    cached: &AccountRelayListStatus,
-) {
-    if status.nip65.relays.is_empty() {
-        status.nip65.relays = cached.nip65.relays.clone();
-    }
-    if status.inbox.relays.is_empty() {
-        status.inbox.relays = cached.inbox.relays.clone();
-    }
-    if status.bootstrap_relays.is_empty() {
-        status.bootstrap_relays = cached.bootstrap_relays.clone();
-    }
-    status.refresh();
 }
 
 pub(crate) fn fresh_or_cached_key_package(
