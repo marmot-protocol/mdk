@@ -23,7 +23,6 @@ use crypto::{
 use host_safety::validate_locator;
 
 pub(crate) use blossom::{blossom_blob_url, fetch_blossom_blob};
-pub(crate) use crypto::canonical_media_type_v1 as canonical_media_type;
 pub(crate) use group_image::{fetch_group_image, upload_group_image};
 pub(crate) use host_safety::is_loopback_http_endpoint;
 
