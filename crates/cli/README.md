@@ -539,6 +539,15 @@ When a daemon is running for the same home, TUI child commands use the daemon so
 state. While the daemon is running, the TUI attaches to daemon-backed runtime subscriptions for live message, chat, and
 group-state changes, and refreshes snapshots when the composer is idle.
 
+User-initiated commands — sending a message, replying, reacting/unreacting, deleting, opening a chat, searching users,
+opening group detail, and listing invites — run on a background worker so a `wn` round-trip never freezes typing,
+scrolling, or input. The ambient chat-list re-read that a notification for a non-selected chat triggers runs on that
+same worker, so a burst of notifications never blocks key handling either. Each shows in-flight feedback (`sending...`,
+`loading chat...`, `searching...`) and folds its result in on the next frame; user-initiated mutations keep their
+submission order, and a load whose target you have already moved past is dropped rather than overwriting the current
+view. Modal or rare flows (login, logout, daemon start/stop, and popup submits such as rename or follow) stay
+synchronous.
+
 Login screen controls:
 
 - Menu (no accounts): `c` create a new identity, `l` log in with an nsec, `q` quit.
@@ -549,7 +558,13 @@ Login screen controls:
 Main view controls:
 
 - `Tab`/`BackTab`: cycle the chat list, messages, and composer.
-- Chats: `j`/`k` or arrows move the selection; `Enter` opens the chat and focuses the messages pane; `g` opens the
+- Chats: `j`/`k` or arrows move the selection; moving it also live-previews the highlighted chat in the message pane
+  after a brief pause (~150ms of quiet), with focus staying on the list, so flicking through with `j`/`k` loads only
+  the chat you settle on. The messages-pane title names the loaded chat (falling back to "Messages"), and the composer
+  sends to that same chat, so the pane always shows which conversation you are reading and sending to — whether it was
+  opened or previewed. `Enter` opens the highlighted chat and moves focus to the messages pane (cancelling any pending
+  preview; opening the chat already shown is just a focus move); a previewed chat is marked read the same way opening
+  it is. `g` opens the
   group-detail screen for the selected chat; `s` opens user search; `p` opens your profile; `h` opens the relay-health
   screen; `I` opens the pending-invites picker; `A` reopens the
   account picker. Each row shows an unread badge (bold name plus `(N)`) and a dark-gray last-message preview (sender

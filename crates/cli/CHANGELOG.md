@@ -109,6 +109,33 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- TUI: user-initiated actions no longer freeze the interface for a `wn` subprocess round-trip. Sending a message,
+  replying, reacting/unreacting, deleting, opening a chat, searching users, opening group detail, and listing invites
+  now run on a dedicated background worker and fold their result back into the view on the next frame, so typing,
+  scrolling, and input stay responsive while the command runs. The ambient chat-list re-read that a notification for a
+  non-selected chat triggers runs on that same worker (behind any queued mutations, so a re-read reflects a send that
+  preceded it), so a notification burst never blocks key handling either. Each shows honest in-flight feedback
+  (`sending...`, `loading chat...`, `searching...`, `loading invites...`, `loading group detail...`, and a
+  `loading chat...` placeholder in the message pane) and reports the outcome when it lands. User-initiated mutations
+  keep their submission order (a single worker drains a FIFO queue), optimistic send rows keep their by-id upsert
+  semantics, and a result whose target the user has already moved past — an open-chat load for a chat they left, a
+  search whose query changed, an invites list or a chat re-list whose account changed — is dropped instead of
+  clobbering the current view. A same-chat reload merges its page by id rather than replacing, so a live subscription
+  insert during the load window survives. Failures are still caught to the status line and never tear down the session.
+  Genuinely modal or rare flows (login/create-identity, logout, daemon start/stop, popup submits such as
+  rename/add-member/follow, profile, relay health, and stream compose) stay synchronous. No JSON response shapes
+  changed.
+- TUI: `j`/`k` in the chat list now live-previews the highlighted conversation while focus stays on the list
+  (flick-through browsing). The preview is debounced to ~150ms of quiet after the last movement, so racing through the
+  list loads only the chat you settle on rather than one load per row; a preview superseded by further movement is
+  dropped, and it marks the previewed chat read the same way opening it does (it is on screen — matching the reference
+  client's select-clears-unread precedent). The composer's send target follows the previewed chat (WYSIWYG), and the
+  messages-pane title now names the loaded chat (terminal-safe, shortened, falling back to "Messages"), keeping the
+  `[N older | M newer]` overflow annotation alongside — so the pane always shows which conversation you are reading and
+  sending to, whether it was opened or previewed. `Enter` is unchanged — it opens the highlighted chat and moves focus
+  to the message pane, cancelling any pending preview; opening the chat already settled in the pane is a focus move
+  only (no redundant reload). No JSON response shapes changed.
+
 - TUI: inline images are no longer pixelated, and `o` now shows the actual image on pixel-capable terminals. Inline
   previews stay cell-exact half-blocks but downscale through a proper resampling filter (Lanczos3) instead of
   `ratatui-image`'s nearest-neighbor default, so the 8-row preview reads as a legible thumbnail. On a terminal whose
@@ -209,9 +236,9 @@ versioning through the workspace version in the root `Cargo.toml`.
   the badge untouched and surfaces on the status line — never zeroed locally). Live badge/preview deltas for the open
   chat ride the `messages timeline subscribe` feed's `chat_list_row`; for other chats the TUI consumes
   `notifications subscribe` and, on a NewMessage for a non-selected chat, does one debounced `chats list` re-read per
-  tick (notification events deduplicated by `notification_key`). Group-invite notifications surface as a status-line
-  notice. Background re-lists and reorders keep the highlighted chat selected by group id. No JSON response shapes
-  changed.
+  tick (notification events deduplicated by `notification_key`), run on the background worker rather than the event
+  loop. Group-invite notifications surface as a status-line notice. Background re-lists and reorders keep the
+  highlighted chat selected by group id. No JSON response shapes changed.
 
 ### Added
 

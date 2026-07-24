@@ -2265,8 +2265,10 @@ fn line_text(line: &Line<'_>) -> String {
 }
 
 fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
+    let effects = EffectRunner::spawn(client.clone());
     TuiApp {
         client,
+        effects,
         initial_account: None,
         running: true,
         screen: Screen::Main,
@@ -2296,6 +2298,11 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         notification_subscription: None,
         pending_chat_relist: false,
         pending_mark_read: false,
+        loading_chat: None,
+        searching_users: None,
+        loading_group_detail: None,
+        loading_invites: false,
+        flick_countdown: None,
         seen_notification_keys: SeenNotificationKeys::new(),
         daemon: DaemonView {
             running: true,
@@ -3139,7 +3146,59 @@ fn tick_performs_the_pending_relist_exactly_once() {
     assert!(changed);
     assert!(
         !app.pending_chat_relist,
-        "tick runs the pending re-list once, then clears the debounce flag"
+        "tick queues the pending re-list once, then clears the debounce flag"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_notification_armed_relist_runs_off_loop_and_preserves_selection() {
+    let account_id = "aa".repeat(32);
+    let group_a = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    // The re-read returns B as the most-active chat (a reorder): B first, A last.
+    let response = format!(
+        r#"{{"ok":true,"result":{{"chats":[{{"group_id":"{group_b}","profile":{{"name":"b"}},"last_message":{{"timeline_at":200,"plaintext":"hi","sender":"x"}}}},{{"group_id":"{group_a}","profile":{{"name":"a"}},"last_message":{{"timeline_at":100,"plaintext":"yo","sender":"x"}}}}]}}}}"#
+    );
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(tempdir.path(), &response);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default(); // no live subscriptions to drain
+    // A is selected; a NewMessage for another chat armed a background re-list.
+    app.chats = vec![
+        projected_chat(&group_a, "a", 0, Some(100)),
+        projected_chat(&group_b, "b", 1, Some(50)),
+    ];
+    app.selected_chat = 0;
+    app.pending_chat_relist = true;
+
+    // tick queues the re-list off the event loop (it never runs `chats list` on the
+    // key-handling thread) and clears the debounce.
+    assert!(app.tick());
+    assert!(
+        !app.pending_chat_relist,
+        "the debounce clears when the re-list is queued"
+    );
+
+    // Folding the worker's result reorders the list but keeps A selected by id.
+    app.settle_effects(1);
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    assert!(
+        recorded.contains("chats list"),
+        "the re-read ran through the effect worker: {recorded:?}"
+    );
+    assert_eq!(
+        app.selected_chat_row().map(|chat| chat.group_id.as_str()),
+        Some(group_a.as_str()),
+        "the background reorder keeps the highlight on the chat the user selected"
+    );
+    assert_eq!(
+        app.selected_chat, 1,
+        "A is now second after B out-ranked it"
     );
 }
 
@@ -3213,14 +3272,12 @@ fn tick_marks_the_viewed_chat_read_once_and_clears_the_badge() {
     app.selected_chat = 0;
     app.pending_mark_read = true;
 
-    assert!(app.tick());
+    assert!(app.tick(), "tick queues the mark-read off-loop");
+    assert!(!app.pending_mark_read, "a queued mark-read clears the flag");
+    app.settle_effects(1);
     assert_eq!(
         app.chats[0].projection.unread_count, 0,
-        "tick folds the mark-read response and clears the viewed chat's badge"
-    );
-    assert!(
-        !app.pending_mark_read,
-        "a successful mark-read clears the flag"
+        "folding the mark-read response clears the viewed chat's badge"
     );
 
     // The folded projection is now zero, so a second tick re-arms nothing.
@@ -3236,7 +3293,11 @@ fn a_failed_relist_re_arms_for_the_next_tick() {
     app.daemon = DaemonView::default(); // no live subscriptions to drain
     app.pending_chat_relist = true;
 
+    // tick queues the re-list off-loop and clears the debounce; the failure lands
+    // when the worker's result folds.
     app.tick();
+    assert!(!app.pending_chat_relist, "the debounce clears on queue");
+    app.settle_effects(1);
 
     assert!(
         app.pending_chat_relist,
@@ -3261,6 +3322,8 @@ fn a_failed_mark_read_re_arms_for_the_next_tick() {
     app.pending_mark_read = true;
 
     app.tick();
+    // The mark-read runs off-loop; folding its failed result re-arms the flag.
+    app.settle_effects(1);
 
     assert!(
         app.pending_mark_read,
@@ -3296,10 +3359,13 @@ fn opening_a_chat_marks_it_read_and_clears_the_badge() {
     app.selected_chat = 0;
 
     app.refresh_messages().expect("refresh messages");
+    // The load runs off-loop and, with no daemon, queues diagnostics and a
+    // mark-read; folding all three clears the badge.
+    app.settle_effects(3);
 
     assert_eq!(
         app.chats[0].projection.unread_count, 0,
-        "opening a chat folds the mark-read response and clears the badge immediately"
+        "opening a chat folds the mark-read response and clears the badge"
     );
 }
 
@@ -3307,8 +3373,7 @@ fn opening_a_chat_marks_it_read_and_clears_the_badge() {
 fn mark_read_failure_keeps_the_badge_honest() {
     let account_id = "aa".repeat(32);
     let group_id = "bb".repeat(32);
-    let (_tempdir, client) = test_json_client(r#"{"ok":false,"error":{"message":"daemon gone"}}"#);
-    let mut app = test_tui_app(client, &account_id);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
     app.chats = vec![ChatRow {
         group_id: group_id.clone(),
         name: "general".to_owned(),
@@ -3321,15 +3386,28 @@ fn mark_read_failure_keeps_the_badge_honest() {
     }];
     app.selected_chat = 0;
 
-    let result = app.mark_selected_chat_read(&account_id, &group_id);
+    // A failed mark-read folds honestly: it never zeroes the badge locally and
+    // re-arms so the next tick retries.
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::MarkRead {
+            account: account_id,
+            group: group_id,
+        },
+        result: Err("daemon gone".to_owned()),
+    });
 
-    assert!(
-        result.is_err(),
-        "a failed mark-read is surfaced, not swallowed"
-    );
     assert_eq!(
         app.chats[0].projection.unread_count, 5,
         "a failed mark-read never zeroes the badge locally"
+    );
+    assert!(
+        app.pending_mark_read,
+        "a failed mark-read re-arms for the next tick"
+    );
+    assert!(
+        app.status.contains("mark-read failed"),
+        "the error still surfaces on the status line: {}",
+        app.status
     );
 }
 
@@ -5744,16 +5822,69 @@ fn pinned_view_follows_incoming_messages() {
 
 #[test]
 fn timeline_pane_title_reports_offscreen_row_counts() {
-    // Everything on screen: the plain title.
-    assert_eq!(timeline_pane_title(5, 0, 4), "Messages");
+    // Everything on screen: just the base title.
+    assert_eq!(timeline_pane_title("Ops", 5, 0, 4), "Ops");
     // Older rows above the view.
-    assert_eq!(timeline_pane_title(10, 3, 9), "Messages [3 older]");
+    assert_eq!(timeline_pane_title("Ops", 10, 3, 9), "Ops [3 older]");
     // Newer rows below the view.
-    assert_eq!(timeline_pane_title(10, 0, 6), "Messages [3 newer]");
+    assert_eq!(timeline_pane_title("Ops", 10, 0, 6), "Ops [3 newer]");
     // Both directions.
     assert_eq!(
-        timeline_pane_title(10, 2, 6),
-        "Messages [2 older | 3 newer]"
+        timeline_pane_title("Ops", 10, 2, 6),
+        "Ops [2 older | 3 newer]"
+    );
+    // With no loaded chat the base falls back to the plain "Messages".
+    assert_eq!(timeline_pane_title("Messages", 5, 0, 4), "Messages");
+}
+
+#[test]
+fn messages_pane_title_names_the_loaded_chat_not_the_highlighted_one() {
+    let account_id = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let group_c = "cc".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    app.chats = vec![
+        projected_chat(&group_b, "BravoRoom", 0, Some(200)),
+        projected_chat(&group_c, "CharlieRoom", 0, Some(100)),
+    ];
+    // The pane shows B (opened or a settled preview), while the highlight has since
+    // moved to C. The title tracks the loaded pane (WYSIWYG), not the selection.
+    app.selected_chat = 1;
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_b.clone());
+    app.timeline = vec![timeline_row("m1", 200)];
+
+    // Row 0 is the top border of both panes; the only text there is the two pane
+    // titles ("Chats" left, the messages title right). Chat names appear as list
+    // items on later rows, so the loaded chat's name on row 0 can only be the
+    // messages-pane title.
+    let rows = rendered_rows(&mut app);
+    assert!(
+        rows[0].contains("BravoRoom"),
+        "the messages pane title names the loaded chat, got: {:?}",
+        rows[0]
+    );
+    assert!(
+        !rows[0].contains("CharlieRoom"),
+        "the title does not name the merely-highlighted chat, got: {:?}",
+        rows[0]
+    );
+}
+
+#[test]
+fn messages_pane_title_falls_back_to_messages_with_no_loaded_chat() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    // No chat loaded into the pane.
+    app.messages_group_id = None;
+
+    let rows = rendered_rows(&mut app);
+    assert!(
+        rows[0].contains("Messages"),
+        "with nothing loaded the pane title is the plain \"Messages\", got: {:?}",
+        rows[0]
     );
 }
 
@@ -5908,6 +6039,8 @@ fn send_message_upserts_an_optimistic_timeline_row() {
 
     app.send_message("hello there".to_owned())
         .expect("send message");
+    // The send runs off-loop; folding it inserts the optimistic row.
+    app.settle_effects(1);
 
     assert_eq!(app.timeline.len(), 1);
     assert_eq!(app.timeline[0].message_id, "m1");
@@ -5940,6 +6073,8 @@ fn send_message_uses_the_documented_plural_messages_namespace() {
     app.messages_group_id = Some("bb".repeat(32));
 
     app.send_message("hello there".to_owned()).expect("send");
+    // The worker runs the send off-loop; wait for it before reading the argv.
+    app.settle_effects(1);
 
     let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
     let args: Vec<&str> = recorded.lines().collect();
@@ -5971,6 +6106,8 @@ fn refresh_messages_loads_the_materialized_timeline_page() {
     app.selected_chat = 0;
 
     app.refresh_messages().expect("refresh messages");
+    // The load runs off-loop; folding it populates the pane.
+    app.settle_effects(1);
 
     assert_eq!(app.timeline.len(), 1);
     assert_eq!(app.timeline[0].message_id, "m1");
@@ -6227,6 +6364,36 @@ fn render_messages_wraps_long_lines_so_the_tail_is_visible() {
     assert!(
         rendered.contains("TAILMARKER"),
         "the wrapped tail of a long message must render, not truncate at the pane edge"
+    );
+}
+
+#[test]
+fn messages_pane_shows_loading_while_an_open_chat_load_is_in_flight() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.focus = Focus::Messages;
+    // An open-chat load is in flight and the pane has not yet folded any rows.
+    app.loading_chat = Some("bb".repeat(32));
+    assert!(app.timeline.is_empty());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw TUI");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(
+        rendered.contains("loading chat..."),
+        "an in-flight load shows honest feedback in the pane, not 'no messages'"
+    );
+    assert!(
+        !rendered.contains("no messages"),
+        "'no messages' is only shown once the load settles empty"
     );
 }
 
@@ -6687,8 +6854,10 @@ fn open_group_detail_loads_state_and_esc_returns_to_main() {
     app.selected_chat = 0;
 
     app.handle_key(char_key('g')).expect("g opens group detail");
-
     assert_eq!(app.screen, Screen::GroupDetail);
+    // The four-call load runs off-loop; folding it populates the view.
+    app.settle_effects(1);
+
     let view = app.group_detail.as_ref().expect("group detail loaded");
     assert_eq!(view.members.len(), 2);
     assert!(view.account_is_admin);
@@ -6916,6 +7085,7 @@ fn invites_picker_accept_closes_the_popup_once_the_last_invite_is_gone() {
     app.focus = Focus::Chats;
 
     app.handle_key(char_key('I')).expect("I opens invites");
+    app.settle_effects(1);
     assert!(matches!(app.popup, Some(Popup::Picker { .. })));
 
     app.handle_key(char_key('a')).expect("accept invite");
@@ -6941,6 +7111,7 @@ fn invites_picker_decline_closes_the_popup_once_the_last_invite_is_gone() {
     app.focus = Focus::Chats;
 
     app.handle_key(char_key('I')).expect("I opens invites");
+    app.settle_effects(1);
     app.handle_key(char_key('d')).expect("decline invite");
 
     assert!(app.popup.is_none());
@@ -6964,6 +7135,7 @@ fn invites_picker_stays_open_after_accepting_one_of_several() {
     app.focus = Focus::Chats;
 
     app.handle_key(char_key('I')).expect("I opens invites");
+    app.settle_effects(1);
     match &app.popup {
         Some(Popup::Picker { items, .. }) => assert_eq!(items.len(), 2, "two invites shown"),
         other => panic!("expected the invites picker, got {other:?}"),
@@ -7015,6 +7187,7 @@ fn accepting_an_invite_from_group_detail_returns_to_main() {
     });
 
     app.handle_key(char_key('I')).expect("I opens invites");
+    app.settle_effects(1);
     app.handle_key(char_key('a')).expect("accept invite");
 
     assert_eq!(
@@ -7037,6 +7210,7 @@ fn empty_invites_shows_an_info_card_not_a_picker() {
     app.focus = Focus::Chats;
 
     app.handle_key(char_key('I')).expect("I with no invites");
+    app.settle_effects(1);
 
     assert!(matches!(app.popup, Some(Popup::Card { .. })));
 }
@@ -7379,8 +7553,10 @@ fn enter_opens_the_chat_and_focuses_messages() {
     assert_eq!(
         app.focus,
         Focus::Messages,
-        "opening a chat moves focus to the messages pane"
+        "opening a chat moves focus to the messages pane immediately"
     );
+    // The timeline load runs off-loop; folding it settles the pane target.
+    app.settle_effects(1);
     assert_eq!(app.messages_group_id.as_deref(), Some(group_id.as_str()));
 }
 
@@ -8362,6 +8538,12 @@ fn messages_u_unreacts_immediately_without_prefilling_or_reloading() {
         "u acts immediately; it never focuses the composer"
     );
     assert!(app.input.is_empty(), "u does not prefill the composer");
+    assert_eq!(
+        app.status, "removing reaction...",
+        "the subprocess runs off-loop; the in-flight status is honest"
+    );
+
+    app.settle_effects(1);
     assert_eq!(app.status, "removed reaction");
     assert_eq!(
         app.timeline.len(),
@@ -8430,6 +8612,8 @@ fn delete_allows_own_message_arriving_via_the_received_path() {
 
     app.delete_selected_message()
         .expect("an own message on the received path renders as yours and is deletable");
+    assert_eq!(app.status, "deleting...", "in-flight feedback");
+    app.settle_effects(1);
     assert_eq!(app.status, "deleted message");
 }
 
@@ -8446,10 +8630,12 @@ fn own_message_interactions_do_not_reload_the_timeline() {
 
     app.react_to_selected_message("+".to_owned())
         .expect("react");
+    app.settle_effects(1);
     assert_eq!(app.status, "reacted +");
     assert_eq!(app.timeline.len(), 1, "react does not reload the list");
 
     app.delete_selected_message().expect("delete own");
+    app.settle_effects(1);
     assert_eq!(app.status, "deleted message");
     assert_eq!(
         app.timeline.len(),
@@ -8808,9 +8994,11 @@ fn user_search_runs_query_and_navigates_results() {
         app.handle_key(char_key(character)).expect("type query");
     }
     assert_eq!(app.user_search.as_ref().unwrap().query.value(), "ali");
-    // Enter runs the one-shot search and moves focus into the results.
+    // Enter runs the one-shot search off-loop; folding it moves focus into the
+    // results.
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .expect("run search");
+    app.settle_effects(1);
     {
         let view = app.user_search.as_ref().expect("search view");
         assert_eq!(view.results.len(), 2);
@@ -8836,10 +9024,469 @@ fn slash_users_query_runs_the_search_immediately() {
     );
     let mut app = test_tui_app(client, &"aa".repeat(32));
     app.open_user_search(Some("alice".to_owned()));
+    // The search runs off-loop; folding it populates the results.
+    app.settle_effects(1);
     let view = app.user_search.as_ref().expect("search view");
     assert_eq!(view.query.value(), "alice");
     assert_eq!(view.results.len(), 1);
     assert_eq!(view.focus, UserSearchFocus::Results);
+}
+
+fn flick_chat(group_id: &str, name: &str) -> ChatRow {
+    ChatRow {
+        group_id: group_id.to_owned(),
+        name: name.to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    }
+}
+
+#[test]
+fn flick_j_schedules_a_debounced_preview_and_fires_after_the_quiet_window() {
+    let account_id = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![flick_chat(&"aa".repeat(32), "a"), flick_chat(&group_b, "b")];
+    app.selected_chat = 0;
+
+    app.handle_key(char_key('j'))
+        .expect("j highlights the next chat");
+    assert_eq!(app.selected_chat, 1, "highlight moved");
+    assert_eq!(
+        app.flick_countdown,
+        Some(FLICK_PREVIEW_DEBOUNCE_TICKS),
+        "a preview is scheduled but not fired"
+    );
+    assert_eq!(app.focus, Focus::Chats, "focus stays on the chat list");
+    assert!(app.loading_chat.is_none(), "nothing loads yet");
+
+    // Not enough quiet ticks yet.
+    for _ in 0..(FLICK_PREVIEW_DEBOUNCE_TICKS - 1) {
+        app.tick();
+    }
+    assert!(
+        app.loading_chat.is_none(),
+        "the debounce has not elapsed; no preview load"
+    );
+
+    // The tick that reaches zero fires the preview for the highlighted chat.
+    app.tick();
+    assert_eq!(app.flick_countdown, None, "the countdown cleared");
+    assert_eq!(
+        app.loading_chat.as_deref(),
+        Some(group_b.as_str()),
+        "the highlighted chat's timeline load fired"
+    );
+    assert_eq!(app.focus, Focus::Chats, "focus never left the chat list");
+}
+
+#[cfg(unix)]
+#[test]
+fn rapid_flick_coalesces_to_one_load_of_the_final_selection() {
+    let account_id = "aa".repeat(32);
+    let group_a = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let group_c = "cc".repeat(32);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![
+        flick_chat(&group_a, "a"),
+        flick_chat(&group_b, "b"),
+        flick_chat(&group_c, "c"),
+    ];
+    app.selected_chat = 0;
+
+    // Race through the list with no quiet ticks between presses: j (->b), j
+    // (->c), k (->b). The countdown resets on every move, so nothing fires yet.
+    app.handle_key(char_key('j')).expect("j");
+    app.handle_key(char_key('j')).expect("j");
+    app.handle_key(char_key('k')).expect("k");
+    assert_eq!(app.selected_chat, 1, "settled on the middle chat");
+    assert!(app.loading_chat.is_none(), "no premature load mid-race");
+
+    // Let the movement quiet: exactly one preview fires, for the final selection.
+    for _ in 0..FLICK_PREVIEW_DEBOUNCE_TICKS {
+        app.tick();
+    }
+    assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
+    app.settle_effects(1);
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let timeline_loads: Vec<&str> = recorded
+        .lines()
+        .filter(|line| line.contains("timeline list"))
+        .collect();
+    assert_eq!(
+        timeline_loads.len(),
+        1,
+        "rapid flicks coalesce to exactly one timeline load: {recorded:?}"
+    );
+    assert!(
+        timeline_loads[0].contains(&group_b),
+        "the single load targets the final selection (b): {:?}",
+        timeline_loads[0]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn enter_after_a_settled_same_chat_preview_is_a_focus_move_only() {
+    let account_id = "aa".repeat(32);
+    let group_a = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_appending_arg_executable(
+        tempdir.path(),
+        r#"{"ok":true,"result":{"messages":[],"has_more_before":false}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![flick_chat(&group_a, "a"), flick_chat(&group_b, "b")];
+    app.selected_chat = 0;
+
+    // Flick to B and let the preview fire and settle onto the pane.
+    app.handle_key(char_key('j')).expect("j to b");
+    for _ in 0..FLICK_PREVIEW_DEBOUNCE_TICKS {
+        app.tick();
+    }
+    assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
+    app.settle_effects(1); // fold the flick preview load
+    assert_eq!(app.messages_group_id.as_deref(), Some(group_b.as_str()));
+    assert!(app.loading_chat.is_none(), "the preview settled");
+
+    // Enter on the already-loaded, settled chat is a focus move only: it must not
+    // re-enqueue a redundant timeline load (nor a second mark-read).
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(
+        app.focus,
+        Focus::Messages,
+        "Enter still moves focus to the message pane"
+    );
+    assert!(
+        app.loading_chat.is_none(),
+        "Enter on a settled same-chat preview enqueues no reload"
+    );
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let timeline_loads: Vec<&str> = recorded
+        .lines()
+        .filter(|line| line.contains("timeline list"))
+        .collect();
+    assert_eq!(
+        timeline_loads.len(),
+        1,
+        "flick-then-open loads B exactly once, not twice: {recorded:?}"
+    );
+}
+
+#[test]
+fn enter_supersedes_a_pending_flick_preview() {
+    let account_id = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    app.focus = Focus::Chats;
+    app.chats = vec![flick_chat(&"aa".repeat(32), "a"), flick_chat(&group_b, "b")];
+    app.selected_chat = 0;
+
+    app.handle_key(char_key('j'))
+        .expect("j schedules a preview");
+    assert!(app.flick_countdown.is_some());
+
+    // Enter opens the chat immediately and cancels the pending preview.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .expect("enter");
+    assert_eq!(
+        app.flick_countdown, None,
+        "the pending preview is cancelled"
+    );
+    assert_eq!(app.focus, Focus::Messages, "Enter moves focus to messages");
+    assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
+}
+
+#[test]
+fn group_detail_load_maps_to_the_four_groups_calls_in_order() {
+    let effect = Effect::LoadGroupDetail {
+        account: "aa".repeat(32),
+        group: "gg".to_owned(),
+    };
+    let calls = effect.calls();
+    let subcommands: Vec<&str> = calls.iter().map(|call| call.args[1].as_str()).collect();
+    assert_eq!(
+        subcommands,
+        vec!["members", "admins", "relays", "show"],
+        "group detail reads members, admins, relays, then show — the fold's slice order"
+    );
+}
+
+#[test]
+fn a_stale_group_detail_load_after_leaving_is_dropped() {
+    let self_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &self_id);
+    // The user opened a group detail, then left before it landed.
+    app.screen = Screen::Main;
+    app.loading_group_detail = None;
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadGroupDetail {
+            account: self_id.clone(),
+            group: "cc".repeat(32),
+        },
+        result: Ok(vec![
+            serde_json::json!({"members": [{"member_id": self_id, "npub": "npubself"}]}),
+            serde_json::json!({"admins": []}),
+            serde_json::json!({"relays": []}),
+            serde_json::json!({"profile": {"name": "Ops"}}),
+        ]),
+    });
+    assert!(
+        app.group_detail.is_none(),
+        "a group-detail result after leaving never repopulates the view"
+    );
+}
+
+#[test]
+fn open_group_detail_reports_loading_then_settles_on_fold() {
+    let self_id = "aa".repeat(32);
+    let group_id = "cc".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &self_id);
+    app.focus = Focus::Chats;
+    app.chats = vec![projected_chat(&group_id, "Ops", 0, Some(10))];
+    app.selected_chat = 0;
+
+    app.open_group_detail().expect("open group detail");
+    assert_eq!(
+        app.status, "loading group detail...",
+        "honest in-flight feedback while the four-call load runs off-loop"
+    );
+    assert_eq!(app.screen, Screen::GroupDetail);
+
+    // Folding the completed load clears the in-flight status.
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadGroupDetail {
+            account: self_id.clone(),
+            group: group_id.clone(),
+        },
+        result: Ok(vec![
+            serde_json::json!({"members": [{"member_id": self_id, "npub": "npubself"}]}),
+            serde_json::json!({"admins": []}),
+            serde_json::json!({"relays": []}),
+            serde_json::json!({"profile": {"name": "Ops"}}),
+        ]),
+    });
+    assert_ne!(
+        app.status, "loading group detail...",
+        "the in-flight status is cleared once the load lands"
+    );
+    assert!(app.group_detail.is_some(), "the view populated");
+}
+
+#[test]
+fn invites_load_reports_loading_then_opens_the_picker() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+
+    app.open_invites().expect("kickoff");
+    assert_eq!(
+        app.status, "loading invites...",
+        "honest in-flight feedback"
+    );
+    assert!(app.loading_invites, "a load is in flight");
+    assert!(
+        app.popup.is_none(),
+        "the picker opens only when the list lands"
+    );
+
+    // A second press while one is in flight does not double-queue.
+    app.open_invites().expect("no double-queue");
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadInvites {
+            account: account_id,
+        },
+        result: Ok(vec![serde_json::json!({
+            "invites": [{"group_id": "cc", "profile": {"name": "Ops"}, "pending_confirmation": true}]
+        })]),
+    });
+    assert!(!app.loading_invites, "the load settled");
+    assert!(
+        matches!(
+            app.popup,
+            Some(Popup::Picker {
+                purpose: PickerPurpose::Invites,
+                ..
+            })
+        ),
+        "the invites picker opened"
+    );
+}
+
+#[test]
+fn a_stale_invites_result_for_a_switched_account_is_dropped() {
+    let account_a = "aa".repeat(32);
+    let account_b = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_a);
+    app.accounts = vec![
+        AccountRow {
+            account_id: account_a.clone(),
+            npub: "npuba".to_owned(),
+            display_name: None,
+            local_signing: true,
+        },
+        AccountRow {
+            account_id: account_b.clone(),
+            npub: "npubb".to_owned(),
+            display_name: None,
+            local_signing: true,
+        },
+    ];
+    // A is selected and started an invites load; the user then switched to B
+    // before it landed.
+    app.selected_account = 0;
+    app.loading_invites = true;
+    app.selected_account = 1;
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadInvites {
+            account: account_a.clone(),
+        },
+        result: Ok(vec![serde_json::json!({
+            "invites": [{"group_id": "cc", "profile": {"name": "Ops"}, "pending_confirmation": true}]
+        })]),
+    });
+
+    assert!(
+        app.popup.is_none(),
+        "an invites list for a since-switched account never opens a picker of the wrong account's invites"
+    );
+    assert!(
+        !app.loading_invites,
+        "the stale load clears the in-flight guard so a fresh open can proceed"
+    );
+}
+
+#[test]
+fn user_search_maps_to_the_users_search_argv() {
+    let effect = Effect::UserSearch {
+        account: "aa".repeat(32),
+        query: "alice".to_owned(),
+    };
+    assert_eq!(
+        effect.calls(),
+        vec![WnCall {
+            account: "aa".repeat(32),
+            args: vec!["users".to_owned(), "search".to_owned(), "alice".to_owned(),],
+        }]
+    );
+}
+
+#[test]
+fn a_stale_user_search_result_for_a_superseded_query_is_dropped() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::UserSearch;
+    let mut view = UserSearchView::default();
+    view.query.set_value("bob".to_owned());
+    app.user_search = Some(view);
+    // The pending search is for "bob"; an "alice" result is a superseded query.
+    app.searching_users = Some("bob".to_owned());
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::UserSearch {
+            account: account_id,
+            query: "alice".to_owned(),
+        },
+        result: Ok(vec![serde_json::json!({
+            "users": [{"account_id_hex":"aa","npub":"npubaa","radius":0,"matched_field":"name","match_quality":"exact"}]
+        })]),
+    });
+
+    assert!(
+        app.user_search.as_ref().unwrap().results.is_empty(),
+        "the superseded query's results never land"
+    );
+    assert_eq!(
+        app.searching_users.as_deref(),
+        Some("bob"),
+        "the pending search anchor is untouched by a stale result"
+    );
+}
+
+#[test]
+fn leaving_a_search_in_flight_drops_a_late_result_from_the_reopened_screen() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    // A search for "alice" is in flight on the search screen.
+    app.screen = Screen::UserSearch;
+    let mut view = UserSearchView::default();
+    view.query.set_value("alice".to_owned());
+    app.user_search = Some(view);
+    app.searching_users = Some("alice".to_owned());
+    app.status = "searching...".to_owned();
+
+    // The user leaves before it lands: the pending-search anchor is cleared so a
+    // late fold cannot pass the tag guard against a freshly reopened screen.
+    app.leave_screen();
+    assert!(
+        app.searching_users.is_none(),
+        "leaving clears the in-flight search anchor"
+    );
+
+    // The user reopens a fresh search screen without running a new query.
+    app.open_user_search(None);
+    assert!(app.user_search.as_ref().unwrap().results.is_empty());
+
+    // The abandoned "alice" search now completes; its result must not land in the
+    // fresh screen.
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::UserSearch {
+            account: account_id,
+            query: "alice".to_owned(),
+        },
+        result: Ok(vec![serde_json::json!({
+            "users": [{"account_id_hex":"aa","npub":"npubaa","radius":0,"matched_field":"name","match_quality":"exact"}]
+        })]),
+    });
+    assert!(
+        app.user_search.as_ref().unwrap().results.is_empty(),
+        "a search abandoned by leaving never repopulates a freshly reopened screen"
+    );
+}
+
+#[test]
+fn leaving_a_search_in_flight_clears_the_searching_status() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::UserSearch;
+    let mut view = UserSearchView::default();
+    view.query.set_value("alice".to_owned());
+    app.user_search = Some(view);
+    app.searching_users = Some("alice".to_owned());
+    app.status = "searching...".to_owned();
+
+    app.leave_screen();
+
+    assert!(
+        app.status.is_empty(),
+        "the stranded \"searching...\" status is cleared when leaving mid-search, got {:?}",
+        app.status
+    );
 }
 
 #[test]
@@ -9430,4 +10077,434 @@ fn group_picker_esc_closes_with_zero_side_effects() {
     assert!(app.user_search.is_some(), "the search view is intact");
     assert_eq!(app.chats.len(), 1, "chats untouched");
     assert_eq!(app.selected_chat, 0, "selection untouched");
+}
+
+// ---- Non-blocking effects: the dispatch-decision-as-value seam ----
+
+#[test]
+fn react_effect_maps_to_the_plural_messages_react_argv() {
+    // The pure argv mapping is asserted without spawning a subprocess: the
+    // effect resolves to exactly the call the worker will run.
+    let effect = Effect::React {
+        account: "aa".repeat(32),
+        group: "bb".repeat(32),
+        message_id: "m1".to_owned(),
+        emoji: "+".to_owned(),
+    };
+    assert_eq!(
+        effect.calls(),
+        vec![WnCall {
+            account: "aa".repeat(32),
+            args: vec![
+                "messages".to_owned(),
+                "react".to_owned(),
+                "bb".repeat(32),
+                "m1".to_owned(),
+                "+".to_owned(),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn react_key_in_messages_focus_resolves_to_the_selected_rows_effect() {
+    // key + state -> invocation value, with no subprocess: the selected timeline
+    // row and the loaded group/account resolve into the effect the app enqueues.
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.timeline = vec![timeline_row("m0", 0), timeline_row("m1", 10)];
+
+    let effect = app.resolve_react("+".to_owned()).expect("resolves");
+    assert_eq!(
+        effect,
+        Effect::React {
+            account: account_id,
+            group: group_id,
+            message_id: "m1".to_owned(),
+            emoji: "+".to_owned(),
+        },
+        "reacts to the newest (pinned-selected) row"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_mutations_run_in_fifo_order_off_the_event_loop() {
+    // Two user-initiated mutations must reach `wn` in the order they were queued.
+    // A single worker thread draining one FIFO channel preserves that order; the
+    // appending fake records each argv line so the order is observable.
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_appending_arg_executable(tempdir.path(), r#"{"ok":true,"result":{}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.timeline = vec![timeline_row("m1", 10)];
+
+    app.react_to_selected_message("1".to_owned())
+        .expect("react 1");
+    app.react_to_selected_message("2".to_owned())
+        .expect("react 2");
+    app.settle_effects(2);
+
+    let recorded = std::fs::read_to_string(&args_file).expect("recorded args");
+    let react_lines: Vec<&str> = recorded
+        .lines()
+        .filter(|line| line.contains(" react "))
+        .collect();
+    assert_eq!(react_lines.len(), 2, "both reacts ran: {recorded:?}");
+    assert!(
+        react_lines[0].ends_with(" 1") && react_lines[1].ends_with(" 2"),
+        "queued reacts ran FIFO (emoji 1 then 2): {react_lines:?}"
+    );
+}
+
+#[test]
+fn react_reports_in_flight_then_final_status_via_the_fold() {
+    // The kickoff reports "reacting..." immediately (honest in-flight feedback);
+    // folding the worker result reports the final status. No timeline reload.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some("bb".repeat(32));
+    app.timeline = vec![timeline_row("m1", 10)];
+
+    app.react_to_selected_message("+".to_owned())
+        .expect("react");
+    assert_eq!(app.status, "reacting...", "in-flight feedback is honest");
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::React {
+            account: account_id,
+            group: "bb".repeat(32),
+            message_id: "m1".to_owned(),
+            emoji: "+".to_owned(),
+        },
+        result: Ok(vec![serde_json::json!({})]),
+    });
+    assert_eq!(app.status, "reacted +");
+    assert_eq!(app.timeline.len(), 1, "react never reloads the timeline");
+}
+
+#[test]
+fn open_chat_load_maps_to_the_timeline_page_argv() {
+    let effect = Effect::LoadTimeline {
+        account: "aa".repeat(32),
+        group: "bb".repeat(32),
+    };
+    assert_eq!(
+        effect.calls(),
+        vec![WnCall {
+            account: "aa".repeat(32),
+            args: vec![
+                "messages".to_owned(),
+                "timeline".to_owned(),
+                "list".to_owned(),
+                "--group".to_owned(),
+                "bb".repeat(32),
+                "--limit".to_owned(),
+                TUI_TIMELINE_PAGE_SIZE.to_string(),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn opening_a_chat_reports_loading_then_folds_the_timeline_page() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.chats = vec![ChatRow {
+        group_id: group_id.clone(),
+        name: "general".to_owned(),
+        archived: false,
+        projection: ChatProjection::default(),
+    }];
+    app.selected_chat = 0;
+    // Daemon is off in this app, so the load stays a pure fold with no spawned
+    // subscription children.
+    app.daemon.running = false;
+
+    app.refresh_messages().expect("kickoff");
+    assert_eq!(app.status, "loading chat...", "honest in-flight feedback");
+    assert_eq!(app.loading_chat.as_deref(), Some(group_id.as_str()));
+    assert!(
+        app.timeline.is_empty(),
+        "rows arrive only when the load folds"
+    );
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadTimeline {
+            account: account_id.clone(),
+            group: group_id.clone(),
+        },
+        result: Ok(vec![serde_json::json!({
+            "messages": [{
+                "message_id": "m1",
+                "direction": "received",
+                "from": "alice",
+                "plaintext": "hello",
+                "timeline_at": 100,
+                "received_at": 100
+            }],
+            "has_more_before": true
+        })]),
+    });
+
+    assert_eq!(app.timeline.len(), 1);
+    assert_eq!(app.timeline[0].message_id, "m1");
+    assert!(app.timeline_scroll.has_more_before);
+    assert!(app.timeline_scroll.is_pinned());
+    assert_eq!(app.messages_group_id.as_deref(), Some(group_id.as_str()));
+    assert_eq!(app.loading_chat, None, "the load is settled");
+    assert_eq!(app.status, "loaded 1 message(s)");
+}
+
+#[test]
+fn a_stale_open_chat_load_for_a_superseded_chat_is_dropped() {
+    // Open chat A, then open chat B before A's load lands. A's late result must
+    // not clobber the pane now targeting B.
+    let account_id = "aa".repeat(32);
+    let group_a = "aa".repeat(32);
+    let group_b = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    app.chats = vec![
+        ChatRow {
+            group_id: group_a.clone(),
+            name: "a".to_owned(),
+            archived: false,
+            projection: ChatProjection::default(),
+        },
+        ChatRow {
+            group_id: group_b.clone(),
+            name: "b".to_owned(),
+            archived: false,
+            projection: ChatProjection::default(),
+        },
+    ];
+
+    app.selected_chat = 0;
+    app.refresh_messages().expect("open A");
+    app.selected_chat = 1;
+    app.refresh_messages().expect("open B");
+    assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
+
+    // A's late result arrives after the user moved to B.
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadTimeline {
+            account: account_id.clone(),
+            group: group_a.clone(),
+        },
+        result: Ok(vec![serde_json::json!({
+            "messages": [{"message_id":"stale","direction":"received","from":"x","plaintext":"old","timeline_at":1,"received_at":1}],
+            "has_more_before": false
+        })]),
+    });
+    assert!(
+        app.timeline.is_empty(),
+        "the superseded load is dropped; the pane still awaits B"
+    );
+    assert_ne!(
+        app.messages_group_id.as_deref(),
+        Some(group_a.as_str()),
+        "the pane never adopts the stale chat"
+    );
+    assert_eq!(app.loading_chat.as_deref(), Some(group_b.as_str()));
+
+    // B's result lands and is accepted.
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadTimeline {
+            account: account_id,
+            group: group_b.clone(),
+        },
+        result: Ok(vec![serde_json::json!({
+            "messages": [{"message_id":"fresh","direction":"received","from":"x","plaintext":"new","timeline_at":9,"received_at":9}],
+            "has_more_before": false
+        })]),
+    });
+    assert_eq!(app.timeline.len(), 1);
+    assert_eq!(app.timeline[0].message_id, "fresh");
+    assert_eq!(app.messages_group_id.as_deref(), Some(group_b.as_str()));
+}
+
+#[test]
+fn same_chat_reload_merges_and_keeps_a_live_subscription_insert() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon.running = false;
+    // A chat is loaded and settled: the pane shows two messages and its group is
+    // the loaded target, so a same-chat reload keeps the pane and its live
+    // subscription (it never clears the pane like a different-chat open does).
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.timeline = vec![timeline_row("m1", 100), timeline_row("m2", 200)];
+    // A same-chat reload is in flight (its group matches the loaded pane).
+    app.loading_chat = Some(group_id.clone());
+
+    // Between enqueue and fold, the live timeline subscription folds in a newer
+    // message.
+    app.timeline.push(timeline_row("m3", 300));
+
+    // The reload page returns only what was materialized at enqueue time (m1, m2).
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::LoadTimeline {
+            account: account_id,
+            group: group_id.clone(),
+        },
+        result: Ok(vec![serde_json::json!({
+            "messages": [
+                {"message_id":"m1","direction":"received","from":"x","plaintext":"one","timeline_at":100,"received_at":100},
+                {"message_id":"m2","direction":"received","from":"x","plaintext":"two","timeline_at":200,"received_at":200}
+            ],
+            "has_more_before": false
+        })]),
+    });
+
+    assert_eq!(
+        timeline_ids(&app.timeline),
+        vec!["m1", "m2", "m3"],
+        "a same-chat reload merges the page by id instead of replacing, so a \
+         subscription insert during the load window survives"
+    );
+    assert!(app.loading_chat.is_none(), "the reload settled");
+    assert_eq!(app.messages_group_id.as_deref(), Some(group_id.as_str()));
+}
+
+#[test]
+fn send_maps_to_the_plural_messages_send_argv() {
+    let effect = Effect::SendMessage {
+        account: "aa".repeat(32),
+        group: "bb".repeat(32),
+        text: "hi".to_owned(),
+    };
+    assert_eq!(
+        effect.calls(),
+        vec![WnCall {
+            account: "aa".repeat(32),
+            args: vec![
+                "messages".to_owned(),
+                "send".to_owned(),
+                "bb".repeat(32),
+                "hi".to_owned(),
+            ],
+        }],
+        "send uses the documented plural `messages send`, not the singular alias"
+    );
+}
+
+#[test]
+fn sending_reports_in_flight_then_folds_an_optimistic_row() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+
+    app.send_message("hello there".to_owned()).expect("kickoff");
+    assert_eq!(app.status, "sending...", "in-flight feedback is honest");
+    assert!(
+        app.timeline.is_empty(),
+        "the row folds only when the send lands"
+    );
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::SendMessage {
+            account: account_id,
+            group: group_id,
+            text: "hello there".to_owned(),
+        },
+        result: Ok(vec![
+            serde_json::json!({"published": 1, "message_ids": ["m1"]}),
+        ]),
+    });
+
+    assert_eq!(app.timeline.len(), 1);
+    assert_eq!(app.timeline[0].message_id, "m1");
+    assert_eq!(app.timeline[0].direction, "sent");
+    assert_eq!(app.timeline[0].display_text, "hello there");
+    assert!(
+        app.timeline_scroll.is_pinned(),
+        "an own send keeps the view pinned to the bottom"
+    );
+}
+
+#[test]
+fn an_optimistic_send_row_for_a_chat_the_user_left_is_dropped() {
+    // The send still happened; folding its row into a pane now showing another
+    // chat would be wrong, so the fold drops it (the group's subscription shows
+    // it on return).
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_group_id = Some("bb".repeat(32));
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::SendMessage {
+            account: account_id,
+            group: "cc".repeat(32),
+            text: "hello".to_owned(),
+        },
+        result: Ok(vec![
+            serde_json::json!({"published": 1, "message_ids": ["m1"]}),
+        ]),
+    });
+    assert!(
+        app.timeline.is_empty(),
+        "no optimistic row lands in the pane of a different chat"
+    );
+}
+
+#[test]
+fn reply_resolves_the_selected_target_and_folds_an_optimistic_reply() {
+    let account_id = "aa".repeat(32);
+    let group_id = "bb".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.messages_account_id = Some(account_id.clone());
+    app.messages_group_id = Some(group_id.clone());
+    app.timeline = vec![timeline_row("parent", 5)];
+
+    let effect = app.resolve_reply("re: hi".to_owned()).expect("resolves");
+    assert_eq!(
+        effect,
+        Effect::SendReply {
+            account: account_id.clone(),
+            group: group_id.clone(),
+            reply_to: "parent".to_owned(),
+            text: "re: hi".to_owned(),
+        },
+        "the reply targets the selected (pinned newest) row"
+    );
+
+    app.send_reply("re: hi".to_owned()).expect("kickoff");
+    assert_eq!(app.status, "sending reply...");
+    app.apply_effect_done_for_test(EffectDone {
+        effect,
+        result: Ok(vec![
+            serde_json::json!({"published": 1, "message_ids": ["r1"]}),
+        ]),
+    });
+    let reply_row = app
+        .timeline
+        .iter()
+        .find(|row| row.message_id == "r1")
+        .expect("the optimistic reply row folded in");
+    assert_eq!(reply_row.direction, "sent");
+    assert_eq!(
+        reply_row
+            .reply
+            .as_ref()
+            .map(|reply| reply.reply_to_message_id.as_str()),
+        Some("parent"),
+        "the optimistic reply carries its parent id"
+    );
 }

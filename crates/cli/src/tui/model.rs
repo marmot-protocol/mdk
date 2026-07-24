@@ -17,6 +17,223 @@ pub(crate) struct WnInvocation {
     pub(crate) stdin: Option<String>,
 }
 
+/// One `wn` call an [`Effect`] expands to: the account it runs under plus the
+/// argv. Distinct from [`WnInvocation`] (the account-less argv+stdin of the
+/// synchronous account-setup path) because every off-loop effect runs under a
+/// selected account and none of them feeds stdin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WnCall {
+    pub(crate) account: String,
+    pub(crate) args: Vec<String>,
+}
+
+/// A user-initiated `wn` operation resolved to a pure value and queued to run
+/// off the event loop. Separating *what to run* (this value, resolved from the
+/// key and current state) from *running it* (the worker) is the testing
+/// backbone: the resolve step and the argv mapping are asserted without ever
+/// spawning a subprocess, and the worker folds the result back on `tick`.
+///
+/// Each field the fold needs that is not carried by the `wn` result travels on
+/// the variant (the group id a load targets, the text an optimistic send row
+/// shows), so a completed effect can be folded exactly as the synchronous
+/// handler folded its `run_json` return.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Effect {
+    /// Send a text message. The optimistic row the fold inserts uses `text` and
+    /// `account` (data the `wn` result does not echo back).
+    SendMessage {
+        account: String,
+        group: String,
+        text: String,
+    },
+    /// Send a reply to `reply_to`. Mirrors `SendMessage` plus the parent id the
+    /// optimistic reply row carries.
+    SendReply {
+        account: String,
+        group: String,
+        reply_to: String,
+        text: String,
+    },
+    React {
+        account: String,
+        group: String,
+        message_id: String,
+        emoji: String,
+    },
+    Unreact {
+        account: String,
+        group: String,
+        message_id: String,
+    },
+    Delete {
+        account: String,
+        group: String,
+        message_id: String,
+    },
+    /// Load (or reload) the materialized timeline page for a chat — the
+    /// open-chat / flick-through load. Stale results (a newer open superseded
+    /// this one) are dropped at fold time by comparing `group` to the pane's
+    /// pending target.
+    LoadTimeline { account: String, group: String },
+    /// Mark the loaded chat read up to its newest message and fold the returned
+    /// projection into its row, clearing the badge without waiting for a push.
+    MarkRead { account: String, group: String },
+    /// Load MLS group diagnostics for the loaded chat (the no-daemon fallback;
+    /// with a daemon the group-state subscription supplies these live).
+    GroupDiagnostics { account: String, group: String },
+    /// Run a one-shot user directory search. Stale results (a newer query, or a
+    /// left screen) are dropped at fold time by comparing `query` to the pending
+    /// search.
+    UserSearch { account: String, query: String },
+    /// Load the group-detail view: members, admins, relays, and profile (four
+    /// `wn` calls run in that order on the worker thread).
+    LoadGroupDetail { account: String, group: String },
+    /// Load the pending-invites list (`groups invites`) to open the invites
+    /// picker off the event loop.
+    LoadInvites { account: String },
+    /// Re-read the chat list for ambient state (the debounced response to a
+    /// notification for a non-selected chat). Runs off the event loop so a
+    /// notification burst never freezes key handling; the fold resorts and
+    /// preserves the highlighted chat by group id. Stale results (the selected
+    /// account changed while it was in flight) are dropped at fold time.
+    Relist {
+        account: String,
+        include_archived: bool,
+    },
+}
+
+impl Effect {
+    /// The `wn` call(s) this effect runs, in order. Almost every effect is a
+    /// single call; the group-detail load expands to several. Pure — the worker
+    /// executes the returned calls and tests assert them.
+    pub(crate) fn calls(&self) -> Vec<WnCall> {
+        match self {
+            Effect::SendMessage {
+                account,
+                group,
+                text,
+            } => vec![WnCall {
+                account: account.clone(),
+                args: vec![
+                    "messages".to_owned(),
+                    "send".to_owned(),
+                    group.clone(),
+                    text.clone(),
+                ],
+            }],
+            Effect::SendReply {
+                account,
+                group,
+                reply_to,
+                text,
+            } => vec![WnCall {
+                account: account.clone(),
+                args: reply_send_args(group, reply_to, text),
+            }],
+            Effect::React {
+                account,
+                group,
+                message_id,
+                emoji,
+            } => vec![WnCall {
+                account: account.clone(),
+                args: vec![
+                    "messages".to_owned(),
+                    "react".to_owned(),
+                    group.clone(),
+                    message_id.clone(),
+                    emoji.clone(),
+                ],
+            }],
+            Effect::Unreact {
+                account,
+                group,
+                message_id,
+            } => vec![WnCall {
+                account: account.clone(),
+                args: vec![
+                    "messages".to_owned(),
+                    "unreact".to_owned(),
+                    group.clone(),
+                    message_id.clone(),
+                ],
+            }],
+            Effect::Delete {
+                account,
+                group,
+                message_id,
+            } => vec![WnCall {
+                account: account.clone(),
+                args: vec![
+                    "messages".to_owned(),
+                    "delete".to_owned(),
+                    group.clone(),
+                    message_id.clone(),
+                ],
+            }],
+            Effect::LoadTimeline { account, group } => vec![WnCall {
+                account: account.clone(),
+                args: vec![
+                    "messages".to_owned(),
+                    "timeline".to_owned(),
+                    "list".to_owned(),
+                    "--group".to_owned(),
+                    group.clone(),
+                    "--limit".to_owned(),
+                    TUI_TIMELINE_PAGE_SIZE.to_string(),
+                ],
+            }],
+            Effect::MarkRead { account, group } => vec![WnCall {
+                account: account.clone(),
+                args: vec!["chats".to_owned(), "mark-read".to_owned(), group.clone()],
+            }],
+            Effect::GroupDiagnostics { account, group } => vec![WnCall {
+                account: account.clone(),
+                args: vec!["groups".to_owned(), "show".to_owned(), group.clone()],
+            }],
+            Effect::UserSearch { account, query } => vec![WnCall {
+                account: account.clone(),
+                args: vec!["users".to_owned(), "search".to_owned(), query.clone()],
+            }],
+            Effect::LoadGroupDetail { account, group } => vec![
+                WnCall {
+                    account: account.clone(),
+                    args: vec!["groups".to_owned(), "members".to_owned(), group.clone()],
+                },
+                WnCall {
+                    account: account.clone(),
+                    args: vec!["groups".to_owned(), "admins".to_owned(), group.clone()],
+                },
+                WnCall {
+                    account: account.clone(),
+                    args: vec!["groups".to_owned(), "relays".to_owned(), group.clone()],
+                },
+                WnCall {
+                    account: account.clone(),
+                    args: vec!["groups".to_owned(), "show".to_owned(), group.clone()],
+                },
+            ],
+            Effect::LoadInvites { account } => vec![WnCall {
+                account: account.clone(),
+                args: vec!["groups".to_owned(), "invites".to_owned()],
+            }],
+            Effect::Relist {
+                account,
+                include_archived,
+            } => {
+                let mut args = vec!["chats".to_owned(), "list".to_owned()];
+                if *include_archived {
+                    args.push("--include-archived".to_owned());
+                }
+                vec![WnCall {
+                    account: account.clone(),
+                    args,
+                }]
+            }
+        }
+    }
+}
+
 /// Build the `wn` invocation for account setup. `setup_relay` supplies the
 /// first-run relay to `create-identity` / `login` through the one relay flag
 /// those commands actually accept — the (global, for `create-identity`;

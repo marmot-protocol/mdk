@@ -37,6 +37,12 @@ pub(crate) use view::*;
 
 type TuiResult<T> = Result<T, TuiError>;
 const UI_EVENT_WAIT: Duration = Duration::from_millis(50);
+/// Ticks of quiet after the last chat-list selection move before the highlighted
+/// chat is previewed (flick-through). At the ~50ms tick cadence this is ~150ms,
+/// so racing through the list with j/k coalesces to a single load of the chat
+/// the user settles on instead of one load per row. Each move resets the count;
+/// the tick loop counts it down (no separate timer).
+const FLICK_PREVIEW_DEBOUNCE_TICKS: u32 = 3;
 const STREAM_APPEND_FLUSH_INTERVAL: Duration = Duration::from_millis(125);
 const FOCUS_ACCENT: Color = Color::Green;
 const ACCOUNT_ACCENT: Color = Color::White;
@@ -74,6 +80,19 @@ const TUI_LIVE_STREAM_TEXT_LIMIT: usize = 64 * 1024;
 /// truncation. The List widget clips overflow too; this keeps a stored preview
 /// tidy and bounded independent of the panel width.
 const TUI_CHAT_PREVIEW_LIMIT: usize = 48;
+
+/// Max chars of the loaded chat's name in the messages-pane title before
+/// trailing-ellipsis truncation, leaving room for the `[N older | M newer]`
+/// overflow annotation alongside it. The panel border clips overflow too; this
+/// keeps the title tidy and bounded independent of the pane width.
+const MESSAGES_TITLE_NAME_LIMIT: usize = 32;
+
+/// The in-flight status shown while a group-detail load runs off the event loop,
+/// matching the `sending...`/`loading chat...`/`searching...` in-flight
+/// vocabulary. The fold clears it on settle, and leaving mid-load resets it, both
+/// guarded on this exact value so a more relevant status (e.g. a mutation's
+/// confirmation) is never clobbered.
+const LOADING_GROUP_DETAIL_STATUS: &str = "loading group detail...";
 
 pub(crate) async fn run_tui(cli: Cli) -> CliOutput {
     match TuiApp::new(cli).and_then(|mut app| app.run()) {

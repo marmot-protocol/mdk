@@ -142,17 +142,21 @@ pub(crate) fn stream_preview_line_pair(
     ])
 }
 
-/// The messages-pane title: plain "Messages" when pinned with everything on
-/// screen, otherwise annotated with the row counts above and below the viewport
-/// so the reader knows history or newer content is off-screen.
-pub(crate) fn timeline_pane_title(total: usize, first: usize, last: usize) -> String {
+/// The messages-pane title: the loaded chat's name (its `base`, or plain
+/// "Messages" when nothing is loaded) when pinned with everything on screen,
+/// otherwise annotated with the row counts above and below the viewport so the
+/// reader knows history or newer content is off-screen. Naming the loaded chat
+/// makes the pane target visible — the flick preview retargets the pane to a
+/// chat the highlight may have since moved past, so the title is the WYSIWYG cue
+/// for which conversation is shown.
+pub(crate) fn timeline_pane_title(base: &str, total: usize, first: usize, last: usize) -> String {
     let above = first;
     let below = total.saturating_sub(last + 1);
     match (above, below) {
-        (0, 0) => "Messages".to_owned(),
-        (above, 0) => format!("Messages [{above} older]"),
-        (0, below) => format!("Messages [{below} newer]"),
-        (above, below) => format!("Messages [{above} older | {below} newer]"),
+        (0, 0) => base.to_owned(),
+        (above, 0) => format!("{base} [{above} older]"),
+        (0, below) => format!("{base} [{below} newer]"),
+        (above, below) => format!("{base} [{above} older | {below} newer]"),
     }
 }
 
@@ -817,12 +821,32 @@ impl TuiApp {
         frame.render_stateful_widget(list, area, &mut state);
     }
 
+    /// The messages-pane title base: the loaded chat's terminal-safe, shortened
+    /// name, or the plain "Messages" when no chat is loaded (or its row is not in
+    /// the list). Keyed on the loaded pane target (`messages_group_id`), not the
+    /// highlighted selection, so it names the conversation actually on screen.
+    fn loaded_chat_title(&self) -> String {
+        self.messages_group_id
+            .as_deref()
+            .and_then(|group_id| self.chats.iter().find(|chat| chat.group_id == group_id))
+            .map(|chat| shorten(&terminal_safe_text(&chat.name), MESSAGES_TITLE_NAME_LIMIT))
+            .unwrap_or_else(|| "Messages".to_owned())
+    }
+
     pub(crate) fn render_messages(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Messages;
+        let base_title = self.loaded_chat_title();
         if self.timeline.is_empty() {
+            // Honest feedback while an open-chat / flick-through load is in flight
+            // off the event loop; "no messages" is only shown once it has settled.
+            let placeholder = if self.loading_chat.is_some() {
+                "loading chat..."
+            } else {
+                "no messages"
+            };
             frame.render_widget(
-                Paragraph::new(vec![Line::from("no messages")])
-                    .block(panel_block("Messages", focused)),
+                Paragraph::new(vec![Line::from(placeholder)])
+                    .block(panel_block(&base_title, focused)),
                 area,
             );
             return;
@@ -910,12 +934,12 @@ impl TuiApp {
                     cursor_y = cursor_y.saturating_add(heights[index]);
                 }
                 (
-                    timeline_pane_title(total, first, last),
+                    timeline_pane_title(&base_title, total, first, last),
                     lines,
                     Some((first, last)),
                 )
             }
-            None => ("Messages".to_owned(), Vec::new(), None),
+            None => (base_title.clone(), Vec::new(), None),
         };
         if bottom_block > 0 {
             lines.extend(preview_lines);

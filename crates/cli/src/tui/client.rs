@@ -246,100 +246,292 @@ pub(crate) fn spawn_subscription_reader(
     Ok(rx)
 }
 
-impl TuiApp {
-    pub(crate) fn send_message(&mut self, text: String) -> TuiResult<()> {
-        let account_id = self.message_account_id()?;
-        let group_id = self.message_group_id()?;
-        // Use the documented plural `messages` surface, matching the react /
-        // unreact / delete / retry interactions (`message` is a hidden alias).
-        let args = vec!["messages", "send", &group_id, &text];
-        let result = self.client.run_json(Some(&account_id), &args)?;
-        let status = publish_status("sent message", &result);
-        if let Some(message_id) = result
-            .get("message_ids")
-            .and_then(Value::as_array)
-            .and_then(|ids| ids.first())
-            .and_then(Value::as_str)
-        {
-            // Optimistic row; the timeline projection event upserts over it by id
-            // once the send lands in the materialized view.
-            let now = unix_now_seconds();
-            let row = TimelineRow {
-                message_id: message_id.to_owned(),
-                direction: "sent".to_owned(),
-                from: account_id,
-                from_display_name: None,
-                plaintext: text.clone(),
-                display_text: text,
-                timeline_at: now,
-                received_at: now,
-                deleted: false,
-                reactions: Vec::new(),
-                reply: None,
-                attachments: Vec::new(),
-            };
-            if let TimelineFoldOutcome::Inserted(index) =
-                apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
-            {
-                self.timeline_scroll.on_insert(index, self.timeline.len());
+/// A completed effect handed back from the worker to the event loop: the effect
+/// that ran (so the fold knows how to interpret it) plus, in order, every call's
+/// parsed result — or the first error encountered.
+pub(crate) struct EffectDone {
+    pub(crate) effect: Effect,
+    pub(crate) result: Result<Vec<Value>, String>,
+}
+
+/// Runs queued [`Effect`]s on one dedicated worker thread, so a user-initiated
+/// `wn` round-trip never blocks the render loop and queued mutations run in FIFO
+/// order — a single thread draining a single channel preserves submission order
+/// end to end. Results return over a second channel drained on `tick`, mirroring
+/// the media pipeline and the subscription readers.
+///
+/// Supervision is deliberately omitted. If the worker thread ever panicked it
+/// would drop `done_tx`; `drain` would then see `Disconnected`, and any in-flight
+/// status (`sending...`, `loading chat...`, …) would be stranded with no fold to
+/// clear it — there is no restart. That is acceptable because the realistic panic
+/// surface here is empty: an effect is just `run_json`, which returns a `Result`
+/// (spawn/IO/JSON failures are values, not panics) reduced to a message string,
+/// and `parse_json_output` is panic-free (lossy UTF-8 decode, checked JSON parse,
+/// no indexing or unwraps). Reaching a panic would take an allocation abort, by
+/// which point the whole process is already lost.
+///
+/// A `wn` child still running when the app quits is left to finish: dropping the
+/// app drops `tx`, so the worker exits after its current effect, but that child
+/// is not killed. A send completing just after quit is acceptable (the work
+/// reached the relay); a read (a load) merely wastes the moment it takes to
+/// exit. Neither warrants tracking and reaping children across shutdown.
+pub(crate) struct EffectRunner {
+    tx: mpsc::Sender<Effect>,
+    rx: Receiver<EffectDone>,
+}
+
+impl EffectRunner {
+    pub(crate) fn spawn(client: WnClient) -> Self {
+        let (tx, effect_rx) = mpsc::channel::<Effect>();
+        let (done_tx, rx) = mpsc::channel::<EffectDone>();
+        thread::spawn(move || {
+            // `recv` returns `Err` once the app drops its `tx` (shutdown), so the
+            // worker exits cleanly. Effects run strictly one at a time in the
+            // order received.
+            while let Ok(effect) = effect_rx.recv() {
+                let result = run_effect(&client, &effect);
+                if done_tx.send(EffectDone { effect, result }).is_err() {
+                    return;
+                }
             }
-        } else {
-            self.refresh_messages()?;
+        });
+        Self { tx, rx }
+    }
+
+    /// Queue an effect to run off the event loop. The send only fails if the
+    /// worker is gone, which happens only at shutdown; a dropped effect then
+    /// simply never folds, which is correct while tearing down.
+    pub(crate) fn enqueue(&self, effect: Effect) {
+        let _ = self.tx.send(effect);
+    }
+
+    /// Drain every effect that finished since the last tick, for folding now.
+    pub(crate) fn drain(&self) -> Vec<EffectDone> {
+        let mut done = Vec::new();
+        // `try_recv` yields `Empty` when caught up and `Disconnected` only if the
+        // worker died; either ends the drain. The worker holds `done_tx` for the
+        // app's lifetime, so `Disconnected` is a shutdown-only edge.
+        while let Ok(item) = self.rx.try_recv() {
+            done.push(item);
         }
-        self.status = status;
+        done
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Option<EffectDone> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+}
+
+/// Run every call an effect expands to, in order, short-circuiting on the first
+/// error (mirroring the `?` chaining the synchronous handlers used). Worker
+/// thread only. The error is reduced to a message string at this boundary; the
+/// folds only ever surface it on the status line.
+fn run_effect(client: &WnClient, effect: &Effect) -> Result<Vec<Value>, String> {
+    let mut values = Vec::new();
+    for call in effect.calls() {
+        match client.run_json(Some(&call.account), &call.args) {
+            Ok(value) => values.push(value),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Ok(values)
+}
+
+/// Reduce a single-call effect's outcome to its one result value. A successful
+/// effect with no calls yields `Null` (defensive; every effect has at least one
+/// call today).
+fn single_effect_value(result: Result<Vec<Value>, String>) -> Result<Value, String> {
+    result.map(|mut values| values.pop().unwrap_or(Value::Null))
+}
+
+impl TuiApp {
+    /// Fold a completed effect back into state, exactly as the synchronous
+    /// handler folded its `run_json` return. A failure lands on the status line
+    /// and never tears down the session (the caught-error invariant).
+    pub(crate) fn apply_effect_done(&mut self, done: EffectDone) {
+        let EffectDone { effect, result } = done;
+        match effect {
+            Effect::SendMessage {
+                account,
+                group,
+                text,
+            } => {
+                self.fold_optimistic_send(account, group, text, None, "sent message", result);
+            }
+            Effect::SendReply {
+                account,
+                group,
+                reply_to,
+                text,
+            } => {
+                self.fold_optimistic_send(
+                    account,
+                    group,
+                    text,
+                    Some(reply_to),
+                    "sent reply",
+                    result,
+                );
+            }
+            Effect::React { emoji, .. } => {
+                self.fold_status_effect(result, format!("reacted {emoji}"));
+            }
+            Effect::Unreact { .. } => {
+                self.fold_status_effect(result, "removed reaction".to_owned());
+            }
+            Effect::Delete { .. } => {
+                self.fold_status_effect(result, "deleted message".to_owned());
+            }
+            Effect::LoadTimeline { account, group } => {
+                self.fold_load_timeline(account, group, result);
+            }
+            Effect::MarkRead { group, .. } => {
+                self.fold_mark_read(group, result);
+            }
+            Effect::GroupDiagnostics { group, .. } => {
+                self.fold_group_diagnostics(group, result);
+            }
+            Effect::UserSearch { query, .. } => {
+                self.fold_user_search(query, result);
+            }
+            Effect::LoadGroupDetail { account, group } => {
+                self.fold_group_detail(account, group, result);
+            }
+            Effect::LoadInvites { account } => {
+                self.fold_invites(account, result);
+            }
+            Effect::Relist { account, .. } => {
+                self.fold_relist(account, result);
+            }
+        }
+    }
+
+    /// Fold an effect whose only visible outcome is a status line: report
+    /// `success` on `Ok`, or the caught error otherwise.
+    fn fold_status_effect(&mut self, result: Result<Vec<Value>, String>, success: String) {
+        self.status = match result {
+            Ok(_) => success,
+            Err(err) => format!("error: {err}"),
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_effect_done_for_test(&mut self, done: EffectDone) {
+        self.apply_effect_done(done);
+    }
+
+    /// Wait for `count` queued effects to finish on the worker and fold each,
+    /// for end-to-end tests over a fake `wn`. Panics if the worker stalls.
+    #[cfg(test)]
+    pub(crate) fn settle_effects(&mut self, count: usize) {
+        for _ in 0..count {
+            let done = self
+                .effects
+                .recv_timeout(Duration::from_secs(5))
+                .expect("effect worker produced a result");
+            self.apply_effect_done(done);
+        }
+    }
+
+    /// Send the composer text off the event loop. The optimistic row folds in
+    /// when the send lands (the timeline projection upserts over it by id once it
+    /// reaches the materialized view), so nothing blocks the render loop.
+    pub(crate) fn send_message(&mut self, text: String) -> TuiResult<()> {
+        let effect = self.resolve_send_message(text)?;
+        self.effects.enqueue(effect);
+        self.status = "sending...".to_owned();
         Ok(())
     }
 
-    /// Send the composer text as a reply to the selected message
-    /// (`messages send --group <g> --reply-to <id> <text>`). The `--reply-to`
-    /// flag goes before the trailing text: the CLI send guard treats a
-    /// `--reply-to` that lands after the text as literal message text and rejects
-    /// it (`reply_to_after_message_text`). The target resolves here, at submit,
-    /// with the same clear error the other interactions use when nothing is
-    /// selected. No list refetch: mirrors `send_message`'s optimistic row, which
-    /// the timeline projection upserts over by id once the reply lands.
+    /// Resolve (without running) the send effect. Uses the documented plural
+    /// `messages send` surface, matching react/unreact/delete/retry.
+    pub(crate) fn resolve_send_message(&self, text: String) -> TuiResult<Effect> {
+        Ok(Effect::SendMessage {
+            account: self.message_account_id()?,
+            group: self.message_group_id()?,
+            text,
+        })
+    }
+
+    /// Send the composer text as a reply to the selected message, off the event
+    /// loop. The target resolves at submit with the same clear error the other
+    /// interactions use when nothing is selected; the optimistic reply row folds
+    /// in when the reply lands.
     pub(crate) fn send_reply(&mut self, text: String) -> TuiResult<()> {
-        let account_id = self.message_account_id()?;
-        let group_id = self.message_group_id()?;
-        let reply_to = self.selected_timeline_message_id()?;
-        let args = reply_send_args(&group_id, &reply_to, &text);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = self.client.run_json(Some(&account_id), &arg_refs)?;
-        let status = publish_status("sent reply", &result);
-        if let Some(message_id) = result
-            .get("message_ids")
-            .and_then(Value::as_array)
-            .and_then(|ids| ids.first())
-            .and_then(Value::as_str)
-        {
-            let now = unix_now_seconds();
-            let row = TimelineRow {
-                message_id: message_id.to_owned(),
-                direction: "sent".to_owned(),
-                from: account_id,
-                from_display_name: None,
-                plaintext: text.clone(),
-                display_text: text,
-                timeline_at: now,
-                received_at: now,
-                deleted: false,
-                reactions: Vec::new(),
-                reply: Some(TimelineReply {
-                    reply_to_message_id: reply_to,
-                    preview: None,
-                }),
-                attachments: Vec::new(),
-            };
-            if let TimelineFoldOutcome::Inserted(index) =
-                apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
-            {
-                self.timeline_scroll.on_insert(index, self.timeline.len());
+        let effect = self.resolve_reply(text)?;
+        self.effects.enqueue(effect);
+        self.status = "sending reply...".to_owned();
+        Ok(())
+    }
+
+    pub(crate) fn resolve_reply(&self, text: String) -> TuiResult<Effect> {
+        Ok(Effect::SendReply {
+            account: self.message_account_id()?,
+            group: self.message_group_id()?,
+            reply_to: self.selected_timeline_message_id()?,
+            text,
+        })
+    }
+
+    /// Fold a completed send/reply, exactly as the synchronous path did: report
+    /// the publish status and, while the pane still shows the target chat, insert
+    /// the optimistic row the timeline projection later upserts over by id. A row
+    /// for a chat the user has since left is dropped (the send still happened;
+    /// its group feed surfaces it on return). With no returned id, reload the
+    /// page like the synchronous path did.
+    fn fold_optimistic_send(
+        &mut self,
+        account: String,
+        group: String,
+        text: String,
+        reply_to: Option<String>,
+        action: &str,
+        result: Result<Vec<Value>, String>,
+    ) {
+        let result = match single_effect_value(result) {
+            Ok(value) => value,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
             }
-        } else {
-            self.refresh_messages()?;
+        };
+        let status = publish_status(action, &result);
+        if self.messages_group_id.as_deref() == Some(group.as_str()) {
+            if let Some(message_id) = result
+                .get("message_ids")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_str)
+            {
+                let now = unix_now_seconds();
+                let row = TimelineRow {
+                    message_id: message_id.to_owned(),
+                    direction: "sent".to_owned(),
+                    from: account,
+                    from_display_name: None,
+                    plaintext: text.clone(),
+                    display_text: text,
+                    timeline_at: now,
+                    received_at: now,
+                    deleted: false,
+                    reactions: Vec::new(),
+                    reply: reply_to.map(|reply_to_message_id| TimelineReply {
+                        reply_to_message_id,
+                        preview: None,
+                    }),
+                    attachments: Vec::new(),
+                };
+                if let TimelineFoldOutcome::Inserted(index) =
+                    apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
+                {
+                    self.timeline_scroll.on_insert(index, self.timeline.len());
+                }
+            } else {
+                let _ = self.refresh_messages();
+            }
         }
         self.status = status;
-        Ok(())
     }
 
     /// The message id of the currently selected timeline row. Errors when the
@@ -352,42 +544,57 @@ impl TuiApp {
         Ok(self.timeline[index].message_id.clone())
     }
 
-    /// React to the selected message (`messages react <group> <id> [emoji]`). No
-    /// list refetch: the timeline projection subscription folds the reaction in
-    /// both directions, so success only updates the status line.
+    /// React to the selected message (`messages react <group> <id> [emoji]`). The
+    /// subprocess runs off the event loop; the timeline projection subscription
+    /// folds the reaction in both directions, so the fold only updates status.
     pub(crate) fn react_to_selected_message(&mut self, emoji: String) -> TuiResult<()> {
-        let account_id = self.message_account_id()?;
-        let group_id = self.message_group_id()?;
-        let message_id = self.selected_timeline_message_id()?;
-        self.client.run_json(
-            Some(&account_id),
-            &["messages", "react", &group_id, &message_id, &emoji],
-        )?;
-        self.status = format!("reacted {emoji}");
+        let effect = self.resolve_react(emoji)?;
+        self.effects.enqueue(effect);
+        self.status = "reacting...".to_owned();
         Ok(())
+    }
+
+    /// Resolve (without running) the react effect for the selected row.
+    pub(crate) fn resolve_react(&self, emoji: String) -> TuiResult<Effect> {
+        Ok(Effect::React {
+            account: self.message_account_id()?,
+            group: self.message_group_id()?,
+            message_id: self.selected_timeline_message_id()?,
+            emoji,
+        })
     }
 
     /// Remove your own reaction from the selected message
-    /// (`messages unreact <group> <id>`). No list refetch (see `react_to_...`).
+    /// (`messages unreact <group> <id>`), off the event loop (see `react_...`).
     pub(crate) fn unreact_selected_message(&mut self) -> TuiResult<()> {
-        let account_id = self.message_account_id()?;
-        let group_id = self.message_group_id()?;
-        let message_id = self.selected_timeline_message_id()?;
-        self.client.run_json(
-            Some(&account_id),
-            &["messages", "unreact", &group_id, &message_id],
-        )?;
-        self.status = "removed reaction".to_owned();
+        let effect = self.resolve_unreact()?;
+        self.effects.enqueue(effect);
+        self.status = "removing reaction...".to_owned();
         Ok(())
     }
 
-    /// Delete the selected message (`messages delete <group> <id>`). Delete only
-    /// makes sense for your own messages; the row's `direction` makes the check
-    /// trivial, so a clear status-line error fires early instead of a CLI
-    /// rejection. No list refetch: the projection tombstones the row.
+    pub(crate) fn resolve_unreact(&self) -> TuiResult<Effect> {
+        Ok(Effect::Unreact {
+            account: self.message_account_id()?,
+            group: self.message_group_id()?,
+            message_id: self.selected_timeline_message_id()?,
+        })
+    }
+
+    /// Delete the selected message (`messages delete <group> <id>`) off the event
+    /// loop. Delete only makes sense for your own messages; the ownership check
+    /// runs at resolve time, so a clear status-line error fires before anything
+    /// is queued. No list refetch: the projection tombstones the row.
     pub(crate) fn delete_selected_message(&mut self) -> TuiResult<()> {
-        let account_id = self.message_account_id()?;
-        let group_id = self.message_group_id()?;
+        let effect = self.resolve_delete()?;
+        self.effects.enqueue(effect);
+        self.status = "deleting...".to_owned();
+        Ok(())
+    }
+
+    pub(crate) fn resolve_delete(&self) -> TuiResult<Effect> {
+        let account = self.message_account_id()?;
+        let group = self.message_group_id()?;
         let index = self
             .timeline_scroll
             .resolved_selection(self.timeline.len())
@@ -401,13 +608,11 @@ impl TuiApp {
                 "can only delete your own messages".to_owned(),
             ));
         }
-        let message_id = self.timeline[index].message_id.clone();
-        self.client.run_json(
-            Some(&account_id),
-            &["messages", "delete", &group_id, &message_id],
-        )?;
-        self.status = "deleted message".to_owned();
-        Ok(())
+        Ok(Effect::Delete {
+            account,
+            group,
+            message_id: self.timeline[index].message_id.clone(),
+        })
     }
 
     /// Retry a failed outbound event (`messages retry <group> <event-id>`). The
@@ -743,29 +948,54 @@ impl TuiApp {
         self.group_detail = None;
         self.load_group_detail(&group_id)?;
         self.screen = Screen::GroupDetail;
-        self.status = "group detail".to_owned();
+        // Honest in-flight feedback while the four-call load runs off-loop; the
+        // fold clears it on settle.
+        self.status = LOADING_GROUP_DETAIL_STATUS.to_owned();
         Ok(())
     }
 
-    /// Load (or reload) the group-detail view: members with admin badges from
-    /// `groups members` + `groups admins`, relay hints from `groups relays`, and
-    /// name/description from `groups show`. The member selection is preserved and
-    /// clamped across reloads so a membership change never jumps the cursor.
+    /// Load (or reload) the group-detail view off the event loop: members with
+    /// admin badges (`groups members` + `groups admins`), relay hints
+    /// (`groups relays`), and name/description (`groups show`). The member
+    /// selection is preserved and clamped across reloads so a membership change
+    /// never jumps the cursor.
     pub(crate) fn load_group_detail(&mut self, group_id: &str) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
-        let members_result = self
-            .client
-            .run_json(Some(&account_id), &["groups", "members", group_id])?;
-        let admins_result = self
-            .client
-            .run_json(Some(&account_id), &["groups", "admins", group_id])?;
-        let relays_result = self
-            .client
-            .run_json(Some(&account_id), &["groups", "relays", group_id])?;
-        let show_result = self
-            .client
-            .run_json(Some(&account_id), &["groups", "show", group_id])?;
-        let (name, description) = parse_group_profile(&show_result).unwrap_or_else(|| {
+        self.loading_group_detail = Some(group_id.to_owned());
+        self.effects.enqueue(Effect::LoadGroupDetail {
+            account: account_id,
+            group: group_id.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Fold a completed group-detail load. Dropped if a newer open superseded it
+    /// or the screen was left (`loading_group_detail` is cleared on leave, and
+    /// reloads of the same group keep it set so each reload still folds). The
+    /// four results arrive in `calls()` order: members, admins, relays, show.
+    fn fold_group_detail(
+        &mut self,
+        account: String,
+        group: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if self.loading_group_detail.as_deref() != Some(group.as_str())
+            || !matches!(self.screen, Screen::GroupDetail)
+        {
+            return;
+        }
+        let results = match result {
+            Ok(values) => values,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
+        let [members_result, admins_result, relays_result, show_result] = results.as_slice() else {
+            self.status = "group detail load returned unexpected results".to_owned();
+            return;
+        };
+        let (name, description) = parse_group_profile(show_result).unwrap_or_else(|| {
             (
                 self.selected_chat_row()
                     .map(|chat| chat.name.clone())
@@ -773,22 +1003,27 @@ impl TuiApp {
                 String::new(),
             )
         });
-        let members = parse_group_members(&members_result);
-        let admins = parse_group_admins(&admins_result);
-        let relays = parse_group_relays(&relays_result);
+        let members = parse_group_members(members_result);
+        let admins = parse_group_admins(admins_result);
+        let relays = parse_group_relays(relays_result);
         let previous = self.group_detail.as_ref().map_or(0, |view| view.selected);
         let mut view = build_group_detail(
-            group_id,
+            &group,
             &name,
             &description,
             &members,
             &admins,
             &relays,
-            &account_id,
+            &account,
         );
         view.selected = previous.min(view.members.len().saturating_sub(1));
         self.group_detail = Some(view);
-        Ok(())
+        // Clear the in-flight status now the load settled, but only if it is still
+        // showing: a reload triggered by a mutation (rename/add/remove/promote)
+        // has already set its own confirmation, which must not be clobbered.
+        if self.status == LOADING_GROUP_DETAIL_STATUS {
+            self.status = "group detail".to_owned();
+        }
     }
 
     fn reload_group_detail_if_active(&mut self, group_id: &str) -> TuiResult<()> {
@@ -883,20 +1118,55 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Open the pending-invites list picker (`groups invites`). An empty result
-    /// shows an info card rather than an empty picker.
+    /// Open the pending-invites list picker (`groups invites`) off the event
+    /// loop; the picker (or an empty-state info card) opens when the list lands.
+    /// A load already in flight is not re-queued.
     pub(crate) fn open_invites(&mut self) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
-        let result = self
-            .client
-            .run_json(Some(&account_id), &["groups", "invites"])?;
+        if self.loading_invites {
+            return Ok(());
+        }
+        self.loading_invites = true;
+        self.status = "loading invites...".to_owned();
+        self.effects.enqueue(Effect::LoadInvites {
+            account: account_id,
+        });
+        Ok(())
+    }
+
+    /// Fold the pending-invites list into the invites picker (an empty result
+    /// shows an info card rather than an empty picker). The picker is not
+    /// screen-scoped (it is reachable from both the main view and group detail),
+    /// but it is anchored to the enqueuing account: a result whose account no
+    /// longer matches the selection is dropped rather than opening a picker of a
+    /// switched-away account's invites.
+    fn fold_invites(&mut self, account: String, result: Result<Vec<Value>, String>) {
+        if !self.loading_invites {
+            return;
+        }
+        self.loading_invites = false;
+        if self
+            .selected_account_row()
+            .map(|selected| selected.account_id.as_str())
+            != Some(account.as_str())
+        {
+            return;
+        }
+        let result = match single_effect_value(result) {
+            Ok(value) => value,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
         let items = parse_invite_items(&result);
+        let count = items.len();
         self.popup = Some(if items.is_empty() {
             Popup::info("Invites", "No pending invites.")
         } else {
             Popup::invites(items, 0)
         });
-        Ok(())
+        self.status = format!("{count} pending invite(s)");
     }
 
     /// After an accept/decline from the invites picker, re-read the pending
@@ -964,8 +1234,8 @@ impl TuiApp {
         }
     }
 
-    /// Run the one-shot `users search <query>` at the default radius and fold the
-    /// results into the view. An empty query is a no-op with a status hint.
+    /// Run the one-shot `users search <query>` off the event loop; the results
+    /// fold into the view when they land. An empty query is a no-op with a hint.
     pub(crate) fn run_user_search(&mut self) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         let query = self
@@ -977,9 +1247,33 @@ impl TuiApp {
             self.status = "type a query, then Enter to search".to_owned();
             return Ok(());
         }
-        let result = self
-            .client
-            .run_json(Some(&account_id), &["users", "search", &query])?;
+        self.searching_users = Some(query.clone());
+        self.status = "searching...".to_owned();
+        self.effects.enqueue(Effect::UserSearch {
+            account: account_id,
+            query,
+        });
+        Ok(())
+    }
+
+    /// Fold a completed user search into the view, dropping a result whose query
+    /// no longer matches the pending search (a newer query superseded it) or
+    /// whose screen has been left.
+    fn fold_user_search(&mut self, query: String, result: Result<Vec<Value>, String>) {
+        if self.searching_users.as_deref() != Some(query.as_str()) {
+            return;
+        }
+        self.searching_users = None;
+        if self.user_search.is_none() {
+            return;
+        }
+        let result = match single_effect_value(result) {
+            Ok(value) => value,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
         let results = parse_user_search_results(&result);
         let count = results.len();
         if let Some(view) = self.user_search.as_mut() {
@@ -992,7 +1286,6 @@ impl TuiApp {
             view.selected = 0;
         }
         self.status = format!("found {count} user(s)");
-        Ok(())
     }
 
     /// Open the dismiss-on-any-key profile card for the selected search result
@@ -1518,117 +1811,204 @@ impl TuiApp {
         self.refresh_messages()
     }
 
+    /// Load (or reload) the selected chat's timeline off the event loop. Resolves
+    /// the selected account/group synchronously (a clear error if either is
+    /// missing) and hands the load to the effect worker; the page, subscriptions,
+    /// mark-read, and diagnostics are folded in when the result lands.
     pub(crate) fn refresh_messages(&mut self) -> TuiResult<()> {
         let account_id = self.require_selected_local_account()?;
         let group_id = self.require_selected_group()?;
-        let args = vec![
-            "messages".to_owned(),
-            "timeline".to_owned(),
-            "list".to_owned(),
-            "--group".to_owned(),
-            group_id.clone(),
-            "--limit".to_owned(),
-            TUI_TIMELINE_PAGE_SIZE.to_string(),
-        ];
-        let result = self.client.run_json(Some(&account_id), &args)?;
-        self.timeline = parse_timeline_page(&result);
-        self.timeline_scroll = TimelineScroll {
-            has_more_before: timeline_page_has_more_before(&result),
-            ..TimelineScroll::default()
+        self.begin_timeline_load(account_id, group_id);
+        Ok(())
+    }
+
+    /// Reset the pane to a loading state (only when switching to a different
+    /// group, so a same-chat reload never flashes empty), tag the pending target
+    /// for the stale guard, and queue the timeline load.
+    pub(crate) fn begin_timeline_load(&mut self, account_id: String, group_id: String) {
+        // Any explicit or fired load supersedes a pending flick-through preview.
+        self.flick_countdown = None;
+        if self.messages_group_id.as_deref() != Some(group_id.as_str()) {
+            // Drop the prior chat's pane and its per-group subscriptions so their
+            // drains cannot pollute the pane while the new chat loads.
+            self.clear_timeline_pane();
+            self.messages_group_id = None;
+            self.group_state_subscription = None;
+            self.group_diagnostics = None;
+        }
+        self.loading_chat = Some(group_id.clone());
+        self.status = "loading chat...".to_owned();
+        self.effects.enqueue(Effect::LoadTimeline {
+            account: account_id,
+            group: group_id,
+        });
+    }
+
+    /// Fold a completed timeline load into the pane, exactly as the synchronous
+    /// path did after its `run_json` returned — but dropping a result whose group
+    /// no longer matches the pending target (a newer open superseded it).
+    fn fold_load_timeline(
+        &mut self,
+        account: String,
+        group: String,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if self.loading_chat.as_deref() != Some(group.as_str()) {
+            return;
+        }
+        let result = match single_effect_value(result) {
+            Ok(value) => value,
+            Err(err) => {
+                self.loading_chat = None;
+                self.status = format!("error: {err}");
+                return;
+            }
         };
-        self.messages_account_id = Some(account_id.clone());
-        self.messages_group_id = Some(group_id.clone());
+        if self.messages_group_id.as_deref() == Some(group.as_str()) {
+            // Same-chat reload: the pane and its timeline subscription stayed live
+            // (a different-chat open clears them and reloads fresh, so a stale
+            // fold there is harmless). A subscription insert may have landed
+            // between enqueue and now; merging the page in by id — the same
+            // idempotent upsert-by-id fold the subscription and history paging
+            // use — keeps those live rows instead of erasing them with a full
+            // replace, and preserves the existing scroll/pin (the pane was never
+            // reset). A genuinely new page row shifts the scroll exactly as a live
+            // insert would; a row already present is an idempotent update.
+            for row in parse_timeline_page(&result) {
+                if let TimelineFoldOutcome::Inserted(index) =
+                    apply_timeline_change(&mut self.timeline, TimelineChange::Upsert(Box::new(row)))
+                {
+                    self.timeline_scroll.on_insert(index, self.timeline.len());
+                }
+            }
+        } else {
+            // Different-chat open: the pane was cleared on enqueue, so replace it
+            // with the fresh page and reset the scroll to the pinned default.
+            self.timeline = parse_timeline_page(&result);
+            self.timeline_scroll = TimelineScroll {
+                has_more_before: timeline_page_has_more_before(&result),
+                ..TimelineScroll::default()
+            };
+        }
+        self.messages_account_id = Some(account.clone());
+        self.messages_group_id = Some(group.clone());
+        self.loading_chat = None;
         // Establish all three subscriptions regardless of any one's outcome. The
         // timeline feed drives the pane's live updates and its `ensure_*` also
         // kills a stale prior-group child, so a failed plain feed must not skip
         // it. Each error surfaces on the status line; the user sees the first by
         // precedence (message, then timeline, then group state).
         let message_subscription_error = self
-            .ensure_message_subscription(&account_id)
+            .ensure_message_subscription(&account)
             .err()
             .map(|err| format!("message subscription failed: {err}"));
         let timeline_subscription_error = self
-            .ensure_timeline_subscription(&account_id, &group_id)
+            .ensure_timeline_subscription(&account, &group)
             .err()
             .map(|err| format!("timeline subscription failed: {err}"));
         let group_state_subscription_error = self
-            .ensure_group_state_subscription(&account_id, &group_id)
+            .ensure_group_state_subscription(&account, &group)
             .err()
             .map(|err| format!("group state subscription failed: {err}"));
         if self.daemon.running && group_state_subscription_error.is_none() {
             if self
                 .group_diagnostics
                 .as_ref()
-                .is_none_or(|diagnostics| diagnostics.group_id != group_id)
+                .is_none_or(|diagnostics| diagnostics.group_id != group)
             {
-                self.group_diagnostics = Some(GroupDiagnostics::unavailable(
-                    &group_id,
-                    "loading group state",
-                ));
+                self.group_diagnostics =
+                    Some(GroupDiagnostics::unavailable(&group, "loading group state"));
             }
         } else {
-            self.refresh_group_diagnostics(&account_id, &group_id);
+            // No daemon (or its state feed failed): fetch diagnostics off-loop.
+            self.effects.enqueue(Effect::GroupDiagnostics {
+                account: account.clone(),
+                group: group.clone(),
+            });
         }
-        // Opening a chat clears its badge immediately: mark it read and fold the
+        // Opening a chat clears its badge: mark it read off-loop and fold the
         // returned projection into the row rather than waiting for a push (the
-        // chats feed does not emit one after a local mark-read). A failure leaves
-        // the badge untouched — never zeroed locally — and surfaces on the status
-        // line behind any subscription error.
-        let mark_read_error = self
-            .mark_selected_chat_read(&account_id, &group_id)
-            .err()
-            .map(|err| format!("mark-read failed: {err}"));
+        // chats feed does not emit one after a local mark-read).
+        self.effects.enqueue(Effect::MarkRead { account, group });
         self.status = message_subscription_error
             .or(timeline_subscription_error)
             .or(group_state_subscription_error)
-            .or(mark_read_error)
             .unwrap_or_else(|| format!("loaded {} message(s)", self.timeline.len()));
-        Ok(())
     }
 
-    /// Mark the loaded chat read up to its newest message and fold the refreshed
-    /// projection into its row, clearing the badge without waiting for a push.
-    /// The runtime read marker is forward-only, so re-marking is idempotent. On
-    /// failure the badge is left honest (never zeroed locally) and the error is
-    /// returned for the status line.
-    pub(crate) fn mark_selected_chat_read(
-        &mut self,
-        account_id: &str,
-        group_id: &str,
-    ) -> TuiResult<()> {
-        let result = self
-            .client
-            .run_json(Some(account_id), &["chats", "mark-read", group_id])?;
-        fold_chat_projection(
-            &mut self.chats,
-            &mut self.selected_chat,
-            group_id,
-            parse_chat_projection(&result),
-        );
-        Ok(())
+    /// Fold a completed mark-read: apply the returned projection to the chat's
+    /// row, clearing the badge. The runtime read marker is forward-only, so
+    /// re-marking is idempotent. On failure the badge is left honest (never
+    /// zeroed locally) and the mark-read is re-armed for the next tick.
+    fn fold_mark_read(&mut self, group: String, result: Result<Vec<Value>, String>) {
+        match single_effect_value(result) {
+            Ok(value) => {
+                fold_chat_projection(
+                    &mut self.chats,
+                    &mut self.selected_chat,
+                    &group,
+                    parse_chat_projection(&value),
+                );
+            }
+            Err(err) => {
+                self.pending_mark_read = true;
+                self.set_drain_status(format!("mark-read failed: {err}"));
+            }
+        }
     }
 
-    /// Background chats re-list for ambient state: re-read `chats list` and
-    /// refresh each row's projection (unread + last-message) while preserving the
+    /// Fold group diagnostics for the loaded chat (the no-daemon fallback),
+    /// dropping the result if the pane has since moved to another group.
+    fn fold_group_diagnostics(&mut self, group: String, result: Result<Vec<Value>, String>) {
+        if self.messages_group_id.as_deref() != Some(group.as_str()) {
+            return;
+        }
+        self.group_diagnostics = Some(match single_effect_value(result) {
+            Ok(value) => parse_group_diagnostics(&value).unwrap_or_else(|| {
+                GroupDiagnostics::unavailable(
+                    &group,
+                    "groups show did not return group diagnostics",
+                )
+            }),
+            Err(err) => GroupDiagnostics::unavailable(&group, err),
+        });
+    }
+
+    /// Fold a completed background chats re-list (the debounced response to a
+    /// notification for a non-selected chat). Refreshes each row's projection
+    /// (unread + last-message) and re-orders by activity while preserving the
     /// messages pane, its subscriptions, and the highlighted chat by group id.
     /// Unlike `refresh_chats` this never reloads the timeline or resets
-    /// subscriptions; it is the debounced response to a notification for a
-    /// non-selected chat. Silent on success (ambient), so it never clobbers the
-    /// status line.
-    pub(crate) fn relist_chats(&mut self) -> TuiResult<()> {
-        let Some(account) = self.selected_account_row().cloned() else {
-            return Ok(());
+    /// subscriptions, and it is silent on success (ambient) so it never clobbers
+    /// the status line.
+    fn fold_relist(&mut self, account: String, result: Result<Vec<Value>, String>) {
+        // Anchor to the enqueuing account: if the selection changed while the
+        // re-list was in flight, its rows belong to a different account — dropping
+        // them here keeps the fold from clobbering the now-selected account's chats
+        // with a stale account's list.
+        if self
+            .selected_account_row()
+            .map(|account| account.account_id.as_str())
+            != Some(account.as_str())
+        {
+            return;
+        }
+        let value = match single_effect_value(result) {
+            Ok(value) => value,
+            Err(err) => {
+                // Re-arm like the synchronous path did so a transient failure
+                // retries next tick instead of dropping the batch.
+                self.pending_chat_relist = true;
+                self.set_drain_status(format!("chat re-list failed: {err}"));
+                return;
+            }
         };
-        if !account.local_signing {
-            return Ok(());
-        }
+        // Capture the selected chat BEFORE replacing the list, then reselect it by
+        // group id after resorting. A naive resort-preserving-selection helper here
+        // would read the old index into the freshly parsed (unsorted) list and jump
+        // the highlight onto a different chat.
         let previous_group_id = self.selected_chat_row().map(|chat| chat.group_id.clone());
-        let mut args = vec!["chats".to_owned(), "list".to_owned()];
-        if self.show_archived_chats {
-            args.push("--include-archived".to_owned());
-        }
-        let result = self.client.run_json(Some(&account.account_id), &args)?;
-        self.chats = result
+        self.chats = value
             .get("chats")
             .and_then(Value::as_array)
             .map(|chats| chats.iter().filter_map(parse_chat).collect())
@@ -1636,7 +2016,6 @@ impl TuiApp {
         sort_chats_by_activity(&mut self.chats);
         self.selected_chat = selected_chat_index(&self.chats, previous_group_id.as_deref())
             .unwrap_or_else(|| self.selected_chat.min(self.chats.len().saturating_sub(1)));
-        Ok(())
     }
 
     /// Fetch and prepend the previous history page. Runs synchronously like every
@@ -1687,23 +2066,6 @@ impl TuiApp {
         self.timeline_scroll.loading_older = false;
         self.status = format!("loaded {prepended} older message(s)");
         Ok(())
-    }
-
-    pub(crate) fn refresh_group_diagnostics(&mut self, account_id: &str, group_id: &str) {
-        self.group_diagnostics = Some(
-            match self
-                .client
-                .run_json(Some(account_id), &["groups", "show", group_id])
-            {
-                Ok(result) => parse_group_diagnostics(&result).unwrap_or_else(|| {
-                    GroupDiagnostics::unavailable(
-                        group_id,
-                        "groups show did not return group diagnostics",
-                    )
-                }),
-                Err(err) => GroupDiagnostics::unavailable(group_id, err.to_string()),
-            },
-        );
     }
 
     pub(crate) fn ensure_chat_subscription(&mut self, account_id: &str) -> TuiResult<()> {

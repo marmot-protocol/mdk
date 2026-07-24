@@ -59,6 +59,27 @@ pub(crate) struct TuiApp {
     /// zero count leaves it clear. Cleared before the call and re-armed on error
     /// like `pending_chat_relist`, so a failure retries next tick, not forever.
     pub(crate) pending_mark_read: bool,
+    /// The group id of the most recently requested open-chat / flick-through
+    /// timeline load. A `LoadTimeline` result is folded only while its group
+    /// still matches this (the subscription-style stale guard); a later open
+    /// supersedes an earlier one that has not landed yet. `None` when the pane
+    /// is settled.
+    pub(crate) loading_chat: Option<String>,
+    /// The query of the most recently requested user search, or `None` when no
+    /// search is outstanding. A `UserSearch` result is folded only while its
+    /// query still matches (the same stale guard as `loading_chat`).
+    pub(crate) searching_users: Option<String>,
+    /// The group id of the group-detail load in flight, or `None`. A
+    /// `LoadGroupDetail` result is folded only while it still matches.
+    pub(crate) loading_group_detail: Option<String>,
+    /// Whether an invites-list load is in flight, gating a duplicate enqueue and
+    /// signalling the fold to open the picker.
+    pub(crate) loading_invites: bool,
+    /// Ticks remaining before the highlighted chat is previewed (flick-through),
+    /// or `None` when no preview is pending. Set to `FLICK_PREVIEW_DEBOUNCE_TICKS`
+    /// on each chat-list selection move and counted down each tick, so rapid j/k
+    /// coalesces to one load of the chat the user settles on.
+    pub(crate) flick_countdown: Option<u32>,
     /// Notification `notification_key`s already handled, so the runtime feed's
     /// duplicated emissions do not re-trigger a re-list or a repeated invite
     /// notice. FIFO-bounded to the recent event window, not unbounded.
@@ -94,13 +115,20 @@ pub(crate) struct TuiApp {
     /// Inbound-media state (Phase 6): terminal image capability, per-hash
     /// download/decode status, and the decoded protocols the renderer draws.
     pub(crate) media: MediaState,
+    /// Runs user-initiated `wn` mutations and loads off the event loop, in FIFO
+    /// order, delivering results back for folding on `tick`. This is what keeps
+    /// send/react/open-chat/search/etc. from freezing the render loop for a
+    /// subprocess round-trip.
+    pub(crate) effects: EffectRunner,
 }
 
 impl TuiApp {
     pub(crate) fn new(cli: Cli) -> TuiResult<Self> {
         let client = WnClient::from_cli(&cli)?;
+        let effects = EffectRunner::spawn(client.clone());
         Ok(Self {
             client,
+            effects,
             initial_account: cli.account.clone(),
             running: true,
             screen: Screen::Login(LoginMode::Menu),
@@ -125,6 +153,11 @@ impl TuiApp {
             notification_subscription: None,
             pending_chat_relist: false,
             pending_mark_read: false,
+            loading_chat: None,
+            searching_users: None,
+            loading_group_detail: None,
+            loading_invites: false,
+            flick_countdown: None,
             seen_notification_keys: SeenNotificationKeys::new(),
             daemon: DaemonView::default(),
             group_diagnostics: None,
@@ -263,6 +296,15 @@ impl TuiApp {
         // subprocess and decode run on worker threads; this only folds results.
         changed |= self.media.drain();
         changed |= self.ensure_media_downloads();
+        // Fold every effect that finished off-loop since the last tick, exactly
+        // as the synchronous handler folded its `run_json` return.
+        let completed = self.effects.drain();
+        if !completed.is_empty() {
+            for done in completed {
+                self.apply_effect_done(done);
+            }
+            changed = true;
+        }
         // Debounce: notification drains coalesce every NewMessage for a
         // non-loaded chat since the last tick into this one pending flag, so at
         // most one background `chats list` re-read runs per tick. Cleared before
@@ -272,9 +314,22 @@ impl TuiApp {
         // tick cadence is the hot-loop ceiling by construction).
         if self.pending_chat_relist {
             self.pending_chat_relist = false;
-            if let Err(err) = self.relist_chats() {
-                self.pending_chat_relist = true;
-                self.set_drain_status(format!("chat re-list failed: {err}"));
+            // Route the re-read through the effect worker rather than shelling out
+            // on the key-handling thread: a `chats list` subprocess inside `tick`
+            // would freeze typing. FIFO behind any queued mutations is fine (and
+            // even desirable — the mutation lands before the re-read reflects it).
+            // Only a local signing account has chats to list; a non-signing or
+            // absent selection simply queues nothing. The fold re-arms this flag on
+            // failure, so a transient error retries next tick instead of dropping
+            // the batch.
+            if let Some(account) = self
+                .selected_account_row()
+                .filter(|account| account.local_signing)
+            {
+                self.effects.enqueue(Effect::Relist {
+                    account: account.account_id.clone(),
+                    include_archived: self.show_archived_chats,
+                });
             }
             changed = true;
         }
@@ -287,10 +342,25 @@ impl TuiApp {
             if let (Some(account_id), Some(group_id)) = (
                 self.messages_account_id.clone(),
                 self.messages_group_id.clone(),
-            ) && let Err(err) = self.mark_selected_chat_read(&account_id, &group_id)
-            {
-                self.pending_mark_read = true;
-                self.set_drain_status(format!("mark-read failed: {err}"));
+            ) {
+                self.effects.enqueue(Effect::MarkRead {
+                    account: account_id,
+                    group: group_id,
+                });
+            }
+            changed = true;
+        }
+        // Flick-through debounce: count down the ticks since the last chat-list
+        // move and fire one preview load when the movement quiets, so racing
+        // through the list with j/k coalesces to a single load of the settled-on
+        // chat. `fire_flick_preview` and `begin_timeline_load` clear the counter.
+        if let Some(remaining) = self.flick_countdown {
+            let next = remaining.saturating_sub(1);
+            if next == 0 {
+                self.flick_countdown = None;
+                self.fire_flick_preview();
+            } else {
+                self.flick_countdown = Some(next);
             }
             changed = true;
         }
@@ -663,12 +733,46 @@ impl TuiApp {
     pub(crate) fn move_selection(&mut self, delta: isize) {
         match self.focus {
             Focus::Chats => {
+                let before = self.selected_chat;
                 self.selected_chat = move_index(self.selected_chat, self.chats.len(), delta);
+                if self.selected_chat != before {
+                    // Flick-through: schedule a debounced preview of the newly
+                    // highlighted chat. Focus stays on the chat list; the load
+                    // fires only after the movement quiets (see `tick`).
+                    self.flick_countdown = Some(FLICK_PREVIEW_DEBOUNCE_TICKS);
+                }
             }
             // The messages pane owns its own selection through `timeline_scroll`;
             // it is driven directly in `handle_key`, not through `move_selection`.
             Focus::Messages | Focus::Composer => {}
         }
+    }
+
+    /// Fire the debounced flick-through preview: load the highlighted chat's
+    /// timeline while focus stays on the chat list. A no-op unless the chat list
+    /// has focus and the highlight names a chat the pane is not already showing.
+    /// The load is tagged with its group id (via `begin_timeline_load`), so a
+    /// preview superseded by further movement is dropped at fold time, and it
+    /// marks the previewed chat read exactly as opening it does — the chat is on
+    /// screen, so viewing-is-reading applies.
+    fn fire_flick_preview(&mut self) {
+        if self.focus != Focus::Chats {
+            return;
+        }
+        let Some(account_id) = self
+            .selected_account_row()
+            .filter(|account| account.local_signing)
+            .map(|account| account.account_id.clone())
+        else {
+            return;
+        };
+        let Some(group_id) = self.selected_chat_row().map(|chat| chat.group_id.clone()) else {
+            return;
+        };
+        if self.messages_group_id.as_deref() == Some(group_id.as_str()) {
+            return;
+        }
+        self.begin_timeline_load(account_id, group_id);
     }
 
     /// Move the account-picker highlight (login/account-select screen only).
@@ -718,7 +822,19 @@ impl TuiApp {
             // Opening a chat also moves focus to the messages pane so the reader
             // can immediately scroll the conversation.
             Focus::Chats => {
-                self.refresh_messages()?;
+                // Opening the chat already loaded and settled in the pane — Enter
+                // after a settled flick preview of the same chat — is a focus move
+                // only. Reloading would re-enqueue a redundant timeline load and a
+                // second mark-read for a pane that already shows this chat (its
+                // live subscription keeps it current). A load still in flight, a
+                // different highlighted chat, or an empty pane still (re)loads.
+                let already_settled = self.loading_chat.is_none()
+                    && self.messages_group_id.is_some()
+                    && self.selected_chat_row().map(|chat| chat.group_id.as_str())
+                        == self.messages_group_id.as_deref();
+                if !already_settled {
+                    self.refresh_messages()?;
+                }
                 self.focus = Focus::Messages;
                 Ok(())
             }
@@ -1198,6 +1314,10 @@ impl TuiApp {
     /// same submit reached from elsewhere (e.g. group detail) is unaffected.
     fn reveal_chat_from_search(&mut self) {
         if self.screen == Screen::UserSearch {
+            // Drop any in-flight search so a late fold cannot repopulate the search
+            // view after we have moved on to the revealed chat (the same stale-fold
+            // guard `leave_screen` applies on `Esc`).
+            self.searching_users = None;
             self.user_search = None;
             self.screen = Screen::Main;
             self.focus = Focus::Chats;
@@ -1238,6 +1358,16 @@ impl TuiApp {
 
     pub(crate) fn leave_group_detail(&mut self) {
         self.group_detail = None;
+        // Clearing the load anchor drops any group-detail result still in flight,
+        // so a late load cannot repopulate the view after the screen is left.
+        self.loading_group_detail = None;
+        // Leaving mid-load would otherwise strand the "loading group detail..."
+        // status (the fold that clears it is now dropped). Reset it, guarded so a
+        // meaningful status a caller sets afterward (accept-invite, leave-group) is
+        // never clobbered.
+        if self.status == LOADING_GROUP_DETAIL_STATUS {
+            self.status = String::new();
+        }
         self.screen = Screen::Main;
         self.focus = Focus::Chats;
     }
@@ -1409,6 +1539,14 @@ impl TuiApp {
     /// the search/profile/relay-health `Esc` handlers (their data is a one-shot
     /// load with no per-view subscription to tear down).
     pub(crate) fn leave_screen(&mut self) {
+        // A user search may still be in flight. Clearing its anchor drops the
+        // stale result at fold time (mirroring `leave_group_detail`'s
+        // `loading_group_detail` clear), so reopening the search screen never
+        // inherits the abandoned query's results, and resets the "searching..."
+        // status the abandoned load would otherwise strand on the status line.
+        if self.searching_users.take().is_some() {
+            self.status = String::new();
+        }
         self.user_search = None;
         self.profile_view = None;
         self.relay_health = None;
