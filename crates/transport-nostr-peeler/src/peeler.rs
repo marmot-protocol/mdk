@@ -488,9 +488,7 @@ fn ensure_welcome_routing_matches(
         TransportEnvelope::Welcome { recipient } if recipient.as_slice() == event_recipient => {
             Ok(())
         }
-        TransportEnvelope::Welcome { .. } => Err(PeelerError::Malformed(
-            "event p tag does not match transport envelope".into(),
-        )),
+        TransportEnvelope::Welcome { .. } => Err(PeelerError::WrongRecipient),
         TransportEnvelope::GroupMessage { .. } => Err(PeelerError::Malformed(
             "welcome peeler received group envelope".into(),
         )),
@@ -1104,7 +1102,7 @@ mod tests {
             .await
             .expect_err("mismatched route should not peel");
 
-        assert!(matches!(err, PeelerError::Malformed(_)));
+        assert!(matches!(err, PeelerError::WrongRecipient));
     }
 
     #[tokio::test]

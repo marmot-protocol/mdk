@@ -86,6 +86,12 @@ impl<S: StorageProvider> Engine<S> {
                     reason: StaleReason::AlreadySeen,
                 })
             }
+            Err(EngineError::Peeler(PeelerError::WrongRecipient)) => {
+                self.storage.put_ingress_dedup_marker(&msg.id)?;
+                Ok(IngestOutcome::Stale {
+                    reason: StaleReason::NotForThisClient,
+                })
+            }
             Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
                 Ok(IngestOutcome::Stale {

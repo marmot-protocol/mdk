@@ -324,6 +324,9 @@ impl TransportPeeler for BoundaryRejectionPeeler {
     }
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        if msg.payload == BOUNDARY_REJECTION_PAYLOAD {
+            return Err(self.rejection.peeler_error());
+        }
         MockPeeler.peel_welcome(msg).await
     }
 
@@ -1051,6 +1054,49 @@ async fn wrong_transport_recipient_is_typed_terminal_input() {
         StaleReason::NotForThisClient,
     )
     .await;
+}
+
+#[tokio::test]
+async fn wrong_transport_welcome_recipient_is_typed_terminal_input() {
+    let mut engine = build_client_with_peeler(
+        b"welcome-wrong-recipient",
+        Box::new(BoundaryRejectionPeeler {
+            rejection: BoundaryRejection::WrongRecipient,
+            path: BoundaryRejectionPath::Direct,
+        }),
+    );
+    let rejected = TransportMessage {
+        id: hash_id(b"wrong transport welcome recipient"),
+        payload: BOUNDARY_REJECTION_PAYLOAD.to_vec(),
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mock".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: engine.self_id(),
+        },
+    };
+
+    let outcome = engine
+        .ingest(rejected.clone())
+        .await
+        .expect("wrong-recipient welcome is terminal input, not a drain failure");
+    assert_eq!(
+        outcome,
+        IngestOutcome::Stale {
+            reason: StaleReason::NotForThisClient
+        }
+    );
+
+    let duplicate = engine
+        .ingest(rejected)
+        .await
+        .expect("redelivery short-circuits after wrong-recipient welcome");
+    assert_eq!(
+        duplicate,
+        IngestOutcome::Stale {
+            reason: StaleReason::AlreadySeen
+        }
+    );
 }
 
 #[tokio::test]

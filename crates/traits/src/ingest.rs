@@ -36,7 +36,8 @@ pub enum StaleReason {
         current: EpochId,
         msg_epoch: EpochId,
     },
-    /// A welcome addressed to a member other than ourselves.
+    /// Input addressed to another member, or whose signed transport routing
+    /// metadata conflicts with the envelope presented to the engine.
     NotForThisClient,
     /// No local group matches this message's routing.
     UnknownGroup,
