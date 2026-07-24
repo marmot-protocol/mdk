@@ -783,9 +783,9 @@ fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom()
 
 #[test]
 fn canonical_media_type_trims_ascii_whitespace_only() {
-    // ASCII whitespace on the edges is stripped per the spec algorithm.
+    // ASCII whitespace on the edges is stripped per the V1 algorithm.
     assert_eq!(
-        canonical_media_type("  image/png \t").expect("ascii-trimmed type is valid"),
+        canonical_media_type_v1("  image/png \t").expect("ascii-trimmed type is valid"),
         "image/png",
     );
 
@@ -793,7 +793,7 @@ fn canonical_media_type_trims_ascii_whitespace_only() {
     // ASCII whitespace, so it MUST be preserved: trimming it would derive a
     // different file_key/AAD than a spec-conformant peer that keeps it.
     let canonical =
-        canonical_media_type("\u{00A0}image/png").expect("non-empty MIME type is valid");
+        canonical_media_type_v1("\u{00A0}image/png").expect("non-empty MIME type is valid");
     assert_eq!(canonical, "\u{00A0}image/png");
     assert!(canonical.starts_with('\u{00A0}'));
 }

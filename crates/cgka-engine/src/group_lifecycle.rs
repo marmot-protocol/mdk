@@ -945,6 +945,17 @@ impl<S: StorageProvider> Engine<S> {
                 crate::app_components::validate_current_profile_group_invariants(&mls_group)
                     .map_err(|_| EngineError::InvalidWelcome)?;
 
+                // Validate every known GroupContext component before any joined
+                // state leaves this transaction. Commit ingest validates
+                // AppDataUpdate payloads, but a Welcome installs a complete
+                // dictionary without traversing that seam.
+                crate::app_components::validate_app_component_dictionary(&mls_group).map_err(
+                    |error| match error {
+                        storage @ EngineError::Storage(_) => storage,
+                        _ => EngineError::InvalidWelcome,
+                    },
+                )?;
+
                 // 5c. Reject active required capabilities this client cannot
                 // apply, including required agent-stream roles.
                 let mut group_required =
@@ -1358,15 +1369,20 @@ pub(crate) fn build_group_context_snapshot<S: StorageProvider>(
 }
 
 /// Mirror signed app-component state into the local app-facing group record.
-/// Missing profile state leaves the record's existing values unchanged.
 pub(crate) fn mirror_app_components_into_record(
     mls_group: &MlsGroup,
     record: &mut cgka_traits::group::Group,
 ) {
-    if let Ok(Some((name, description))) = crate::app_components::group_profile_of_group(mls_group)
-    {
-        record.name = name;
-        record.description = description;
+    match crate::app_components::group_profile_of_group(mls_group) {
+        Ok(Some((name, description))) => {
+            record.name = name;
+            record.description = description;
+        }
+        Ok(None) => {
+            record.name.clear();
+            record.description.clear();
+        }
+        Err(_) => {}
     }
     if let Ok(components) = crate::app_components::required_app_components_of_group(mls_group) {
         record.required_capabilities.app_components = components;

@@ -176,6 +176,7 @@ impl AppClient {
         Some(EventGroupProjection {
             nostr_routing,
             group_metadata,
+            profile: self.profile_for_group(group_id),
             admin_policy: self
                 .runtime
                 .admin_pubkeys(group_id)
@@ -508,6 +509,7 @@ impl AppClient {
                     Ok::<_, AppError>(EventGroupProjection {
                         nostr_routing: self.nostr_routing_for_group(group_id)?,
                         group_metadata: group_metadata.as_ref(),
+                        profile: self.profile_for_group(group_id),
                         admin_policy: self
                             .runtime
                             .admin_pubkeys(group_id)
