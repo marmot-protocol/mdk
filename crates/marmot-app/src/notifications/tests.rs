@@ -189,6 +189,43 @@ fn empty_malformed_or_too_long_tokens_are_rejected_without_secret_material() {
     assert!(!err.to_string().contains(&too_long));
 }
 
+#[tokio::test]
+async fn local_token_gossip_normalizes_relay_hint_before_signing_and_storage() {
+    let owner = Keys::generate();
+    let token_bytes = b"provider-token".to_vec();
+    let registration = StoredPushRegistration {
+        registration: PushRegistration {
+            account_ref: "alice".to_owned(),
+            account_id_hex: owner.public_key().to_hex(),
+            platform: PushPlatform::Fcm,
+            token_fingerprint: push_token_fingerprint(PushPlatform::Fcm, &token_bytes),
+            server_pubkey_hex: Keys::generate().public_key().to_hex(),
+            relay_hint: Some(" \twss://relay.example\n".to_owned()),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_shared_at_ms: None,
+        },
+        token_bytes,
+    };
+
+    let (payload, record) = local_token_gossip_payload(
+        "ef".repeat(16),
+        owner.public_key().to_hex(),
+        1,
+        &registration,
+        &owner,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(record.relay_hint.as_deref(), Some("wss://relay.example"));
+    assert_eq!(
+        payload.tokens[0].relay_hint.as_deref(),
+        Some("wss://relay.example")
+    );
+    assert!(record.verify_owner_sig());
+}
+
 #[test]
 fn kind_446_content_is_base64_concatenated_tokens_with_version_tag() {
     let token = vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN];
@@ -498,6 +535,103 @@ fn identical_push_gossip_entries_are_deduplicated_before_verification() {
     {
         PushGossipAction::Remove(removals) => assert_eq!(removals.len(), 1),
         other => panic!("expected removal action, got {other:?}"),
+    }
+}
+
+#[test]
+fn normalized_relay_hint_duplicates_are_deduplicated_before_verification_and_apply() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id = cgka_traits::GroupId::new(vec![0xEF; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let server = "cd".repeat(32);
+    let mut record = signed_token_record(&owner, &group_id_hex, 1, &server, 100);
+    record.relay_hint = None;
+    record.sign_owner(&owner).unwrap();
+
+    let omitted_hint = serde_json::to_value(PushTokenGossipEntry::from_record(&record)).unwrap();
+    let mut blank_hint = omitted_hint.clone();
+    blank_hint["relay_hint"] = serde_json::json!(" \t");
+    let payload = serde_json::json!({
+        "v": PUSH_VERSION,
+        "tokens": [omitted_hint, blank_hint],
+    })
+    .to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let message = ReceivedMessage {
+        message_id_hex: "11".repeat(32),
+        source_message_id_hex: "22".repeat(32),
+        sender: owner_id.clone(),
+        sender_display_name: None,
+        group_id,
+        source_epoch: 1,
+        plaintext: payload,
+        kind: MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+        tags: vec![vec!["v".to_owned(), PUSH_VERSION.to_owned()]],
+        recorded_at: 1,
+        received_at: 1,
+    };
+
+    reset_owner_signature_verification_count();
+    app.ingest_push_gossip_message("alice", &message, std::slice::from_ref(&owner_id))
+        .unwrap();
+
+    assert_eq!(
+        owner_signature_verification_count(),
+        1,
+        "wire variants of one canonical record must verify only once"
+    );
+    let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
+    assert_eq!(stored.len(), 1, "the canonical record applies only once");
+    assert_eq!(stored[0].relay_hint, None);
+}
+
+#[test]
+fn surrounding_relay_hint_whitespace_is_deduplicated_before_verification() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let record = signed_token_record(&owner, &group_id_hex, 1, &"cd".repeat(32), 100);
+    let canonical = serde_json::to_value(PushTokenGossipEntry::from_record(&record)).unwrap();
+    let mut padded = canonical.clone();
+    padded["relay_hint"] = serde_json::json!(" \twss://relay.example\n");
+    let payload = serde_json::json!({
+        "v": PUSH_VERSION,
+        "tokens": [canonical, padded],
+    })
+    .to_string();
+
+    reset_owner_signature_verification_count();
+    let action = verify_push_gossip(
+        parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+            &group_id_hex,
+            &payload,
+        )
+        .unwrap(),
+        &group_id_hex,
+        std::slice::from_ref(&owner_id),
+    );
+
+    assert_eq!(
+        owner_signature_verification_count(),
+        1,
+        "signed-record-equivalent relay hints must verify only once"
+    );
+    match action {
+        PushGossipAction::Upsert(records) => {
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].relay_hint.as_deref(),
+                Some("wss://relay.example")
+            );
+        }
+        other => panic!("expected upsert action, got {other:?}"),
     }
 }
 

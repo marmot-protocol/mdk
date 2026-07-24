@@ -581,6 +581,10 @@ fn decode_hex_32(value: &str, name: &str) -> Result<[u8; 32], AppError> {
         .map_err(|_| AppError::InvalidPushGossip(format!("{name} must be 32-byte hex")))
 }
 
+fn normalized_relay_hint(relay_hint: Option<&str>) -> Option<&str> {
+    relay_hint.map(str::trim).filter(|hint| !hint.is_empty())
+}
+
 /// Canonical `SignedRecord` bytes from the spec's "Owner authentication" section.
 /// `encrypted_token` is `Some` for token entries (kinds 447/448, `PUSH_RECORD_DOMAIN`)
 /// and `None` for removals (kind 449, `PUSH_REMOVAL_DOMAIN`), which omit the field.
@@ -609,10 +613,7 @@ fn push_signed_record_bytes(
     let group_id_len = u16::try_from(group_id.len())
         .map_err(|_| AppError::InvalidPushGossip("group id too long".into()))?;
     // Blank/whitespace-only hints sign as absent so signer and verifier agree.
-    let relay = relay_hint
-        .map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .unwrap_or("");
+    let relay = normalized_relay_hint(relay_hint).unwrap_or("");
     let relay_bytes = relay.as_bytes();
     let relay_len = u16::try_from(relay_bytes.len())
         .map_err(|_| AppError::InvalidPushGossip("relay hint too long".into()))?;
@@ -662,11 +663,7 @@ struct PushOwnerProofEvent<'a> {
 fn push_owner_proof_event(input: PushOwnerProofEvent<'_>) -> Result<UnsignedEvent, AppError> {
     let member_pubkey = PublicKey::parse(input.member_id_hex)
         .map_err(|_| AppError::InvalidPushGossip("member id must be a Nostr pubkey".into()))?;
-    let relay = input
-        .relay_hint
-        .map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .unwrap_or("");
+    let relay = normalized_relay_hint(input.relay_hint).unwrap_or("");
     let mut tags = vec![
         Tag::custom(TagKind::custom("d"), [input.domain.to_owned()]),
         Tag::custom(TagKind::custom("group_id"), [input.group_id_hex.to_owned()]),
@@ -994,11 +991,8 @@ pub(crate) async fn local_token_gossip_payload(
         platform: registration.registration.platform,
         token_fingerprint: registration.registration.token_fingerprint.clone(),
         server_pubkey_hex: registration.registration.server_pubkey_hex.clone(),
-        relay_hint: registration
-            .registration
-            .relay_hint
-            .clone()
-            .filter(|relay| !relay.trim().is_empty()),
+        relay_hint: normalized_relay_hint(registration.registration.relay_hint.as_deref())
+            .map(str::to_owned),
         encrypted_token,
         owner_ts: now,
         owner_sig: String::new(),
@@ -1067,6 +1061,7 @@ pub(crate) fn parse_push_gossip(
                 .tokens
                 .into_iter()
                 .filter_map(|entry| serde_json::from_value::<PushTokenGossipEntry>(entry).ok())
+                .map(PushTokenGossipEntry::normalize_relay_hint)
                 .filter(|entry| seen.insert(entry.clone()))
                 .filter_map(|entry| entry.into_record(group_id_hex).ok())
                 .collect();
@@ -1143,6 +1138,11 @@ pub(crate) fn verify_push_gossip(
 }
 
 impl PushTokenGossipEntry {
+    fn normalize_relay_hint(mut self) -> Self {
+        self.relay_hint = normalized_relay_hint(self.relay_hint.as_deref()).map(str::to_owned);
+        self
+    }
+
     fn from_record(record: &GroupPushTokenRecord) -> Self {
         Self {
             member_id_hex: record.member_id_hex.clone(),
@@ -1178,7 +1178,7 @@ impl PushTokenGossipEntry {
             platform,
             token_fingerprint: self.token_fingerprint,
             server_pubkey_hex: self.server_pubkey_hex,
-            relay_hint: self.relay_hint.filter(|relay| !relay.trim().is_empty()),
+            relay_hint: self.relay_hint,
             encrypted_token,
             owner_ts: self.owner_ts,
             owner_sig: self.owner_sig,
