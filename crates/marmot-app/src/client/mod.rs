@@ -203,17 +203,12 @@ impl AppClient {
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
         match self.app.latest_key_package(&self.state.label) {
-            Ok(key_package) => {
-                if is_last_resort_key_package(&key_package)
-                    .map_err(marmot_account::AccountError::Engine)?
-                {
-                    self.app
-                        .publish_cached_key_package(&self.state.label, key_package)
-                        .await
-                } else {
-                    Ok(self.runtime.publish_fresh_key_package().await?)
-                }
+            Ok(key_package) if is_last_resort_key_package(&key_package).unwrap_or(false) => {
+                self.app
+                    .publish_cached_key_package(&self.state.label, key_package)
+                    .await
             }
+            Ok(_) => Ok(self.runtime.publish_fresh_key_package().await?),
             Err(AppError::MissingKeyPackage(_)) => {
                 Ok(self.runtime.publish_fresh_key_package().await?)
             }
