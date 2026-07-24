@@ -186,7 +186,8 @@ async fn fresh_key_package_for_account(
         Box::new(NostrMlsPeeler::new().with_welcome_signer(signer.as_nostr_signer())),
     )
     .account_identity_proof_signer(signer.as_proof_signer())
-    .feature_registry(app_feature_registry());
+    .feature_registry(app_feature_registry())
+    .supported_app_components(app.supported_app_component_ids());
     if legacy {
         config = config.legacy_compatibility_profile();
     }
@@ -1492,13 +1493,27 @@ fn encrypted_media_v2_round_trips_through_account_projection() {
     assert_eq!(restored.encrypted_media, group.encrypted_media);
 }
 
-#[test]
-fn key_package_capabilities_advertise_both_frozen_v1_and_current_v2_support() {
+#[tokio::test]
+async fn key_package_capabilities_advertise_every_supported_group_component() {
     let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("component-advertisement").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let supported = app.supported_app_component_ids();
+    assert!(supported.contains(&GROUP_BLOSSOM_IMAGE_COMPONENT_ID));
+    assert!(supported.contains(&GROUP_MESSAGE_RETENTION_COMPONENT_ID));
+    assert!(supported.contains(&GROUP_AVATAR_URL_COMPONENT_ID));
     assert!(supported.contains(&GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID));
     assert!(supported.contains(&GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID));
+
+    let key_package = fresh_key_package_for_account(&app, &account, false).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&key_package).unwrap();
+    for component_id in supported {
+        assert!(
+            metadata.app_components.contains(&component_id),
+            "generated KeyPackage omitted supported component {component_id:#06x}"
+        );
+    }
 }
 
 #[test]

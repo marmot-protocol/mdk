@@ -260,6 +260,13 @@ where
         Ok((group_id, effects))
     }
 
+    pub fn constructable_capabilities(
+        &self,
+        key_packages: &[cgka_traits::engine::KeyPackage],
+    ) -> AccountResult<cgka_traits::capabilities::GroupCapabilities> {
+        Ok(self.session.constructable_capabilities(key_packages)?)
+    }
+
     pub async fn create_group_with_audit_context(
         &mut self,
         request: CreateGroupRequest,
@@ -285,9 +292,27 @@ where
         request: CreateGroupRequest,
         context: AuditEventContext,
     ) -> AccountResult<CreateGroupEffects> {
+        self.prepare_create_group_with_optional_app_components_and_audit_context(
+            request,
+            Vec::new(),
+            context,
+        )
+        .await
+    }
+
+    pub async fn prepare_create_group_with_optional_app_components_and_audit_context(
+        &mut self,
+        request: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        context: AuditEventContext,
+    ) -> AccountResult<CreateGroupEffects> {
         Ok(self
             .session
-            .create_group_with_audit_context(request, context)
+            .create_group_with_optional_app_components_and_audit_context(
+                request,
+                optional_app_components,
+                context,
+            )
             .await?)
     }
 

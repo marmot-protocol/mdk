@@ -24,10 +24,11 @@ use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT,
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppError, AppGroupMemberRecord,
-    AppGroupMlsState, AppGroupRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery,
-    PushRegistration, ReceivedMessage, SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    AppGroupMlsState, AppGroupRecord, AppInitialGroupImage, AppProjectionUpdate,
+    AppQuarantinedGroup, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    PendingWelcomeDelivery, PushRegistration, ReceivedMessage, SecureDeleteExpiredResult,
+    SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 
@@ -93,6 +94,7 @@ pub(crate) enum AccountWorkerCommand {
         name: String,
         members: Vec<String>,
         description: Option<String>,
+        initial_image: Option<AppInitialGroupImage>,
         respond: oneshot::Sender<Result<GroupId, AppError>>,
     },
     Members {
@@ -712,11 +714,14 @@ async fn handle_account_worker_command(
             name,
             members,
             description,
+            initial_image,
             respond,
         } => {
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-                let group_id = client.create_group(&name, &member_refs).await?;
+                let group_id = client
+                    .create_group_with_initial_image(&name, &member_refs, initial_image)
+                    .await?;
                 if description.is_some() {
                     client
                         .update_group_profile(&group_id, None, description.as_deref())

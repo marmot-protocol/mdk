@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 use super::DEFAULT_BLOSSOM_SERVER_URL;
 use super::blossom::{blossom_blob_url, fetch_blossom_blob, upload_blossom_blob};
 use super::canonical_media_type;
-use crate::AppError;
+use crate::{AppError, AppGroupImageInput};
 
 const GROUP_IMAGE_VERSION: &str = "marmot-group-image-v1";
 
@@ -30,6 +30,18 @@ pub(crate) struct GroupImageUpload {
     pub(crate) image_nonce_hex: String,
     pub(crate) image_upload_key_hex: String,
     pub(crate) media_type: String,
+}
+
+impl From<GroupImageUpload> for AppGroupImageInput {
+    fn from(upload: GroupImageUpload) -> Self {
+        Self {
+            image_hash_hex: upload.image_hash_hex,
+            image_key_hex: upload.image_key_hex,
+            image_nonce_hex: upload.image_nonce_hex,
+            image_upload_key_hex: upload.image_upload_key_hex,
+            media_type: Some(upload.media_type),
+        }
+    }
 }
 
 fn group_image_aad(media_type: &str) -> Vec<u8> {

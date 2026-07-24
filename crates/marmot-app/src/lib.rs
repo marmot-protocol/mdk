@@ -137,7 +137,8 @@ pub use groups::{
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason,
     AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
     AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
-    AppGroupSystemEvent, AppProtocolProfile, AppQuarantinedGroup, group_system_event_from_message,
+    AppGroupSystemEvent, AppInitialGroupImage, AppProtocolProfile, AppQuarantinedGroup,
+    group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -1131,7 +1132,9 @@ impl MarmotApp {
                 .ok()
                 .and_then(|key_package| key_package_metadata(&key_package).ok())
                 .is_some_and(|metadata| {
-                    metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+                    client
+                        .app
+                        .key_package_metadata_matches_current_support(&metadata)
                 });
             if cached_current {
                 client
@@ -1157,7 +1160,9 @@ impl MarmotApp {
                     .ok()
                     .and_then(|key_package| key_package_metadata(&key_package).ok())
                     .is_some_and(|metadata| {
-                        metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+                        client
+                            .app
+                            .key_package_metadata_matches_current_support(&metadata)
                     })
                 {
                     client
@@ -2235,7 +2240,7 @@ impl MarmotApp {
         .ok()
         .and_then(|key_package| key_package_metadata(&key_package).ok())
         .is_some_and(|metadata| {
-            metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            self.key_package_metadata_matches_current_support(&metadata)
                 && metadata.credential_identity_hex == record.account_id_hex
         });
         if is_current {
@@ -2350,10 +2355,13 @@ impl MarmotApp {
         for record in records {
             let event_id = record.event.id.clone();
             let endpoints = record.endpoints.clone();
-            let profile = key_package_from_record(record)
+            let is_current = key_package_from_record(record)
                 .ok()
-                .map(|fetched| fetched.key_package.protocol_profile);
-            if profile == Some(cgka_traits::group::ProtocolProfile::Current) {
+                .and_then(|fetched| key_package_metadata(&fetched.key_package).ok())
+                .is_some_and(|metadata| {
+                    self.key_package_metadata_matches_current_support(&metadata)
+                });
+            if is_current {
                 continue;
             }
             if !self.mark_key_package_cutover_replacement_pending(label) {
@@ -2388,13 +2396,13 @@ impl MarmotApp {
     fn key_package_cutover_replacement_pending_path(&self, label: &str) -> PathBuf {
         self.key_package_cache_dir()
             .join(KEY_PACKAGE_DIR)
-            .join(format!("{label}.strict-cutover-replacement-pending"))
+            .join(format!("{label}.capability-refresh-v1-replacement-pending"))
     }
 
     fn key_package_cutover_scan_complete_path(&self, label: &str) -> PathBuf {
         self.key_package_cache_dir()
             .join(KEY_PACKAGE_DIR)
-            .join(format!("{label}.strict-cutover-relay-scan-complete"))
+            .join(format!("{label}.capability-refresh-v1-relay-scan-complete"))
     }
 
     fn key_package_cutover_replacement_pending(&self, label: &str) -> bool {
@@ -3571,14 +3579,28 @@ impl MarmotApp {
 
     fn supported_app_component_ids(&self) -> Vec<u16> {
         let mut components = default_group_components();
+        components.insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
         components.insert(NOSTR_ROUTING_COMPONENT_ID);
+        components.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
         components.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
+        components.insert(GROUP_AVATAR_URL_COMPONENT_ID);
         // Existing legacy groups continue to require V1, while fresh
         // current-profile groups require V2. Advertising both is support, not
         // negotiation: each group's required component id selects exactly one.
         components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
         components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
         components.into_iter().collect()
+    }
+
+    fn key_package_metadata_matches_current_support(
+        &self,
+        metadata: &cgka_engine::key_package::KeyPackageMetadata,
+    ) -> bool {
+        metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && self
+                .supported_app_component_ids()
+                .iter()
+                .all(|component_id| metadata.app_components.contains(component_id))
     }
 
     fn new_nostr_routing(&self) -> Result<NostrRoutingV1, AppError> {

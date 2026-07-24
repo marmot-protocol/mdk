@@ -51,6 +51,7 @@ pub(crate) struct InitialComponentState {
     pub(crate) description: String,
     pub(crate) admins: Vec<[u8; 32]>,
     pub(crate) app_components: Vec<AppComponentData>,
+    pub(crate) optional_app_components: Vec<AppComponentData>,
 }
 
 pub(crate) fn leaf_app_components_extension(
@@ -134,6 +135,15 @@ pub(crate) fn app_data_dictionary_extension_for_group(
         if required.contains(component.component_id) {
             dict.insert(component.component_id, component.data.clone());
         }
+    }
+    for component in &initial.optional_app_components {
+        if !seen_initial.insert(component.component_id) {
+            return Err(EngineError::Other(
+                "group creation request contains duplicate app components".into(),
+            ));
+        }
+        validate_initial_app_component(component)?;
+        dict.insert(component.component_id, component.data.clone());
     }
     Ok(Extension::AppDataDictionary(
         AppDataDictionaryExtension::new(dict),
@@ -1668,6 +1678,7 @@ mod tests {
             description: "desc".to_string(),
             admins: vec![[7u8; 32]],
             app_components: Vec::new(),
+            optional_app_components: Vec::new(),
         };
         let ext = app_data_dictionary_extension_for_group(&required, &initial)
             .expect("creation dictionary should build");
@@ -1752,6 +1763,7 @@ mod tests {
             description: "desc".to_string(),
             admins: vec![[7u8; 32]],
             app_components: Vec::new(),
+            optional_app_components: Vec::new(),
         };
 
         let ext = app_data_dictionary_extension_for_group(&required, &initial)

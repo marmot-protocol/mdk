@@ -1056,6 +1056,19 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn create_group_with_initial_image(
+        &self,
+        account_ref: &str,
+        name: &str,
+        members: &[String],
+        description: Option<String>,
+        initial_image: Option<crate::AppInitialGroupImage>,
+    ) -> Result<GroupId, AppError> {
+        self.accounts
+            .create_group_with_initial_image(account_ref, name, members, description, initial_image)
+            .await
+    }
+
     pub async fn group_members(
         &self,
         account_ref: &str,

@@ -17,6 +17,7 @@ use cgka_traits::app_components::{
 use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent,
 };
+use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendIntent};
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::transport::TransportEnvelope;
@@ -41,10 +42,11 @@ use crate::{
     AppError, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
     AppGroupEncryptedMediaComponent, AppGroupImageComponent, AppGroupImageInput,
     AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupRecord,
-    AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup, AppRuntime, AppTransportRouting,
-    GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
-    PendingWelcomeDelivery, SelfMembership, SendSummary, remember_seen_event, unix_now_seconds,
+    AppInitialGroupImage, AppMessageQuery, AppPerformanceTelemetry, AppQuarantinedGroup,
+    AppRuntime, AppTransportRouting, GroupInviteDeclineResult, MarmotApp, MarmotRelayPlane,
+    MarmotRelayPlaneAccountAdapter, MediaAttachmentReference, MediaDownloadResult,
+    MediaUploadRequest, MediaUploadResult, PendingWelcomeDelivery, SelfMembership, SendSummary,
+    remember_seen_event, unix_now_seconds,
 };
 
 mod audit;
@@ -235,6 +237,9 @@ impl AppClient {
                 let reusable_current = match key_package_metadata(&key_package) {
                     Ok(metadata) if metadata.protocol_profile == ProtocolProfile::Current => {
                         is_last_resort_key_package(&key_package).unwrap_or(false)
+                            && self
+                                .app
+                                .key_package_metadata_matches_current_support(&metadata)
                     }
                     // Strict cutover replaces legacy or malformed cached
                     // packages instead of republishing them.
@@ -278,6 +283,16 @@ impl AppClient {
         name: &str,
         member_refs: &[&str],
     ) -> Result<GroupId, AppError> {
+        self.create_group_with_initial_image(name, member_refs, None)
+            .await
+    }
+
+    pub async fn create_group_with_initial_image(
+        &mut self,
+        name: &str,
+        member_refs: &[&str],
+        initial_image: Option<AppInitialGroupImage>,
+    ) -> Result<GroupId, AppError> {
         validate_group_profile(name, "")?;
         let mut members = Vec::with_capacity(member_refs.len());
         for member in member_refs {
@@ -299,20 +314,58 @@ impl AppClient {
         let encrypted_media = self.encrypted_media_component_for_new_group()?;
         let encrypted_media_component_id = encrypted_media.component_id;
         app_components.push(encrypted_media);
+        let constructable = self.runtime.constructable_capabilities(&members)?;
+        let mut optional_app_components = Vec::new();
+        if let Some(image) = initial_image {
+            match preferred_initial_group_image_component(
+                &constructable,
+                image.source_url.is_some(),
+            ) {
+                Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID) => {
+                    let upload =
+                        upload_group_image(&image.plaintext, &image.media_type, None).await?;
+                    let input = AppGroupImageInput::from(upload);
+                    optional_app_components.push(AppComponentData {
+                        component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+                        data: hex::decode(AppGroupImageComponent::new(input).data_hex)?,
+                    });
+                }
+                Some(GROUP_AVATAR_URL_COMPONENT_ID) => {
+                    if let Some(url) = image.source_url {
+                        optional_app_components.push(
+                            AppGroupAvatarUrlComponent::new(url, image.dim, image.thumbhash)?
+                                .to_app_component_data()?,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut touched_components = vec![
+            NOSTR_ROUTING_COMPONENT_ID,
+            AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            encrypted_media_component_id,
+        ];
+        touched_components.extend(
+            optional_app_components
+                .iter()
+                .map(|component| component.component_id),
+        );
+        let changed_fields = if optional_app_components.is_empty() {
+            vec!["name", "members"]
+        } else {
+            vec!["name", "members", "image"]
+        };
         let audit_context = Self::local_human_action_context(
             "create_group",
-            vec!["name", "members"],
-            vec![
-                NOSTR_ROUTING_COMPONENT_ID,
-                AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
-                encrypted_media_component_id,
-            ],
+            changed_fields,
+            touched_components,
             Some(member_refs.len() as u64),
         );
 
         let prepared = self
             .runtime
-            .prepare_create_group_with_audit_context(
+            .prepare_create_group_with_optional_app_components_and_audit_context(
                 CreateGroupRequest {
                     name: name.to_owned(),
                     description: String::new(),
@@ -321,6 +374,7 @@ impl AppClient {
                     app_components,
                     initial_admins: Vec::new(),
                 },
+                optional_app_components,
                 audit_context.clone(),
             )
             .await?;
@@ -1610,13 +1664,7 @@ impl AppClient {
             AppGroupImageInput::default()
         } else {
             let upload = upload_group_image(&plaintext, media_type, None).await?;
-            AppGroupImageInput {
-                image_hash_hex: upload.image_hash_hex,
-                image_key_hex: upload.image_key_hex,
-                image_nonce_hex: upload.image_nonce_hex,
-                image_upload_key_hex: upload.image_upload_key_hex,
-                media_type: Some(upload.media_type),
-            }
+            AppGroupImageInput::from(upload)
         };
         let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
         let effects = self
@@ -2394,6 +2442,26 @@ impl AppClient {
     }
 }
 
+fn preferred_initial_group_image_component(
+    constructable: &GroupCapabilities,
+    has_source_url: bool,
+) -> Option<u16> {
+    if constructable
+        .app_components
+        .contains(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+    {
+        Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+    } else if has_source_url
+        && constructable
+            .app_components
+            .contains(GROUP_AVATAR_URL_COMPONENT_ID)
+    {
+        Some(GROUP_AVATAR_URL_COMPONENT_ID)
+    } else {
+        None
+    }
+}
+
 /// Whether the local account (`local_account_id_hex`) is absent from a group's
 /// engine roster — the backfill's suppression decision. MLS member ids in this
 /// design are the Nostr account pubkey hex, so an account is "still a member"
@@ -2412,8 +2480,40 @@ fn local_account_removed_from_roster(
 
 #[cfg(test)]
 mod post_canonical_create_tests {
-    use super::recover_post_canonical_result;
+    use super::{preferred_initial_group_image_component, recover_post_canonical_result};
     use crate::AppError;
+    use cgka_traits::app_components::{
+        GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    };
+    use cgka_traits::capabilities::GroupCapabilities;
+
+    #[test]
+    fn founding_image_prefers_blossom_then_url_then_none() {
+        let mut capabilities = GroupCapabilities::default();
+        capabilities
+            .app_components
+            .insert(GROUP_AVATAR_URL_COMPONENT_ID);
+        capabilities
+            .app_components
+            .insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        assert_eq!(
+            preferred_initial_group_image_component(&capabilities, true),
+            Some(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+        );
+
+        capabilities
+            .app_components
+            .ids
+            .remove(&GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        assert_eq!(
+            preferred_initial_group_image_component(&capabilities, true),
+            Some(GROUP_AVATAR_URL_COMPONENT_ID)
+        );
+        assert_eq!(
+            preferred_initial_group_image_component(&capabilities, false),
+            None
+        );
+    }
 
     #[test]
     fn post_canonical_failures_default_instead_of_escaping() {
