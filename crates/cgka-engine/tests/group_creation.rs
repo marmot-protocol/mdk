@@ -1412,7 +1412,7 @@ async fn nostr_routing_component_drives_group_message_route() {
         .await
         .unwrap();
     let msg = match sent {
-        SendResult::ApplicationMessage { msg } => msg,
+        SendResult::ApplicationMessage { msg, .. } => msg,
         other => panic!("expected app message, got {other:?}"),
     };
     assert_eq!(

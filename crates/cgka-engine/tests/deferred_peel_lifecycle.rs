@@ -253,7 +253,7 @@ async fn send_app(
         .await
         .expect("send app");
     match result {
-        SendResult::ApplicationMessage { msg } => route(msg, group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg, group_id),
         other => panic!("expected app message, got {other:?}"),
     }
 }

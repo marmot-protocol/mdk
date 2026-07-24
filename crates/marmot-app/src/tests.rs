@@ -1140,6 +1140,7 @@ fn received_message_sender_is_admitted_to_directory_cache() {
         sender_display_name: None,
         group_id: GroupId::new(vec![0x01]),
         source_epoch: 0,
+        retention: None,
         plaintext: "hello".to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),
@@ -1531,6 +1532,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             kind: 9,
             tags: Vec::new(),
             source_epoch: None,
+            retention: None,
             recorded_at: Some(1_700_000_101),
             origin_commit_id: None,
             moderation_grant: false,
@@ -1597,6 +1599,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             kind: 9,
             tags: Vec::new(),
             source_epoch: None,
+            retention: None,
             recorded_at: Some(1_700_000_102),
             origin_commit_id: None,
             moderation_grant: false,
@@ -1729,6 +1732,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
         sender_display_name: None,
         group_id: group_id.clone(),
         source_epoch: 1,
+        retention: None,
         plaintext: content,
         kind: crate::notifications::MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         tags: vec![vec!["v".to_owned(), "marmot-push-v1".to_owned()]],
@@ -2319,6 +2323,7 @@ fn received_event_decodes_when_id_and_sender_match() {
         None,
         &group_id,
         0,
+        None,
         "msg1",
         1_700_000_000,
         Some(42),
@@ -2362,7 +2367,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
     let bytes = event.encode().unwrap();
     let group_id = GroupId::new(vec![0x01]);
     let message = groups::decode_received_event(
-        &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+        &bytes, SENDER_HEX, None, &group_id, 7, None, "msg1", 0, None, false,
     )
     .expect("an out-of-policy media locator must not drop the message");
     assert_eq!(message.plaintext, "delayed media");
@@ -2438,7 +2443,7 @@ fn received_media_message_with_malformed_v2_reference_keeps_the_message() {
     let group_id = GroupId::new(vec![0x01]);
     assert!(
         groups::decode_received_event(
-            &bytes, SENDER_HEX, None, &group_id, 7, "msg1", 0, None, false,
+            &bytes, SENDER_HEX, None, &group_id, 7, None, "msg1", 0, None, false,
         )
         .is_some(),
         "a malformed V2 attachment must not drop its carrying message",
@@ -2457,7 +2462,7 @@ fn received_event_with_tampered_id_is_rejected() {
     let group_id = GroupId::new(vec![0x01]);
     assert!(
         groups::decode_received_event(
-            &bytes, SENDER_HEX, None, &group_id, 0, "msg1", 0, None, false,
+            &bytes, SENDER_HEX, None, &group_id, 0, None, "msg1", 0, None, false,
         )
         .is_none()
     );
@@ -2479,6 +2484,7 @@ fn received_event_with_wrong_sender_is_rejected() {
             None,
             &group_id,
             0,
+            None,
             "msg1",
             0,
             None,
@@ -2633,7 +2639,7 @@ fn relay_telemetry_settings_reject_invalid_persisted_interval() {
 }
 
 #[test]
-fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_layer() {
+fn source_epoch_retention_is_app_visible_and_returns_media_hashes_when_expired() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let account = home.create_account("alice").unwrap();
@@ -2672,7 +2678,8 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
                 "v encrypted-media-v1".to_owned(),
                 format!("ciphertext_sha256 {media_hash}"),
             ]],
-            source_epoch: None,
+            source_epoch: Some(7),
+            retention: Some(AppMessageRetentionDecision::new(10, 5)),
             recorded_at: Some(10),
             origin_commit_id: None,
             moderation_grant: false,
@@ -2683,8 +2690,12 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
     let stored = app.messages("alice").unwrap();
     assert_eq!(stored[0].recorded_at, 10);
     assert_eq!(stored[0].received_at, 100);
-    // Retention follows the authenticated recorded_at even though this device
-    // observed the message well after the cutoff.
+    assert_eq!(
+        stored[0].retention,
+        Some(AppMessageRetentionDecision::new(10, 5))
+    );
+    // Expiry follows the authenticated source decision even though this
+    // device observed the message well after its deadline.
     assert!(
         app.chat_list_row("alice", "aa")
             .unwrap()
@@ -2694,7 +2705,7 @@ fn secure_prune_account_app_events_before_returns_media_hashes_above_storage_lay
     );
 
     let outcome = app
-        .secure_prune_account_app_events_before("alice", "aa", 15)
+        .secure_prune_expired_account_app_events("alice", "aa", 15)
         .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
@@ -2752,6 +2763,7 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
             kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
             tags: Vec::new(),
             source_epoch: Some(2),
+            retention: None,
             recorded_at: Some(10),
             origin_commit_id,
             moderation_grant: false,

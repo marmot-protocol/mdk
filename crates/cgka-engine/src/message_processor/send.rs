@@ -809,10 +809,15 @@ impl<S: StorageProvider> Engine<S> {
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
-        let wrap_metadata = GroupMessageMetadata::application(
+        let source_epoch = EpochId(mls_group.epoch().as_u64());
+        let source_retention_seconds =
+            crate::app_components::message_retention_seconds_of_group(&mls_group)?;
+        let retention = cgka_traits::app_event::AppMessageRetentionDecision::new(
             app_event.created_at,
-            crate::app_components::message_retention_seconds_of_group(&mls_group)?,
+            source_retention_seconds.unwrap_or(0),
         );
+        let wrap_metadata =
+            GroupMessageMetadata::application(app_event.created_at, source_retention_seconds);
 
         let out: MlsMessageOut = mls_group
             .create_message(&provider, &self.identity.signer, &payload)
@@ -836,14 +841,15 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
 
         let wrapped = route_wrapped_group_message(wrapped, &ctx);
-        self.record_sent_openmls_message(
-            &wrapped,
-            out_bytes.as_slice(),
-            &group_id,
-            EpochId(mls_group.epoch().as_u64()),
-        )?;
+        self.record_sent_openmls_message(&wrapped, out_bytes.as_slice(), &group_id, source_epoch)?;
 
-        Ok(SendResult::ApplicationMessage { msg: wrapped })
+        Ok(SendResult::ApplicationMessage {
+            msg: wrapped,
+            group_id,
+            app_event_id: app_event.id,
+            source_epoch,
+            retention,
+        })
     }
 }
 

@@ -369,6 +369,10 @@ async fn current_founding_creation_is_immediately_stable_and_survives_restart() 
             epoch: EpochId(1),
             sender: bob.self_id(),
             payload: app_payload_for(&bob, b"invitee first message"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
         }]
     );
 
@@ -444,6 +448,10 @@ async fn session_ingest_surfaces_join_and_app_message_events() {
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello through session"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
         }]
     );
 }
@@ -503,6 +511,10 @@ async fn reopened_creator_can_send_valid_group_messages() {
             epoch: EpochId(1),
             sender: alice.self_id(),
             payload: app_payload_for(&alice, b"hello after restart"),
+            retention: Some(cgka_traits::AppMessageRetentionDecision::new(
+                1_700_000_000,
+                0,
+            )),
         }]
     );
 }
@@ -747,10 +759,14 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
         settlement_quiescence_ms: 3_600_000,
         ..CanonicalizationPolicy::default()
     });
+    let queued_payload = app_payload_for(&carol, b"queued by session");
+    let queued_app_event_id = cgka_traits::MarmotAppEvent::decode(&queued_payload)
+        .expect("queued app event decodes")
+        .id;
     let queued = carol
         .send(SendIntent::AppMessage {
             group_id: created.group_id.clone(),
-            payload: app_payload_for(&carol, b"queued by session"),
+            payload: queued_payload,
         })
         .await
         .unwrap();
@@ -771,8 +787,17 @@ async fn session_advance_convergence_releases_queued_outbound_work() {
                 work,
                 PublishWork::ApplicationMessage {
                     queued_intent: Some(regenerated),
+                    group_id,
+                    app_event_id,
+                    source_epoch,
+                    retention,
                     ..
                 } if regenerated == &queued_intent
+                    && group_id == &created.group_id
+                    && app_event_id == &queued_app_event_id
+                    && *source_epoch == EpochId(2)
+                    && *retention
+                        == cgka_traits::AppMessageRetentionDecision::new(1_700_000_000, 0)
             )
         }),
         "expected queued application message to retain its durable intent handle, got {:?}",

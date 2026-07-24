@@ -18,6 +18,30 @@ use thiserror::Error;
 use crate::engine::GroupStateChange;
 use crate::types::{GroupId, MemberId};
 
+/// The normalized disappearing-message decision pinned when an MLS
+/// application message is accepted.
+///
+/// `retention_seconds == 0` means retention was disabled at the message's
+/// authenticated source epoch. A non-zero duration whose timestamp addition
+/// overflows is still a known decision, but has no finite `expires_at` and must
+/// never be pruned by a timestamp sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppMessageRetentionDecision {
+    pub retention_seconds: u64,
+    pub expires_at: Option<u64>,
+}
+
+impl AppMessageRetentionDecision {
+    pub fn new(recorded_at: u64, retention_seconds: u64) -> Self {
+        Self {
+            retention_seconds,
+            expires_at: (retention_seconds != 0)
+                .then(|| recorded_at.checked_add(retention_seconds))
+                .flatten(),
+        }
+    }
+}
+
 /// Nostr `kind` values used as Marmot inner app events.
 pub const MARMOT_APP_EVENT_KIND_DELETE: u64 = 5;
 pub const MARMOT_APP_EVENT_KIND_REACTION: u64 = 7;

@@ -383,8 +383,43 @@ where
 
         while let Some(work) = queue.pop_front() {
             match work {
-                PublishWork::ApplicationMessage { msg, queued_intent }
-                | PublishWork::Proposal { msg, queued_intent } => {
+                PublishWork::ApplicationMessage {
+                    msg,
+                    queued_intent,
+                    group_id,
+                    app_event_id,
+                    source_epoch,
+                    retention,
+                } => {
+                    let reports_before = output.reports.len();
+                    let status = self.publish_one(msg, &mut output, context.clone()).await?;
+                    if status.accepted_by_any_endpoint {
+                        if let Some(message_id) = output
+                            .reports
+                            .get(reports_before)
+                            .map(|report| report.message_id.clone())
+                        {
+                            output
+                                .published_app_messages
+                                .push(PublishedApplicationMessage {
+                                    group_id,
+                                    app_event_id,
+                                    message_id,
+                                    source_epoch,
+                                    retention,
+                                });
+                        } else {
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                method = "publish_session_effects_with_audit_context",
+                                error_kind = "accepted_app_publish_report_missing",
+                                "accepted application publish had no transport report"
+                            );
+                        }
+                    }
+                    self.resolve_regenerated_queued_intent(queued_intent, status);
+                }
+                PublishWork::Proposal { msg, queued_intent } => {
                     let status = self.publish_one(msg, &mut output, context.clone()).await?;
                     self.resolve_regenerated_queued_intent(queued_intent, status);
                 }
@@ -995,12 +1030,25 @@ pub struct AccountDeviceEffects {
     pub pending_convergence: Vec<GroupId>,
     pub reports: Vec<TransportPublishReport>,
     pub failures: Vec<PublishFailure>,
+    /// Application messages accepted by at least one transport endpoint,
+    /// carrying source-state metadata captured by the exact MLS encryption
+    /// operation and the adapter-visible transport id.
+    pub published_app_messages: Vec<PublishedApplicationMessage>,
     /// Welcomes whose publish failed after their commit/create was already
     /// confirmed. Unlike `failures`, each entry carries the recipient and
     /// group so the caller can re-deliver the stored welcome via
     /// [`AccountDeviceRuntime::redeliver_welcome`] without re-committing.
     pub welcome_failures: Vec<WelcomeDeliveryFailure>,
     pub pending: Vec<PendingResolution>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedApplicationMessage {
+    pub group_id: GroupId,
+    pub app_event_id: String,
+    pub message_id: cgka_traits::MessageId,
+    pub source_epoch: EpochId,
+    pub retention: cgka_traits::app_event::AppMessageRetentionDecision,
 }
 
 impl AccountDeviceEffects {

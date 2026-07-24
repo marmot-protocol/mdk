@@ -1231,12 +1231,6 @@ impl AppClient {
             }
             other => other,
         };
-        let source_epoch = match &intent {
-            AppMessageIntent::Media { attachments, .. } => attachments
-                .first()
-                .map(|attachment| attachment.source_epoch),
-            _ => None,
-        };
         let event = build_inner_event(&intent, &sender, unix_now_seconds())?;
         let payload = encode_inner_event(&event)?;
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -1244,14 +1238,8 @@ impl AppClient {
 
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {
-            let update = self.record_local_app_event_projection(
-                group_id,
-                &sender,
-                &event,
-                None,
-                source_epoch,
-                false,
-            )?;
+            let update = self
+                .record_local_app_event_projection(group_id, &sender, &event, None, None, false)?;
             on_local_projection(update);
         }
 
@@ -1306,17 +1294,21 @@ impl AppClient {
             self.record_human_action_succeeded(group_id, context, &effects);
         }
         self.remember_published_reports(&effects);
-        let source_message_id_hex = effects
-            .reports
-            .first()
-            .map(|report| hex::encode(report.message_id.as_slice()));
+        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
+        let published = effects.published_app_messages.iter().find(|published| {
+            published.group_id == *group_id && published.app_event_id == app_event_id
+        });
+        let source_message_id_hex =
+            published.map(|published| hex::encode(published.message_id.as_slice()));
+        let source_state =
+            published.map(|published| (published.source_epoch.0, published.retention));
         if should_project_locally {
             let update = self.record_local_app_event_projection(
                 group_id,
                 &sender,
                 &event,
                 source_message_id_hex,
-                source_epoch,
+                source_state,
                 true,
             )?;
             on_local_projection(update);
@@ -1844,6 +1836,7 @@ impl AppClient {
         let effects = self.runtime.advance_convergence(group_id).await?;
         fail_if_publish_failed(&effects)?;
         self.remember_published_reports(&effects);
+        let _finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.app.save_state(&self.state)?;

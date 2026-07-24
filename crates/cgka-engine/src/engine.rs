@@ -625,7 +625,7 @@ impl<S: StorageProvider> Engine<S> {
         let mut rows = Vec::new();
 
         let main = match result {
-            SendResult::ApplicationMessage { msg } => {
+            SendResult::ApplicationMessage { msg, .. } => {
                 Some((msg, MessageArtifactKind::ApplicationMessage))
             }
             SendResult::Proposal { msg } => Some((msg, MessageArtifactKind::Proposal)),

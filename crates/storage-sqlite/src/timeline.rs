@@ -5,11 +5,11 @@ use crate::{
     unix_now_seconds,
 };
 use cgka_traits::app_event::{
-    EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG, STREAM_CHUNKS_TAG, STREAM_HASH_TAG,
-    STREAM_START_TAG, STREAM_TAG,
+    AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION, QUOTE_REF_TAG,
+    STREAM_CHUNKS_TAG, STREAM_HASH_TAG, STREAM_START_TAG, STREAM_TAG,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
@@ -313,7 +313,17 @@ impl SqliteAccountStorage {
         // Default path freezes an existing row's moderation_grant on conflict
         // (see the upsert below): a re-received or relay-echoed delete must not
         // have its honored verdict recomputed against later admin state.
-        self.record_app_event_inner(event, false)
+        self.record_app_event_inner(event, false, None)
+    }
+
+    /// Record an app event together with the normalized retention decision
+    /// resolved from its authenticated MLS source epoch.
+    pub fn record_app_event_with_retention(
+        &self,
+        event: &StoredAppEvent,
+        retention: Option<AppMessageRetentionDecision>,
+    ) -> StorageResult<TimelineProjectionUpdate> {
+        self.record_app_event_inner(event, false, retention)
     }
 
     /// Like [`record_app_event`], but a conflicting row's `moderation_grant` is
@@ -324,13 +334,107 @@ impl SqliteAccountStorage {
         &self,
         event: &StoredAppEvent,
     ) -> StorageResult<TimelineProjectionUpdate> {
-        self.record_app_event_inner(event, true)
+        self.record_app_event_inner(event, true, None)
+    }
+
+    pub fn record_app_event_refreshing_moderation_grant_with_retention(
+        &self,
+        event: &StoredAppEvent,
+        retention: Option<AppMessageRetentionDecision>,
+    ) -> StorageResult<TimelineProjectionUpdate> {
+        self.record_app_event_inner(event, true, retention)
+    }
+
+    /// Finalize an optimistic local row from the exact MLS state that encrypted
+    /// the message. The first decision wins: retries, relay echoes, and
+    /// duplicate publication cannot reinterpret the source epoch or deadline.
+    pub fn finalize_app_event_source_retention(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        source_message_id_hex: Option<&str>,
+        source_epoch: u64,
+        retention: AppMessageRetentionDecision,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1
+                     FROM app_events
+                     WHERE group_id_hex = ?1
+                       AND message_id_hex = ?2
+                       AND retention_seconds IS NULL
+                       AND (source_epoch IS NULL OR source_epoch = ?3)",
+                    params![group_id_hex, message_id_hex, u64_to_i64(source_epoch)?],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?;
+            if exists.is_none() {
+                return Ok(None);
+            }
+            let updated = conn
+                .execute(
+                    "UPDATE app_events
+                     SET source_message_id_hex = COALESCE(source_message_id_hex, ?3),
+                         source_epoch = COALESCE(source_epoch, ?4),
+                         retention_seconds = ?5,
+                         retention_expires_at = ?6
+                     WHERE group_id_hex = ?1
+                       AND message_id_hex = ?2
+                       AND retention_seconds IS NULL
+                       AND (source_epoch IS NULL OR source_epoch = ?4)",
+                    params![
+                        group_id_hex,
+                        message_id_hex,
+                        source_message_id_hex,
+                        u64_to_i64(source_epoch)?,
+                        u64_to_i64(retention.retention_seconds)?,
+                        retention.expires_at.map(u64_to_i64).transpose()?,
+                    ],
+                )
+                .storage()?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            let (kind, tags) = app_event_projection_parts_tx(&conn, group_id_hex, message_id_hex)?
+                .ok_or_else(|| {
+                    StorageError::Backend("finalized app event row missing after update".to_owned())
+                })?;
+            let affected_message_ids = affected_timeline_message_ids_for_parts_tx(
+                &conn,
+                group_id_hex,
+                message_id_hex,
+                kind,
+                &tags,
+            )?;
+            for message_id in &affected_message_ids {
+                upsert_message_timeline_projection_for_message_tx(&conn, group_id_hex, message_id)?;
+            }
+            let messages =
+                timeline_records_by_ids_tx(&conn, group_id_hex, affected_message_ids.clone())?;
+            let changes = timeline_changes_for_event(
+                message_id_hex,
+                kind,
+                &tags,
+                None,
+                &affected_message_ids,
+                &messages,
+            );
+            Ok(Some(TimelineProjectionUpdate {
+                group_id_hex: group_id_hex.to_owned(),
+                messages,
+                changes,
+            }))
+        })
     }
 
     fn record_app_event_inner(
         &self,
         event: &StoredAppEvent,
         refresh_moderation_grant: bool,
+        retention: Option<AppMessageRetentionDecision>,
     ) -> StorageResult<TimelineProjectionUpdate> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -368,12 +472,12 @@ impl SqliteAccountStorage {
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id,
-                    moderation_grant
+                    moderation_grant, retention_seconds, retention_expires_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
                     source_message_id_hex = excluded.source_message_id_hex,
-                    source_epoch = excluded.source_epoch,
+                    source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,
                     plaintext = excluded.plaintext,
@@ -382,7 +486,12 @@ impl SqliteAccountStorage {
                     recorded_at = excluded.recorded_at,
                     received_at = excluded.received_at,
                     origin_commit_id = COALESCE(excluded.origin_commit_id, app_events.origin_commit_id),
-                    moderation_grant = CASE WHEN ?14 THEN excluded.moderation_grant ELSE app_events.moderation_grant END,
+                    moderation_grant = CASE WHEN ?16 THEN excluded.moderation_grant ELSE app_events.moderation_grant END,
+                    retention_seconds = COALESCE(app_events.retention_seconds, excluded.retention_seconds),
+                    retention_expires_at = CASE
+                        WHEN app_events.retention_seconds IS NULL THEN excluded.retention_expires_at
+                        ELSE app_events.retention_expires_at
+                    END,
                     invalidated = 0,
                     invalidation_reason = NULL",
                 params![
@@ -399,6 +508,13 @@ impl SqliteAccountStorage {
                     u64_to_i64(event.received_at)?,
                     &event.origin_commit_id,
                     event.moderation_grant,
+                    retention
+                        .map(|decision| u64_to_i64(decision.retention_seconds))
+                        .transpose()?,
+                    retention
+                        .and_then(|decision| decision.expires_at)
+                        .map(u64_to_i64)
+                        .transpose()?,
                     refresh_moderation_grant,
                 ],
             )
@@ -773,6 +889,32 @@ pub(crate) fn secure_prune_app_events_before_tx(
         "secure_delete must be ON before the prune transaction is opened"
     );
     let pruned_events = app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+    secure_prune_selected_app_events_tx(tx, group_id_hex, pruned_events)
+}
+
+/// Securely prune only rows whose source-epoch retention decision has reached
+/// its exact expiry. Rows with no decision (legacy/unrecoverable), disabled
+/// retention, or a non-finite overflow result have NULL expiry and survive.
+pub(crate) fn secure_prune_expired_app_events_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    now: u64,
+) -> StorageResult<SecurePruneAppEventsResult> {
+    debug_assert_eq!(
+        tx.query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0),
+        1,
+        "secure_delete must be ON before the prune transaction is opened"
+    );
+    let pruned_events = expired_app_events_tx(tx, group_id_hex, now)?;
+    secure_prune_selected_app_events_tx(tx, group_id_hex, pruned_events)
+}
+
+fn secure_prune_selected_app_events_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    pruned_events: Vec<PrunedAppEvent>,
+) -> StorageResult<SecurePruneAppEventsResult> {
     if pruned_events.is_empty() {
         return Ok(SecurePruneAppEventsResult::default());
     }
@@ -792,21 +934,14 @@ pub(crate) fn secure_prune_app_events_before_tx(
         )?);
     }
 
-    scrub_app_events_before_cutoff_tx(tx, group_id_hex, cutoff_recorded_at)?;
+    scrub_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     // `message_timeline.plaintext` is indexed for search; overwriting it
     // under `secure_delete` before DELETE also rewrites the old index key.
     scrub_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
 
     // Deleting the owning app_events rows cascades to message_modifier_edges
     // via its ON DELETE CASCADE foreign key.
-    let pruned = tx
-        .execute(
-            "DELETE FROM app_events
-             WHERE group_id_hex = ?1
-               AND recorded_at < ?2",
-            params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
-        )
-        .storage()?;
+    let pruned = delete_app_event_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
 
     delete_timeline_projection_rows_by_ids_tx(tx, group_id_hex, &pruned_message_ids)?;
     affected_message_ids.retain(|message_id| !pruned_message_ids.contains(message_id));
@@ -1366,27 +1501,95 @@ fn app_events_before_cutoff_tx(
     .storage()
 }
 
-fn scrub_app_events_before_cutoff_tx(
+fn expired_app_events_tx(
     tx: &Connection,
     group_id_hex: &str,
-    cutoff_recorded_at: u64,
+    now: u64,
+) -> StorageResult<Vec<PrunedAppEvent>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT message_id_hex, kind, tags_json
+             FROM app_events
+             WHERE group_id_hex = ?1
+               AND retention_expires_at IS NOT NULL
+               AND retention_expires_at <= ?2
+             ORDER BY retention_expires_at, message_id_hex, insert_order",
+        )
+        .storage()?;
+    stmt.query_map(params![group_id_hex, u64_to_i64(now)?], |row| {
+        let tags = tags_from_json(row.get::<_, String>(2)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+        })?;
+        Ok(PrunedAppEvent {
+            message_id_hex: row.get(0)?,
+            kind: row.get::<_, i64>(1)?.try_into().unwrap_or_default(),
+            tags,
+        })
+    })
+    .storage()?
+    .collect::<Result<Vec<_>, _>>()
+    .storage()
+}
+
+fn scrub_app_event_rows_by_ids_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
 ) -> StorageResult<()> {
-    tx.execute(
-        "UPDATE app_events
-         SET source_message_id_hex = NULL,
-             source_epoch = NULL,
-             direction = '',
-             sender = '',
-             plaintext = zeroblob(length(plaintext)),
-             tags_json = zeroblob(length(tags_json)),
-             invalidation_reason = NULL,
-             origin_commit_id = NULL
-         WHERE group_id_hex = ?1
-           AND recorded_at < ?2",
-        params![group_id_hex, u64_to_i64(cutoff_recorded_at)?],
-    )
-    .storage()?;
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        tx.execute(
+            &format!(
+                "UPDATE app_events
+                 SET source_message_id_hex = NULL,
+                     source_epoch = NULL,
+                     direction = '',
+                     sender = '',
+                     plaintext = zeroblob(length(plaintext)),
+                     tags_json = zeroblob(length(tags_json)),
+                     invalidation_reason = NULL,
+                     origin_commit_id = NULL,
+                     retention_seconds = NULL,
+                     retention_expires_at = NULL
+                 WHERE group_id_hex = ?
+                   AND message_id_hex IN ({placeholders})"
+            ),
+            params_from_iter(values.iter()),
+        )
+        .storage()?;
+    }
     Ok(())
+}
+
+fn delete_app_event_rows_by_ids_tx(
+    tx: &Connection,
+    group_id_hex: &str,
+    message_ids: &BTreeSet<String>,
+) -> StorageResult<usize> {
+    let message_ids = message_ids.iter().collect::<Vec<_>>();
+    let mut deleted = 0usize;
+    for chunk in message_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = group_and_message_id_values(group_id_hex, chunk);
+        deleted = deleted.saturating_add(
+            tx.execute(
+                &format!(
+                    "DELETE FROM app_events
+                     WHERE group_id_hex = ?
+                       AND message_id_hex IN ({placeholders})"
+                ),
+                params_from_iter(values.iter()),
+            )
+            .storage()?,
+        );
+    }
+    Ok(deleted)
 }
 
 fn scrub_timeline_projection_rows_by_ids_tx(

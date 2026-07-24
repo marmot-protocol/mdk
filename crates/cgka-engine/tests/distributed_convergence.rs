@@ -4235,7 +4235,7 @@ async fn engine_queues_app_send_until_convergence_is_settled() {
 
     assert_eq!(drained.len(), 1);
     let sent_app = match &drained[0] {
-        SendResult::ApplicationMessage { msg } => route(msg.clone(), &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg.clone(), &group_id),
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
@@ -4700,7 +4700,7 @@ async fn send_preflight_retries_deferred_peels_after_convergence_apply() {
         .unwrap();
 
     let sent_app = match sent {
-        SendResult::ApplicationMessage { msg } => route(msg, &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg, &group_id),
         other => panic!("expected ApplicationMessage after catch-up, got {other:?}"),
     };
     assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
@@ -5087,7 +5087,7 @@ async fn trait_advance_convergence_drains_queued_outbound_intent() {
 
     assert_eq!(drained.len(), 1);
     let sent_app = match &drained[0] {
-        SendResult::ApplicationMessage { msg } => route(msg.clone(), &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg.clone(), &group_id),
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     assert_eq!(engine.epoch(&group_id).unwrap(), EpochId(2));
@@ -5405,7 +5405,7 @@ async fn queued_outbound_intent_survives_engine_rebuild() {
 
     assert_eq!(drained.len(), 1);
     let sent_app = match &drained[0] {
-        SendResult::ApplicationMessage { msg } => route(msg.clone(), &group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg.clone(), &group_id),
         other => panic!("expected ApplicationMessage, got {other:?}"),
     };
     assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(2));
@@ -5476,7 +5476,7 @@ async fn send_app(
         .await
         .expect("send app");
     match result {
-        SendResult::ApplicationMessage { msg } => route(msg, group_id),
+        SendResult::ApplicationMessage { msg, .. } => route(msg, group_id),
         other => panic!("expected app message, got {other:?}"),
     }
 }

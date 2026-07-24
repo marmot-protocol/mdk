@@ -302,7 +302,7 @@ impl<S: StorageProvider> Engine<S> {
             let result = self.do_send_ready(record.intent.clone()).await?;
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
             match &result {
-                SendResult::ApplicationMessage { msg } | SendResult::Proposal { msg } => {
+                SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
                     self.queued_intent_by_message
                         .insert(msg.id.clone(), (record.group_id.clone(), record.id.clone()));
                 }
