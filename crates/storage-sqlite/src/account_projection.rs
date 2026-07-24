@@ -828,7 +828,7 @@ impl SqliteAccountStorage {
         if outcome.pruned_media_epoch_secrets > 0 {
             tracing::debug!(
                 target: "storage_sqlite::retention",
-                method = "secure_prune_app_events_before",
+                method = mode.trace_method(),
                 pruned_media_epoch_secrets = outcome.pruned_media_epoch_secrets,
                 "retired encrypted-media epoch secrets after final retained references expired"
             );
