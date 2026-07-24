@@ -547,6 +547,13 @@ impl RelaySyncTelemetry {
             .map(subscription_is_synced)
     }
 
+    /// Whether any relay for `subscription_id` has reached EOSE.
+    pub fn subscription_any_eose(&self, subscription_id: &str) -> Option<bool> {
+        self.subscriptions
+            .get(subscription_id)
+            .map(|subscription| subscription.relays.values().any(|relay| relay.eose_seen))
+    }
+
     /// Aggregate, privacy-safe snapshot of subscription sync timing.
     pub fn snapshot(&self) -> RelaySyncSnapshot {
         let synced = self

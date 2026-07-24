@@ -181,6 +181,17 @@ impl<S: StorageProvider> Engine<S> {
                         message_id,
                         own_commit_stamp.take(),
                     )?;
+                    if let Some(maintenance) = storage.maintenance_storage()
+                        && let Some(mut evolution) = maintenance
+                            .list_group_evolutions()?
+                            .into_iter()
+                            .find(|evolution| {
+                                evolution.signed_message_id.as_ref() == Some(message_id)
+                            })
+                    {
+                        evolution.phase = cgka_traits::maintenance::GroupEvolutionPhase::Confirmed;
+                        maintenance.put_group_evolution(&evolution)?;
+                    }
                 }
                 if let Some((_, intent_id)) = queued_intent.as_ref() {
                     storage.delete_queued_outbound_intent(intent_id)?;
@@ -302,6 +313,7 @@ impl<S: StorageProvider> Engine<S> {
         mut fanout: Option<&mut OutboundFanout>,
     ) -> Result<(), EngineError> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let origin_commit_id = self.peek_pending_commit_for_recovery(pending);
 
         let group_id = self
             .epoch_manager
@@ -360,6 +372,18 @@ impl<S: StorageProvider> Engine<S> {
 
         if let (Some(fanout), Some(rolled_back)) = (fanout.take(), rolled_back_fanout) {
             *fanout = rolled_back;
+        }
+        if let Some(message_id) = origin_commit_id.as_ref()
+            && let Some(maintenance) = self.storage.maintenance_storage()
+            && let Some(evolution) = maintenance
+                .list_group_evolutions()?
+                .into_iter()
+                .find(|evolution| evolution.signed_message_id.as_ref() == Some(message_id))
+        {
+            // No relay accepted the event, so the staged evolution can be
+            // compensated and regenerated from the still-live semantic
+            // obligation.
+            maintenance.delete_group_evolution(&evolution.id)?;
         }
 
         let kind = self

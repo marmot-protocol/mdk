@@ -45,6 +45,13 @@ impl From<AccountUnread> for AccountUnreadFfi {
 pub struct SendSummaryFfi {
     pub published: u32,
     pub message_ids: Vec<String>,
+    pub maintenance_disposition: SendMaintenanceDispositionFfi,
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum SendMaintenanceDispositionFfi {
+    Ready,
+    PostJoinRotationPendingRetryable,
 }
 
 impl From<SendSummary> for SendSummaryFfi {
@@ -52,6 +59,14 @@ impl From<SendSummary> for SendSummaryFfi {
         Self {
             published: super::saturating_u32(value.published),
             message_ids: value.message_ids,
+            maintenance_disposition: match value.maintenance_disposition {
+                cgka_traits::SendMaintenanceDisposition::Ready => {
+                    SendMaintenanceDispositionFfi::Ready
+                }
+                cgka_traits::SendMaintenanceDisposition::PostJoinRotationPendingRetryable => {
+                    SendMaintenanceDispositionFfi::PostJoinRotationPendingRetryable
+                }
+            },
         }
     }
 }

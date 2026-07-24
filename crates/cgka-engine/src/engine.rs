@@ -24,6 +24,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::group_context::GroupContext;
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::maintenance::{MaintenanceRandom, WallClock};
 use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
@@ -39,15 +40,42 @@ use openmls::prelude::{
 };
 use openmls_rust_crypto::RustCrypto;
 pub use openmls_traits::types::Ciphersuite;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tls_codec::Deserialize as _;
 
 /// Default ciphersuite. MLS-1.0 mandatory-to-implement; TLS-ish naming.
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn now(&self) -> cgka_traits::Timestamp {
+        cgka_traits::Timestamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct OsMaintenanceRandom(Mutex<rand::rngs::OsRng>);
+
+impl MaintenanceRandom for OsMaintenanceRandom {
+    fn next_u64(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .next_u64()
+    }
+}
 
 fn hydration_quarantine_reason_tag(reason: GroupHydrationQuarantineReason) -> &'static str {
     match reason {
@@ -123,6 +151,8 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) peeler: Box<dyn TransportPeeler>,
     pub(crate) ciphersuite: Ciphersuite,
     pub(crate) max_past_epochs: usize,
+    pub(crate) wall_clock: Arc<dyn WallClock>,
+    pub(crate) maintenance_random: Arc<dyn MaintenanceRandom>,
 
     /// Per-group state-machine owner. Every transition, pending-ref
     /// allocation, and fork-detection marker flows through this struct.
@@ -136,6 +166,10 @@ pub struct Engine<S: StorageProvider> {
     /// Standalone proposal messages produced by engine-maintained lifecycle
     /// work. Unlike `auto_publish_buf`, these do not have a pending commit ref.
     pub(crate) auto_proposal_buf: VecDeque<TransportMessage>,
+    /// Authenticated standalone proposals accepted during ingest. This
+    /// internal signal lets the account scheduler reset its quiet window
+    /// without exposing proposals as user-visible group events.
+    pub(crate) valid_proposal_groups: VecDeque<GroupId>,
     /// Group-state changes effected by a locally staged commit, with the actor
     /// to attribute each to. Buffered here because publish-before-apply defers
     /// the OpenMLS merge: the `GroupEvent::GroupStateChanged` events are emitted
@@ -285,6 +319,8 @@ pub struct EngineBuilder<S: StorageProvider> {
     peeler: Option<Box<dyn TransportPeeler>>,
     ciphersuite: Ciphersuite,
     max_past_epochs: usize,
+    wall_clock: Arc<dyn WallClock>,
+    maintenance_random: Arc<dyn MaintenanceRandom>,
     recorder: Option<Box<dyn ForensicRecorder>>,
 }
 
@@ -301,6 +337,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             peeler: None,
             ciphersuite: DEFAULT_CIPHERSUITE,
             max_past_epochs: crate::wire_format::DEFAULT_MAX_PAST_EPOCHS,
+            wall_clock: Arc::new(SystemWallClock),
+            maintenance_random: Arc::new(OsMaintenanceRandom::default()),
             recorder: None,
         }
     }
@@ -365,6 +403,16 @@ impl<S: StorageProvider> EngineBuilder<S> {
         self
     }
 
+    pub fn maintenance_sources(
+        mut self,
+        wall_clock: Arc<dyn WallClock>,
+        maintenance_random: Arc<dyn MaintenanceRandom>,
+    ) -> Self {
+        self.wall_clock = wall_clock;
+        self.maintenance_random = maintenance_random;
+        self
+    }
+
     /// Install a forensic audit-log recorder. Without this call the engine
     /// uses [`NoopRecorder`] and emits no audit events.
     pub fn recorder(mut self, recorder: Box<dyn ForensicRecorder>) -> Self {
@@ -418,11 +466,14 @@ impl<S: StorageProvider> EngineBuilder<S> {
             peeler,
             ciphersuite: self.ciphersuite,
             max_past_epochs: self.max_past_epochs,
+            wall_clock: self.wall_clock,
+            maintenance_random: self.maintenance_random,
             epoch_manager: crate::epoch_manager::EpochManager::new(),
             fork_recovery: crate::fork_recovery::ForkRecoveryManager::default(),
             events_buf: VecDeque::new(),
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
+            valid_proposal_groups: VecDeque::new(),
             pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             retryable_unpersisted_ingest_id: None,
@@ -526,6 +577,10 @@ impl<S: StorageProvider> Engine<S> {
         self.pending_group_id(pending)?;
         self.do_publish_failed_with_fanout(pending, Some(fanout))
             .await
+    }
+
+    pub fn drain_valid_proposal_groups(&mut self) -> Vec<GroupId> {
+        self.valid_proposal_groups.drain(..).collect()
     }
 
     pub async fn ingest_with_audit_context(
@@ -928,17 +983,19 @@ impl<S: StorageProvider> Engine<S> {
         crate::openmls_projection::recover_interrupted_apply_snapshot(&self.storage, group_id)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
 
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mut mls_group = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &mls_gid,
-        )
-        .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
-        .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?;
+        let mut mls_group = {
+            let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+                &self.crypto,
+                self.storage.mls_storage(),
+            );
+            openmls::group::MlsGroup::load(
+                <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+                &mls_gid,
+            )
+            .map_err(|_| GroupHydrationQuarantineReason::OpenMlsLoadFailed)?
+            .ok_or(GroupHydrationQuarantineReason::OpenMlsGroupMissing)?
+        };
 
         // Record the transport routing id as soon as the MLS state loads —
         // before any validation that can quarantine the group — so inbound
@@ -1084,7 +1141,17 @@ impl<S: StorageProvider> Engine<S> {
                 )
             })
         });
-        if mls_group.pending_commit().is_some() && !staged_removes_member && !restored_pending {
+        let restored_durable_evolution =
+            if mls_group.pending_commit().is_some() && !restored_pending {
+                self.restore_durable_group_evolution_on_hydrate(group_id, &mls_group)?
+            } else {
+                false
+            };
+        if mls_group.pending_commit().is_some()
+            && !staged_removes_member
+            && !restored_pending
+            && !restored_durable_evolution
+        {
             // Clear the staged commit transactionally (preserves the #421
             // crash-safety fix): the MLS storage mutation must be atomic so a
             // crash mid-clear cannot leave torn group state.
@@ -1123,6 +1190,10 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
 
+        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
+            &self.crypto,
+            self.storage.mls_storage(),
+        );
         let leave_request = self
             .leave_request_to_restore_on_hydrate(group_id, &mut mls_group, &group, &provider)
             .map_err(|_| GroupHydrationQuarantineReason::GroupRecordLoadFailed)?;
@@ -1174,6 +1245,8 @@ impl<S: StorageProvider> Engine<S> {
                 snapshot_name,
             );
             ("pending_publish", "hydrate_stable_group")
+        } else if restored_durable_evolution {
+            ("pending_publish", "hydrate_stable_group")
         } else {
             self.epoch_manager.set_stable(group_id.clone(), group.epoch);
             ("stable", "hydrate_stable_group")
@@ -1215,6 +1288,118 @@ impl<S: StorageProvider> Engine<S> {
             self.schedule_pending_convergence_group(group_id);
         }
         Ok(group.epoch)
+    }
+
+    /// Restore a prepared/attempted evolution from its exact signed transport
+    /// record instead of clearing the surviving OpenMLS pending commit.
+    ///
+    /// Returns `Ok(false)` for legacy staged commits that predate durable
+    /// evolution records; the caller keeps the existing compatibility
+    /// recovery for those.
+    fn restore_durable_group_evolution_on_hydrate(
+        &mut self,
+        group_id: &GroupId,
+        mls_group: &openmls::group::MlsGroup,
+    ) -> Result<bool, GroupHydrationQuarantineReason> {
+        use cgka_traits::maintenance::GroupEvolutionPhase;
+        use cgka_traits::message::StoredMessagePayload;
+
+        let Some(maintenance) = self.storage.maintenance_storage() else {
+            return Ok(false);
+        };
+        let source_epoch = EpochId(mls_group.epoch().as_u64());
+        let evolution = maintenance
+            .list_group_evolutions()
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
+            .into_iter()
+            .rev()
+            .find(|evolution| {
+                evolution.group_id == *group_id
+                    && evolution.source_epoch == source_epoch
+                    && matches!(
+                        evolution.phase,
+                        GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+                    )
+            });
+        let Some(evolution) = evolution else {
+            return Ok(false);
+        };
+        let Some(message_id) = evolution.signed_message_id.clone() else {
+            return Ok(false);
+        };
+        let record = self
+            .storage
+            .get_message(&message_id)
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let payload = StoredMessagePayload::decode(&record.payload)
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let exact_message = payload
+            .as_exact_transport()
+            .cloned()
+            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let openmls_message = payload
+            .as_openmls_wire()
+            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let staged_commit = mls_group
+            .pending_commit()
+            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let commit_priority =
+            crate::app_components::commit_ordering_priority_for_staged(staged_commit);
+        let snapshot = evolution
+            .recovery_snapshot
+            .clone()
+            .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+
+        self.epoch_manager
+            .set_stable(group_id.clone(), source_epoch);
+        let pending = self.epoch_manager.next_pending_ref();
+        self.epoch_manager
+            .begin_pending(
+                group_id.clone(),
+                source_epoch,
+                evolution.target_epoch,
+                cgka_traits::engine_state::StagedCommitHandle::from_bytes(
+                    group_id.as_slice().to_vec(),
+                ),
+                pending,
+                crate::epoch_manager::PendingKind::GroupEvolution,
+                None,
+            )
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        let mut evolution = evolution;
+        evolution.pending_ref = Some(pending);
+        maintenance
+            .put_group_evolution(&evolution)
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        self.track_pending_commit_for_recovery(
+            pending,
+            group_id.clone(),
+            source_epoch,
+            message_id,
+            cgka_traits::engine::CommitOrderingKey::from_commit_bytes(
+                source_epoch,
+                commit_priority,
+                self.identity.self_id().clone(),
+                &openmls_message.payload,
+            ),
+            snapshot,
+        );
+        self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
+            msg: exact_message,
+            pending,
+        });
+        self.audit_group(
+            group_id,
+            crate::audit_helpers::epoch_state_changed_event(
+                None,
+                "pending_publish",
+                evolution.target_epoch,
+                "hydrate_durable_group_evolution",
+                Some(pending),
+                Some("group_evolution"),
+            ),
+        );
+        Ok(true)
     }
 
     fn leave_request_to_restore_on_hydrate(

@@ -15,6 +15,7 @@ pub mod error;
 pub mod group;
 pub mod group_context;
 pub mod ingest;
+pub mod maintenance;
 pub mod message;
 pub mod peeler;
 pub mod storage;
@@ -79,12 +80,19 @@ pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
 pub use ingest::{
     IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
 };
+pub use maintenance::{
+    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
+    GroupMaintenanceState, GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation,
+    MaintenancePhase, MaintenanceRandom, MaintenanceTrigger, MonotonicClock,
+    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, SendMaintenanceDisposition,
+    SignedPublicationArtifact, TransportFanoutAttemptState, TransportFanoutTarget, WallClock,
+};
 pub use message::{MessageRecord, MessageState, OwnCommitConvergenceStamp, StoredMessagePayload};
 pub use peeler::{GroupMessageMetadata, TransportPeeler};
 pub use storage::{
-    CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MessageStorage,
-    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
-    StorageProvider, StorageResult, WelcomeStorage,
+    CapabilityStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
+    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
+    StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,

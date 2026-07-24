@@ -1116,4 +1116,108 @@ impl AccountManager {
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
     }
+
+    pub async fn key_package_maintenance_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn maintenance_status(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::MaintenanceStatus {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn schedule_manual_self_update(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<String, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ScheduleManualSelfUpdate {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn periodic_maintenance_policy(
+        &self,
+        account_ref: &str,
+    ) -> Result<cgka_traits::PeriodicMaintenancePolicy, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PeriodicMaintenancePolicy { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn set_periodic_maintenance_policy(
+        &self,
+        account_ref: &str,
+        policy: cgka_traits::PeriodicMaintenancePolicy,
+    ) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::SetPeriodicMaintenancePolicy { policy, respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn pause_maintenance(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::PauseMaintenance { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn resume_maintenance(&self, account_ref: &str) -> Result<(), AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ResumeMaintenance { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn run_due_maintenance(&self, account_ref: &str) -> Result<SendSummary, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::RunDueMaintenance { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
 }

@@ -20,6 +20,10 @@ use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::maintenance::{
+    DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
+    MaintenanceObligation, MaintenanceRandom, PeriodicMaintenancePolicy, WallClock,
+};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::StorageError;
 use cgka_traits::transport::TransportMessage;
@@ -71,6 +75,7 @@ pub struct SessionConfig {
     storage_options: SqliteStorageOptions,
     convergence_policy: CanonicalizationPolicy,
     recorder: Option<Box<dyn ForensicRecorder>>,
+    maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn MaintenanceRandom>)>,
 }
 
 impl SessionConfig {
@@ -93,6 +98,7 @@ impl SessionConfig {
             storage_options: SqliteStorageOptions::default(),
             convergence_policy: CanonicalizationPolicy::default(),
             recorder: None,
+            maintenance_sources: None,
         }
     }
 
@@ -150,6 +156,15 @@ impl SessionConfig {
 
     pub fn convergence_policy(mut self, policy: CanonicalizationPolicy) -> Self {
         self.convergence_policy = policy;
+        self
+    }
+
+    pub fn maintenance_sources(
+        mut self,
+        wall_clock: Arc<dyn WallClock>,
+        maintenance_random: Arc<dyn MaintenanceRandom>,
+    ) -> Self {
+        self.maintenance_sources = Some((wall_clock, maintenance_random));
         self
     }
 }
@@ -223,6 +238,9 @@ pub struct CreateGroupEffects {
 pub struct IngestEffects {
     pub outcome: IngestOutcome,
     pub effects: SessionEffects,
+    /// Groups for which an authenticated standalone proposal was accepted.
+    /// Commits are represented by `GroupEvent::EpochChanged`.
+    pub valid_proposal_groups: Vec<GroupId>,
 }
 
 impl AccountDeviceSession {
@@ -270,6 +288,9 @@ impl AccountDeviceSession {
             builder
         };
         let mut builder = builder.peeler(config.peeler);
+        if let Some((wall_clock, maintenance_random)) = config.maintenance_sources {
+            builder = builder.maintenance_sources(wall_clock, maintenance_random);
+        }
         if let Some(recorder) = config.recorder {
             builder = builder.recorder(recorder);
         }
@@ -311,6 +332,13 @@ impl AccountDeviceSession {
         Ok(key_package)
     }
 
+    pub fn key_package_metadata(
+        &self,
+        key_package: &KeyPackage,
+    ) -> Result<cgka_engine::KeyPackageMetadata, EngineError> {
+        cgka_engine::key_package_metadata(key_package)
+    }
+
     /// Delete a previously generated KeyPackage bundle from storage.
     ///
     /// Used by the account orchestration layer to prune the private bundle
@@ -332,6 +360,94 @@ impl AccountDeviceSession {
             "key package bundle deleted"
         );
         Ok(())
+    }
+
+    pub fn key_package_lifecycle(&self) -> SessionResult<Option<KeyPackageLifecycleState>> {
+        Ok(self.engine.key_package_lifecycle()?)
+    }
+
+    pub fn put_key_package_lifecycle(&self, state: &KeyPackageLifecycleState) -> SessionResult<()> {
+        Ok(self.engine.put_key_package_lifecycle(state)?)
+    }
+
+    pub fn promote_key_package_lifecycle(
+        &mut self,
+        retired: &[KeyPackage],
+        state: &KeyPackageLifecycleState,
+    ) -> SessionResult<()> {
+        Ok(self.engine.promote_key_package_lifecycle(retired, state)?)
+    }
+
+    pub fn group_maintenance(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Option<GroupMaintenanceState>> {
+        Ok(self.engine.group_maintenance(group_id)?)
+    }
+
+    pub fn put_group_maintenance(&self, state: &GroupMaintenanceState) -> SessionResult<()> {
+        Ok(self.engine.put_group_maintenance(state)?)
+    }
+
+    pub fn put_maintenance_obligation(&self, record: &MaintenanceObligation) -> SessionResult<()> {
+        Ok(self.engine.put_maintenance_obligation(record)?)
+    }
+
+    pub fn maintenance_obligation(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<Option<MaintenanceObligation>> {
+        Ok(self.engine.maintenance_obligation(id)?)
+    }
+
+    pub fn maintenance_obligations(&self) -> SessionResult<Vec<MaintenanceObligation>> {
+        Ok(self.engine.list_maintenance_obligations()?)
+    }
+
+    pub fn delete_maintenance_obligation(&self, id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.delete_maintenance_obligation(id)?)
+    }
+
+    pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {
+        Ok(self.engine.list_group_evolutions()?)
+    }
+
+    pub fn put_group_evolution(&self, record: &DurableGroupEvolution) -> SessionResult<()> {
+        Ok(self.engine.put_group_evolution(record)?)
+    }
+
+    pub fn own_leaf_hash(&self, group_id: &GroupId) -> SessionResult<Vec<u8>> {
+        Ok(self.engine.own_leaf_hash(group_id)?)
+    }
+
+    pub fn put_transport_fanout(&self, record: &DurableTransportFanout) -> SessionResult<()> {
+        Ok(self.engine.put_transport_fanout(record)?)
+    }
+
+    pub fn transport_fanout(
+        &self,
+        id: &MessageId,
+    ) -> SessionResult<Option<DurableTransportFanout>> {
+        Ok(self.engine.transport_fanout(id)?)
+    }
+
+    pub fn transport_fanouts(&self) -> SessionResult<Vec<DurableTransportFanout>> {
+        Ok(self.engine.list_transport_fanouts()?)
+    }
+
+    pub fn delete_transport_fanout(&self, id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.delete_transport_fanout(id)?)
+    }
+
+    pub fn periodic_maintenance_policy(&self) -> SessionResult<PeriodicMaintenancePolicy> {
+        Ok(self.engine.periodic_maintenance_policy()?)
+    }
+
+    pub fn put_periodic_maintenance_policy(
+        &self,
+        policy: PeriodicMaintenancePolicy,
+    ) -> SessionResult<()> {
+        Ok(self.engine.put_periodic_maintenance_policy(policy)?)
     }
 
     pub fn group_record(&self, group_id: &GroupId) -> SessionResult<Group> {
@@ -578,8 +694,13 @@ impl AccountDeviceSession {
             outcome_kind = ingest_outcome_kind(&outcome),
             "transport message ingested"
         );
+        let valid_proposal_groups = self.engine.drain_valid_proposal_groups();
         let effects = self.collect_effects(vec![]);
-        Ok(IngestEffects { outcome, effects })
+        Ok(IngestEffects {
+            outcome,
+            effects,
+            valid_proposal_groups,
+        })
     }
 
     pub async fn ingest_delivery(
@@ -602,8 +723,13 @@ impl AccountDeviceSession {
             outcome_kind = ingest_outcome_kind(&outcome),
             "transport delivery ingested"
         );
+        let valid_proposal_groups = self.engine.drain_valid_proposal_groups();
         let effects = self.collect_effects(vec![]);
-        Ok(IngestEffects { outcome, effects })
+        Ok(IngestEffects {
+            outcome,
+            effects,
+            valid_proposal_groups,
+        })
     }
 
     pub async fn advance_convergence(
@@ -909,6 +1035,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::Invite { .. } => "invite",
         SendIntent::RemoveMembers { .. } => "remove_members",
         SendIntent::Leave { .. } => "leave",
+        SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
     }

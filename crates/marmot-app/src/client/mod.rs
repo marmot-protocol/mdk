@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use cgka_engine::key_package::{is_last_resort_key_package, key_package_metadata};
 use cgka_session::PublishWork;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
@@ -86,6 +85,10 @@ pub struct AppClient {
     /// Set when [`epoch_stall`] arms a backfill during ingest; drained after the
     /// sync by running the full-history transport replay.
     pub(crate) epoch_backfill_pending: bool,
+    /// Temporary full-history subscriptions installed only while a post-join
+    /// maintenance obligation is waiting for its first relay EOSE.
+    pub(crate) post_join_maintenance_subscriptions:
+        HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
 }
 
 /// Cross the point-of-no-return for current-profile group creation without
@@ -232,35 +235,155 @@ impl AppClient {
             .await?;
         self.refresh_routing()?;
         self.runtime.activate_transport(None).await?;
-        match self.app.latest_key_package(&self.state.label) {
-            Ok(key_package) => {
-                let reusable_current = match key_package_metadata(&key_package) {
-                    Ok(metadata) if metadata.protocol_profile == ProtocolProfile::Current => {
-                        is_last_resort_key_package(&key_package).unwrap_or(false)
-                            && self
-                                .app
-                                .key_package_metadata_matches_current_support(&metadata)
-                    }
-                    // Strict cutover replaces legacy or malformed cached
-                    // packages instead of republishing them.
-                    Ok(_) | Err(_) => false,
-                };
-                if reusable_current {
-                    self.app
-                        .publish_cached_key_package(&self.state.label, key_package)
-                        .await
-                } else {
-                    Ok(self.runtime.publish_fresh_key_package().await?)
-                }
-            }
-            Err(
-                AppError::MissingKeyPackage(_)
-                | AppError::InvalidKeyPackageEvent(_)
-                | AppError::Hex(_)
-                | AppError::Json(_),
-            ) => Ok(self.runtime.publish_fresh_key_package().await?),
-            Err(err) => Err(err),
+        // SQLCipher lifecycle state is authoritative. On first rollout the
+        // publisher imports only the legacy JSON `d` slot, then performs the
+        // recorded upgrade replacement under that same slot.
+        Ok(self.runtime.publish_fresh_key_package().await?)
+    }
+
+    pub fn maintenance_status(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self.runtime.maintenance_status(group_id)?)
+    }
+
+    pub fn key_package_maintenance_status(
+        &self,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        Ok(self.runtime.key_package_maintenance_status()?)
+    }
+
+    pub fn schedule_manual_self_update(&mut self, group_id: &GroupId) -> Result<String, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(hex::encode(
+            self.runtime
+                .schedule_manual_self_update(group_id)?
+                .as_slice(),
+        ))
+    }
+
+    pub fn periodic_maintenance_policy(
+        &self,
+    ) -> Result<cgka_traits::PeriodicMaintenancePolicy, AppError> {
+        Ok(self.runtime.periodic_maintenance_policy()?)
+    }
+
+    pub fn set_periodic_maintenance_policy(
+        &self,
+        policy: cgka_traits::PeriodicMaintenancePolicy,
+    ) -> Result<(), AppError> {
+        Ok(self.runtime.set_periodic_maintenance_policy(policy)?)
+    }
+
+    pub fn pause_maintenance(&mut self) {
+        self.runtime.pause_maintenance();
+    }
+
+    pub fn resume_maintenance(&mut self) {
+        self.runtime.resume_maintenance();
+    }
+
+    pub async fn run_due_maintenance(&mut self) -> Result<SendSummary, AppError> {
+        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
+            self.runtime.sweep_expired_key_package_private_material()?;
+            return Ok(SendSummary {
+                published: 0,
+                message_ids: Vec::new(),
+                maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
+            });
         }
+        let effects = self.runtime.run_due_maintenance().await?;
+        self.queue_own_group_system_projection_updates(&effects);
+        Ok(send_summary_from_effects(&effects))
+    }
+
+    pub(crate) fn key_package_maintenance_requires_catch_up(&self) -> bool {
+        self.app.cursor_persistence() == crate::CursorPersistence::Advance
+            && self
+                .runtime
+                .key_package_maintenance_requires_catch_up()
+                .unwrap_or(false)
+    }
+
+    /// Install, poll, and retire temporary post-join full-history
+    /// subscriptions. A restart reconstructs this ephemeral map from durable
+    /// CatchUp obligations; the EOSE deadline itself remains persisted.
+    pub(crate) async fn advance_post_join_maintenance_subscriptions(
+        &mut self,
+    ) -> Result<(), AppError> {
+        if self.app.cursor_persistence() == crate::CursorPersistence::Frozen {
+            return Ok(());
+        }
+        let routes = self.routing.snapshot().group_routes;
+        let mut waiting = HashSet::new();
+
+        for group in &self.state.groups {
+            let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
+            let status = self.runtime.maintenance_status(&group_id)?;
+            let needs_subscription = status.obligations.iter().any(|obligation| {
+                obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
+                    && matches!(
+                        obligation.phase,
+                        cgka_traits::MaintenancePhase::CatchUp
+                            | cgka_traits::MaintenancePhase::EoseTimeout
+                            | cgka_traits::MaintenancePhase::Grace
+                    )
+            });
+            if !needs_subscription {
+                continue;
+            }
+            waiting.insert(group_id.clone());
+
+            if !self
+                .post_join_maintenance_subscriptions
+                .contains_key(&group_id)
+            {
+                let route = routes
+                    .iter()
+                    .find(|route| route.group_id == group_id)
+                    .cloned()
+                    .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?;
+                let subscription_id = self
+                    .adapter
+                    .install_group_maintenance_subscription(route.clone())
+                    .await?;
+                self.runtime
+                    .mark_post_join_subscription_installed(&group_id)?;
+                self.post_join_maintenance_subscriptions
+                    .insert(group_id.clone(), (subscription_id, route));
+            }
+
+            let first_eose = if let Some((subscription_id, _)) =
+                self.post_join_maintenance_subscriptions.get(&group_id)
+            {
+                self.adapter
+                    .group_maintenance_any_eose(subscription_id)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if first_eose {
+                self.runtime.mark_post_join_eose(&group_id)?;
+            }
+        }
+
+        let stale = self
+            .post_join_maintenance_subscriptions
+            .keys()
+            .filter(|group_id| !waiting.contains(*group_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for group_id in stale {
+            if let Some((_, route)) = self.post_join_maintenance_subscriptions.remove(&group_id) {
+                self.adapter
+                    .remove_group_maintenance_subscription(&route)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn rotate_key_package(&mut self) -> Result<KeyPackage, AppError> {
@@ -1411,6 +1534,7 @@ impl AppClient {
             SendSummary {
                 published: effects.reports.len(),
                 message_ids: vec![app_event_id],
+                maintenance_disposition: effects.maintenance_disposition,
             },
         ))
     }
@@ -2015,6 +2139,7 @@ impl AppClient {
         Ok(SendSummary {
             published: effects.reports.len(),
             message_ids,
+            maintenance_disposition: effects.maintenance_disposition,
         })
     }
 

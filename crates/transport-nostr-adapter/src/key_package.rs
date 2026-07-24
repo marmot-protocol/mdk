@@ -33,6 +33,13 @@ pub struct NostrKeyPackagePublication {
 
 impl NostrKeyPackagePublication {
     pub fn to_event(&self) -> Result<NostrTransportEvent, TransportAdapterError> {
+        self.to_event_at(crate::unix_now_seconds())
+    }
+
+    pub fn to_event_at(
+        &self,
+        created_at: u64,
+    ) -> Result<NostrTransportEvent, TransportAdapterError> {
         if self.account_id.as_slice().len() != 32 {
             return Err(TransportAdapterError::Publish(
                 "Marmot KeyPackage account id must be a 32-byte Nostr pubkey".into(),
@@ -85,11 +92,12 @@ impl NostrKeyPackagePublication {
             values_tag(APP_COMPONENTS_TAG, &self.app_components),
         ];
 
-        Ok(NostrTransportEvent::new_unsigned(
+        Ok(NostrTransportEvent::new_unsigned_at(
             identity,
             KIND_MARMOT_KEY_PACKAGE,
             tags,
             BASE64_STANDARD.encode(self.key_package.bytes()),
+            created_at,
         ))
     }
 }
@@ -124,6 +132,33 @@ impl NostrKeyPackagePublisher {
         let mut outcome = self
             .relay_client
             .publish_event(&publication.publish_endpoints, &event, self.required_acks)
+            .await?;
+        outcome.message_id.get_or_insert(event_id);
+        Ok(outcome)
+    }
+
+    /// Publish a caller-prepared exact signed event. No fields are regenerated
+    /// and the relay client verifies the supplied signature before sending.
+    pub async fn publish_prepared_key_package(
+        &self,
+        publication: &NostrKeyPackagePublication,
+        event: &NostrTransportEvent,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        if event.sig.is_none()
+            || event.kind != KIND_MARMOT_KEY_PACKAGE
+            || event.pubkey != hex::encode(publication.account_id.as_slice())
+            || event.tag_value(D_TAG) != Some(publication.key_package_slot_id.as_str())
+        {
+            return Err(TransportAdapterError::Publish(
+                "prepared KeyPackage event does not match publication".into(),
+            ));
+        }
+        let event_id = MessageId::new(hex::decode(&event.id).map_err(|err| {
+            TransportAdapterError::Publish(format!("invalid KeyPackage event id: {err}"))
+        })?);
+        let mut outcome = self
+            .relay_client
+            .publish_event(&publication.publish_endpoints, event, self.required_acks)
             .await?;
         outcome.message_id.get_or_insert(event_id);
         Ok(outcome)

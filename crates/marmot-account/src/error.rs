@@ -63,6 +63,8 @@ pub enum AccountError {
     TransportRouting(#[from] TransportRoutingError),
     #[error(transparent)]
     KeyPackage(#[from] KeyPackagePublishError),
+    #[error("key package replacement is blocked by local clock skew")]
+    ClockSkewBlocked,
     #[error("transport delivery was addressed to a different account")]
     WrongAccountDelivery,
 }

@@ -11,9 +11,11 @@ use cgka_traits::GroupId;
 use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
-    AppQuarantinedGroupFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMutationResultFfi, MemberRefFfi, SendSummaryFfi,
-    group_details_ffi, group_id_from_hex, group_management_state_ffi, normalize_member_ref_ffi,
+    AppQuarantinedGroupFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
+    GroupMaintenanceStatusFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
+    GroupMutationResultFfi, KeyPackageMaintenanceStatusFfi, MemberRefFfi,
+    PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_details_ffi, group_id_from_hex,
+    group_management_state_ffi, normalize_member_ref_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -736,6 +738,79 @@ impl Marmot {
             .set_group_archived(&account_ref, &group_id_hex, archived)
             .await?;
         Ok(group.into())
+    }
+
+    pub async fn group_maintenance_status(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupMaintenanceStatusFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .maintenance_status(&account_ref, &group_id)
+            .await?
+            .into())
+    }
+
+    pub async fn key_package_maintenance_status(
+        &self,
+        account_ref: String,
+    ) -> Result<Option<KeyPackageMaintenanceStatusFfi>, MarmotKitError> {
+        Ok(self
+            .runtime
+            .key_package_maintenance_status(&account_ref)
+            .await?
+            .map(Into::into))
+    }
+
+    pub async fn schedule_group_self_update(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<String, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .schedule_manual_self_update(&account_ref, &group_id)
+            .await?)
+    }
+
+    pub async fn periodic_maintenance_policy(
+        &self,
+        account_ref: String,
+    ) -> Result<PeriodicMaintenancePolicyFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .periodic_maintenance_policy(&account_ref)
+            .await?
+            .into())
+    }
+
+    pub async fn set_periodic_maintenance_policy(
+        &self,
+        account_ref: String,
+        policy: PeriodicMaintenancePolicyFfi,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_periodic_maintenance_policy(&account_ref, policy.into())
+            .await?)
+    }
+
+    pub async fn pause_maintenance(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        Ok(self.runtime.pause_maintenance(&account_ref).await?)
+    }
+
+    pub async fn resume_maintenance(&self, account_ref: String) -> Result<(), MarmotKitError> {
+        Ok(self.runtime.resume_maintenance(&account_ref).await?)
+    }
+
+    pub async fn run_due_maintenance(
+        &self,
+        account_ref: String,
+    ) -> Result<SendSummaryFfi, MarmotKitError> {
+        Ok(self.runtime.run_due_maintenance(&account_ref).await?.into())
     }
 }
 

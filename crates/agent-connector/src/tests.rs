@@ -1197,7 +1197,10 @@ async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
         },
     )
     .await;
-    let AgentControlResponse::FinalSent { message_ids_hex } = sent.payload else {
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent.payload
+    else {
         panic!("expected debug final sent response");
     };
     assert_eq!(message_ids_hex, vec![format!("{:064x}", 1)]);
@@ -2199,7 +2202,10 @@ async fn connector_socket_sends_final_message() {
     let response: AgentControlEnvelope<AgentControlResponse> =
         read_envelope(&mut client_read).await.unwrap().unwrap();
     assert_eq!(response.id.as_deref(), Some("req-final"));
-    let AgentControlResponse::FinalSent { message_ids_hex } = response.payload else {
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = response.payload
+    else {
         panic!("expected final sent response");
     };
     assert_eq!(message_ids_hex.len(), 1);
@@ -3848,6 +3854,7 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
 
     let AgentControlResponse::FinalSent {
         message_ids_hex: first_ids,
+        ..
     } = first_result.unwrap()
     else {
         panic!("expected first send to return FinalSent");
@@ -3856,6 +3863,7 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
 
     let AgentControlResponse::FinalSent {
         message_ids_hex: second_ids,
+        ..
     } = second_result.unwrap()
     else {
         panic!("expected concurrent retry to return FinalSent");

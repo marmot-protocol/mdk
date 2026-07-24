@@ -1452,6 +1452,7 @@ impl<S: StorageProvider> Engine<S> {
                             self.convergence_now_ms(),
                         )?;
                     }
+                    self.valid_proposal_groups.push_back(group_id);
                     Ok(IngestOutcome::Processed)
                 }
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => self

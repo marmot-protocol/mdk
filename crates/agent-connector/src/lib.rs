@@ -8,6 +8,7 @@ mod error;
 mod event_projection;
 mod inbound;
 mod invite_policy;
+mod maintenance;
 mod media_roots;
 mod media_temp;
 mod messaging;

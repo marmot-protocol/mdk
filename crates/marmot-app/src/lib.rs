@@ -46,9 +46,12 @@ use cgka_traits::{
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublisher, TransportRoutingError, TransportRoutingPolicy,
+    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, TransportRoutingError,
+    TransportRoutingPolicy,
 };
-use nostr_sdk::prelude::{Client as NostrSdkClient, PublicKey};
+use nostr_sdk::prelude::{
+    Client as NostrSdkClient, EventBuilder, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
+};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rusqlite::Connection;
@@ -712,6 +715,7 @@ pub struct AppMessageQuery {
 pub struct SendSummary {
     pub published: usize,
     pub message_ids: Vec<String>,
+    pub maintenance_disposition: cgka_traits::SendMaintenanceDisposition,
 }
 
 /// A welcome that a confirmed group create/invite could not deliver to its
@@ -1158,6 +1162,7 @@ impl MarmotApp {
             pending_welcome_delivery_events: Vec::new(),
             epoch_stall: Default::default(),
             epoch_backfill_pending: false,
+            post_join_maintenance_subscriptions: HashMap::new(),
         };
         client
             .app
@@ -1171,17 +1176,18 @@ impl MarmotApp {
             .app
             .key_package_cutover_replacement_pending(&client.state.label)
         {
-            let cached_current = client
-                .app
-                .latest_key_package(&client.state.label)
-                .ok()
+            let lifecycle_current = client
+                .runtime
+                .key_package_maintenance_status()
+                .map_err(AppError::from)?
+                .and_then(|lifecycle| lifecycle.current_key_package)
                 .and_then(|key_package| key_package_metadata(&key_package).ok())
                 .is_some_and(|metadata| {
                     client
                         .app
                         .key_package_metadata_matches_current_support(&metadata)
                 });
-            if cached_current {
+            if lifecycle_current {
                 client
                     .app
                     .clear_key_package_cutover_replacement_pending(&client.state.label);
@@ -1200,9 +1206,10 @@ impl MarmotApp {
                     ),
                 }
                 if client
-                    .app
-                    .latest_key_package(&client.state.label)
-                    .ok()
+                    .runtime
+                    .key_package_maintenance_status()
+                    .map_err(AppError::from)?
+                    .and_then(|lifecycle| lifecycle.current_key_package)
                     .and_then(|key_package| key_package_metadata(&key_package).ok())
                     .is_some_and(|metadata| {
                         client
@@ -2955,36 +2962,6 @@ impl MarmotApp {
         (metadata.credential_identity_hex == account_id_hex).then_some(record.key_package_id)
     }
 
-    async fn publish_cached_key_package(
-        &self,
-        label: &str,
-        key_package: KeyPackage,
-    ) -> Result<KeyPackage, AppError> {
-        let account = self.account_home().account(label)?;
-        let signer = self.account_signer_for_summary(&account)?;
-        let account_id_hex = account.account_id_hex;
-        let relay_lists = self.account_relay_list_status_for_account_id(&account_id_hex)?;
-        if relay_lists.nip65.relays.is_empty() {
-            return Err(AppError::MissingRelayLists(vec![
-                MissingRelayListKind::Nip65,
-            ]));
-        }
-        let publisher = AppKeyPackagePublisher {
-            app: self.clone(),
-            account_label: label.to_owned(),
-            signer,
-        };
-        publisher
-            .publish_key_package(KeyPackagePublication {
-                account_id: MemberId::new(hex::decode(account_id_hex)?),
-                key_package: key_package.clone(),
-                endpoints: self.key_package_endpoints(&relay_lists),
-            })
-            .await
-            .map_err(|err| AppError::Publish(err.to_string()))?;
-        Ok(key_package)
-    }
-
     fn validated_current_local_key_package(&self, label: &str) -> Option<KeyPackage> {
         let account = self.account_home().account(label).ok()?;
         let key_package = self.latest_key_package(label).ok()?;
@@ -4135,12 +4112,11 @@ struct AppKeyPackagePublisher {
     signer: AccountSigner,
 }
 
-#[async_trait]
-impl KeyPackagePublisher for AppKeyPackagePublisher {
-    async fn publish_key_package(
+impl AppKeyPackagePublisher {
+    fn nostr_publication(
         &self,
-        publication: KeyPackagePublication,
-    ) -> Result<(), KeyPackagePublishError> {
+        publication: &KeyPackagePublication,
+    ) -> Result<NostrKeyPackagePublication, KeyPackagePublishError> {
         let metadata = key_package_metadata(&publication.key_package)
             .map_err(|e| KeyPackagePublishError::unexposed(e.to_string()))?;
         if metadata.protocol_profile != cgka_traits::group::ProtocolProfile::Current {
@@ -4154,23 +4130,11 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 "KeyPackage credential identity does not match publication account",
             ));
         }
-        let key_package_id = self
-            .app
-            .reusable_key_package_slot_id(&self.account_label, &account_id_hex)
-            .unwrap_or_else(|| {
-                let mut slot_id = [0_u8; 32];
-                OsRng.fill_bytes(&mut slot_id);
-                hex::encode(slot_id)
-            });
-        let key_package_ref_hex = metadata.key_package_ref_hex;
-        let relay_client = self
-            .app
-            .relay_client_for_endpoints(self.signer.as_nostr_signer(), &publication.endpoints);
-        let nostr_publication = NostrKeyPackagePublication {
+        Ok(NostrKeyPackagePublication {
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),
-            key_package_slot_id: key_package_id.clone(),
-            key_package_ref: key_package_ref_hex.clone(),
+            key_package_slot_id: publication.slot_id.clone(),
+            key_package_ref: metadata.key_package_ref_hex,
             mls_ciphersuite: format!("0x{:04x}", metadata.ciphersuite),
             mls_extensions: metadata
                 .mls_extensions
@@ -4191,41 +4155,120 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 .map(|id| format!("0x{id:04x}"))
                 .collect(),
             publish_endpoints: publication.endpoints.clone(),
-        };
-        // Relay publish happens first. A failure here means no relay accepted
-        // the event (`NostrKeyPackagePublisher` requires >=1 ack and returns
-        // `Err` only when the accept count falls short), so the KeyPackage was
-        // never externally exposed and the orphaned private bundle is safe to
-        // prune (mdk#160).
+        })
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for AppKeyPackagePublisher {
+    fn legacy_slot_id(&self, account_id: &MemberId) -> Option<String> {
+        self.app
+            .reusable_key_package_slot_id(&self.account_label, &hex::encode(account_id.as_slice()))
+    }
+
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        let nostr_publication = self.nostr_publication(&publication)?;
+        let unsigned_dto = nostr_publication
+            .to_event_at(publication.created_at.0)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let tags = unsigned_dto
+            .tags
+            .iter()
+            .cloned()
+            .map(Tag::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let signer = self.signer.as_nostr_signer();
+        let public_key = signer
+            .get_public_key()
+            .await
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let unsigned = EventBuilder::new(
+            Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16),
+            unsigned_dto.content,
+        )
+        .tags(tags)
+        .custom_created_at(NostrTimestamp::from_secs(publication.created_at.0))
+        .build(public_key);
+        let signed = signer
+            .sign_event(unsigned)
+            .await
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let event = NostrTransportEvent::from_nostr_event(&signed)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        Ok(cgka_traits::SignedPublicationArtifact {
+            id: cgka_traits::MessageId::new(signed.id.to_bytes().to_vec()),
+            created_at: publication.created_at,
+            bytes: serde_json::to_vec(&event)
+                .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?,
+        })
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        let nostr_publication = self.nostr_publication(publication)?;
+        let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        if event.id != hex::encode(artifact.id.as_slice())
+            || event.created_at != artifact.created_at.0
+        {
+            return Err(KeyPackagePublishError::unexposed(
+                "persisted KeyPackage event identity does not match lifecycle record",
+            ));
+        }
+        let relay_client = self
+            .app
+            .relay_client_for_endpoints(self.signer.as_nostr_signer(), &publication.endpoints);
         let outcome = NostrKeyPackagePublisher::new(relay_client)
-            .publish_key_package(&nostr_publication)
+            .publish_prepared_key_package(&nostr_publication, &event)
             .await
             .map_err(|e| KeyPackagePublishError::unexposed(e.to_string()))?;
-        let key_package_event_id = outcome
-            .message_id
-            .map(|message_id| hex::encode(message_id.as_slice()))
-            .unwrap_or_default();
+        let accepted = outcome
+            .accepted
+            .into_iter()
+            .map(|receipt| receipt.endpoint)
+            .collect::<Vec<_>>();
+        let failed = outcome
+            .failed
+            .into_iter()
+            .map(|failure| failure.endpoint)
+            .collect::<Vec<_>>();
 
-        // From here on the KeyPackage HAS been accepted by at least one relay,
-        // so it is externally discoverable. Any subsequent failure must NOT
-        // prune the private bundle, or an inviter could build a Welcome against
-        // the published event that this account can never join. Mark these
-        // errors `exposed` (mdk#160 adversarial review).
-        let dir = self.app.key_package_cache_dir().join(KEY_PACKAGE_DIR);
-        fs::create_dir_all(&dir).map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
-        write_json(
-            dir.join(format!("{}.json", self.account_label)),
-            &KeyPackageRecord {
-                account_label: self.account_label.clone(),
+        // SQLCipher lifecycle state remains authoritative. This directory row
+        // is only a best-effort projection for local invite lookups, which
+        // otherwise could reuse a consumed package until the next relay fetch.
+        if !accepted.is_empty() {
+            let account_id_hex = hex::encode(publication.account_id.as_slice());
+            let relay_lists = self
+                .app
+                .account_relay_list_status_for_account_id(&account_id_hex)
+                .unwrap_or_else(|_| AccountRelayListStatus::empty());
+            let fetched = FetchedKeyPackage {
                 account_id_hex,
-                key_package_id,
-                key_package_ref_hex,
-                key_package_event_id,
-                published_at: unix_now_seconds(),
-                key_package_hex: hex::encode(publication.key_package.bytes()),
-            },
-        )
-        .map_err(|e| KeyPackagePublishError::exposed(e.to_string()))
+                key_package: publication.key_package.clone(),
+                key_package_id: publication.slot_id.clone(),
+                key_package_ref_hex: nostr_publication.key_package_ref,
+                key_package_event_id: hex::encode(artifact.id.as_slice()),
+                created_at: artifact.created_at.0,
+                source_relays: accepted.iter().map(|endpoint| endpoint.0.clone()).collect(),
+                relay_lists,
+            };
+            if self.app.remember_directory_key_package(&fetched).is_err() {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "publish_prepared_key_package",
+                    "acknowledged key package directory projection remains stale"
+                );
+            }
+        }
+
+        Ok(KeyPackagePublishReceipt { accepted, failed })
     }
 }
 
@@ -4430,6 +4473,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, 
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[cfg(test)]
 fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), AppError> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {

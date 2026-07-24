@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::{
@@ -30,8 +32,9 @@ use cgka_traits::{
 };
 use marmot_account::{
     AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
-    KeyPackagePublisher, PendingResolution, PublishedApplicationMessage, StaticTransportRouting,
-    TransportRoutingError, TransportRoutingPolicy,
+    KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceRandom, MonotonicClock,
+    PendingResolution, PublishedApplicationMessage, StaticTransportRouting, TransportRoutingError,
+    TransportRoutingPolicy, WallClock,
 };
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
 
@@ -90,6 +93,55 @@ fn hash_id(bytes: &[u8]) -> MessageId {
 }
 
 struct MockPeeler;
+
+#[derive(Debug)]
+struct TestWallClock(AtomicU64);
+
+impl TestWallClock {
+    fn new(now: u64) -> Self {
+        Self(AtomicU64::new(now))
+    }
+
+    fn set(&self, now: u64) {
+        self.0.store(now, Ordering::Relaxed);
+    }
+}
+
+impl WallClock for TestWallClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.0.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Debug, Default)]
+struct TestMonotonicClock(AtomicU64);
+
+impl TestMonotonicClock {
+    fn set_millis(&self, elapsed: u64) {
+        self.0.store(elapsed, Ordering::Relaxed);
+    }
+}
+
+impl MonotonicClock for TestMonotonicClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Debug)]
+struct TestRandom(AtomicU64);
+
+impl TestRandom {
+    fn new(next: u64) -> Self {
+        Self(AtomicU64::new(next))
+    }
+}
+
+impl MaintenanceRandom for TestRandom {
+    fn next_u64(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 #[async_trait]
 impl TransportPeeler for MockPeeler {
@@ -219,6 +271,41 @@ fn session_with_registry_and_components(
     .unwrap()
 }
 
+async fn welcome_for_key_package(
+    inviter: &mut AccountDeviceSession,
+    recipient: &MemberId,
+    key_package: cgka_traits::engine::KeyPackage,
+    name: &str,
+) -> TransportMessage {
+    let created = inviter
+        .create_group(CreateGroupRequest {
+            name: name.into(),
+            description: String::new(),
+            members: vec![key_package],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    match &created.effects.publish[0] {
+        PublishWork::GroupCreated { welcomes, pending } => {
+            inviter.confirm_published(*pending).await.unwrap();
+            welcomes
+                .iter()
+                .find(|message| {
+                    matches!(
+                        &message.envelope,
+                        TransportEnvelope::Welcome { recipient: addressed } if addressed == recipient
+                    )
+                })
+                .expect("welcome addressed to key package owner")
+                .clone()
+        }
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    }
+}
+
 /// MIP-03 self-remove feature registration, mirroring the cgka-session
 /// lifecycle test. Sending `SendIntent::Leave` as a non-last-admin produces a
 /// remove **proposal**; when the admin ingests it, the engine auto-commits the
@@ -247,6 +334,7 @@ struct RecordingAdapterInner {
     syncs: Mutex<Vec<TransportGroupSync>>,
     publishes: Mutex<Vec<TransportPublishRequest>>,
     accepted_counts: Mutex<VecDeque<usize>>,
+    publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     timeout_pattern: Mutex<VecDeque<bool>>,
 }
@@ -274,6 +362,10 @@ impl RecordingAdapter {
 
     fn timeout_pattern(&self, pattern: impl IntoIterator<Item = bool>) {
         self.inner.timeout_pattern.lock().unwrap().extend(pattern);
+    }
+
+    fn error_next(&self) {
+        self.inner.publish_errors.lock().unwrap().push_back(true);
     }
 
     fn activations(&self) -> Vec<TransportAccountActivation> {
@@ -315,15 +407,29 @@ impl TransportAdapter for RecordingAdapter {
         request: TransportPublishRequest,
     ) -> Result<TransportPublishReport, TransportAdapterError> {
         self.inner.publishes.lock().unwrap().push(request.clone());
-        if self
+        let timed_out = self
             .inner
             .timeout_pattern
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(false)
-        {
-            return Err(TransportAdapterError::Publish("simulated timeout".into()));
+            .unwrap_or(false);
+        let ambiguous_error = self
+            .inner
+            .publish_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(false);
+        if timed_out || ambiguous_error {
+            return Err(TransportAdapterError::Publish(
+                if timed_out {
+                    "simulated timeout"
+                } else {
+                    "injected ambiguous adapter failure"
+                }
+                .into(),
+            ));
         }
         let accepted_count = self
             .inner
@@ -411,18 +517,117 @@ struct RecordingKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for RecordingKeyPackages {
-    async fn publish_key_package(
+    async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
-    ) -> Result<(), KeyPackagePublishError> {
-        self.publications.lock().unwrap().push(publication);
-        Ok(())
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        Ok(test_key_package_artifact(&publication))
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        _artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        self.publications.lock().unwrap().push(publication.clone());
+        Ok(KeyPackagePublishReceipt {
+            accepted: publication.endpoints.clone(),
+            failed: Vec::new(),
+        })
     }
 }
 
 impl RecordingKeyPackages {
     fn publications(&self) -> Vec<KeyPackagePublication> {
         self.publications.lock().unwrap().clone()
+    }
+}
+
+#[derive(Clone, Default)]
+struct PartialFanoutKeyPackages {
+    publications: Arc<
+        Mutex<
+            Vec<(
+                KeyPackagePublication,
+                cgka_traits::SignedPublicationArtifact,
+            )>,
+        >,
+    >,
+}
+
+impl PartialFanoutKeyPackages {
+    fn publications(
+        &self,
+    ) -> Vec<(
+        KeyPackagePublication,
+        cgka_traits::SignedPublicationArtifact,
+    )> {
+        self.publications.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for PartialFanoutKeyPackages {
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        Ok(test_key_package_artifact(&publication))
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        let call_index = self.publications.lock().unwrap().len();
+        self.publications
+            .lock()
+            .unwrap()
+            .push((publication.clone(), artifact.clone()));
+        if call_index == 0 {
+            Ok(KeyPackagePublishReceipt {
+                accepted: publication.endpoints.iter().take(1).cloned().collect(),
+                failed: publication.endpoints.iter().skip(1).cloned().collect(),
+            })
+        } else {
+            Ok(KeyPackagePublishReceipt {
+                accepted: publication.endpoints.clone(),
+                failed: Vec::new(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PrepareFailsKeyPackages {
+    preparations: Arc<Mutex<Vec<KeyPackagePublication>>>,
+}
+
+impl PrepareFailsKeyPackages {
+    fn preparations(&self) -> Vec<KeyPackagePublication> {
+        self.preparations.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for PrepareFailsKeyPackages {
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        self.preparations.lock().unwrap().push(publication);
+        Err(KeyPackagePublishError::unexposed(
+            "injected pre-signing failure",
+        ))
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        _publication: &KeyPackagePublication,
+        _artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        panic!("an unsigned replacement must never reach the network")
     }
 }
 
@@ -449,11 +654,19 @@ impl FlakyKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for FlakyKeyPackages {
-    async fn publish_key_package(
+    async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
-    ) -> Result<(), KeyPackagePublishError> {
-        self.publications.lock().unwrap().push(publication);
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        Ok(test_key_package_artifact(&publication))
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        _artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        self.publications.lock().unwrap().push(publication.clone());
         let mut remaining = self.remaining_failures.lock().unwrap();
         if *remaining > 0 {
             *remaining -= 1;
@@ -461,7 +674,10 @@ impl KeyPackagePublisher for FlakyKeyPackages {
                 "injected publish failure",
             ));
         }
-        Ok(())
+        Ok(KeyPackagePublishReceipt {
+            accepted: publication.endpoints.clone(),
+            failed: Vec::new(),
+        })
     }
 }
 
@@ -483,16 +699,38 @@ impl ExposedThenFailsKeyPackages {
 
 #[async_trait]
 impl KeyPackagePublisher for ExposedThenFailsKeyPackages {
-    async fn publish_key_package(
+    async fn prepare_key_package(
         &self,
         publication: KeyPackagePublication,
-    ) -> Result<(), KeyPackagePublishError> {
-        self.publications.lock().unwrap().push(publication);
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        Ok(test_key_package_artifact(&publication))
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        _artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        self.publications.lock().unwrap().push(publication.clone());
         // External publish succeeded; a subsequent local step (e.g. cache write)
         // failed. The KeyPackage is already exposed.
         Err(KeyPackagePublishError::exposed(
             "injected post-exposure failure (e.g. local cache write)",
         ))
+    }
+}
+
+fn test_key_package_artifact(
+    publication: &KeyPackagePublication,
+) -> cgka_traits::SignedPublicationArtifact {
+    use sha2::{Digest, Sha256};
+    let mut bytes = publication.key_package.bytes().to_vec();
+    bytes.extend_from_slice(publication.slot_id.as_bytes());
+    bytes.extend_from_slice(&publication.created_at.0.to_be_bytes());
+    cgka_traits::SignedPublicationArtifact {
+        id: MessageId::new(Sha256::digest(&bytes).to_vec()),
+        created_at: publication.created_at,
+        bytes,
     }
 }
 
@@ -554,11 +792,10 @@ async fn publish_fresh_key_package_uses_directory_boundary() {
 }
 
 #[tokio::test]
-async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() {
-    // mdk#160: when publication fails, publish_fresh_key_package must
-    // surface the publish error AND delete the orphaned private bundle that
-    // fresh_key_package persisted, so a failing-publisher retry loop does not
-    // accumulate unused private key material.
+async fn publish_fresh_key_package_retries_the_same_durable_replacement() {
+    // A prepared replacement is a durable publication obligation. A failed
+    // attempt retains both the exact artifact and its private init key so a
+    // retry cannot create a different externally visible package.
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot kp cleanup key").unwrap();
     let session = session(dir.path().join("alice.sqlite"), &key, b"alice");
@@ -580,9 +817,7 @@ async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() 
         .expect_err("publish failure must propagate");
     assert!(matches!(err, AccountError::KeyPackage(_)), "got {err:?}");
 
-    // Retry: a brand-new bundle is generated and this time publication
-    // succeeds. The bundle from the failed attempt was pruned, so it is not
-    // left orphaned in storage.
+    // Retry: publication succeeds with the same prepared package.
     let key_package = runtime
         .publish_fresh_key_package()
         .await
@@ -590,11 +825,357 @@ async fn publish_fresh_key_package_propagates_publish_error_and_prunes_bundle() 
     assert!(!key_package.bytes().is_empty());
 
     let publications = publisher.publications();
-    // One failed attempt + one successful attempt were both sent to the
-    // publisher; they carry distinct freshly generated key packages.
+    // One failed attempt + one successful attempt carry the same package,
+    // slot, timestamp, and therefore the same signed artifact identity.
     assert_eq!(publications.len(), 2);
-    assert_ne!(publications[0].key_package, publications[1].key_package);
+    assert_eq!(publications[0], publications[1]);
     assert_eq!(publications[1].key_package, key_package);
+}
+
+#[tokio::test]
+async fn unsigned_key_package_replacement_recovers_after_restart_without_changing_authorship() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot kp unsigned crash key").unwrap();
+    let failing = PrepareFailsKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(10_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let random = Arc::new(TestRandom::new(7));
+    let policy = StaticTransportRouting::new(vec![])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        policy.clone(),
+        failing.clone(),
+    )
+    .with_maintenance_sources(wall.clone(), monotonic.clone(), random.clone());
+
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("injected signing failure must propagate");
+    let prepared_before_crash = failing.preparations();
+    assert_eq!(prepared_before_crash.len(), 1);
+    let pending_before_crash = runtime
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .pending_replacement
+        .unwrap();
+    assert!(pending_before_crash.signed_event.is_none());
+    assert_eq!(
+        pending_before_crash.authored_created_at,
+        prepared_before_crash[0].created_at
+    );
+    drop(runtime);
+
+    let succeeding = RecordingKeyPackages::default();
+    let mut restarted = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        policy,
+        succeeding.clone(),
+    )
+    .with_maintenance_sources(wall, monotonic, random);
+    restarted
+        .publish_fresh_key_package()
+        .await
+        .expect("restart must sign and publish the durable pending replacement");
+
+    let published = succeeding.publications();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0], prepared_before_crash[0]);
+    assert!(
+        restarted
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .pending_replacement
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn key_package_rotation_reuses_stable_slot_and_monotonically_advances_created_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp stable slot key").unwrap();
+    let publisher = RecordingKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(20_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(11)),
+    );
+
+    let first = runtime.publish_fresh_key_package().await.unwrap();
+    let second = runtime.publish_fresh_key_package().await.unwrap();
+    let publications = publisher.publications();
+    assert_eq!(publications.len(), 2);
+    assert_eq!(publications[0].slot_id, publications[1].slot_id);
+    assert_eq!(
+        publications[1].created_at.0,
+        publications[0].created_at.0 + 1
+    );
+    assert_ne!(first, second);
+
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(lifecycle.retained_private_material.len(), 1);
+    assert_eq!(
+        lifecycle.retained_private_material[0].key_package,
+        publications[0].key_package
+    );
+}
+
+#[tokio::test]
+async fn key_package_first_ack_promotes_then_paused_maintenance_finishes_exact_fanout() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp independent fanout key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let publisher = PartialFanoutKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(70_000));
+    let routing = StaticTransportRouting::new(vec![]).key_package_endpoints(vec![
+        TransportEndpoint("wss://keys-a.example".into()),
+        TransportEndpoint("wss://keys-b.example".into()),
+    ]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        routing.clone(),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect("first relay acknowledgement promotes the replacement");
+    let promoted = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert!(promoted.pending_replacement.is_none());
+    assert_eq!(
+        promoted
+            .publication_targets
+            .iter()
+            .filter(|target| { target.state == cgka_traits::TransportFanoutAttemptState::Accepted })
+            .count(),
+        1
+    );
+    assert_eq!(
+        promoted
+            .publication_targets
+            .iter()
+            .filter(|target| {
+                target.state == cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+            })
+            .count(),
+        1
+    );
+
+    drop(runtime);
+    let mut restarted = AccountDeviceRuntime::new(
+        session(database, &key, b"alice"),
+        RecordingAdapter::default(),
+        routing,
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(23)),
+    );
+    restarted.pause_maintenance();
+    wall.set(70_030);
+    restarted.run_due_maintenance().await.unwrap();
+    let calls = publisher.publications();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, calls[1].1);
+    assert_eq!(calls[0].0.slot_id, calls[1].0.slot_id);
+    assert_eq!(calls[0].0.created_at, calls[1].0.created_at);
+    assert_eq!(
+        calls[1].0.endpoints,
+        vec![TransportEndpoint("wss://keys-b.example".into())]
+    );
+    let completed = restarted.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(completed.phase, cgka_traits::MaintenancePhase::Complete);
+    assert!(
+        completed
+            .publication_targets
+            .iter()
+            .all(|target| { target.state == cgka_traits::TransportFanoutAttemptState::Accepted })
+    );
+}
+
+#[tokio::test]
+async fn key_package_expiry_sweep_deletes_private_material_while_network_maintenance_is_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp paused expiry key").unwrap();
+    let wall = Arc::new(TestWallClock::new(80_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(29)),
+    );
+
+    runtime.publish_fresh_key_package().await.unwrap();
+    let not_after = runtime
+        .key_package_maintenance_status()
+        .unwrap()
+        .unwrap()
+        .current_not_after
+        .unwrap();
+
+    runtime.pause_maintenance();
+    wall.set(not_after.0);
+    assert_eq!(
+        runtime
+            .sweep_expired_key_package_private_material()
+            .unwrap(),
+        1
+    );
+
+    let expired = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert!(expired.current_key_package.is_none());
+    assert!(expired.current_key_package_ref.is_none());
+    assert!(expired.authored_signed_event.is_none());
+    assert!(expired.publication_targets.is_empty());
+    assert!(runtime.key_package_network_maintenance_due().unwrap());
+}
+
+#[tokio::test]
+async fn key_package_rotation_blocks_when_clock_rollback_exceeds_future_skew_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp rollback key").unwrap();
+    let publisher = RecordingKeyPackages::default();
+    let wall = Arc::new(TestWallClock::new(50_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        publisher.clone(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(19)),
+    );
+
+    runtime.publish_fresh_key_package().await.unwrap();
+    wall.set(1);
+    let error = runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("large rollback must not escape through a new routine slot");
+    assert!(matches!(error, AccountError::ClockSkewBlocked));
+    assert_eq!(publisher.publications().len(), 1);
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert_eq!(
+        lifecycle.phase,
+        cgka_traits::MaintenancePhase::ClockSkewBlocked
+    );
+    assert!(lifecycle.pending_replacement.is_none());
+}
+
+#[tokio::test]
+async fn consumed_last_resort_private_material_survives_pending_replacement_then_deletes_on_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot consumed kp lifecycle key").unwrap();
+    let initial_publisher = RecordingKeyPackages::default();
+    let initial_policy = StaticTransportRouting::new(vec![])
+        .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]);
+    let mut initial = AccountDeviceRuntime::new(
+        session(alice_database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        initial_policy.clone(),
+        initial_publisher.clone(),
+    );
+    let old_key_package = initial.publish_fresh_key_package().await.unwrap();
+    let alice_id = initial.session().self_id();
+    drop(initial);
+
+    // These invites are all prepared while the old last-resort KeyPackage is
+    // still publicly discoverable.
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let mut carol = session(dir.path().join("carol.sqlite"), &key, b"carol");
+    let mut dave = session(dir.path().join("dave.sqlite"), &key, b"dave");
+    let bob_welcome =
+        welcome_for_key_package(&mut bob, &alice_id, old_key_package.clone(), "bob invite").await;
+    let carol_welcome = welcome_for_key_package(
+        &mut carol,
+        &alice_id,
+        old_key_package.clone(),
+        "carol invite",
+    )
+    .await;
+    let dave_welcome =
+        welcome_for_key_package(&mut dave, &alice_id, old_key_package.clone(), "dave invite").await;
+
+    let replacement_publisher = FlakyKeyPackages::new(1);
+    let mut runtime = AccountDeviceRuntime::new(
+        session(alice_database, &key, b"alice"),
+        RecordingAdapter::default(),
+        initial_policy,
+        replacement_publisher,
+    );
+    runtime.session_mut().ingest(bob_welcome).await.unwrap();
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect_err("first replacement attempt is intentionally unacknowledged");
+
+    // A Welcome already in flight remains processable for as long as the
+    // replacement publication has not been acknowledged.
+    runtime
+        .session_mut()
+        .ingest(carol_welcome)
+        .await
+        .expect("old private material must survive a pending replacement");
+
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .expect("replacement acknowledgement must promote atomically");
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert!(lifecycle.last_consumed_key_package_ref.is_none());
+    assert!(
+        lifecycle
+            .retained_private_material
+            .iter()
+            .all(|material| material.key_package != old_key_package)
+    );
+
+    // Once the replacement is acknowledged the old init key is gone, so a
+    // third prebuilt Welcome cannot consume it.
+    let rejected = runtime
+        .session_mut()
+        .ingest(dave_welcome)
+        .await
+        .expect("missing private material is a classified stale ingest");
+    assert!(matches!(
+        rejected.outcome,
+        cgka_traits::IngestOutcome::Stale {
+            reason: cgka_traits::ingest::StaleReason::PeelFailed
+        }
+    ));
 }
 
 #[tokio::test]
@@ -695,6 +1276,135 @@ async fn publish_fresh_key_package_retains_bundle_when_publish_fails_after_expos
 }
 
 #[tokio::test]
+async fn post_join_rotation_does_not_block_application_send_and_returns_disposition() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot post join send key").unwrap();
+    let mut alice = session(alice_database.clone(), &key, b"alice");
+    let alice_kp = alice.fresh_key_package().await.unwrap();
+    let alice_id = alice.self_id();
+    let alice_hex = hex::encode(alice_id.as_slice());
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let created = bob
+        .create_group(CreateGroupRequest {
+            name: "post-join pending send".into(),
+            description: String::new(),
+            members: vec![alice_kp],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { welcomes, pending } => {
+            bob.confirm_published(*pending).await.unwrap();
+            welcomes
+                .iter()
+                .find(|message| {
+                    matches!(
+                        &message.envelope,
+                        TransportEnvelope::Welcome { recipient } if recipient == &alice_id
+                    )
+                })
+                .unwrap()
+                .clone()
+        }
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    alice.ingest(welcome.clone()).await.unwrap();
+    alice
+        .ingest(welcome)
+        .await
+        .expect("Welcome replay is classified without duplicating maintenance");
+    let group_id = created.group_id;
+    let obligations = alice.maintenance_obligations().unwrap();
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(
+        obligations[0].trigger,
+        cgka_traits::MaintenanceTrigger::PostJoin
+    );
+    assert_eq!(obligations[0].phase, cgka_traits::MaintenancePhase::CatchUp);
+    let joined_at = obligations[0].created_at.0;
+    drop(alice);
+
+    let wall = Arc::new(TestWallClock::new(joined_at.saturating_add(1)));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        session(alice_database, &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://group.example".into())],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(31)),
+    );
+    runtime
+        .mark_post_join_subscription_installed(&group_id)
+        .unwrap();
+    let first_deadline = runtime.maintenance_status(&group_id).unwrap().obligations[0]
+        .eose_deadline_at
+        .unwrap();
+    wall.set(joined_at.saturating_add(100));
+    runtime
+        .mark_post_join_subscription_installed(&group_id)
+        .unwrap();
+    assert_eq!(
+        runtime.maintenance_status(&group_id).unwrap().obligations[0].eose_deadline_at,
+        Some(first_deadline),
+        "restart/reinstallation must not extend the persisted EOSE deadline"
+    );
+
+    wall.set(first_deadline.0);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime.maintenance_status(&group_id).unwrap().obligations[0].phase,
+        cgka_traits::MaintenancePhase::EoseTimeout
+    );
+
+    let effects = runtime
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice_hex, b"send while rotation is pending"),
+        })
+        .await
+        .expect("post-join maintenance must not block application sends");
+    assert_eq!(
+        effects.maintenance_disposition,
+        cgka_traits::SendMaintenanceDisposition::PostJoinRotationPendingRetryable
+    );
+    assert_eq!(effects.published_app_messages.len(), 1);
+
+    runtime.mark_post_join_eose(&group_id).unwrap();
+    let grace = runtime.maintenance_status(&group_id).unwrap().obligations[0].clone();
+    assert_eq!(grace.phase, cgka_traits::MaintenancePhase::Grace);
+    wall.set(grace.grace_until.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime.maintenance_status(&group_id).unwrap().obligations[0].phase,
+        cgka_traits::MaintenancePhase::Quiet
+    );
+
+    monotonic.set_millis(60_000);
+    wall.set(wall.now().0.saturating_add(60));
+    runtime.run_due_maintenance().await.unwrap();
+    let jitter = runtime.maintenance_status(&group_id).unwrap().obligations[0].clone();
+    assert_eq!(jitter.phase, cgka_traits::MaintenancePhase::Jitter);
+    wall.set(jitter.not_before.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime.maintenance_status(&group_id).unwrap().obligations[0].phase,
+        cgka_traits::MaintenancePhase::Complete
+    );
+}
+
+#[tokio::test]
 async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot create group key").unwrap();
@@ -747,6 +1457,253 @@ async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
     assert_eq!(
         publishes[0].target.endpoints(),
         &[TransportEndpoint("wss://bob-inbox.example".into())]
+    );
+}
+
+#[tokio::test]
+async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanout() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot manual maintenance key").unwrap();
+    let initial_runtime = AccountDeviceRuntime::new(
+        current_session(database.clone(), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    let mut initial_runtime = initial_runtime;
+    let (group_id, created) = initial_runtime
+        .create_group(CreateGroupRequest {
+            name: "manual-only group".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert!(created.failures.is_empty());
+    let mut maintenance_state = initial_runtime
+        .session()
+        .group_maintenance(&group_id)
+        .unwrap()
+        .unwrap();
+    maintenance_state.periodic_enrolled = false;
+    maintenance_state.next_periodic_rotation_at = None;
+    initial_runtime
+        .session()
+        .put_group_maintenance(&maintenance_state)
+        .unwrap();
+    let source_epoch = initial_runtime.session().epoch(&group_id).unwrap();
+    drop(initial_runtime);
+
+    let adapter = RecordingAdapter::default();
+    adapter.accept_only_next(1);
+    let wall = Arc::new(TestWallClock::new(100_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        StaticTransportRouting::new(vec![])
+            .required_acks(2)
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![
+                    TransportEndpoint("wss://group-a.example".into()),
+                    TransportEndpoint("wss://group-b.example".into()),
+                ],
+            ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+
+    monotonic.set_millis(60_000);
+    wall.set(100_060);
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(jittered.phase, cgka_traits::MaintenancePhase::Jitter);
+    wall.set(jittered.not_before.unwrap().0);
+
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::Complete
+    );
+    assert!(
+        !runtime
+            .session()
+            .group_maintenance(&group_id)
+            .unwrap()
+            .unwrap()
+            .periodic_enrolled,
+        "manual success must not enroll an existing/manual-only group"
+    );
+
+    wall.set(wall.now().0.saturating_add(30));
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes[0].message, publishes[1].message);
+    assert_eq!(publishes[0].target.endpoints().len(), 2);
+    assert_eq!(publishes[1].target.endpoints().len(), 1);
+    let fanout = runtime
+        .session()
+        .transport_fanouts()
+        .unwrap()
+        .into_iter()
+        .find(|fanout| fanout.id == publishes[0].message.id)
+        .unwrap();
+    assert!(fanout.evolution_confirmed);
+    assert!(
+        fanout
+            .targets
+            .iter()
+            .all(|target| { target.state == cgka_traits::TransportFanoutAttemptState::Accepted })
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot ambiguous self update key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let created = initial
+        .create_group(CreateGroupRequest {
+            name: "ambiguous self update".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    let source_epoch = initial.epoch(&group_id).unwrap();
+    drop(initial);
+
+    let adapter = RecordingAdapter::default();
+    adapter.error_next();
+    let routing = StaticTransportRouting::new(vec![]).with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![TransportEndpoint("wss://group.example".into())],
+    );
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database.clone(), &key, b"alice"),
+        adapter.clone(),
+        routing.clone(),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    monotonic.set_millis(60_000);
+    wall.set(120_060);
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    wall.set(jittered.not_before.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+
+    assert_eq!(adapter.publishes().len(), 1);
+    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
+    assert!(fanout.possible_exposure);
+    assert!(!fanout.evolution_confirmed);
+    assert_eq!(
+        fanout.targets[0].state,
+        cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::PendingPublication
+    );
+    drop(runtime);
+
+    let mut restarted = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    restarted.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        adapter.publishes().len(),
+        1,
+        "persisted backoff must prevent an immediate restart retry"
+    );
+    let fanout = restarted.session().transport_fanouts().unwrap().remove(0);
+    assert!(fanout.possible_exposure);
+    assert!(!fanout.evolution_confirmed);
+
+    wall.set(wall.now().0.saturating_add(30));
+    restarted.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes[0].message, publishes[1].message);
+    assert_eq!(
+        restarted.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+    assert_eq!(
+        restarted
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::Complete
     );
 }
 

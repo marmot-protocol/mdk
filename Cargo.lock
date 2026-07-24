@@ -3162,6 +3162,7 @@ dependencies = [
  "libc",
  "marmot-forensics",
  "nostr",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",

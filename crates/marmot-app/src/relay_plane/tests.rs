@@ -304,7 +304,8 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
     let subscriptions = relay.subscriptions.lock().unwrap().clone();
     assert!(subscriptions.iter().all(|subscription| match subscription {
         NostrSubscription::AccountInbox { endpoints, .. }
-        | NostrSubscription::Group { endpoints, .. } => endpoints.len() == 1,
+        | NostrSubscription::Group { endpoints, .. }
+        | NostrSubscription::GroupMaintenance { endpoints, .. } => endpoints.len() == 1,
     }));
 }
 

@@ -113,7 +113,13 @@ impl<S: StorageProvider> Engine<S> {
             ..msg.clone()
         };
         self.storage.with_transaction(|_storage| {
-            self.persist_openmls_wire_message(&openmls_msg, group_id, epoch, MessageState::Sent)?;
+            self.persist_signed_openmls_wire_message(
+                msg,
+                &openmls_msg,
+                group_id,
+                epoch,
+                MessageState::Sent,
+            )?;
             self.persist_sent_openmls_content_marker(
                 &openmls_msg,
                 content_id.clone(),
@@ -139,7 +145,7 @@ impl<S: StorageProvider> Engine<S> {
             payload: mls_bytes.to_vec(),
             ..msg.clone()
         };
-        let payload = StoredMessagePayload::openmls_wire(openmls_msg.clone())
+        let payload = StoredMessagePayload::signed_openmls_wire(msg.clone(), openmls_msg.clone())
             .encode()
             .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
         let record = MessageRecord {
@@ -257,6 +263,26 @@ impl<S: StorageProvider> Engine<S> {
             epoch,
             state,
             StoredMessagePayload::openmls_wire(msg.clone()),
+        )
+    }
+
+    pub(crate) fn persist_signed_openmls_wire_message(
+        &self,
+        exact_message: &TransportMessage,
+        openmls_message: &TransportMessage,
+        group_id: &GroupId,
+        epoch: EpochId,
+        state: MessageState,
+    ) -> Result<(), EngineError> {
+        self.persist_stored_message_payload(
+            exact_message.id.clone(),
+            group_id,
+            epoch,
+            state,
+            StoredMessagePayload::signed_openmls_wire(
+                exact_message.clone(),
+                openmls_message.clone(),
+            ),
         )
     }
 

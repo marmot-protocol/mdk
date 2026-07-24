@@ -1130,7 +1130,9 @@ async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
         .iter()
         .filter_map(|subscription| match subscription {
             NostrSubscription::Group { since, .. } => Some(*since),
-            NostrSubscription::AccountInbox { .. } => None,
+            NostrSubscription::AccountInbox { .. } | NostrSubscription::GroupMaintenance { .. } => {
+                None
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(

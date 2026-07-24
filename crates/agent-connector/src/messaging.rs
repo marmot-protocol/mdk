@@ -2,7 +2,7 @@
 
 use agent_control::{
     AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef, AgentControlMediaUpload,
-    AgentControlResponse,
+    AgentControlResponse, AgentControlSendMaintenanceDisposition,
 };
 use cgka_traits::GroupId;
 use marmot_app::{
@@ -12,6 +12,7 @@ use marmot_app::{
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
+use crate::maintenance::agent_maintenance_disposition;
 use crate::stream_session::SendIdempotencyAcquisition;
 use crate::validation::normalize_hex;
 
@@ -131,7 +132,10 @@ impl AgentConnector {
         let idempotency = if let Some(key) = idempotency_key {
             match self.idempotency.acquire(&key, &fingerprint).await? {
                 SendIdempotencyAcquisition::Completed(message_ids_hex) => {
-                    return Ok(AgentControlResponse::FinalSent { message_ids_hex });
+                    return Ok(AgentControlResponse::FinalSent {
+                        message_ids_hex,
+                        maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                    });
                 }
                 SendIdempotencyAcquisition::Leader(reservation) => Some((key, reservation)),
             }
@@ -159,6 +163,7 @@ impl AgentConnector {
         }
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -180,6 +185,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -261,6 +267,7 @@ impl AgentConnector {
         });
         Ok(AgentControlResponse::FinalSent {
             message_ids_hex: record.message_ids_hex,
+            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
         })
     }
 
@@ -300,6 +307,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -352,6 +360,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -372,6 +381,7 @@ impl AgentConnector {
             .await?;
         Ok(AgentControlResponse::AppEventSent {
             message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
     }
 
@@ -420,8 +430,15 @@ impl AgentConnector {
                 },
             )
             .await?;
+        let sent = result.sent;
         Ok(AgentControlResponse::FinalSent {
-            message_ids_hex: result.sent.map(|sent| sent.message_ids).unwrap_or_default(),
+            message_ids_hex: sent
+                .as_ref()
+                .map(|sent| sent.message_ids.clone())
+                .unwrap_or_default(),
+            maintenance_disposition: sent
+                .map(|sent| agent_maintenance_disposition(sent.maintenance_disposition))
+                .unwrap_or_default(),
         })
     }
 

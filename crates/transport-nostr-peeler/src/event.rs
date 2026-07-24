@@ -243,7 +243,19 @@ impl NostrTransportEvent {
         tags: Vec<Vec<String>>,
         content: String,
     ) -> Self {
-        let created_at = now_unix_seconds();
+        Self::new_unsigned_at(pubkey, kind, tags, content, now_unix_seconds())
+    }
+
+    /// Build an unsigned DTO at an explicitly selected wall-clock timestamp.
+    /// Replaceable-event lifecycle code uses this to persist and retry one
+    /// exact signed event while maintaining monotonic `created_at` ordering.
+    pub fn new_unsigned_at(
+        pubkey: String,
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+        created_at: u64,
+    ) -> Self {
         let id = pre_signing_id(&pubkey, created_at, kind, &tags, &content);
         Self {
             id,

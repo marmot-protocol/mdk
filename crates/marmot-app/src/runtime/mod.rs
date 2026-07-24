@@ -1956,8 +1956,66 @@ impl MarmotAppRuntime {
         self.accounts.rotate_key_package(account_ref).await
     }
 
+    pub async fn key_package_maintenance_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        self.accounts
+            .key_package_maintenance_status(account_ref)
+            .await
+    }
+
     pub async fn publish_new_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         self.rotate_key_package(account_ref).await
+    }
+
+    pub async fn maintenance_status(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
+        self.accounts
+            .maintenance_status(account_ref, group_id)
+            .await
+    }
+
+    pub async fn schedule_manual_self_update(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<String, AppError> {
+        self.accounts
+            .schedule_manual_self_update(account_ref, group_id)
+            .await
+    }
+
+    pub async fn periodic_maintenance_policy(
+        &self,
+        account_ref: &str,
+    ) -> Result<cgka_traits::PeriodicMaintenancePolicy, AppError> {
+        self.accounts.periodic_maintenance_policy(account_ref).await
+    }
+
+    pub async fn set_periodic_maintenance_policy(
+        &self,
+        account_ref: &str,
+        policy: cgka_traits::PeriodicMaintenancePolicy,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .set_periodic_maintenance_policy(account_ref, policy)
+            .await
+    }
+
+    pub async fn pause_maintenance(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.pause_maintenance(account_ref).await
+    }
+
+    pub async fn resume_maintenance(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.resume_maintenance(account_ref).await
+    }
+
+    pub async fn run_due_maintenance(&self, account_ref: &str) -> Result<SendSummary, AppError> {
+        self.accounts.run_due_maintenance(account_ref).await
     }
 
     pub async fn account_key_packages(

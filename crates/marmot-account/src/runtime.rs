@@ -1,7 +1,9 @@
 //! Account-device runtime: drives session effects through transport publish,
 //! confirmation, and rollback, and the effect aggregates it produces.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
 
 use cgka_session::{
     AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
@@ -14,12 +16,18 @@ use cgka_traits::engine::{
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::ingest::IngestOutcome;
+use cgka_traits::maintenance::{
+    DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceStatus,
+    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
+    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial,
+    SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
+};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
     EpochId, FanoutMlsState, GroupId, MemberId, OutboundFanout, OutboundFanoutOutcome, Timestamp,
-    TransportAccountActivation, TransportAdapter, TransportDelivery, TransportEndpoint,
-    TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSync, TransportPublishReport,
-    TransportPublishRequest, TransportPublishTarget,
+    TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
+    TransportEndpoint, TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSync,
+    TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
 };
 use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
@@ -31,13 +39,28 @@ use crate::routing::{
     StaticTransportRouting, TransportRoutingPolicy, publish_target_group_id, publish_target_kind,
     publish_target_relay_urls,
 };
+use crate::time::{
+    MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
+    WallClock,
+};
 
 const TRACE_TARGET: &str = "marmot_account::runtime";
+const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
+const KEY_PACKAGE_REFRESH_MIN_LEAD_SECS: u64 = 14 * 24 * 60 * 60;
+const KEY_PACKAGE_REFRESH_MAX_LEAD_SECS: u64 = 21 * 24 * 60 * 60;
+const MAINTENANCE_EOSE_TIMEOUT_SECS: u64 = 5 * 60;
+const MAINTENANCE_POST_EOSE_GRACE_SECS: u64 = 15;
+const MAINTENANCE_QUIET_SECS: u64 = 60;
+const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
+const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
+const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PublishStatus {
     met_required_acks: bool,
     accepted_by_any_endpoint: bool,
+    possible_ambiguous_exposure: bool,
+    retry_deferred: bool,
 }
 
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
@@ -45,6 +68,11 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     adapter: A,
     routing: R,
     key_packages: K,
+    wall_clock: Arc<dyn WallClock>,
+    monotonic_clock: Arc<dyn MonotonicClock>,
+    maintenance_random: Arc<dyn MaintenanceRandom>,
+    maintenance_paused: bool,
+    maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -59,7 +87,24 @@ where
             adapter,
             routing,
             key_packages,
+            wall_clock: Arc::new(SystemWallClock),
+            monotonic_clock: Arc::new(SystemMonotonicClock::default()),
+            maintenance_random: Arc::new(OsMaintenanceRandom::default()),
+            maintenance_paused: false,
+            maintenance_quiet_monotonic: HashMap::new(),
         }
+    }
+
+    pub fn with_maintenance_sources(
+        mut self,
+        wall_clock: Arc<dyn WallClock>,
+        monotonic_clock: Arc<dyn MonotonicClock>,
+        maintenance_random: Arc<dyn MaintenanceRandom>,
+    ) -> Self {
+        self.wall_clock = wall_clock;
+        self.monotonic_clock = monotonic_clock;
+        self.maintenance_random = maintenance_random;
+        self
     }
 
     pub fn session(&self) -> &AccountDeviceSession {
@@ -199,58 +244,955 @@ where
             endpoint_count = self.routing.key_package_endpoints().len(),
             "publishing fresh key package"
         );
-        let key_package = self.session.fresh_key_package().await?;
-        // `fresh_key_package` persists the bundle's private HPKE init key
-        // material into storage as a side effect of building it. If publication
-        // fails *before any external exposure*, we must prune that orphaned
-        // private bundle; otherwise an app retrying on a schedule against a
-        // failing publisher accumulates unused private key material indefinitely
-        // (mdk#160).
-        //
-        // But pruning is only safe when the publisher guarantees the KeyPackage
-        // was never externally exposed. A publisher may publish to a relay first
-        // and only then perform a local step (e.g. a cache write) that can fail:
-        // in that case the KeyPackage is already discoverable, and deleting the
-        // private bundle would leave a remotely visible but unjoinable
-        // KeyPackage. `KeyPackagePublishError::externally_exposed` distinguishes
-        // the two; we prune only on the unexposed path (mirrors the welcome
-        // publish exposure handling in `publish_group_created`).
-        if let Err(publish_err) = self
+        let now = self.wall_clock.now();
+        let endpoints = self.routing.key_package_endpoints();
+        let mut lifecycle = match self.session.key_package_lifecycle()? {
+            Some(state) => state,
+            None => KeyPackageLifecycleState {
+                stable_slot_id: self
+                    .key_packages
+                    .legacy_slot_id(&self.session.self_id())
+                    .unwrap_or_else(|| {
+                        (0..4)
+                            .flat_map(|_| self.maintenance_random.next_u64().to_be_bytes())
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect()
+                    }),
+                phase: cgka_traits::MaintenancePhase::Complete,
+                current_key_package: None,
+                current_key_package_ref: None,
+                current_not_before: None,
+                current_not_after: None,
+                authored_event_id: None,
+                authored_event_created_at: None,
+                authored_signed_event: None,
+                publication_targets: Vec::new(),
+                refresh_at: None,
+                upgrade_rotation_recorded: false,
+                last_consumed_key_package_ref: None,
+                last_consumed_at: None,
+                retained_private_material: Vec::new(),
+                pending_replacement: None,
+            },
+        };
+
+        if lifecycle.pending_replacement.is_none() {
+            let created_at = Timestamp(
+                lifecycle
+                    .authored_event_created_at
+                    .map(|previous| previous.0.saturating_add(1))
+                    .unwrap_or(now.0)
+                    .max(now.0),
+            );
+            if created_at.0 > now.0.saturating_add(KEY_PACKAGE_MAX_FUTURE_SKEW_SECS) {
+                lifecycle.phase = cgka_traits::MaintenancePhase::ClockSkewBlocked;
+                self.session.put_key_package_lifecycle(&lifecycle)?;
+                return Err(AccountError::ClockSkewBlocked);
+            }
+            let key_package = self.session.fresh_key_package().await?;
+            let metadata = self.session.key_package_metadata(&key_package)?;
+            let lead = self.maintenance_random.sample_inclusive(
+                KEY_PACKAGE_REFRESH_MIN_LEAD_SECS,
+                KEY_PACKAGE_REFRESH_MAX_LEAD_SECS,
+            );
+            lifecycle.pending_replacement = Some(PendingKeyPackageReplacement {
+                key_package,
+                key_package_ref: hex::decode(&metadata.key_package_ref_hex)
+                    .map_err(|error| cgka_traits::EngineError::Serialize(error.to_string()))?,
+                authored_created_at: created_at,
+                not_before: Timestamp(metadata.not_before),
+                not_after: Timestamp(metadata.not_after),
+                refresh_at: Timestamp(metadata.not_after.saturating_sub(lead)),
+                signed_event: None,
+                targets: endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| TransportFanoutTarget {
+                        endpoint,
+                        state: TransportFanoutAttemptState::Unattempted,
+                        attempt_count: 0,
+                        last_attempt_at: None,
+                        failure_code: None,
+                    })
+                    .collect(),
+                attempt_count: 0,
+                last_failure_code: None,
+            });
+            lifecycle.phase = cgka_traits::MaintenancePhase::PendingPublication;
+            self.session.put_key_package_lifecycle(&lifecycle)?;
+        }
+
+        if lifecycle
+            .pending_replacement
+            .as_ref()
+            .is_some_and(|pending| pending.signed_event.is_none())
+        {
+            let pending = lifecycle
+                .pending_replacement
+                .as_ref()
+                .expect("unsigned pending replacement exists");
+            let publication = KeyPackagePublication {
+                account_id: self.session.self_id().clone(),
+                key_package: pending.key_package.clone(),
+                slot_id: lifecycle.stable_slot_id.clone(),
+                created_at: pending.authored_created_at,
+                endpoints: pending
+                    .targets
+                    .iter()
+                    .map(|target| target.endpoint.clone())
+                    .collect(),
+            };
+            let artifact = self.key_packages.prepare_key_package(publication).await?;
+            lifecycle
+                .pending_replacement
+                .as_mut()
+                .expect("unsigned pending replacement exists")
+                .signed_event = Some(artifact);
+            // Exact signed bytes are durable before the first network call.
+            self.session.put_key_package_lifecycle(&lifecycle)?;
+        }
+
+        let pending = lifecycle
+            .pending_replacement
+            .as_ref()
+            .expect("pending replacement exists");
+        let artifact = pending
+            .signed_event
+            .as_ref()
+            .expect("prepared replacement has an exact signed event")
+            .clone();
+        let publication = KeyPackagePublication {
+            account_id: self.session.self_id().clone(),
+            key_package: pending.key_package.clone(),
+            slot_id: lifecycle.stable_slot_id.clone(),
+            created_at: artifact.created_at,
+            endpoints: pending
+                .targets
+                .iter()
+                .map(|target| target.endpoint.clone())
+                .collect(),
+        };
+        let receipt = match self
             .key_packages
-            .publish_key_package(KeyPackagePublication {
-                account_id: self.session.self_id(),
-                key_package: key_package.clone(),
-                endpoints: self.routing.key_package_endpoints(),
-            })
+            .publish_prepared_key_package(&publication, &artifact)
             .await
         {
-            if publish_err.externally_exposed {
-                // The KeyPackage may already be discoverable on a relay. Retain
-                // the private bundle so an inviter's Welcome built against the
-                // published event can still be joined.
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "publish_fresh_key_package",
-                    "key package publish failed after possible external exposure; retaining private bundle"
-                );
-            } else if let Err(cleanup_err) = self.session.delete_key_package(&key_package).await {
-                // Cleanup is best-effort. Surface the failure for diagnosis but
-                // still return the original publish error, which is the
-                // actionable one for the caller.
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    method = "publish_fresh_key_package",
-                    error_kind = if cleanup_err.is_transient() {
-                        "engine_transient"
-                    } else {
-                        "engine"
-                    },
-                    "failed to delete orphaned key package bundle after publish failure"
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some(pending) = lifecycle.pending_replacement.as_mut() {
+                    pending.attempt_count = pending.attempt_count.saturating_add(1);
+                    pending.last_failure_code = Some(
+                        if error.externally_exposed {
+                            "ambiguous_exposure"
+                        } else {
+                            "publish_failed"
+                        }
+                        .into(),
+                    );
+                    note_key_package_attempt(
+                        &mut pending.targets,
+                        &publication.endpoints,
+                        &[],
+                        &[],
+                        self.wall_clock.now(),
+                    );
+                }
+                lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
+                self.session.put_key_package_lifecycle(&lifecycle)?;
+                return Err(error.into());
+            }
+        };
+        if receipt.accepted.is_empty() {
+            if let Some(pending) = lifecycle.pending_replacement.as_mut() {
+                pending.attempt_count = pending.attempt_count.saturating_add(1);
+                pending.last_failure_code = Some("no_acknowledgement".into());
+                note_key_package_attempt(
+                    &mut pending.targets,
+                    &publication.endpoints,
+                    &receipt.accepted,
+                    &receipt.failed,
+                    self.wall_clock.now(),
                 );
             }
-            return Err(publish_err.into());
+            lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
+            self.session.put_key_package_lifecycle(&lifecycle)?;
+            return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                "no KeyPackage relay acknowledged the replacement",
+            )
+            .into());
         }
-        Ok(key_package)
+
+        let mut replacement = lifecycle
+            .pending_replacement
+            .take()
+            .expect("published replacement exists");
+        note_key_package_attempt(
+            &mut replacement.targets,
+            &publication.endpoints,
+            &receipt.accepted,
+            &receipt.failed,
+            self.wall_clock.now(),
+        );
+        let previous = lifecycle.current_key_package.clone();
+        let previous_was_consumed = lifecycle.current_key_package_ref.is_some()
+            && lifecycle.current_key_package_ref == lifecycle.last_consumed_key_package_ref;
+        if !previous_was_consumed
+            && let (Some(key_package), Some(key_package_ref), Some(not_after)) = (
+                previous.clone(),
+                lifecycle.current_key_package_ref.clone(),
+                lifecycle.current_not_after,
+            )
+        {
+            lifecycle
+                .retained_private_material
+                .push(RetainedKeyPackagePrivateMaterial {
+                    key_package,
+                    key_package_ref,
+                    not_after,
+                    replaced_at: self.wall_clock.now(),
+                });
+        }
+        lifecycle.current_key_package = Some(replacement.key_package.clone());
+        lifecycle.current_key_package_ref = Some(replacement.key_package_ref);
+        lifecycle.current_not_before = Some(replacement.not_before);
+        lifecycle.current_not_after = Some(replacement.not_after);
+        lifecycle.authored_event_id = Some(artifact.id.clone());
+        lifecycle.authored_event_created_at = Some(artifact.created_at);
+        lifecycle.authored_signed_event = Some(artifact);
+        lifecycle.publication_targets = replacement.targets;
+        lifecycle.refresh_at = Some(replacement.refresh_at);
+        lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
+            matches!(
+                target.state,
+                TransportFanoutAttemptState::Accepted
+                    | TransportFanoutAttemptState::PolicyProhibited
+            )
+        }) {
+            cgka_traits::MaintenancePhase::Complete
+        } else {
+            cgka_traits::MaintenancePhase::Fanout
+        };
+        lifecycle.upgrade_rotation_recorded = true;
+        lifecycle.last_consumed_key_package_ref = None;
+        lifecycle.last_consumed_at = None;
+        let retired = if previous_was_consumed {
+            previous.into_iter().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.session
+            .promote_key_package_lifecycle(&retired, &lifecycle)?;
+        Ok(replacement.key_package)
+    }
+
+    pub fn key_package_maintenance_status(
+        &self,
+    ) -> AccountResult<Option<KeyPackageLifecycleState>> {
+        Ok(self.session.key_package_lifecycle()?)
+    }
+
+    pub fn key_package_network_maintenance_due(&self) -> AccountResult<bool> {
+        let now = self.wall_clock.now();
+        Ok(match self.session.key_package_lifecycle()? {
+            None => true,
+            Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
+                Some(pending) => {
+                    pending.signed_event.is_none()
+                        || pending
+                            .targets
+                            .iter()
+                            .any(|target| key_package_target_retry_due(target, now))
+                }
+                None => {
+                    lifecycle.current_key_package.is_none()
+                        || lifecycle.last_consumed_key_package_ref
+                            == lifecycle.current_key_package_ref
+                        || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
+                        || !lifecycle.upgrade_rotation_recorded
+                }
+            },
+        })
+    }
+
+    pub fn key_package_has_pending_fanout(&self) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .key_package_lifecycle()?
+            .is_some_and(|lifecycle| {
+                lifecycle.authored_signed_event.is_some()
+                    && lifecycle.publication_targets.iter().any(|target| {
+                        matches!(
+                            target.state,
+                            TransportFanoutAttemptState::Unattempted
+                                | TransportFanoutAttemptState::AttemptedFailed
+                        )
+                    })
+            }))
+    }
+
+    async fn retry_key_package_fanout(&mut self) -> AccountResult<()> {
+        let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(());
+        };
+        if lifecycle.pending_replacement.is_some() {
+            return Ok(());
+        }
+        let Some(artifact) = lifecycle.authored_signed_event.clone() else {
+            return Ok(());
+        };
+        let endpoints = lifecycle
+            .publication_targets
+            .iter()
+            .filter(|target| key_package_target_retry_due(target, self.wall_clock.now()))
+            .map(|target| target.endpoint.clone())
+            .collect::<Vec<_>>();
+        if endpoints.is_empty() {
+            return Ok(());
+        }
+        let Some(key_package) = lifecycle.current_key_package.clone() else {
+            return Ok(());
+        };
+        lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
+        self.session.put_key_package_lifecycle(&lifecycle)?;
+        let publication = KeyPackagePublication {
+            account_id: self.session.self_id().clone(),
+            key_package,
+            slot_id: lifecycle.stable_slot_id.clone(),
+            created_at: artifact.created_at,
+            endpoints,
+        };
+        match self
+            .key_packages
+            .publish_prepared_key_package(&publication, &artifact)
+            .await
+        {
+            Ok(receipt) => {
+                note_key_package_attempt(
+                    &mut lifecycle.publication_targets,
+                    &publication.endpoints,
+                    &receipt.accepted,
+                    &receipt.failed,
+                    self.wall_clock.now(),
+                );
+                lifecycle.phase = if lifecycle.publication_targets.iter().all(|target| {
+                    matches!(
+                        target.state,
+                        TransportFanoutAttemptState::Accepted
+                            | TransportFanoutAttemptState::PolicyProhibited
+                    )
+                }) {
+                    cgka_traits::MaintenancePhase::Complete
+                } else {
+                    cgka_traits::MaintenancePhase::Fanout
+                };
+                self.session.put_key_package_lifecycle(&lifecycle)?;
+                Ok(())
+            }
+            Err(error) => {
+                note_key_package_attempt(
+                    &mut lifecycle.publication_targets,
+                    &publication.endpoints,
+                    &[],
+                    &[],
+                    self.wall_clock.now(),
+                );
+                lifecycle.phase = cgka_traits::MaintenancePhase::Fanout;
+                self.session.put_key_package_lifecycle(&lifecycle)?;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn key_package_maintenance_requires_catch_up(&self) -> AccountResult<bool> {
+        let now = self.wall_clock.now();
+        Ok(match self.session.key_package_lifecycle()? {
+            None => true,
+            Some(lifecycle) => {
+                lifecycle.pending_replacement.is_none()
+                    && lifecycle.last_consumed_key_package_ref != lifecycle.current_key_package_ref
+                    && (lifecycle.current_key_package.is_none()
+                        || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
+                        || !lifecycle.upgrade_rotation_recorded)
+            }
+        })
+    }
+
+    /// Delete expired private init-key material even when network maintenance
+    /// is paused or transport cursor persistence is frozen.
+    pub fn sweep_expired_key_package_private_material(&mut self) -> AccountResult<usize> {
+        let now = self.wall_clock.now();
+        let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(0);
+        };
+        let mut retired = Vec::new();
+        if lifecycle
+            .current_not_after
+            .is_some_and(|deadline| deadline <= now)
+            && let Some(expired) = lifecycle.current_key_package.take()
+        {
+            lifecycle.current_key_package_ref = None;
+            lifecycle.current_not_before = None;
+            lifecycle.current_not_after = None;
+            lifecycle.authored_signed_event = None;
+            lifecycle.publication_targets.clear();
+            lifecycle.refresh_at = None;
+            lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
+            retired.push(expired);
+        }
+        if lifecycle
+            .pending_replacement
+            .as_ref()
+            .is_some_and(|pending| pending.not_after <= now)
+            && let Some(expired) = lifecycle.pending_replacement.take()
+        {
+            lifecycle.phase = cgka_traits::MaintenancePhase::Failed;
+            retired.push(expired.key_package);
+        }
+        let consumed_ref = lifecycle.last_consumed_key_package_ref.as_deref();
+        let mut consumed_retained_deleted = false;
+        let mut retained = Vec::with_capacity(lifecycle.retained_private_material.len());
+        for material in lifecycle.retained_private_material.drain(..) {
+            let was_consumed = consumed_ref
+                .is_some_and(|consumed| consumed == material.key_package_ref.as_slice());
+            if material.not_after <= now || was_consumed {
+                consumed_retained_deleted |= was_consumed;
+                retired.push(material.key_package);
+            } else {
+                retained.push(material);
+            }
+        }
+        lifecycle.retained_private_material = retained;
+        if consumed_retained_deleted {
+            lifecycle.last_consumed_key_package_ref = None;
+            lifecycle.last_consumed_at = None;
+        }
+        let deleted = retired.len();
+        if deleted > 0 {
+            self.session
+                .promote_key_package_lifecycle(&retired, &lifecycle)?;
+        }
+        Ok(deleted)
+    }
+
+    pub fn maintenance_status(&self, group_id: &GroupId) -> AccountResult<GroupMaintenanceStatus> {
+        Ok(GroupMaintenanceStatus {
+            group_id: group_id.clone(),
+            state: self.session.group_maintenance(group_id)?,
+            obligations: self
+                .session
+                .maintenance_obligations()?
+                .into_iter()
+                .filter(|obligation| &obligation.group_id == group_id)
+                .collect(),
+            evolutions: self
+                .session
+                .group_evolutions()?
+                .into_iter()
+                .filter(|evolution| &evolution.group_id == group_id)
+                .collect(),
+            fanouts: self
+                .session
+                .transport_fanouts()?
+                .into_iter()
+                .filter(|fanout| fanout.group_id.as_ref() == Some(group_id))
+                .collect(),
+            paused: self.maintenance_paused,
+        })
+    }
+
+    pub fn periodic_maintenance_policy(&self) -> AccountResult<PeriodicMaintenancePolicy> {
+        Ok(self.session.periodic_maintenance_policy()?)
+    }
+
+    pub fn set_periodic_maintenance_policy(
+        &self,
+        policy: PeriodicMaintenancePolicy,
+    ) -> AccountResult<()> {
+        Ok(self.session.put_periodic_maintenance_policy(policy)?)
+    }
+
+    pub fn pause_maintenance(&mut self) {
+        self.maintenance_paused = true;
+    }
+
+    pub fn resume_maintenance(&mut self) {
+        self.maintenance_paused = false;
+    }
+
+    pub fn maintenance_is_paused(&self) -> bool {
+        self.maintenance_paused
+    }
+
+    pub fn schedule_manual_self_update(
+        &mut self,
+        group_id: &GroupId,
+    ) -> AccountResult<cgka_traits::MessageId> {
+        use sha2::{Digest, Sha256};
+        self.session.group_record(group_id)?;
+        let now = self.wall_clock.now();
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-manual-self-update-v1");
+        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+        hasher.update(group_id.as_slice());
+        hasher.update(now.0.to_be_bytes());
+        hasher.update(self.maintenance_random.next_u64().to_be_bytes());
+        let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+        let obligation = MaintenanceObligation {
+            id: id.clone(),
+            group_id: group_id.clone(),
+            trigger: MaintenanceTrigger::Manual,
+            phase: MaintenancePhase::Quiet,
+            created_at: now,
+            operational_target_at: None,
+            overdue: false,
+            eose_deadline_at: None,
+            grace_until: None,
+            quiet_since: Some(now),
+            own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
+            sampled_jitter_ms: self.maintenance_random.sample_inclusive(0, 30_000),
+            not_before: None,
+            attempt_count: 0,
+            semantic_rearm_count: 0,
+            last_failure_code: None,
+        };
+        self.session.put_maintenance_obligation(&obligation)?;
+        self.maintenance_quiet_monotonic
+            .insert(id.clone(), self.monotonic_clock.elapsed());
+        Ok(id)
+    }
+
+    /// Record successful installation of the temporary post-join
+    /// full-history subscription. The five-minute EOSE deadline starts here.
+    pub fn mark_post_join_subscription_installed(&self, group_id: &GroupId) -> AccountResult<()> {
+        let now = self.wall_clock.now();
+        for mut obligation in self.session.maintenance_obligations()? {
+            if obligation.group_id == *group_id
+                && obligation.trigger == MaintenanceTrigger::PostJoin
+                && obligation.phase == MaintenancePhase::CatchUp
+                && obligation.eose_deadline_at.is_none()
+            {
+                obligation.eose_deadline_at = Some(Timestamp(
+                    now.0.saturating_add(MAINTENANCE_EOSE_TIMEOUT_SECS),
+                ));
+                self.session.put_maintenance_obligation(&obligation)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_post_join_eose(&self, group_id: &GroupId) -> AccountResult<()> {
+        let now = self.wall_clock.now();
+        for mut obligation in self.session.maintenance_obligations()? {
+            if obligation.group_id == *group_id
+                && obligation.trigger == MaintenanceTrigger::PostJoin
+                && matches!(
+                    obligation.phase,
+                    MaintenancePhase::CatchUp | MaintenancePhase::EoseTimeout
+                )
+            {
+                obligation.phase = MaintenancePhase::Grace;
+                obligation.grace_until = Some(Timestamp(
+                    now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                ));
+                self.session.put_maintenance_obligation(&obligation)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Only call this for authenticated, valid MLS commits or proposals.
+    pub fn note_valid_state_bearing_input(&mut self, group_id: &GroupId) -> AccountResult<()> {
+        let now = self.wall_clock.now();
+        for mut obligation in self.session.maintenance_obligations()? {
+            if obligation.group_id == *group_id
+                && !matches!(
+                    obligation.phase,
+                    MaintenancePhase::Complete | MaintenancePhase::Failed
+                )
+            {
+                obligation.phase = MaintenancePhase::Quiet;
+                obligation.quiet_since = Some(now);
+                obligation.not_before = None;
+                self.session.put_maintenance_obligation(&obligation)?;
+                self.maintenance_quiet_monotonic
+                    .insert(obligation.id, self.monotonic_clock.elapsed());
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance durable maintenance state and publish work whose safety windows
+    /// have elapsed. Callers may invoke this from any timer cadence; all
+    /// deadlines and sampled jitter are persisted.
+    pub async fn run_due_maintenance(&mut self) -> AccountResult<AccountDeviceEffects> {
+        use sha2::{Digest, Sha256};
+
+        self.sweep_expired_key_package_private_material()?;
+        let mut output = AccountDeviceEffects::default();
+        // Hydration recreates the publication edge for a surviving staged
+        // evolution. Consume that edge before consulting the semantic
+        // obligation below. Otherwise a successful retry can confirm the
+        // pending evolution, drain the still-buffered hydration work as part
+        // of confirmation, and attempt to confirm the same PendingStateRef a
+        // second time. The durable fanout backoff in publish_one still makes
+        // this safe to call before a failed target is retryable.
+        let recovered = self.session.drain();
+        if !recovered.is_empty() {
+            let recovered = self.publish_session_effects(recovered).await?;
+            output.absorb_account_effects(recovered);
+        }
+        let now = self.wall_clock.now();
+        // Fanout of an already-acknowledged exact event is publication
+        // recovery, not a new preparation, so it continues while paused.
+        if self.key_package_has_pending_fanout()?
+            && let Err(error) = self.retry_key_package_fanout().await
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "run_due_maintenance",
+                error_kind = if error.to_string().is_empty() {
+                    "key_package_fanout"
+                } else {
+                    "key_package_fanout_retry"
+                },
+                "key package exact-event fanout remains retryable"
+            );
+        }
+        let key_package_due = self.key_package_network_maintenance_due()?;
+        let key_package_prepared = self
+            .session
+            .key_package_lifecycle()?
+            .is_some_and(|lifecycle| lifecycle.pending_replacement.is_some());
+        if key_package_due
+            && (!self.maintenance_paused || key_package_prepared)
+            && let Err(error) = self.publish_fresh_key_package().await
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "run_due_maintenance",
+                error_kind = if matches!(error, AccountError::ClockSkewBlocked) {
+                    "clock_skew_blocked"
+                } else {
+                    "key_package_retry"
+                },
+                "key package maintenance remains retryable"
+            );
+        }
+        self.retry_confirmed_transport_fanouts(&mut output).await?;
+
+        // Old groups have no enrollment row and are intentionally excluded.
+        for group_id in if self.maintenance_paused {
+            Vec::new()
+        } else {
+            self.session.live_group_ids()?
+        } {
+            let Some(mut state) = self.session.group_maintenance(&group_id)? else {
+                continue;
+            };
+            if !state.periodic_enrolled {
+                continue;
+            }
+            let has_active =
+                self.session
+                    .maintenance_obligations()?
+                    .into_iter()
+                    .any(|obligation| {
+                        obligation.group_id == group_id
+                            && !matches!(
+                                obligation.phase,
+                                MaintenancePhase::Complete | MaintenancePhase::Failed
+                            )
+                    });
+            if has_active {
+                continue;
+            }
+            if state.next_periodic_rotation_at.is_none()
+                && let Some(last_rotation) = state.last_own_leaf_rotation_at
+            {
+                state.next_periodic_rotation_at = Some(Timestamp(
+                    last_rotation.0.saturating_add(
+                        self.maintenance_random
+                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
+                    ),
+                ));
+                self.session.put_group_maintenance(&state)?;
+            }
+            if state
+                .next_periodic_rotation_at
+                .is_some_and(|deadline| deadline <= now)
+            {
+                let mut hasher = Sha256::new();
+                hasher.update(b"marmot-periodic-self-update-v1");
+                hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+                hasher.update(group_id.as_slice());
+                hasher.update(
+                    state
+                        .next_periodic_rotation_at
+                        .expect("checked above")
+                        .0
+                        .to_be_bytes(),
+                );
+                let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+                let obligation = MaintenanceObligation {
+                    id: id.clone(),
+                    group_id: group_id.clone(),
+                    trigger: MaintenanceTrigger::Periodic,
+                    phase: MaintenancePhase::Quiet,
+                    created_at: now,
+                    operational_target_at: None,
+                    overdue: false,
+                    eose_deadline_at: None,
+                    grace_until: None,
+                    quiet_since: Some(now),
+                    own_leaf_baseline_hash: Some(self.session.own_leaf_hash(&group_id)?),
+                    sampled_jitter_ms: self.maintenance_random.sample_inclusive(0, 15 * 60 * 1_000),
+                    not_before: None,
+                    attempt_count: 0,
+                    semantic_rearm_count: 0,
+                    last_failure_code: None,
+                };
+                self.session.put_maintenance_obligation(&obligation)?;
+                self.maintenance_quiet_monotonic
+                    .insert(id, self.monotonic_clock.elapsed());
+            }
+        }
+
+        let mut obligations = self.session.maintenance_obligations()?;
+        obligations.sort_by_key(|obligation| obligation.created_at);
+        for mut obligation in obligations {
+            if matches!(
+                obligation.phase,
+                MaintenancePhase::Complete | MaintenancePhase::Failed
+            ) {
+                continue;
+            }
+            if obligation
+                .operational_target_at
+                .is_some_and(|target| target <= now)
+            {
+                obligation.overdue = true;
+            }
+
+            if self.maintenance_paused {
+                let has_prepared_evolution =
+                    self.session
+                        .group_evolutions()?
+                        .into_iter()
+                        .any(|evolution| {
+                            evolution.phase != GroupEvolutionPhase::SupersededByConvergence
+                                && matches!(
+                                    &evolution.semantic,
+                                    GroupEvolutionSemantic::SelfUpdate {
+                                        obligation_id,
+                                        ..
+                                    } if obligation_id == &obligation.id
+                                )
+                                && matches!(
+                                    evolution.phase,
+                                    GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+                                )
+                        });
+                if !has_prepared_evolution {
+                    self.session.put_maintenance_obligation(&obligation)?;
+                    continue;
+                }
+            }
+
+            match obligation.phase {
+                MaintenancePhase::CatchUp => {
+                    if obligation
+                        .eose_deadline_at
+                        .is_some_and(|deadline| deadline <= now)
+                    {
+                        obligation.phase = MaintenancePhase::EoseTimeout;
+                        obligation.grace_until = Some(Timestamp(
+                            now.0.saturating_add(MAINTENANCE_POST_EOSE_GRACE_SECS),
+                        ));
+                    }
+                    self.session.put_maintenance_obligation(&obligation)?;
+                    continue;
+                }
+                MaintenancePhase::EoseTimeout | MaintenancePhase::Grace => {
+                    if obligation.grace_until.is_none_or(|deadline| deadline > now) {
+                        self.session.put_maintenance_obligation(&obligation)?;
+                        continue;
+                    }
+                    obligation.phase = MaintenancePhase::Quiet;
+                    obligation.quiet_since = Some(now);
+                    self.maintenance_quiet_monotonic
+                        .insert(obligation.id.clone(), self.monotonic_clock.elapsed());
+                    self.session.put_maintenance_obligation(&obligation)?;
+                    continue;
+                }
+                MaintenancePhase::Quiet => {
+                    let quiet_long_enough = self
+                        .maintenance_quiet_monotonic
+                        .get(&obligation.id)
+                        .map(|started| {
+                            self.monotonic_clock.elapsed().saturating_sub(*started)
+                                >= Duration::from_secs(MAINTENANCE_QUIET_SECS)
+                        })
+                        .unwrap_or_else(|| {
+                            obligation.quiet_since.is_some_and(|started| {
+                                now.0.saturating_sub(started.0) >= MAINTENANCE_QUIET_SECS
+                            })
+                        });
+                    if !quiet_long_enough {
+                        self.session.put_maintenance_obligation(&obligation)?;
+                        continue;
+                    }
+                    let jitter_secs = obligation.sampled_jitter_ms.saturating_add(999) / 1_000;
+                    obligation.phase = MaintenancePhase::Jitter;
+                    obligation.not_before = Some(Timestamp(now.0.saturating_add(jitter_secs)));
+                    self.session.put_maintenance_obligation(&obligation)?;
+                    continue;
+                }
+                MaintenancePhase::Jitter => {
+                    if obligation.not_before.is_none_or(|deadline| deadline > now) {
+                        self.session.put_maintenance_obligation(&obligation)?;
+                        continue;
+                    }
+                }
+                MaintenancePhase::PendingPublication | MaintenancePhase::Retry => {
+                    if let Some(evolution) =
+                        self.session
+                            .group_evolutions()?
+                            .into_iter()
+                            .find(|evolution| {
+                                evolution.phase != GroupEvolutionPhase::SupersededByConvergence
+                                    && matches!(
+                                        &evolution.semantic,
+                                        GroupEvolutionSemantic::SelfUpdate {
+                                            obligation_id,
+                                            ..
+                                        } if obligation_id == &obligation.id
+                                    )
+                            })
+                    {
+                        if evolution.phase == GroupEvolutionPhase::Confirmed {
+                            self.complete_maintenance_obligation(&mut obligation, now)?;
+                            continue;
+                        }
+                        if let (Some(pending), Some(message_id)) =
+                            (evolution.pending_ref, evolution.signed_message_id)
+                            && let Some(fanout) = self.session.transport_fanout(&message_id)?
+                        {
+                            let retry = SessionEffects {
+                                events: Vec::new(),
+                                publish: vec![PublishWork::AutoPublish {
+                                    msg: fanout.exact_message,
+                                    pending,
+                                }],
+                                queued: Vec::new(),
+                                pending_convergence: Vec::new(),
+                            };
+                            let retried = self.publish_session_effects(retry).await?;
+                            let confirmed = retried.pending.iter().any(|resolution| {
+                                matches!(
+                                    resolution,
+                                    PendingResolution::Confirmed { pending: resolved }
+                                        if *resolved == pending
+                                )
+                            });
+                            output.absorb_account_effects(retried);
+                            if confirmed {
+                                self.complete_maintenance_obligation(&mut obligation, now)?;
+                            } else {
+                                obligation.phase = MaintenancePhase::PendingPublication;
+                                obligation.attempt_count =
+                                    obligation.attempt_count.saturating_add(1);
+                                self.session.put_maintenance_obligation(&obligation)?;
+                            }
+                            continue;
+                        }
+                    }
+                    obligation.phase = MaintenancePhase::Retry;
+                }
+                MaintenancePhase::Paused
+                | MaintenancePhase::Overdue
+                | MaintenancePhase::ClockSkewBlocked
+                | MaintenancePhase::Fanout
+                | MaintenancePhase::SupersededByConvergence => {
+                    obligation.phase = MaintenancePhase::Retry;
+                }
+                MaintenancePhase::Complete | MaintenancePhase::Failed => continue,
+            }
+
+            if self
+                .session
+                .has_pending_convergence_inputs(&obligation.group_id)?
+                || self
+                    .session
+                    .quarantined_groups()
+                    .iter()
+                    .any(|(group_id, _)| group_id == &obligation.group_id)
+            {
+                obligation.phase = MaintenancePhase::Retry;
+                obligation.last_failure_code = Some("safety_gate".into());
+                self.session.put_maintenance_obligation(&obligation)?;
+                continue;
+            }
+
+            let group_id = obligation.group_id.clone();
+            match self
+                .send(SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                })
+                .await
+            {
+                Ok(effects) => {
+                    let confirmed = effects.pending.iter().any(|resolution| {
+                        matches!(resolution, PendingResolution::Confirmed { .. })
+                    });
+                    output.absorb_account_effects(effects);
+                    if confirmed {
+                        self.complete_maintenance_obligation(&mut obligation, now)?;
+                    } else {
+                        obligation.phase = MaintenancePhase::PendingPublication;
+                        obligation.attempt_count = obligation.attempt_count.saturating_add(1);
+                        self.session.put_maintenance_obligation(&obligation)?;
+                    }
+                }
+                Err(error) => {
+                    obligation.phase = MaintenancePhase::Retry;
+                    obligation.attempt_count = obligation.attempt_count.saturating_add(1);
+                    obligation.last_failure_code = Some(
+                        if error.to_string().is_empty() {
+                            "maintenance_send_failed"
+                        } else {
+                            "maintenance_deferred"
+                        }
+                        .into(),
+                    );
+                    self.session.put_maintenance_obligation(&obligation)?;
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn complete_maintenance_obligation(
+        &mut self,
+        obligation: &mut MaintenanceObligation,
+        completed_at: Timestamp,
+    ) -> AccountResult<()> {
+        obligation.phase = MaintenancePhase::Complete;
+        obligation.last_failure_code = None;
+        self.session.put_maintenance_obligation(obligation)?;
+        self.maintenance_quiet_monotonic.remove(&obligation.id);
+        if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
+            state.last_own_leaf_rotation_at = Some(completed_at);
+            state.next_periodic_rotation_at = state.periodic_enrolled.then(|| {
+                Timestamp(
+                    completed_at.0.saturating_add(
+                        self.maintenance_random
+                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
+                    ),
+                )
+            });
+            self.session.put_group_maintenance(&state)?;
+        }
+        Ok(())
     }
 
     pub async fn create_group(
@@ -330,8 +1272,30 @@ where
     }
 
     pub async fn send(&mut self, intent: SendIntent) -> AccountResult<AccountDeviceEffects> {
+        let disposition_group = match &intent {
+            SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
+            _ => None,
+        };
         let effects = self.session.send(intent).await?;
-        self.publish_session_effects(effects).await
+        let mut output = self.publish_session_effects(effects).await?;
+        if let Some(group_id) = disposition_group
+            && self
+                .session
+                .maintenance_obligations()?
+                .into_iter()
+                .any(|obligation| {
+                    obligation.group_id == group_id
+                        && obligation.trigger == MaintenanceTrigger::PostJoin
+                        && !matches!(
+                            obligation.phase,
+                            MaintenancePhase::Complete | MaintenancePhase::Failed
+                        )
+                })
+        {
+            output.maintenance_disposition =
+                SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
+        }
+        Ok(output)
     }
 
     pub async fn send_with_audit_context(
@@ -339,12 +1303,35 @@ where
         intent: SendIntent,
         context: AuditEventContext,
     ) -> AccountResult<AccountDeviceEffects> {
+        let disposition_group = match &intent {
+            SendIntent::AppMessage { group_id, .. } => Some(group_id.clone()),
+            _ => None,
+        };
         let effects = self
             .session
             .send_with_audit_context(intent, context.clone())
             .await?;
-        self.publish_session_effects_with_audit_context(effects, Some(context))
-            .await
+        let mut output = self
+            .publish_session_effects_with_audit_context(effects, Some(context))
+            .await?;
+        if let Some(group_id) = disposition_group
+            && self
+                .session
+                .maintenance_obligations()?
+                .into_iter()
+                .any(|obligation| {
+                    obligation.group_id == group_id
+                        && obligation.trigger == MaintenanceTrigger::PostJoin
+                        && !matches!(
+                            obligation.phase,
+                            MaintenancePhase::Complete | MaintenancePhase::Failed
+                        )
+                })
+        {
+            output.maintenance_disposition =
+                SendMaintenanceDisposition::PostJoinRotationPendingRetryable;
+        }
+        Ok(output)
     }
 
     pub async fn advance_convergence(
@@ -389,8 +1376,28 @@ where
         if delivery.account_id != self.session.self_id() {
             return Err(AccountError::WrongAccountDelivery);
         }
-        let IngestEffects { outcome, effects } = self.session.ingest_delivery(delivery).await?;
+        let IngestEffects {
+            outcome,
+            effects,
+            valid_proposal_groups,
+        } = self.session.ingest_delivery(delivery).await?;
         let effects = self.publish_session_effects(effects).await?;
+        let mut state_bearing_groups = effects
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::EpochChanged { group_id, .. } => Some(group_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        state_bearing_groups.extend(valid_proposal_groups);
+        let mut unique_state_bearing_groups = Vec::new();
+        for group_id in state_bearing_groups {
+            if !unique_state_bearing_groups.contains(&group_id) {
+                self.note_valid_state_bearing_input(&group_id)?;
+                unique_state_bearing_groups.push(group_id);
+            }
+        }
         Ok(AccountIngestEffects { outcome, effects })
     }
 
@@ -411,6 +1418,8 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, context).await?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_superseded_maintenance(&output.events)?;
         Ok(output)
     }
 
@@ -520,7 +1529,138 @@ where
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_superseded_maintenance(&output.events)?;
         Ok(output)
+    }
+
+    fn reconcile_confirmed_own_leaf_rotations(
+        &mut self,
+        events: &[GroupEvent],
+    ) -> AccountResult<()> {
+        let changed_groups = events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::EpochChanged { group_id, .. } => Some(group_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut unique_changed_groups = Vec::new();
+        let now = self.wall_clock.now();
+        for group_id in changed_groups {
+            if unique_changed_groups.contains(&group_id) {
+                continue;
+            }
+            unique_changed_groups.push(group_id.clone());
+            let self_id = self.session.self_id();
+            let local_member_present = self
+                .session
+                .members(&group_id)?
+                .iter()
+                .any(|member| member.id == self_id);
+            if !local_member_present {
+                for mut obligation in self.session.maintenance_obligations()? {
+                    if obligation.group_id != group_id
+                        || matches!(
+                            obligation.phase,
+                            MaintenancePhase::Complete | MaintenancePhase::Failed
+                        )
+                    {
+                        continue;
+                    }
+                    obligation.phase = MaintenancePhase::Failed;
+                    obligation.last_failure_code = Some("local_member_removed".into());
+                    self.session.put_maintenance_obligation(&obligation)?;
+                    self.maintenance_quiet_monotonic.remove(&obligation.id);
+                }
+                if let Some(mut state) = self.session.group_maintenance(&group_id)? {
+                    state.periodic_enrolled = false;
+                    state.next_periodic_rotation_at = None;
+                    self.session.put_group_maintenance(&state)?;
+                }
+                continue;
+            }
+            let current = self.session.own_leaf_hash(&group_id)?;
+            for mut obligation in self.session.maintenance_obligations()? {
+                if obligation.group_id != group_id
+                    || matches!(
+                        obligation.phase,
+                        MaintenancePhase::Complete | MaintenancePhase::Failed
+                    )
+                {
+                    continue;
+                }
+                if obligation
+                    .own_leaf_baseline_hash
+                    .as_ref()
+                    .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
+                {
+                    self.complete_maintenance_obligation(&mut obligation, now)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_superseded_maintenance(&mut self, events: &[GroupEvent]) -> AccountResult<()> {
+        let superseded = events
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::GroupStateInvalidated {
+                    group_id,
+                    invalidated_commit_id,
+                    ..
+                } => Some((group_id.clone(), invalidated_commit_id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if superseded.is_empty() {
+            return Ok(());
+        }
+
+        let now = self.wall_clock.now();
+        for (group_id, invalidated_commit_id) in superseded {
+            let evolutions = self.session.group_evolutions()?;
+            for mut evolution in evolutions.into_iter().filter(|evolution| {
+                evolution.group_id == group_id
+                    && evolution.signed_message_id.as_ref() == Some(&invalidated_commit_id)
+                    && evolution.phase != GroupEvolutionPhase::SupersededByConvergence
+            }) {
+                evolution.phase = GroupEvolutionPhase::SupersededByConvergence;
+                self.session.put_group_evolution(&evolution)?;
+
+                let GroupEvolutionSemantic::SelfUpdate { obligation_id, .. } = evolution.semantic
+                else {
+                    continue;
+                };
+                let Some(mut obligation) = self.session.maintenance_obligation(&obligation_id)?
+                else {
+                    continue;
+                };
+                let selected_branch_rotated_own_leaf = evolution
+                    .own_leaf_before_hash
+                    .as_ref()
+                    .is_some_and(|before| {
+                        self.session
+                            .own_leaf_hash(&group_id)
+                            .is_ok_and(|current| current.as_slice() != before.as_slice())
+                    });
+                if selected_branch_rotated_own_leaf {
+                    self.complete_maintenance_obligation(&mut obligation, now)?;
+                } else {
+                    obligation.phase = MaintenancePhase::Quiet;
+                    obligation.quiet_since = Some(now);
+                    obligation.not_before = None;
+                    obligation.semantic_rearm_count =
+                        obligation.semantic_rearm_count.saturating_add(1);
+                    obligation.last_failure_code = Some("superseded_by_convergence".into());
+                    self.maintenance_quiet_monotonic
+                        .insert(obligation.id.clone(), self.monotonic_clock.elapsed());
+                    self.session.put_maintenance_obligation(&obligation)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn resolve_regenerated_queued_intent(
@@ -622,6 +1762,73 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
+        let maintenance_evolution = messages.len() == 1
+            && self
+                .session
+                .group_evolutions()?
+                .into_iter()
+                .any(|evolution| {
+                    evolution.signed_message_id.as_ref()
+                        == messages.first().map(|message| &message.id)
+                });
+        if maintenance_evolution {
+            // A crash can land after the first relay acknowledgement and its
+            // durable maintenance-fanout write but before local MLS
+            // confirmation. The accepted target is sufficient evidence to
+            // apply the original staged evolution without another exposure.
+            if let [message] = messages.as_slice()
+                && let Some(fanout) = self.session.transport_fanout(&message.id)?
+                && fanout
+                    .targets
+                    .iter()
+                    .any(|target| target.state == TransportFanoutAttemptState::Accepted)
+            {
+                let effects = self.confirm_published_retrying(pending).await?;
+                output
+                    .pending
+                    .push(PendingResolution::Confirmed { pending });
+                output.absorb_session_effects(effects, queue);
+                self.mark_transport_fanout_evolution_confirmed(&message.id);
+                self.finish_transport_fanout(&message.id, output).await?;
+                return Ok(());
+            }
+
+            let mut all_published = true;
+            let mut any_accepted = false;
+            let mut ambiguous_exposure = false;
+            let mut retry_deferred = false;
+            let mut message_ids = Vec::with_capacity(messages.len());
+            for message in messages {
+                message_ids.push(message.id.clone());
+                let status = self
+                    .publish_legacy_one(message, output, context.clone())
+                    .await?;
+                any_accepted |= status.accepted_by_any_endpoint;
+                all_published &= status.met_required_acks;
+                ambiguous_exposure |= status.possible_ambiguous_exposure;
+                retry_deferred |= status.retry_deferred;
+            }
+
+            if all_published || any_accepted {
+                let effects = self.confirm_published_retrying(pending).await?;
+                output
+                    .pending
+                    .push(PendingResolution::Confirmed { pending });
+                output.absorb_session_effects(effects, queue);
+                for message_id in message_ids {
+                    self.mark_transport_fanout_evolution_confirmed(&message_id);
+                    self.finish_transport_fanout(&message_id, output).await?;
+                }
+            } else if !ambiguous_exposure && !retry_deferred {
+                let effects = self.session.publish_failed(pending).await?;
+                output
+                    .pending
+                    .push(PendingResolution::RolledBack { pending });
+                output.absorb_session_effects(effects, queue);
+            }
+            return Ok(());
+        }
+
         // A pending MLS state has one frozen group-message artifact. Its first
         // relay acknowledgement releases MLS inside `drive_outbound_fanout`;
         // remaining targets continue as an independent durable obligation.
@@ -649,6 +1856,7 @@ where
     ) -> AccountResult<()> {
         let mut all_published = true;
         let mut any_welcome_exposed = false;
+        let mut retry_deferred = false;
         let mut welcome_failures = Vec::new();
         let mut delivered_welcome_ids = Vec::new();
         for welcome in welcomes {
@@ -658,6 +1866,7 @@ where
             let status =
                 Box::pin(self.publish_one(welcome, None, output, queue, context.clone())).await?;
             any_welcome_exposed |= status.accepted_by_any_endpoint;
+            retry_deferred |= status.retry_deferred;
             if status.met_required_acks {
                 delivered_welcome_ids.push(welcome_id);
             } else {
@@ -696,7 +1905,7 @@ where
             // re-delivering; a rolled-back create discards the whole
             // evolution, welcomes included.
             output.welcome_failures.extend(welcome_failures);
-        } else {
+        } else if !retry_deferred {
             let effects = self.session.publish_failed(pending).await?;
             output
                 .pending
@@ -748,6 +1957,43 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
+        let commit_id = commit.id.clone();
+        let maintenance_evolution = self
+            .session
+            .group_evolutions()?
+            .into_iter()
+            .any(|evolution| {
+                evolution.signed_message_id.as_ref() == Some(&commit_id)
+                    && matches!(
+                        evolution.semantic,
+                        GroupEvolutionSemantic::SelfUpdate { .. }
+                    )
+            });
+        if maintenance_evolution {
+            let commit_status = self
+                .publish_legacy_one(commit, output, context.clone())
+                .await?;
+            if commit_status.met_required_acks || commit_status.accepted_by_any_endpoint {
+                let effects = self.confirm_published_retrying(pending).await?;
+                output
+                    .pending
+                    .push(PendingResolution::Confirmed { pending });
+                output.absorb_session_effects(effects, queue);
+                self.mark_transport_fanout_evolution_confirmed(&commit_id);
+                self.finish_transport_fanout(&commit_id, output).await?;
+                debug_assert!(welcomes.is_empty());
+                return Ok(());
+            }
+            if !commit_status.possible_ambiguous_exposure && !commit_status.retry_deferred {
+                let effects = self.session.publish_failed(pending).await?;
+                output
+                    .pending
+                    .push(PendingResolution::RolledBack { pending });
+                output.absorb_session_effects(effects, queue);
+            }
+            return Ok(());
+        }
+
         let commit_status =
             Box::pin(self.publish_one(commit, Some(pending), output, queue, context.clone()))
                 .await?;
@@ -781,6 +2027,110 @@ where
         Ok(())
     }
 
+    fn mark_transport_fanout_evolution_confirmed(&self, message_id: &cgka_traits::MessageId) {
+        let Ok(Some(mut fanout)) = self.session.transport_fanout(message_id) else {
+            return;
+        };
+        fanout.evolution_confirmed = true;
+        if let Err(error) = self.session.put_transport_fanout(&fanout) {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "mark_transport_fanout_evolution_confirmed",
+                transient = error.is_transient(),
+                "confirmed evolution fanout remains conservatively unconfirmed"
+            );
+        }
+    }
+
+    async fn retry_confirmed_transport_fanouts(
+        &self,
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
+        let now = self.wall_clock.now();
+        for fanout in self.session.transport_fanouts()? {
+            if fanout
+                .bounded_until
+                .is_some_and(|bounded_until| bounded_until <= now)
+            {
+                continue;
+            }
+            if fanout.evolution_id.is_some() && !fanout.evolution_confirmed {
+                continue;
+            }
+            self.finish_transport_fanout(&fanout.id, output).await?;
+        }
+        Ok(())
+    }
+
+    /// Complete the endpoint snapshot for an already-persisted exact event.
+    ///
+    /// Group evolutions call this only after the first accepted acknowledgement
+    /// has been applied locally. These attempts therefore cannot reopen the MLS
+    /// pending state or change the canonical branch.
+    async fn finish_transport_fanout(
+        &self,
+        message_id: &cgka_traits::MessageId,
+        output: &mut AccountDeviceEffects,
+    ) -> AccountResult<()> {
+        let Some(mut fanout) = self.session.transport_fanout(message_id)? else {
+            return Ok(());
+        };
+        let remaining = fanout
+            .targets
+            .iter()
+            .filter(|target| transport_fanout_target_retry_due(target, self.wall_clock.now()))
+            .map(|target| target.endpoint.clone())
+            .collect::<Vec<_>>();
+        for endpoint in remaining {
+            let target = publish_target_for_endpoint(&fanout.target, endpoint.clone());
+            match self
+                .adapter
+                .publish(TransportPublishRequest {
+                    account_id: self.session.self_id(),
+                    message: fanout.exact_message.clone(),
+                    target,
+                    required_acks: 1,
+                })
+                .await
+            {
+                Ok(report) => {
+                    apply_report_to_fanout(
+                        &mut fanout,
+                        std::slice::from_ref(&endpoint),
+                        &report,
+                        self.wall_clock.now(),
+                    );
+                    if !report.met_required_acks() {
+                        output.failures.push(PublishFailure {
+                            message_id: report.message_id.clone(),
+                            reason: "fanout endpoint did not acknowledge".into(),
+                        });
+                    }
+                    output.reports.push(report);
+                }
+                Err(_) => {
+                    fanout.possible_exposure = true;
+                    if let Some(target) = fanout
+                        .targets
+                        .iter_mut()
+                        .find(|target| target.endpoint == endpoint)
+                    {
+                        target.attempt_count = target.attempt_count.saturating_add(1);
+                        target.last_attempt_at = Some(self.wall_clock.now());
+                        target.state = TransportFanoutAttemptState::AttemptedFailed;
+                        target.failure_code = Some("adapter_error".into());
+                    }
+                    output.failures.push(PublishFailure {
+                        message_id: message_id.clone(),
+                        reason: "fanout adapter error".into(),
+                    });
+                }
+            }
+            self.session.put_transport_fanout(&fanout)?;
+        }
+        Ok(())
+    }
+
     /// Re-publish a stored welcome whose original delivery failed after its
     /// commit was already confirmed (mdk#352).
     ///
@@ -798,10 +2148,13 @@ where
         // `stored_sent_welcome` only returns welcome envelopes.
         let recipient = welcome_recipient(&message);
         let mut output = AccountDeviceEffects::default();
-        let mut queue = VecDeque::new();
         let failures_before = output.failures.len();
-        let status =
-            Box::pin(self.publish_one(message, None, &mut output, &mut queue, None)).await?;
+        // This is an explicit operator/user retry, so do not make the caller
+        // wait for the automatic fanout backoff window. The original exact
+        // Welcome and target snapshot are still reused.
+        let status = self
+            .publish_one_with_retry_policy(message, &mut output, None, true)
+            .await?;
         if status.met_required_acks {
             self.mark_welcome_delivered_best_effort(message_id);
         } else if let Some(recipient) = recipient {
@@ -1000,6 +2353,8 @@ where
         let status = PublishStatus {
             met_required_acks: report.met_required_acks(),
             accepted_by_any_endpoint: report.accepted_count() > 0,
+            possible_ambiguous_exposure: false,
+            retry_deferred: false,
         };
         if !status.met_required_acks {
             output.failures.push(PublishFailure {
@@ -1073,6 +2428,17 @@ where
         output: &mut AccountDeviceEffects,
         context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        self.publish_one_with_retry_policy(message, output, context, false)
+            .await
+    }
+
+    async fn publish_one_with_retry_policy(
+        &self,
+        message: TransportMessage,
+        output: &mut AccountDeviceEffects,
+        context: Option<AuditEventContext>,
+        retry_immediately: bool,
+    ) -> AccountResult<PublishStatus> {
         let message_id = message.id.clone();
         let msg_id_hex = hex::encode(message_id.as_slice());
         // Capture the outbound wire envelope before `message` is moved into the
@@ -1089,33 +2455,49 @@ where
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
-        let target = match self.routing.publish_target(&message) {
-            Ok(target) => target,
-            Err(e) => {
-                self.session.record_audit_event(
-                    None,
-                    Some(publish_context),
-                    AuditEventKind::PublishFailure {
-                        msg_id: msg_id_hex,
-                        artifact_kind,
-                        stage: "routing".into(),
-                        target_kind: "unknown".into(),
-                        relay_url: None,
-                        relay_urls: Vec::new(),
-                        required_acks: None,
+        let existing_fanout = self.session.transport_fanout(&message_id)?;
+        if existing_fanout
+            .as_ref()
+            .is_some_and(|fanout| fanout.exact_message != message)
+        {
+            return Err(AccountError::Transport(TransportAdapterError::Publish(
+                "persisted exact transport event does not match retry input".into(),
+            )));
+        }
+        let target = if let Some(fanout) = existing_fanout.as_ref() {
+            fanout.target.clone()
+        } else {
+            match self.routing.publish_target(&message) {
+                Ok(target) => target,
+                Err(e) => {
+                    self.session.record_audit_event(
+                        None,
+                        Some(publish_context),
+                        AuditEventKind::PublishFailure {
+                            msg_id: msg_id_hex,
+                            artifact_kind,
+                            stage: "routing".into(),
+                            target_kind: "unknown".into(),
+                            relay_url: None,
+                            relay_urls: Vec::new(),
+                            required_acks: None,
+                            reason: e.to_string(),
+                            detail: None,
+                            transport: Some(wire),
+                        },
+                    );
+                    output.failures.push(PublishFailure {
+                        message_id,
                         reason: e.to_string(),
-                        detail: None,
-                        transport: Some(wire),
-                    },
-                );
-                output.failures.push(PublishFailure {
-                    message_id,
-                    reason: e.to_string(),
-                });
-                return Ok(PublishStatus::default());
+                    });
+                    return Ok(PublishStatus::default());
+                }
             }
         };
-        let required_acks = self.routing.required_acks(&target);
+        let required_acks = existing_fanout
+            .as_ref()
+            .map(|fanout| fanout.required_acks)
+            .unwrap_or_else(|| self.routing.required_acks(&target));
         let target_kind = publish_target_kind(&target).to_string();
         let relay_urls = publish_target_relay_urls(&target);
         let target_group_id = publish_target_group_id(&target);
@@ -1132,18 +2514,121 @@ where
                 transport: Some(wire.clone()),
             },
         );
+        let mut fanout = if let Some(fanout) = existing_fanout {
+            fanout
+        } else {
+            DurableTransportFanout {
+                id: message_id.clone(),
+                group_id: target_group_id.clone(),
+                evolution_id: self
+                    .session
+                    .group_evolutions()?
+                    .into_iter()
+                    .find(|evolution| evolution.signed_message_id.as_ref() == Some(&message_id))
+                    .map(|evolution| evolution.id),
+                exact_message: message.clone(),
+                target: target.clone(),
+                targets: target
+                    .endpoints()
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| TransportFanoutTarget {
+                        endpoint,
+                        state: TransportFanoutAttemptState::Unattempted,
+                        attempt_count: 0,
+                        last_attempt_at: None,
+                        failure_code: None,
+                    })
+                    .collect(),
+                required_acks,
+                evolution_confirmed: false,
+                possible_exposure: false,
+                created_at: self.wall_clock.now(),
+                bounded_until: Some(Timestamp(
+                    self.wall_clock
+                        .now()
+                        .0
+                        .saturating_add(TRANSPORT_FANOUT_RETENTION_SECS),
+                )),
+            }
+        };
+        // Exact signed bytes and the endpoint snapshot are durable before the
+        // first network call.
+        self.session.put_transport_fanout(&fanout)?;
+        let defers_remaining_fanout_until_confirmation = fanout.evolution_id.is_some();
+        if let Some(evolution_id) = fanout.evolution_id.as_ref()
+            && let Some(mut evolution) = self
+                .session
+                .group_evolutions()?
+                .into_iter()
+                .find(|evolution| &evolution.id == evolution_id)
+            && evolution.phase == GroupEvolutionPhase::Prepared
+        {
+            evolution.phase = GroupEvolutionPhase::Attempting;
+            self.session.put_group_evolution(&evolution)?;
+        }
+
+        let retry_endpoints = fanout
+            .targets
+            .iter()
+            .filter(|target| {
+                retry_immediately && target.state == TransportFanoutAttemptState::AttemptedFailed
+                    || transport_fanout_target_retry_due(target, self.wall_clock.now())
+            })
+            .map(|target| target.endpoint.clone())
+            .collect::<Vec<_>>();
+        let accepted_before = fanout
+            .targets
+            .iter()
+            .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+            .count();
+        if retry_endpoints.is_empty() {
+            let retry_deferred = accepted_before < required_acks.max(1)
+                && fanout.targets.iter().any(|target| {
+                    matches!(
+                        target.state,
+                        TransportFanoutAttemptState::Unattempted
+                            | TransportFanoutAttemptState::AttemptedFailed
+                    )
+                });
+            return Ok(PublishStatus {
+                met_required_acks: accepted_before >= required_acks.max(1),
+                accepted_by_any_endpoint: accepted_before > 0,
+                possible_ambiguous_exposure: fanout.possible_exposure,
+                retry_deferred,
+            });
+        }
+        let attempt_target = publish_target_with_endpoints(&target, retry_endpoints.clone());
+        let attempt_required_acks = required_acks
+            .max(1)
+            .saturating_sub(accepted_before)
+            .max(1)
+            .min(retry_endpoints.len());
+
         let report = match self
             .adapter
             .publish(TransportPublishRequest {
                 account_id: self.session.self_id(),
-                message,
-                target,
-                required_acks,
+                message: message.clone(),
+                target: attempt_target,
+                required_acks: attempt_required_acks,
             })
             .await
         {
             Ok(report) => report,
             Err(e) => {
+                fanout.possible_exposure = true;
+                for target in &mut fanout.targets {
+                    if retry_endpoints.contains(&target.endpoint)
+                        && target.state != TransportFanoutAttemptState::Accepted
+                    {
+                        target.attempt_count = target.attempt_count.saturating_add(1);
+                        target.last_attempt_at = Some(self.wall_clock.now());
+                        target.state = TransportFanoutAttemptState::AttemptedFailed;
+                        target.failure_code = Some("adapter_error".into());
+                    }
+                }
+                self.session.put_transport_fanout(&fanout)?;
                 self.session.record_audit_event(
                     target_group_id.as_ref(),
                     Some(publish_context),
@@ -1164,11 +2649,26 @@ where
                     message_id,
                     reason: e.to_string(),
                 });
-                return Ok(PublishStatus::default());
+                return Ok(PublishStatus {
+                    possible_ambiguous_exposure: true,
+                    ..PublishStatus::default()
+                });
             }
         };
-        let published = report.met_required_acks();
-        let accepted_by_any_endpoint = report.accepted_count() > 0;
+        apply_report_to_fanout(
+            &mut fanout,
+            &retry_endpoints,
+            &report,
+            self.wall_clock.now(),
+        );
+        self.session.put_transport_fanout(&fanout)?;
+        let accepted_total = fanout
+            .targets
+            .iter()
+            .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+            .count();
+        let published = accepted_total >= required_acks.max(1);
+        let accepted_by_any_endpoint = accepted_total > 0;
         self.session.record_audit_event(
             target_group_id.as_ref(),
             Some(publish_context.clone()),
@@ -1218,9 +2718,14 @@ where
             });
         }
         output.reports.push(report);
+        if !defers_remaining_fanout_until_confirmation {
+            self.finish_transport_fanout(&message_id, output).await?;
+        }
         Ok(PublishStatus {
             met_required_acks: published,
             accepted_by_any_endpoint,
+            possible_ambiguous_exposure: fanout.possible_exposure,
+            retry_deferred: false,
         })
     }
 }
@@ -1228,6 +2733,20 @@ where
 fn single_endpoint_target(
     target: &TransportPublishTarget,
     endpoint: TransportEndpoint,
+) -> TransportPublishTarget {
+    publish_target_with_endpoints(target, vec![endpoint])
+}
+
+fn publish_target_for_endpoint(
+    target: &TransportPublishTarget,
+    endpoint: TransportEndpoint,
+) -> TransportPublishTarget {
+    publish_target_with_endpoints(target, vec![endpoint])
+}
+
+fn publish_target_with_endpoints(
+    target: &TransportPublishTarget,
+    endpoints: Vec<TransportEndpoint>,
 ) -> TransportPublishTarget {
     match target {
         TransportPublishTarget::Group {
@@ -1237,11 +2756,11 @@ fn single_endpoint_target(
         } => TransportPublishTarget::Group {
             group_id: group_id.clone(),
             transport_group_id: transport_group_id.clone(),
-            endpoints: vec![endpoint],
+            endpoints,
         },
         TransportPublishTarget::Inbox { recipient, .. } => TransportPublishTarget::Inbox {
             recipient: recipient.clone(),
-            endpoints: vec![endpoint],
+            endpoints,
         },
     }
 }
@@ -1277,6 +2796,97 @@ fn frozen_fanout_report(fanout: &OutboundFanout) -> TransportPublishReport {
         failed,
         required_acks: fanout.request().required_acks,
     }
+}
+
+fn apply_report_to_fanout(
+    fanout: &mut DurableTransportFanout,
+    attempted: &[TransportEndpoint],
+    report: &TransportPublishReport,
+    attempted_at: Timestamp,
+) {
+    for target in &mut fanout.targets {
+        if target.state == TransportFanoutAttemptState::Accepted
+            || !attempted.contains(&target.endpoint)
+        {
+            continue;
+        }
+        let accepted = report
+            .accepted
+            .iter()
+            .any(|receipt| receipt.endpoint == target.endpoint);
+        let failed = report
+            .failed
+            .iter()
+            .find(|failure| failure.endpoint == target.endpoint);
+        target.attempt_count = target.attempt_count.saturating_add(1);
+        target.last_attempt_at = Some(attempted_at);
+        if accepted {
+            target.state = TransportFanoutAttemptState::Accepted;
+            target.failure_code = None;
+        } else {
+            target.state = TransportFanoutAttemptState::AttemptedFailed;
+            // Persist a coarse category only. Detailed transport errors may
+            // contain endpoint-specific or otherwise identifying data.
+            target.failure_code = Some(
+                if failed.is_none_or(|failure| failure.reason.is_empty()) {
+                    "publish_failed"
+                } else {
+                    "transport_rejected"
+                }
+                .into(),
+            );
+        }
+    }
+}
+
+fn note_key_package_attempt(
+    targets: &mut [TransportFanoutTarget],
+    attempted: &[TransportEndpoint],
+    accepted: &[TransportEndpoint],
+    failed: &[TransportEndpoint],
+    attempted_at: Timestamp,
+) {
+    for target in targets {
+        if target.state == TransportFanoutAttemptState::Accepted
+            || !attempted.contains(&target.endpoint)
+        {
+            continue;
+        }
+        target.attempt_count = target.attempt_count.saturating_add(1);
+        target.last_attempt_at = Some(attempted_at);
+        if accepted.contains(&target.endpoint) {
+            target.state = TransportFanoutAttemptState::Accepted;
+            target.failure_code = None;
+        } else {
+            target.state = TransportFanoutAttemptState::AttemptedFailed;
+            target.failure_code = Some(
+                if failed.contains(&target.endpoint) {
+                    "transport_rejected"
+                } else {
+                    "publish_failed"
+                }
+                .into(),
+            );
+        }
+    }
+}
+
+fn key_package_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
+    transport_fanout_target_retry_due(target, now)
+}
+
+fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timestamp) -> bool {
+    if matches!(
+        target.state,
+        TransportFanoutAttemptState::Accepted | TransportFanoutAttemptState::PolicyProhibited
+    ) {
+        return false;
+    }
+    let shift = target.attempt_count.saturating_sub(1).min(7);
+    let backoff = 30_u64.saturating_mul(1_u64 << shift).min(60 * 60);
+    target
+        .last_attempt_at
+        .is_none_or(|last| now.0 >= last.0.saturating_add(backoff))
 }
 
 /// The welcome recipient carried in the message's transport envelope, if the
@@ -1348,6 +2958,7 @@ pub struct AccountDeviceEffects {
     /// [`AccountDeviceRuntime::redeliver_welcome`] without re-committing.
     pub welcome_failures: Vec<WelcomeDeliveryFailure>,
     pub pending: Vec<PendingResolution>,
+    pub maintenance_disposition: SendMaintenanceDisposition,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1382,6 +2993,24 @@ impl AccountDeviceEffects {
         self.queued.extend(effects.queued);
         self.pending_convergence.extend(effects.pending_convergence);
         queue.extend(effects.publish);
+    }
+
+    fn absorb_account_effects(&mut self, mut other: AccountDeviceEffects) {
+        self.events.append(&mut other.events);
+        self.queued.append(&mut other.queued);
+        self.pending_convergence
+            .append(&mut other.pending_convergence);
+        self.reports.append(&mut other.reports);
+        self.failures.append(&mut other.failures);
+        self.published_app_messages
+            .append(&mut other.published_app_messages);
+        self.welcome_failures.append(&mut other.welcome_failures);
+        self.pending.append(&mut other.pending);
+        if other.maintenance_disposition
+            == SendMaintenanceDisposition::PostJoinRotationPendingRetryable
+        {
+            self.maintenance_disposition = other.maintenance_disposition;
+        }
     }
 }
 

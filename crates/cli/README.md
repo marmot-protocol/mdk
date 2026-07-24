@@ -146,6 +146,7 @@ KeyPackage commands:
 ```sh
 wn --account <npub-or-hex> keys list
 wn --account <npub-or-hex> keys publish
+wn --account <npub-or-hex> keys maintenance-status
 wn --account <npub-or-hex> keys rotate
 wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>
 wn keys check <npub-or-hex>
@@ -153,8 +154,12 @@ wn --account <npub-or-hex> keys delete <event-id>
 wn --account <npub-or-hex> keys delete-all --confirm
 ```
 
-`keys publish` republishes the currently cached KeyPackage; `keys rotate` (alias `force-publish`) force-mints and
-publishes a fresh replacement KeyPackage.
+`keys publish` initializes or retries the durable KeyPackage lifecycle and publishes a fresh replacement under the
+account-device's stable kind-30443 `d` slot. Once an exact event has been signed, every retry reuses it.
+`keys rotate` (alias `force-publish`) explicitly starts the same replacement operation when no replacement is
+already pending. Routine replacement does not publish a kind-5 deletion; `keys delete` and `keys delete-all` remain
+explicit teardown/legacy-cleanup tools. `keys maintenance-status` shows the persisted slot, lifetime, refresh,
+replacement, retry, and retained-private-material state.
 
 KeyPackage publish/fetch/check/list use the current relay-directory path. `keys list` returns the relay event id for
 each known KeyPackage record. `keys delete` publishes a Nostr deletion for one event id, and `keys delete-all
@@ -225,6 +230,14 @@ wn --account <npub-or-hex> groups set-avatar-url <group-hex> --clear
 wn --account <npub-or-hex> groups promote <group-hex> <member-npub-or-hex>
 wn --account <npub-or-hex> groups demote <group-hex> <member-npub-or-hex>
 wn --account <npub-or-hex> groups self-demote <group-hex>
+wn --account <npub-or-hex> groups maintenance-status <group-hex>
+wn --account <npub-or-hex> groups schedule-self-update <group-hex>
+wn --account <npub-or-hex> groups maintenance-policy
+wn --account <npub-or-hex> groups maintenance-policy --set enabled
+wn --account <npub-or-hex> groups maintenance-policy --set disabled
+wn --account <npub-or-hex> groups pause-maintenance
+wn --account <npub-or-hex> groups resume-maintenance
+wn --account <npub-or-hex> groups run-maintenance
 wn --account <npub-or-hex> groups subscribe-state <group-hex>
 
 wn --account <npub-or-hex> group create <name> [member-npub-or-hex ...]
@@ -236,6 +249,13 @@ wn --account <npub-or-hex> group update <group-hex> --description <description>
 wn --account <npub-or-hex> group set-avatar-url <group-hex> --url <https-url> [--dim <WxH>] [--thumbhash <hex>]
 wn --account <npub-or-hex> group set-avatar-url <group-hex> --clear
 ```
+
+Newly created or joined groups follow the persisted periodic-maintenance policy, which defaults to enabled.
+Pre-rollout groups are not automatically enrolled; `groups schedule-self-update` schedules one rotation without
+changing their enrollment. Pause/resume is process-local: it stops new preparation while preserving durable
+obligations and already-prepared publication recovery. Application-message JSON results include
+`maintenance_disposition`, which is `ready` or `post_join_rotation_pending_retryable`; a pending post-join rotation
+does not block the send.
 
 Message commands:
 

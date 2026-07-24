@@ -26,14 +26,14 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, Member};
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::message::{MessageRecord, MessageState};
+use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     AccountDeviceSignerBinding, AccountDeviceSignerStorage, CapabilityStorage,
     ConvergencePolicyStorage, GroupStorage, KeyPackageBundleStorage, LeaveRequest,
-    LeaveRequestStorage, MemberValidationCacheStorage, MessageStorage, OutboundFanoutStorage,
-    OutboundIntentStorage, QueuedOutboundIntent, StorageError, StorageProvider, StorageResult,
-    StoredKeyPackageBundle, WelcomeStorage,
+    LeaveRequestStorage, MaintenanceStorage, MemberValidationCacheStorage, MessageStorage,
+    OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageError,
+    StorageProvider, StorageResult, StoredKeyPackageBundle, WelcomeStorage,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -277,6 +277,100 @@ fn fork_snapshot_names(
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+#[tokio::test]
+async fn self_update_is_staged_and_retains_the_exact_signed_transport_message() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "self-update".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    let result = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let (message, pending) = match result {
+        SendResult::GroupEvolution {
+            msg,
+            pending,
+            welcomes,
+        } => {
+            assert!(welcomes.is_empty());
+            (msg, pending)
+        }
+        other => panic!("expected self-update evolution, got {other:?}"),
+    };
+
+    let record = storage.get_message(&message.id).unwrap();
+    let payload = StoredMessagePayload::decode(&record.payload).unwrap();
+    assert_eq!(payload.as_exact_transport(), Some(&message));
+    assert!(payload.as_openmls_wire().is_some());
+    let evolutions = storage.list_group_evolutions().unwrap();
+    assert_eq!(evolutions.len(), 1);
+    assert_eq!(evolutions[0].signed_message_id.as_ref(), Some(&message.id));
+
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
+}
+
+#[tokio::test]
+async fn self_update_restart_republishes_the_identical_signed_event() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_engine_with_storage(b"alice", storage.clone());
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "self-update-restart".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    if let SendResult::GroupCreated { pending, .. } = created {
+        alice.confirm_published(pending).await.unwrap();
+    }
+
+    let prepared = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let original = match prepared {
+        SendResult::GroupEvolution { msg, .. } => msg,
+        other => panic!("expected self-update evolution, got {other:?}"),
+    };
+    drop(alice);
+
+    let mut restarted = build_engine_with_storage(b"alice", storage);
+    restarted.hydrate_stable_groups_from_storage().unwrap();
+    let recovered = restarted.drain_auto_publish();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].msg, original);
+    assert_eq!(recovered[0].msg.id, original.id);
+
+    restarted
+        .confirm_published(recovered[0].pending)
+        .await
+        .unwrap();
+    assert_eq!(restarted.epoch(&group_id).unwrap(), EpochId(1));
 }
 
 // ── 1. Invite + publish_failed → projected member rolls back ───────────────

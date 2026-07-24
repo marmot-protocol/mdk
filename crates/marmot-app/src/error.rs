@@ -191,6 +191,7 @@ fn account_error_kind(error: &AccountError) -> &'static str {
         AccountError::Transport(_) => "account_transport",
         AccountError::TransportRouting(_) => "account_transport_routing",
         AccountError::KeyPackage(_) => "account_key_package",
+        AccountError::ClockSkewBlocked => "account_clock_skew_blocked",
         AccountError::WrongAccountDelivery => "account_wrong_delivery",
     }
 }

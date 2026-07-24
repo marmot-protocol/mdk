@@ -1,14 +1,14 @@
 //! `group` and `groups` command namespace handlers and group output helpers.
 
-use cgka_traits::GroupId;
+use cgka_traits::{GroupId, PeriodicMaintenancePolicy};
 use marmot_account::AccountHome;
 use marmot_app::{AppError, AppGroupMemberRecord, AppGroupMlsState, MarmotApp, MarmotAppRuntime};
 use serde_json::{Value, json};
 
 use crate::{
-    CommandOutput, GroupCommand, GroupsCommand, WnError, ensure_local_signing, group_json,
-    group_list_plain, group_show_output, normalize_group_id_hex, npub_for_account_id,
-    parse_public_key, resolve_account,
+    CommandOutput, GroupCommand, GroupsCommand, MaintenancePolicySetting, WnError,
+    ensure_local_signing, group_json, group_list_plain, group_show_output, normalize_group_id_hex,
+    npub_for_account_id, parse_public_key, resolve_account,
 };
 
 pub(crate) async fn group_command(
@@ -97,6 +97,7 @@ pub(crate) async fn group_command_with_runtime(
                     "members": members,
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -121,6 +122,7 @@ pub(crate) async fn group_command_with_runtime(
                     "members": members,
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -151,6 +153,7 @@ pub(crate) async fn group_command_with_runtime(
                     "group": group_json(group),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -208,6 +211,7 @@ pub(crate) async fn group_command_with_runtime(
                     "group": group_json(group),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -384,6 +388,7 @@ pub(crate) async fn groups_command_with_runtime(
                     "group_id": hex::encode(group_id.as_slice()),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -520,6 +525,132 @@ pub(crate) async fn groups_command_with_runtime(
             )
             .await
         }
+        GroupsCommand::MaintenanceStatus { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let status = runtime
+                .maintenance_status(&account.label, &group_id)
+                .await?;
+            let active = status
+                .obligations
+                .iter()
+                .filter(|obligation| {
+                    !matches!(
+                        obligation.phase,
+                        cgka_traits::MaintenancePhase::Complete
+                            | cgka_traits::MaintenancePhase::Failed
+                    )
+                })
+                .count();
+            Ok(CommandOutput {
+                plain: format!(
+                    "maintenance group={} active={} paused={}",
+                    hex::encode(group_id.as_slice()),
+                    active,
+                    status.paused
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "maintenance": status,
+                }),
+            })
+        }
+        GroupsCommand::ScheduleSelfUpdate { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id = GroupId::new(hex::decode(normalize_group_id_hex(&group_id)?)?);
+            let obligation_id = runtime
+                .schedule_manual_self_update(&account.label, &group_id)
+                .await?;
+            Ok(CommandOutput {
+                plain: format!(
+                    "scheduled self-update for group {}",
+                    hex::encode(group_id.as_slice())
+                ),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "group_id": hex::encode(group_id.as_slice()),
+                    "obligation_id": obligation_id,
+                    "scheduled": true,
+                }),
+            })
+        }
+        GroupsCommand::MaintenancePolicy { set } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            if let Some(setting) = set {
+                let policy = match setting {
+                    MaintenancePolicySetting::Enabled => {
+                        PeriodicMaintenancePolicy::EnabledForNewGroups
+                    }
+                    MaintenancePolicySetting::Disabled => PeriodicMaintenancePolicy::Disabled,
+                };
+                runtime
+                    .set_periodic_maintenance_policy(&account.label, policy)
+                    .await?;
+            }
+            let policy = runtime.periodic_maintenance_policy(&account.label).await?;
+            let policy_name = match policy {
+                PeriodicMaintenancePolicy::EnabledForNewGroups => "enabled_for_new_groups",
+                PeriodicMaintenancePolicy::Disabled => "disabled",
+            };
+            Ok(CommandOutput {
+                plain: policy_name.to_owned(),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "periodic_maintenance_policy": policy,
+                }),
+            })
+        }
+        GroupsCommand::PauseMaintenance => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            runtime.pause_maintenance(&account.label).await?;
+            Ok(CommandOutput {
+                plain: "maintenance paused".to_owned(),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "paused": true,
+                }),
+            })
+        }
+        GroupsCommand::ResumeMaintenance => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            runtime.resume_maintenance(&account.label).await?;
+            Ok(CommandOutput {
+                plain: "maintenance resumed".to_owned(),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "paused": false,
+                }),
+            })
+        }
+        GroupsCommand::RunMaintenance => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            let summary = runtime.run_due_maintenance(&account.label).await?;
+            Ok(CommandOutput {
+                plain: format!("maintenance published={}", summary.published),
+                json: json!({
+                    "account_id": account.account_id_hex,
+                    "npub": npub_for_account_id(&account.account_id_hex)?,
+                    "published": summary.published,
+                    "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
+                }),
+            })
+        }
         GroupsCommand::SubscribeState { .. } => Err(WnError::MessagesSubscribeRequiresDaemon),
     }
 }
@@ -576,6 +707,7 @@ async fn group_admin_policy_output(
             "group": group_json(group),
             "published": summary.published,
             "message_ids": summary.message_ids,
+            "maintenance_disposition": summary.maintenance_disposition,
         }),
     })
 }

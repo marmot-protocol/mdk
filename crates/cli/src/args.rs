@@ -78,6 +78,12 @@ impl SecretStoreKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+pub(crate) enum MaintenancePolicySetting {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Subcommand)]
 pub(crate) enum Command {
     #[command(about = "Open the interactive terminal UI")]
@@ -318,8 +324,13 @@ pub(crate) enum AccountCommand {
 pub(crate) enum KeyPackageCommand {
     #[command(about = "List local KeyPackage publication records")]
     List,
-    #[command(about = "Republish the currently cached KeyPackage")]
+    #[command(about = "Publish or retry the durable stable-slot KeyPackage replacement")]
     Publish,
+    #[command(
+        name = "maintenance-status",
+        about = "Show durable KeyPackage lifecycle and replacement status"
+    )]
+    MaintenanceStatus,
     #[command(
         about = "Force mint and publish a fresh replacement KeyPackage",
         alias = "force-publish"
@@ -615,6 +626,47 @@ pub(crate) enum GroupsCommand {
         #[arg(help = "Group id to update")]
         group_id: String,
     },
+    #[command(
+        name = "maintenance-status",
+        about = "Show durable self-update maintenance state for a group"
+    )]
+    MaintenanceStatus {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
+        name = "schedule-self-update",
+        about = "Schedule one manual own-leaf rotation"
+    )]
+    ScheduleSelfUpdate {
+        #[arg(help = "Group id to update")]
+        group_id: String,
+    },
+    #[command(
+        name = "maintenance-policy",
+        about = "Show or configure automatic periodic maintenance for newly enrolled groups"
+    )]
+    MaintenancePolicy {
+        #[arg(
+            long,
+            value_enum,
+            value_name = "enabled|disabled",
+            help = "Set the persisted policy; omit to show it"
+        )]
+        set: Option<MaintenancePolicySetting>,
+    },
+    #[command(
+        name = "pause-maintenance",
+        about = "Pause new maintenance preparations until this runtime resumes"
+    )]
+    PauseMaintenance,
+    #[command(
+        name = "resume-maintenance",
+        about = "Resume maintenance preparations for this runtime"
+    )]
+    ResumeMaintenance,
+    #[command(name = "run-maintenance", about = "Run one due-maintenance pass now")]
+    RunMaintenance,
     #[command(
         name = "subscribe-state",
         about = "Subscribe to live group-state updates through the daemon"

@@ -632,6 +632,10 @@ impl StorageProvider for SqliteAccountStorage {
         &self.openmls
     }
 
+    fn maintenance_storage(&self) -> Option<&dyn cgka_traits::storage::MaintenanceStorage> {
+        Some(self)
+    }
+
     fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<StorageError>,

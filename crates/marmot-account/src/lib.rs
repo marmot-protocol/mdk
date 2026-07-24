@@ -13,13 +13,15 @@ mod nip49_export;
 mod routing;
 mod runtime;
 mod secret_store;
+mod time;
 
 pub use error::{AccountError, AccountHomeError, AccountHomeResult, AccountResult};
 pub use home::{
     AccountHome, AccountSummary, DEFAULT_KEYCHAIN_SERVICE_NAME, EXTERNAL_SQLCIPHER_SECRET_FILE,
 };
 pub use key_package::{
-    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublisher, NoopKeyPackagePublisher,
+    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    NoopKeyPackagePublisher,
 };
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{
@@ -27,3 +29,7 @@ pub use runtime::{
     PublishFailure, PublishedApplicationMessage, WelcomeDeliveryFailure,
 };
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
+pub use time::{
+    MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
+    WallClock,
+};

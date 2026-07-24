@@ -124,6 +124,7 @@ pub(crate) async fn message_command_with_runtime(
                     "group_id": hex::encode(group_id.as_slice()),
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -150,6 +151,7 @@ pub(crate) async fn message_command_with_runtime(
                     "target_message_id": message_id,
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -174,6 +176,7 @@ pub(crate) async fn message_command_with_runtime(
                     "retry_scope": "group_convergence",
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -202,6 +205,7 @@ pub(crate) async fn message_command_with_runtime(
                     "emoji": emoji,
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
@@ -228,6 +232,7 @@ pub(crate) async fn message_command_with_runtime(
                     "target_message_id": message_id,
                     "published": summary.published,
                     "message_ids": summary.message_ids,
+                    "maintenance_disposition": summary.maintenance_disposition,
                 }),
             })
         }
