@@ -40,7 +40,8 @@ skips content validation is a contract violation, not a style choice.
 - **No self-reported identifier is trusted before verification.** `to_transport_message` verifies the event `id`
   against the recomputed NIP-01 event hash before it becomes `TransportMessage.id` (which keys routing metrics,
   telemetry, and the forensic `wire_id`); a mismatch fails closed on every ingest path, including telemetry-only
-  observation. Signature verification still happens at peel time.
+  observation. For kind 445 it also verifies the signature before reading routing tags, then the peeler repeats
+  signature and routing-shape verification as defense in depth. Gift-wrap signature verification remains at peel time.
 - **Loose first-match helpers (`tag_value`, `tag_values`) are for non-routing, genuinely multi-valued fields only**,
   and any such field must carry explicit count/length bounds. Do not reach for them when wiring up a new tag.
 

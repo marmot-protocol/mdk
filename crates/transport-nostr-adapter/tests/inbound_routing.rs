@@ -14,7 +14,7 @@ use transport_nostr_adapter::{
     NostrPublishOutcome, NostrRelayClient, NostrRelayEvent, NostrSubscription,
     NostrTransportAdapter, RelayExportConsent, RelayIndex,
 };
-use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
+use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrPeelerError, NostrTransportEvent};
 
 const DEFAULT_CONCURRENT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1862,19 +1862,92 @@ async fn sync_telemetry_tracks_only_live_subscriptions_across_churn() {
     assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 0);
 }
 
+#[tokio::test]
+async fn tampered_kind_445_signature_fails_before_adapter_delivery() {
+    let adapter = NostrTransportAdapter::new(Arc::new(FakeRelayClient::default()));
+    let signed = nostr::EventBuilder::new(
+        nostr::Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
+        "outer encrypted body",
+    )
+    .tags([nostr::Tag::custom(
+        nostr::TagKind::custom("h"),
+        [hex::encode([0x99; 32])],
+    )])
+    .sign_with_keys(&nostr::Keys::generate())
+    .expect("sign kind-445 fixture");
+    let mut event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    event.sig = Some("00".repeat(64));
+
+    assert!(matches!(
+        event.to_transport_message(),
+        Err(NostrPeelerError::Malformed(_))
+    ));
+
+    let err = adapter
+        .handle_relay_event(NostrRelayEvent {
+            event,
+            endpoint: TransportEndpoint("wss://relay.example".into()),
+            subscription_id: Some("sub".into()),
+        })
+        .await
+        .expect_err("unauthenticated kind-445 must fail before delivery");
+
+    assert!(matches!(
+        err,
+        cgka_traits::TransportAdapterError::Backend(_)
+    ));
+}
+
+#[tokio::test]
+async fn direct_and_adapter_ingress_reject_extra_kind_445_tag_as_malformed() {
+    let adapter = NostrTransportAdapter::new(Arc::new(FakeRelayClient::default()));
+    let signed = nostr::EventBuilder::new(
+        nostr::Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
+        "outer encrypted body extra-tag",
+    )
+    .tags([
+        nostr::Tag::custom(nostr::TagKind::custom("h"), [hex::encode([0x99; 32])]),
+        nostr::Tag::custom(nostr::TagKind::custom("encoding"), ["base64"]),
+    ])
+    .sign_with_keys(&nostr::Keys::generate())
+    .expect("sign malformed kind-445 fixture");
+    let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+
+    assert!(matches!(
+        event.to_transport_message(),
+        Err(NostrPeelerError::Malformed(_))
+    ));
+
+    let err = adapter
+        .handle_relay_event(NostrRelayEvent {
+            event,
+            endpoint: TransportEndpoint("wss://relay.example".into()),
+            subscription_id: Some("sub".into()),
+        })
+        .await
+        .expect_err("extra kind-445 tags must fail closed at mapping");
+
+    assert!(matches!(
+        err,
+        cgka_traits::TransportAdapterError::Backend(_)
+    ));
+}
+
 fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
-    // `to_transport_message` verifies the id against the event hash (#351), so
-    // the distinguishing byte lives in the content and the id is computed from
-    // it — distinct `id_byte` values still yield distinct event ids.
-    let mut event = NostrTransportEvent {
-        id: String::new(),
-        pubkey: "22".repeat(32),
-        created_at: 1_700_000_010,
-        kind: KIND_MARMOT_GROUP_MESSAGE,
-        tags: vec![vec!["h".into(), hex::encode(transport_group_id)]],
-        content: format!("outer encrypted body {id_byte}"),
-        sig: None,
-    };
-    event.id = event.computed_id();
-    event
+    // Stable fixtures preserve duplicate-event ids while carrying a valid
+    // kind-445 signature required by the authenticated routing boundary.
+    static KEYS: std::sync::OnceLock<nostr::Keys> = std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(nostr::Keys::generate);
+    let signed = nostr::EventBuilder::new(
+        nostr::Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
+        format!("outer encrypted body {id_byte}"),
+    )
+    .tags([nostr::Tag::custom(
+        nostr::TagKind::custom("h"),
+        [hex::encode(transport_group_id)],
+    )])
+    .custom_created_at(nostr::Timestamp::from_secs(1_700_000_010))
+    .sign_with_keys(keys)
+    .expect("sign kind-445 fixture");
+    NostrTransportEvent::from_nostr_event(&signed).expect("map signed kind-445 fixture")
 }

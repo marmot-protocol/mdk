@@ -1,11 +1,11 @@
 //! Acceptance test for hostile-input resilience of the transport drain.
 //!
 //! Anyone can publish a kind-445 event to a group's cleartext routing tag
-//! without being a member, so structurally-invalid content — too short to
-//! carry the spec's `base64(nonce || ciphertext)` envelope — is ordinary
-//! hostile wire input, not an exceptional condition. It must classify as
-//! stale inside the engine and never surface as a sync failure: a peel error
-//! that propagates as `Err` aborts the whole catch-up drain, loses the sync
+//! without being a member, so an event carrying tags outside the exact
+//! `h`/optional-`expiration` shape is ordinary hostile wire input, not an
+//! exceptional condition. It must be rejected before engine delivery and
+//! never surface as a sync failure: an ingest error that aborts the whole
+//! catch-up drain loses the sync
 //! summary (and with it every `MessageReceived` event the drain had
 //! produced), skips the app-state save, and — because the garbage event
 //! remains unremembered — re-aborts every subsequent catch-up the relay
@@ -29,7 +29,7 @@ use nostr_sdk::prelude::{
     Timestamp as NostrTimestamp,
 };
 use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
-use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
+use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrPeelerError, NostrTransportEvent};
 
 async fn mock_relay() -> (MockRelay, String) {
     let relay = MockRelay::run().await.unwrap();
@@ -70,12 +70,9 @@ async fn wait_for_event<F>(
     .expect("runtime event")
 }
 
-/// Publish a kind-445 whose content is structurally too short to be a
-/// `base64(nonce || ciphertext)` envelope, with a fresh ephemeral (non-member)
-/// signing key — the peeler classifies it `Malformed` before any decryption
-/// attempt. Contrast `since_floor.rs`'s probe helper, which deliberately
-/// builds an envelope-*shaped* payload so it classifies `DecryptFailed`
-/// instead; this helper pins the other, structurally-invalid classification.
+/// Publish a signed kind-445 carrying a forbidden extra tag. The direct mapping
+/// assertion and the cold relay catch-up exercise the same fixture at both
+/// ingress seams; neither may deliver it to engine state.
 async fn publish_malformed_group_message_at(
     relay_url: &str,
     nostr_group_id_hex: &str,
@@ -85,15 +82,22 @@ async fn publish_malformed_group_message_at(
     assert!(short.len() < NOSTR_GROUP_CONTENT_MIN_LEN);
     let ephemeral = Keys::generate();
     let signed = EventBuilder::new(Kind::MlsGroupMessage, BASE64_STANDARD.encode(short))
-        .tags([Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-            [nostr_group_id_hex.to_owned()],
-        )])
+        .tags([
+            Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+                [nostr_group_id_hex.to_owned()],
+            ),
+            Tag::custom(TagKind::custom("encoding"), ["base64"]),
+        ])
         .custom_created_at(NostrTimestamp::from_secs(created_at))
         .sign_with_keys(&ephemeral)
         .expect("sign ephemeral kind-445 test event");
     let transport_event =
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event");
+    assert!(matches!(
+        transport_event.to_transport_message(),
+        Err(NostrPeelerError::Malformed(_))
+    ));
     let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
     relay_client
         .publish_event(
@@ -197,7 +201,7 @@ async fn malformed_group_message_does_not_starve_messages_behind_it() {
     assert_eq!(
         account_sync_failures(&runtime_bob_boot2),
         0,
-        "hostile wire input must classify as stale inside the engine, never \
+        "hostile wire input must be rejected before engine delivery, never \
          surface as a sync failure",
     );
     runtime_bob_boot2.shutdown().await;

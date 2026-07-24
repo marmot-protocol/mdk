@@ -1,6 +1,6 @@
 use crate::{
-    GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrPeelerError,
-    RECIPIENT_TAG,
+    EXPIRATION_TAG, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE, KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE,
+    NostrPeelerError, RECIPIENT_TAG,
 };
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::types::{MemberId, MessageId};
@@ -32,8 +32,10 @@ impl NostrTransportEvent {
     pub fn to_transport_message(&self) -> Result<TransportMessage, NostrPeelerError> {
         // #709/#351 — the resulting `TransportMessage.id` keys routing metrics,
         // telemetry, and the forensic `wire_id`, so bind it to the event hash
-        // here rather than trusting the self-reported id. Signature
-        // verification still happens at peel time.
+        // here rather than trusting the self-reported id. Kind-445 signature
+        // verification happens before reading its routing tags and is repeated
+        // by the peeler as defense in depth; gift-wrap verification stays at the
+        // welcome peel boundary.
         if !self.id.eq_ignore_ascii_case(&self.computed_id()) {
             return Err(NostrPeelerError::Malformed(
                 "event id does not match event hash".into(),
@@ -42,12 +44,16 @@ impl NostrTransportEvent {
         let id = MessageId::new(decode_hex_exact("event id", &self.id, 32)?);
         let envelope = match self.kind {
             KIND_MARMOT_GROUP_MESSAGE => {
-                let group_id = self.single_tag_value(GROUP_TAG)?;
+                // Kind-445 routing is attacker-visible and drives account/group
+                // delivery. Authenticate the complete outer event before reading
+                // its tags so unauthenticated input never reaches engine state.
+                self.to_verified_nostr_event()?;
+                let group_id = validate_kind_445_tag_shape(self)?;
                 TransportEnvelope::GroupMessage {
                     // The `h` tag is the hex of the 32-byte nostr_group_id
                     // (spec/transports/nostr.md); shorter/longer route ids are
                     // rejected, not passed through.
-                    transport_group_id: decode_hex_exact("group h tag", group_id, 32)?,
+                    transport_group_id: decode_lowercase_hex_exact("group h tag", group_id, 32)?,
                 }
             }
             KIND_NIP59_GIFT_WRAP => {
@@ -240,22 +246,218 @@ pub(crate) fn decode_hex_exact(
     Ok(bytes)
 }
 
+pub(crate) fn decode_lowercase_hex_exact(
+    label: &str,
+    value: &str,
+    expected_len: usize,
+) -> Result<Vec<u8>, NostrPeelerError> {
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, 'a'..='f'))
+    {
+        return Err(NostrPeelerError::Malformed(format!(
+            "{label} must be lowercase hex"
+        )));
+    }
+    decode_hex_exact(label, value, expected_len)
+}
+
+fn validate_expiration_tag_value(value: &str) -> Result<(), NostrPeelerError> {
+    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(NostrPeelerError::Malformed(
+            "kind-445 expiration tag must be a unix timestamp decimal string".into(),
+        ));
+    }
+    value.parse::<u64>().map_err(|_| {
+        NostrPeelerError::Malformed(
+            "kind-445 expiration tag must be a unix timestamp decimal string".into(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Enforce the exact kind-445 outer tag shape from `spec/transports/nostr.md`.
+///
+/// Exactly one `h` tag and at most one `expiration` tag are permitted; tag order
+/// is not specified. Returns the validated `h` tag value.
+pub(crate) fn validate_kind_445_tag_shape(
+    event: &NostrTransportEvent,
+) -> Result<&str, NostrPeelerError> {
+    let mut h_value: Option<&str> = None;
+    let mut expiration_seen = false;
+
+    for tag in &event.tags {
+        let name = tag
+            .first()
+            .map(String::as_str)
+            .ok_or_else(|| NostrPeelerError::Malformed("kind-445 tag has no name".into()))?;
+        match name {
+            GROUP_TAG => {
+                if tag.len() != 2 {
+                    return Err(NostrPeelerError::Malformed(
+                        "kind-445 h tag must have exactly one value".into(),
+                    ));
+                }
+                if h_value.is_some() {
+                    return Err(NostrPeelerError::Malformed(
+                        "Nostr event must contain exactly one h tag".into(),
+                    ));
+                }
+                h_value = Some(tag[1].as_str());
+            }
+            EXPIRATION_TAG => {
+                if tag.len() != 2 {
+                    return Err(NostrPeelerError::Malformed(
+                        "kind-445 expiration tag must have exactly one value".into(),
+                    ));
+                }
+                if expiration_seen {
+                    return Err(NostrPeelerError::Malformed(
+                        "Nostr event must contain at most one expiration tag".into(),
+                    ));
+                }
+                expiration_seen = true;
+                validate_expiration_tag_value(tag[1].as_str())?;
+            }
+            _ => {
+                return Err(NostrPeelerError::Malformed(
+                    "kind-445 event has an unsupported tag".into(),
+                ));
+            }
+        }
+    }
+
+    h_value.ok_or_else(|| NostrPeelerError::MissingTag(GROUP_TAG.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn signed_kind_445_event(tags: Vec<Vec<String>>, content: &str) -> NostrTransportEvent {
+        let tags = tags.into_iter().map(|tag| {
+            let mut fields = tag.into_iter();
+            let name = fields.next().expect("test tag has a name");
+            nostr::Tag::custom(nostr::TagKind::custom(name), fields)
+        });
+        let signed = nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_MARMOT_GROUP_MESSAGE as u16),
+            content,
+        )
+        .tags(tags)
+        .sign_with_keys(&nostr::Keys::generate())
+        .expect("sign kind-445 test event");
+        NostrTransportEvent::from_nostr_event(&signed).expect("map signed test event")
+    }
+
+    #[test]
+    fn kind_445_tag_shape_table() {
+        let valid_h = "aa".repeat(32);
+        let cases: Vec<(&str, Vec<Vec<String>>, bool)> = vec![
+            ("missing h", vec![], false),
+            (
+                "duplicate h",
+                vec![
+                    vec!["h".into(), valid_h.clone()],
+                    vec!["h".into(), valid_h.clone()],
+                ],
+                false,
+            ),
+            (
+                "extra unknown tag",
+                vec![
+                    vec!["h".into(), valid_h.clone()],
+                    vec!["encoding".into(), "base64".into()],
+                ],
+                false,
+            ),
+            (
+                "h wrong arity (extra value)",
+                vec![vec!["h".into(), valid_h.clone(), "extra".into()]],
+                false,
+            ),
+            ("h valueless", vec![vec!["h".into()]], false),
+            (
+                "h uppercase hex",
+                vec![vec!["h".into(), "AA".repeat(32)]],
+                false,
+            ),
+            (
+                "h wrong length (raw MLS group id sized)",
+                vec![vec!["h".into(), "aa".repeat(16)]],
+                false,
+            ),
+            (
+                "expiration duplicate",
+                vec![
+                    vec!["h".into(), valid_h.clone()],
+                    vec!["expiration".into(), "1700000060".into()],
+                    vec!["expiration".into(), "1700000070".into()],
+                ],
+                false,
+            ),
+            (
+                "expiration wrong arity",
+                vec![vec!["h".into(), valid_h.clone()], vec!["expiration".into()]],
+                false,
+            ),
+            (
+                "expiration malformed timestamp",
+                vec![
+                    vec!["h".into(), valid_h.clone()],
+                    vec!["expiration".into(), "not-a-timestamp".into()],
+                ],
+                false,
+            ),
+            (
+                "valid h only",
+                vec![vec!["h".into(), valid_h.clone()]],
+                true,
+            ),
+            (
+                "valid expiration then h",
+                vec![
+                    vec!["expiration".into(), "1700000060".into()],
+                    vec!["h".into(), valid_h.clone()],
+                ],
+                true,
+            ),
+            (
+                "valid h then expiration",
+                vec![
+                    vec!["h".into(), valid_h.clone()],
+                    vec!["expiration".into(), "1700000060".into()],
+                ],
+                true,
+            ),
+        ];
+
+        for (name, tags, should_accept) in cases {
+            let event = signed_kind_445_event(tags, "encrypted body");
+            let result = event.to_transport_message();
+            assert_eq!(
+                result.is_ok(),
+                should_accept,
+                "case {name}: expected accept={should_accept}, got {result:?}"
+            );
+            if should_accept {
+                assert!(matches!(
+                    result.unwrap().envelope,
+                    TransportEnvelope::GroupMessage { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(NostrPeelerError::Malformed(_) | NostrPeelerError::MissingTag(_))
+                ));
+            }
+        }
+    }
+
     #[test]
     fn kind_445_event_maps_to_group_transport_message() {
-        let mut event = NostrTransportEvent {
-            id: String::new(),
-            pubkey: "22".repeat(32),
-            created_at: 1_700_000_000,
-            kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into(), "aa".repeat(32)]],
-            content: "encrypted body".into(),
-            sig: None,
-        };
-        event.id = event.computed_id();
+        let event =
+            signed_kind_445_event(vec![vec!["h".into(), "aa".repeat(32)]], "encrypted body");
 
         let msg = event.to_transport_message().expect("event maps");
 
@@ -263,7 +465,7 @@ mod tests {
             msg.id.as_slice(),
             hex::decode(&event.id).unwrap().as_slice()
         );
-        assert_eq!(msg.timestamp.0, 1_700_000_000);
+        assert_eq!(msg.timestamp.0, event.created_at);
         assert_eq!(msg.source.0, NOSTR_SOURCE);
         // The peeler does not extract `e` causal-dependency tags (kind 445 carries
         // none per transports/nostr.md).
@@ -384,16 +586,7 @@ mod tests {
         // The `h` tag is the hex of the 32-byte nostr_group_id
         // (spec/transports/nostr.md); a short route id must be rejected at the
         // boundary, not passed through into the transport envelope.
-        let mut event = NostrTransportEvent {
-            id: String::new(),
-            pubkey: "22".repeat(32),
-            created_at: 1_700_000_000,
-            kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into(), "aa55".into()]],
-            content: "encrypted body".into(),
-            sig: None,
-        };
-        event.id = event.computed_id();
+        let event = signed_kind_445_event(vec![vec!["h".into(), "aa55".into()]], "encrypted body");
 
         assert!(matches!(
             event.to_transport_message(),
@@ -421,16 +614,10 @@ mod tests {
             Err(NostrPeelerError::Malformed(_))
         ));
 
-        let mut group = NostrTransportEvent {
-            id: String::new(),
-            pubkey: "22".repeat(32),
-            created_at: 1_700_000_000,
-            kind: KIND_MARMOT_GROUP_MESSAGE,
-            tags: vec![vec!["h".into()], vec!["h".into(), "aa".repeat(32)]],
-            content: "encrypted body".into(),
-            sig: None,
-        };
-        group.id = group.computed_id();
+        let group = signed_kind_445_event(
+            vec![vec!["h".into()], vec!["h".into(), "aa".repeat(32)]],
+            "encrypted body",
+        );
         assert!(matches!(
             group.to_transport_message(),
             Err(NostrPeelerError::Malformed(_))
