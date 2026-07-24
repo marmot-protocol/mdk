@@ -17,6 +17,27 @@ use crate::conversions::{
 };
 use crate::errors::MarmotKitError;
 
+#[derive(Clone, uniffi::Record)]
+pub struct InitialGroupImageFfi {
+    pub plaintext: Vec<u8>,
+    pub media_type: String,
+    pub source_url: Option<String>,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+impl std::fmt::Debug for InitialGroupImageFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitialGroupImageFfi")
+            .field("plaintext_len", &self.plaintext.len())
+            .field("media_type", &self.media_type)
+            .field("has_source_url", &self.source_url.is_some())
+            .field("dim", &self.dim)
+            .field("thumbhash", &self.thumbhash)
+            .finish()
+    }
+}
+
 pub(crate) async fn group_details_for(
     kit: &Marmot,
     account_ref: &str,
@@ -226,6 +247,37 @@ impl Marmot {
         let group_id = self
             .runtime
             .create_group(&account_ref, &name, &member_refs, description)
+            .await?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Create a group with an optional initial avatar. MDK prefers an
+    /// encrypted Blossom image and uses `source_url` only when the founding
+    /// members do not all support that component but do support URL avatars.
+    pub async fn create_group_with_initial_image(
+        &self,
+        account_ref: String,
+        name: String,
+        member_refs: Vec<String>,
+        description: Option<String>,
+        initial_image: Option<InitialGroupImageFfi>,
+    ) -> Result<String, MarmotKitError> {
+        let initial_image = initial_image.map(|image| marmot_app::AppInitialGroupImage {
+            plaintext: image.plaintext,
+            media_type: image.media_type,
+            source_url: image.source_url,
+            dim: image.dim,
+            thumbhash: image.thumbhash,
+        });
+        let group_id = self
+            .runtime
+            .create_group_with_initial_image(
+                &account_ref,
+                &name,
+                &member_refs,
+                description,
+                initial_image,
+            )
             .await?;
         Ok(hex::encode(group_id.as_slice()))
     }

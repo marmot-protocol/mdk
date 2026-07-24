@@ -6,7 +6,8 @@ use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
-    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, default_group_components,
+    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
+    default_group_components,
 };
 use cgka_traits::capabilities::{
     Capability, CapabilityRequirement, Feature, FeatureStatus, RequirementLevel,
@@ -286,6 +287,125 @@ async fn group_creation_retains_non_negotiable_mandatory_components() {
             .required_capabilities
             .app_components
             .contains(TEST_APP_COMPONENT)
+    );
+}
+
+#[tokio::test]
+async fn constructable_capabilities_include_creator_support() {
+    let alice = build_engine_with_components(b"alice", default_group_components());
+    let mut bob_supported = default_group_components();
+    bob_supported.insert(TEST_APP_COMPONENT);
+    let mut bob = build_engine_with_components(b"bob", bob_supported);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+
+    let constructable = alice
+        .constructable_capabilities(std::slice::from_ref(&bob_kp))
+        .unwrap();
+
+    assert!(
+        !constructable.app_components.contains(TEST_APP_COMPONENT),
+        "an invitee cannot make a component constructable when the creator lacks support"
+    );
+}
+
+#[tokio::test]
+async fn optional_initial_component_state_is_not_a_membership_requirement() {
+    let mut alice_supported = default_group_components();
+    alice_supported.insert(TEST_APP_COMPONENT);
+    let mut alice = build_engine_with_components(b"alice", alice_supported);
+    let mut bob = build_engine_with_components(b"bob", default_group_components());
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let state = vec![0x01, 0x02, 0x03];
+
+    let (group_id, _) = alice
+        .create_group_with_optional_app_components(
+            CreateGroupRequest {
+                name: "optional-state".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            vec![AppComponentData {
+                component_id: TEST_APP_COMPONENT,
+                data: state.clone(),
+            }],
+        )
+        .await
+        .expect("an invitee need not support optional initial state");
+
+    let group = alice.group_record(&group_id).unwrap();
+    assert!(
+        !group
+            .required_capabilities
+            .app_components
+            .contains(TEST_APP_COMPONENT)
+    );
+    assert_eq!(
+        alice.app_component(&group_id, TEST_APP_COMPONENT).unwrap(),
+        Some(state)
+    );
+}
+
+#[tokio::test]
+async fn optional_initial_component_state_requires_creator_support() {
+    let mut alice = build_engine_with_components(b"alice", default_group_components());
+
+    let error = alice
+        .create_group_with_optional_app_components(
+            CreateGroupRequest {
+                name: "unsupported-optional-state".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            },
+            vec![AppComponentData {
+                component_id: TEST_APP_COMPONENT,
+                data: vec![0x01],
+            }],
+        )
+        .await
+        .expect_err("the creator must support optional initial component state");
+
+    assert!(
+        matches!(error, EngineError::MissingRequiredCapabilities { .. }),
+        "expected MissingRequiredCapabilities, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn group_creation_rejects_component_duplicated_across_required_and_optional_state() {
+    let mut supported = default_group_components();
+    supported.insert(TEST_APP_COMPONENT);
+    let mut alice = build_engine_with_components(b"alice", supported);
+
+    let error = alice
+        .create_group_with_optional_app_components(
+            CreateGroupRequest {
+                name: "duplicate-component-state".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![AppComponentData {
+                    component_id: TEST_APP_COMPONENT,
+                    data: vec![0x01],
+                }],
+                initial_admins: vec![],
+            },
+            vec![AppComponentData {
+                component_id: TEST_APP_COMPONENT,
+                data: vec![0x02],
+            }],
+        )
+        .await
+        .expect_err("a component cannot appear in both initial-state lists");
+
+    assert!(
+        matches!(error, EngineError::Other(ref message) if message == "group creation request contains duplicate app components"),
+        "expected duplicate-component rejection, got {error:?}"
     );
 }
 
