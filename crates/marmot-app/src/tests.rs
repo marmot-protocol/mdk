@@ -1779,6 +1779,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
         "alice",
         &message(honest, &relayer),
         &[owner_id.clone(), relayer.clone()],
+        cgka_traits::group::ProtocolProfile::Current,
     )
     .unwrap();
     let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
@@ -1794,6 +1795,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
         "alice",
         &message(spoof, &relayer),
         &[owner_id.clone(), relayer, attacker.public_key().to_hex()],
+        cgka_traits::group::ProtocolProfile::Current,
     )
     .unwrap();
     let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();

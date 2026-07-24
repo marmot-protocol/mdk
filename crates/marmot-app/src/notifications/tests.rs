@@ -223,7 +223,11 @@ async fn local_token_gossip_normalizes_relay_hint_before_signing_and_storage() {
         payload.tokens[0].relay_hint.as_deref(),
         Some("wss://relay.example")
     );
-    assert!(record.verify_owner_sig());
+    assert_eq!(
+        record.owner_proof_event().unwrap().kind,
+        Kind::Custom(PUSH_OWNER_PROOF_EVENT_KIND)
+    );
+    assert!(record.verify_owner_sig(ProtocolProfile::Current));
 }
 
 #[test]
@@ -232,6 +236,22 @@ fn kind_446_content_is_base64_concatenated_tokens_with_version_tag() {
     let content = build_notification_rumor_content(&[token.clone(), token.clone()]).unwrap();
     let decoded = BASE64_STANDARD.decode(content).unwrap();
     assert_eq!(decoded.len(), PUSH_ENCRYPTED_TOKEN_LEN * 2);
+}
+
+#[test]
+fn kind_446_content_is_bounded_to_32_encrypted_tokens() {
+    let token = vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN];
+    assert!(
+        build_notification_rumor_content(&vec![
+            token.clone();
+            PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS
+        ])
+        .is_ok()
+    );
+    assert!(
+        build_notification_rumor_content(&vec![token; PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS + 1])
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -580,8 +600,13 @@ fn normalized_relay_hint_duplicates_are_deduplicated_before_verification_and_app
     };
 
     reset_owner_signature_verification_count();
-    app.ingest_push_gossip_message("alice", &message, std::slice::from_ref(&owner_id))
-        .unwrap();
+    app.ingest_push_gossip_message(
+        "alice",
+        &message,
+        std::slice::from_ref(&owner_id),
+        ProtocolProfile::Current,
+    )
+    .unwrap();
 
     assert_eq!(
         owner_signature_verification_count(),
@@ -690,8 +715,13 @@ fn mixed_entry_permutations_apply_the_same_valid_winner() {
         };
 
         reset_owner_signature_verification_count();
-        app.ingest_push_gossip_message("alice", &message, std::slice::from_ref(&owner_id))
-            .unwrap();
+        app.ingest_push_gossip_message(
+            "alice",
+            &message,
+            std::slice::from_ref(&owner_id),
+            ProtocolProfile::Current,
+        )
+        .unwrap();
         assert_eq!(
             owner_signature_verification_count(),
             2,
@@ -1320,6 +1350,227 @@ fn signed_removal_record(
     record
 }
 
+fn sign_token_record_with_event_kind(record: &mut GroupPushTokenRecord, keys: &Keys, kind: u16) {
+    let proof_event = record.owner_proof_event_with_kind(kind).unwrap();
+    let signed = proof_event.clone().sign_with_keys(keys).unwrap();
+    record.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed).unwrap();
+}
+
+fn sign_removal_record_with_event_kind(
+    record: &mut PushTokenRemovalRecord,
+    group_id_hex: &str,
+    keys: &Keys,
+    kind: u16,
+) {
+    let proof_event = record
+        .owner_proof_event_with_kind(group_id_hex, kind)
+        .unwrap();
+    let signed = proof_event.clone().sign_with_keys(keys).unwrap();
+    record.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed).unwrap();
+}
+
+fn sign_token_record_raw_legacy(record: &mut GroupPushTokenRecord, keys: &Keys) {
+    let message = Message::from_digest(record.signing_digest().unwrap());
+    record.owner_sig = hex::encode(
+        SECP256K1
+            .sign_schnorr_no_aux_rand(&message, keys.key_pair(SECP256K1))
+            .serialize(),
+    );
+}
+
+fn sign_removal_record_raw_legacy(
+    record: &mut PushTokenRemovalRecord,
+    group_id_hex: &str,
+    keys: &Keys,
+) {
+    let message = Message::from_digest(record.signing_digest(group_id_hex).unwrap());
+    record.owner_sig = hex::encode(
+        SECP256K1
+            .sign_schnorr_no_aux_rand(&message, keys.key_pair(SECP256K1))
+            .serialize(),
+    );
+}
+
+#[test]
+fn current_and_legacy_profiles_enforce_the_owner_proof_matrix() {
+    let keys = Keys::generate();
+    let group = "ee".repeat(16);
+    let server = "dd".repeat(32);
+    let member = keys.public_key().to_hex();
+
+    let current = signed_token_record(&keys, &group, 1, &server, 100);
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let verified = verify_push_gossip_for_profile(
+            PushGossipAction::Upsert(vec![current.clone()]),
+            &group,
+            std::slice::from_ref(&member),
+            profile,
+        );
+        assert!(
+            matches!(verified, PushGossipAction::Upsert(records) if records.len() == 1),
+            "kind-451 proof must be accepted for {profile:?}"
+        );
+    }
+
+    let mut transitional = current.clone();
+    sign_token_record_with_event_kind(&mut transitional, &keys, LEGACY_PUSH_OWNER_PROOF_EVENT_KIND);
+    let current_result = verify_push_gossip_for_profile(
+        PushGossipAction::Upsert(vec![transitional.clone()]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Current,
+    );
+    assert!(matches!(current_result, PushGossipAction::Upsert(records) if records.is_empty()));
+    let legacy_result = verify_push_gossip_for_profile(
+        PushGossipAction::Upsert(vec![transitional]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Legacy,
+    );
+    assert!(matches!(legacy_result, PushGossipAction::Upsert(records) if records.len() == 1));
+
+    let mut wrong_registry_kind = current.clone();
+    sign_token_record_with_event_kind(&mut wrong_registry_kind, &keys, 452);
+    for profile in [ProtocolProfile::Current, ProtocolProfile::Legacy] {
+        let result = verify_push_gossip_for_profile(
+            PushGossipAction::Upsert(vec![wrong_registry_kind.clone()]),
+            &group,
+            std::slice::from_ref(&member),
+            profile,
+        );
+        assert!(
+            matches!(result, PushGossipAction::Upsert(records) if records.is_empty()),
+            "kind-452 proof must be rejected for {profile:?}"
+        );
+    }
+
+    let mut raw = current;
+    sign_token_record_raw_legacy(&mut raw, &keys);
+    let current_result = verify_push_gossip_for_profile(
+        PushGossipAction::Upsert(vec![raw.clone()]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Current,
+    );
+    assert!(matches!(current_result, PushGossipAction::Upsert(records) if records.is_empty()));
+    let legacy_result = verify_push_gossip_for_profile(
+        PushGossipAction::Upsert(vec![raw]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Legacy,
+    );
+    assert!(matches!(legacy_result, PushGossipAction::Upsert(records) if records.len() == 1));
+}
+
+#[test]
+fn removal_owner_proofs_follow_the_same_profile_matrix() {
+    let keys = Keys::generate();
+    let group = "ee".repeat(16);
+    let server = "dd".repeat(32);
+    let member = keys.public_key().to_hex();
+    let current = signed_removal_record(&keys, &group, 1, &server, 100);
+
+    let mut transitional = current.clone();
+    sign_removal_record_with_event_kind(
+        &mut transitional,
+        &group,
+        &keys,
+        LEGACY_PUSH_OWNER_PROOF_EVENT_KIND,
+    );
+    let current_result = verify_push_gossip_for_profile(
+        PushGossipAction::Remove(vec![transitional.clone()]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Current,
+    );
+    assert!(matches!(current_result, PushGossipAction::Remove(records) if records.is_empty()));
+    let legacy_result = verify_push_gossip_for_profile(
+        PushGossipAction::Remove(vec![transitional]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Legacy,
+    );
+    assert!(matches!(legacy_result, PushGossipAction::Remove(records) if records.len() == 1));
+
+    let mut raw = current;
+    sign_removal_record_raw_legacy(&mut raw, &group, &keys);
+    let current_result = verify_push_gossip_for_profile(
+        PushGossipAction::Remove(vec![raw.clone()]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Current,
+    );
+    assert!(matches!(current_result, PushGossipAction::Remove(records) if records.is_empty()));
+    let legacy_result = verify_push_gossip_for_profile(
+        PushGossipAction::Remove(vec![raw]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Legacy,
+    );
+    assert!(matches!(legacy_result, PushGossipAction::Remove(records) if records.len() == 1));
+}
+
+#[test]
+fn removal_kind_451_vector_matches_the_adopted_spec() {
+    let mut secret = [0_u8; 32];
+    secret[31] = 3;
+    let keys = Keys::new(nostr::SecretKey::from_slice(&secret).unwrap());
+    let group_id_hex: String = (0_u8..32).map(|byte| format!("{byte:02x}")).collect();
+    let record = PushTokenRemovalRecord {
+        member_id_hex: keys.public_key().to_hex(),
+        leaf_index: 3,
+        platform: PushPlatform::Apns,
+        token_fingerprint: "sha256:000102030405060708090a0b".to_owned(),
+        server_pubkey_hex:
+            "2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4"
+                .to_owned(),
+        owner_ts: 1_700_000_000_000,
+        owner_sig:
+            "04c3588a6533399aeaebb6c596fab896186dd0af1f9724f2926d984d2876490c76e1d149127e0fa697d7f19a0807aa373e942f0eb33edc63071567f274ce3bec"
+                .to_owned(),
+    };
+
+    let event = record.owner_proof_event(&group_id_hex).unwrap();
+    assert_eq!(event.kind, Kind::Custom(PUSH_OWNER_PROOF_EVENT_KIND));
+    assert_eq!(
+        event.id.expect("owner-proof event id is computed").to_hex(),
+        "be12f4d029d3cac4034251949d6c013ff18eae00870e199012c7a97e8960b7a2"
+    );
+    assert!(record.verify_owner_sig(&group_id_hex, ProtocolProfile::Current));
+}
+
+#[test]
+fn future_or_negative_owner_timestamps_are_rejected_before_signature_work() {
+    let keys = Keys::generate();
+    let group = "ee".repeat(16);
+    let server = "dd".repeat(32);
+    let member = keys.public_key().to_hex();
+    let too_future = unix_now_ms()
+        .saturating_add(PUSH_OWNER_TS_MAX_FUTURE_MS)
+        .saturating_add(60_000);
+    let future = signed_token_record(&keys, &group, 1, &server, too_future);
+    let negative = signed_token_record(&keys, &group, 2, &server, -1);
+    let future_removal = signed_removal_record(&keys, &group, 1, &server, too_future);
+    let negative_removal = signed_removal_record(&keys, &group, 2, &server, -1);
+
+    reset_owner_signature_verification_count();
+    let upserts = verify_push_gossip_for_profile(
+        PushGossipAction::Upsert(vec![future, negative]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Current,
+    );
+    let removals = verify_push_gossip_for_profile(
+        PushGossipAction::Remove(vec![future_removal, negative_removal]),
+        &group,
+        std::slice::from_ref(&member),
+        ProtocolProfile::Current,
+    );
+    assert!(matches!(upserts, PushGossipAction::Upsert(records) if records.is_empty()));
+    assert!(matches!(removals, PushGossipAction::Remove(records) if records.is_empty()));
+    assert_eq!(owner_signature_verification_count(), 0);
+}
+
 #[test]
 fn verify_keeps_owner_signed_self_update() {
     let keys = Keys::generate();
@@ -1446,7 +1697,7 @@ fn signed_record_survives_wire_round_trip_and_verifies() {
     match verified {
         PushGossipAction::Upsert(records) => {
             assert_eq!(records.len(), 1);
-            assert!(records[0].verify_owner_sig());
+            assert!(records[0].verify_owner_sig(ProtocolProfile::Current));
         }
         other => panic!("expected upsert, got {other:?}"),
     }

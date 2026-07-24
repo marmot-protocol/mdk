@@ -28,6 +28,7 @@ use cgka_traits::app_event::{
     EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION,
 };
+use cgka_traits::group::ProtocolProfile;
 
 use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
 use crate::{
@@ -44,6 +45,8 @@ pub const KIND_MARMOT_NOTIFICATION_SERVER_RELAYS: u64 = 10050;
 pub const PUSH_VERSION: &str = "marmot-push-v1";
 pub const PUSH_ENCRYPTED_TOKEN_LEN: usize = 1084;
 const PUSH_MAX_GOSSIP_ENTRIES: usize = 32;
+const PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS: usize = 32;
+const PUSH_OWNER_TS_MAX_FUTURE_MS: i64 = 3_600_000;
 const PUSH_TOKEN_PLAINTEXT_LEN: usize = 1024;
 const PUSH_MAX_PROVIDER_TOKEN_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN - 3;
 const PUSH_CIPHERTEXT_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN + 16;
@@ -54,7 +57,8 @@ const PUSH_HKDF_INFO: &[u8] = b"marmot-push-token-encryption";
 /// distinct unpublished Nostr events so a signature cannot be cross-applied
 /// between them and external signers can produce the proof without raw digest
 /// access.
-const PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
+const PUSH_OWNER_PROOF_EVENT_KIND: u16 = 451;
+const LEGACY_PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
 const PUSH_RECORD_DOMAIN: &str = "marmot-push-token-record-v1";
 const PUSH_REMOVAL_DOMAIN: &str = "marmot-push-token-removal-v1";
 const NOTIFICATION_VERSION_TAG: &str = "v";
@@ -200,7 +204,7 @@ pub struct GroupPushTokenRecord {
     /// ordering primitive. Distinct from `updated_at_ms` (local receive time).
     pub owner_ts: i64,
     /// 64-byte BIP-340 Schnorr signature (128 lowercase hex) by `member_id_hex`
-    /// over the canonical `SignedRecord`. See `push_record_signing_digest`.
+    /// over the exact local-only kind-451 owner-proof event id.
     pub owner_sig: String,
     pub updated_at_ms: i64,
 }
@@ -662,7 +666,10 @@ struct PushOwnerProofEvent<'a> {
     encrypted_token: Option<&'a [u8]>,
 }
 
-fn push_owner_proof_event(input: PushOwnerProofEvent<'_>) -> Result<UnsignedEvent, AppError> {
+fn push_owner_proof_event(
+    input: PushOwnerProofEvent<'_>,
+    kind: u16,
+) -> Result<UnsignedEvent, AppError> {
     let member_pubkey = PublicKey::parse(input.member_id_hex)
         .map_err(|_| AppError::InvalidPushGossip("member id must be a Nostr pubkey".into()))?;
     let relay = normalized_relay_hint(input.relay_hint).unwrap_or("");
@@ -702,12 +709,10 @@ fn push_owner_proof_event(input: PushOwnerProofEvent<'_>) -> Result<UnsignedEven
         .encrypted_token
         .map(|token| BASE64_STANDARD.encode(token))
         .unwrap_or_default();
-    Ok(
-        EventBuilder::new(Kind::Custom(PUSH_OWNER_PROOF_EVENT_KIND), content)
-            .tags(tags)
-            .custom_created_at(Timestamp::zero())
-            .build(member_pubkey),
-    )
+    Ok(EventBuilder::new(Kind::Custom(kind), content)
+        .tags(tags)
+        .custom_created_at(Timestamp::zero())
+        .build(member_pubkey))
 }
 
 fn push_owner_sig_from_signed_event(
@@ -717,7 +722,13 @@ fn push_owner_sig_from_signed_event(
     let expected_id = expected
         .id
         .ok_or_else(|| AppError::Publish("push owner proof event id was not set".into()))?;
-    if signed.id != expected_id || signed.pubkey != expected.pubkey {
+    if signed.id != expected_id
+        || signed.pubkey != expected.pubkey
+        || signed.created_at != expected.created_at
+        || signed.kind != expected.kind
+        || signed.tags != expected.tags
+        || signed.content != expected.content
+    {
         return Err(AppError::Publish(
             "push owner proof signature does not match record".into(),
         ));
@@ -797,18 +808,25 @@ impl GroupPushTokenRecord {
     }
 
     fn owner_proof_event(&self) -> Result<UnsignedEvent, AppError> {
-        push_owner_proof_event(PushOwnerProofEvent {
-            domain: PUSH_RECORD_DOMAIN,
-            group_id_hex: &self.group_id_hex,
-            member_id_hex: &self.member_id_hex,
-            leaf_index: self.leaf_index,
-            platform: self.platform,
-            server_pubkey_hex: &self.server_pubkey_hex,
-            token_fingerprint: &self.token_fingerprint,
-            owner_ts: self.owner_ts,
-            relay_hint: self.relay_hint.as_deref(),
-            encrypted_token: Some(&self.encrypted_token),
-        })
+        self.owner_proof_event_with_kind(PUSH_OWNER_PROOF_EVENT_KIND)
+    }
+
+    fn owner_proof_event_with_kind(&self, kind: u16) -> Result<UnsignedEvent, AppError> {
+        push_owner_proof_event(
+            PushOwnerProofEvent {
+                domain: PUSH_RECORD_DOMAIN,
+                group_id_hex: &self.group_id_hex,
+                member_id_hex: &self.member_id_hex,
+                leaf_index: self.leaf_index,
+                platform: self.platform,
+                server_pubkey_hex: &self.server_pubkey_hex,
+                token_fingerprint: &self.token_fingerprint,
+                owner_ts: self.owner_ts,
+                relay_hint: self.relay_hint.as_deref(),
+                encrypted_token: Some(&self.encrypted_token),
+            },
+            kind,
+        )
     }
 
     /// Sign this record with the owner account `keys`, populating `owner_sig`.
@@ -836,15 +854,22 @@ impl GroupPushTokenRecord {
     }
 
     /// True when `owner_sig` is a valid Nostr signature by `member_id_hex`.
-    pub(crate) fn verify_owner_sig(&self) -> bool {
+    pub(crate) fn verify_owner_sig(&self, profile: ProtocolProfile) -> bool {
         if let Ok(proof_event) = self.owner_proof_event()
             && verify_push_owner_sig(proof_event, &self.owner_sig)
         {
             return true;
         }
-        // Legacy fallback (see verify_push_owner_sig_legacy): tokens signed by
-        // older clients, and rows already persisted before the event-shaped
-        // proof, carry a signature over SHA-256(SignedRecord), not the event id.
+        if profile == ProtocolProfile::Current {
+            return false;
+        }
+        if let Ok(proof_event) =
+            self.owner_proof_event_with_kind(LEGACY_PUSH_OWNER_PROOF_EVENT_KIND)
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        // Verification-only raw legacy fallback for already-deployed groups.
         match self.signing_digest() {
             Ok(digest) => {
                 verify_push_owner_sig_legacy(digest, &self.member_id_hex, &self.owner_sig)
@@ -876,18 +901,29 @@ impl PushTokenRemovalRecord {
     }
 
     fn owner_proof_event(&self, group_id_hex: &str) -> Result<UnsignedEvent, AppError> {
-        push_owner_proof_event(PushOwnerProofEvent {
-            domain: PUSH_REMOVAL_DOMAIN,
-            group_id_hex,
-            member_id_hex: &self.member_id_hex,
-            leaf_index: self.leaf_index,
-            platform: self.platform,
-            server_pubkey_hex: &self.server_pubkey_hex,
-            token_fingerprint: &self.token_fingerprint,
-            owner_ts: self.owner_ts,
-            relay_hint: None,
-            encrypted_token: None,
-        })
+        self.owner_proof_event_with_kind(group_id_hex, PUSH_OWNER_PROOF_EVENT_KIND)
+    }
+
+    fn owner_proof_event_with_kind(
+        &self,
+        group_id_hex: &str,
+        kind: u16,
+    ) -> Result<UnsignedEvent, AppError> {
+        push_owner_proof_event(
+            PushOwnerProofEvent {
+                domain: PUSH_REMOVAL_DOMAIN,
+                group_id_hex,
+                member_id_hex: &self.member_id_hex,
+                leaf_index: self.leaf_index,
+                platform: self.platform,
+                server_pubkey_hex: &self.server_pubkey_hex,
+                token_fingerprint: &self.token_fingerprint,
+                owner_ts: self.owner_ts,
+                relay_hint: None,
+                encrypted_token: None,
+            },
+            kind,
+        )
     }
 
     #[cfg(test)]
@@ -915,15 +951,22 @@ impl PushTokenRemovalRecord {
         Ok(())
     }
 
-    pub(crate) fn verify_owner_sig(&self, group_id_hex: &str) -> bool {
+    pub(crate) fn verify_owner_sig(&self, group_id_hex: &str, profile: ProtocolProfile) -> bool {
         if let Ok(proof_event) = self.owner_proof_event(group_id_hex)
             && verify_push_owner_sig(proof_event, &self.owner_sig)
         {
             return true;
         }
-        // Legacy fallback (see verify_push_owner_sig_legacy): older clients, and
-        // rows already persisted before the event-shaped proof, signed over
-        // SHA-256(SignedRecord), not the event id.
+        if profile == ProtocolProfile::Current {
+            return false;
+        }
+        if let Ok(proof_event) =
+            self.owner_proof_event_with_kind(group_id_hex, LEGACY_PUSH_OWNER_PROOF_EVENT_KIND)
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        // Verification-only raw legacy fallback for already-deployed groups.
         match self.signing_digest(group_id_hex) {
             Ok(digest) => {
                 verify_push_owner_sig_legacy(digest, &self.member_id_hex, &self.owner_sig)
@@ -935,6 +978,7 @@ impl PushTokenRemovalRecord {
 
 pub fn build_notification_rumor_content(tokens: &[Vec<u8>]) -> Result<String, AppError> {
     if tokens.is_empty()
+        || tokens.len() > PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS
         || tokens
             .iter()
             .any(|token| token.len() != PUSH_ENCRYPTED_TOKEN_LEN)
@@ -1112,18 +1156,22 @@ where
 /// never poisons the batch — and a verified entry is applied no matter which
 /// member relayed it (kind 447 self-update or kind 448 transitive list response),
 /// which is what makes offline-member bootstrap safe.
-pub(crate) fn verify_push_gossip(
+pub(crate) fn verify_push_gossip_for_profile(
     action: PushGossipAction,
     group_id_hex: &str,
     active_members: &[String],
+    profile: ProtocolProfile,
 ) -> PushGossipAction {
     let active: HashSet<&str> = active_members.iter().map(String::as_str).collect();
+    let latest_valid_owner_ts = unix_now_ms().saturating_add(PUSH_OWNER_TS_MAX_FUTURE_MS);
     match action {
         PushGossipAction::Upsert(records) => PushGossipAction::Upsert(
             records
                 .into_iter()
                 .filter(|record| {
-                    active.contains(record.member_id_hex.as_str()) && record.verify_owner_sig()
+                    active.contains(record.member_id_hex.as_str())
+                        && (0..=latest_valid_owner_ts).contains(&record.owner_ts)
+                        && record.verify_owner_sig(profile)
                 })
                 .collect(),
         ),
@@ -1132,11 +1180,26 @@ pub(crate) fn verify_push_gossip(
                 .into_iter()
                 .filter(|removal| {
                     active.contains(removal.member_id_hex.as_str())
-                        && removal.verify_owner_sig(group_id_hex)
+                        && (0..=latest_valid_owner_ts).contains(&removal.owner_ts)
+                        && removal.verify_owner_sig(group_id_hex, profile)
                 })
                 .collect(),
         ),
     }
+}
+
+#[cfg(test)]
+fn verify_push_gossip(
+    action: PushGossipAction,
+    group_id_hex: &str,
+    active_members: &[String],
+) -> PushGossipAction {
+    verify_push_gossip_for_profile(
+        action,
+        group_id_hex,
+        active_members,
+        ProtocolProfile::Current,
+    )
 }
 
 impl PushTokenGossipEntry {

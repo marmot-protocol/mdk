@@ -513,21 +513,34 @@ impl AppClient {
                     // member set; owner signatures are then verified per record so
                     // a kind 448 may apply other members' records (offline-member
                     // bootstrap) without trusting the relaying sender.
-                    let ingest_result = self
-                        .runtime
-                        .members(&message.group_id)
-                        .map_err(AppError::from)
-                        .map(|members| {
-                            members
-                                .into_iter()
-                                .map(|member| hex::encode(member.id.as_slice()))
-                                .collect::<Vec<_>>()
+                    let ingest_result = group_metadata
+                        .as_ref()
+                        .map(|group| group.protocol_profile)
+                        .ok_or_else(|| {
+                            AppError::InvalidPushGossip(
+                                "group profile unavailable for push gossip".into(),
+                            )
                         })
-                        .and_then(|active_member_ids| {
+                        .and_then(|profile| {
+                            self.runtime
+                                .members(&message.group_id)
+                                .map_err(AppError::from)
+                                .map(|members| {
+                                    (
+                                        profile,
+                                        members
+                                            .into_iter()
+                                            .map(|member| hex::encode(member.id.as_slice()))
+                                            .collect::<Vec<_>>(),
+                                    )
+                                })
+                        })
+                        .and_then(|(profile, active_member_ids)| {
                             self.app.ingest_push_gossip_message(
                                 &self.state.label,
                                 &message,
                                 &active_member_ids,
+                                profile,
                             )
                         });
                     if let Err(err) = ingest_result {
