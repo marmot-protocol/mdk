@@ -2876,12 +2876,8 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
     );
 }
 
-// Finding 2: an in-place nostr_group_id / relay rotation on an existing group
-// must switch the transport subscription. `add_group` previously early-returned
-// on a duplicate group_id, so a rotated route never took effect; it now replaces
-// by group_id and reports whether the route set changed.
 #[test]
-fn transport_add_group_replaces_route_for_same_group_on_rotation() {
+fn transport_group_route_replacement_installs_current_and_prior_routes() {
     let routing = AppTransportRouting::new(AppRoutingState {
         local_inbox_endpoints: Vec::new(),
         key_package_endpoints: Vec::new(),
@@ -2895,19 +2891,15 @@ fn transport_add_group_replaces_route_for_same_group_on_rotation() {
         transport_group_id: vec![0x41; 32],
         endpoints: vec![TransportEndpoint("wss://x.example".to_owned())],
     };
-    // First insert of a new group route reports a change.
-    assert!(routing.add_group(sub_x.clone()));
-    // Re-adding the identical subscription is a no-op.
-    assert!(!routing.add_group(sub_x.clone()));
+    assert!(routing.replace_group_routes(&group_id, vec![sub_x.clone()]));
+    assert!(!routing.replace_group_routes(&group_id, vec![sub_x.clone()]));
 
-    // Rotation: same group_id, new transport_group_id + relay. Must replace the
-    // existing route, report a change, and NOT leave a duplicate for the group.
     let sub_y = TransportGroupSubscription {
         group_id: group_id.clone(),
         transport_group_id: vec![0x59; 32],
         endpoints: vec![TransportEndpoint("wss://y.example".to_owned())],
     };
-    assert!(routing.add_group(sub_y.clone()));
+    assert!(routing.replace_group_routes(&group_id, vec![sub_y.clone(), sub_x.clone()]));
 
     let snapshot = routing.snapshot();
     let routes: Vec<_> = snapshot
@@ -2915,6 +2907,61 @@ fn transport_add_group_replaces_route_for_same_group_on_rotation() {
         .iter()
         .filter(|route| route.group_id == group_id)
         .collect();
-    assert_eq!(routes.len(), 1, "rotation must replace, not duplicate");
-    assert_eq!(routes[0], &sub_y);
+    assert_eq!(routes.len(), 2);
+    assert!(routes.contains(&&sub_x));
+    assert!(routes.contains(&&sub_y));
+}
+
+#[test]
+fn reopening_account_restores_current_and_prior_group_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    let group_id_hex = "aa".repeat(16);
+    let mut group = AppGroupRecord::new(
+        group_id_hex.clone(),
+        AppGroupNostrRoutingComponent::new(
+            NostrRoutingV1::new([0x22; 32], vec!["wss://current.example".to_owned()]).unwrap(),
+        )
+        .unwrap(),
+        "routed".to_owned(),
+        String::new(),
+        AppGroupImageInput::default(),
+        AppGroupAdminPolicyComponent::new(Vec::new()),
+        AppGroupMessageRetentionComponent::disabled(),
+    );
+    group.prior_nostr_routes = vec![AppPriorNostrRoute {
+        nostr_group_id_hex: hex::encode([0x11; 32]),
+        relays: vec!["wss://prior.example".to_owned()],
+        last_epoch: 7,
+    }];
+    group.nostr_routing_last_epoch = 8;
+    app.save_state(&AccountState {
+        label: "alice".to_owned(),
+        seen_events: Vec::new(),
+        last_transport_timestamp: Some(1_800_000_000),
+        groups: vec![group],
+    })
+    .unwrap();
+    drop(app);
+
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://account.example");
+    let state = reopened.load_state("alice").unwrap();
+    assert_eq!(state.groups[0].prior_nostr_routes[0].last_epoch, 7);
+    assert_eq!(state.groups[0].nostr_routing_last_epoch, 8);
+    let routes = reopened
+        .routing_for(&state)
+        .unwrap()
+        .snapshot()
+        .group_routes;
+    assert_eq!(routes.len(), 2);
+    assert_eq!(
+        routes
+            .iter()
+            .map(|route| route.transport_group_id.clone())
+            .collect::<HashSet<_>>(),
+        HashSet::from([vec![0x11; 32], vec![0x22; 32]])
+    );
 }

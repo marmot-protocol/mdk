@@ -229,6 +229,8 @@ fn group(id: &str, name: &str) -> StoredAccountGroup {
         pending_confirmation: false,
         welcomer_account_id_hex: None,
         via_welcome_message_id_hex: None,
+        nostr_routing_last_epoch: 0,
+        prior_nostr_routes: Vec::new(),
         self_membership: SelfMembership::Member,
         components: vec![
             StoredAccountGroupComponent {
@@ -352,11 +354,18 @@ fn delete_event(
 #[test]
 fn account_projection_state_roundtrips_groups_components_and_seen_events() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let mut stored_group = group("aa", "alpha");
+    stored_group.nostr_routing_last_epoch = 8;
+    stored_group.prior_nostr_routes = vec![StoredNostrRoute {
+        nostr_group_id_hex: "11".repeat(32),
+        relays: vec!["wss://prior.example".to_owned()],
+        last_epoch: 7,
+    }];
     let state = StoredAccountState {
         label: "alice".to_owned(),
         seen_events: vec!["old".to_owned(), "kept".to_owned()],
         last_transport_timestamp: Some(1_700_000_001),
-        groups: vec![group("aa", "alpha")],
+        groups: vec![stored_group],
     };
 
     store
@@ -369,6 +378,15 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
     assert_eq!(restored.groups[0].profile_name, "alpha");
     assert_eq!(restored.groups[0].components.len(), 2);
     assert_eq!(restored.groups[0].components[1].component_id, 0x8004);
+    assert_eq!(restored.groups[0].nostr_routing_last_epoch, 8);
+    assert_eq!(
+        restored.groups[0].prior_nostr_routes,
+        vec![StoredNostrRoute {
+            nostr_group_id_hex: "11".repeat(32),
+            relays: vec!["wss://prior.example".to_owned()],
+            last_epoch: 7,
+        }]
+    );
 }
 
 #[test]

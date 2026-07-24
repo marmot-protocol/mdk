@@ -543,8 +543,14 @@ impl TransportAdapter for NostrTransportAdapter {
             activation.inbox_endpoints.clone(),
             inbox_since(activation.since),
         ));
+        let full_backfill_groups = groups_requiring_full_backfill(&activation.group_subscriptions);
         for group in &activation.group_subscriptions {
-            issued.push(group_subscription(&account_id, group, activation.since));
+            let since = if full_backfill_groups.contains(&group.group_id) {
+                None
+            } else {
+                activation.since
+            };
+            issued.push(group_subscription(&account_id, group, since));
         }
         // Register routing/telemetry state BEFORE the relay REQs go out: a
         // relay may stream stored events the moment it sees a subscription,
@@ -1237,9 +1243,17 @@ fn diff_group_subscriptions(
         .iter()
         .map(|group| group_subscription(account_id, group, None))
         .collect::<Vec<_>>();
+    let full_backfill_groups = groups_requiring_full_backfill(desired);
     let desired_subscriptions = desired
         .iter()
-        .map(|group| group_subscription(account_id, group, since))
+        .map(|group| {
+            let since = if full_backfill_groups.contains(&group.group_id) {
+                None
+            } else {
+                since
+            };
+            group_subscription(account_id, group, since)
+        })
         .collect::<Vec<_>>();
     let current_keys = current_subscriptions
         .iter()
@@ -1260,6 +1274,24 @@ fn diff_group_subscriptions(
         .collect();
 
     (to_add, to_remove)
+}
+
+/// More than one subscription for one MLS group means the caller retained at
+/// least one prior routing address alongside the current address. A global
+/// account cursor cannot safely bound those subscriptions: a delayed event at
+/// the prior address can have a `created_at` older than that cursor. Backfill
+/// every retained address for the group and rely on authenticated event-id
+/// deduplication and the engine's retained-epoch bounds to discard repeats or
+/// stale traffic.
+fn groups_requiring_full_backfill(groups: &[TransportGroupSubscription]) -> HashSet<GroupId> {
+    let mut seen = HashSet::new();
+    let mut repeated = HashSet::new();
+    for group in groups {
+        if !seen.insert(group.group_id.clone()) {
+            repeated.insert(group.group_id.clone());
+        }
+    }
+    repeated
 }
 
 fn normalized_endpoints(endpoints: &[TransportEndpoint]) -> Vec<TransportEndpoint> {

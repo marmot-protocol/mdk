@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_ROLE_FANOUT,
     AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
@@ -41,6 +42,16 @@ pub struct AppGroupRecord {
     pub protocol_profile: AppProtocolProfile,
     pub endpoint: String,
     pub nostr_routing: AppGroupNostrRoutingComponent,
+    /// Highest epoch observed while the current routing address was active.
+    /// Kept separately so a rollback can retain the losing branch address for
+    /// its real epoch range instead of inferring from the new canonical tip.
+    #[serde(default)]
+    pub nostr_routing_last_epoch: u64,
+    /// Older authenticated routing addresses that still overlap at least one
+    /// retained-history window. These are local delivery history, not part of
+    /// the current signed component.
+    #[serde(default)]
+    pub prior_nostr_routes: Vec<AppPriorNostrRoute>,
     pub profile: AppGroupProfileComponent,
     pub image: AppGroupImageComponent,
     /// URL-based group avatar. When `present`, it takes precedence over `image`
@@ -279,6 +290,14 @@ pub struct AppGroupNostrRoutingComponent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppPriorNostrRoute {
+    pub nostr_group_id_hex: String,
+    pub relays: Vec<String>,
+    /// Last epoch known to have used this route.
+    pub last_epoch: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppAgentTextStreamComponent {
     pub component_id: u16,
     pub component: String,
@@ -350,6 +369,8 @@ impl AppGroupRecord {
             protocol_profile: AppProtocolProfile::Legacy,
             endpoint,
             nostr_routing,
+            nostr_routing_last_epoch: 0,
+            prior_nostr_routes: Vec::new(),
             profile: AppGroupProfileComponent::new(profile_name, profile_description),
             image: AppGroupImageComponent::new(image),
             avatar_url: AppGroupAvatarUrlComponent::absent(),
@@ -394,14 +415,35 @@ impl AppGroupRecord {
         record.encrypted_media = encrypted_media;
         if let Some(group) = group {
             record.protocol_profile = group.protocol_profile.into();
+            record.nostr_routing_last_epoch = group.epoch.0;
         }
         record
     }
 
     pub(crate) fn refresh_from_group(&mut self, projection: &EventGroupProjection<'_>) {
         let nostr_routing = projection.nostr_routing.clone();
+        let route_changed = !same_nostr_route(&self.nostr_routing, &nostr_routing);
+        if route_changed {
+            let last_epoch = projection
+                .group_metadata
+                .map(|group| group.epoch.0.saturating_sub(1))
+                .unwrap_or_default()
+                .max(self.nostr_routing_last_epoch);
+            self.remember_prior_nostr_route(last_epoch);
+        }
         self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
         self.nostr_routing = nostr_routing;
+        self.nostr_routing_last_epoch = match (route_changed, projection.group_metadata) {
+            (true, Some(group)) => group.epoch.0,
+            (true, None) => 0,
+            (false, Some(group)) => self.nostr_routing_last_epoch.max(group.epoch.0),
+            (false, None) => self.nostr_routing_last_epoch,
+        };
+        let current = &self.nostr_routing;
+        self.prior_nostr_routes.retain(|route| {
+            route.nostr_group_id_hex != current.nostr_group_id_hex
+                || normalized_relays(&route.relays) != normalized_relays(&current.relays)
+        });
         self.admin_policy = projection.admin_policy.clone();
         self.message_retention = projection.message_retention.clone();
         self.agent_text_stream = projection.agent_text_stream.clone();
@@ -413,6 +455,55 @@ impl AppGroupRecord {
             self.profile =
                 AppGroupProfileComponent::new(group.name.clone(), group.description.clone());
         }
+    }
+
+    fn remember_prior_nostr_route(&mut self, last_epoch: u64) {
+        let relays = normalized_relays(&self.nostr_routing.relays);
+        if let Some(existing) = self.prior_nostr_routes.iter_mut().find(|route| {
+            route.nostr_group_id_hex == self.nostr_routing.nostr_group_id_hex
+                && normalized_relays(&route.relays) == relays
+        }) {
+            existing.last_epoch = existing.last_epoch.max(last_epoch);
+        } else {
+            self.prior_nostr_routes.push(AppPriorNostrRoute {
+                nostr_group_id_hex: self.nostr_routing.nostr_group_id_hex.clone(),
+                relays,
+                last_epoch,
+            });
+        }
+        self.prior_nostr_routes.sort_by(|left, right| {
+            left.last_epoch
+                .cmp(&right.last_epoch)
+                .then_with(|| left.nostr_group_id_hex.cmp(&right.nostr_group_id_hex))
+                .then_with(|| left.relays.cmp(&right.relays))
+        });
+    }
+
+    /// Retire prior routes only after every protocol retention window has
+    /// advanced beyond the route's last epoch. Returns whether anything was
+    /// retired.
+    pub(crate) fn prune_prior_nostr_routes(&mut self, current_epoch: u64) -> bool {
+        let policy = CanonicalizationPolicy::default();
+        let retained_depth = policy
+            .convergence
+            .max_rewind_commits
+            .max(policy.app_message_past_epoch_limit);
+        let oldest_live_epoch = current_epoch.saturating_sub(retained_depth);
+        let before = self.prior_nostr_routes.len();
+        self.prior_nostr_routes
+            .retain(|route| route.last_epoch >= oldest_live_epoch);
+        self.prior_nostr_routes.len() != before
+    }
+
+    pub(crate) fn transport_subscriptions(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
+        let mut subscriptions = vec![self.nostr_routing.subscription(group_id)?];
+        for route in &self.prior_nostr_routes {
+            subscriptions.push(route.subscription(group_id)?);
+        }
+        Ok(subscriptions)
     }
 
     pub(crate) fn apply_confirmation_state(&mut self, state: GroupConfirmationProjection) {
@@ -445,6 +536,212 @@ impl AppGroupRecord {
                 self.welcomer_account_id_hex = welcomer_account_id_hex;
             }
         }
+    }
+}
+
+impl AppPriorNostrRoute {
+    fn subscription(&self, group_id: &GroupId) -> Result<TransportGroupSubscription, AppError> {
+        let transport_group_id = hex::decode(&self.nostr_group_id_hex)?;
+        if transport_group_id.len() != 32 {
+            return Err(AppError::InvalidNostrRouting(
+                "prior Nostr group id must be 32 bytes".into(),
+            ));
+        }
+        if self.relays.is_empty() {
+            return Err(AppError::InvalidNostrRouting(
+                "prior Nostr routing relays must not be empty".into(),
+            ));
+        }
+        Ok(TransportGroupSubscription {
+            group_id: group_id.clone(),
+            transport_group_id,
+            endpoints: self.relays.iter().cloned().map(TransportEndpoint).collect(),
+        })
+    }
+}
+
+fn same_nostr_route(
+    left: &AppGroupNostrRoutingComponent,
+    right: &AppGroupNostrRoutingComponent,
+) -> bool {
+    left.nostr_group_id_hex == right.nostr_group_id_hex
+        && normalized_relays(&left.relays) == normalized_relays(&right.relays)
+}
+
+fn normalized_relays(relays: &[String]) -> Vec<String> {
+    let mut relays = relays.to_vec();
+    relays.sort();
+    relays.dedup();
+    relays
+}
+
+#[cfg(test)]
+mod prior_nostr_route_tests {
+    use super::*;
+    use cgka_traits::capabilities::GroupCapabilities;
+    use cgka_traits::types::EpochId;
+
+    fn routing(id: u8, relay: &str) -> AppGroupNostrRoutingComponent {
+        AppGroupNostrRoutingComponent::new(NostrRoutingV1 {
+            nostr_group_id: [id; 32],
+            relays: vec![relay.to_owned()],
+        })
+        .unwrap()
+    }
+
+    fn group(epoch: u64) -> Group {
+        Group {
+            id: GroupId::new(vec![1; 16]),
+            name: "group".to_owned(),
+            description: String::new(),
+            epoch: EpochId(epoch),
+            members: Vec::new(),
+            required_capabilities: GroupCapabilities::default(),
+            protocol_profile: ProtocolProfile::Current,
+            removed: false,
+            join_epoch: EpochId(0),
+        }
+    }
+
+    fn projection<'a>(
+        nostr_routing: AppGroupNostrRoutingComponent,
+        group: &'a Group,
+    ) -> EventGroupProjection<'a> {
+        EventGroupProjection {
+            nostr_routing,
+            group_metadata: Some(group),
+            admin_policy: AppGroupAdminPolicyComponent::new(Vec::new()),
+            message_retention: AppGroupMessageRetentionComponent::disabled(),
+            agent_text_stream: AppAgentTextStreamComponent::disabled(),
+            avatar_url: AppGroupAvatarUrlComponent::absent(),
+            encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
+            image: AppGroupImageInput::default(),
+        }
+    }
+
+    #[test]
+    fn rotation_retains_prior_route_until_both_epoch_windows_expire() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://old.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let at_epoch_six = group(6);
+
+        record.refresh_from_group(&projection(
+            routing(2, "wss://current.example"),
+            &at_epoch_six,
+        ));
+
+        assert_eq!(
+            record.prior_nostr_routes,
+            vec![AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([1u8; 32]),
+                relays: vec!["wss://old.example".to_owned()],
+                last_epoch: 5,
+            }]
+        );
+        assert_eq!(
+            record
+                .transport_subscriptions(&GroupId::new(vec![1; 16]))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert!(!record.prune_prior_nostr_routes(10));
+        assert!(record.prune_prior_nostr_routes(11));
+        assert!(record.prior_nostr_routes.is_empty());
+    }
+
+    #[test]
+    fn rotating_back_to_a_prior_address_deduplicates_history() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://one.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let epoch_two = group(2);
+        record.refresh_from_group(&projection(routing(2, "wss://two.example"), &epoch_two));
+        let epoch_three = group(3);
+        record.refresh_from_group(&projection(routing(1, "wss://one.example"), &epoch_three));
+
+        assert_eq!(record.prior_nostr_routes.len(), 1);
+        assert_eq!(
+            record.prior_nostr_routes[0].nostr_group_id_hex,
+            hex::encode([2u8; 32])
+        );
+    }
+
+    #[test]
+    fn relay_only_rotation_retains_the_prior_relay_set_for_the_same_id() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://old.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        record.nostr_routing_last_epoch = 5;
+        let epoch_six = group(6);
+
+        record.refresh_from_group(&projection(routing(1, "wss://current.example"), &epoch_six));
+
+        assert_eq!(
+            record.prior_nostr_routes,
+            vec![AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([1u8; 32]),
+                relays: vec!["wss://old.example".to_owned()],
+                last_epoch: 5,
+            }]
+        );
+        assert_eq!(
+            record
+                .transport_subscriptions(&GroupId::new(vec![1; 16]))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rollback_retains_losing_route_through_its_last_observed_epoch() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(2, "wss://losing.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        record.nostr_routing_last_epoch = 10;
+        let rolled_back = group(6);
+
+        record.refresh_from_group(&projection(
+            routing(1, "wss://selected.example"),
+            &rolled_back,
+        ));
+
+        assert_eq!(
+            record.prior_nostr_routes,
+            vec![AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([2u8; 32]),
+                relays: vec!["wss://losing.example".to_owned()],
+                last_epoch: 10,
+            }]
+        );
+        assert_eq!(record.nostr_routing_last_epoch, 6);
     }
 }
 

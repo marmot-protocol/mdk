@@ -540,6 +540,8 @@ mod tests {
             pending_confirmation: false,
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
+            nostr_routing_last_epoch: 0,
+            prior_nostr_routes: Vec::new(),
             self_membership: SelfMembership::Member,
             components: vec![],
         }

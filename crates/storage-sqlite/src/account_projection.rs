@@ -70,6 +70,10 @@ pub struct StoredAccountGroup {
     pub pending_confirmation: bool,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,
+    pub nostr_routing_last_epoch: u64,
+    /// Authenticated Nostr routes that preceded the current group component
+    /// and still intersect a retained-history window.
+    pub prior_nostr_routes: Vec<StoredNostrRoute>,
     /// The local account's membership in this group. Read-only on this struct:
     /// it is loaded from `account_groups` but owned exclusively by
     /// [`SqliteAccountStorage::set_group_self_membership`], so the projection
@@ -77,6 +81,13 @@ pub struct StoredAccountGroup {
     /// membership change). New rows take the schema default `Member`.
     pub self_membership: SelfMembership,
     pub components: Vec<StoredAccountGroupComponent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredNostrRoute {
+    pub nostr_group_id_hex: String,
+    pub relays: Vec<String>,
+    pub last_epoch: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,6 +268,8 @@ struct RawStoredAccountGroup {
     pending_confirmation: bool,
     welcomer_account_id_hex: Option<String>,
     via_welcome_message_id_hex: Option<String>,
+    nostr_routing_last_epoch: i64,
+    prior_nostr_routes_json: String,
     self_membership: SelfMembership,
 }
 
@@ -313,7 +326,8 @@ impl SqliteAccountStorage {
                         image_hash_hex, image_key_hex, image_nonce_hex,
                         image_upload_key_hex, image_media_type, admin_keys_hex,
                         archived, pending_confirmation, welcomer_account_id_hex,
-                        via_welcome_message_id_hex, self_membership
+                        via_welcome_message_id_hex, nostr_routing_last_epoch,
+                        prior_nostr_routes_json, self_membership
                  FROM account_groups
                  ORDER BY updated_at, group_id_hex",
             )
@@ -335,7 +349,9 @@ impl SqliteAccountStorage {
                     pending_confirmation: row.get::<_, i64>(11)? != 0,
                     welcomer_account_id_hex: row.get(12)?,
                     via_welcome_message_id_hex: row.get(13)?,
-                    self_membership: SelfMembership::from_storage(&row.get::<_, String>(14)?),
+                    nostr_routing_last_epoch: row.get(14)?,
+                    prior_nostr_routes_json: row.get(15)?,
+                    self_membership: SelfMembership::from_storage(&row.get::<_, String>(16)?),
                 })
             })
             .storage()?
@@ -346,6 +362,8 @@ impl SqliteAccountStorage {
         let mut components_by_group = all_account_group_components(&conn)?;
         let mut groups = Vec::with_capacity(raw_groups.len());
         for raw in raw_groups {
+            let prior_nostr_routes = serde_json::from_str(&raw.prior_nostr_routes_json)
+                .map_err(|err| StorageError::Serialization(err.to_string()))?;
             let components = components_by_group
                 .remove(&raw.group_id_hex)
                 .unwrap_or_default();
@@ -364,6 +382,11 @@ impl SqliteAccountStorage {
                 pending_confirmation: raw.pending_confirmation,
                 welcomer_account_id_hex: raw.welcomer_account_id_hex,
                 via_welcome_message_id_hex: raw.via_welcome_message_id_hex,
+                nostr_routing_last_epoch: raw
+                    .nostr_routing_last_epoch
+                    .try_into()
+                    .unwrap_or_default(),
+                prior_nostr_routes,
                 self_membership: raw.self_membership,
                 components,
             });
@@ -490,15 +513,19 @@ impl SqliteAccountStorage {
             }
 
             for group in &state.groups {
+                let nostr_routing_last_epoch =
+                    i64::try_from(group.nostr_routing_last_epoch).unwrap_or(i64::MAX);
+                let prior_nostr_routes_json = serde_json::to_string(&group.prior_nostr_routes)
+                    .map_err(|err| StorageError::Serialization(err.to_string()))?;
                 conn.execute(
                     "INSERT INTO account_groups (
                         group_id_hex, endpoint, profile_name, profile_description,
                         image_hash_hex, image_key_hex, image_nonce_hex,
                         image_upload_key_hex, image_media_type, admin_keys_hex, archived,
                         pending_confirmation, welcomer_account_id_hex, via_welcome_message_id_hex,
-                        updated_at
+                        nostr_routing_last_epoch, prior_nostr_routes_json, updated_at
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                      ON CONFLICT(group_id_hex) DO UPDATE SET
                         endpoint = excluded.endpoint,
                         profile_name = excluded.profile_name,
@@ -513,6 +540,8 @@ impl SqliteAccountStorage {
                         pending_confirmation = excluded.pending_confirmation,
                         welcomer_account_id_hex = excluded.welcomer_account_id_hex,
                         via_welcome_message_id_hex = excluded.via_welcome_message_id_hex,
+                        nostr_routing_last_epoch = excluded.nostr_routing_last_epoch,
+                        prior_nostr_routes_json = excluded.prior_nostr_routes_json,
                         updated_at = excluded.updated_at
                      WHERE account_groups.endpoint IS NOT excluded.endpoint
                         OR account_groups.profile_name IS NOT excluded.profile_name
@@ -526,7 +555,9 @@ impl SqliteAccountStorage {
                         OR account_groups.archived IS NOT excluded.archived
                         OR account_groups.pending_confirmation IS NOT excluded.pending_confirmation
                         OR account_groups.welcomer_account_id_hex IS NOT excluded.welcomer_account_id_hex
-                        OR account_groups.via_welcome_message_id_hex IS NOT excluded.via_welcome_message_id_hex",
+                        OR account_groups.via_welcome_message_id_hex IS NOT excluded.via_welcome_message_id_hex
+                        OR account_groups.nostr_routing_last_epoch IS NOT excluded.nostr_routing_last_epoch
+                        OR account_groups.prior_nostr_routes_json IS NOT excluded.prior_nostr_routes_json",
                     params![
                         &group.group_id_hex,
                         &group.endpoint,
@@ -542,6 +573,8 @@ impl SqliteAccountStorage {
                         bool_i64(group.pending_confirmation),
                         &group.welcomer_account_id_hex,
                         &group.via_welcome_message_id_hex,
+                        nostr_routing_last_epoch,
+                        prior_nostr_routes_json,
                         now_i64
                     ],
                 )

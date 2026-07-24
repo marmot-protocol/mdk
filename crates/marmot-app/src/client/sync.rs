@@ -55,6 +55,12 @@ impl AppClient {
     }
 
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
+        // Reconcile epoch-bounded prior routes before issuing the first relay
+        // subscriptions. This makes retirement deterministic even for a quiet
+        // group that has no new inbound events after restart.
+        if self.refresh_group_routes()? {
+            self.app.save_state(&self.state)?;
+        }
         let rebuild_since = self
             .relay_plane
             .subscription_rebuild_since(self.state.last_transport_timestamp);
@@ -118,8 +124,11 @@ impl AppClient {
             // Best-effort projection: a quarantined group is not live, so its
             // routing/metadata components may be unavailable. Skip projection
             // rather than propagate — the event must still reach subscribers.
-            let group_projection = event_group_id(event)
-                .and_then(|group_id| self.event_group_projection_best_effort(group_id));
+            let group_metadata =
+                event_group_id(event).and_then(|group_id| self.runtime.group_record(group_id).ok());
+            let group_projection = event_group_id(event).and_then(|group_id| {
+                self.event_group_projection_best_effort(group_id, group_metadata.as_ref())
+            });
             observe_event(
                 &mut self.state,
                 &display_names,
@@ -143,12 +152,9 @@ impl AppClient {
                 routes_dirty = true;
             }
         }
-        // #695 + rotation: reconcile transport routes once after the batch drains
-        // instead of per membership-changing event. refresh_group_routes upserts
-        // every group's current subscription — picking up a join's new route AND
-        // an in-place nostr_group_id / relay rotation on an existing group
-        // (Finding 2) — and reports whether anything changed; a membership count
-        // change (join/leave) also forces the single resync.
+        // Reconcile transport routes once after the batch drains instead of per
+        // membership-changing event. This installs a join's current route and
+        // retains any still-live address displaced by a routing rotation.
         let routes_changed = self.refresh_group_routes()?;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
@@ -161,14 +167,15 @@ impl AppClient {
     /// component lookup fails (e.g. the group is quarantined and not live).
     /// Used by the no-inbound drain path where a missing projection must not
     /// abort processing.
-    fn event_group_projection_best_effort(
+    fn event_group_projection_best_effort<'a>(
         &self,
         group_id: &cgka_traits::GroupId,
-    ) -> Option<EventGroupProjection<'static>> {
+        group_metadata: Option<&'a cgka_traits::group::Group>,
+    ) -> Option<EventGroupProjection<'a>> {
         let nostr_routing = self.nostr_routing_for_group(group_id).ok()?;
         Some(EventGroupProjection {
             nostr_routing,
-            group_metadata: None,
+            group_metadata,
             admin_policy: self
                 .runtime
                 .admin_pubkeys(group_id)
@@ -664,11 +671,8 @@ impl AppClient {
                 .messages
                 .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
         }
-        // #695 + rotation: reconcile transport routes once after the batch drains.
-        // refresh_group_routes upserts every group's current subscription (a
-        // join's new route AND an in-place nostr_group_id / relay rotation on an
-        // existing group, Finding 2) and reports whether anything changed; a
-        // membership count change (join/leave) also forces the single resync.
+        // Reconcile current and still-live prior routes once after the batch
+        // drains; a membership-count change also forces the same single resync.
         let routes_changed = self.refresh_group_routes()?;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;

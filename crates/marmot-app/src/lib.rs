@@ -137,7 +137,8 @@ pub use groups::{
     AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason,
     AppGroupImageComponent, AppGroupMemberRecord, AppGroupMessageRetentionComponent,
     AppGroupMlsState, AppGroupNostrRoutingComponent, AppGroupProfileComponent, AppGroupRecord,
-    AppGroupSystemEvent, AppProtocolProfile, AppQuarantinedGroup, group_system_event_from_message,
+    AppGroupSystemEvent, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
+    group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -2163,7 +2164,7 @@ impl MarmotApp {
         let mut group_routes = Vec::new();
         for group in &state.groups {
             let group_id = GroupId::new(hex::decode(&group.group_id_hex)?);
-            group_routes.push(group.nostr_routing.subscription(&group_id)?);
+            group_routes.extend(group.transport_subscriptions(&group_id)?);
         }
 
         Ok(AppTransportRouting::new(AppRoutingState {
@@ -3685,25 +3686,29 @@ impl AppTransportRouting {
         }
     }
 
-    /// Insert or replace the route for a group, returning whether the route set
-    /// changed. Replaces by `group_id` (rather than early-returning on a
-    /// duplicate) so an in-place `nostr_group_id` / relay rotation on an existing
-    /// group actually switches the subscription (Finding 2). Returns `false`
-    /// when the group's subscription is already present and identical.
-    fn add_group(&self, group: TransportGroupSubscription) -> bool {
+    /// Atomically replace every current/prior subscription for one group.
+    /// Returns whether the desired route set differs from the installed set.
+    fn replace_group_routes(
+        &self,
+        group_id: &GroupId,
+        mut routes: Vec<TransportGroupSubscription>,
+    ) -> bool {
         let mut state = self.write();
-        if let Some(existing) = state
+        let mut existing = state
             .group_routes
-            .iter_mut()
-            .find(|existing| existing.group_id == group.group_id)
-        {
-            if *existing == group {
-                return false;
-            }
-            *existing = group;
-            return true;
+            .iter()
+            .filter(|route| route.group_id == *group_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        normalize_group_subscriptions(&mut existing);
+        normalize_group_subscriptions(&mut routes);
+        if existing == routes {
+            return false;
         }
-        state.group_routes.push(group);
+        state
+            .group_routes
+            .retain(|route| route.group_id != *group_id);
+        state.group_routes.extend(routes);
         true
     }
 
@@ -3726,6 +3731,19 @@ impl AppTransportRouting {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn normalize_group_subscriptions(routes: &mut Vec<TransportGroupSubscription>) {
+    for route in routes.iter_mut() {
+        route.endpoints.sort();
+        route.endpoints.dedup();
+    }
+    routes.sort_by(|left, right| {
+        left.transport_group_id
+            .cmp(&right.transport_group_id)
+            .then_with(|| left.endpoints.cmp(&right.endpoints))
+    });
+    routes.dedup();
 }
 
 impl TransportRoutingPolicy for AppTransportRouting {

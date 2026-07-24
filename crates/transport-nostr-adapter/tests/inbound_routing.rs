@@ -1087,6 +1087,78 @@ async fn synced_group_subscriptions_replace_old_routes() {
     );
 }
 
+#[tokio::test]
+async fn restart_with_retained_route_backfills_and_routes_delayed_old_event() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+    let prior_transport_group_id = vec![0xC3; 32];
+    let current_transport_group_id = vec![0xD4; 32];
+    let prior_endpoint = TransportEndpoint("wss://prior.example".into());
+    let current_endpoint = TransportEndpoint("wss://current.example".into());
+
+    // A reopened account carries both the current and retained prior route.
+    // The global cursor is deliberately newer than the delayed event below;
+    // retained routes therefore must be subscribed without that cursor.
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: current_transport_group_id,
+                    endpoints: vec![current_endpoint],
+                },
+                TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: prior_transport_group_id.clone(),
+                    endpoints: vec![prior_endpoint.clone()],
+                },
+            ],
+            since: Some(Timestamp(1_800_000_000)),
+        })
+        .await
+        .expect("restart activation succeeds");
+
+    let group_subscriptions = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|subscription| match subscription {
+            NostrSubscription::Group { since, .. } => Some(*since),
+            NostrSubscription::AccountInbox { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(group_subscriptions, vec![None, None]);
+
+    let delayed = group_event("12", &prior_transport_group_id);
+    assert!(
+        delayed.created_at < 1_800_000_000,
+        "fixture must predate the global restart cursor"
+    );
+    let delivered = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: prior_endpoint,
+            subscription_id: Some("retained-prior-route".into()),
+            event: delayed,
+        })
+        .await
+        .expect("delayed prior-route event is accepted");
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        adapter
+            .receive()
+            .await
+            .expect("receive succeeds")
+            .expect("delivery is present")
+            .group_id_hint,
+        Some(group_id)
+    );
+}
+
 // Regression for mdk#337: a failed relay unsubscribe must not fail the sync or
 // leave the routing index serving the old group set. The removal takes effect
 // in routing state immediately; the relay-side teardown is queued for retry.
