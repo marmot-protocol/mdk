@@ -203,8 +203,9 @@ pub struct GroupPushTokenRecord {
     /// Owner-signed millisecond stamp; the high half of the `(owner_ts, digest)`
     /// ordering primitive. Distinct from `updated_at_ms` (local receive time).
     pub owner_ts: i64,
-    /// 64-byte BIP-340 Schnorr signature (128 lowercase hex) by `member_id_hex`
-    /// over the exact local-only kind-451 owner-proof event id.
+    /// 64-byte BIP-340 Schnorr signature (128 lowercase hex) by `member_id_hex`.
+    /// Current producers sign the exact local-only kind-451 owner-proof event
+    /// id; legacy groups may retain kind-450 or raw-record-digest proofs.
     pub owner_sig: String,
     pub updated_at_ms: i64,
 }
@@ -722,6 +723,8 @@ fn push_owner_sig_from_signed_event(
     let expected_id = expected
         .id
         .ok_or_else(|| AppError::Publish("push owner proof event id was not set".into()))?;
+    // The id plus `verify` cryptographically binds these fields. Compare them
+    // explicitly as defense in depth at the external-signer trust boundary.
     if signed.id != expected_id
         || signed.pubkey != expected.pubkey
         || signed.created_at != expected.created_at
