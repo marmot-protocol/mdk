@@ -303,6 +303,24 @@ impl AccountDeviceSession {
         Ok(self.engine.stored_sent_welcome(id)?)
     }
 
+    /// Retained outbound Welcomes that have not yet met their independent
+    /// delivery policy. This is derived from the engine's transactional
+    /// message store, so it survives a crash before app projection writes.
+    pub fn outstanding_sent_welcomes(&self) -> SessionResult<Vec<(GroupId, TransportMessage)>> {
+        Ok(self.engine.outstanding_sent_welcomes()?)
+    }
+
+    /// IDs of delivery-aware outbound Welcomes, including completed ones.
+    pub fn tracked_outbound_welcome_ids(&self) -> SessionResult<Vec<MessageId>> {
+        Ok(self.engine.tracked_outbound_welcome_ids()?)
+    }
+
+    /// Complete one retained outbound Welcome delivery obligation after the
+    /// transport reports the required acknowledgements.
+    pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> SessionResult<()> {
+        Ok(self.engine.mark_sent_welcome_delivered(id)?)
+    }
+
     /// Stored groups that failed session-open hydration and were skipped
     /// (mdk#151 / #417), paired with their coarse quarantine reason.
     /// Backs the application's per-group recovery surface (mdk#426).

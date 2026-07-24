@@ -40,6 +40,9 @@ impl AccountManager {
         }
     }
 
+    /// Create the group and return its canonical id. Invitation delivery is
+    /// reported independently through `WelcomeDeliveryPending` events and
+    /// `pending_welcome_deliveries`.
     pub async fn create_group(
         &self,
         account_ref: &str,

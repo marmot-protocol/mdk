@@ -28,8 +28,9 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
+use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::StorageProvider;
+use cgka_traits::storage::{MessageStorage, StorageProvider};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -434,6 +435,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
 #[derive(Default)]
 struct MockPeeler {
     welcome_sender: Option<MemberId>,
+    collide_welcome_ids: bool,
 }
 
 fn hash_id(bytes: &[u8]) -> MessageId {
@@ -501,7 +503,11 @@ impl TransportPeeler for MockPeeler {
         let mut id_material = payload.ciphertext.clone();
         id_material.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&id_material),
+            id: if self.collide_welcome_ids {
+                MessageId::new(b"colliding-founding-welcome-id".to_vec())
+            } else {
+                hash_id(&id_material)
+            },
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -570,6 +576,7 @@ fn build_client_with_welcome_sender(
         .feature_registry(registry)
         .peeler(Box::new(MockPeeler {
             welcome_sender: Some(welcome_sender),
+            collide_welcome_ids: false,
         }))
         .build()
         .expect("build engine")
@@ -986,6 +993,15 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
         other => panic!("expected FoundingGroupCreated, got {other:?}"),
     };
     let welcome_id = welcome.id.clone();
+    let stored = storage.get_message(&welcome_id).unwrap();
+    assert!(
+        StoredMessagePayload::decode(&stored.payload)
+            .unwrap()
+            .as_outbound_welcome()
+            .is_some(),
+        "new outbound Welcomes must carry an explicit recoverable-delivery tag"
+    );
+    assert_eq!(alice.outstanding_sent_welcomes().unwrap().len(), 1);
     let group = alice.group_record(&group_id).unwrap();
     assert_eq!(group.epoch, cgka_traits::types::EpochId(1));
     assert_eq!(group.members.len(), 2);
@@ -1014,7 +1030,8 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
             .extensions
             .contains(&ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE)
     );
-    let duplicate_welcome = welcome.clone();
+    let mut duplicate_welcome = welcome.clone();
+    duplicate_welcome.id = MessageId::new(b"distinct-transport-id-same-welcome".to_vec());
     let joined = bob.join_welcome(welcome).await.unwrap();
     assert_eq!(
         bob.group_record(&joined).unwrap().protocol_profile,
@@ -1030,6 +1047,7 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     ));
     assert_eq!(bob.epoch(&joined).unwrap(), cgka_traits::types::EpochId(1));
     assert_eq!(bob.members(&joined).unwrap().len(), 2);
+
     assert!(matches!(
         alice.drain_events().as_slice(),
         [cgka_traits::engine::GroupEvent::GroupCreated { group_id: created }]
@@ -1047,6 +1065,20 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     assert!(matches!(error, EngineError::InvalidAccountIdentityProof(_)));
 
     drop(alice);
+
+    // Upgrade compatibility: historical versions stored outbound Welcomes as
+    // raw `Sent` rows but did not persist their acknowledgement completion.
+    // A known id remains re-deliverable, while cold-restart discovery must not
+    // resurrect such an old row after it may already have reached its recipient.
+    let mut historical = storage.get_message(&welcome_id).unwrap();
+    let message = StoredMessagePayload::decode(&historical.payload)
+        .unwrap()
+        .into_message();
+    historical.payload = StoredMessagePayload::raw_transport(message)
+        .encode()
+        .unwrap();
+    storage.put_message(&historical).unwrap();
+
     let mut reopened = EngineBuilder::new(storage)
         .identity(pad32(b"alice-current-group"))
         .account_identity_proof_signer(proof_signer(b"alice-current-group"))
@@ -1059,9 +1091,53 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     assert_eq!(reopened_group.protocol_profile, ProtocolProfile::Current);
     assert_eq!(reopened_group.epoch, cgka_traits::types::EpochId(1));
     assert_eq!(reopened_group.members.len(), 2);
+    assert!(
+        reopened.outstanding_sent_welcomes().unwrap().is_empty(),
+        "historical raw Sent Welcomes have unknown ack state and must not be rediscovered"
+    );
     let (stored_group, stored_welcome) = reopened.stored_sent_welcome(&welcome_id).unwrap();
     assert_eq!(stored_group, group_id);
     assert_eq!(stored_welcome.id, welcome_id);
+}
+
+#[tokio::test]
+async fn current_group_rejects_colliding_founding_welcome_ids_atomically() {
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice-colliding-welcomes"))
+        .account_identity_proof_signer(proof_signer(b"alice-colliding-welcomes"))
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler {
+            welcome_sender: None,
+            collide_welcome_ids: true,
+        }))
+        .build()
+        .unwrap();
+    let mut bob = build_current_client(b"bob-colliding-welcomes");
+    let mut carol = build_current_client(b"carol-colliding-welcomes");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+
+    let error = alice
+        .create_group(CreateGroupRequest {
+            name: "colliding founding welcomes".into(),
+            description: String::new(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("two invitees must not share a Welcome delivery id");
+
+    assert!(matches!(
+        error,
+        EngineError::Backend(ref message)
+            if message == "founding creation did not produce one distinct Welcome per invitee"
+    ));
+    assert!(
+        alice.live_group_ids().unwrap().is_empty(),
+        "the failed founding transaction must leave no live group"
+    );
 }
 
 #[tokio::test]

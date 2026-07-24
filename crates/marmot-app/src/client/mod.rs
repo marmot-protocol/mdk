@@ -86,6 +86,30 @@ pub struct AppClient {
     pub(crate) epoch_backfill_pending: bool,
 }
 
+/// Cross the point-of-no-return for current-profile group creation without
+/// allowing repairable follow-up work to turn a canonical group into an
+/// apparent create failure. Returning `Err` after that boundary encourages a
+/// caller to retry and create a second group. The engine's retained outbound
+/// Welcome index and account-open reconciliation repair any missed projection
+/// work.
+fn recover_post_canonical_result<T: Default>(
+    method: &'static str,
+    result: Result<T, AppError>,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method,
+                error_kind = error.privacy_safe_kind(),
+                "canonical group creation outpaced repairable follow-up work"
+            );
+            T::default()
+        }
+    }
+}
+
 /// A point-in-time copy of the live session's read-only group projections
 /// (`members`, `group_mls_state`, `quarantined_groups`).
 ///
@@ -229,6 +253,12 @@ impl AppClient {
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
 
+    /// Create a locally canonical group and attempt each founding Welcome.
+    ///
+    /// `Ok(group_id)` reports group creation, not blanket invitation success.
+    /// Any Welcome that misses its acknowledgement policy is reported through
+    /// `WelcomeDeliveryPending` and remains listed by
+    /// [`Self::pending_welcome_deliveries`] for explicit re-delivery.
     pub async fn create_group(
         &mut self,
         name: &str,
@@ -285,18 +315,32 @@ impl AppClient {
         // transport delivery. Persist every exact Welcome obligation before
         // the first external side effect, so a crash between recipients
         // cannot lose the still-undelivered work or induce a second group.
-        let founding_welcome_intents =
-            self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects)?;
-        let effects = self
-            .runtime
-            .publish_prepared_session_effects_with_audit_context(
-                prepared.effects,
-                audit_context.clone(),
-            )
-            .await?;
-        self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects)?;
-        fail_if_publish_failed(&effects)?;
-        self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects)?;
+        let founding_welcome_intents = recover_post_canonical_result(
+            "record_founding_welcome_delivery_intents",
+            self.record_founding_welcome_delivery_intents(&group_id, &prepared.effects),
+        );
+        let effects = recover_post_canonical_result(
+            "publish_prepared_founding_group",
+            self.runtime
+                .publish_prepared_session_effects_with_audit_context(
+                    prepared.effects,
+                    audit_context.clone(),
+                )
+                .await
+                .map_err(AppError::from),
+        );
+        recover_post_canonical_result(
+            "clear_delivered_founding_welcome_intents",
+            self.clear_delivered_founding_welcome_intents(&founding_welcome_intents, &effects),
+        );
+        recover_post_canonical_result(
+            "classify_founding_welcome_publish",
+            fail_if_publish_failed(&effects),
+        );
+        recover_post_canonical_result(
+            "record_founding_welcome_delivery_failures",
+            self.record_welcome_delivery_failures(&hex::encode(group_id.as_slice()), &effects),
+        );
         self.record_human_action_succeeded(&group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         // The engine group is already published and confirmed. Projection,
@@ -2207,6 +2251,60 @@ impl AppClient {
         Ok(())
     }
 
+    /// Reconcile the app-facing repair index from the engine's authoritative
+    /// retained Welcome obligations.
+    ///
+    /// The engine persists founding Welcomes in the same transaction that
+    /// makes the group canonical. This closes the crash window between
+    /// `prepare_create_group` returning and the app recording its convenience
+    /// index: a cold restart can rebuild missing rows without re-creating the
+    /// group or re-consuming KeyPackages.
+    fn reconcile_pending_welcome_delivery_index(&self) -> Result<(), AppError> {
+        let outstanding = self.runtime.outstanding_welcome_deliveries()?;
+        let tracked_ids = self
+            .runtime
+            .tracked_outbound_welcome_ids()?
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect::<HashSet<_>>();
+        let storage = self.app.account_storage(&self.state.label)?;
+        let existing = storage.list_pending_welcome_deliveries()?;
+        let outstanding_ids = outstanding
+            .iter()
+            .map(|(_, welcome)| hex::encode(welcome.id.as_slice()))
+            .collect::<HashSet<_>>();
+
+        for record in &existing {
+            if tracked_ids.contains(&record.message_id_hex)
+                && !outstanding_ids.contains(&record.message_id_hex)
+            {
+                storage.clear_pending_welcome_delivery(&record.message_id_hex)?;
+            }
+        }
+
+        let existing_ids = existing
+            .into_iter()
+            .map(|record| record.message_id_hex)
+            .collect::<HashSet<_>>();
+        let recorded_at = unix_now_seconds();
+        for (group_id, welcome) in outstanding {
+            let TransportEnvelope::Welcome { recipient } = welcome.envelope else {
+                continue;
+            };
+            let message_id_hex = hex::encode(welcome.id.as_slice());
+            if existing_ids.contains(&message_id_hex) {
+                continue;
+            }
+            storage.record_pending_welcome_delivery(
+                &message_id_hex,
+                &hex::encode(group_id.as_slice()),
+                &hex::encode(recipient.as_slice()),
+                recorded_at,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Drain the welcomes queued for re-delivery during the last create/invite,
     /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
     /// (mdk#352).
@@ -2218,6 +2316,7 @@ impl AppClient {
     /// first. Each entry's `message_id_hex` is the handle for
     /// [`AppClient::redeliver_welcome`].
     pub fn pending_welcome_deliveries(&self) -> Result<Vec<PendingWelcomeDelivery>, AppError> {
+        self.reconcile_pending_welcome_delivery_index()?;
         Ok(self
             .app
             .account_storage(&self.state.label)?
@@ -2282,6 +2381,24 @@ fn local_account_removed_from_roster(
     !members
         .iter()
         .any(|member| hex::encode(member.id.as_slice()).eq_ignore_ascii_case(local_account_id_hex))
+}
+
+#[cfg(test)]
+mod post_canonical_create_tests {
+    use super::recover_post_canonical_result;
+    use crate::AppError;
+
+    #[test]
+    fn post_canonical_failures_default_instead_of_escaping() {
+        let recovered: Vec<String> = recover_post_canonical_result(
+            "test_post_canonical_failure",
+            Err(AppError::Publish("injected failure".into())),
+        );
+        assert!(recovered.is_empty());
+
+        let successful: u8 = recover_post_canonical_result("test_post_canonical_success", Ok(7));
+        assert_eq!(successful, 7);
+    }
 }
 
 #[cfg(test)]

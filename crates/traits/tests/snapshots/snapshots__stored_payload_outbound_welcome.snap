@@ -1,0 +1,61 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: outbound_welcome_payload
+---
+{
+  "kind": "outbound_welcome",
+  "message": {
+    "id": [
+      187,
+      187,
+      187,
+      187
+    ],
+    "payload": [
+      1,
+      2,
+      3
+    ],
+    "timestamp": 1717171717,
+    "causal_deps": [],
+    "source": "nostr",
+    "envelope": {
+      "Welcome": {
+        "recipient": [
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221,
+          221
+        ]
+      }
+    }
+  }
+}

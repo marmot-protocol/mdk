@@ -1040,6 +1040,10 @@ impl MarmotAppRuntime {
         }
     }
 
+    /// Create a locally canonical group. A successful return does not imply
+    /// every invitation Welcome was delivered; subscribe for
+    /// [`MarmotAppEvent::WelcomeDeliveryPending`] or query
+    /// [`Self::pending_welcome_deliveries`] before presenting invite success.
     pub async fn create_group(
         &self,
         account_ref: &str,

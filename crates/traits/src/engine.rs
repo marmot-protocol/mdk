@@ -194,7 +194,8 @@ pub enum SendResult {
     /// founding Add are already canonical when this result is returned. No
     /// normal group message or pending publish handle exists; each Welcome is
     /// an independent delivery obligation whose failure cannot roll back the
-    /// group.
+    /// group. This result alone does not imply any Welcome was delivered:
+    /// callers must publish and acknowledge every entry independently.
     FoundingGroupCreated { welcomes: Vec<TransportMessage> },
 }
 

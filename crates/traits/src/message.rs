@@ -39,6 +39,11 @@ pub struct OwnCommitConvergenceStamp {
 ///
 /// - `RawTransport`: original transport-wrapped message. Used when peeling is
 ///   deferred or the engine needs to retry with a different epoch context.
+/// - `OutboundWelcome`: a locally produced Welcome retained until its
+///   independent transport acknowledgement policy is satisfied. Keeping this
+///   distinct from historical `RawTransport` `Sent` rows lets cold-restart
+///   recovery find only delivery obligations created by versions that track
+///   their completion.
 /// - `OpenMlsWire`: transport metadata plus payload replaced with peeled MLS
 ///   wire bytes. Only this variant and `OwnCommitWire` are eligible for
 ///   OpenMLS projection and convergence replay.
@@ -50,6 +55,7 @@ pub struct OwnCommitConvergenceStamp {
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum StoredMessagePayload {
     RawTransport(TransportMessage),
+    OutboundWelcome(TransportMessage),
     OpenMlsWire(TransportMessage),
     OwnCommitWire {
         message: TransportMessage,
@@ -60,6 +66,10 @@ pub enum StoredMessagePayload {
 impl StoredMessagePayload {
     pub fn raw_transport(message: TransportMessage) -> Self {
         Self::RawTransport(message)
+    }
+
+    pub fn outbound_welcome(message: TransportMessage) -> Self {
+        Self::OutboundWelcome(message)
     }
 
     pub fn openmls_wire(message: TransportMessage) -> Self {
@@ -87,13 +97,20 @@ impl StoredMessagePayload {
     pub fn as_raw_transport(&self) -> Option<&TransportMessage> {
         match self {
             Self::RawTransport(message) => Some(message),
-            Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
+            Self::OutboundWelcome(_) | Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
+        }
+    }
+
+    pub fn as_outbound_welcome(&self) -> Option<&TransportMessage> {
+        match self {
+            Self::OutboundWelcome(message) => Some(message),
+            Self::RawTransport(_) | Self::OpenMlsWire(_) | Self::OwnCommitWire { .. } => None,
         }
     }
 
     pub fn as_openmls_wire(&self) -> Option<&TransportMessage> {
         match self {
-            Self::RawTransport(_) => None,
+            Self::RawTransport(_) | Self::OutboundWelcome(_) => None,
             Self::OpenMlsWire(message) | Self::OwnCommitWire { message, .. } => Some(message),
         }
     }
@@ -102,7 +119,7 @@ impl StoredMessagePayload {
     /// published-and-confirmed commit.
     pub fn own_commit_stamp(&self) -> Option<&OwnCommitConvergenceStamp> {
         match self {
-            Self::RawTransport(_) | Self::OpenMlsWire(_) => None,
+            Self::RawTransport(_) | Self::OutboundWelcome(_) | Self::OpenMlsWire(_) => None,
             Self::OwnCommitWire { stamp, .. } => Some(stamp),
         }
     }
@@ -110,6 +127,7 @@ impl StoredMessagePayload {
     pub fn into_message(self) -> TransportMessage {
         match self {
             Self::RawTransport(message)
+            | Self::OutboundWelcome(message)
             | Self::OpenMlsWire(message)
             | Self::OwnCommitWire { message, .. } => message,
         }
@@ -129,6 +147,7 @@ pub struct MessageRecord {
 ///
 /// Transitions:
 ///   `Sent` → `Sent` (outbound message recorded for durable own-echo checks)
+///   `Sent` → `Processed` (a retained outbound Welcome met its delivery policy)
 ///   `Created` → `Processed` (happy path after successful ingest)
 ///   `Created` → `Failed` (terminal error — no retry)
 ///   `Created` → `Retryable` (transient error — can be re-tried later)
@@ -143,7 +162,8 @@ pub enum MessageState {
     Sent,
     /// Stored but not yet processed.
     Created,
-    /// Successfully applied to the group state.
+    /// Successfully applied to the group state, or a retained outbound
+    /// Welcome whose independent delivery obligation completed.
     Processed,
     /// Terminal failure — do not retry.
     Failed,
