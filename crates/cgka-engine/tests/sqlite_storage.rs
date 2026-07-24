@@ -11,6 +11,7 @@ use cgka_engine::EngineBuilder;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
@@ -176,5 +177,11 @@ async fn create_group_confirm_and_reopen_with_encrypted_sqlite_storage() {
     assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
 
     let reopened = SqliteAccountStorage::open_encrypted(&alice_path, &key).unwrap();
-    assert_eq!(reopened.get_group(&group_id).unwrap().epoch, EpochId(1));
+    let reopened_group = reopened.get_group(&group_id).unwrap();
+    assert_eq!(reopened_group.epoch, EpochId(1));
+    assert_eq!(
+        reopened_group.protocol_profile,
+        ProtocolProfile::Legacy,
+        "the persisted application-profile classification must survive an engine reopen"
+    );
 }

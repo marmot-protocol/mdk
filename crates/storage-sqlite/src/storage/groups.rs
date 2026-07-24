@@ -113,9 +113,32 @@ mod tests {
             .unwrap();
 
         let reopened = store.get_group(&group.id).unwrap();
-        assert_eq!(reopened.protocol_profile, ProtocolProfile::Legacy);
-        assert_eq!(reopened.name, group.name);
-        assert_eq!(reopened.members, group.members);
+        assert_eq!(reopened, group);
+    }
+
+    #[test]
+    fn corrupt_present_group_profile_fails_closed() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 7, 3);
+        let mut record = serde_json::to_value(&group).unwrap();
+        record["protocol_profile"] = serde_json::json!("nope");
+        let bytes = serde_json::to_vec(&record).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, ?2, ?3)",
+                rusqlite::params![group.id.as_slice(), 7, bytes],
+            )
+            .unwrap();
+
+        let error = store
+            .get_group(&group.id)
+            .expect_err("a present corrupt profile must not fall through the serde default");
+        assert!(
+            matches!(&error, StorageError::Serialization(message) if message.contains("unknown variant")),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

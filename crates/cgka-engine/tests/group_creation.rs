@@ -21,6 +21,7 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::TransportPeeler;
@@ -880,6 +881,38 @@ async fn fresh_key_package_roundtrips_bytes() {
     assert!(
         !kp.bytes().is_empty(),
         "key package bytes should be non-empty"
+    );
+}
+
+#[tokio::test]
+async fn create_group_rejects_relabelled_legacy_key_package_profile() {
+    let mut alice = build_client(b"alice-profile", selfremove_registry());
+    let mut bob = build_client(b"bob-profile", selfremove_registry());
+    let relabelled_key_package = bob
+        .fresh_key_package()
+        .await
+        .unwrap()
+        .with_protocol_profile(ProtocolProfile::Current);
+
+    let err = alice
+        .create_group(CreateGroupRequest {
+            name: "profile-mismatch".into(),
+            description: "".into(),
+            members: vec![relabelled_key_package],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .expect_err("legacy proof bytes must not be accepted as a Current-profile KeyPackage");
+
+    assert!(
+        matches!(
+            &err,
+            EngineError::InvalidAccountIdentityProof(message)
+                if message.contains("decoded account proof is Legacy")
+        ),
+        "unexpected error: {err:?}"
     );
 }
 

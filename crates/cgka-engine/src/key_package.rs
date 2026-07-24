@@ -10,6 +10,7 @@ use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
+use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
     Extensions, KeyPackage as MlsKeyPackage, KeyPackageVerifyError, MlsMessageBodyIn, MlsMessageIn,
@@ -51,6 +52,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
         key_package.leaf_node(),
         key_package.ciphersuite(),
     )?;
+    ensure_legacy_key_package_profile(kp)?;
     let key_package_ref = key_package
         .hash_ref(&crypto)
         .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))?;
@@ -83,6 +85,7 @@ pub fn is_last_resort_key_package(kp: &KeyPackage) -> Result<bool, EngineError> 
         key_package.leaf_node(),
         key_package.ciphersuite(),
     )?;
+    ensure_legacy_key_package_profile(kp)?;
     Ok(key_package.last_resort())
 }
 
@@ -183,8 +186,26 @@ impl<S: StorageProvider> Engine<S> {
             key_package.leaf_node(),
             self.ciphersuite,
         )?;
+        ensure_legacy_key_package_profile(kp)?;
         Ok(key_package)
     }
+}
+
+/// Bind the persisted wrapper classification to the only account-proof
+/// carrier this pre-cutover slice can validate.
+///
+/// The stacked current-profile implementation generalizes this check by
+/// deriving the profile from the decoded proof carrier. Keeping the check here
+/// prevents callers from relabeling legacy wire bytes as current in the
+/// meantime and then dispatching on unverified metadata.
+fn ensure_legacy_key_package_profile(key_package: &KeyPackage) -> Result<(), EngineError> {
+    if key_package.protocol_profile != ProtocolProfile::Legacy {
+        return Err(EngineError::InvalidAccountIdentityProof(format!(
+            "KeyPackage metadata says {:?}, but its decoded account proof is Legacy",
+            key_package.protocol_profile
+        )));
+    }
+    Ok(())
 }
 
 fn validate_key_package(

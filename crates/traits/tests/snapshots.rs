@@ -682,6 +682,37 @@ fn key_package_profile_is_persisted_and_old_records_default_to_legacy() {
     let reopened: KeyPackage =
         serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
     assert_eq!(reopened.protocol_profile, ProtocolProfile::Current);
+
+    let invalid = serde_json::from_value::<KeyPackage>(serde_json::json!({
+        "bytes": [7, 8, 9],
+        "protocol_profile": "nope"
+    }))
+    .expect_err("a present corrupt profile must not fall through the serde default");
+    assert!(invalid.to_string().contains("unknown variant"));
+}
+
+#[test]
+fn key_package_equality_and_hash_include_protocol_profile_but_not_source() {
+    use std::collections::HashSet;
+
+    let legacy = KeyPackage::new(vec![1, 2, 3]);
+    let legacy_with_source =
+        KeyPackage::with_source_event_id(vec![1, 2, 3], MessageId::new(vec![4; 32]));
+    let current = KeyPackage::new(vec![1, 2, 3]).with_protocol_profile(ProtocolProfile::Current);
+
+    assert_eq!(
+        legacy, legacy_with_source,
+        "transport provenance must not change KeyPackage identity"
+    );
+    assert_ne!(
+        legacy, current,
+        "application-profile metadata must remain visible to equality"
+    );
+    assert_eq!(
+        HashSet::from([legacy, legacy_with_source, current]).len(),
+        2,
+        "hashing must use the same identity fields as equality"
+    );
 }
 
 #[test]

@@ -60,9 +60,12 @@ pub struct KeyPackage {
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<KeyPackageSource>,
-    /// Persisted wire-compatibility profile. Raw KeyPackages constructed by
-    /// pre-classification callers default to legacy and must still be checked
-    /// against their decoded wire state by the engine.
+    /// Persisted application-profile classification asserted by the wrapper.
+    ///
+    /// Raw KeyPackages constructed before the strict cutover default to
+    /// legacy. The engine must verify this value against the decoded
+    /// account-proof carrier before any behavior branches on it; it is not a
+    /// statement about whether the MLS bytes use `app_data_dictionary`.
     #[serde(default)]
     pub protocol_profile: ProtocolProfile,
 }
@@ -96,7 +99,10 @@ impl KeyPackage {
 
 impl PartialEq for KeyPackage {
     fn eq(&self, other: &Self) -> bool {
-        self.bytes == other.bytes
+        // Transport provenance does not change KeyPackage identity, but the
+        // application-profile classification is security-relevant metadata
+        // and must not disappear from equality assertions or keyed sets.
+        self.bytes == other.bytes && self.protocol_profile == other.protocol_profile
     }
 }
 
@@ -105,6 +111,7 @@ impl Eq for KeyPackage {}
 impl Hash for KeyPackage {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.bytes.hash(state);
+        self.protocol_profile.hash(state);
     }
 }
 
