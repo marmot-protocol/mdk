@@ -101,7 +101,7 @@ fn recover_post_canonical_result<T: Default>(
         Err(error) => {
             tracing::warn!(
                 target: "marmot_app::client",
-                method,
+                method = method,
                 error_kind = error.privacy_safe_kind(),
                 "canonical group creation outpaced repairable follow-up work"
             );
