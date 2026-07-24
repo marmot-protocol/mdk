@@ -276,6 +276,22 @@ versioning through the workspace version in the root `Cargo.toml`.
   commands expose the lifecycle. New groups are periodically enrolled by default; existing groups remain manual-only.
   Successful application-send JSON now includes `maintenance_disposition` without blocking sends while post-join
   rotation is pending. ([#1103](https://github.com/marmot-protocol/mdk/pull/1103))
+- TUI: the daemon auto-starts at launch when it is down and the TUI holds a relay source to give it (the
+  `--discovery-relays`/`--default-account-relays` passthrough flags, a global `--relay`, or `WN_RELAY`) — exactly as
+  `/daemon start` would, but off the event loop, since `wn daemon start` blocks up to five seconds on its readiness
+  poll. The status line shows `starting daemon...` and then the outcome, the status-bar dot flips green when the start
+  lands, and the daemon-backed live subscriptions attach without any manual action. Without a relay source no start is
+  attempted (it would fail requiring a relay URL): one honest status says so and the login/main flow continues degraded
+  exactly as before. Deliberate divergence from the retired reference client, which killed its auto-started daemon on
+  exit: the TUI never stops the daemon, because other `wn` commands share it — stop it explicitly with `/daemon stop`.
+- TUI: `f`/`x` on a highlighted user-search result follow/unfollow that user directly — the same key letters as the
+  Profile screen's `f`/`x`, but acting directly on the highlighted result (Profile's go through popups) instead of a
+  round-trip through the Profile screen with a pasted pubkey. Both run
+  `follows add`/`follows remove` on the background worker with in-flight feedback, and the outcome folds into a
+  per-row `[following]` badge. Rows an account already follows are badged up front from a `follows list` snapshot (one
+  local directory read per search, not a `follows check` per row). A fold whose search screen was left, whose acting
+  account was switched, or whose user is no longer among the results is dropped rather than badging the wrong row; the
+  results-focus hints line and the help card name the new keys.
 - TUI: `/logout` removes the currently selected account. `wn logout` is destructive — it permanently erases the
   account's local data (messages, group membership, and MLS state) from this device and, for a local-signing account,
   deletes its signing key too — so the confirmation scales to the consequence. A local-signing logout is irreversible,

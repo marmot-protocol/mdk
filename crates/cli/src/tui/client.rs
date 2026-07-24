@@ -323,16 +323,27 @@ impl EffectRunner {
     }
 }
 
-/// Run every call an effect expands to, in order, short-circuiting on the first
-/// error (mirroring the `?` chaining the synchronous handlers used). Worker
-/// thread only. The error is reduced to a message string at this boundary; the
-/// folds only ever surface it on the status line.
+/// Run every call an effect expands to, in order. A required call's failure
+/// short-circuits the effect with the error (mirroring the `?` chaining the
+/// synchronous handlers used). A trailing best-effort enrichment call's failure
+/// instead stops the run and returns the required results already gathered, so
+/// the fold degrades gracefully — a `users search` whose `follows list` badge
+/// read failed still folds its results, unbadged, rather than being discarded as
+/// an error. Worker thread only. The error is reduced to a message string at this
+/// boundary; the folds only ever surface it on the status line.
 fn run_effect(client: &WnClient, effect: &Effect) -> Result<Vec<Value>, String> {
+    let calls = effect.calls();
+    let required = calls.len() - effect.best_effort_trailing_calls();
     let mut values = Vec::new();
-    for call in effect.calls() {
-        match client.run_json(Some(&call.account), &call.args) {
+    for (index, call) in calls.into_iter().enumerate() {
+        match client.run_json(call.account.as_deref(), &call.args) {
             Ok(value) => values.push(value),
-            Err(err) => return Err(err.to_string()),
+            Err(err) if index < required => return Err(err.to_string()),
+            // A trailing best-effort call failed. Every remaining call is also
+            // best-effort (they are trailing by construction), so stop here: the
+            // fold treats the missing enrichment value exactly as an older
+            // single-value result — no badges — instead of surfacing an error.
+            Err(_) => break,
         }
     }
     Ok(values)
@@ -404,6 +415,22 @@ impl TuiApp {
             Effect::Relist { account, .. } => {
                 self.fold_relist(account, result);
             }
+            Effect::FollowUser {
+                account,
+                pubkey,
+                label,
+                ..
+            } => {
+                self.fold_follow_update(account, pubkey, label, true, result);
+            }
+            Effect::UnfollowUser {
+                account,
+                pubkey,
+                label,
+                ..
+            } => {
+                self.fold_follow_update(account, pubkey, label, false, result);
+            }
         }
     }
 
@@ -432,6 +459,21 @@ impl TuiApp {
                 .expect("effect worker produced a result");
             self.apply_effect_done(done);
         }
+    }
+
+    /// Wait for the launch daemon auto-start's one-shot thread to report and fold
+    /// its outcome, for end-to-end tests over a fake `wn`. Panics if no auto-start
+    /// is in flight or the thread stalls.
+    #[cfg(test)]
+    pub(crate) fn settle_daemon_autostart(&mut self) {
+        let rx = self
+            .daemon_autostart
+            .take()
+            .expect("a daemon auto-start is in flight");
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("daemon auto-start produced a result");
+        self.fold_daemon_start(result);
     }
 
     /// Send the composer text off the event loop. The optimistic row folds in
@@ -1279,14 +1321,21 @@ impl TuiApp {
         if self.user_search.is_none() {
             return;
         }
-        let result = match single_effect_value(result) {
-            Ok(value) => value,
+        let values = match result {
+            Ok(values) => values,
             Err(err) => {
                 self.status = format!("error: {err}");
                 return;
             }
         };
-        let results = parse_user_search_results(&result);
+        let mut results = parse_user_search_results(values.first().unwrap_or(&Value::Null));
+        // The effect's second call is the local `follows list` snapshot; badge
+        // every row's follow state from it. Tolerant to a missing value like
+        // every parse (an older single-value result simply carries no badges).
+        let follows = follows_pubkey_set(values.get(1).unwrap_or(&Value::Null));
+        for row in &mut results {
+            row.following = follows.contains(&row.pubkey);
+        }
         let count = results.len();
         if let Some(view) = self.user_search.as_mut() {
             view.focus = if results.is_empty() {
@@ -1298,6 +1347,101 @@ impl TuiApp {
             view.selected = 0;
         }
         self.status = format!("found {count} user(s)");
+    }
+
+    /// Follow the highlighted search result (`f`) off the event loop; the fold
+    /// badges the row when the publish lands.
+    pub(crate) fn follow_search_result(&mut self) {
+        self.update_search_follow(true);
+    }
+
+    /// Unfollow the highlighted search result (`x`); mirrors `f`.
+    pub(crate) fn unfollow_search_result(&mut self) {
+        self.update_search_follow(false);
+    }
+
+    /// Queue the follow/unfollow effect for the highlighted result. `follows
+    /// add`/`remove` are idempotent, so the explicit pair stays correct even if
+    /// the row's badge is momentarily stale — unlike a toggle, which would
+    /// invert the intent. No selected result is a silent no-op (the key only
+    /// renders meaningful in results focus).
+    fn update_search_follow(&mut self, follow: bool) {
+        let Some(row) = self
+            .user_search
+            .as_ref()
+            .and_then(UserSearchView::selected_result)
+        else {
+            return;
+        };
+        let pubkey = row.pubkey.clone();
+        let label = row.display_label();
+        let account = match self.require_selected_local_account() {
+            Ok(account) => account,
+            Err(err) => {
+                self.status = format!("error: {err}");
+                return;
+            }
+        };
+        let relay = self.client.account_setup_relay();
+        self.status = if follow {
+            format!("following {label}...")
+        } else {
+            format!("unfollowing {label}...")
+        };
+        let effect = if follow {
+            Effect::FollowUser {
+                account,
+                pubkey,
+                label,
+                relay,
+            }
+        } else {
+            Effect::UnfollowUser {
+                account,
+                pubkey,
+                label,
+                relay,
+            }
+        };
+        self.effects.enqueue(effect);
+    }
+
+    /// Fold a search-screen follow/unfollow: report the outcome, then badge the
+    /// acted-on row. The mutation's status is unconditional (the publish
+    /// happened, like a react or delete), but the badge fold is anchored — the
+    /// search view must still exist (leaving destroys it) and the selected
+    /// account must still be the acting one; the row is keyed by pubkey, so a
+    /// newer query's results only pick up the badge where that user is
+    /// genuinely still on screen.
+    fn fold_follow_update(
+        &mut self,
+        account: String,
+        pubkey: String,
+        label: String,
+        following: bool,
+        result: Result<Vec<Value>, String>,
+    ) {
+        if let Err(err) = single_effect_value(result) {
+            self.status = format!("error: {err}");
+            return;
+        }
+        self.status = if following {
+            format!("followed {label}")
+        } else {
+            format!("unfollowed {label}")
+        };
+        if self
+            .selected_account_row()
+            .map(|row| row.account_id.as_str())
+            != Some(account.as_str())
+        {
+            return;
+        }
+        if let Some(view) = self.user_search.as_mut() {
+            for row in view.results.iter_mut().filter(|row| row.pubkey == pubkey) {
+                row.following = following;
+            }
+        }
     }
 
     /// Open the dismiss-on-any-key profile card for the selected search result
@@ -1677,14 +1821,52 @@ impl TuiApp {
         Ok(())
     }
 
-    pub(crate) fn refresh_daemon_status(&mut self) -> TuiResult<()> {
-        let result = self.client.run_json(None, &["daemon", "status"])?;
-        self.daemon = parse_daemon_view(&result);
+    /// Adopt a daemon status/start result: parse the view and (re)attach the
+    /// daemon-backed subscriptions for the current selection. Shared by the
+    /// status refresh, the synchronous `/daemon start`, and the launch
+    /// auto-start fold, so every path that learns the daemon came up reflects
+    /// it the same way — including the status-bar dot, which reads
+    /// `daemon.running` each frame.
+    fn adopt_daemon_view(&mut self, result: &Value) {
+        self.daemon = parse_daemon_view(result);
         self.ensure_selected_chat_subscription();
         self.ensure_selected_message_subscription();
         self.ensure_selected_group_state_subscription();
         self.ensure_selected_timeline_subscription();
         self.ensure_selected_notification_subscription();
+    }
+
+    /// Fold the launch daemon auto-start's outcome: adopt the started daemon or
+    /// surface the failure on the status line. Either way the session stays up.
+    ///
+    /// The status write is guarded on the `starting daemon...` sentinel the
+    /// auto-start set (the same idiom the group-detail load uses). Because it runs
+    /// off the event loop, a user action may have queued a newer status (e.g.
+    /// `sending...`) meanwhile; that must survive. Only overwrite while the
+    /// sentinel is still showing, and otherwise let the status-bar dot — which
+    /// reads `daemon.running` each frame — tell the story. The daemon view is
+    /// always adopted regardless, so the dot and the subscriptions reflect the
+    /// start either way; checking the sentinel after the adopt also preserves a
+    /// genuine subscription-failure status the adopt may have surfaced.
+    pub(crate) fn fold_daemon_start(&mut self, result: Result<Value, String>) {
+        match result {
+            Ok(value) => {
+                self.adopt_daemon_view(&value);
+                if self.status == STARTING_DAEMON_STATUS {
+                    self.status = daemon_status_sentence(&self.daemon);
+                }
+            }
+            Err(err) => {
+                if self.status == STARTING_DAEMON_STATUS {
+                    self.status = format!("daemon start failed: {err}");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn refresh_daemon_status(&mut self) -> TuiResult<()> {
+        let result = self.client.run_json(None, &["daemon", "status"])?;
+        self.adopt_daemon_view(&result);
         Ok(())
     }
 
@@ -1694,12 +1876,7 @@ impl TuiApp {
             &self.client.default_account_relays,
         );
         let result = self.client.run_json(None, &args)?;
-        self.daemon = parse_daemon_view(&result);
-        self.ensure_selected_chat_subscription();
-        self.ensure_selected_message_subscription();
-        self.ensure_selected_group_state_subscription();
-        self.ensure_selected_timeline_subscription();
-        self.ensure_selected_notification_subscription();
+        self.adopt_daemon_view(&result);
         self.status = daemon_status_sentence(&self.daemon);
         Ok(())
     }

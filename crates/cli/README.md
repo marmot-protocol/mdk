@@ -539,6 +539,16 @@ When a daemon is running for the same home, TUI child commands use the daemon so
 state. While the daemon is running, the TUI attaches to daemon-backed runtime subscriptions for live message, chat, and
 group-state changes, and refreshes snapshots when the composer is idle.
 
+When the daemon is not running at launch, the TUI auto-starts it — exactly as `/daemon start` would — provided it
+holds a relay source to give it: the passthrough flags above, a global `--relay`, or `WN_RELAY`. The start runs off
+the event loop (`wn daemon start` waits on a readiness poll), so the status line shows `starting daemon...` and then
+the outcome, and the status-bar dot flips green when it lands. Without any relay source no start is attempted — it
+would only fail requiring a relay URL — and one status says so; the login/main flow continues degraded. To fix it,
+restart `wn tui` with `--discovery-relays`/`--default-account-relays` (or `WN_RELAY`); `/daemon start` in-session reads
+the same relay sources and would fail identically. Unlike the retired reference client, which killed its auto-started
+daemon on exit, the TUI never stops the daemon when it quits:
+other `wn` commands share it. Stop it explicitly with `/daemon stop` or `wn daemon stop`.
+
 User-initiated commands — sending a message, replying, reacting/unreacting, deleting, opening a chat, searching users,
 opening group detail, and listing invites — run on a background worker so a `wn` round-trip never freezes typing,
 scrolling, or input. The ambient chat-list re-read that a notification for a non-selected chat triggers runs on that
@@ -660,7 +670,12 @@ query (so `j`/`k` are literal text) and `Enter` runs the search; once there are 
 starts a new chat with them (a text popup names it, then `group create`), and `a` adds them to an existing chat: a
 group picker lists your chats (`j`/`k` move, `Enter` picks, `Esc` closes without side effects), preselecting the open
 chat when one is loaded, and `Enter` opens the confirm popup that guards the add (`groups add-members`), naming both
-the user and the chosen chat. With no chats a status notice explains and points at `c`. `i` returns to the query, and
+the user and the chosen chat. With no chats a status notice explains and points at `c`. `f` follows the highlighted
+result (`follows add`) and `x` unfollows them (`follows remove`) — the same key letters as the Profile screen's
+`f`/`x`, but acting directly on the highlighted result (Profile's go through popups). Both run on the background
+worker with in-flight feedback and fold into a per-row
+`[following]` badge; rows you already follow are badged up front from a `follows list` snapshot taken with each
+search. `i` returns to the query, and
 `Esc` returns to the main view. Result rows show the display name/name, a shortened npub, and the `matched_field · match_quality · radius`
 attribution the search returns.
 

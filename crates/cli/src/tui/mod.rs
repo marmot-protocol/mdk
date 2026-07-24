@@ -97,6 +97,22 @@ const MESSAGES_TITLE_NAME_LIMIT: usize = 32;
 /// confirmation) is never clobbered.
 const LOADING_GROUP_DETAIL_STATUS: &str = "loading group detail...";
 
+/// The in-flight status shown while the launch daemon auto-start runs off the
+/// event loop, in the same in-flight vocabulary. The fold replaces it with the
+/// started daemon's status sentence, or with the failure.
+const STARTING_DAEMON_STATUS: &str = "starting daemon...";
+
+/// The single honest status when the daemon is down at launch and the TUI holds
+/// no relay source to start it with (`wn daemon start` would fail with
+/// `missing_relay_url`). Surfaced once — no start attempt, no retry loop — and
+/// the login/main flow continues degraded exactly as today. It points only at
+/// the actionable path: relaunching `wn tui` with relay flags (or `WN_RELAY`).
+/// It deliberately does not suggest `/daemon start`, which reads the very same
+/// relay sources (launch flags / `WN_RELAY`) and would fail identically, so it
+/// is no help in-session.
+const DAEMON_AUTOSTART_NO_RELAYS_STATUS: &str = "daemon not running and no relays configured; \
+restart wn tui with --discovery-relays/--default-account-relays (or WN_RELAY)";
+
 pub(crate) async fn run_tui(cli: Cli) -> CliOutput {
     match TuiApp::new(cli).and_then(|mut app| app.run()) {
         Ok(()) => CliOutput {

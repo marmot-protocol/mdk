@@ -1399,7 +1399,7 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<L
     for (index, result) in view.results.iter().enumerate() {
         let is_selected = results_focused && index == view.selected;
         let marker = if is_selected { ">" } else { " " };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::raw(format!("{marker} ")),
             Span::styled(
                 shorten(&terminal_safe_text(&result.display_label()), 28),
@@ -1409,7 +1409,16 @@ pub(crate) fn user_search_lines(view: &UserSearchView, searching: bool) -> Vec<L
                 format!("  {}", terminal_safe_text(&shorten(&result.npub, 18))),
                 Style::default().fg(Color::DarkGray),
             ),
-        ]));
+        ];
+        if result.following {
+            // Passive state, styled like the row's other metadata (dark gray),
+            // not like attention (yellow) or chrome (cyan).
+            spans.push(Span::styled(
+                "  [following]",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
         lines.push(Line::from(Span::styled(
             format!(
                 "    {} · {} · radius {}",

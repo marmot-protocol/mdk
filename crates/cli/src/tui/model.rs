@@ -17,13 +17,13 @@ pub(crate) struct WnInvocation {
     pub(crate) stdin: Option<String>,
 }
 
-/// One `wn` call an [`Effect`] expands to: the account it runs under plus the
-/// argv. Distinct from [`WnInvocation`] (the account-less argv+stdin of the
-/// synchronous account-setup path) because every off-loop effect runs under a
-/// selected account and none of them feeds stdin.
+/// One `wn` call an [`Effect`] expands to: the account it runs under (`None`
+/// for the account-less daemon control call, which must work before any
+/// account exists) plus the argv. Distinct from [`WnInvocation`] (the argv+stdin
+/// of the synchronous account-setup path) because no effect feeds stdin.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WnCall {
-    pub(crate) account: String,
+    pub(crate) account: Option<String>,
     pub(crate) args: Vec<String>,
 }
 
@@ -100,6 +100,24 @@ pub(crate) enum Effect {
         account: String,
         include_archived: bool,
     },
+    /// Follow the highlighted search result (`f`). `label` names the user on
+    /// the status line; `relay` is the setup relay `follows add` requires,
+    /// resolved at enqueue by the same only-when-no-global-`--relay` rule the
+    /// Profile screen's synchronous path uses. The fold badges the acted-on
+    /// row by pubkey, anchored to the surviving view and acting account.
+    FollowUser {
+        account: String,
+        pubkey: String,
+        label: String,
+        relay: Option<String>,
+    },
+    /// Unfollow the highlighted search result (`x`). Mirrors [`Self::FollowUser`].
+    UnfollowUser {
+        account: String,
+        pubkey: String,
+        label: String,
+        relay: Option<String>,
+    },
 }
 
 impl Effect {
@@ -113,7 +131,7 @@ impl Effect {
                 group,
                 text,
             } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec![
                     "messages".to_owned(),
                     "send".to_owned(),
@@ -127,7 +145,7 @@ impl Effect {
                 reply_to,
                 text,
             } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: reply_send_args(group, reply_to, text),
             }],
             Effect::React {
@@ -136,7 +154,7 @@ impl Effect {
                 message_id,
                 emoji,
             } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec![
                     "messages".to_owned(),
                     "react".to_owned(),
@@ -150,7 +168,7 @@ impl Effect {
                 group,
                 message_id,
             } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec![
                     "messages".to_owned(),
                     "unreact".to_owned(),
@@ -163,7 +181,7 @@ impl Effect {
                 group,
                 message_id,
             } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec![
                     "messages".to_owned(),
                     "delete".to_owned(),
@@ -172,7 +190,7 @@ impl Effect {
                 ],
             }],
             Effect::LoadTimeline { account, group } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec![
                     "messages".to_owned(),
                     "timeline".to_owned(),
@@ -184,37 +202,46 @@ impl Effect {
                 ],
             }],
             Effect::MarkRead { account, group } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec!["chats".to_owned(), "mark-read".to_owned(), group.clone()],
             }],
             Effect::GroupDiagnostics { account, group } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec!["groups".to_owned(), "show".to_owned(), group.clone()],
             }],
-            Effect::UserSearch { account, query } => vec![WnCall {
-                account: account.clone(),
-                args: vec!["users".to_owned(), "search".to_owned(), query.clone()],
-            }],
+            Effect::UserSearch { account, query } => vec![
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["users".to_owned(), "search".to_owned(), query.clone()],
+                },
+                // The local `follows list` directory read: one cheap call that
+                // badges every result row's follow state up front, instead of
+                // a `follows check` round-trip per row.
+                WnCall {
+                    account: Some(account.clone()),
+                    args: vec!["follows".to_owned(), "list".to_owned()],
+                },
+            ],
             Effect::LoadGroupDetail { account, group } => vec![
                 WnCall {
-                    account: account.clone(),
+                    account: Some(account.clone()),
                     args: vec!["groups".to_owned(), "members".to_owned(), group.clone()],
                 },
                 WnCall {
-                    account: account.clone(),
+                    account: Some(account.clone()),
                     args: vec!["groups".to_owned(), "admins".to_owned(), group.clone()],
                 },
                 WnCall {
-                    account: account.clone(),
+                    account: Some(account.clone()),
                     args: vec!["groups".to_owned(), "relays".to_owned(), group.clone()],
                 },
                 WnCall {
-                    account: account.clone(),
+                    account: Some(account.clone()),
                     args: vec!["groups".to_owned(), "show".to_owned(), group.clone()],
                 },
             ],
             Effect::LoadInvites { account } => vec![WnCall {
-                account: account.clone(),
+                account: Some(account.clone()),
                 args: vec!["groups".to_owned(), "invites".to_owned()],
             }],
             Effect::Relist {
@@ -226,12 +253,59 @@ impl Effect {
                     args.push("--include-archived".to_owned());
                 }
                 vec![WnCall {
-                    account: account.clone(),
+                    account: Some(account.clone()),
                     args,
                 }]
             }
+            Effect::FollowUser {
+                account,
+                pubkey,
+                relay,
+                ..
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: follows_update_args("add", pubkey, relay.as_deref()),
+            }],
+            Effect::UnfollowUser {
+                account,
+                pubkey,
+                relay,
+                ..
+            } => vec![WnCall {
+                account: Some(account.clone()),
+                args: follows_update_args("remove", pubkey, relay.as_deref()),
+            }],
         }
     }
+
+    /// How many of this effect's trailing [`calls`](Self::calls) are best-effort
+    /// enrichment rather than required work. A required call's failure aborts the
+    /// effect with the error; a trailing best-effort call's failure instead yields
+    /// the required results already gathered, so the fold degrades gracefully
+    /// (it reads trailing enrichment values tolerantly). Zero unless an effect
+    /// opts a trailing call out here.
+    pub(crate) fn best_effort_trailing_calls(&self) -> usize {
+        match self {
+            // `[users search, follows list]`: the search is required, but the
+            // `follows list` only badges results with follow state. A badge-read
+            // failure must yield the search results with no badges, never discard
+            // a successful search as an error.
+            Effect::UserSearch { .. } => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// Args for `follows add|remove <pubkey>`, with the command-local `--relay`
+/// those handlers require appended when the enqueue resolved one (absent when a
+/// global `--relay` already covers every child).
+fn follows_update_args(action: &str, pubkey: &str, relay: Option<&str>) -> Vec<String> {
+    let mut args = vec!["follows".to_owned(), action.to_owned(), pubkey.to_owned()];
+    if let Some(relay) = relay {
+        args.push("--relay".to_owned());
+        args.push(relay.to_owned());
+    }
+    args
 }
 
 /// Build the `wn` invocation for account setup. `setup_relay` supplies the
@@ -1008,7 +1082,7 @@ pub(crate) fn help_card_lines() -> Vec<String> {
         "On the selected message: r react (Enter sends +), u unreact, d delete, R reply.",
         "Composer: cursor editing (arrows/Home/End, Backspace/Delete); Enter sends.",
         "Group detail: j/k move; A add member; x remove; P promote; R rename; L leave.",
-        "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat.",
+        "User search: type + Enter searches; Enter opens a card; c chat; a add to a chat; f follow; x unfollow.",
         "Profile: j/k move; Enter edits a field; f follow; x unfollow. Relay health: r refresh.",
         "Popups capture every key; Esc or the shown key closes them.",
         "",
@@ -1230,6 +1304,10 @@ pub(crate) struct UserSearchResultRow {
     pub(crate) matched_field: String,
     pub(crate) match_quality: String,
     pub(crate) radius: u8,
+    /// Whether the selected account follows this user. Not in the `users
+    /// search` JSON: seeded from the search effect's `follows list` snapshot
+    /// at fold time, then kept current by the `f`/`x` follow-effect folds.
+    pub(crate) following: bool,
 }
 
 impl UserSearchResultRow {
@@ -1305,7 +1383,24 @@ fn parse_user_search_result(value: &Value) -> Option<UserSearchResultRow> {
             .get("radius")
             .and_then(Value::as_u64)
             .unwrap_or_default() as u8,
+        following: false,
     })
+}
+
+/// The set of followed pubkeys (hex account ids) a `follows list` result
+/// carries, for badging search rows. Tolerant like every parse here: a missing
+/// or malformed value is an empty set.
+pub(crate) fn follows_pubkey_set(value: &Value) -> HashSet<String> {
+    value
+        .get("follows")
+        .and_then(Value::as_array)
+        .map(|follows| {
+            follows
+                .iter()
+                .filter_map(|follow| value_string(follow, "account_id"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The dismiss-on-any-key profile card body for a `users show` result. Picture
@@ -1664,7 +1759,9 @@ fn build_relay_health_rows(spread: &Value, sync: &Value) -> Vec<RelayHealthRow> 
 pub(crate) fn user_search_hint(focus: UserSearchFocus) -> &'static str {
     match focus {
         UserSearchFocus::Query => "type query  Enter search  Down results  Esc back",
-        UserSearchFocus::Results => "j/k move  Enter profile  c chat  a add  i query  Esc back",
+        UserSearchFocus::Results => {
+            "j/k move  Enter profile  f follow  x unfollow  c chat  a add  i query  Esc back"
+        }
     }
 }
 
@@ -4631,6 +4728,25 @@ pub(crate) fn composer_display_text(input: &str) -> String {
 /// flags. `wn daemon start` accepts comma-delimited `--discovery-relays` /
 /// `--default-account-relays`, so each non-empty list is joined and passed as
 /// the same flag the daemon exposes (flag passthrough, no JSON change).
+/// Whether a `daemon start` spawned by this TUI would have a relay to run with.
+/// Mirrors the exact sources `wn daemon start` accepts — the two passthrough
+/// flag lists, the global `--relay`, and the `WN_RELAY` environment fallback —
+/// so the launch auto-start never declines to start a daemon that would in
+/// fact have started, and never attempts one guaranteed to fail with
+/// `missing_relay_url`. The environment value arrives as a parameter so this
+/// stays pure; the caller reads `WN_RELAY` at the composition root.
+pub(crate) fn daemon_start_has_relay_source(
+    relay: Option<&str>,
+    discovery_relays: &[String],
+    default_account_relays: &[String],
+    env_relay: Option<&str>,
+) -> bool {
+    relay.is_some()
+        || !discovery_relays.is_empty()
+        || !default_account_relays.is_empty()
+        || env_relay.is_some_and(|relay| !relay.trim().is_empty())
+}
+
 pub(crate) fn daemon_start_args(
     discovery_relays: &[String],
     default_account_relays: &[String],

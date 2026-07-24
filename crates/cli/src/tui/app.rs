@@ -120,6 +120,13 @@ pub(crate) struct TuiApp {
     /// send/react/open-chat/search/etc. from freezing the render loop for a
     /// subprocess round-trip.
     pub(crate) effects: EffectRunner,
+    /// Receiver for the launch daemon auto-start's outcome, delivered from its
+    /// own one-shot thread and drained on `tick`. Auto-start deliberately does
+    /// not ride the shared FIFO `effects` worker: its `wn daemon start` blocks up
+    /// to five seconds on a readiness poll and has no ordering dependency with
+    /// user effects, so queueing it there would stall the first user action
+    /// behind it. `None` until auto-start spawns, and again once its result folds.
+    pub(crate) daemon_autostart: Option<Receiver<Result<Value, String>>>,
 }
 
 /// True when a keypress carries no Ctrl/Alt modifier, so a bare accelerator (a
@@ -186,6 +193,7 @@ impl TuiApp {
             profile_view: None,
             relay_health: None,
             media: MediaState::new(),
+            daemon_autostart: None,
         })
     }
 
@@ -211,6 +219,10 @@ impl TuiApp {
         let result = (|| -> TuiResult<()> {
             let _ = self.refresh_daemon_status();
             self.start()?;
+            // After the startup routing so the auto-start status is what the
+            // first frame shows, and so its enqueued effect runs behind any
+            // initial loads instead of delaying them on the FIFO worker.
+            self.autostart_daemon_if_needed(std::env::var("WN_RELAY").ok());
             let mut dirty = true;
             while self.running {
                 dirty |= self.tick();
@@ -311,6 +323,9 @@ impl TuiApp {
         // subprocess and decode run on worker threads; this only folds results.
         changed |= self.media.drain();
         changed |= self.ensure_media_downloads();
+        // Fold the launch daemon auto-start's outcome if its one-shot thread has
+        // reported (it runs off the shared effect worker, so it drains here).
+        changed |= self.drain_daemon_autostart();
         // Fold every effect that finished off-loop since the last tick, exactly
         // as the synchronous handler folded its `run_json` return.
         let completed = self.effects.drain();
@@ -387,6 +402,71 @@ impl TuiApp {
             }
         }
         changed
+    }
+
+    /// Launch daemon auto-start: when the daemon is down and the TUI holds a
+    /// relay source to give it, start it exactly as `/daemon start` would — but
+    /// on its own one-shot thread, because `wn daemon start` blocks up to five
+    /// seconds on its readiness poll. It runs off the shared FIFO effect worker
+    /// deliberately: it has no ordering dependency with user effects, so queueing
+    /// it there would stall the first user action behind that five-second poll.
+    /// The thread mirrors the media worker — spawn, run the subprocess, deliver
+    /// the outcome over a channel drained on `tick`. Without a relay source the
+    /// start would only fail with `missing_relay_url`, so one honest status is
+    /// surfaced instead (no attempt, no retry loop) and the login/main flow
+    /// continues degraded. With a daemon already running this is a no-op (today's
+    /// behavior). Deliberate divergence from the retired reference client, which
+    /// killed its auto-started daemon on exit: ours outlives the TUI, because
+    /// other `wn` commands share it. `env_relay` is the caller's `WN_RELAY` read,
+    /// injected so the relay-source decision stays pure and testable.
+    pub(crate) fn autostart_daemon_if_needed(&mut self, env_relay: Option<String>) {
+        if self.daemon.running {
+            return;
+        }
+        if daemon_start_has_relay_source(
+            self.client.relay.as_deref(),
+            &self.client.discovery_relays,
+            &self.client.default_account_relays,
+            env_relay.as_deref(),
+        ) {
+            let client = self.client.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let args =
+                    daemon_start_args(&client.discovery_relays, &client.default_account_relays);
+                let result = client.run_json(None, &args).map_err(|err| err.to_string());
+                // The receiver is dropped only at shutdown; a failed send there
+                // simply means the app is gone and the result is moot.
+                let _ = tx.send(result);
+            });
+            self.daemon_autostart = Some(rx);
+            self.status = STARTING_DAEMON_STATUS.to_owned();
+        } else {
+            self.status = DAEMON_AUTOSTART_NO_RELAYS_STATUS.to_owned();
+        }
+    }
+
+    /// Fold the launch daemon auto-start's outcome once its thread reports, then
+    /// clear the one-shot channel. Returns whether anything changed, so `tick`
+    /// can mark the frame dirty. `Disconnected` (the thread panicked before
+    /// sending, which the panic-free subprocess path makes unreachable) just
+    /// clears the channel and leaves the degraded status in place.
+    fn drain_daemon_autostart(&mut self) -> bool {
+        let Some(rx) = self.daemon_autostart.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.daemon_autostart = None;
+                self.fold_daemon_start(result);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.daemon_autostart = None;
+                true
+            }
+        }
     }
 
     /// Route the opening screen from the loaded account list: no accounts opens
@@ -1642,8 +1722,12 @@ impl TuiApp {
     }
 
     /// Results-focus keys: `j`/`k` navigate (with `k` at the top returning to the
-    /// query), `Enter` opens the profile card, `c` starts a chat, `a` picks a chat
-    /// to add the user to, and `i`/`/` return to the query.
+    /// query), `Enter` opens the profile card, `f`/`x` follow/unfollow the
+    /// highlighted result (the same key letters as the Profile screen's, but
+    /// acting directly on the highlighted result — Profile's `f`/`x` go through
+    /// popups; `Tab` would collide with the muscle memory of pane cycling on
+    /// Main), `c` starts a chat, `a` picks a chat to add the user to, and `i`/`/`
+    /// return to the query.
     fn handle_user_search_results_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1665,6 +1749,8 @@ impl TuiApp {
                     self.status = format!("error: {err}");
                 }
             }
+            KeyCode::Char('f') => self.follow_search_result(),
+            KeyCode::Char('x') => self.unfollow_search_result(),
             KeyCode::Char('c') => self.open_new_chat_with_user_popup(),
             KeyCode::Char('a') => self.open_add_user_to_chat_popup(),
             KeyCode::Char('i') | KeyCode::Char('/') => {

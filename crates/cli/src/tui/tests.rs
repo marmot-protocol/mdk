@@ -2381,6 +2381,7 @@ fn test_tui_app(client: WnClient, account_id: &str) -> TuiApp {
         profile_view: None,
         relay_health: None,
         media: MediaState::new(),
+        daemon_autostart: None,
     }
 }
 
@@ -2485,6 +2486,29 @@ fn test_arg_recording_executable(dir: &std::path::Path, response: &str) -> (Path
     permissions.set_mode(0o755);
     std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
     (exe, args_file)
+}
+
+/// A fake `wn` whose behavior is the literal `#!/bin/sh` script `body`, so a test
+/// can vary the response by subcommand (a `case " $* " in ... esac`) or add a
+/// `sleep` to model a slow call. Returns the tempdir (keep it alive) and a client
+/// pointed at the script.
+#[cfg(unix)]
+fn test_scripted_client(body: &str) -> (tempfile::TempDir, WnClient) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let exe = tempdir.path().join("wn-json");
+    std::fs::write(&exe, format!("#!/bin/sh\n{body}")).expect("write fake wn");
+    let mut permissions = std::fs::metadata(&exe)
+        .expect("fake wn metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&exe, permissions).expect("chmod fake wn");
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    (tempdir, client)
 }
 
 #[cfg(windows)]
@@ -6716,7 +6740,7 @@ fn hints_line_matches_the_keymap_per_screen_and_focus() {
     );
     assert_eq!(
         user_search_hint(UserSearchFocus::Results),
-        "j/k move  Enter profile  c chat  a add  i query  Esc back"
+        "j/k move  Enter profile  f follow  x unfollow  c chat  a add  i query  Esc back"
     );
     assert_eq!(
         hints_line(Screen::Main, Focus::Messages, true),
@@ -9991,17 +10015,203 @@ fn a_stale_invites_result_for_a_switched_account_is_dropped() {
 }
 
 #[test]
-fn user_search_maps_to_the_users_search_argv() {
+fn user_search_maps_to_the_users_search_argv_plus_a_follows_snapshot() {
+    // The second call is the local `follows list` directory read — one cheap
+    // call that lets every result row render an accurate follow badge, instead
+    // of a `follows check` per row.
     let effect = Effect::UserSearch {
         account: "aa".repeat(32),
         query: "alice".to_owned(),
     };
     assert_eq!(
         effect.calls(),
-        vec![WnCall {
-            account: "aa".repeat(32),
-            args: vec!["users".to_owned(), "search".to_owned(), "alice".to_owned(),],
-        }]
+        vec![
+            WnCall {
+                account: Some("aa".repeat(32)),
+                args: vec!["users".to_owned(), "search".to_owned(), "alice".to_owned()],
+            },
+            WnCall {
+                account: Some("aa".repeat(32)),
+                args: vec!["follows".to_owned(), "list".to_owned()],
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_user_search_fold_badges_the_rows_the_account_already_follows() {
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.screen = Screen::UserSearch;
+    app.user_search = Some(UserSearchView::default());
+    app.searching_users = Some("ali".to_owned());
+
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::UserSearch {
+            account: account_id,
+            query: "ali".to_owned(),
+        },
+        result: Ok(vec![
+            serde_json::json!({
+                "users": [
+                    {"account_id_hex": "bb".repeat(32), "npub": "npubbb", "radius": 1,
+                     "matched_field": "name", "match_quality": "prefix",
+                     "profile": {"display_name": "Alice"}},
+                    {"account_id_hex": "cc".repeat(32), "npub": "npubcc", "radius": 2,
+                     "matched_field": "name", "match_quality": "prefix",
+                     "profile": {"display_name": "Alina"}},
+                ]
+            }),
+            serde_json::json!({
+                "follows": [{"account_id": "bb".repeat(32), "npub": "npubbb"}]
+            }),
+        ]),
+    });
+
+    let view = app.user_search.as_ref().expect("search view");
+    assert!(
+        view.results[0].following,
+        "the followed result is badged from the snapshot"
+    );
+    assert!(
+        !view.results[1].following,
+        "an unfollowed result carries no badge"
+    );
+
+    let rendered = user_search_lines(view, false)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("[following]"),
+        "the badge renders on the followed row; got:\n{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("[following]").count(),
+        1,
+        "only the followed row is badged; got:\n{rendered}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failing_follows_snapshot_still_folds_the_search_results_without_badges() {
+    // The badge read is the effect's second call and is best-effort: a
+    // `follows list` failure that lands *after* a successful `users search`
+    // must still surface the results (with no badges), never discard the whole
+    // search as an error the way the old first-error short-circuit did.
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_scripted_client(
+        "case \" $* \" in\n\
+         *' follows list '*)\n\
+         cat <<'JSON'\n{\"ok\":false,\"error\":{\"message\":\"relay unreachable\"}}\nJSON\n;;\n\
+         *' users search '*)\n\
+         cat <<'JSON'\n{\"ok\":true,\"result\":{\"users\":[\
+         {\"account_id_hex\":\"bb\",\"npub\":\"npubbb\",\"radius\":1,\"matched_field\":\"name\",\"match_quality\":\"prefix\",\"profile\":{\"display_name\":\"Alice\"}},\
+         {\"account_id_hex\":\"cc\",\"npub\":\"npubcc\",\"radius\":2,\"matched_field\":\"name\",\"match_quality\":\"prefix\",\"profile\":{\"display_name\":\"Alina\"}}\
+         ]}}\nJSON\n;;\n\
+         *)\ncat <<'JSON'\n{\"ok\":true,\"result\":{}}\nJSON\n;;\nesac\n",
+    );
+    let mut app = test_tui_app(client, &account_id);
+
+    app.open_user_search(Some("ali".to_owned()));
+    app.settle_effects(1);
+
+    let view = app.user_search.as_ref().expect("search view");
+    assert_eq!(view.results.len(), 2, "both search results still fold in");
+    assert!(
+        view.results.iter().all(|row| !row.following),
+        "a failed follows snapshot leaves every row unbadged"
+    );
+    assert_eq!(
+        app.status, "found 2 user(s)",
+        "the search succeeds; the best-effort badge failure is not surfaced as an error"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failing_user_search_call_still_reports_as_an_error() {
+    // The search itself is the required first call: its failure must still land
+    // on the status line as an error (the best-effort tolerance covers only the
+    // trailing badge read).
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_scripted_client(
+        "case \" $* \" in\n\
+         *' users search '*)\n\
+         cat <<'JSON'\n{\"ok\":false,\"error\":{\"message\":\"directory offline\"}}\nJSON\n;;\n\
+         *)\ncat <<'JSON'\n{\"ok\":true,\"result\":{}}\nJSON\n;;\nesac\n",
+    );
+    let mut app = test_tui_app(client, &account_id);
+
+    app.open_user_search(Some("ali".to_owned()));
+    app.settle_effects(1);
+
+    assert_eq!(app.status, "error: directory offline");
+    assert!(
+        app.user_search
+            .as_ref()
+            .expect("search view")
+            .results
+            .is_empty(),
+        "a failed search folds no results"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_re_search_after_following_badges_the_row_from_the_follows_snapshot() {
+    // Following a result (`f`) badges its row directly; a fresh re-search rebuilds
+    // the result rows from scratch, so their badge can only come from the
+    // `follows list` snapshot the search takes. This proves that snapshot reflects
+    // the just-made follow end to end. The fake `follows list` returns the user
+    // only once `follows add` has run (a marker beside the script), so the first
+    // search shows no badge and the re-search does.
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_scripted_client(
+        "marker=\"$(dirname \"$0\")/followed\"\n\
+         case \" $* \" in\n\
+         *' follows add '*)\n\
+         : > \"$marker\"\n\
+         cat <<'JSON'\n{\"ok\":true,\"result\":{\"follows\":[{\"account_id\":\"bb\",\"npub\":\"npubbb\"}]}}\nJSON\n;;\n\
+         *' follows list '*)\n\
+         if [ -f \"$marker\" ]; then\n\
+         cat <<'JSON'\n{\"ok\":true,\"result\":{\"follows\":[{\"account_id\":\"bb\",\"npub\":\"npubbb\"}]}}\nJSON\n\
+         else\n\
+         cat <<'JSON'\n{\"ok\":true,\"result\":{\"follows\":[]}}\nJSON\n\
+         fi\n;;\n\
+         *' users search '*)\n\
+         cat <<'JSON'\n{\"ok\":true,\"result\":{\"users\":[\
+         {\"account_id_hex\":\"bb\",\"npub\":\"npubbb\",\"radius\":1,\"matched_field\":\"name\",\"match_quality\":\"prefix\",\"profile\":{\"display_name\":\"Bob\"}}\
+         ]}}\nJSON\n;;\n\
+         *)\ncat <<'JSON'\n{\"ok\":true,\"result\":{}}\nJSON\n;;\nesac\n",
+    );
+    let mut app = test_tui_app(client, &account_id);
+
+    app.open_user_search(Some("bob".to_owned()));
+    app.settle_effects(1);
+    assert!(
+        !app.user_search.as_ref().expect("search view").results[0].following,
+        "before following, the snapshot has no follow so the row is unbadged"
+    );
+
+    app.handle_key(char_key('f'))
+        .expect("f follows the highlighted result");
+    app.settle_effects(1);
+
+    // Re-run the same query: the results are rebuilt from scratch, so the badge
+    // below can only have come from the refreshed follows snapshot.
+    app.run_user_search().expect("re-search");
+    app.settle_effects(1);
+    assert!(
+        app.user_search.as_ref().expect("search view").results[0].following,
+        "the re-search badges the row from the follows snapshot that now lists the user"
     );
 }
 
@@ -10308,6 +10518,7 @@ fn user_search_frame_shows_query_and_results() {
             matched_field: "name".to_owned(),
             match_quality: "prefix".to_owned(),
             radius: 1,
+            following: false,
         }],
         focus: UserSearchFocus::Results,
         ..UserSearchView::default()
@@ -10493,6 +10704,7 @@ fn user_search_app_with_selected_result(client: WnClient) -> TuiApp {
             matched_field: "name".to_owned(),
             match_quality: "exact".to_owned(),
             radius: 0,
+            following: false,
         }],
         focus: UserSearchFocus::Results,
         ..UserSearchView::default()
@@ -10703,7 +10915,7 @@ fn react_effect_maps_to_the_plural_messages_react_argv() {
     assert_eq!(
         effect.calls(),
         vec![WnCall {
-            account: "aa".repeat(32),
+            account: Some("aa".repeat(32)),
             args: vec![
                 "messages".to_owned(),
                 "react".to_owned(),
@@ -10813,7 +11025,7 @@ fn open_chat_load_maps_to_the_timeline_page_argv() {
     assert_eq!(
         effect.calls(),
         vec![WnCall {
-            account: "aa".repeat(32),
+            account: Some("aa".repeat(32)),
             args: vec![
                 "messages".to_owned(),
                 "timeline".to_owned(),
@@ -11000,7 +11212,7 @@ fn send_maps_to_the_plural_messages_send_argv() {
     assert_eq!(
         effect.calls(),
         vec![WnCall {
-            account: "aa".repeat(32),
+            account: Some("aa".repeat(32)),
             args: vec![
                 "messages".to_owned(),
                 "send".to_owned(),
@@ -11115,5 +11327,495 @@ fn reply_resolves_the_selected_target_and_folds_an_optimistic_reply() {
             .map(|reply| reply.reply_to_message_id.as_str()),
         Some("parent"),
         "the optimistic reply carries its parent id"
+    );
+}
+
+// --- Daemon auto-start at launch ---
+//
+// `wn tui` needs a running daemon for group/invite flows and live feeds, and the
+// field-proven footgun is forgetting `/daemon start`. Launch auto-starts the
+// daemon off the event loop when it is down and the TUI holds a relay source to
+// give it; without one it surfaces a single honest status and continues
+// degraded. Deliberate divergence from the retired reference client: the daemon
+// is never killed on exit, because other `wn` commands share it.
+
+#[cfg(unix)]
+#[test]
+fn launch_with_no_daemon_and_relay_flags_auto_starts_the_daemon() {
+    let account_id = "aa".repeat(32);
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_arg_recording_executable(
+        tempdir.path(),
+        r#"{"ok":true,"result":{"running":true,"pid":4242}}"#,
+    );
+    let client = WnClient {
+        exe,
+        discovery_relays: vec!["wss://d.example".to_owned()],
+        ..test_unused_client()
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default();
+
+    app.autostart_daemon_if_needed(None);
+    assert_eq!(
+        app.status, STARTING_DAEMON_STATUS,
+        "the in-flight status shows before the outcome lands"
+    );
+    assert!(
+        app.daemon_autostart.is_some(),
+        "auto-start runs on its own one-shot thread, not the shared effect worker"
+    );
+
+    app.settle_daemon_autostart();
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    let args: Vec<&str> = recorded.lines().collect();
+    assert!(
+        args.windows(2).any(|pair| pair == ["daemon", "start"]),
+        "auto-start spawns `daemon start`; got {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--discovery-relays", "wss://d.example"]),
+        "the TUI relay passthrough reaches the daemon-start child; got {args:?}"
+    );
+    assert!(
+        app.daemon.running,
+        "the fold adopts the started daemon, flipping the status-bar dot's data source"
+    );
+    assert_eq!(app.status, "daemon running");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_launch_daemon_auto_start_does_not_stall_the_first_user_action() {
+    // The launch auto-start's `wn daemon start` blocks up to five seconds on its
+    // readiness poll, so it must run on its own thread, not the single FIFO
+    // effect worker. A user action enqueued right after it must fold without
+    // waiting behind the daemon start (here a ~300ms sleep stands in for the poll).
+    let account_id = "aa".repeat(32);
+    let (_tempdir, client) = test_scripted_client(
+        "case \" $* \" in\n\
+         *' daemon start '*)\n\
+         sleep 0.3\n\
+         cat <<'JSON'\n{\"ok\":true,\"result\":{\"running\":true,\"pid\":4242}}\nJSON\n;;\n\
+         *)\ncat <<'JSON'\n{\"ok\":true,\"result\":{}}\nJSON\n;;\nesac\n",
+    );
+    let client = WnClient {
+        discovery_relays: vec!["wss://d.example".to_owned()],
+        ..client
+    };
+    let mut app = test_tui_app(client, &account_id);
+    app.daemon = DaemonView::default();
+
+    // Warm the subprocess exec path first: the one-time cost of loading the
+    // shell/script into the page cache (~half a second cold, ~10ms after) would
+    // otherwise swamp the timing budget below and make it flaky. This settles a
+    // throwaway effect through the worker so every later spawn is warm.
+    app.effects.enqueue(Effect::MarkRead {
+        account: account_id.clone(),
+        group: "warmup".to_owned(),
+    });
+    assert!(
+        app.effects.recv_timeout(Duration::from_secs(5)).is_some(),
+        "warmup effect completes",
+    );
+
+    // Kick off the auto-start (its `daemon start` sleeps ~300ms), then queue a
+    // user effect right behind it. On the shared FIFO worker it would wait out
+    // the whole start; on its own thread the worker is free, so the user effect
+    // folds well inside the 200ms budget (warm spawns are ~10ms).
+    app.autostart_daemon_if_needed(None);
+    app.effects.enqueue(Effect::MarkRead {
+        account: account_id,
+        group: "g1".to_owned(),
+    });
+    assert!(
+        app.effects
+            .recv_timeout(Duration::from_millis(200))
+            .is_some(),
+        "a user effect enqueued during auto-start folds without waiting behind the ~300ms daemon start"
+    );
+}
+
+#[test]
+fn launch_with_no_daemon_and_no_relay_source_surfaces_one_honest_status() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.daemon = DaemonView::default();
+
+    app.autostart_daemon_if_needed(None);
+
+    assert_eq!(app.status, DAEMON_AUTOSTART_NO_RELAYS_STATUS);
+    // The status must point at the only path that actually gives the daemon a
+    // relay in this situation: relaunching `wn tui` with the relay flags (or
+    // WN_RELAY). It must not suggest `/daemon start`, which reads the very same
+    // relay sources and would fail identically -- non-actionable in-session.
+    assert!(DAEMON_AUTOSTART_NO_RELAYS_STATUS.contains("restart"));
+    assert!(DAEMON_AUTOSTART_NO_RELAYS_STATUS.contains("--discovery-relays"));
+    assert!(DAEMON_AUTOSTART_NO_RELAYS_STATUS.contains("--default-account-relays"));
+    assert!(DAEMON_AUTOSTART_NO_RELAYS_STATUS.contains("WN_RELAY"));
+    assert!(
+        !DAEMON_AUTOSTART_NO_RELAYS_STATUS.contains("/daemon start"),
+        "the no-relays status must not point at the non-actionable /daemon start"
+    );
+    assert!(
+        app.daemon_autostart.is_none(),
+        "no start thread spawns without a relay source"
+    );
+    assert!(
+        app.effects
+            .recv_timeout(Duration::from_millis(200))
+            .is_none(),
+        "no start attempt is queued on the effect worker either"
+    );
+    assert!(!app.daemon.running);
+    assert!(
+        app.running,
+        "the session continues degraded, exactly as today"
+    );
+}
+
+#[test]
+fn launch_with_a_running_daemon_never_attempts_an_auto_start() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    assert!(app.daemon.running, "precondition: the daemon is already up");
+    app.status = "2 chats".to_owned();
+
+    app.autostart_daemon_if_needed(None);
+
+    assert_eq!(app.status, "2 chats", "today's no-op behavior is preserved");
+    assert!(
+        app.daemon_autostart.is_none(),
+        "no redundant start thread spawns for an already-running daemon"
+    );
+    assert!(
+        app.effects
+            .recv_timeout(Duration::from_millis(200))
+            .is_none(),
+        "no redundant start attempt is queued"
+    );
+}
+
+#[test]
+fn a_failed_daemon_auto_start_reports_and_leaves_the_session_up() {
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.daemon = DaemonView::default();
+    // The in-flight sentinel the auto-start sets before its thread reports.
+    app.status = STARTING_DAEMON_STATUS.to_owned();
+
+    app.fold_daemon_start(Err("daemon did not become ready".to_owned()));
+
+    assert_eq!(
+        app.status,
+        "daemon start failed: daemon did not become ready"
+    );
+    assert!(
+        !app.daemon.running,
+        "a failed start never fakes a green dot"
+    );
+    assert!(
+        app.running,
+        "a failed auto-start never tears down the session"
+    );
+}
+
+#[test]
+fn a_daemon_auto_start_fold_keeps_a_users_in_flight_status() {
+    // The auto-start runs off-loop, so a user may have queued an action (setting
+    // e.g. "sending...") before its result folds. Adopting the started daemon
+    // must not clobber that in-flight status with "daemon running"; the daemon
+    // dot already tells that story. The status write is guarded on the
+    // "starting daemon..." sentinel it set, and only replaces that.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon = DaemonView::default();
+    // Pre-attach the daemon-backed feeds so the re-adopt's subscription ensures
+    // short-circuit (they are idempotent) rather than trying — and failing — to
+    // spawn against the stub `wn`; that isolates the status guard under test.
+    app.chat_subscription = Some(test_chat_subscription(&account_id, false));
+    app.message_subscription = Some(test_message_subscription(&account_id));
+    app.notification_subscription = Some(test_notification_subscription(&account_id));
+    app.status = "sending...".to_owned();
+
+    app.fold_daemon_start(Ok(serde_json::json!({"running": true, "pid": 4242})));
+
+    assert_eq!(
+        app.status, "sending...",
+        "the user's in-flight status survives the auto-start fold"
+    );
+    assert!(
+        app.daemon.running,
+        "the daemon view is still adopted so the dot flips green"
+    );
+}
+
+#[test]
+fn a_daemon_auto_start_fold_replaces_its_own_in_flight_sentinel() {
+    // With no user action in between, the "starting daemon..." sentinel is still
+    // showing, so the fold replaces it with the outcome sentence.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.daemon = DaemonView::default();
+    // Pre-attach the feeds so the re-adopt's ensures short-circuit (see the
+    // in-flight-status test): isolates the sentinel replacement under test.
+    app.chat_subscription = Some(test_chat_subscription(&account_id, false));
+    app.message_subscription = Some(test_message_subscription(&account_id));
+    app.notification_subscription = Some(test_notification_subscription(&account_id));
+    app.status = STARTING_DAEMON_STATUS.to_owned();
+
+    app.fold_daemon_start(Ok(serde_json::json!({"running": true, "pid": 4242})));
+
+    assert_eq!(app.status, "daemon running");
+}
+
+#[test]
+fn a_daemon_auto_start_fold_re_adopts_manual_subscriptions_as_a_no_op() {
+    // A user who ran `/daemon start` manually is already attached to the
+    // daemon-backed feeds. The launch auto-start's late result then folds and
+    // re-adopts the daemon view, which re-runs the subscription ensures. Those
+    // must be idempotent: no feed is re-spawned (the fake `wn` here cannot spawn,
+    // so any re-spawn attempt would fail and taint the status), and the existing
+    // subscriptions are retained.
+    let account_id = "aa".repeat(32);
+    let mut app = test_tui_app(test_unused_client(), &account_id);
+    app.chat_subscription = Some(test_chat_subscription(&account_id, false));
+    app.message_subscription = Some(test_message_subscription(&account_id));
+    app.notification_subscription = Some(test_notification_subscription(&account_id));
+    app.status = "daemon running".to_owned();
+
+    app.fold_daemon_start(Ok(serde_json::json!({"running": true, "pid": 4242})));
+
+    assert!(
+        app.chat_subscription.is_some()
+            && app.message_subscription.is_some()
+            && app.notification_subscription.is_some(),
+        "the already-attached subscriptions are retained across the re-adopt"
+    );
+    assert!(
+        !app.status.contains("subscription failed"),
+        "re-adopt is idempotent: no feed is re-spawned, got {:?}",
+        app.status
+    );
+    assert!(
+        app.daemon.running,
+        "the re-adopt keeps the daemon dot green"
+    );
+}
+
+#[test]
+fn every_daemon_start_relay_source_counts_for_the_auto_start_decision() {
+    // The exact sources `wn daemon start` accepts, mirrored so the TUI never
+    // declines to start a daemon that would in fact have started: the two
+    // passthrough flag lists, the global --relay, and the WN_RELAY fallback.
+    assert!(!daemon_start_has_relay_source(None, &[], &[], None));
+    assert!(daemon_start_has_relay_source(
+        None,
+        &["wss://d.example".to_owned()],
+        &[],
+        None
+    ));
+    assert!(daemon_start_has_relay_source(
+        None,
+        &[],
+        &["wss://a.example".to_owned()],
+        None
+    ));
+    assert!(daemon_start_has_relay_source(
+        Some("wss://r.example"),
+        &[],
+        &[],
+        None
+    ));
+    assert!(daemon_start_has_relay_source(
+        None,
+        &[],
+        &[],
+        Some("wss://env.example")
+    ));
+    assert!(
+        !daemon_start_has_relay_source(None, &[], &[], Some("   ")),
+        "a blank WN_RELAY is not a relay source"
+    );
+}
+
+// --- Follow/unfollow from user-search results ---
+//
+// The retired reference client followed the highlighted result directly from
+// the search screen; ours required leaving to the Profile screen with a pasted
+// pubkey. `f`/`x` mirror the Profile screen's existing follow/unfollow keys,
+// run through the effect worker, and fold into the per-row badge.
+
+#[test]
+fn follow_effects_map_to_the_follows_add_and_remove_argv() {
+    // The relay travels on the variant (resolved at enqueue from the same
+    // setup-relay rule the Profile screen's synchronous path uses), so `calls`
+    // stays pure and the add/remove child always has the relay it requires.
+    let follow = Effect::FollowUser {
+        account: "aa".repeat(32),
+        pubkey: "bb".repeat(32),
+        label: "Bob".to_owned(),
+        relay: Some("wss://setup.example".to_owned()),
+    };
+    assert_eq!(
+        follow.calls(),
+        vec![WnCall {
+            account: Some("aa".repeat(32)),
+            args: vec![
+                "follows".to_owned(),
+                "add".to_owned(),
+                "bb".repeat(32),
+                "--relay".to_owned(),
+                "wss://setup.example".to_owned(),
+            ],
+        }]
+    );
+    let unfollow = Effect::UnfollowUser {
+        account: "aa".repeat(32),
+        pubkey: "bb".repeat(32),
+        label: "Bob".to_owned(),
+        relay: None,
+    };
+    assert_eq!(
+        unfollow.calls(),
+        vec![WnCall {
+            account: Some("aa".repeat(32)),
+            // No --relay here: a global --relay already covers every child.
+            args: vec!["follows".to_owned(), "remove".to_owned(), "bb".repeat(32)],
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn f_follows_the_highlighted_search_result_through_the_effect_worker() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) = test_arg_recording_executable(
+        tempdir.path(),
+        r#"{"ok":true,"result":{"follows":[{"account_id":"bb","npub":"npubbb"}]}}"#,
+    );
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = user_search_app_with_selected_result(client);
+
+    app.handle_key(char_key('f')).expect("f follows");
+    assert_eq!(
+        app.status, "following Bob...",
+        "the in-flight status shows before the publish lands"
+    );
+
+    app.settle_effects(1);
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    let args: Vec<&str> = recorded.lines().collect();
+    assert!(
+        args.windows(3).any(|w| w == ["follows", "add", "bb"]),
+        "f runs `follows add` on the highlighted result; got {args:?}"
+    );
+    assert_eq!(app.status, "followed Bob");
+    assert!(
+        app.user_search.as_ref().expect("search view").results[0].following,
+        "the badge folds in when the publish lands"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn x_unfollows_the_highlighted_search_result_through_the_effect_worker() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let (exe, args_file) =
+        test_arg_recording_executable(tempdir.path(), r#"{"ok":true,"result":{"follows":[]}}"#);
+    let client = WnClient {
+        exe,
+        ..test_unused_client()
+    };
+    let mut app = user_search_app_with_selected_result(client);
+    if let Some(view) = app.user_search.as_mut() {
+        view.results[0].following = true;
+    }
+
+    app.handle_key(char_key('x')).expect("x unfollows");
+    assert_eq!(app.status, "unfollowing Bob...");
+
+    app.settle_effects(1);
+    let recorded = std::fs::read_to_string(&args_file).expect("the fake wn ran");
+    let args: Vec<&str> = recorded.lines().collect();
+    assert!(
+        args.windows(3).any(|w| w == ["follows", "remove", "bb"]),
+        "x runs `follows remove` on the highlighted result; got {args:?}"
+    );
+    assert_eq!(app.status, "unfollowed Bob");
+    assert!(
+        !app.user_search.as_ref().expect("search view").results[0].following,
+        "the badge clears when the removal lands"
+    );
+}
+
+#[test]
+fn a_stale_follow_fold_reports_but_never_badges_a_left_or_changed_search() {
+    // Left screen: the mutation outcome still surfaces (the publish happened),
+    // but there is no view to badge — and nothing crashes.
+    let mut app = test_tui_app(test_unused_client(), &"aa".repeat(32));
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::FollowUser {
+            account: "aa".repeat(32),
+            pubkey: "bb".to_owned(),
+            label: "Bob".to_owned(),
+            relay: None,
+        },
+        result: Ok(vec![serde_json::json!({"follows": []})]),
+    });
+    assert_eq!(app.status, "followed Bob");
+    assert!(app.user_search.is_none());
+
+    // Changed results: the fold is keyed by pubkey, so rows of a newer query
+    // that no longer include the acted-on user never pick up its badge.
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    if let Some(view) = app.user_search.as_mut() {
+        view.results[0].pubkey = "cc".to_owned();
+    }
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::FollowUser {
+            account: "aa".repeat(32),
+            pubkey: "bb".to_owned(),
+            label: "Bob".to_owned(),
+            relay: None,
+        },
+        result: Ok(vec![serde_json::json!({"follows": []})]),
+    });
+    assert!(
+        !app.user_search.as_ref().expect("search view").results[0].following,
+        "a different row never picks up a stale fold's badge"
+    );
+
+    // Switched account: the badge is account-scoped truth, so a fold from a
+    // since-switched account is dropped even if the same pubkey is on screen.
+    let mut app = user_search_app_with_selected_result(test_unused_client());
+    app.accounts[0].account_id = "dd".repeat(32);
+    app.apply_effect_done_for_test(EffectDone {
+        effect: Effect::FollowUser {
+            account: "aa".repeat(32),
+            pubkey: "bb".to_owned(),
+            label: "Bob".to_owned(),
+            relay: None,
+        },
+        result: Ok(vec![serde_json::json!({"follows": []})]),
+    });
+    assert!(
+        !app.user_search.as_ref().expect("search view").results[0].following,
+        "a fold from a since-switched account never badges the new account's view"
+    );
+}
+
+#[test]
+fn the_search_results_hints_and_help_card_name_the_follow_keys() {
+    let hint = user_search_hint(UserSearchFocus::Results);
+    assert!(
+        hint.contains("f follow  x unfollow"),
+        "the results-focus hints name the follow keys; got: {hint}"
+    );
+    let help = help_card_lines().join("\n");
+    assert!(
+        help.contains("f follow; x unfollow"),
+        "the help card names the search-screen follow keys; got: {help}"
     );
 }
