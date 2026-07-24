@@ -982,8 +982,16 @@ impl<S: StorageProvider> Engine<S> {
                         &group_id,
                         staged.add_proposals().next().is_some(),
                     ) {
-                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                        return Err(error);
+                        return match error {
+                            EngineError::InvalidTransition(_) => self
+                                .terminalize_rejected_proposal(
+                                    &group_id,
+                                    &msg.id,
+                                    &raw_msg_id,
+                                    ProposalRejectionCategory::UnsupportedProposal,
+                                ),
+                            error => Err(error),
+                        };
                     }
                     if let Err(rejection) = crate::app_components::authorize_staged_commit_proposals(
                         &mls_group, &staged,
@@ -1333,8 +1341,16 @@ impl<S: StorageProvider> Engine<S> {
                         &group_id,
                         matches!(queued.proposal(), Proposal::Add(_)),
                     ) {
-                        self.update_stored_message_state(&msg.id, MessageState::Failed)?;
-                        return Err(error);
+                        return match error {
+                            EngineError::InvalidTransition(_) => self
+                                .terminalize_rejected_proposal(
+                                    &group_id,
+                                    &msg.id,
+                                    &raw_msg_id,
+                                    ProposalRejectionCategory::UnsupportedProposal,
+                                ),
+                            error => Err(error),
+                        };
                     }
                     if let Err(rejection) =
                         crate::app_components::authorize_standalone_proposal(&mls_group, &queued)

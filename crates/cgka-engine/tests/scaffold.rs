@@ -91,7 +91,6 @@ fn engine_can_be_built_and_boxed_as_trait_object() {
 #[test]
 fn builder_rejects_missing_identity() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
-        .legacy_compatibility_profile()
         .peeler(Box::new(StubPeeler))
         .build();
     assert!(matches!(res, Err(EngineError::Other(_))));
@@ -100,7 +99,6 @@ fn builder_rejects_missing_identity() {
 #[test]
 fn builder_rejects_missing_peeler() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
-        .legacy_compatibility_profile()
         .identity(b"id".to_vec())
         .build();
     assert!(matches!(res, Err(EngineError::Other(_))));

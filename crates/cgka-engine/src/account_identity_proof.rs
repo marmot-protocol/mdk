@@ -620,9 +620,10 @@ pub(crate) fn validate_standalone_proposal_account_identity_proof(
     let profile = protocol_profile_of_group(group)?;
     match proposal.proposal() {
         Proposal::Add(add) => {
-            let leaf = add.key_package().leaf_node();
+            let key_package = add.key_package();
+            let leaf = key_package.leaf_node();
             ensure_profile(
-                validate_leaf_account_identity_proof(leaf, ciphersuite)?,
+                validate_leaf_account_identity_proof(leaf, key_package.ciphersuite())?,
                 profile,
                 "standalone Add proposal",
             )?;
