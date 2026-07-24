@@ -9,6 +9,27 @@ use crate::capabilities::GroupCapabilities;
 use crate::types::{EpochId, GroupId, MemberId};
 use serde::{Deserialize, Serialize};
 
+/// Marmot application-profile generation for a group or KeyPackage.
+///
+/// This is the strict-cutover classification used for decisions that differ
+/// between the deployed legacy application profile and the adopted current
+/// profile, including the account-identity-proof carrier, encrypted-media
+/// component, and mixed-profile rejection. It does **not** identify which MLS
+/// extension carrier encodes application data: legacy-classified state may
+/// already use the current `app_data_dictionary` carrier.
+///
+/// Existing persisted records predate profile classification and therefore
+/// deserialize as [`ProtocolProfile::Legacy`]. Current-profile state is always
+/// explicit; code must not infer a hybrid profile independently for each
+/// application component.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolProfile {
+    #[default]
+    Legacy,
+    Current,
+}
+
 /// A group, as storage sees it. Mirrors the engine's view of the group's
 /// metadata — not the MLS tree (OpenMLS owns that).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +40,11 @@ pub struct Group {
     pub epoch: EpochId,
     pub members: Vec<Member>,
     pub required_capabilities: GroupCapabilities,
+    /// Persisted application-profile generation for this group. Records
+    /// written before profile classification existed are deterministically
+    /// legacy, regardless of the MLS carrier used by their latest state.
+    #[serde(default)]
+    pub protocol_profile: ProtocolProfile,
     /// The local copy of this group is marked removed: retained canonical
     /// state records the local member's own removal (spec
     /// `protocol-core/member-departure.md`, "Realizing removal"). The record

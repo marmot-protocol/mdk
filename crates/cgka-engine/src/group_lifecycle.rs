@@ -23,7 +23,7 @@ use cgka_traits::app_components::{AppComponentSet, default_group_components};
 use cgka_traits::capabilities::{GroupCapabilities, TransportKind};
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
 use cgka_traits::error::EngineError;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
@@ -340,6 +340,11 @@ impl<S: StorageProvider> Engine<S> {
             epoch: EpochId(mls_group.epoch().as_u64()),
             members: projected_members,
             required_capabilities: required_caps,
+            // This persistence-only slice predates the strict application
+            // profile cutover, so creation is intentionally classified
+            // Legacy. The value does not describe the MLS application-data
+            // carrier, which is already app_data_dictionary.
+            protocol_profile: ProtocolProfile::Legacy,
             removed: false,
             join_epoch: EpochId(mls_group.epoch().as_u64()),
         };
@@ -700,6 +705,10 @@ impl<S: StorageProvider> Engine<S> {
                     members: marmot_members(&mls_group),
                     required_capabilities:
                         crate::capability_manager::required_capabilities_from_group(&mls_group),
+                    // Welcome state remains Legacy-classified until the
+                    // strict application-profile classifier lands. This does
+                    // not imply legacy MLS application-data encoding.
+                    protocol_profile: ProtocolProfile::Legacy,
                     removed: false,
                     join_epoch: EpochId(mls_group.epoch().as_u64()),
                 };

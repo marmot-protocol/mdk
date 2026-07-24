@@ -2,4 +2,4 @@
 source: crates/traits/tests/snapshots.rs
 expression: "format!(\"{:?}\", CreateGroupRequest\n{\n    name: \"demo\".into(), description: \"\".into(), members:\n    vec![KeyPackage::new(vec![0xEF; 4])], required_features:\n    vec![Feature(\"self-remove\")], app_components: vec![], initial_admins:\n    vec![],\n})"
 ---
-"CreateGroupRequest { name: \"demo\", description: \"\", members: [KeyPackage { bytes: [239, 239, 239, 239], source: None }], required_features: [Feature(\"self-remove\")], app_components: [], initial_admins: [] }"
+"CreateGroupRequest { name: \"demo\", description: \"\", members: [KeyPackage { bytes: [239, 239, 239, 239], source: None, protocol_profile: Legacy }], required_features: [Feature(\"self-remove\")], app_components: [], initial_admins: [] }"

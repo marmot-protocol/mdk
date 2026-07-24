@@ -79,6 +79,7 @@ mod tests {
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
     use cgka_traits::capabilities::GroupCapabilities;
+    use cgka_traits::group::ProtocolProfile;
     use cgka_traits::storage::{
         CapabilityStorage, ConvergencePolicyStorage, GroupStorage, MessageStorage,
         OutboundIntentStorage, StorageError, StorageProvider,
@@ -89,9 +90,55 @@ mod tests {
     #[test]
     fn group_roundtrip_preserves_every_field() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let group = sample_group(gid(1), 7, 3);
+        let mut group = sample_group(gid(1), 7, 3);
+        group.protocol_profile = ProtocolProfile::Current;
         store.put_group(&group).unwrap();
         assert_eq!(store.get_group(&group.id).unwrap(), group);
+    }
+
+    #[test]
+    fn pre_profile_group_record_reopens_as_legacy() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 7, 3);
+        let mut record = serde_json::to_value(&group).unwrap();
+        record.as_object_mut().unwrap().remove("protocol_profile");
+        let bytes = serde_json::to_vec(&record).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, ?2, ?3)",
+                rusqlite::params![group.id.as_slice(), 7, bytes],
+            )
+            .unwrap();
+
+        let reopened = store.get_group(&group.id).unwrap();
+        assert_eq!(reopened, group);
+    }
+
+    #[test]
+    fn corrupt_present_group_profile_fails_closed() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 7, 3);
+        let mut record = serde_json::to_value(&group).unwrap();
+        record["protocol_profile"] = serde_json::json!("nope");
+        let bytes = serde_json::to_vec(&record).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cgka_groups (id, epoch, record) VALUES (?1, ?2, ?3)",
+                rusqlite::params![group.id.as_slice(), 7, bytes],
+            )
+            .unwrap();
+
+        let error = store
+            .get_group(&group.id)
+            .expect_err("a present corrupt profile must not fall through the serde default");
+        assert!(
+            matches!(&error, StorageError::Serialization(message) if message.contains("unknown variant")),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

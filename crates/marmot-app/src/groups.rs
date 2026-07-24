@@ -878,6 +878,7 @@ mod delete_moderation_grant_tests {
                 })
                 .collect(),
             required_capabilities: Default::default(),
+            protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
             removed: false,
             join_epoch: EpochId(0),
         }

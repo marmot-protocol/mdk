@@ -18,7 +18,7 @@ use cgka_traits::engine::{
     KeyPackage, SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, StaleReason};
 use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::transport::{
@@ -662,9 +662,56 @@ fn snapshot_group_and_member() {
                 credential: vec![],
             }],
             required_capabilities: GroupCapabilities::default(),
+            protocol_profile: ProtocolProfile::Current,
             removed: false,
             join_epoch: EpochId(2),
         }
+    );
+}
+
+#[test]
+fn key_package_profile_is_persisted_and_old_records_default_to_legacy() {
+    let legacy: KeyPackage = serde_json::from_value(serde_json::json!({
+        "bytes": [1, 2, 3],
+        "source": null
+    }))
+    .unwrap();
+    assert_eq!(legacy.protocol_profile, ProtocolProfile::Legacy);
+
+    let current = KeyPackage::new(vec![4, 5, 6]).with_protocol_profile(ProtocolProfile::Current);
+    let reopened: KeyPackage =
+        serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+    assert_eq!(reopened.protocol_profile, ProtocolProfile::Current);
+
+    let invalid = serde_json::from_value::<KeyPackage>(serde_json::json!({
+        "bytes": [7, 8, 9],
+        "protocol_profile": "nope"
+    }))
+    .expect_err("a present corrupt profile must not fall through the serde default");
+    assert!(invalid.to_string().contains("unknown variant"));
+}
+
+#[test]
+fn key_package_equality_and_hash_include_protocol_profile_but_not_source() {
+    use std::collections::HashSet;
+
+    let legacy = KeyPackage::new(vec![1, 2, 3]);
+    let legacy_with_source =
+        KeyPackage::with_source_event_id(vec![1, 2, 3], MessageId::new(vec![4; 32]));
+    let current = KeyPackage::new(vec![1, 2, 3]).with_protocol_profile(ProtocolProfile::Current);
+
+    assert_eq!(
+        legacy, legacy_with_source,
+        "transport provenance must not change KeyPackage identity"
+    );
+    assert_ne!(
+        legacy, current,
+        "application-profile metadata must remain visible to equality"
+    );
+    assert_eq!(
+        HashSet::from([legacy, legacy_with_source, current]).len(),
+        2,
+        "hashing must use the same identity fields as equality"
     );
 }
 
