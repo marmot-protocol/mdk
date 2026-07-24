@@ -1,0 +1,25 @@
+[package]
+name = "marmot-c"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "marmot_c"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[features]
+default = []
+# Test-only accounting of every FFI allocation/free pair; used by the
+# roundtrip tests to prove deep-free completeness. Never enable in release
+# artifacts.
+alloc-audit = []
+
+[dependencies]
+marmot-uniffi.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

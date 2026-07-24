@@ -18,6 +18,7 @@ This repo owns the Rust implementation workspace for Marmot:
 - app message Markdown display parser,
 - shared JSONL forensic audit schema,
 - UniFFI bindings for the app runtime,
+- C ABI bindings for the app runtime,
 - CLI surface, daemon, and TUI,
 - conformance simulator and vector fixtures,
 - Goggles-incident replay adapter (agent-state export parse + classify),
@@ -50,6 +51,7 @@ The canonical protocol specification lives in
 | Host integrations / connector coexistence | `integrations/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
+| App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` |
 | Goggles incident replay adapter | `crates/incident-replay/AGENTS.md` |

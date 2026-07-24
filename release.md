@@ -18,6 +18,8 @@ Current tracks:
   harness install assets, including Hermes, OpenClaw, and OpenCode.
 - MarmotKit binding releases use tags like `marmotkit-v0.9.0`. These build generated app-consumable binding bundles
   from `crates/marmot-uniffi` and attach them to a GitHub Release.
+- Marmot C binding releases use tags like `marmotc-v0.9.0`. These build the C ABI bundle (shared/static library,
+  `marmot.h`, pkg-config file) from `crates/marmot-c` and attach it to a GitHub Release.
 
 Future binary or package tracks should follow the same shape, for example `quic-broker-v0.9.0` or `wn-cli-v0.9.0`, only
 when those artifacts become independently consumed release surfaces.
@@ -315,6 +317,36 @@ The Android zip contains:
 
 Each manifest records the release tag, source commit, workspace version, `Cargo.lock` hash, Rust toolchain versions,
 and package contents. App repos should pin a tag and verify the `.sha256` file before vendoring the bundle.
+
+## Marmot C Binding Release
+
+Use this when native consumers (C/C++, Zig, Odin, raw FFI) need a pinned C ABI bundle instead of building
+`crates/marmot-c` from a local MDK checkout.
+
+The workflow lives at:
+
+```text
+.github/workflows/c-bindings.yml
+```
+
+It runs only when a tag matching `marmotc-v*` is pushed. The workflow validates version-like tags such as
+`marmotc-v0.9.0`, builds the Linux bundle, smoke-tests it against gcc and clang under valgrind, and creates or
+updates the matching GitHub Release titled `v<version> - Marmot C`.
+
+Create the tag:
+
+```sh
+git tag -a marmotc-v0.9.0 -m "Marmot C v0.9.0"
+git push origin marmotc-v0.9.0
+```
+
+The release job creates these assets:
+
+- `marmot-c-linux-x86_64-<version>.zip`
+- `marmot-c-linux-x86_64-<version>.zip.sha256`
+
+The zip contains `lib/libmarmot_c.so`, `lib/libmarmot_c.a`, `include/marmot.h`, `lib/pkgconfig/marmot-c.pc`,
+`README.md`, and `manifest.json`. Additional targets (macOS, Windows, musl) join the matrix as they get CI coverage.
 
 ## App Repo Consumption
 
